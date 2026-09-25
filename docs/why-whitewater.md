@@ -1,0 +1,543 @@
+# Why Whitewater
+
+> Whitewater is FinnStream's clean-sheet distributed database and streaming platform: a self-managing, partitionless event fabric built around durable feeds, key-defined ordering, opaque cursors, first-class indexes, secure defaults, and incremental elasticity.
+
+## Document status
+
+- **Status:** Product motivation and terminology proposal
+- **Product:** Whitewater
+- **Company and package namespace:** FinnStream / `finnstream`
+- **Architecture source:** [Whitewater architecture](kafka-successor-architecture.md)
+- **Operational experience:** [Humane operations and day-two requirements](operational-experience.md)
+- **Public model:** `fabric -> space -> feed -> key -> cursor -> subscription`
+- **Implementation:** Rust
+
+This document explains why Whitewater exists, how it differs from Kafka, and how familiar Kafka concepts translate into the Whitewater model. It distinguishes committed principles from areas that still require prototyping and benchmarking.
+
+## A database and a streaming platform
+
+Whitewater is designed as both systems from the beginning rather than a message broker with database behavior assembled around it:
+
+```text
+Feed         = immutable temporal database and replayable event history
+Index        = persisted replicated current/queryable state
+Subscription = continuous capacity-aware delivery
+Pipe         = stateful or stateless streaming computation
+Cursor       = stable opaque position in temporal history
+```
+
+The database and streaming responsibilities share FeedId, durability, security, placement, replication, observability, backup, and disaster-recovery contracts. Applications should not need to export every Feed into another database for basic key lookup, nor should database-style Indexes erase or redefine the underlying event history.
+
+## What Kafka got right
+
+Kafka established several ideas worth preserving:
+
+- A durable append-only history is a powerful integration primitive.
+- Writers and readers can be decoupled in time and deployment.
+- Replay is more useful than destructive queue consumption for many systems.
+- Sequential IO and immutable segments can deliver excellent throughput.
+- Replication makes event infrastructure a system of record rather than transient plumbing.
+- An ecosystem can grow around a small durable-log core.
+
+Whitewater is not based on the claim that Kafka is useless or universally slow. It starts from the observation that Kafka's public and operational abstractions expose too much of its physical implementation and couple responsibilities that should evolve independently.
+
+## Why build something new
+
+### 1. Partitions became too many things
+
+A Kafka partition is simultaneously:
+
+```text
+ordering boundary
++ throughput unit
++ storage unit
++ replication unit
++ leader-election unit
++ consumer-assignment unit
++ scaling decision
+```
+
+That coupling forces application teams to make permanent infrastructure decisions before they know future traffic. Increasing partition count changes ordering and key distribution. Reducing it is not a normal operation. Hot partitions remain hot even when the rest of a cluster is idle.
+
+Whitewater keeps only the useful public guarantee:
+
+```text
+Events with the same key are observed in accepted order.
+Unrelated keys may proceed independently.
+```
+
+Physical ranges, replicas, files, and placement are internal. They may split, merge, or move without changing a Feed or its client contract.
+
+### 2. Partition counts leak infrastructure into application design
+
+Kafka clients and operators must understand partition counts, leaders, replicas, assignment, and partition-local offsets. Capacity planning becomes part of topic creation, and changing capacity can alter behavior.
+
+A Whitewater Writer selects a Feed and key. A Reader selects a Feed or Feed pattern. The Fabric decides placement and parallelism.
+
+### 3. Consumer-group rebalancing interrupts unrelated work
+
+Kafka group membership changes can trigger coordinated reassignments. Cooperative protocols improve this, but applications still reason about group generations, poll intervals, session timeouts, assignment callbacks, and revoked partitions.
+
+Whitewater uses short, epoch-fenced leases over small internal work ranges. A failed Reader loses only its leases. Other Readers continue and acquire abandoned work incrementally. Joining capacity causes gradual lease transfer, not a global stop.
+
+### 4. Offsets expose physical layout
+
+A Kafka offset identifies a position inside one physical partition. Applications store topic, partition, and offset tuples, so physical topology becomes part of their state.
+
+Whitewater returns an opaque Cursor. A Cursor may encode Feed identity, range generation, segment, and record position, but clients do not interpret it. This leaves Whitewater free to reorganize storage while retaining a stable read contract.
+
+### 5. Configuration interactions are difficult to reason about
+
+Kafka exposes many individually defensible settings whose combinations define correctness and availability:
+
+- `acks`
+- replication factor
+- `min.insync.replicas`
+- producer retries and idempotence
+- in-flight request limits
+- delivery timeouts
+- consumer poll and session timeouts
+- fetch byte and wait settings
+- partition assignment strategies
+- segment and retention settings
+- cleanup policy
+- controller, broker, listener, and security settings
+
+The result is not merely a large configuration file. It is a large correctness state space where apparently harmless changes can weaken durability, duplicate work, interrupt consumption, or prevent progress.
+
+Whitewater chooses safe defaults as protocol behavior. Expert controls may exist, but basic durability, retry safety, backpressure, and membership must not depend on assembling the right combination of dozens of settings.
+
+### 6. Broker, controller, and KRaft concerns leak into operation
+
+Kafka has evolved from ZooKeeper coordination to KRaft, with brokers, controllers, process roles, listener matrices, quorum configuration, and migration history. KRaft is a substantial improvement, but operators still manage topology that applications should not need to understand.
+
+Whitewater runs one Node binary. Nodes may hold control-plane, data-plane, or mixed responsibilities internally, but role placement is reconciled by the Fabric. An orchestrator manages container count; it does not define Whitewater's logical data model.
+
+### 7. Elasticity is not transparent
+
+Adding Kafka brokers does not automatically redistribute existing partitions or remove hot spots. Removing brokers requires reassignment. Partition placement and data movement are explicit operational projects.
+
+Whitewater separates Feed identity, key ordering, active-range ownership, immutable history, and compute placement. Scaling changes capacity one Node at a time. The control plane incrementally moves internal ranges and leases. Scale-in is permitted only after a Node is drained and its durability obligations are satisfied.
+
+### 8. Cleanup policy mixes event history with materialized state
+
+Kafka asks a topic to choose between deletion, compaction, or both. Log compaction can approximate the latest value for each key, but it is asynchronous and remains represented as a log with tombstones and segment cleanup behavior. Applications often rebuild an in-memory or embedded store by replaying a changelog.
+
+Whitewater has one Feed model:
+
+- A Feed is immutable event history.
+- Events are never rewritten into a different semantic type by a cleanup mode.
+- History lifecycle and tiering are policies, not alternative Feed personalities.
+- Current state and query acceleration are represented by explicit Indexes.
+
+There is no public `cleanup.policy`, no compacted Feed type, and no implication that a durable history is also an efficient key-value database.
+
+Finite storage still requires explicit lifecycle rules. A Space may inherit a History Policy controlling local hot retention, object-storage tiering, legal retention, and eventual expiry. Expiry removes history according to policy; it does not convert a Feed into a key-value store.
+
+### 9. Current state should be a first-class persisted index
+
+When a Feed needs latest-value-by-key behavior, Whitewater creates a Key Index:
+
+```text
+Feed:  commerce.orders.events
+Index: commerce.orders.byid
+Key:   order123
+Value: latest indexed order state
+```
+
+An Index is:
+
+- Persisted, not merely an in-memory cache.
+- Replicated with an explicit durability contract.
+- Updated continuously as accepted events advance.
+- Checkpointed so restart does not require replaying all history.
+- Rebuildable from retained Feed history for verification or disaster recovery.
+- Independently movable from the active append range.
+- Queryable without scanning every event.
+
+Additional indexes may support exact keys, prefixes, selected fields, time ranges, and explicitly defined projections. Index creation is deliberate because indexes consume write IO, storage, memory, and replication bandwidth.
+
+The event append and required synchronous index mutations need a defined atomicity boundary. An acknowledgement must not claim an index is current unless the replicated index mutation required by that Index's consistency policy is also durable.
+
+### 10. Kafka lacks general first-class indexing
+
+Kafka efficiently retrieves sequential records by partition offset and time indexes, but it is not a general queryable event store. Lookup by business key or arbitrary field typically requires another database, Kafka Streams state store, ksqlDB table, search engine, or custom consumer-maintained projection.
+
+Whitewater keeps sequential Feed IO but allows optional first-class replicated Indexes. The Fabric knows which Cursor each Index has applied, can report freshness, can move Index ownership, and can prevent stale replicas from serving strict reads.
+
+### 11. Changelog plus reconstructed store duplicates responsibility
+
+Kafka Streams commonly represents state as a local store backed by a changelog topic. Recovery can involve restoring that local store by replaying its changelog. The model is robust, but state, changelog, cache, assignment, and restoration remain separate concerns exposed to the application framework.
+
+Whitewater treats indexed state as a persisted and replicated storage primitive. Feed history remains the audit source, while Index checkpoints and replicas provide fast current state. Memory is a cache above the persisted Index, not the only live representation.
+
+### 12. Security has too many optional paths
+
+Kafka can be deployed securely, but it can also expose plaintext listeners, and operators choose among TLS, mTLS, SASL mechanisms, JAAS configuration, ACL systems, and external identity integrations.
+
+Whitewater's baseline is intentionally narrow:
+
+- All client and inter-Node traffic is encrypted in transit.
+- There is no plaintext production listener.
+- Client authentication uses scoped API keys over TLS.
+- API keys map to identities and capabilities at Space and Feed boundaries.
+- Keys are stored as one-way verifiers; plaintext credentials are not persisted.
+- Rotation and overlapping validity are standard operations.
+- Audit events are part of the control plane.
+
+An API key must not be used directly as an encryption key. If a Feed requires a separate encryption boundary, its Encryption Policy references a Key ID. Data is encrypted with a data-encryption key, and that key is wrapped by a key-encryption key supplied by a KMS, HSM, or customer key provider. A separate scoped API key may authorize access to the Feed, but authentication material and encryption material remain distinct.
+
+### 13. Safe durability should not be optional
+
+Whitewater requires at least three Nodes. Active data has at least three replicas across distinct eligible Nodes, and normal durable acknowledgement requires a quorum.
+
+```text
+minimum Fabric size:     3 Nodes
+minimum active replicas: 3
+normal write quorum:      2 of 3
+```
+
+These are baseline invariants rather than per-Feed tuning. A future Durability Policy may request more replicas or geographic copies, but not fewer than the safe baseline.
+
+Development also runs three Nodes. Three containers on one laptop validate topology and failure logic but do not create three physical failure domains. Production placement must spread replicas across machines and, where available, zones.
+
+A single-Node mode may exist only as a storage-engine unit-test harness. It is not a supported Fabric deployment and must not silently present production durability semantics.
+
+### 14. Renaming should not rewrite data
+
+A Kafka topic name is its identity. Renaming normally means creating another topic and copying records, then migrating clients, ACLs, schemas, connectors, and consumer state.
+
+Whitewater separates identity from naming:
+
+```text
+FeedId:   immutable system identity
+FeedName: mutable human-readable alias
+```
+
+A rename updates metadata atomically. Records, Cursors, Subscriptions, Pipes, Indexes, policies, schemas, and placement remain attached to the FeedId.
+
+Feed names use lowercase dotted notation with a maximum encoded length of 512 bytes:
+
+```regex
+^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*$
+```
+
+Examples:
+
+```text
+commerce.orders.created
+payments.authorisations.requested
+identity.customers.updated
+region1.telemetry.received
+```
+
+Every segment begins with a lowercase ASCII letter. Numbers may appear after the first character. There are no empty segments, leading dots, trailing dots, uppercase letters, spaces, hyphens, or underscores.
+
+Rename aliases may optionally remain as time-bounded redirects, but an old name must never be silently reassigned while a redirect or client reference remains valid.
+
+### 15. JVM costs are not the same as saying Java is slow
+
+Kafka demonstrates that Java can sustain excellent throughput. Whitewater chooses Rust for different reasons:
+
+- Predictable tail latency without garbage-collection pauses.
+- Lower baseline memory overhead per Node.
+- Memory safety without a managed runtime.
+- Efficient binary protocols and zero-copy opportunities.
+- One native artifact with fewer runtime layers.
+- Fine-grained control over IO, allocation, caching, and backpressure.
+- Safer concurrency for a storage and consensus implementation.
+
+Rust does not automatically make Whitewater faster. Algorithms, disk layout, replication, batching, syscalls, and failure handling matter more than language marketing. Every performance claim requires reproducible benchmarks.
+
+### 16. Local development should resemble production
+
+Kafka development environments often use weaker replication, fewer controllers, different listeners, and different security than production. Problems then emerge only after deployment.
+
+Whitewater's standard development Fabric uses three Nodes, TLS, API-key authentication, membership, replication topology, and the same protocol as production. Local tooling may automate certificates and credentials, but it must not replace the architecture with a different single-Node product.
+
+### 17. Schemas should be first-class but not mandatory in storage
+
+Kafka's core stores bytes, while schemas generally live in a separately deployed registry. Whitewater also keeps Feed storage schema-neutral, but schema metadata, compatibility policy, validation, and generated clients can be integrated services under the same control plane and identity model.
+
+A Feed can accept arbitrary bytes or reference a Schema Policy. Schema enforcement is explicit and does not force JSON, Avro, or Protobuf into the storage engine.
+
+### 18. Multi-tenancy and isolation should not be retrofits
+
+Whitewater Spaces are policy and accounting boundaries from the beginning. CPU, memory, local IO, object-store IO, network bandwidth, connection count, Feed count, Index cost, and retained bytes must be attributable to a Space.
+
+Schedulers protect small workloads from noisy neighbours and prevent one hot Feed or key from consuming an entire Fabric unnoticed.
+
+### 19. Operational feedback should explain causes, not just lag
+
+Kafka lag is useful but insufficient. Whitewater should identify whether delay originates from:
+
+- Writer ingress
+- Quorum replication
+- Storage flush
+- Index application
+- Reader capacity
+- Lease availability
+- Object-store retrieval
+- A hot key
+- Quota enforcement
+- A failed or draining Node
+
+Capacity-aware subscriptions and protocol credits become control inputs, while metrics explain the resulting behavior.
+
+## Whitewater foundations
+
+### Fabric
+
+A Fabric is one cooperating Whitewater installation. It has a stable FabricId, a control-plane quorum, at least three Nodes, and one security and policy domain.
+
+### Node
+
+A Node is a replaceable process or container contributing storage, network, CPU, and optionally control-plane capacity. Applications do not address a specific Node for normal Feed operations.
+
+### Space
+
+A Space is a hierarchical administrative boundary for ownership, policy inheritance, quotas, authorization, schemas, encryption, and billing. Dotted Feed names naturally project into Space prefixes.
+
+### Feed
+
+A Feed is immutable, replayable event history with an immutable FeedId and mutable dotted FeedName. It has no public partitions and no cleanup-policy mode.
+
+### Key
+
+The key defines ordering. Events accepted for the same FeedId and key are observed in accepted order. Ordering between unrelated keys is deliberately unspecified so they can move and execute independently.
+
+### Metadata
+
+Metadata is the optional record-attached map of names to arbitrary bytes. It replaces Kafka record-header terminology and carries tracing, content description, provenance, routing hints, and application annotations without changing the payload. Metadata does not define ordering and must remain bounded by protocol limits.
+
+### Record time
+
+Every record stores `event_time_ns` and `ingest_time_ns` as signed 64-bit Unix epoch nanoseconds. Event time preserves Writer/source precision; ingest time records Whitewater acceptance. Keeping both avoids Kafka's CreateTime-versus-LogAppendTime replacement choice. JSON APIs encode these values as decimal strings to preserve exact 64-bit values in JavaScript.
+
+### Cursor
+
+A Cursor is an opaque, Feed-scoped position. Clients store, commit, and return it but do not calculate with its internal fields. Each standalone Reader owns an independent current Cursor and may seek without affecting anyone else.
+
+### Subscription
+
+A Subscription describes durable read intent, progress, filtering, and delivery policy. Every Subscription has its own durable acknowledged Cursor, independent from every other Subscription. Readers cooperating in one Subscription receive epoch-fenced leases over internal ranges and share that Subscription's progress; membership changes do not globally rebalance all work.
+
+### Pipe
+
+A Pipe is managed processing from one or more Feeds into Feeds and Indexes. Atomic consume-and-append advances input progress and commits output effects together within a defined boundary.
+
+### Index
+
+An Index is a named, persisted, replicated projection over a Feed or Pipe output. A Key Index replaces the common compacted-topic/KTable/latest-value use case without changing Feed history semantics.
+
+### History Policy
+
+A History Policy controls hot local duration, tiering, legal retention, archival, and eventual expiry. It does not switch a Feed between deletion and compaction personalities.
+
+### Durability Policy
+
+The baseline is three replicas and quorum acknowledgement. Stronger policies may add replicas, zones, or regions. Applications do not tune `acks`, ISR thresholds, and replication factor independently.
+
+### Encryption Policy
+
+An Encryption Policy specifies transport requirements, at-rest encryption, customer-managed key references, and rotation. Authentication API keys authorize access but are not encryption keys.
+
+## Kafka-to-Whitewater equivalents
+
+| Kafka concept | Whitewater concept | Difference |
+|---|---|---|
+| Kafka cluster | Fabric | Self-managing installation with a stable FabricId and minimum three Nodes |
+| Broker | Node | Replaceable capacity; applications do not target storage owners |
+| KRaft controller | Control plane | Small consensus scope for identity, ownership, epochs, membership, and recovery decisions |
+| Topic | Feed | Immutable history with an immutable FeedId and mutable dotted name |
+| Topic name | FeedName | Mutable alias; rename does not copy records or reset consumers |
+| Topic UUID | FeedId | Primary identity used by Cursors, policies, Indexes, and Subscriptions |
+| Partition | No public equivalent | Internal ranges are invisible and may split, merge, or move |
+| Partition leader | Active-range owner | Temporary epoch-fenced placement hidden from clients |
+| Record key | Key | Explicit ordering identity rather than only a partitioning hint |
+| Record headers | Metadata | Optional bounded key/value bytes for tracing, provenance, content description, and annotations |
+| Offset | Cursor | Opaque and stable across internal topology evolution |
+| Producer | Writer | Appends by Feed and key without partition selection |
+| Idempotent producer | Every Writer | Identity and sequence deduplication are protocol defaults |
+| Consumer | Reader | Receives work according to advertised capacity |
+| Consumer group | Subscription | Durable read intent using incremental leases rather than global generations |
+| Group rebalance | Lease transfer | Only affected internal ranges move; unrelated work continues |
+| Group generation | Lease epoch | Fences stale Readers at the smallest practical ownership boundary |
+| Consumer lag | Cursor distance and delay breakdown | Reports storage, replication, Index, delivery, and processing causes |
+| Bootstrap servers | Fabric endpoint/discovery | Clients discover healthy Nodes and need no broker topology knowledge |
+| Replication factor | Durability Policy | Minimum three replicas; no unsafe lower setting |
+| `acks` | Durability Policy | Safe quorum behavior is standard rather than a producer tuning choice |
+| ISR | Replica health | Internal operational state, not an application configuration concern |
+| `min.insync.replicas` | Quorum invariant | Derived from the Durability Policy |
+| Topic `cleanup.policy=delete` | Feed plus History Policy | Immutable history expires or tiers according to lifecycle policy |
+| Topic `cleanup.policy=compact` | Feed plus Key Index | Current state is a persisted replicated Index; history remains history |
+| Tombstone | Explicit Index deletion mutation | Deletes indexed state without redefining Feed storage semantics |
+| Log segment | Immutable segment | Internal storage chunk that may move to object storage |
+| Retention bytes/time | History Policy | Inherited through Spaces and coordinated with tiering and legal rules |
+| Kafka Streams state store | Index or Pipe state | Persisted and replicated first-class state, with memory as a cache |
+| Changelog topic | Index replication/checkpoint history | Recovery uses replicated checkpoints plus Feed tail rather than full replay by default |
+| KTable | Key Index | Direct latest-value view with known freshness Cursor |
+| Transactional producer | Atomic consume-and-append | Narrow, streaming-focused atomic primitive |
+| Kafka Connect | Adapter/Gateway | Integration runs outside the storage core through stable Feed APIs |
+| Schema Registry | Schema service | Integrated identity and policy model but optional for byte storage |
+| ACL | Space/Feed capability policy | Scoped API-key identity with inherited policy |
+| SASL mechanisms | API-key authentication over TLS | One baseline client authentication model |
+| SSL/plaintext listeners | TLS-only listener | No production plaintext mode |
+| Quotas | Space resource policy | Accounts for CPU, IO, storage, object retrieval, Indexes, and network |
+| Rack awareness | Failure-domain placement | Mandatory replica separation where infrastructure exposes domains |
+| Tiered storage | Transparent segment lifecycle | Clients keep Feed/Cursor semantics while storage location changes |
+| AdminClient | Control API and `wwctl` | Operates on logical resources, not partitions and broker assignments |
+
+## Index engine direction
+
+Whitewater should define an internal Index Engine trait before selecting one implementation. Required capabilities include:
+
+- Durable write batches
+- Crash recovery
+- Prefix and range iteration
+- Multiple isolated keyspaces
+- Snapshots or MVCC
+- Checksums
+- Explicit fsync/persistence control
+- Bounded write amplification
+- Background maintenance and compaction control
+- Backup/checkpoint creation
+- Efficient replication snapshot transfer
+- Metrics for cache, stalls, compaction, and disk usage
+- Stable behavior under sustained mixed append/read load
+
+Candidates for benchmarking:
+
+| Candidate | Characteristics | Main concern |
+|---|---|---|
+| RocksDB via Rust bindings | Mature LSM, column families, broad operational history | C++ dependency, build complexity, FFI, large tuning surface |
+| Fjall | Pure safe Rust LSM, keyspaces, transactions, compression, range/prefix scans | Younger operational history; durability modes and long-running workloads need validation |
+| redb | Pure Rust ACID embedded KV using copy-on-write B+ trees | Different write-amplification and large sustained-ingest characteristics from an LSM |
+| Purpose-built Whitewater engine | Exact replication/checkpoint integration and minimal surface | Highest engineering and correctness cost; should not be the first assumption |
+
+The preferred outcome is a pure-Rust engine, with Fjall and redb treated as serious first candidates rather than secondary fallbacks. This keeps the deployment, memory-safety, debugging, and build story aligned with Whitewater's Rust core.
+
+The selection must still follow benchmarks and fault tests using Whitewater's real index workload. “Written in Rust” is valuable but not sufficient to outweigh recovery correctness and operational evidence.
+
+## Additional improvements to pursue
+
+### Data and processing
+
+- Online internal-range split, merge, and movement without client-visible changes
+- Hot-key isolation and explicit hot-key diagnostics
+- Atomic consume-and-append with optional co-located state mutations
+- Built-in delayed delivery and retry schedules without retry-Feed conventions
+- Dead-letter handling as a Subscription policy rather than naming conventions
+- Point-in-time Index snapshots
+- Feed branching for test and replay environments
+- Server-side filtering with cost controls and Index-aware planning
+- Wildcard subscriptions over dotted Feed namespaces
+- Consistent snapshots across selected Feeds where explicitly requested
+
+### Storage
+
+- Replicated active append ranges on local NVMe
+- Immutable checksummed sealed segments
+- Transparent object-store tiering
+- Predictive prefetch for historical reads
+- Content verification and repair
+- Per-Space storage accounting
+- Online disk replacement and cache rebalancing
+- Background maintenance that yields to foreground latency targets
+
+### Clients and protocol
+
+- Credit-based delivery with explicit message, byte, and latency budgets
+- Adaptive batching, compression, and concurrency
+- Protocol-native idempotency
+- Server-advertised backoff and overload signals
+- Small binary protocol with negotiated extensions
+- Generated clients from optional schemas
+- First-class async Rust, Java, .NET, Go, Python, JavaScript, and C clients
+- Connection migration without application-visible ownership events
+
+### Operations
+
+- One Node binary with automatic internal role placement
+- Rolling upgrades with protocol/version fencing
+- Slow hysteretic autoscaling through Docker, Kubernetes, Nomad, ECS, or a webhook actuator
+- Drain-before-remove guarantees
+- Failure-domain-aware placement
+- Continuous replica verification and self-healing
+- Built-in fault injection for development Fabrics
+- Explainable pressure and placement decisions
+- Deterministic configuration snapshots and audit history
+- No unsafe production configuration combinations
+
+### Security
+
+- TLS-only client and Node communication
+- Short, scoped, rotatable API credentials
+- Capability inheritance through Spaces
+- Customer-managed envelope-encryption keys
+- Feed- and Index-specific encryption boundaries
+- Full control-plane audit Feed
+- Rate limits and anomaly detection per identity
+- Secret-free logs and diagnostics
+- Automated certificate and key rotation
+
+### Developer experience
+
+- Three-Node development Fabric by default
+- One command to start, inspect, test failure, and reset
+- Feed names that can be renamed without migration
+- No partition-count decision during creation
+- No exposed offsets, leaders, ISR, or assignment callbacks
+- Human-readable diagnostics for durability, pressure, and delayed delivery
+- Built-in replay and deterministic test fixtures
+- Local tooling that exercises the same protocol and topology as production
+
+## Decisions versus open questions
+
+### Directional decisions
+
+- Product name is Whitewater by FinnStream.
+- Public resources are Fabric, Space, Feed, Key, Cursor, Subscription, Pipe, Index, and Node.
+- Feed identity is immutable and separate from mutable dotted naming.
+- Keys define ordering.
+- Partitions are not public.
+- Minimum supported Fabric size is three Nodes.
+- Baseline active replication is three copies with quorum acknowledgement.
+- TLS is mandatory.
+- Scoped API keys are the baseline client-authentication mechanism.
+- Feed history and current-state indexing are separate concepts.
+- There is no public cleanup-policy mode.
+- Scale-in requires verified draining and safe-to-remove state.
+
+### Still requiring prototypes or benchmarks
+
+- Exact active-range replication protocol
+- Raft library and control-plane state layout
+- FeedId representation and Cursor encoding evolution
+- Atomic boundary between append, cursor advancement, Pipe output, and strict Index updates
+- Index Engine selection
+- Index replication and checkpoint transfer
+- History expiry guarantees when Index rebuildability is required
+- Multi-region consistency and failover
+- API-key root of trust and KMS integration
+- Wildcard namespace expansion strategy
+- Hot-key mitigation limits
+- Object-store outage behavior
+- Query and Index definition language
+
+## Summary
+
+Kafka made durable event history mainstream, but its partition abstraction couples ordering, scaling, storage, replication, and consumption. Whitewater separates those concerns.
+
+The intended developer experience is:
+
+```text
+choose a Space
+name a Feed
+append by Key
+resume with a Cursor
+process through a Subscription or Pipe
+add an Index when queryable state is needed
+```
+
+The Fabric owns placement, replicas, files, leases, tiering, batching, and scaling. Safe behavior is the default rather than the outcome of correctly tuning a large configuration matrix.

@@ -1,0 +1,26 @@
+# Project guidance
+
+- The architecture source of truth is `docs/kafka-successor-architecture.md`; the product problem catalogue is `docs/kafka-pain-points.md`; product motivation and Kafka equivalents are in `docs/why-whitewater.md`; operational experience requirements are in `docs/operational-experience.md`.
+- `docs/tasks.md` is the living execution tracker. Keep one current-focus milestone, mark work in progress before implementation, and check items only after linked tests/evidence pass.
+- Preserve the public model `fabric -> space -> feed -> key -> cursor -> subscription`; do not expose physical partitions.
+- WCL commands, HTTP control requests, CLI commands, SDKs, and future MCP tools must converge on the typed `ControlController`; do not duplicate resource semantics in interface layers.
+- Standard three-Node development uses the OpenRaft-backed Control Plane and reports `control_plane` authority only after majority commit. `local_prototype` is reserved for Nodes without Control Plane configuration.
+- Public terminology is Control Plane; Raft, voters, and majority quorum are internal correctness mechanisms rather than user-managed resources.
+- Feed names use lowercase dotted segments matching `^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*$` with a 512-byte maximum, while immutable FeedId values carry identity across renames.
+- Supported Fabrics require at least three Nodes and three active replicas, including the standard development topology.
+- Treat Whitewater as both a distributed database and a streaming platform: Feeds provide immutable temporal history, while persisted replicated Indexes provide current and queryable state.
+- Record-attached arbitrary key/value bytes are called Metadata, never Headers; reserve header terminology for transport protocols such as HTTP.
+- Every record stores signed 64-bit Unix epoch nanoseconds in `event_time_ns` and `ingest_time_ns`; do not reduce record time to milliseconds. JSON represents these as decimal strings to avoid JavaScript precision loss.
+- Standalone Readers own independent current Cursors; every named Subscription owns independent durable acknowledged progress shared only by Readers cooperating in that Subscription.
+- Use `C:\Code\Stackapps\kafka-trunk` as a read-only implementation reference and record retained lessons in `docs/kafka-source-lessons.md`; preserve proven correctness behavior without copying Kafka's public partition coupling.
+- Feed history has one immutable semantic model; use explicit persisted replicated Indexes rather than cleanup-policy or compacted-Feed modes.
+- Prefer a pure-Rust Index Engine such as Fjall or redb when benchmarks and fault tests prove it meets durability, recovery, replication, and sustained-ingest requirements; retain an engine abstraction until that decision is earned.
+- Client and inter-Node traffic is TLS-only. API keys authorize access but must never be used directly as encryption keys.
+- Prioritize correctness contracts before throughput optimization.
+- The host may not have Rust installed. Verification can run with `rust:1.90-bookworm` in Docker.
+- Standard checks: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets`.
+- Standard development and membership testing use `compose.cluster.yml` with at least three Nodes via `docker compose up --scale node=N`.
+- The current gossip-style membership is discovery only, not consensus or record replication.
+- Autoscaling must use sustained thresholds, hysteresis, cooldowns, and one-node steps.
+- Never scale in a node unless ownership/data draining has completed and the node reports safe-to-remove.
+- Infrastructure scaling runs outside data nodes; do not mount Docker or orchestrator credentials into a data node.

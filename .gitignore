@@ -1,0 +1,7 @@
+/target/
+/.idea/
+.env
+*.log
+/data/
+.DS_Store
+Thumbs.db

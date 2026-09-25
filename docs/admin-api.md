@@ -1,0 +1,506 @@
+# Whitewater Admin API v1
+
+The Whitewater Admin API is the only remote entry point for administrative commands. WCL, `wwctl`, Rust clients, future SDKs, UIs, operators, and MCP tools all use this API and converge on the same typed `ControlController`. Front ends contain no catalog authority and may be replaced, rewritten, or moved to separate projects without changing Whitewater server semantics.
+
+```text
+WCL / wwctl / Rust AdminClient / any HTTP client / future MCP
+    -> authenticated Admin API
+    -> typed Command
+    -> ControlController
+    -> control-plane transaction
+```
+
+The standard three-Node Fabric uses a persistent OpenRaft Control Plane. Commands submitted to any Node are forwarded to the elected leader and return only after majority commit. Nodes started without Control Plane configuration retain an explicit `local_prototype` fallback for isolated tests.
+
+## Authentication
+
+Every Admin API request requires:
+
+```http
+Authorization: Bearer <api-key>
+```
+
+The Node reads its expected key from:
+
+```text
+FINNSTREAM_ADMIN_API_KEY
+```
+
+Keys shorter than 24 characters are rejected during configuration. The server stores only an in-memory BLAKE3 digest and compares supplied digests without early exit.
+
+If no key is configured, Admin API requests return `503 Service Unavailable`. Missing or incorrect credentials return `401 Unauthorized`.
+
+Docker development files use this clearly non-production fallback:
+
+```text
+whitewater-local-development-admin-key
+```
+
+Override it before starting Compose:
+
+```bash
+export FINNSTREAM_ADMIN_API_KEY='replace-with-a-random-development-key'
+docker compose up --build -d
+```
+
+PowerShell:
+
+```powershell
+$env:FINNSTREAM_ADMIN_API_KEY = 'replace-with-a-random-development-key'
+docker compose up --build -d
+```
+
+Production must supply a generated secret through the orchestrator or secret manager. There is no production fallback in the binary.
+
+## Execute WCL
+
+```http
+POST /v1/admin/wcl
+Authorization: Bearer <api-key>
+Content-Type: application/json
+```
+
+```json
+{
+  "request_id": "018f5f65-5d87-7c2e-a9a3-3af92c48ed21",
+  "script": "CREATE SPACE orders; CREATE FEED orders.created; SHOW FEEDS;"
+}
+```
+
+Curl:
+
+```bash
+curl -X POST http://localhost:7071/v1/admin/wcl \
+  -H 'authorization: Bearer whitewater-local-development-admin-key' \
+  -H 'content-type: application/json' \
+  -d '{"script":"SHOW FEEDS;"}'
+```
+
+`POST /v1/control/execute` remains an authenticated compatibility alias during the prototype and should not be used by new clients.
+
+## Execute typed commands
+
+Clients do not need to generate WCL text. They can submit typed JSON commands directly:
+
+```http
+POST /v1/admin/commands
+Authorization: Bearer <api-key>
+Content-Type: application/json
+```
+
+```json
+{
+  "request_id": "018f5f65-5d87-7c2e-a9a3-3af92c48ed21",
+  "commands": [
+    {
+      "command": "create_space",
+      "name": "orders"
+    },
+    {
+      "command": "create_feed",
+      "name": "orders.created"
+    },
+    {
+      "command": "create_writer",
+      "name": "checkout",
+      "feed": "orders.created"
+    },
+    {
+      "command": "create_reader",
+      "name": "audit",
+      "feed": "orders.created",
+      "start": {
+        "kind": "beginning"
+      }
+    }
+  ]
+}
+```
+
+## Typed command shapes
+
+### Create
+
+```json
+{ "command": "create_space", "name": "orders" }
+```
+
+```json
+{ "command": "create_feed", "name": "orders.created" }
+```
+
+```json
+{
+  "command": "create_writer",
+  "name": "checkout",
+  "feed": "orders.created"
+}
+```
+
+```json
+{
+  "command": "create_reader",
+  "name": "audit",
+  "feed": "orders.created",
+  "start": { "kind": "beginning" }
+}
+```
+
+Reader start variants:
+
+```json
+{ "kind": "beginning" }
+{ "kind": "now" }
+{ "kind": "cursor", "cursor": "AbGTj_j2..." }
+```
+
+```json
+{ "command": "create_role", "name": "orderanalytics" }
+```
+
+### Rename
+
+```json
+{
+  "command": "rename",
+  "kind": "feed",
+  "current": "orders.created",
+  "new": "orders.accepted"
+}
+```
+
+Kinds are `space`, `feed`, `writer`, `reader`, and `role`.
+
+### Drop
+
+```json
+{
+  "command": "drop",
+  "kind": "reader",
+  "name": "audit"
+}
+```
+
+### Show
+
+```json
+{ "command": "show", "kind": "feeds" }
+```
+
+Kinds are `spaces`, `feeds`, `writers`, `readers`, `roles`, and `grants`.
+
+### Describe
+
+```json
+{
+  "command": "describe",
+  "kind": "feed",
+  "name": "orders.created"
+}
+```
+
+### Grant
+
+```json
+{
+  "command": "grant",
+  "actions": ["read", "write"],
+  "namespace": "orders.*",
+  "role": "orderapplication"
+}
+```
+
+Actions are `read`, `write`, and `manage`.
+
+### Explain access
+
+```json
+{
+  "command": "explain_access",
+  "role": "orderapplication",
+  "action": "read",
+  "feed": "orders.created"
+}
+```
+
+### Seek Reader
+
+```json
+{
+  "command": "seek_reader",
+  "reader": "audit",
+  "start": {
+    "kind": "cursor",
+    "cursor": "AbGTj_j2..."
+  }
+}
+```
+
+## Response
+
+WCL and typed requests return the same structure:
+
+```json
+{
+  "request_id": "018f5f65-5d87-7c2e-a9a3-3af92c48ed21",
+  "revision": 4,
+  "authority": "control_plane",
+  "warning": "",
+  "results": [
+    {
+      "statement": "CREATE FEED",
+      "message": "created Feed orders.created",
+      "data": {
+        "feed_id": "c0153abc-2015-45fe-812e-0824f7543786",
+        "name": "orders.created",
+        "status": "active"
+      }
+    }
+  ]
+}
+```
+
+## Rust AdminClient
+
+```rust
+use finnstream::{
+    admin::AdminClient,
+    control::{Command, ReaderStart, ShowKind},
+};
+
+let admin = AdminClient::new(
+    "http://localhost:7071",
+    std::env::var("WHITEWATER_API_KEY")?,
+);
+
+let result = admin
+    .execute_commands(vec![
+        Command::CreateSpace {
+            name: "orders".to_owned(),
+        },
+        Command::CreateFeed {
+            name: "orders.created".to_owned(),
+        },
+    ])
+    .await?;
+```
+
+Resource-oriented methods are available for applications that should not construct command enums:
+
+```rust
+admin.create_space("orders").await?;
+admin.create_feed("orders.created").await?;
+admin
+    .create_writer("checkout", "orders.created")
+    .await?;
+admin
+    .create_reader(
+        "audit",
+        "orders.created",
+        ReaderStart::Beginning,
+    )
+    .await?;
+admin.show(ShowKind::Feeds).await?;
+```
+
+WCL through the same client:
+
+```rust
+let result = admin
+    .execute_wcl("SHOW FEEDS;")
+    .await?;
+```
+
+## Front-end boundary
+
+The Admin API is the product boundary. A web UI, desktop application, IDE integration, Terraform provider, Operator, or customer-specific console can be built without embedding the Whitewater server or WCL parser. Typed JSON is sufficient for every command.
+
+`wwctl` is deliberately a free-standing, replaceable front end. It depends on the public AdminClient/API contract and can move into a separate repository later. It never links to or opens catalog storage, and the server works without it.
+
+## wwctl
+
+`wwctl` is an interactive Admin API shell when started without `--execute` or `--file`:
+
+```bash
+export WHITEWATER_API_KEY='whitewater-local-development-admin-key'
+
+wwctl
+```
+
+```text
+Whitewater Control Language shell
+whitewater> SHOW FEEDS;
+whitewater> CREATE SPACE orders;
+whitewater> \\help
+```
+
+One-shot execution remains available:
+
+```bash
+wwctl --execute "SHOW FEEDS;"
+```
+
+Or provide the key explicitly:
+
+```bash
+wwctl \
+  --api-key 'whitewater-local-development-admin-key' \
+  --execute "SHOW FEEDS;"
+```
+
+## Local wcl-cli command
+
+Windows can use the API-only PowerShell frontend without Rust or Docker commands. Install it into `%USERPROFILE%\.local\bin` and persist the local development settings with:
+
+```powershell
+.\scripts\install-wcl-cli.ps1
+```
+
+Custom endpoints and key:
+
+```powershell
+.\scripts\install-wcl-cli.ps1 `
+  -Endpoints 'server1:7070;server2:7070;server3:7070' `
+  -ApiKey 'replace-with-a-random-development-key'
+```
+
+The installer copies `scripts/wcl-cli.ps1`, creates the `wcl-cli` launcher, updates the user `PATH` when required, and persists configuration for future terminals:
+
+```powershell
+[Environment]::SetEnvironmentVariable(
+    'WHITEWATER_API_KEY',
+    'whitewater-local-development-admin-key',
+    'User'
+)
+
+[Environment]::SetEnvironmentVariable(
+    'WHITEWATER_ENDPOINTS',
+    '127.0.0.1:7071;127.0.0.1:7072;127.0.0.1:7073',
+    'User'
+)
+```
+
+Open a new terminal, then run:
+
+```powershell
+wcl-cli
+```
+
+Without a configured key, `wcl-cli` prompts using secure input. One-shot mutation retries can reuse a request ID:
+
+```powershell
+wcl-cli -Execute 'CREATE SPACE orders;' -RequestId '018f5f65-5d87-7c2e-a9a3-3af92c48ed21'
+```
+
+Override endpoints for one session with a quoted semicolon-separated list:
+
+```powershell
+wcl-cli "server1:7070;server2:7070;server3:7070"
+```
+
+The quote is required because PowerShell and shells treat semicolons as command separators.
+
+Temporary PowerShell configuration:
+
+```powershell
+$env:WHITEWATER_API_KEY = 'whitewater-local-development-admin-key'
+$env:WHITEWATER_ENDPOINTS = '127.0.0.1:7071;127.0.0.1:7072;127.0.0.1:7073'
+wcl-cli
+```
+
+zsh or bash:
+
+```bash
+export WHITEWATER_API_KEY='whitewater-local-development-admin-key'
+export WHITEWATER_ENDPOINTS='127.0.0.1:7071;127.0.0.1:7072;127.0.0.1:7073'
+wcl-cli
+```
+
+Persist those exports in `~/.zshrc` or the shell's equivalent. Use a secret manager rather than a shell profile for production credentials.
+
+Endpoint failover is safe for the standard three-Node Fabric because every Node routes through one replicated Control Plane. Nodes deliberately started without Control Plane configuration report `local_prototype`; do not mix those isolated test Nodes into an endpoint list.
+
+## Any language can use the API
+
+JavaScript:
+
+```javascript
+const response = await fetch("http://localhost:7071/v1/admin/commands", {
+  method: "POST",
+  headers: {
+    authorization: `Bearer ${process.env.WHITEWATER_API_KEY}`,
+    "content-type": "application/json",
+  },
+  body: JSON.stringify({
+    commands: [{ command: "show", kind: "feeds" }],
+  }),
+});
+
+if (!response.ok) throw new Error(await response.text());
+console.log(await response.json());
+```
+
+Python:
+
+```python
+import os
+import requests
+
+response = requests.post(
+    "http://localhost:7071/v1/admin/commands",
+    headers={"Authorization": f"Bearer {os.environ['WHITEWATER_API_KEY']}"},
+    json={"commands": [{"command": "show", "kind": "feeds"}]},
+    timeout=10,
+)
+response.raise_for_status()
+print(response.json())
+```
+
+## Error behavior
+
+```text
+400 Bad Request         invalid WCL, command, name, or resource state
+401 Unauthorized        missing or invalid Bearer API key
+503 Service Unavailable Admin API key not configured
+500 Internal Error      storage, serialization, or unexpected controller failure
+```
+
+Errors use:
+
+```json
+{
+  "error": "human-readable message"
+}
+```
+
+## Security roadmap
+
+The development key proves the authenticated interface boundary. Production identity still requires:
+
+- Hashed, persisted API-key records
+- Key IDs and one-time secret display
+- Rotation and overlapping validity
+- Expiry
+- Revocation
+- Role attachment
+- Per-command authorization enforcement
+- Audit events
+- TLS-only transport
+- Rate limiting
+- Replicated authentication state
+
+Until these exist, the current Admin key is one Fabric-wide prototype credential. Namespace grants are modeled and explainable but are not yet enforced against that credential.
+
+## Control-plane roadmap
+
+The API contract is designed to remain while implementation authority changes:
+
+```text
+Today:
+Admin API -> ControlController -> local catalog file
+
+Later:
+Admin API -> ControlController -> Raft proposal -> replicated catalog
+```
+
+Future additions include idempotency keys, atomic command batches, dry-run plans, pagination, watch streams, signed audit records, and generated clients for supported languages.

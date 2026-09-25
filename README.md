@@ -1,0 +1,183 @@
+# Whitewater
+
+Whitewater by FinnStream is a clean-sheet distributed database and partitionless streaming platform built around `fabric -> space -> feed -> key -> cursor -> subscription`. Applications do not create or manage partitions.
+
+Design documents:
+
+- [Living tasks and milestones](docs/tasks.md)
+- [Active Range replication contract](docs/active-range-replication.md)
+- [Whitewater skills and contribution map](skills.md)
+- [Kafka pain points Whitewater must address](docs/kafka-pain-points.md)
+- [Why Whitewater and Kafka equivalents](docs/why-whitewater.md)
+- [Humane operational and developer experience](docs/operational-experience.md)
+- [Reddit community introduction and pinned launch post](docs/reddit-whitewater-streams-introduction.md)
+- [Lessons retained from Apache Kafka source](docs/kafka-source-lessons.md)
+- [Authenticated Whitewater Admin API v1](docs/admin-api.md)
+- [Three-Node replicated Control Plane](docs/control-plane.md)
+- [Whitewater Control Language v0](docs/wcl.md)
+- [Whitewater architecture](docs/kafka-successor-architecture.md)
+
+This repository currently contains the Phase 1 correctness foundation and an early dynamic-membership prototype:
+
+- Durable checksummed binary append log
+- Hierarchical Feed namespaces with a prototype legacy stream API
+- Opaque stream-scoped Cursors with independent Reader positions
+- Nanosecond `event_time_ns` and `ingest_time_ns` with legacy millisecond decoding
+- Producer identity and sequence deduplication
+- Read-after-cursor HTTP API
+- DNS-seeded node discovery, heartbeats, expiry, and graceful leave
+- WCL v0 controller for Spaces, Feeds, Writers, Readers, Roles, namespace grants, rename, seek, show, describe, explain, and safe drop
+- Persistent OpenRaft Control Plane with three-voter majority commit, leader election, follower forwarding, and restart recovery
+- Persisted local prototype catalog fallback and `wwctl` command runner
+- Three-Node and arbitrary-scale Docker development environments
+
+The standard three-Node Fabric now uses Raft consensus for control metadata. Feed records are not replicated yet; active-range quorum replication remains the next major durability phase.
+
+## Run a development Fabric
+
+A supported Fabric always has at least three Nodes. The standard development setup publishes Nodes on ports `7071`, `7072`, and `7073`:
+
+```bash
+docker compose up --build -d
+curl http://localhost:7071/health
+```
+
+For arbitrary scale, Compose assigns each replica a random published host port while Nodes communicate over port `7070` on the internal network:
+
+```bash
+docker compose -f compose.cluster.yml up --build -d --scale node=5
+docker compose -f compose.cluster.yml ps
+```
+
+Windows helper:
+
+```powershell
+./scripts/cluster.ps1 up 5
+./scripts/cluster.ps1 smoke 5
+./scripts/cluster.ps1 scale 8
+./scripts/cluster.ps1 smoke 8
+./scripts/cluster.ps1 down
+```
+
+Linux/macOS helper:
+
+```bash
+./scripts/cluster.sh up 5
+./scripts/cluster.sh smoke 5
+./scripts/cluster.sh scale 8
+./scripts/cluster.sh down
+```
+
+Every replica resolves the `node:7070` service DNS record, joins discovered peers, exchanges known addresses, sends heartbeats, and removes members that stop responding.
+
+## Slow automatic scaling
+
+Nodes expose cumulative demand and storage-safety telemetry. The host-side controller samples all replicas, asks a node for a stateful hysteresis recommendation, and changes the Compose replica count by one node at a time.
+
+```powershell
+./scripts/cluster.ps1 autoscale -MinNodes 3 -MaxNodes 12
+```
+
+Defaults require approximately one minute of sustained high pressure before adding a node, five minutes of sustained low pressure before considering removal, and a two-minute cooldown after each action. Thresholds and sample windows are configurable parameters.
+
+Scale-in is blocked unless the highest-index Compose replica reports `safe_to_remove`. In this prototype that means the node has no records. Once replicated active ranges and draining exist, this signal will represent completed ownership transfer and verified durable replicas. Scaling out currently proves orchestration and membership behavior; it does not redistribute existing streams yet.
+
+The autoscaler runs outside data nodes, so the nodes do not receive Docker socket access.
+
+## Whitewater Control Language
+
+The authenticated Admin API is the product boundary; WCL, UIs, Operators, SDKs, MCP, and the CLI are replaceable front ends. Start the installed local API-only shell with:
+
+```text
+wcl-cli
+```
+
+It reads `WHITEWATER_API_KEY` and `WHITEWATER_ENDPOINTS`, or securely prompts for a missing key. The Rust `wwctl` frontend remains available from Cargo and inside the Docker image.
+
+```text
+whitewater> CREATE SPACE orders;
+whitewater> CREATE FEED orders.created;
+whitewater> SHOW FEEDS;
+```
+
+Or call the controller directly:
+
+```bash
+curl -X POST http://localhost:7071/v1/admin/wcl \
+  -H 'authorization: Bearer whitewater-local-development-admin-key' \
+  -H 'content-type: application/json' \
+  -d '{"script":"SHOW FEEDS;"}'
+```
+
+All administrative commands pass through the authenticated Admin API. Clients may submit WCL to `/v1/admin/wcl` or typed commands to `/v1/admin/commands`. See the [Admin API](docs/admin-api.md) and [Whitewater Control Language v0](docs/wcl.md). The Compose key shown above is a public local-development credential; override `FINNSTREAM_ADMIN_API_KEY` outside local testing.
+
+## API examples
+
+Create a Feed using the current prototype endpoint:
+
+```bash
+curl -X POST http://localhost:7070/v1/streams \
+  -H 'content-type: application/json' \
+  -d '{"name":"/orders/europe"}'
+```
+
+Append bytes using base64:
+
+```bash
+curl -X POST http://localhost:7070/v1/records \
+  -H 'content-type: application/json' \
+  -d '{
+    "stream":"/orders/europe",
+    "producer_id":"d2719d72-9f39-49c8-a5a4-1ea846941bad",
+    "sequence":1,
+    "event_time_ns":"1700000000123456789",
+    "key_base64":"Y3VzdG9tZXItMTIz",
+    "payload_base64":"eyJvcmRlcklkIjoiQS0xIn0=",
+    "metadata_base64":{}
+  }'
+```
+
+Read from the beginning:
+
+```bash
+curl 'http://localhost:7070/v1/records?stream=%2Forders%2Feurope&limit=100'
+```
+
+Continue after an opaque Cursor by adding `&after=<cursor>`. Each Reader can retain and seek with its own Cursor independently; reading does not modify another Reader's position. Durable named Subscription checkpoints will be stored by the replicated control plane in a later phase.
+
+Responses expose nanosecond-resolution `event_time_ns` and `ingest_time_ns` as decimal strings so JavaScript clients do not lose 64-bit precision. The binary record format stores signed `i64` values. The prototype still accepts legacy numeric `timestamp_ms` input and converts it to nanoseconds, but emits only nanosecond fields.
+
+Inspect membership and node pressure:
+
+```bash
+curl http://localhost:7070/v1/cluster/members
+curl http://localhost:7070/v1/node/metrics
+```
+
+The stateful recommendation endpoint is used by the host controller:
+
+```bash
+curl -X POST http://localhost:7070/v1/cluster/autoscale/recommend \
+  -H 'content-type: application/json' \
+  -d '{
+    "policy":{"min_nodes":3,"max_nodes":12,"scale_out_threshold":0.75,"scale_in_threshold":0.2,"scale_out_samples":6,"scale_in_samples":30,"cooldown_samples":12},
+    "pressure":0.82,
+    "removable_nodes":0
+  }'
+```
+
+## Development
+
+With Rust installed:
+
+```bash
+cargo fmt --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets
+```
+
+Without a host Rust toolchain:
+
+```bash
+docker run --rm -v "$PWD:/workspace" -w /workspace rust:1.90-bookworm cargo test --all-targets
+```

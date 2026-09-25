@@ -1,0 +1,57 @@
+name: whitewater-dev
+
+x-node: &node
+  build:
+    context: .
+  environment: &node-environment
+    FINNSTREAM_SEEDS: node1:7070,node2:7070,node3:7070
+    FINNSTREAM_NODE_CAPACITY: 100
+    FINNSTREAM_ADMIN_API_KEY: ${FINNSTREAM_ADMIN_API_KEY:-whitewater-local-development-admin-key}
+    FINNSTREAM_CONTROL_NODES: 1@node1:7070,2@node2:7070,3@node3:7070
+    FINNSTREAM_CONTROL_PLANE_KEY: ${FINNSTREAM_CONTROL_PLANE_KEY:-whitewater-local-development-control-key}
+  restart: unless-stopped
+
+services:
+  node1:
+    <<: *node
+    hostname: whitewater-node1
+    ports:
+      - "7071:7070"
+    environment:
+      <<: *node-environment
+      FINNSTREAM_NODE_ID: whitewater-node1
+      FINNSTREAM_CONTROL_NODE_ID: 1
+      FINNSTREAM_ADVERTISE_URL: http://node1:7070
+    volumes:
+      - whitewater-node1-data:/var/lib/finnstream
+
+  node2:
+    <<: *node
+    hostname: whitewater-node2
+    ports:
+      - "7072:7070"
+    environment:
+      <<: *node-environment
+      FINNSTREAM_NODE_ID: whitewater-node2
+      FINNSTREAM_CONTROL_NODE_ID: 2
+      FINNSTREAM_ADVERTISE_URL: http://node2:7070
+    volumes:
+      - whitewater-node2-data:/var/lib/finnstream
+
+  node3:
+    <<: *node
+    hostname: whitewater-node3
+    ports:
+      - "7073:7070"
+    environment:
+      <<: *node-environment
+      FINNSTREAM_NODE_ID: whitewater-node3
+      FINNSTREAM_CONTROL_NODE_ID: 3
+      FINNSTREAM_ADVERTISE_URL: http://node3:7070
+    volumes:
+      - whitewater-node3-data:/var/lib/finnstream
+
+volumes:
+  whitewater-node1-data:
+  whitewater-node2-data:
+  whitewater-node3-data:

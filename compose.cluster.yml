@@ -1,0 +1,19 @@
+name: finnstream-cluster
+
+services:
+  node:
+    build:
+      context: .
+    environment:
+      FINNSTREAM_SEEDS: node:7070
+      FINNSTREAM_HEARTBEAT_MS: 1000
+      FINNSTREAM_MEMBER_TIMEOUT_MS: 5000
+      FINNSTREAM_NODE_CAPACITY: 100
+      FINNSTREAM_ADMIN_API_KEY: ${FINNSTREAM_ADMIN_API_KEY:-whitewater-local-development-admin-key}
+    expose:
+      - "7070"
+    ports:
+      - "7070"
+    volumes:
+      - /var/lib/finnstream
+    restart: unless-stopped

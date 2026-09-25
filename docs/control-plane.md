@@ -1,0 +1,229 @@
+# Whitewater Control Plane
+
+Whitewater presents one Fabric-wide **Control Plane**. Internally, three control voters use Raft majority consensus, but applications and operators do not manage a user-visible “quorum” resource.
+
+## Responsibilities
+
+The Control Plane owns logical metadata and administrative ordering:
+
+- Spaces
+- Feed identities and names
+- Writers and Readers
+- Reader Cursors
+- Roles and namespace grants
+- Future Subscriptions, Indexes, Pipes, schemas, policies, credentials, and placement epochs
+
+It does not replicate Feed records yet. Active-range data replication remains a separate phase.
+
+## Three-voter baseline
+
+The standard development Fabric configures three voters:
+
+```text
+Node 1: node1:7070
+Node 2: node2:7070
+Node 3: node3:7070
+```
+
+A metadata mutation commits only after a majority accepts it:
+
+```text
+3 healthy voters -> commits continue
+2 healthy voters -> commits continue
+1 healthy voter  -> mutations and linearizable reads are refused
+```
+
+There is no supported one-voter Control Plane mode.
+
+## Public behavior
+
+Any Node may receive an authenticated Admin API request.
+
+```text
+request reaches leader
+    -> propose command
+    -> replicate command log
+    -> majority commit
+    -> apply deterministic catalog transition on every Node
+    -> reply success
+
+request reaches follower
+    -> discover elected leader
+    -> forward command internally
+    -> return committed result
+```
+
+Successful standard-development responses now report:
+
+```json
+{
+  "authority": "control_plane",
+  "warning": ""
+}
+```
+
+A Node not configured as a Control Plane voter retains `local_prototype` behavior for isolated storage tests and arbitrary-scale membership experiments.
+
+## Deterministic transitions
+
+Every replicated mutation contains:
+
+```text
+request_id
+issued_at_ns
+command
+```
+
+Resource IDs are derived deterministically from request identity and resource type. Every replica therefore creates the same FeedId, WriterId, ReaderId, RoleId, and GrantId.
+
+Applied request results are persisted by request ID. Replaying one committed command after a crash returns its original result without applying it twice.
+
+## Read behavior
+
+`SHOW`, `DESCRIBE`, and `EXPLAIN ACCESS` are read-only commands. The receiving Node first obtains a Raft linearizability guarantee, then reads its applied catalog without appending another command or incrementing catalog revision.
+
+If a majority cannot confirm leadership, linearizable reads fail rather than silently returning potentially stale metadata.
+
+## Persistence
+
+Each voter persists:
+
+```text
+/var/lib/finnstream/control-plane-raft.json
+/var/lib/finnstream/control-plane-catalog.json
+```
+
+Persisted Raft state includes:
+
+- Vote
+- Committed LogId
+- Replicated log entries
+- Last purged LogId
+- Last applied LogId
+- Membership
+- Current snapshot metadata and bytes
+
+Writes use a temporary file, flush it, synchronize it, and rename it into place.
+
+Catalog snapshots are included in Raft snapshots. Snapshot installation replaces the local catalog with the committed leader snapshot.
+
+## Leader election and failover
+
+The current timing policy is:
+
+```text
+heartbeat:          500 ms
+election minimum:  1500 ms
+election maximum:  3000 ms
+```
+
+When the leader stops, surviving voters elect another leader. Admin clients may keep using any surviving Node; followers forward to the new leader.
+
+A restarted former leader reloads its vote, log, applied metadata, and catalog, then catches up before serving current linearizable metadata.
+
+## Quorum-loss behavior
+
+Control mutations have a five-second majority-commit deadline. On quorum loss they return an unavailable error describing likely majority loss. They do not fall back to local catalog mutation.
+
+A timeout is an ambiguous network result: a proposal may commit later if the majority returns. Every Admin request therefore carries a client-visible `request_id`. Retrying the same script or typed command batch with the same ID returns the original persisted result and does not apply the catalog transition twice. Clients must not generate a new request ID when retrying an outcome they did not observe.
+
+This is a safety choice:
+
+```text
+no majority
+    -> no metadata write success
+    -> no split-brain namespace or identity state
+```
+
+## Status API
+
+```http
+GET /v1/admin/control-plane
+Authorization: Bearer <admin-api-key>
+```
+
+Example:
+
+```json
+{
+  "node_id": 2,
+  "leader_id": 2,
+  "state": "leader",
+  "current_term": 2,
+  "last_log_index": 9,
+  "last_applied_index": 9,
+  "membership": [1, 2, 3],
+  "catalog_revision": 7
+}
+```
+
+## Internal transport
+
+Nodes use authenticated internal HTTP endpoints for:
+
+- AppendEntries
+- Vote requests
+- Snapshot installation
+- Leader-forwarded application writes
+
+The shared prototype credential is configured with:
+
+```text
+FINNSTREAM_CONTROL_PLANE_KEY
+```
+
+Keys shorter than 24 characters are rejected. The development fallback is not a production secret.
+
+Production work still requires TLS/mTLS for internal transport, credential rotation, and failure-domain identity. An internal shared key alone is not the final security model.
+
+## Static membership limitation
+
+Control voter membership is currently configured statically:
+
+```text
+FINNSTREAM_CONTROL_NODE_ID
+FINNSTREAM_CONTROL_NODES
+FINNSTREAM_CONTROL_PLANE_KEY
+```
+
+Example:
+
+```text
+FINNSTREAM_CONTROL_NODE_ID=1
+FINNSTREAM_CONTROL_NODES=1@node1:7070,2@node2:7070,3@node3:7070
+```
+
+Dynamic learner addition and joint-consensus membership changes are future work. Arbitrary data capacity Nodes do not automatically become Control Plane voters.
+
+## Verified scenarios
+
+The three-Node Docker Fabric has demonstrated:
+
+- Initial leader election
+- Three-voter membership agreement
+- Command submission through a follower
+- Internal forwarding to the leader
+- Majority commit
+- Identical FeedId/catalog state on every Node
+- Leader stop and new leader election
+- Successful mutation after leader failure
+- Restart and catch-up of the former leader
+- Persistent catalog recovery
+- No success response when two of three voters are unavailable
+- Deterministic request IDs and idempotent retry across Node restart
+- Uncommitted command removal after leader loss and a new majority election
+
+## Remaining production work
+
+- Internal TLS/mTLS
+- Dynamic voter replacement using learner catch-up and joint consensus
+- Automated snapshots under sustained catalog volume
+- Corruption and partial-write fault injection
+- Disk-full handling
+- Backup/restore procedures
+- Metrics, alert thresholds, and election diagnostics
+- Multi-region metadata policy
+- Rolling compatibility tests across Control Plane versions
+- Formalized migration from prototype local catalogs
+
+The Control Plane is metadata consensus. Whitewater still needs a separate quorum replication protocol for active Feed ranges before event writes have distributed durability.
