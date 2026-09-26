@@ -52,6 +52,24 @@ docker compose up --build -d
 
 Production must supply a generated secret through the orchestrator or secret manager. There is no production fallback in the binary.
 
+## Replicated Feed records
+
+Append through any Node with `POST /v1/feeds/append`. Read majority-committed records through any current replica:
+
+```http
+GET /v1/feeds/records?feed=orders.events&limit=100
+Authorization: Bearer <api-key>
+```
+
+Continue after an opaque Cursor without changing another caller's position:
+
+```http
+GET /v1/feeds/records?feed=orders.events&after=<cursor>&limit=100
+Authorization: Bearer <api-key>
+```
+
+Only records at or below the local durable CommitPosition are returned. A Cursor that is unknown, uncommitted, or belongs to another Feed is rejected rather than exposing an uncommitted tail.
+
 ## Execute WCL
 
 ```http
@@ -198,6 +216,31 @@ Kinds are `spaces`, `feeds`, `writers`, `readers`, `roles`, and `grants`.
   "name": "orders.created"
 }
 ```
+
+### Inspect and transfer Active Range placement
+
+Placement is an authenticated operator view. Writers and Readers never receive owner or replica topology.
+
+```json
+{
+  "command": "inspect_placement",
+  "feed": "orders.created"
+}
+```
+
+The result contains the internal RangeId, generation, current owner, RF3 replica set, and ownership epoch. The standard development Fabric currently treats its three statically configured Control Plane Nodes as storage-capable placement candidates.
+
+Ownership transfer is epoch-fenced and limited to a current replica:
+
+```json
+{
+  "command": "transfer_active_range_ownership",
+  "feed": "orders.created",
+  "owner": "control-2"
+}
+```
+
+Repeating the same request ID returns the original result without incrementing the epoch twice.
 
 ### Grant
 

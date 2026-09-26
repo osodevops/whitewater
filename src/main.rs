@@ -2,6 +2,9 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use anyhow::Result;
 use finnstream::{
+    active_range::{
+        HttpReplicaTransport, MajorityAppendCoordinator, ReplicaAppendService, StorageNodeId,
+    },
     admin::AdminAuthenticator,
     api::{router, AppState},
     autoscale::AutoscaleController,
@@ -39,9 +42,15 @@ async fn main() -> Result<()> {
     } else {
         "control-catalog.json"
     };
-    let control = Arc::new(ControlController::open(
+    let eligible_storage_nodes = config
+        .control_nodes
+        .iter()
+        .map(|(node_id, _)| StorageNodeId::try_new(format!("control-{node_id}")))
+        .collect::<Result<Vec<_>, _>>()?;
+    let control = Arc::new(ControlController::open_with_storage_nodes(
         config.data_dir.join(catalog_file),
         store.clone(),
+        eligible_storage_nodes,
     )?);
     let control_plane = match (config.control_node_id, config.control_plane_key.clone()) {
         (Some(node_id), Some(key)) => {
@@ -60,6 +69,45 @@ async fn main() -> Result<()> {
                 )
                 .await?,
             ))
+        }
+        _ => None,
+    };
+    let replica_append = config
+        .control_node_id
+        .map(|node_id| {
+            StorageNodeId::try_new(format!("control-{node_id}")).map(|local_node| {
+                Arc::new(ReplicaAppendService::new(
+                    config.data_dir.join("active-ranges"),
+                    local_node,
+                    control.clone(),
+                ))
+            })
+        })
+        .transpose()?;
+    let control_endpoints = config
+        .control_nodes
+        .iter()
+        .map(|(node_id, address)| {
+            StorageNodeId::try_new(format!("control-{node_id}"))
+                .map(|node| (node, format!("http://{address}")))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let majority_append = match (
+        replica_append.clone(),
+        config.control_plane_key.clone(),
+        config.control_node_id,
+    ) {
+        (Some(local), Some(key), Some(_)) => {
+            let transport = Arc::new(HttpReplicaTransport::new(
+                control_endpoints.clone(),
+                key,
+                Duration::from_secs(2),
+            )?);
+            Some(Arc::new(MajorityAppendCoordinator::new(
+                local,
+                control.clone(),
+                transport,
+            )))
         }
         _ => None,
     };
@@ -95,6 +143,16 @@ async fn main() -> Result<()> {
         autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
         control,
         control_plane: control_plane.clone(),
+        storage_node_id: replica_append
+            .as_ref()
+            .map(|service| service.local_node().clone()),
+        replica_append,
+        majority_append,
+        control_endpoints: Arc::new(control_endpoints),
+        internal_key: config.control_plane_key.clone(),
+        internal_http: reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()?,
         admin_auth,
     })
     .layer(TraceLayer::new_for_http());

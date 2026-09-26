@@ -6,6 +6,7 @@ Design documents:
 
 - [Living tasks and milestones](docs/tasks.md)
 - [Active Range replication contract](docs/active-range-replication.md)
+- [Sequence diagrams for writes, reads, retries, ownership, and Readers](docs/sequence-diagrams.md)
 - [Whitewater skills and contribution map](skills.md)
 - [Kafka pain points Whitewater must address](docs/kafka-pain-points.md)
 - [Why Whitewater and Kafka equivalents](docs/why-whitewater.md)
@@ -20,6 +21,11 @@ Design documents:
 This repository currently contains the Phase 1 correctness foundation and an early dynamic-membership prototype:
 
 - Durable checksummed binary append log
+- Active Range storage with atomic state, persisted durability positions and Writer deduplication, committed segment rotation, torn-tail recovery, and safe uncommitted-tail truncation
+- Consensus-persisted fixed RF3 Active Range placement with epoch-fenced ownership and authenticated inspection
+- Authenticated bounded internal replica append protocol with exact-frame durability, checksum validation, position fencing, and structured rejection
+- Owner-side concurrent RF3 replication with two-of-three durable frame and CommitPosition evidence before success
+- Topology-free committed-only Feed reads with stateless opaque Cursor continuation
 - Hierarchical Feed namespaces with a prototype legacy stream API
 - Opaque stream-scoped Cursors with independent Reader positions
 - Nanosecond `event_time_ns` and `ingest_time_ns` with legacy millisecond decoding
@@ -174,6 +180,12 @@ With Rust installed:
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
+```
+
+Run the automated M1.7 topology-free three-Node append acceptance test against the Compose Fabric:
+
+```bash
+python scripts/test-m17-topology-free-append.py
 ```
 
 Without a host Rust toolchain:

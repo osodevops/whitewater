@@ -12,7 +12,13 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::storage::{LogStore, StorageError};
+use crate::{
+    active_range::{
+        ActiveRangeAssignment, OwnershipEpoch, RangeGeneration, RangeId, ReplicaSet, StorageNodeId,
+        ACTIVE_RANGE_REPLICA_COUNT,
+    },
+    storage::{LogStore, StorageError},
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -103,6 +109,8 @@ struct CatalogState {
     roles: BTreeMap<Uuid, RoleDefinition>,
     grants: BTreeMap<Uuid, NamespaceGrant>,
     #[serde(default)]
+    active_ranges: BTreeMap<Uuid, ActiveRangeAssignment>,
+    #[serde(default)]
     applied_requests: BTreeMap<Uuid, ReplicatedCommandResult>,
 }
 
@@ -117,6 +125,7 @@ impl Default for CatalogState {
             readers: BTreeMap::new(),
             roles: BTreeMap::new(),
             grants: BTreeMap::new(),
+            active_ranges: BTreeMap::new(),
             applied_requests: BTreeMap::new(),
         }
     }
@@ -194,15 +203,37 @@ pub enum Command {
         reader: String,
         start: ReaderStart,
     },
+    InspectPlacement {
+        feed: String,
+    },
+    TransferActiveRangeOwnership {
+        feed: String,
+        owner: StorageNodeId,
+    },
+    RecoverActiveRangeOwnership {
+        feed: String,
+        expected_owner: StorageNodeId,
+        expected_epoch: OwnershipEpoch,
+        new_owner: StorageNodeId,
+    },
 }
 
 impl Command {
     pub fn is_read_only(&self) -> bool {
         matches!(
             self,
-            Self::Show { .. } | Self::Describe { .. } | Self::ExplainAccess { .. }
+            Self::Show { .. }
+                | Self::Describe { .. }
+                | Self::ExplainAccess { .. }
+                | Self::InspectPlacement { .. }
         )
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FixedActiveRangePlacement {
+    pub owner: StorageNodeId,
+    pub replicas: [StorageNodeId; ACTIVE_RANGE_REPLICA_COUNT],
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -210,6 +241,8 @@ pub struct ReplicatedCommand {
     pub request_id: Uuid,
     pub issued_at_ns: i64,
     pub command: Command,
+    #[serde(default)]
+    pub fixed_active_range: Option<FixedActiveRangePlacement>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -272,11 +305,19 @@ impl ControlError {
 pub struct ControlController {
     path: Arc<PathBuf>,
     state: Arc<Mutex<CatalogState>>,
-    store: Arc<dyn LogStore>,
+    eligible_storage_nodes: Arc<BTreeSet<StorageNodeId>>,
 }
 
 impl ControlController {
     pub fn open(path: impl Into<PathBuf>, store: Arc<dyn LogStore>) -> Result<Self, ControlError> {
+        Self::open_with_storage_nodes(path, store, Vec::new())
+    }
+
+    pub fn open_with_storage_nodes(
+        path: impl Into<PathBuf>,
+        _store: Arc<dyn LogStore>,
+        eligible_storage_nodes: Vec<StorageNodeId>,
+    ) -> Result<Self, ControlError> {
         let path = path.into();
         let state = if path.exists() {
             serde_json::from_slice(&fs::read(&path)?)?
@@ -286,7 +327,45 @@ impl ControlController {
         Ok(Self {
             path: Arc::new(path),
             state: Arc::new(Mutex::new(state)),
-            store,
+            eligible_storage_nodes: Arc::new(eligible_storage_nodes.into_iter().collect()),
+        })
+    }
+
+    pub fn prepare_replicated(
+        &self,
+        request_id: Uuid,
+        issued_at_ns: i64,
+        command: Command,
+    ) -> Result<ReplicatedCommand, ControlError> {
+        let fixed_active_range = matches!(&command, Command::CreateFeed { .. })
+            .then(|| self.select_fixed_active_range())
+            .transpose()?;
+        Ok(ReplicatedCommand {
+            request_id,
+            issued_at_ns,
+            command,
+            fixed_active_range,
+        })
+    }
+
+    fn select_fixed_active_range(&self) -> Result<FixedActiveRangePlacement, ControlError> {
+        let replicas = self
+            .eligible_storage_nodes
+            .iter()
+            .take(ACTIVE_RANGE_REPLICA_COUNT)
+            .cloned()
+            .collect::<Vec<_>>();
+        let replicas: [StorageNodeId; ACTIVE_RANGE_REPLICA_COUNT] = replicas.try_into().map_err(
+            |replicas: Vec<StorageNodeId>| {
+                ControlError::InvalidOperation(format!(
+                    "Feed creation requires at least three eligible storage Nodes; only {} are configured",
+                    replicas.len()
+                ))
+            },
+        )?;
+        Ok(FixedActiveRangePlacement {
+            owner: replicas[0].clone(),
+            replicas,
         })
     }
 
@@ -330,13 +409,12 @@ impl ControlController {
                 revision = self.revision().await;
                 continue;
             }
-            let response = self
-                .apply_replicated(ReplicatedCommand {
-                    request_id: derive_command_request_id(request_id, index),
-                    issued_at_ns,
-                    command,
-                })
-                .await;
+            let replicated = self.prepare_replicated(
+                derive_command_request_id(request_id, index),
+                issued_at_ns,
+                command,
+            )?;
+            let response = self.apply_replicated(replicated).await;
             revision = response.revision;
             match (response.result, response.error) {
                 (Some(result), None) => results.push(result),
@@ -360,12 +438,15 @@ impl ControlController {
     pub async fn execute_query(&self, command: Command) -> Result<StatementResult, ControlError> {
         if !command.is_read_only() {
             return Err(ControlError::InvalidOperation(
-                "execute_query accepts only SHOW, DESCRIBE, and EXPLAIN ACCESS".to_owned(),
+                "execute_query accepts only SHOW, DESCRIBE, EXPLAIN ACCESS, and INSPECT PLACEMENT"
+                    .to_owned(),
             ));
         }
         let statement = command_label(&command);
         let mut state = self.state.lock().await;
-        let (message, data) = self.apply(&mut state, command, Uuid::nil(), 0).await?;
+        let (message, data) = self
+            .apply(&mut state, command, Uuid::nil(), 0, None)
+            .await?;
         Ok(StatementResult {
             statement,
             message,
@@ -380,13 +461,20 @@ impl ControlController {
         }
         let previous_state = state.clone();
         let revision = state.revision.saturating_add(1);
-        let statement = command_label(&request.command);
+        let ReplicatedCommand {
+            request_id,
+            issued_at_ns,
+            command,
+            fixed_active_range,
+        } = request;
+        let statement = command_label(&command);
         let response = match self
             .apply(
                 &mut state,
-                request.command,
-                request.request_id,
-                request.issued_at_ns,
+                command,
+                request_id,
+                issued_at_ns,
+                fixed_active_range,
             )
             .await
         {
@@ -408,9 +496,7 @@ impl ControlController {
                 error: Some(error.to_string()),
             },
         };
-        state
-            .applied_requests
-            .insert(request.request_id, response.clone());
+        state.applied_requests.insert(request_id, response.clone());
         if let Err(error) = persist_state(&self.path, &state) {
             *state = previous_state;
             return ReplicatedCommandResult {
@@ -437,6 +523,20 @@ impl ControlController {
         self.state.lock().await.revision
     }
 
+    pub async fn active_feed_by_name(&self, name: &str) -> Option<FeedDefinition> {
+        self.state
+            .lock()
+            .await
+            .feeds
+            .values()
+            .find(|feed| feed.name == name && feed.status == ResourceStatus::Active)
+            .cloned()
+    }
+
+    pub async fn active_range_assignment(&self, feed_id: Uuid) -> Option<ActiveRangeAssignment> {
+        self.state.lock().await.active_ranges.get(&feed_id).cloned()
+    }
+
     pub async fn applied_result(&self, request_id: Uuid) -> Option<ReplicatedCommandResult> {
         self.state
             .lock()
@@ -452,6 +552,7 @@ impl ControlController {
         command: Command,
         request_id: Uuid,
         issued_at_ns: i64,
+        fixed_active_range: Option<FixedActiveRangePlacement>,
     ) -> Result<(String, Value), ControlError> {
         match command {
             Command::CreateSpace { name } => {
@@ -477,8 +578,22 @@ impl ControlController {
                 )?;
                 let space_id = owning_space(state, &name)?.space_id;
                 let feed_id = derived_resource_id(request_id, "feed");
+                let placement = fixed_active_range.ok_or_else(|| {
+                    ControlError::InvalidOperation(
+                        "Feed creation has no consensus-prepared Active Range placement".to_owned(),
+                    )
+                })?;
+                let assignment = ActiveRangeAssignment::try_new(
+                    feed_id,
+                    RangeId::from_uuid(derived_resource_id(request_id, "active-range")),
+                    RangeGeneration::new(1),
+                    placement.owner,
+                    ReplicaSet::try_new(placement.replicas)
+                        .map_err(|error| ControlError::InvalidOperation(error.to_string()))?,
+                    OwnershipEpoch::new(1),
+                )
+                .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
                 let storage_name = format!("/feeds/{}", feed_id.simple());
-                self.store.create_stream(&storage_name).await?;
                 let definition = FeedDefinition {
                     feed_id,
                     name: name.clone(),
@@ -488,6 +603,7 @@ impl ControlController {
                     created_at_ns: issued_at_ns,
                 };
                 state.feeds.insert(feed_id, definition.clone());
+                state.active_ranges.insert(feed_id, assignment);
                 Ok((format!("created Feed {name}"), json!(definition)))
             }
             Command::CreateWriter { name, feed } => {
@@ -633,6 +749,67 @@ impl ControlController {
                 Ok((
                     format!("moved Reader {reader} position"),
                     json!(definition.clone()),
+                ))
+            }
+            Command::InspectPlacement { feed } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                let assignment = state.active_ranges.get(&feed_id).ok_or_else(|| {
+                    ControlError::NotFound(format!("Active Range placement for Feed {feed}"))
+                })?;
+                Ok((
+                    format!("inspected placement for Feed {feed}"),
+                    json!(assignment),
+                ))
+            }
+            Command::TransferActiveRangeOwnership { feed, owner } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                let assignment = state.active_ranges.get_mut(&feed_id).ok_or_else(|| {
+                    ControlError::NotFound(format!("Active Range placement for Feed {feed}"))
+                })?;
+                if assignment.owner == owner {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "Node {owner} already owns the Active Range for Feed {feed}"
+                    )));
+                }
+                let next_epoch = assignment
+                    .ownership_epoch
+                    .checked_next()
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                assignment
+                    .transfer_ownership(owner, next_epoch)
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                Ok((
+                    format!("transferred Active Range ownership for Feed {feed}"),
+                    json!(assignment.clone()),
+                ))
+            }
+            Command::RecoverActiveRangeOwnership {
+                feed,
+                expected_owner,
+                expected_epoch,
+                new_owner,
+            } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                let assignment = state.active_ranges.get_mut(&feed_id).ok_or_else(|| {
+                    ControlError::NotFound(format!("Active Range placement for Feed {feed}"))
+                })?;
+                if assignment.owner != expected_owner
+                    || assignment.ownership_epoch != expected_epoch
+                {
+                    return Err(ControlError::InvalidOperation(
+                        "Active Range ownership changed while recovery was being planned"
+                            .to_owned(),
+                    ));
+                }
+                let next_epoch = expected_epoch
+                    .checked_next()
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                assignment
+                    .transfer_ownership(new_owner, next_epoch)
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                Ok((
+                    format!("recovered Active Range ownership for Feed {feed}"),
+                    json!(assignment.clone()),
                 ))
             }
         }
@@ -887,6 +1064,28 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
         }),
         Some("GRANT") => parse_grant(&tokens),
         Some("EXPLAIN") => parse_explain(&tokens),
+        Some("INSPECT") => {
+            expect_keyword(&tokens, 1, "PLACEMENT")?;
+            expect_keyword(&tokens, 2, "FOR")?;
+            expect_keyword(&tokens, 3, "FEED")?;
+            Ok(Command::InspectPlacement {
+                feed: token(&tokens, 4)?.to_owned(),
+            })
+        }
+        Some("TRANSFER") => {
+            expect_keyword(&tokens, 1, "ACTIVE")?;
+            expect_keyword(&tokens, 2, "RANGE")?;
+            expect_keyword(&tokens, 3, "OWNERSHIP")?;
+            expect_keyword(&tokens, 4, "FOR")?;
+            expect_keyword(&tokens, 5, "FEED")?;
+            expect_keyword(&tokens, 7, "TO")?;
+            let owner = StorageNodeId::try_new(token(&tokens, 8)?.to_owned())
+                .map_err(|error| ControlError::Syntax(error.to_string()))?;
+            Ok(Command::TransferActiveRangeOwnership {
+                feed: token(&tokens, 6)?.to_owned(),
+                owner,
+            })
+        }
         Some("SEEK") => {
             expect_keyword(&tokens, 1, "READER")?;
             expect_keyword(&tokens, 3, "TO")?;
@@ -1315,6 +1514,9 @@ fn command_label(command: &Command) -> String {
         Command::Grant { .. } => "GRANT",
         Command::ExplainAccess { .. } => "EXPLAIN ACCESS",
         Command::SeekReader { .. } => "SEEK READER",
+        Command::InspectPlacement { .. } => "INSPECT PLACEMENT",
+        Command::TransferActiveRangeOwnership { .. } => "TRANSFER ACTIVE RANGE OWNERSHIP",
+        Command::RecoverActiveRangeOwnership { .. } => "RECOVER ACTIVE RANGE OWNERSHIP",
     }
     .to_owned()
 }
@@ -1350,7 +1552,15 @@ mod tests {
     fn new_controller(directory: &TempDir) -> ControlController {
         let store: Arc<dyn LogStore> =
             Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
-        ControlController::open(directory.path().join("catalog.json"), store).unwrap()
+        ControlController::open_with_storage_nodes(
+            directory.path().join("catalog.json"),
+            store,
+            ["storage-1", "storage-2", "storage-3"]
+                .into_iter()
+                .map(|node| StorageNodeId::try_new(node).unwrap())
+                .collect(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -1358,14 +1568,24 @@ mod tests {
         let commands = parse_wcl(
             "CREATE SPACE orders; CREATE FEED orders.created; CREATE WRITER checkout TO orders.created; \
              CREATE READER audit FROM orders.created START AT CURSOR 'abc;123'; CREATE ROLE analytics; \
-             GRANT READ, WRITE ON NAMESPACE orders.* TO ROLE analytics;",
+             GRANT READ, WRITE ON NAMESPACE orders.* TO ROLE analytics; \
+             INSPECT PLACEMENT FOR FEED orders.created; \
+             TRANSFER ACTIVE RANGE OWNERSHIP FOR FEED orders.created TO storage-2;",
         )
         .unwrap();
-        assert_eq!(commands.len(), 6);
+        assert_eq!(commands.len(), 8);
         assert!(
             matches!(&commands[3], Command::CreateReader { start: ReaderStart::Cursor(cursor), .. } if cursor == "abc;123")
         );
         assert!(matches!(&commands[5], Command::Grant { actions, .. } if actions.len() == 2));
+        assert!(
+            matches!(&commands[6], Command::InspectPlacement { feed } if feed == "orders.created")
+        );
+        assert!(matches!(
+            &commands[7],
+            Command::TransferActiveRangeOwnership { feed, owner }
+                if feed == "orders.created" && owner.as_str() == "storage-2"
+        ));
     }
 
     #[tokio::test]
@@ -1431,6 +1651,7 @@ mod tests {
             command: Command::CreateSpace {
                 name: "orders".to_owned(),
             },
+            fixed_active_range: None,
         };
         let left_result = left.apply_replicated(request.clone()).await;
         let right_result = right.apply_replicated(request.clone()).await;

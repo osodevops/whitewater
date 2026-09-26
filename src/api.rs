@@ -5,13 +5,18 @@ use std::{
 };
 
 use axum::{
-    extract::{Query, State},
-    http::{header::AUTHORIZATION, HeaderMap, StatusCode},
+    body::Body,
+    extract::{DefaultBodyLimit, Query, State},
+    http::{header::AUTHORIZATION, HeaderMap, Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
+    Engine,
+};
 use openraft::{
     error::{InstallSnapshotError, RaftError},
     raft::{
@@ -25,8 +30,14 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::{
+    active_range::{
+        AppendIdentity, MajorityAppendCoordinator, MajorityAppendError, ReplicaAppendRequest,
+        ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitRequest, ReplicaCommitResponse,
+        StorageNodeId, MAX_REPLICA_FRAME_BASE64_BYTES,
+    },
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
+    codec::{decode_record, encode_record},
     control::{ControlController, ControlError, ReplicatedCommand},
     control_plane::{
         ControlNodeId, ControlPlane, ControlPlaneError, ControlTypeConfig, FullSnapshotRequest,
@@ -46,15 +57,39 @@ pub struct AppState {
     pub autoscaler: Arc<Mutex<AutoscaleController>>,
     pub control: Arc<ControlController>,
     pub control_plane: Option<Arc<ControlPlane>>,
+    pub replica_append: Option<Arc<ReplicaAppendService>>,
+    pub majority_append: Option<Arc<MajorityAppendCoordinator>>,
+    pub storage_node_id: Option<StorageNodeId>,
+    pub control_endpoints: Arc<BTreeMap<StorageNodeId, String>>,
+    pub internal_key: Option<String>,
+    pub internal_http: reqwest::Client,
     pub admin_auth: AdminAuthenticator,
 }
 
 pub fn router(state: AppState) -> Router {
+    let replica_append_route = post(replica_append)
+        .layer(DefaultBodyLimit::max(
+            MAX_REPLICA_FRAME_BASE64_BYTES + 1024 * 1024,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
+    let replica_commit_route = post(replica_commit).layer(middleware::from_fn_with_state(
+        state.clone(),
+        authorize_replica_append,
+    ));
+    let owner_append_route = post(owner_append).layer(middleware::from_fn_with_state(
+        state.clone(),
+        authorize_replica_append,
+    ));
     Router::new()
         .route("/health", get(health))
         .route("/v1/streams", get(list_streams).post(create_stream))
         .route("/v1/streams/describe", get(describe_stream))
         .route("/v1/records", get(read_records).post(append_record))
+        .route("/v1/feeds/append", post(client_append))
+        .route("/v1/feeds/records", get(read_feed_records))
         .route("/v1/admin/wcl", post(execute_admin_wcl))
         .route("/v1/admin/commands", post(execute_admin_commands))
         .route("/v1/admin/control-plane", get(control_plane_status))
@@ -80,6 +115,15 @@ pub fn router(state: AppState) -> Router {
             "/internal/control-plane/commands",
             post(control_plane_commands),
         )
+        .route(
+            "/internal/active-range/replica/append",
+            replica_append_route,
+        )
+        .route(
+            "/internal/active-range/replica/commit",
+            replica_commit_route,
+        )
+        .route("/internal/active-range/owner/append", owner_append_route)
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
         .route(
@@ -193,6 +237,15 @@ fn authorize_internal<'a>(
     Ok(control_plane)
 }
 
+async fn authorize_replica_append(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, ApiError> {
+    authorize_internal(&state, request.headers())?;
+    Ok(next.run(request).await)
+}
+
 async fn control_plane_append(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -297,6 +350,317 @@ async fn control_plane_write(
         },
     };
     Ok(Json(response))
+}
+
+async fn replica_append(
+    State(state): State<AppState>,
+    Json(request): Json<ReplicaAppendRequest>,
+) -> Result<Json<ReplicaAppendResponse>, ApiError> {
+    let service = state.replica_append.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "Active Range replica storage is not configured on this Node".to_owned(),
+    })?;
+    Ok(Json(match service.append(request).await {
+        Ok(result) => ReplicaAppendResponse {
+            result: Some(result),
+            error: None,
+        },
+        Err(error) => ReplicaAppendResponse {
+            result: None,
+            error: Some(error),
+        },
+    }))
+}
+
+async fn replica_commit(
+    State(state): State<AppState>,
+    Json(request): Json<ReplicaCommitRequest>,
+) -> Result<Json<ReplicaCommitResponse>, ApiError> {
+    let service = state.replica_append.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "Active Range replica storage is not configured on this Node".to_owned(),
+    })?;
+    Ok(Json(match service.commit(request).await {
+        Ok(result) => ReplicaCommitResponse {
+            result: Some(result),
+            error: None,
+        },
+        Err(error) => ReplicaCommitResponse {
+            result: None,
+            error: Some(error),
+        },
+    }))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClientAppendRequest {
+    request_id: Uuid,
+    feed: String,
+    writer_session_id: Uuid,
+    writer_epoch: u64,
+    sequence: u64,
+    event_time_ns: Option<String>,
+    key_base64: String,
+    payload_base64: String,
+    #[serde(default)]
+    metadata_base64: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClientAppendResponse {
+    message_id: Uuid,
+    cursor: String,
+    deduplicated: bool,
+    durability: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InternalOwnerAppendResponse {
+    result: Option<ClientAppendResponse>,
+    error: Option<String>,
+    retryable: bool,
+}
+
+async fn client_append(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ClientAppendRequest>,
+) -> Result<Json<ClientAppendResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let feed = state
+        .control
+        .active_feed_by_name(&request.feed)
+        .await
+        .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", request.feed)))?;
+    let assignment = state
+        .control
+        .active_range_assignment(feed.feed_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Active Range assignment is unavailable"))?;
+    let local = state.storage_node_id.as_ref().ok_or_else(|| {
+        ApiError::unavailable("this Node is not configured for Active Range routing")
+    })?;
+    if &assignment.owner == local {
+        return owner_append_local(&state, request).await.map(Json);
+    }
+    let endpoint = state
+        .control_endpoints
+        .get(&assignment.owner)
+        .ok_or_else(|| {
+            ApiError::unavailable(format!(
+                "current Append Owner {} has no endpoint",
+                assignment.owner
+            ))
+        })?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("internal forwarding credential is unavailable"))?;
+    let response = state
+        .internal_http
+        .post(format!(
+            "{}/internal/active-range/owner/append",
+            endpoint.trim_end_matches('/')
+        ))
+        .header("x-whitewater-control-key", key)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::unavailable(format!(
+            "Append Owner returned HTTP {}",
+            response.status()
+        )));
+    }
+    let response: InternalOwnerAppendResponse = response
+        .json()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    response.result.map(Json).ok_or_else(|| ApiError {
+        status: if response.retryable {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::CONFLICT
+        },
+        message: response
+            .error
+            .unwrap_or_else(|| "Append Owner returned no result".to_owned()),
+    })
+}
+
+async fn owner_append(
+    State(state): State<AppState>,
+    Json(request): Json<ClientAppendRequest>,
+) -> Json<InternalOwnerAppendResponse> {
+    Json(match owner_append_local(&state, request).await {
+        Ok(result) => InternalOwnerAppendResponse {
+            result: Some(result),
+            error: None,
+            retryable: false,
+        },
+        Err(error) => InternalOwnerAppendResponse {
+            result: None,
+            retryable: error.status == StatusCode::SERVICE_UNAVAILABLE,
+            error: Some(error.message),
+        },
+    })
+}
+
+async fn owner_append_local(
+    state: &AppState,
+    request: ClientAppendRequest,
+) -> Result<ClientAppendResponse, ApiError> {
+    let feed = state
+        .control
+        .active_feed_by_name(&request.feed)
+        .await
+        .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", request.feed)))?;
+    let assignment = state
+        .control
+        .active_range_assignment(feed.feed_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Active Range assignment is unavailable"))?;
+    if state.storage_node_id.as_ref() != Some(&assignment.owner) {
+        return Err(ApiError::unavailable(format!(
+            "Node is not current Append Owner {}; refresh assignment and retry",
+            assignment.owner
+        )));
+    }
+    let key = decode_base64("key_base64", &request.key_base64)?;
+    if key.is_empty() {
+        return Err(ApiError::bad_request(
+            "key_base64 must contain a non-empty key",
+        ));
+    }
+    let payload = decode_base64("payload_base64", &request.payload_base64)?;
+    let metadata = request
+        .metadata_base64
+        .into_iter()
+        .map(|(name, value)| decode_base64("metadata_base64", &value).map(|value| (name, value)))
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let ingest_time_ns = unix_ns();
+    let event_time_ns = request
+        .event_time_ns
+        .as_deref()
+        .map(str::parse::<i64>)
+        .transpose()
+        .map_err(|_| ApiError::bad_request("event_time_ns must be a signed 64-bit decimal string"))?
+        .unwrap_or(ingest_time_ns);
+    let message_id = deterministic_uuid(request.request_id, "message");
+    let cursor = URL_SAFE_NO_PAD.encode(blake3::hash(request.request_id.as_bytes()).as_bytes());
+    let frame = encode_record(&StoredRecord {
+        message_id,
+        producer_id: request.writer_session_id,
+        producer_sequence: request.sequence,
+        event_time_ns,
+        ingest_time_ns,
+        key,
+        payload,
+        metadata,
+    })
+    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let coordinator = state
+        .majority_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("majority append coordinator is unavailable"))?;
+    let result = coordinator
+        .append(ReplicaAppendRequest {
+            feed_id: feed.feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+            append_owner: assignment.owner,
+            expected_position: crate::active_range::RangePosition::new(0),
+            identity: AppendIdentity {
+                writer_session_id: request.writer_session_id,
+                writer_epoch: request.writer_epoch,
+                sequence: request.sequence,
+            },
+            cursor,
+            frame_base64: STANDARD.encode(frame),
+        })
+        .await
+        .map_err(majority_api_error)?;
+    Ok(ClientAppendResponse {
+        message_id: result.message_id,
+        cursor: result.cursor,
+        deduplicated: result.deduplicated,
+        durability: "majority_committed".to_owned(),
+    })
+}
+
+fn deterministic_uuid(request_id: Uuid, label: &str) -> Uuid {
+    let mut bytes: [u8; 16] = blake3::hash(&[request_id.as_bytes(), label.as_bytes()].concat())
+        .as_bytes()[..16]
+        .try_into()
+        .unwrap_or([0; 16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
+fn majority_api_error(error: MajorityAppendError) -> ApiError {
+    ApiError {
+        status: if error.retryable {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::CONFLICT
+        },
+        message: error.to_string(),
+    }
+}
+
+#[derive(Deserialize)]
+struct FeedReadQuery {
+    feed: String,
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn read_feed_records(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FeedReadQuery>,
+) -> Result<Json<Vec<RecordResponse>>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let feed = state
+        .control
+        .active_feed_by_name(&query.feed)
+        .await
+        .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", query.feed)))?;
+    let service = state.replica_append.as_ref().ok_or_else(|| {
+        ApiError::unavailable("Active Range replica storage is not configured on this Node")
+    })?;
+    let frames = service
+        .read_committed(
+            feed.feed_id,
+            query.after.as_deref(),
+            query.limit.unwrap_or(100),
+        )
+        .await
+        .map_err(|error| ApiError {
+            status: if error.retryable {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            },
+            message: error.message,
+        })?;
+    frames
+        .into_iter()
+        .map(|item| {
+            decode_record(&item.frame)
+                .map(|record| {
+                    record_response(CursorRecord {
+                        cursor: item.cursor,
+                        record,
+                    })
+                })
+                .map_err(|error| ApiError::unavailable(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Json)
 }
 
 #[derive(Deserialize)]
@@ -602,6 +966,13 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+        }
+    }
 }
 
 impl From<StorageError> for ApiError {
@@ -680,9 +1051,10 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{collections::BTreeMap, time::Duration};
 
     use axum::{body::Body, http::Request};
+    use openraft::BasicNode;
     use serde_json::Value;
     use tempfile::TempDir;
     use tower::ServiceExt;
@@ -767,7 +1139,15 @@ mod tests {
         let store: Arc<dyn LogStore> =
             Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
         let control = Arc::new(
-            ControlController::open(directory.path().join("catalog.json"), store.clone()).unwrap(),
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store.clone(),
+                ["storage-1", "storage-2", "storage-3"]
+                    .into_iter()
+                    .map(|node| crate::active_range::StorageNodeId::try_new(node).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
         );
         let membership = Arc::new(MembershipService::new(
             MemberAnnouncement {
@@ -786,11 +1166,86 @@ mod tests {
             autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
             control,
             control_plane: None,
+            replica_append: None,
+            majority_append: None,
+            storage_node_id: None,
+            control_endpoints: Arc::new(BTreeMap::new()),
+            internal_key: None,
+            internal_http: reqwest::Client::new(),
             admin_auth: AdminAuthenticator::new(Some(
                 "this-is-a-long-development-api-key".to_owned(),
             ))
             .unwrap(),
         })
+    }
+
+    async fn internal_replica_test_router(directory: &TempDir) -> (Router, Arc<ControlPlane>) {
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store.clone(),
+                ["control-1", "control-2", "control-3"]
+                    .into_iter()
+                    .map(|node| crate::active_range::StorageNodeId::try_new(node).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let peers = [1_u64, 2, 3]
+            .into_iter()
+            .map(|node| (node, BasicNode::new(format!("127.0.0.1:{}", 9000 + node))))
+            .collect::<BTreeMap<_, _>>();
+        let control_plane = Arc::new(
+            ControlPlane::start(
+                1,
+                peers,
+                "this-is-a-long-control-plane-key".to_owned(),
+                directory.path().join("raft.json"),
+                control.clone(),
+            )
+            .await
+            .unwrap(),
+        );
+        let membership = Arc::new(MembershipService::new(
+            MemberAnnouncement {
+                node_id: "test-node".to_owned(),
+                api_url: "http://test-node:7070".to_owned(),
+                capacity: 100,
+            },
+            vec![],
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        ));
+        let replica_append = Arc::new(ReplicaAppendService::new(
+            directory.path().join("active-ranges"),
+            crate::active_range::StorageNodeId::try_new("control-1").unwrap(),
+            control.clone(),
+        ));
+        (
+            router(AppState {
+                store,
+                membership,
+                demand: DemandMetrics::default(),
+                autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                control,
+                control_plane: Some(control_plane.clone()),
+                replica_append: Some(replica_append),
+                majority_append: None,
+                storage_node_id: Some(
+                    crate::active_range::StorageNodeId::try_new("control-1").unwrap(),
+                ),
+                control_endpoints: Arc::new(BTreeMap::new()),
+                internal_key: Some("this-is-a-long-control-plane-key".to_owned()),
+                internal_http: reqwest::Client::new(),
+                admin_auth: AdminAuthenticator::new(Some(
+                    "this-is-a-long-development-api-key".to_owned(),
+                ))
+                .unwrap(),
+            }),
+            control_plane,
+        )
     }
 
     fn admin_request(path: &str, body: Value, api_key: Option<&str>) -> Request<Body> {
@@ -804,6 +1259,38 @@ mod tests {
         request
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn replica_append_authentication_runs_before_json_body_decoding() {
+        let directory = TempDir::new().unwrap();
+        let (app, control_plane) = internal_replica_test_router(&directory).await;
+        let request = |credential: Option<&str>| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/internal/active-range/replica/append")
+                .header("content-type", "application/json");
+            if let Some(credential) = credential {
+                request = request.header("x-whitewater-control-key", credential);
+            }
+            request.body(Body::from("not-json")).unwrap()
+        };
+
+        let missing = app.clone().oneshot(request(None)).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        let wrong = app
+            .clone()
+            .oneshot(request(Some("wrong-key")))
+            .await
+            .unwrap();
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        let authenticated = app
+            .oneshot(request(Some("this-is-a-long-control-plane-key")))
+            .await
+            .unwrap();
+        assert_ne!(authenticated.status(), StatusCode::UNAUTHORIZED);
+        assert!(authenticated.status().is_client_error());
+        control_plane.raft().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -841,6 +1328,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(valid.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn placement_inspection_requires_admin_authentication() {
+        let directory = TempDir::new().unwrap();
+        let app = admin_test_router(&directory);
+        let create = serde_json::to_value(CommandBatchRequest {
+            request_id: Some(Uuid::new_v4()),
+            commands: vec![
+                Command::CreateSpace {
+                    name: "orders".to_owned(),
+                },
+                Command::CreateFeed {
+                    name: "orders.created".to_owned(),
+                },
+            ],
+        })
+        .unwrap();
+        let created = app
+            .clone()
+            .oneshot(admin_request(
+                "/v1/admin/commands",
+                create,
+                Some("this-is-a-long-development-api-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let inspect = serde_json::to_value(CommandBatchRequest {
+            request_id: Some(Uuid::new_v4()),
+            commands: vec![Command::InspectPlacement {
+                feed: "orders.created".to_owned(),
+            }],
+        })
+        .unwrap();
+        let unauthorized = app
+            .clone()
+            .oneshot(admin_request("/v1/admin/commands", inspect.clone(), None))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let authorized = app
+            .oneshot(admin_request(
+                "/v1/admin/commands",
+                inspect,
+                Some("this-is-a-long-development-api-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
     }
 
     #[tokio::test]

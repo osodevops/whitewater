@@ -137,6 +137,21 @@ Whitewater should preserve these correctness responsibilities while changing the
 - Capacity-aware allocation
 - Subscription progress independent of Reader liveness
 
+## Replication and high-watermark lessons
+
+Kafka's leader acknowledgement and high-watermark code reinforces several fundamental rules worth retaining without exposing partitions:
+
+- A local append is not committed merely because the leader wrote it.
+- Replica progress must be compared against the exact position required by the append.
+- The committed/high-watermark position is monotonic and cannot advance beyond locally available data.
+- Committed reads stop at the high watermark rather than the physical log end.
+- Truncation must never cross below committed history.
+- Acknowledgement conditions and replica eligibility are evaluated against one stable assignment/epoch view.
+
+Whitewater applies these lessons to an internal Active Range instead of a public partition. It strengthens the initial contract by requiring both the exact frame and CommitPosition evidence to be durable on two of three current replicas before Writer success. A matching BLAKE3 digest prevents a replica at the same numeric position from being mistaken for an identical copy.
+
+Relevant read-only references include `core/src/main/scala/kafka/cluster/Partition.scala` high-watermark advancement and `raft/src/testFixtures/java/org/apache/kafka/raft/MockLog.java` monotonic high-watermark and committed-read boundaries.
+
 ## Practices for future source research
 
 When Whitewater implements a subsystem already present in Kafka:

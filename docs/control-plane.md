@@ -11,7 +11,8 @@ The Control Plane owns logical metadata and administrative ordering:
 - Writers and Readers
 - Reader Cursors
 - Roles and namespace grants
-- Future Subscriptions, Indexes, Pipes, schemas, policies, credentials, and placement epochs
+- Fixed RF3 Active Range assignments and ownership epochs
+- Future Subscriptions, Indexes, Pipes, schemas, policies, and credentials
 
 It does not replicate Feed records yet. Active-range data replication remains a separate phase.
 
@@ -74,7 +75,9 @@ issued_at_ns
 command
 ```
 
-Resource IDs are derived deterministically from request identity and resource type. Every replica therefore creates the same FeedId, WriterId, ReaderId, RoleId, and GrantId.
+Resource IDs are derived deterministically from request identity and resource type. Every replica therefore creates the same FeedId, RangeId, WriterId, ReaderId, RoleId, and GrantId.
+
+For Feed creation, the leader selects one owner and three distinct eligible storage Nodes before submission and embeds that fixed placement in the replicated command. Followers apply the embedded assignment even if their local discovery view differs. The replicated state machine never performs Node-local data-plane provisioning.
 
 Applied request results are persisted by request ID. Replaying one committed command after a crash returns its original result without applying it twice.
 
@@ -174,7 +177,9 @@ FINNSTREAM_CONTROL_PLANE_KEY
 
 Keys shorter than 24 characters are rejected. The development fallback is not a production secret.
 
-Production work still requires TLS/mTLS for internal transport, credential rotation, and failure-domain identity. An internal shared key alone is not the final security model.
+Production work still requires authenticated encryption for internal transport, credential rotation, and failure-domain identity. An internal shared key alone is not the final security model.
+
+The deployment may provide inter-Node encryption through Whitewater-native mTLS, a trusted service mesh/sidecar, or an orchestrator/private-network transport with equivalent authenticated-encryption, identity, rotation, audit, and downgrade-prevention guarantees. Native mTLS is the default and recommended mechanism. The mechanism is configurable, but plaintext production traffic is not: Whitewater must fail closed if the selected transport cannot prove both encryption and peer identity.
 
 ## Static membership limitation
 
@@ -195,6 +200,8 @@ FINNSTREAM_CONTROL_NODES=1@node1:7070,2@node2:7070,3@node3:7070
 
 Dynamic learner addition and joint-consensus membership changes are future work. Arbitrary data capacity Nodes do not automatically become Control Plane voters.
 
+For M1.4 fixed placement, the standard three configured Control Plane Nodes are also treated as storage-capable Nodes with stable internal IDs `control-1`, `control-2`, and `control-3`. Capability-aware placement across additional storage Nodes is Milestone 5 work; M1.4 deliberately proves consensus ownership before dynamic scheduling.
+
 ## Verified scenarios
 
 The three-Node Docker Fabric has demonstrated:
@@ -205,6 +212,9 @@ The three-Node Docker Fabric has demonstrated:
 - Internal forwarding to the leader
 - Majority commit
 - Identical FeedId/catalog state on every Node
+- Identical fixed RF3 Active Range assignment on every Node
+- Authenticated placement inspection through every voter
+- Placement recovery after complete Fabric restart
 - Leader stop and new leader election
 - Successful mutation after leader failure
 - Restart and catch-up of the former leader

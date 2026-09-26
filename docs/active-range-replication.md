@@ -7,6 +7,7 @@
 - **Scope:** One Feed, one Active Range, three replicas, one Append Owner
 - **Durability:** Two-of-three majority
 - **Public visibility:** Active Range topology remains internal
+- **Visual companion:** [Whitewater sequence diagrams](sequence-diagrams.md)
 
 This document defines the correctness contract that Milestone 1 must implement. Performance optimizations may change message batching, pipelining, or transport, but must not weaken these guarantees.
 
@@ -212,6 +213,73 @@ A replica accepts a frame only when:
 - Existing bytes at that position, if present, are identical.
 
 A position gap, stale epoch, wrong generation, invalid checksum, or content conflict is rejected.
+
+## Internal replica append protocol
+
+The current authenticated internal endpoint is:
+
+```http
+POST /internal/active-range/replica/append
+x-whitewater-control-key: <internal-credential>
+Content-Type: application/json
+```
+
+Authentication executes before JSON body decoding. The endpoint applies a bounded body limit derived from the maximum encoded record frame.
+
+The request carries:
+
+```text
+FeedId
+RangeId
+RangeGeneration
+OwnershipEpoch
+Append Owner StorageNodeId
+expected RangePosition
+Writer session identity, epoch, and sequence
+opaque Cursor
+base64 of the already encoded checksummed record frame
+```
+
+The receiver resolves the committed assignment from its applied Control Plane catalog. It never trusts topology supplied only by the sender. It verifies that the sender is the current owner and that the local Node is one of the three current replicas.
+
+The receiver decodes and validates the frame but never reconstructs or re-encodes it. `ActiveRangeStore` synchronizes the exact supplied bytes and returns their BLAKE3 digest. An identical retry at an existing position returns the original durable result; different bytes or identity at that position are rejected.
+
+Protocol errors include a stable code, actionable message, and retryability flag. Missing local assignment may be retryable while the receiver catches up; wrong range, stale owner, invalid checksum, position gap, and content conflict require caller correction or recovery action.
+
+The prototype endpoint uses the existing internal shared credential over HTTP. Production encryption in transit remains mandatory Milestone 9 work; the shared credential is authentication, not transport encryption.
+
+Operators may choose how inter-Node encryption is supplied:
+
+- Whitewater-native TLS with mutual Node authentication, the default and recommended deployment.
+- A service mesh or sidecar that provides mutually authenticated TLS while Whitewater verifies the authenticated peer identity delivered by that trusted boundary.
+- An orchestrator or private-network transport with equivalent authenticated encryption, when its identity, rotation, audit, and downgrade-prevention guarantees are explicitly integrated and verified.
+
+The mechanism is selectable; the production guarantee is not. Plain HTTP is development-only, encryption must cover Control Plane and replica traffic end to end between trusted Node identities, and Whitewater must fail closed when the configured secure transport or peer identity cannot be verified. Payload or at-rest encryption is separate and does not replace transport encryption.
+
+## Majority commit coordinator
+
+The Append Owner performs one append as a two-stage majority operation:
+
+1. Validate the committed assignment and ownership epoch.
+2. Append and synchronize the exact frame locally.
+3. Send the same expected position and encoded frame to both followers concurrently.
+4. Require one follower to acknowledge the same position and BLAKE3 digest, producing two durable frame copies.
+5. Send the commit position and expected frame digest to every follower that durably stored the frame.
+6. Require one follower to persist matching commit evidence.
+7. Persist CommitPosition locally as the second evidence record, then return success.
+
+A follower accepts commit evidence only when the exact digest is already durable at the target position. CommitPosition remains monotonic and cannot pass the flushed boundary.
+
+```text
+3 healthy replicas -> three durable copies and up to three commit records
+owner + follower A  -> two durable copies and two commit records -> success
+owner + follower B  -> two durable copies and two commit records -> success
+owner only          -> one durable copy -> no success
+```
+
+A frame majority without a commit-evidence majority returns a retryable ambiguous failure. The frame may exist on two or three replicas but remains invisible. Retrying the identical Writer identity and sequence reuses those durable frames and attempts commit again. A successful commit whose client response is lost is recovered the same way: retry returns the original MessageId, Cursor, and position.
+
+The initial coordinator contacts both followers concurrently and waits for both bounded transport outcomes before completing. Optimizing the non-required follower into supervised background propagation is deferred until correctness and fault tests are complete.
 
 ## Owner failure recovery
 

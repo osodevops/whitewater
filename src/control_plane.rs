@@ -696,12 +696,12 @@ impl ControlPlane {
             let response = match self.controller.applied_result(command_request_id).await {
                 Some(response) => response,
                 None => {
-                    self.submit(ReplicatedCommand {
-                        request_id: command_request_id,
+                    let replicated = self.controller.prepare_replicated(
+                        command_request_id,
                         issued_at_ns,
                         command,
-                    })
-                    .await?
+                    )?;
+                    self.submit(replicated).await?
                 }
             };
             revision = response.revision;

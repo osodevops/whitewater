@@ -5,8 +5,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::control::{
-    Command, ControlExecution, PermissionAction, ReaderStart, ResourceKind, ShowKind,
+use crate::{
+    active_range::StorageNodeId,
+    control::{Command, ControlExecution, PermissionAction, ReaderStart, ResourceKind, ShowKind},
 };
 
 pub const ADMIN_API_KEY_ENV: &str = "FINNSTREAM_ADMIN_API_KEY";
@@ -241,6 +242,26 @@ impl AdminClient {
         self.execute_one(Command::Describe {
             kind,
             name: name.into(),
+        })
+        .await
+    }
+
+    pub async fn inspect_placement(
+        &self,
+        feed: impl Into<String>,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::InspectPlacement { feed: feed.into() })
+            .await
+    }
+
+    pub async fn transfer_active_range_ownership(
+        &self,
+        feed: impl Into<String>,
+        owner: StorageNodeId,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::TransferActiveRangeOwnership {
+            feed: feed.into(),
+            owner,
         })
         .await
     }

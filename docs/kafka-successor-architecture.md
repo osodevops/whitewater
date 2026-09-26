@@ -1,5 +1,7 @@
 # Whitewater Architecture
 
+Visual companion: [Whitewater sequence diagrams](sequence-diagrams.md).
+
 > A clean-sheet design for a distributed event fabric that keeps Kafka's durable ordered-history model while removing the architectural coupling that makes Kafka difficult to scale, operate, and evolve.
 
 ## Document status

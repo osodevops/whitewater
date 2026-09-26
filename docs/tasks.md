@@ -53,6 +53,7 @@ Dynamic range splitting, elastic placement, Writer UX, Reader sessions, Indexes,
 
 Evidence:
 
+- [Kafka pain points and delivery traceability](kafka-pain-points.md)
 - [Why Whitewater](why-whitewater.md)
 - [Architecture](kafka-successor-architecture.md)
 - [Operational experience](operational-experience.md)
@@ -183,18 +184,19 @@ Evidence:
 
 ## M1.3 — ActiveRangeStore
 
-- [ ] Define the `ActiveRangeStore` trait.
-- [ ] Store ownership epoch and range generation.
-- [ ] Store last appended position.
-- [ ] Store last flushed position.
-- [ ] Store last committed position.
-- [ ] Store Writer sequence/deduplication state.
-- [ ] Rotate checksummed immutable segments.
-- [ ] Recover the active segment after torn-tail writes.
-- [ ] Truncate uncommitted records safely.
-- [ ] Persist range state atomically.
+- [x] Write failing torn-tail and uncommitted-tail truncation tests.
+- [x] Define the `ActiveRangeStore` trait.
+- [x] Store ownership epoch and range generation.
+- [x] Store last appended position.
+- [x] Store last flushed position.
+- [x] Store last committed position.
+- [x] Store Writer sequence/deduplication state.
+- [x] Rotate checksummed immutable segments.
+- [x] Recover the active segment after torn-tail writes.
+- [x] Truncate uncommitted records safely.
+- [x] Persist range state atomically.
 
-Planned layout:
+On-disk layout:
 
 ```text
 FeedId/
@@ -205,102 +207,138 @@ FeedId/
       range-state.json
 ```
 
-Evidence required:
+Evidence:
 
-- Restart test.
-- Torn-write test.
-- Corruption-detection test.
-- Uncommitted-tail truncation test.
+- `src/active_range/store.rs`
+- `tests/active_range_store.rs`
+- Nine integration tests cover restart recovery, persisted deduplication, Writer sequence conflicts/gaps/stale retries, torn active tails, complete-entry corruption, uncommitted-tail truncation, committed segment rotation, generation/epoch fencing, durable epoch change, and commit-position boundaries.
+- Full Rust verification passes with formatting, Clippy warnings denied, 40 library tests, 2 CLI tests, 9 Active Range store integration tests, and the existing storage restart test.
 
 ## M1.4 — Fixed placement in the Control Plane
 
-- [ ] Create one Active Range when the test Feed is created.
-- [ ] Select one Append Owner and three distinct storage-capable replicas.
-- [ ] Persist assignment and ownership epoch through Raft.
-- [ ] Expose an authenticated placement inspection API.
-- [ ] Increment epoch whenever ownership changes.
-- [ ] Refuse assignment when three eligible storage Nodes are unavailable.
+- [x] Create one Active Range when the test Feed is created.
+- [x] Select one Append Owner and three distinct storage-capable replicas.
+- [x] Persist assignment and ownership epoch through Raft.
+- [x] Expose an authenticated placement inspection API.
+- [x] Increment epoch whenever ownership changes.
+- [x] Refuse assignment when three eligible storage Nodes are unavailable.
 
-Evidence required:
+Evidence:
 
-- All Control Plane voters return the same assignment and epoch.
-- Assignment survives complete Fabric restart.
+- `src/control.rs`
+- `src/control_plane.rs`
+- `tests/active_range_placement.rs`
+- Five integration tests prove identical deterministic RF3 placement across voters, leader-embedded placement despite different follower candidate views, insufficient-node refusal, durable monotonic ownership transfer, catalog restart recovery, and snapshot installation.
+- Authenticated API tests prove placement inspection rejects unauthenticated requests.
+- Placement is prepared once by the leader and embedded in the replicated command; followers never derive it from local gossip or Node-local state.
+- Full verification passes with formatting, Clippy warnings denied, 42 library tests, 2 CLI tests, 5 placement integration tests, 9 Active Range store integration tests, and the storage restart test.
+- The rebuilt three-Node Docker Fabric returned one identical assignment from all voters and retained it across complete Fabric restart.
 
 ## M1.5 — Internal replica append protocol
 
-- [ ] Define the replica append request and response.
-- [ ] Send the already encoded record frame; do not reconstruct records on replicas.
-- [ ] Validate FeedId, RangeId, generation, epoch, and expected position.
-- [ ] Validate frame checksum before durable acknowledgement.
-- [ ] Reject position gaps.
-- [ ] Reject different bytes at an existing position.
-- [ ] Reject stale ownership epochs.
-- [ ] Authenticate and eventually encrypt internal replication traffic.
+- [x] Define the replica append request and response.
+- [x] Send the already encoded record frame; do not reconstruct records on replicas.
+- [x] Validate FeedId, RangeId, generation, epoch, and expected position.
+- [x] Validate frame checksum before durable acknowledgement.
+- [x] Reject position gaps.
+- [x] Reject different bytes at an existing position.
+- [x] Reject stale ownership epochs.
+- [x] Authenticate internal replication traffic before decoding the bounded request body.
+- [ ] Replace the shared internal credential and HTTP transport in Milestone 9 with authenticated inter-Node encryption and Node identity; native mTLS is the default, while a verified service-mesh or equivalent orchestrator transport is an optional mechanism.
 
-Evidence required:
+Evidence:
 
-- Identical checksummed bytes on all replicas.
-- Gap, conflict, checksum, and stale-epoch tests.
+- `src/active_range/replication.rs`
+- `src/active_range/store.rs`
+- `src/api.rs`
+- `tests/replica_append_protocol.rs`
+- Six integration tests cover exact-frame durability on all three replicas, identical retry, position gaps, conflicting bytes, invalid frame checksums, wrong range/generation/epoch/owner, non-replica receivers, unknown assignments, invalid base64, and bounded frame size.
+- API tests prove authentication runs before JSON body decoding.
+- Every durable response returns the BLAKE3 digest of the exact encoded frame persisted by `ActiveRangeStore`.
+- Full verification passes with formatting, Clippy warnings denied, 43 library tests, 2 CLI tests, 5 placement integration tests, 9 Active Range store integration tests, 6 replica protocol integration tests, and the storage restart test.
+- The rebuilt three-Node Docker Fabric rejected missing credentials before JSON decoding and durably persisted one live encoded frame on all three assigned replicas with an identical digest.
 
 ## M1.6 — Majority commit
 
-- [ ] Append and flush locally.
-- [ ] Replicate concurrently to the two followers.
-- [ ] Wait for one durable follower acknowledgement.
-- [ ] Advance commit position after two durable copies exist.
-- [ ] Propagate commit position to followers.
-- [ ] Return success only after majority commit.
-- [ ] Return a clearly ambiguous result if client delivery fails after commit.
-- [ ] Preserve request/Writer sequence idempotency.
+- [x] Append and flush locally.
+- [x] Replicate concurrently to the two followers.
+- [x] Wait for one durable follower acknowledgement.
+- [x] Advance commit position after two durable copies exist.
+- [x] Propagate commit position to followers.
+- [x] Return success only after majority commit.
+- [x] Return a retryable ambiguous result when frame majority exists without commit majority; a lost success response is recovered by identical retry.
+- [x] Preserve request/Writer sequence idempotency.
 
-Evidence required:
+Evidence:
 
-- Three healthy replicas: append succeeds.
-- Any two healthy replicas: append succeeds.
-- One healthy replica: no success response.
+- `src/active_range/majority.rs`
+- `src/active_range/replication.rs`
+- `tests/majority_commit.rs`
+- Six integration tests prove three-replica commit, either possible owner-plus-follower majority, one-replica refusal, frame-majority/commit-minority ambiguity, conflicting digest rejection, and original-result retry after commit.
+- CommitPosition evidence is accepted only when the exact frame digest is already durable at that position on the current replica.
+- The production coordinator is wired to a bounded authenticated HTTP transport; M1.7 will expose the client append route.
+- Full verification passes with formatting, Clippy warnings denied, 43 library tests, 2 CLI tests, 5 placement tests, 9 Active Range store tests, 6 replica protocol tests, 6 majority-commit tests, and the storage restart test.
+- The rebuilt three-Node Docker Fabric durably accepted matching CommitPosition evidence for the same exact frame on all three replicas.
 
 ## M1.7 — Route append through any Node
 
-- [ ] Add a minimal authenticated append API.
-- [ ] Resolve FeedName to FeedId.
-- [ ] Resolve FeedId to current Active Range assignment.
-- [ ] Forward non-owner requests to the Append Owner.
-- [ ] Preserve one request ID across forwarding and retries.
-- [ ] Hide owner and replica topology from the client.
+- [x] Add a minimal authenticated append API.
+- [x] Resolve FeedName to FeedId.
+- [x] Resolve FeedId to current Active Range assignment.
+- [x] Forward non-owner requests to the Append Owner.
+- [x] Preserve one request ID across forwarding and retries.
+- [x] Hide owner and replica topology from the client.
+- [x] Convert the live three-Node owner/non-owner acceptance check into an automated integration test.
 
-Evidence required:
+Evidence:
 
-- Append through owner succeeds.
-- Append through each non-owner succeeds with the same semantics.
+- `POST /v1/feeds/append` accepts only Feed, Writer identity/epoch/sequence, key, payload, Metadata, event time, and request ID.
+- Non-owner ingress forwards the unchanged request over authenticated internal transport; only the owner encodes and majority-commits the record.
+- The rebuilt three-Node Fabric returned the same MessageId, Cursor, deduplication result, and `majority_committed` durability through the owner and both non-owner Nodes.
+- Cross-Node retry with the same request ID and Writer sequence returned the original result without a duplicate.
+- `python scripts/test-m17-topology-free-append.py` automates three-Node health, authentication refusal, unique Feed creation, owner and both non-owner ingress paths, stable MessageId/Cursor, majority durability, deduplication, and unknown-Feed rejection.
 
 ## M1.8 — Committed-only reads
 
-- [ ] Restrict reads to `position <= commit_position`.
-- [ ] Ensure locally appended but uncommitted frames are invisible.
-- [ ] Make Cursor creation depend on committed position.
-- [ ] Ensure historical reads do not alter another Reader's position.
+- [x] Restrict reads to `position <= commit_position`.
+- [x] Ensure locally appended but uncommitted frames are invisible.
+- [x] Return Cursors only for committed records and accept opaque Cursor continuation.
+- [x] Ensure historical reads remain stateless and do not alter another Reader's position.
 
-Evidence required:
+Evidence:
 
-- Reader cannot observe a frame before majority commit.
-- Reader sees the frame after commit.
+- `ReplicaAppendService::read_committed` resolves only the committed Active Range store and rejects unknown or uncommitted Cursors.
+- Integration tests prove a durable but uncommitted frame is invisible, appears after CommitPosition persistence, and continuation after its Cursor returns no duplicate.
+- `GET /v1/feeds/records?feed=<name>&after=<cursor>&limit=<n>` decodes only committed exact frames.
+- The automated three-Node acceptance script verifies the same committed MessageId and Cursor through all three Nodes and independent stateless continuation.
+- Full verification passes with formatting, Clippy warnings denied, 43 library tests, 2 CLI tests, 5 placement tests, 9 Active Range store tests, 7 replica protocol tests, 6 majority-commit tests, and the storage restart test.
 
 ## M1.9 — Owner failure and fencing
 
-- [ ] Detect unavailable owner.
-- [ ] Select an eligible caught-up replica.
-- [ ] Commit a higher ownership epoch through the Control Plane.
-- [ ] Fence the old owner before new writes are accepted.
-- [ ] Compare replica append and commit positions.
-- [ ] Discard tails that never reached majority commit.
-- [ ] Preserve records known committed by a majority.
-- [ ] Resume appends at the next valid position.
+- [ ] Connect sustained owner-unavailability detection to automatic recovery initiation.
+- [x] Select an eligible caught-up replica from current RF3 health/progress reports.
+- [x] Commit a higher ownership epoch through a compare-and-set Control Plane command.
+- [x] Fence the old owner before new writes are accepted.
+- [x] Compare replica append and commit positions and derive the highest majority-supported committed prefix.
+- [ ] Collect authenticated live replica progress reports over internal transport.
+- [ ] Discard tails that never reached majority commit on the selected owner and replicas.
+- [x] Preserve the majority-supported committed prefix in the recovery plan.
+- [ ] Reconcile local store epochs and resume appends at the next valid position automatically.
 
-Evidence required:
+Evidence:
 
-- Old owner cannot append after returning.
-- New owner preserves committed records.
-- New owner hides/discards uncommitted records.
+- `src/active_range/recovery.rs`
+- `tests/owner_recovery.rs`
+- Recovery planning refuses a healthy owner or fewer than two healthy replicas, selects a caught-up replica, and computes a higher epoch and majority-supported committed prefix.
+- The replicated recovery command uses expected owner and epoch as compare-and-set guards, so racing or stale plans cannot overwrite newer ownership.
+- Existing epoch validation fences the previous owner immediately after the Control Plane transition.
+
+Evidence still required for completion:
+
+- Automatic sustained-failure trigger.
+- Authenticated replica progress collection.
+- Committed-prefix reconciliation and uncommitted-tail truncation across the replacement owner and replicas.
+- Restart/fault test proving writes resume at the next valid position.
 
 ## M1.10 — Replica catch-up and repair
 
@@ -522,6 +560,8 @@ Autoscaling must never apply one generic removal procedure to all three cases.
 - [ ] Fence stale Writer sessions with epoch.
 - [ ] Allocate and persist sequence state.
 - [ ] Add typed append SDK API.
+- [ ] Add adaptive `auto` batching that tunes record count and byte size from message-size distribution, observed throughput, target latency, server pressure feedback, retry rate, and bounded in-flight memory; retain explicit latency/throughput/manual modes.
+- [ ] Add server feedback fields for recommended batch bytes/count, pressure, retry delay, and maximum accepted frame size without exposing physical topology.
 - [ ] Add `wcl-cli write` as an API-only frontend.
 - [ ] Add payload, file, stdin, binary, Metadata, and event-time options.
 - [ ] Add Writer session inspection and revocation.
@@ -630,7 +670,7 @@ Definition of Done:
 
 ## Milestone 9 — Production security and operations
 
-- [ ] Replace development internal keys with TLS/mTLS Node identity.
+- [ ] Replace development HTTP/shared-key transport with authenticated inter-Node encryption and Node identity: native mTLS by default, with a verified service-mesh or equivalent orchestrator transport as an optional mechanism.
 - [ ] Persist hashed API-key identities.
 - [ ] Implement credential issue, rotation, expiry, and revocation.
 - [ ] Enforce namespace grants on every Admin and data command.
@@ -639,6 +679,23 @@ Definition of Done:
 - [ ] Implement backup, restore, and DR exercises.
 - [ ] Implement redacted support bundles.
 - [ ] Run long-duration, disk-full, corruption, and chaos suites.
+
+## Unscheduled pain-point backlog
+
+These accepted product requirements need dependency review and explicit milestone placement. They do not supersede the current focus or the first unchecked immediate action.
+
+- [ ] Define first-class Subscription retry, delayed-delivery, quarantine, skip, and final-disposition workflows.
+- [ ] Define a Schema Policy milestone covering identity, compatibility, admission validation, evolution, and generated clients.
+- [ ] Expand Pipe work into explicit join, window, watermark, grace-period, and late-arrival contracts.
+- [ ] Define a correlated health-explanation API spanning Writer, quorum, storage, Index, Subscription, and Reader stages.
+- [ ] Define logical-resource cost attribution for storage, replication, movement, egress, Subscriptions, Pipes, and Indexes.
+- [ ] Define richer Feed inspection, time seek, bounded search, and single-event investigation workflows.
+- [ ] Define end-to-end business-flow tracing through Metadata and logical resource IDs.
+- [ ] Define a versioned language-neutral data protocol, cross-language SDK sequence, and shared conformance suite.
+- [ ] Define protocol-wide structured errors covering cause, scope, impact, retry safety, and next safe action.
+- [ ] Define lightweight SDK test doubles so application logic does not always require a running Fabric.
+
+Source: [Kafka pain points and delivery traceability](kafka-pain-points.md).
 
 ---
 
@@ -670,7 +727,20 @@ These tests accumulate across milestones and must never regress:
 1. [x] Write the M1.1 correctness contract and state-transition table.
 2. [x] Review and approve Active Range terminology.
 3. [x] Implement M1.2 domain types with unit tests.
-4. [ ] Define the `ActiveRangeStore` trait.
-5. [ ] Create the first torn-tail and uncommitted-truncation tests before implementation.
+4. [x] Create the first failing torn-tail and uncommitted-tail truncation tests.
+5. [x] Implement and verify `ActiveRangeStore` from the tested recovery contract.
+6. [x] Write the failing M1.4 test that requires Feed creation to commit one identical RF3 Active Range assignment on every Control Plane voter and recover it after complete Fabric restart.
+7. [x] Persist fixed Active Range placement and ownership epoch through the Control Plane.
+8. [x] Write the failing M1.5 replica protocol tests for identical bytes, position gaps, conflicts, invalid checksums, wrong generation, and stale ownership epoch.
+9. [x] Define the authenticated internal replica append request and response around the committed assignment.
+10. [x] Write the failing M1.6 tests proving three healthy replicas and any two healthy replicas commit, while one healthy replica never returns success.
+11. [x] Implement owner-side concurrent replication and two-of-three durable commit evidence.
+12. [x] Verify append through the owner and both non-owners reaches the same owner and preserves one request identity.
+13. [x] Add the minimal authenticated append API and forwarding path without exposing Active Range topology.
+14. [x] Convert the M1.7 live owner/non-owner append verification into an automated three-Node integration test.
+15. [x] Write the failing M1.8 tests proving uncommitted frames remain invisible and become readable only after majority commit.
+16. [x] Route Feed reads through committed Active Range storage and return only committed opaque Cursors.
+17. [ ] Write the failing M1.9 owner-failure tests for stale-owner fencing, committed-prefix preservation, and uncommitted-tail removal.
+18. [ ] Implement automatic owner failure detection and consensus-backed epoch transfer.
 
 The first unchecked item in this section is the next task unless a blocking architecture decision is recorded above.

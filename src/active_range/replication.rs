@@ -1,0 +1,492 @@
+use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc};
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+use uuid::Uuid;
+
+use crate::{codec::MAX_FRAME_BYTES, control::ControlController};
+
+use super::{
+    ActiveRangeAppend, ActiveRangeAssignment, ActiveRangeDescriptor, ActiveRangeError,
+    ActiveRangeStore, ActiveRangeStoreError, AppendIdentity, CommitPosition, FileActiveRangeStore,
+    OwnershipEpoch, RangeGeneration, RangeId, RangePosition, StorageNodeId,
+};
+
+pub const MAX_REPLICA_FRAME_BASE64_BYTES: usize = MAX_FRAME_BYTES.div_ceil(3) * 4;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaAppendRequest {
+    pub feed_id: Uuid,
+    pub range_id: RangeId,
+    pub generation: RangeGeneration,
+    pub ownership_epoch: OwnershipEpoch,
+    pub append_owner: StorageNodeId,
+    pub expected_position: RangePosition,
+    pub identity: AppendIdentity,
+    pub cursor: String,
+    pub frame_base64: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicaAppendAccepted {
+    pub position: RangePosition,
+    pub message_id: Uuid,
+    pub cursor: String,
+    pub frame_digest: [u8; 32],
+    pub deduplicated: bool,
+    pub durable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicaAppendErrorCode {
+    AssignmentNotFound,
+    WrongRange,
+    WrongGeneration,
+    StaleOwnershipEpoch,
+    NotCurrentOwner,
+    ReceiverNotReplica,
+    InvalidFrameEncoding,
+    FrameTooLarge,
+    InvalidFrame,
+    PositionGap,
+    PositionConflict,
+    WriterSequenceConflict,
+    StorageFailure,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicaAppendError {
+    pub code: ReplicaAppendErrorCode,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl ReplicaAppendError {
+    fn rejected(code: ReplicaAppendErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    fn temporary(code: ReplicaAppendErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            retryable: true,
+        }
+    }
+
+    fn storage(message: impl Into<String>) -> Self {
+        Self::temporary(ReplicaAppendErrorCode::StorageFailure, message)
+    }
+}
+
+impl fmt::Display for ReplicaAppendError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.message.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ReplicaAppendError {}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicaAppendResponse {
+    pub result: Option<ReplicaAppendAccepted>,
+    pub error: Option<ReplicaAppendError>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaCommitRequest {
+    pub feed_id: Uuid,
+    pub range_id: RangeId,
+    pub generation: RangeGeneration,
+    pub ownership_epoch: OwnershipEpoch,
+    pub append_owner: StorageNodeId,
+    pub commit_position: CommitPosition,
+    pub frame_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicaCommitAccepted {
+    pub commit_position: CommitPosition,
+    pub durable: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicaCommitResponse {
+    pub result: Option<ReplicaCommitAccepted>,
+    pub error: Option<ReplicaAppendError>,
+}
+
+#[derive(Clone)]
+pub struct ReplicaAppendService {
+    root: Arc<PathBuf>,
+    local_node: StorageNodeId,
+    control: Arc<ControlController>,
+    stores: Arc<RwLock<HashMap<RangeId, FileActiveRangeStore>>>,
+}
+
+impl ReplicaAppendService {
+    pub fn new(
+        root: impl Into<PathBuf>,
+        local_node: StorageNodeId,
+        control: Arc<ControlController>,
+    ) -> Self {
+        Self {
+            root: Arc::new(root.into()),
+            local_node,
+            control,
+            stores: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    pub fn local_node(&self) -> &StorageNodeId {
+        &self.local_node
+    }
+
+    pub async fn next_position(&self, feed_id: Uuid) -> Result<RangePosition, ReplicaAppendError> {
+        let assignment = self
+            .control
+            .active_range_assignment(feed_id)
+            .await
+            .ok_or_else(|| {
+                ReplicaAppendError::temporary(
+                    ReplicaAppendErrorCode::AssignmentNotFound,
+                    format!("no committed Active Range assignment exists for Feed {feed_id}"),
+                )
+            })?;
+        let snapshot = self
+            .store_for(&assignment)
+            .await?
+            .snapshot()
+            .await
+            .map_err(map_store_error)?;
+        snapshot
+            .progress
+            .appended()
+            .checked_next()
+            .map_err(|error| ReplicaAppendError::storage(error.to_string()))
+    }
+
+    pub async fn read_committed(
+        &self,
+        feed_id: Uuid,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<super::StoredRangeFrame>, ReplicaAppendError> {
+        let assignment = self
+            .control
+            .active_range_assignment(feed_id)
+            .await
+            .ok_or_else(|| {
+                ReplicaAppendError::temporary(
+                    ReplicaAppendErrorCode::AssignmentNotFound,
+                    format!("no committed Active Range assignment exists for Feed {feed_id}"),
+                )
+            })?;
+        if !assignment.replicas.contains(&self.local_node) {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::ReceiverNotReplica,
+                format!("Node {} is not a current replica", self.local_node),
+            ));
+        }
+        let store = self.store_for(&assignment).await?;
+        let after_position = match after {
+            Some(cursor) => Some(
+                store
+                    .committed_position_for_cursor(cursor)
+                    .await
+                    .map_err(map_store_error)?
+                    .ok_or_else(|| {
+                        ReplicaAppendError::rejected(
+                            ReplicaAppendErrorCode::PositionConflict,
+                            "Cursor is unknown, uncommitted, or belongs to another Feed",
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        store
+            .read_committed(after_position, limit)
+            .await
+            .map_err(map_store_error)
+    }
+
+    pub async fn append(
+        &self,
+        request: ReplicaAppendRequest,
+    ) -> Result<ReplicaAppendAccepted, ReplicaAppendError> {
+        if request.frame_base64.len() > MAX_REPLICA_FRAME_BASE64_BYTES {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::FrameTooLarge,
+                format!(
+                    "encoded replica frame exceeds the {} byte limit",
+                    MAX_REPLICA_FRAME_BASE64_BYTES
+                ),
+            ));
+        }
+        let frame = STANDARD.decode(&request.frame_base64).map_err(|error| {
+            ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::InvalidFrameEncoding,
+                format!("replica frame is not valid base64: {error}"),
+            )
+        })?;
+        if frame.len() > MAX_FRAME_BYTES {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::FrameTooLarge,
+                format!("decoded replica frame exceeds the {MAX_FRAME_BYTES} byte limit"),
+            ));
+        }
+        let assignment = self
+            .control
+            .active_range_assignment(request.feed_id)
+            .await
+            .ok_or_else(|| {
+                ReplicaAppendError::temporary(
+                    ReplicaAppendErrorCode::AssignmentNotFound,
+                    format!(
+                        "no committed Active Range assignment exists for Feed {}",
+                        request.feed_id
+                    ),
+                )
+            })?;
+        self.validate_assignment(&assignment, &request)?;
+        let store = self.store_for(&assignment).await?;
+        let result = store
+            .append(ActiveRangeAppend {
+                generation: request.generation,
+                ownership_epoch: request.ownership_epoch,
+                expected_position: Some(request.expected_position),
+                identity: request.identity,
+                cursor: request.cursor,
+                frame,
+            })
+            .await
+            .map_err(map_store_error)?;
+        Ok(ReplicaAppendAccepted {
+            position: result.position,
+            message_id: result.message_id,
+            cursor: result.cursor,
+            frame_digest: result.frame_digest,
+            deduplicated: result.deduplicated,
+            durable: true,
+        })
+    }
+
+    pub async fn commit(
+        &self,
+        request: ReplicaCommitRequest,
+    ) -> Result<ReplicaCommitAccepted, ReplicaAppendError> {
+        let assignment = self
+            .control
+            .active_range_assignment(request.feed_id)
+            .await
+            .ok_or_else(|| {
+                ReplicaAppendError::temporary(
+                    ReplicaAppendErrorCode::AssignmentNotFound,
+                    format!(
+                        "no committed Active Range assignment exists for Feed {}",
+                        request.feed_id
+                    ),
+                )
+            })?;
+        if assignment.range_id != request.range_id {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::WrongRange,
+                "commit RangeId does not match the committed assignment",
+            ));
+        }
+        assignment
+            .validate_request(
+                request.generation,
+                request.ownership_epoch,
+                &request.append_owner,
+            )
+            .map_err(map_assignment_error)?;
+        if !assignment.replicas.contains(&self.local_node) {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::ReceiverNotReplica,
+                format!("Node {} is not a current replica", self.local_node),
+            ));
+        }
+        let store = self.store_for(&assignment).await?;
+        let position = RangePosition::new(request.commit_position.value());
+        let local_digest = store
+            .frame_digest(position)
+            .await
+            .map_err(map_store_error)?
+            .ok_or_else(|| {
+                ReplicaAppendError::rejected(
+                    ReplicaAppendErrorCode::PositionGap,
+                    format!("RangePosition {position} is not durable on this replica"),
+                )
+            })?;
+        if local_digest != request.frame_digest {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::PositionConflict,
+                format!("RangePosition {position} has a different frame digest"),
+            ));
+        }
+        store
+            .commit(
+                request.generation,
+                request.ownership_epoch,
+                request.commit_position,
+            )
+            .await
+            .map_err(map_store_error)?;
+        Ok(ReplicaCommitAccepted {
+            commit_position: request.commit_position,
+            durable: true,
+        })
+    }
+
+    fn validate_assignment(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        request: &ReplicaAppendRequest,
+    ) -> Result<(), ReplicaAppendError> {
+        if assignment.range_id != request.range_id {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::WrongRange,
+                format!(
+                    "request RangeId {} does not match committed RangeId {}",
+                    request.range_id, assignment.range_id
+                ),
+            ));
+        }
+        assignment
+            .validate_request(
+                request.generation,
+                request.ownership_epoch,
+                &request.append_owner,
+            )
+            .map_err(map_assignment_error)?;
+        if !assignment.replicas.contains(&self.local_node) {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::ReceiverNotReplica,
+                format!(
+                    "Node {} is not a replica for Active Range {}",
+                    self.local_node, assignment.range_id
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn store_for(
+        &self,
+        assignment: &ActiveRangeAssignment,
+    ) -> Result<FileActiveRangeStore, ReplicaAppendError> {
+        if let Some(store) = self.stores.read().await.get(&assignment.range_id).cloned() {
+            synchronize_store_epoch(&store, assignment).await?;
+            return Ok(store);
+        }
+        let root = Arc::clone(&self.root);
+        let descriptor = ActiveRangeDescriptor {
+            feed_id: assignment.feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        let opened = tokio::task::spawn_blocking(move || {
+            FileActiveRangeStore::open(root.as_ref(), descriptor)
+        })
+        .await
+        .map_err(|error| ReplicaAppendError::storage(error.to_string()))?
+        .map_err(|error| ReplicaAppendError::storage(error.to_string()))?;
+        let mut stores = self.stores.write().await;
+        Ok(stores.entry(assignment.range_id).or_insert(opened).clone())
+    }
+}
+
+async fn synchronize_store_epoch(
+    store: &FileActiveRangeStore,
+    assignment: &ActiveRangeAssignment,
+) -> Result<(), ReplicaAppendError> {
+    let snapshot = store
+        .snapshot()
+        .await
+        .map_err(|error| ReplicaAppendError::storage(error.to_string()))?;
+    if snapshot.generation != assignment.generation {
+        return Err(ReplicaAppendError::rejected(
+            ReplicaAppendErrorCode::WrongGeneration,
+            format!(
+                "local generation {} does not match committed generation {}",
+                snapshot.generation, assignment.generation
+            ),
+        ));
+    }
+    if snapshot.ownership_epoch < assignment.ownership_epoch {
+        store
+            .update_ownership_epoch(
+                assignment.generation,
+                snapshot.ownership_epoch,
+                assignment.ownership_epoch,
+            )
+            .await
+            .map_err(map_store_error)?;
+    } else if snapshot.ownership_epoch > assignment.ownership_epoch {
+        return Err(ReplicaAppendError::rejected(
+            ReplicaAppendErrorCode::StaleOwnershipEpoch,
+            format!(
+                "local ownership epoch {} is ahead of committed epoch {}",
+                snapshot.ownership_epoch, assignment.ownership_epoch
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn map_assignment_error(error: ActiveRangeError) -> ReplicaAppendError {
+    match error {
+        ActiveRangeError::WrongGeneration { .. } => {
+            ReplicaAppendError::rejected(ReplicaAppendErrorCode::WrongGeneration, error.to_string())
+        }
+        ActiveRangeError::StaleEpoch { .. } => ReplicaAppendError::rejected(
+            ReplicaAppendErrorCode::StaleOwnershipEpoch,
+            error.to_string(),
+        ),
+        ActiveRangeError::NotCurrentOwner(_) => {
+            ReplicaAppendError::rejected(ReplicaAppendErrorCode::NotCurrentOwner, error.to_string())
+        }
+        _ => {
+            ReplicaAppendError::rejected(ReplicaAppendErrorCode::StorageFailure, error.to_string())
+        }
+    }
+}
+
+fn map_store_error(error: ActiveRangeStoreError) -> ReplicaAppendError {
+    match error {
+        ActiveRangeStoreError::Codec(_) | ActiveRangeStoreError::WriterIdentityMismatch => {
+            ReplicaAppendError::rejected(ReplicaAppendErrorCode::InvalidFrame, error.to_string())
+        }
+        ActiveRangeStoreError::PositionGap { .. } => {
+            ReplicaAppendError::rejected(ReplicaAppendErrorCode::PositionGap, error.to_string())
+        }
+        ActiveRangeStoreError::PositionConflict(_) => ReplicaAppendError::rejected(
+            ReplicaAppendErrorCode::PositionConflict,
+            error.to_string(),
+        ),
+        ActiveRangeStoreError::WriterSequenceConflict
+        | ActiveRangeStoreError::StaleWriterSequence { .. }
+        | ActiveRangeStoreError::WriterSequenceGap { .. } => ReplicaAppendError::rejected(
+            ReplicaAppendErrorCode::WriterSequenceConflict,
+            error.to_string(),
+        ),
+        ActiveRangeStoreError::WrongGeneration { .. } => {
+            ReplicaAppendError::rejected(ReplicaAppendErrorCode::WrongGeneration, error.to_string())
+        }
+        ActiveRangeStoreError::StaleOwnershipEpoch { .. } => ReplicaAppendError::rejected(
+            ReplicaAppendErrorCode::StaleOwnershipEpoch,
+            error.to_string(),
+        ),
+        other => ReplicaAppendError::storage(other.to_string()),
+    }
+}

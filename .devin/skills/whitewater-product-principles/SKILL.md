@@ -53,7 +53,7 @@ If a proposal does not reduce a documented pain, justify why it belongs in White
 - Keep immutable Feed history separate from explicit persisted replicated Indexes.
 - Provide queryable state without requiring application-managed local stores, changelogs, or routing.
 - Keep schemas optional for storage but first-class in identity, compatibility, validation, and tooling.
-- Use secure defaults: TLS-only transport, scoped API-key identities, explainable authorization, and safe rotation.
+- Use secure defaults: TLS for clients and authenticated encryption with verified Node identity between Nodes. Native mTLS is the default; a trusted service mesh or equivalent orchestrator transport is acceptable only when identity, rotation, audit, and downgrade prevention are verified. Keep scoped API-key identities, explainable authorization, and safe rotation.
 - Use safe durability invariants rather than configuration combinations that silently weaken guarantees.
 - Scale and rebalance gradually with sustained thresholds, hysteresis, disruption budgets, and safe drain gates.
 - Never claim that adding capacity can parallelize one strictly ordered hot key.
@@ -73,6 +73,23 @@ If a proposal does not reduce a documented pain, justify why it belongs in White
 - Preserve simple application APIs while keeping operational consequences visible and explainable.
 - Convert pain points into measurable acceptance criteria rather than subjective claims.
 - Require reproducible evidence for performance or cost claims.
+
+## Rust engineering practices
+
+- Use ownership and borrowing to make lifecycle and mutation boundaries explicit; clone only when ownership transfer or isolation justifies it.
+- Model identities, positions, epochs, and validated values with domain newtypes rather than interchangeable primitives.
+- Keep traits focused on stable subsystem boundaries and prefer concrete types inside an implementation.
+- Make invalid states difficult to represent through constructors and private fields.
+- Use typed errors with actionable context; do not use `unwrap`, `expect`, or panics in production paths.
+- Use checked arithmetic and bounded allocations for all persisted or network-controlled lengths and counters.
+- Keep blocking filesystem work off Tokio executor threads and make lock scope small, explicit, and free of `.await` points.
+- Persist state with write, flush, atomic replace, and directory synchronization where required by the platform durability contract.
+- Treat checksums as corruption detection, not authentication, and validate data before mutating durable state.
+- Recover from expected torn tails, but fail closed on corruption inside an acknowledged or sealed prefix.
+- Keep unsafe Rust out of the implementation unless no safe alternative exists; every unsafe block requires a documented invariant and focused tests.
+- Follow standard naming, formatting, Clippy, and rustdoc conventions; optimize only from measured evidence.
+- Prefer deterministic tests with temporary directories and explicit fault boundaries over sleeps or timing assumptions.
+- Run `cargo fmt --check`, Clippy with warnings denied, and all tests before completion.
 
 ## Completion check
 

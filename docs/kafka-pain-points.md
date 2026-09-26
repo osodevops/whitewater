@@ -13,6 +13,87 @@ This catalogue preserves the problems Whitewater is intended to solve. It is not
 
 Future Whitewater design work should use these pains as inputs, turn relevant items into measurable acceptance criteria, and avoid recreating them under different terminology. A feature is not an improvement merely because it hides an implementation detail from one interface; the detail must be safely automated, made explainable, or removed from the user's responsibility.
 
+## Traceability and delivery status
+
+The tables below group related pains so that the response remains readable. They are a delivery map, not a claim that planned behavior exists.
+
+| Status | Meaning |
+|---|---|
+| **Prototype** | Working in the current prototype, but not yet a complete production contract. |
+| **Foundation** | A contract, domain model, or local implementation exists; distributed behavior is incomplete. |
+| **Designed** | The intended contract is documented, but implementation has not started or is incomplete. |
+| **Planned** | Work appears in [tasks and milestones](tasks.md), but its prerequisite milestone has not completed. |
+| **Roadmap gap** | The pain is accepted and tracked, but no delivery milestone has been sequenced yet. |
+
+### DevOps and platform traceability
+
+| Kafka pain | Whitewater response | Status | Evidence or delivery point |
+|---|---|---|---|
+| Many separately operated components and role-specific processes | One Rust Node binary with internally assigned Control, Storage, Compute, Gateway, and Cache capabilities; one typed control contract serves WCL, APIs, CLIs, SDKs, Operators, and future MCP tools. | **Foundation** | One Node binary and typed `ControlController` exist; role-aware placement is Milestone 5. |
+| Partition counts must be chosen early | Feeds expose keys and ordering, never partition counts. Internal Active Ranges split and merge without changing the Feed contract. | **Foundation** | Feed administration is partitionless; fixed Active Range work is Milestone 1 and online split/merge is Milestone 4. |
+| Repartitioning and reassignment hammer disk and network | Internal range movement is incremental, resumable, checksum-verified, and bounded by foreground SLO and disruption budgets. | **Designed** | Active Range recovery is specified; catch-up is M1.10 and general movement is Milestones 4–5. |
+| Hot partitions and uneven placement | The Fabric detects hot ranges and keys, isolates unrelated keys, and rebalances movable ranges by capacity and failure domain. It reports honestly that one strictly ordered hot key cannot be parallelized automatically. | **Planned** | Hot-key detection and multiple ranges are Milestone 4; role-aware placement is Milestone 5. |
+| Adding brokers does not automatically redistribute useful work | Nodes advertise capabilities and pressure; the Fabric places or moves only the work that addresses the measured bottleneck. | **Foundation** | Membership, demand telemetry, and hysteretic recommendations exist; useful role-aware scaling is Milestone 5. |
+| Capacity planning couples many hidden constraints | Capacity is reported by logical resource and constrained capability, with slow bounded recommendations rather than partition arithmetic. | **Foundation** | Node demand and storage telemetry exist; attribution and capability-specific pressure remain Milestone 5 work. |
+| Retention, compaction, replication, or producers fill disks unexpectedly | Reserve recovery headroom, project growth, admit writes safely, tier sealed history, and identify the responsible Space and Feed before exhaustion. | **Designed** | Operational contract exists; tiered history is Milestone 8 and disk-full suites are Milestone 9. |
+| Broker replacement and recovery are operational projects | A replacement Node catches up verified committed ranges automatically; stale owners are epoch-fenced and scale-in is refused until drain completes. | **Foundation** | Fencing and recovery models exist; owner recovery is M1.9, repair is M1.10, and general drain is Milestone 5. |
+| Consumer lag is visible but difficult to explain | End-to-end diagnostics identify the limiting stage from writer admission through quorum, storage, Index, Subscription, and Reader. | **Designed** | Diagnostic requirements exist in `operational-experience.md`; unified explanation APIs remain unscheduled beyond scaling explanations in Milestone 5. |
+| Group rebalances stop processing | Subscriptions use small epoch-fenced leases transferred incrementally according to Reader capacity; unrelated Readers continue. | **Designed** | Reader capacity starts in Milestone 3; Subscription leases and incremental transfer are Milestone 7. |
+| Tuning folklore and dangerous configuration combinations | Durability, retry safety, and bounded backpressure are protocol invariants with narrow named policies rather than independent low-level switches. | **Foundation** | RF3/two-of-three contract and executable model exist; quorum-durable append is the current Milestone 1. |
+| TLS, SASL, ACLs, and certificate rotation are difficult | TLS-only traffic, scoped API-key identities, capability inheritance, explainable authorization, and overlapping credential rotation are secure defaults. | **Foundation** | Authenticated Admin API exists; production TLS, identity persistence, rotation, audit, and complete enforcement are Milestone 9. |
+| JVM tuning and garbage-collection behavior burden operators | A native Rust implementation avoids JVM deployment and GC tuning while retaining explicit bounded-resource engineering. | **Prototype** | The service is implemented in Rust; long-duration memory and resource characterization remains required. |
+| Upgrades require protocol and compatibility choreography | Nodes advertise compatibility; the Control Plane computes a gated rolling plan, pauses on reduced health, and exposes rollback boundaries. | **Designed** | Upgrade contract exists; implementation and mixed-version tests are Milestone 9. |
+| Cross-datacenter replication and disaster recovery need separate offset translation systems | Remote Feed replicas and Cursor checkpoints use stable Feed identity; DR policy exposes RPO, RTO, promotion, failback, and exercise status. | **Designed** | DR behavior is documented; backup, restore, and DR exercises are Milestone 9. |
+| Topic sprawl leaves unknown owners and retention | Spaces provide ownership, namespace authorization, quotas, policy inheritance, accounting, and safe lifecycle controls over Feeds. | **Foundation** | Spaces, Feeds, grants, inspection, and safe logical drop exist; quotas, ownership enforcement, and History Policy remain incomplete. |
+| Schema governance becomes another separately operated bureaucracy | Schemas remain optional for byte storage but become first-class Feed policy with compatibility, validation, identity, and generated-client support under one control plane. | **Roadmap gap** | Product direction exists, but `tasks.md` has no explicit schema milestone. |
+| Exactly-once marketing hides operational consequences | Whitewater names the actual boundary: idempotent append for duplicate-safe writes and atomic consume-and-append for effects wholly inside Whitewater; external effects retain explicit ambiguity. | **Foundation** | Local append deduplication exists; replicated retry safety is Milestone 1 and atomic effects are Milestone 7. |
+| Observability is fragmented across products and dashboards | Metrics, traces, logs, events, and automatic decisions share logical IDs and feed a built-in “why?” explanation. | **Designed** | Basic tracing and metrics exist; correlated explanation, bounded cardinality, and support bundles remain Milestone 9 or a roadmap gap. |
+| Managed Kafka costs scale sharply; self-hosting hides human cost | Attribute storage, replication, egress, movement, Subscription, Pipe, and Index cost to logical owners; automate routine operations safely. | **Designed** | FinOps requirements exist; complete cost attribution has no dedicated milestone and Index cost begins in Milestone 6. |
+| Production-like testing is expensive | A standard three-Node local Fabric uses the same topology and correctness paths as production, automated by Docker Compose. | **Prototype** | The three-Node Compose Fabric is implemented and health checked; TLS and record replication are not yet production-equivalent. |
+| Incidents are obscure while components look healthy | Every diagnostic states what is happening, scope, cause, automatic action, current durability/availability risk, and next safe action. | **Designed** | Required output is documented; end-to-end implementation remains a roadmap gap. |
+
+### Software-developer traceability
+
+| Kafka pain | Whitewater response | Status | Evidence or delivery point |
+|---|---|---|---|
+| “Just send a message” requires infrastructure expertise | A Writer chooses Feed, Key, payload, Metadata, and event time; owner, range, replica, sequence, batching, and retry routing stay internal. | **Foundation** | Local append exists; replicated append is Milestone 1 and ergonomic Writer sessions/SDK are Milestone 2. |
+| Partitions and partition-local ordering leak into design | The public guarantee is same-Feed/same-Key accepted order. Internal ranges can move, split, and merge without client topology callbacks. | **Foundation** | Public APIs expose no partitions; multi-range ordering is Milestone 4. |
+| Choosing or changing a key becomes infrastructure architecture | Keys express only the business ordering boundary; physical placement is independent. Managed Pipes will make re-keying and shuffle explicit-cost implementation details. | **Designed** | Key ordering is defined; Pipes and atomic effects are Milestone 7. |
+| Consumer groups and rebalances are difficult and pause applications | Independent Readers use opaque Cursors; cooperating Subscription Readers use capacity-aware incremental leases instead of global assignment generations. | **Foundation** | Independent local Cursor reads exist; Reader sessions are Milestone 3 and Subscription leases are Milestone 7. |
+| Applications must understand and manually manage offsets | Clients store, acknowledge, seek, and replay with opaque Feed-scoped Cursors that survive internal topology changes. | **Foundation** | Opaque local Cursors and WCL seek exist; acknowledged durable Reader progress is Milestone 3. |
+| Duplicate messages and ambiguous retries require custom design | Stable Writer identity plus sequence returns the original MessageId and Cursor for identical retry and rejects conflicting reuse. | **Foundation** | Proven for local restart; quorum-safe deduplication is part of Milestone 1 and Writer sessions are Milestone 2. |
+| Exactly-once is misunderstood across external side effects | APIs state the effect boundary precisely; Whitewater can atomically commit Subscription progress with Whitewater outputs, not arbitrary external systems. | **Designed** | Atomic consume-and-append is Milestone 7. |
+| Retries, delayed delivery, dead letters, and poison events are scattered application code | Subscription policy owns retry schedule, bounded attempts, delayed delivery, quarantine, skip rules, and queryable final disposition without stalling unrelated keys. | **Roadmap gap** | The behavior is required by product docs, but Milestone 7 does not yet enumerate the complete workflow. |
+| Backpressure is left to each application | Readers advertise capacity credits; the server bounds in-flight work and isolates slow Readers and keys. | **Designed** | Capacity credits and backpressure are Milestone 3. |
+| Long-running processing conflicts with liveness and rebalance timeouts | Reader liveness, work lease renewal, processing duration, and per-key disposition are separate contracts. | **Designed** | Reader sessions are Milestone 3 and leases are Milestone 7. |
+| Client configuration is enormous | SDKs negotiate safe behavior and adapt batching from observed traffic; applications configure intent and policy rather than transport internals. | **Planned** | Writer SDK begins in Milestone 2; production SDK coverage remains incomplete. |
+| Serialization errors appear far from their source | Optional Feed Schema Policy validates at admission and reports the offending field, compatibility rule, impact, and correction. | **Roadmap gap** | Schema behavior is designed but has no explicit implementation milestone. |
+| Schema Registry and schema formats add separate tooling | Schema identity, compatibility, validation, and generated clients live under the Whitewater control model while storage remains format-neutral. | **Roadmap gap** | No explicit schema milestone exists yet. |
+| Local development and integration tests are heavy | One Compose command starts the supported three-Node topology; client logic should also be testable against SDK abstractions without a Fabric. | **Prototype** | Three-Node Compose exists; lightweight SDK test doubles are not scheduled. |
+| Kafka Streams state, changelogs, and repartition topics are magical | Pipes expose computation; persisted replicated Indexes expose current state and applied-Cursor freshness without application-managed changelog stores. | **Designed** | Indexes are Milestone 6; Pipes and atomic effects are Milestone 7. |
+| Stream joins, windows, grace periods, and late arrivals are difficult | Pipes must expose explicit event-time, watermark, lateness, and state contracts with explainable cost and no hidden internal resources. | **Roadmap gap** | Pipes are scheduled in Milestone 7, but joins/windows/watermarks lack explicit tasks. |
+| Replaying or deleting data becomes offset manipulation | Readers seek by opaque Cursor or time-oriented API; History Policy governs lifecycle separately from current-state Indexes. | **Foundation** | Cursor reads and WCL seek exist; time seek and complete replay UX are Milestone 3 or unscheduled, while lifecycle is Milestone 8. |
+| Inspecting a topic or finding one event is cumbersome | Built-in Feed inspection supports bounded scans; persisted Indexes provide point/prefix/field lookup without adding another product. | **Designed** | Sequential reads exist; Indexes are Milestone 6, while richer event inspection/search UX is a roadmap gap. |
+| Distributed flows are hard to debug and trace | Record Metadata carries trace context; correlated Feed, Subscription, Pipe, Index, and control-decision diagnostics reconstruct a business flow. | **Designed** | Metadata exists; end-to-end business-flow tracing has no explicit milestone. |
+| Java APIs are verbose and non-Java clients diverge | A versioned language-neutral protocol defines semantics; idiomatic SDKs share conformance tests and Java has no privileged behavior. | **Roadmap gap** | A typed Rust client starts in Milestone 2; cross-language SDK and conformance milestones are not yet defined. |
+| Transactional APIs are difficult | Atomic consume-and-append presents a narrow operation around acknowledged input progress and Whitewater output effects. | **Designed** | Milestone 7. |
+| Errors are accurate but not actionable | Structured errors include cause, affected resource, retry safety, impact, and next safe action using consistent codes across SDKs. | **Roadmap gap** | Some domain errors are precise, but a protocol-wide actionable error contract is not scheduled. |
+
+## Current pain-driven priority
+
+M1.6 delivered owner-side majority commit. The owner flushes locally, concurrently replicates the exact frame to both followers, requires one matching durable follower, and persists CommitPosition evidence on two current replicas before returning success. One healthy replica cannot succeed; either owner-plus-follower pair can. Identical retry after a lost response returns the original logical result.
+
+The next implementation is **M1.7 — route append through any Node**:
+
+1. Write failing tests for append through the owner and through each non-owner.
+2. Add a minimal authenticated client append request that contains Feed, Key, payload, Metadata, event time, and stable request/Writer identity—but no physical topology.
+3. Resolve FeedName to FeedId and the committed Active Range assignment.
+4. Forward non-owner requests to the current owner while preserving one request ID and append identity.
+5. Have the owner encode once and invoke the M1.6 majority coordinator.
+6. Return the same MessageId, Cursor, and durability meaning regardless of the ingress Node.
+
+This work directly addresses “just send a message” complexity and topology leakage. Applications must not discover owners, replicas, epochs, positions, or forwarding routes.
+
 ## DevOps and platform-team pain
 
 For DevOps and platform teams, the pain is primarily operational complexity, reliability, scaling, and cost.

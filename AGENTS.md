@@ -15,7 +15,7 @@
 - Use `C:\Code\Stackapps\kafka-trunk` as a read-only implementation reference and record retained lessons in `docs/kafka-source-lessons.md`; preserve proven correctness behavior without copying Kafka's public partition coupling.
 - Feed history has one immutable semantic model; use explicit persisted replicated Indexes rather than cleanup-policy or compacted-Feed modes.
 - Prefer a pure-Rust Index Engine such as Fjall or redb when benchmarks and fault tests prove it meets durability, recovery, replication, and sustained-ingest requirements; retain an engine abstraction until that decision is earned.
-- Client and inter-Node traffic is TLS-only. API keys authorize access but must never be used directly as encryption keys.
+- Client traffic uses TLS. Inter-Node traffic requires authenticated encryption and verified Node identity: native mTLS is the default, while a trusted service mesh or equivalent orchestrator transport is an allowed mechanism when identity, rotation, audit, and downgrade prevention are verified. API keys authorize access but must never be used directly as encryption keys.
 - Prioritize correctness contracts before throughput optimization.
 - The host may not have Rust installed. Verification can run with `rust:1.90-bookworm` in Docker.
 - Standard checks: `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-targets`.

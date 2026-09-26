@@ -7,7 +7,7 @@
 - **Status:** Experience goals and design requirements
 - **Product:** Whitewater by FinnStream
 - **Category:** Distributed database and partitionless streaming platform
-- **Companion documents:** [Kafka pain points](kafka-pain-points.md), [Why Whitewater](why-whitewater.md), and [Whitewater architecture](kafka-successor-architecture.md)
+- **Companion documents:** [Sequence diagrams](sequence-diagrams.md), [Kafka pain points](kafka-pain-points.md), [Why Whitewater](why-whitewater.md), and [Whitewater architecture](kafka-successor-architecture.md)
 - **Audience:** Application developers, platform engineers, SREs, security teams, data engineers, FinOps, and incident responders
 
 This document turns recurring Kafka operational pain into explicit Whitewater behavior. It is not a claim that every Kafka installation suffers every problem. Mature teams operate Kafka successfully, and managed platforms remove substantial work. The goal is to learn from the expertise, tooling, and runbooks those teams had to build and make the common safe behavior part of Whitewater itself.
@@ -146,7 +146,7 @@ The security engineer wants secure defaults and understandable identities. They 
 
 Whitewater promise:
 
-- TLS is mandatory for client and inter-Node traffic.
+- Authenticated encryption is mandatory for client and inter-Node traffic. Native TLS/mTLS is the default; a trusted service mesh or equivalent orchestrator-provided transport may satisfy the inter-Node guarantee when peer identity, rotation, audit, and downgrade prevention are verified.
 - API keys are scoped identities, stored only as verifiers, and designed for rotation.
 - Space and Feed capabilities inherit predictably.
 - Deny and allow decisions are explainable through an authorization trace.

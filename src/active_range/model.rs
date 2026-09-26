@@ -1,6 +1,6 @@
 use std::{collections::BTreeSet, fmt};
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -37,7 +37,7 @@ impl fmt::Display for RangeId {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(transparent)]
 pub struct StorageNodeId(String);
 
@@ -64,6 +64,15 @@ impl StorageNodeId {
 impl fmt::Display for StorageNodeId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+impl<'de> Deserialize<'de> for StorageNodeId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::try_new(String::deserialize(deserializer)?).map_err(D::Error::custom)
     }
 }
 
@@ -115,7 +124,8 @@ ordered_counter!(OwnershipEpoch);
 ordered_counter!(RangePosition);
 ordered_counter!(CommitPosition);
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(transparent)]
 pub struct ReplicaSet {
     replicas: [StorageNodeId; ACTIVE_RANGE_REPLICA_COUNT],
 }
@@ -144,7 +154,19 @@ impl ReplicaSet {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+impl<'de> Deserialize<'de> for ReplicaSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::try_new(<[StorageNodeId; ACTIVE_RANGE_REPLICA_COUNT]>::deserialize(
+            deserializer,
+        )?)
+        .map_err(D::Error::custom)
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ActiveRangeAssignment {
     pub feed_id: Uuid,
     pub range_id: RangeId,
@@ -217,6 +239,34 @@ impl ActiveRangeAssignment {
             return Err(ActiveRangeError::NotCurrentOwner(owner.clone()));
         }
         Ok(())
+    }
+}
+
+impl<'de> Deserialize<'de> for ActiveRangeAssignment {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct Representation {
+            feed_id: Uuid,
+            range_id: RangeId,
+            generation: RangeGeneration,
+            owner: StorageNodeId,
+            replicas: ReplicaSet,
+            ownership_epoch: OwnershipEpoch,
+        }
+
+        let value = Representation::deserialize(deserializer)?;
+        Self::try_new(
+            value.feed_id,
+            value.range_id,
+            value.generation,
+            value.owner,
+            value.replicas,
+            value.ownership_epoch,
+        )
+        .map_err(D::Error::custom)
     }
 }
 
@@ -417,8 +467,20 @@ impl RangeProgress {
         }
     }
 
+    pub fn appended(self) -> RangePosition {
+        self.appended
+    }
+
+    pub fn flushed(self) -> RangePosition {
+        self.flushed
+    }
+
     pub fn commit_position(self) -> CommitPosition {
         self.committed
+    }
+
+    pub fn visible(self) -> RangePosition {
+        self.visible
     }
 
     pub fn advance_appended(&mut self, position: RangePosition) -> Result<(), ActiveRangeError> {
@@ -618,6 +680,26 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<ActiveRangeAssignment>(&encoded).unwrap(),
             assignment
+        );
+    }
+
+    #[test]
+    fn deserialization_preserves_storage_node_and_assignment_invariants() {
+        assert!(serde_json::from_str::<StorageNodeId>("\"invalid node\"").is_err());
+        assert!(serde_json::from_value::<ReplicaSet>(serde_json::json!([
+            "node1", "node1", "node3"
+        ]))
+        .is_err());
+        assert!(
+            serde_json::from_value::<ActiveRangeAssignment>(serde_json::json!({
+                "feed_id": Uuid::from_u128(1),
+                "range_id": Uuid::from_u128(2),
+                "generation": 1,
+                "owner": "node4",
+                "replicas": ["node1", "node2", "node3"],
+                "ownership_epoch": 1
+            }))
+            .is_err()
         );
     }
 
