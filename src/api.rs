@@ -498,6 +498,18 @@ async fn repair_export(
     Json(response)
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WriterSessionAppendRequest {
+    pub request_id: Uuid,
+    pub writer: String,
+    pub session_epoch: u64,
+    pub event_time_ns: Option<String>,
+    pub key_base64: String,
+    pub payload_base64: String,
+    #[serde(default)]
+    pub metadata_base64: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ClientAppendRequest {
     request_id: Uuid,
@@ -513,16 +525,16 @@ struct ClientAppendRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct ClientAppendResponse {
-    message_id: Uuid,
-    cursor: String,
-    deduplicated: bool,
-    durability: String,
+pub struct WriterAppendResponse {
+    pub message_id: Uuid,
+    pub cursor: String,
+    pub deduplicated: bool,
+    pub durability: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct InternalOwnerAppendResponse {
-    result: Option<ClientAppendResponse>,
+    result: Option<WriterAppendResponse>,
     error: Option<String>,
     retryable: bool,
 }
@@ -531,7 +543,7 @@ async fn client_append(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<ClientAppendRequest>,
-) -> Result<Json<ClientAppendResponse>, ApiError> {
+) -> Result<Json<WriterAppendResponse>, ApiError> {
     authorize_admin(&state, &headers)?;
     let feed = state
         .control
@@ -616,7 +628,7 @@ async fn owner_append(
 async fn owner_append_local(
     state: &AppState,
     request: ClientAppendRequest,
-) -> Result<ClientAppendResponse, ApiError> {
+) -> Result<WriterAppendResponse, ApiError> {
     let feed = state
         .control
         .active_feed_by_name(&request.feed)
@@ -688,7 +700,7 @@ async fn owner_append_local(
         })
         .await
         .map_err(majority_api_error)?;
-    Ok(ClientAppendResponse {
+    Ok(WriterAppendResponse {
         message_id: result.message_id,
         cursor: result.cursor,
         deduplicated: result.deduplicated,
