@@ -550,6 +550,15 @@ async fn client_append(
         .active_feed_by_name(&request.feed)
         .await
         .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", request.feed)))?;
+    state
+        .control
+        .validate_writer_append(
+            request.writer_session_id,
+            feed.feed_id,
+            request.writer_epoch,
+            request.sequence,
+        )
+        .await?;
     let assignment = state
         .control
         .active_range_assignment(feed.feed_id)
@@ -634,6 +643,15 @@ async fn owner_append_local(
         .active_feed_by_name(&request.feed)
         .await
         .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", request.feed)))?;
+    state
+        .control
+        .validate_writer_append(
+            request.writer_session_id,
+            feed.feed_id,
+            request.writer_epoch,
+            request.sequence,
+        )
+        .await?;
     let assignment = state
         .control
         .active_range_assignment(feed.feed_id)
