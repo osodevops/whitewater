@@ -544,6 +544,44 @@ impl ControlController {
         self.state.lock().await.revision
     }
 
+    pub async fn active_writer_by_name(&self, name: &str) -> Option<WriterDefinition> {
+        self.state
+            .lock()
+            .await
+            .writers
+            .values()
+            .find(|writer| writer.name == name && writer.status == ResourceStatus::Active)
+            .cloned()
+    }
+
+    pub async fn validate_writer_append(
+        &self,
+        writer_id: Uuid,
+        feed_id: Uuid,
+        session_epoch: u64,
+        sequence: u64,
+    ) -> Result<WriterDefinition, ControlError> {
+        let state = self.state.lock().await;
+        let writer = state
+            .writers
+            .get(&writer_id)
+            .filter(|writer| writer.status == ResourceStatus::Active)
+            .ok_or_else(|| ControlError::NotFound(format!("Writer {writer_id}")))?;
+        if writer.feed_id != feed_id {
+            return Err(ControlError::InvalidOperation(
+                "Writer is bound to a different Feed".to_owned(),
+            ));
+        }
+        validate_writer_epoch(writer, session_epoch)?;
+        if sequence == 0 || sequence >= writer.next_sequence {
+            return Err(ControlError::InvalidOperation(format!(
+                "Writer sequence {sequence} was not allocated; next unallocated sequence is {}",
+                writer.next_sequence
+            )));
+        }
+        Ok(writer.clone())
+    }
+
     pub async fn active_feed_by_name(&self, name: &str) -> Option<FeedDefinition> {
         self.state
             .lock()
