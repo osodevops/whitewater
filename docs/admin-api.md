@@ -249,6 +249,8 @@ Content-Type: application/json
 
 The Control Plane allocates the sequence idempotently from `request_id`, validates the current epoch and immutable Feed binding, and rejects stale or revoked sessions before encoding. Successful responses include majority durability plus adaptive batching feedback.
 
+Send a bounded ordered batch with `POST /v1/writers/append-batch` and `{ "records": [...] }`. The initial implementation commits records sequentially in request order, stops at the first failure, and relies on each record's stable request ID for safe retry of a partially completed batch. `WriterSessionClient::append_batch` uses the same endpoint.
+
 ### Inspect and transfer Active Range placement
 
 Placement is an authenticated operator view. Writers and Readers never receive owner or replica topology.

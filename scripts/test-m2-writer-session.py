@@ -26,6 +26,13 @@ def main():
     if results[0]["deduplicated"] or not all(result["deduplicated"] for result in results[1:]): raise AssertionError("cross-Node Writer retry was not deduplicated")
     if len({result["message_id"] for result in results}) != 1: raise AssertionError("MessageId changed across retry")
     if results[0]["feedback"]["max_frame_bytes"] <= 0: raise AssertionError("server batching feedback missing")
+    batch = {"records": [
+        {"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": epoch, "event_time_ns": str(index + 2), "key_base64": "aw==", "payload_base64": "dmFsdWU=", "metadata_base64": {}}
+        for index in range(3)
+    ]}
+    status, batch_result = post(ENDPOINTS[0], "/v1/writers/append-batch", batch)
+    if status != 200 or len(batch_result["results"]) != 3: raise AssertionError("Writer batch did not commit all records")
+    if batch_result["feedback"]["recommended_batch_count"] <= 0: raise AssertionError("batch feedback missing")
     status, opened = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"OPEN WRITER SESSION {writer};"})
     new_epoch = opened["results"][0]["data"]["session_epoch"]
     stale = dict(append); stale["request_id"] = str(uuid.uuid4())

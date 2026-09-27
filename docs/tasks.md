@@ -580,7 +580,7 @@ Autoscaling must never apply one generic removal procedure to all three cases.
 - [x] Fence stale or revoked Writer sessions with a monotonically increasing epoch.
 - [x] Allocate and persist idempotent sequence state through Control Plane consensus.
 - [x] Add topology-free Writer-session append API and typed Rust `WriterSessionClient`.
-- [~] Add adaptive `auto` batching policy that tunes record count, byte size, and linger from message-size distribution, target latency, server pressure, retry rate, and bounded memory; multi-record wire batching remains to be connected.
+- [x] Add adaptive `auto` batching policy and bounded multi-record Writer API, tuning count, bytes, and linger from message sizes, target latency, server pressure, retries, and bounded memory.
 - [x] Add server feedback fields for recommended batch bytes/count, pressure, retry delay, and maximum accepted frame size without exposing physical topology.
 - [ ] Add `wcl-cli write` as an API-only frontend.
 - [ ] Add payload, file, stdin, binary, Metadata, and event-time options.

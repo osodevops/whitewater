@@ -7,7 +7,10 @@ use uuid::Uuid;
 
 use crate::{
     active_range::StorageNodeId,
-    api::{WriterAppendResponse, WriterSessionAppendRequest},
+    api::{
+        WriterAppendResponse, WriterBatchAppendRequest, WriterBatchAppendResponse,
+        WriterSessionAppendRequest,
+    },
     control::{Command, ControlExecution, PermissionAction, ReaderStart, ResourceKind, ShowKind},
 };
 
@@ -360,6 +363,17 @@ impl AdminClient {
         self.post("/v1/writers/append", request).await
     }
 
+    pub async fn append_writer_batch(
+        &self,
+        records: Vec<WriterSessionAppendRequest>,
+    ) -> Result<WriterBatchAppendResponse, AdminClientError> {
+        self.post(
+            "/v1/writers/append-batch",
+            &WriterBatchAppendRequest { records },
+        )
+        .await
+    }
+
     async fn execute_one(&self, command: Command) -> Result<ControlExecution, AdminClientError> {
         self.execute_commands(vec![command]).await
     }
@@ -398,6 +412,15 @@ impl AdminClient {
             Err(AdminClientError::Api { status, message })
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct WriterRecord {
+    pub request_id: Uuid,
+    pub event_time_ns: Option<i64>,
+    pub key: Vec<u8>,
+    pub payload: Vec<u8>,
+    pub metadata: std::collections::BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -441,6 +464,43 @@ impl WriterSessionClient {
                     .collect(),
             })
             .await
+    }
+
+    pub async fn append_batch(
+        &self,
+        records: Vec<WriterRecord>,
+    ) -> Result<WriterBatchAppendResponse, AdminClientError> {
+        let requests = records
+            .into_iter()
+            .map(|record| WriterSessionAppendRequest {
+                request_id: record.request_id,
+                writer: self.writer.clone(),
+                session_epoch: self.session_epoch,
+                event_time_ns: record.event_time_ns.map(|value| value.to_string()),
+                key_base64: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    record.key,
+                ),
+                payload_base64: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    record.payload,
+                ),
+                metadata_base64: record
+                    .metadata
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (
+                            name,
+                            base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                value,
+                            ),
+                        )
+                    })
+                    .collect(),
+            })
+            .collect();
+        self.admin.append_writer_batch(requests).await
     }
 }
 

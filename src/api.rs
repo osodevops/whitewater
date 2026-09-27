@@ -105,6 +105,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/records", get(read_records).post(append_record))
         .route("/v1/feeds/append", post(client_append))
         .route("/v1/writers/append", post(writer_session_append))
+        .route("/v1/writers/append-batch", post(writer_batch_append))
         .route("/v1/feeds/records", get(read_feed_records))
         .route("/v1/admin/wcl", post(execute_admin_wcl))
         .route("/v1/admin/commands", post(execute_admin_commands))
@@ -527,6 +528,17 @@ struct ClientAppendRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WriterBatchAppendRequest {
+    pub records: Vec<WriterSessionAppendRequest>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WriterBatchAppendResponse {
+    pub results: Vec<WriterAppendResponse>,
+    pub feedback: WriterServerFeedback,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WriterAppendResponse {
     pub message_id: Uuid,
     pub cursor: String,
@@ -540,6 +552,48 @@ struct InternalOwnerAppendResponse {
     result: Option<WriterAppendResponse>,
     error: Option<String>,
     retryable: bool,
+}
+
+async fn writer_batch_append(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<WriterBatchAppendRequest>,
+) -> Result<Json<WriterBatchAppendResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    if request.records.is_empty() || request.records.len() > 1_000 {
+        return Err(ApiError::bad_request(
+            "Writer batch must contain between 1 and 1000 records",
+        ));
+    }
+    let encoded_bytes = request.records.iter().fold(0_usize, |total, record| {
+        total
+            .saturating_add(record.key_base64.len())
+            .saturating_add(record.payload_base64.len())
+            .saturating_add(
+                record
+                    .metadata_base64
+                    .values()
+                    .map(String::len)
+                    .sum::<usize>(),
+            )
+    });
+    if encoded_bytes > crate::codec::MAX_FRAME_BYTES {
+        return Err(ApiError::bad_request(
+            "Writer batch encoded payload exceeds the maximum frame budget",
+        ));
+    }
+    let mut results = Vec::with_capacity(request.records.len());
+    for record in request.records {
+        results.push(
+            writer_session_append(State(state.clone()), headers.clone(), Json(record))
+                .await?
+                .0,
+        );
+    }
+    Ok(Json(WriterBatchAppendResponse {
+        results,
+        feedback: writer_feedback(&state.demand),
+    }))
 }
 
 async fn writer_session_append(
