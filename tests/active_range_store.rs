@@ -195,6 +195,7 @@ async fn committed_segments_rotate_and_remain_readable() {
         descriptor(),
         FileActiveRangeStoreOptions {
             max_segment_bytes: 1,
+            max_range_bytes: None,
         },
     )
     .unwrap();
@@ -282,6 +283,28 @@ async fn writer_sequence_conflicts_gaps_and_stale_retries_are_rejected() {
     assert_eq!(
         store.snapshot().await.unwrap().progress.appended().value(),
         1
+    );
+}
+
+#[tokio::test]
+async fn disk_capacity_exhaustion_rejects_append_without_advancing_progress() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open_with_options(
+        directory.path(),
+        descriptor(),
+        FileActiveRangeStoreOptions {
+            max_segment_bytes: 1024 * 1024,
+            max_range_bytes: Some(1),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        store.append(append(1, b"payload")).await,
+        Err(ActiveRangeStoreError::DiskCapacityExceeded { .. })
+    ));
+    assert_eq!(
+        store.snapshot().await.unwrap().progress.appended().value(),
+        0
     );
 }
 

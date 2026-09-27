@@ -77,12 +77,14 @@ pub struct ActiveRangeSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileActiveRangeStoreOptions {
     pub max_segment_bytes: u64,
+    pub max_range_bytes: Option<u64>,
 }
 
 impl Default for FileActiveRangeStoreOptions {
     fn default() -> Self {
         Self {
             max_segment_bytes: 256 * 1024 * 1024,
+            max_range_bytes: None,
         }
     }
 }
@@ -113,6 +115,10 @@ pub enum ActiveRangeStoreError {
     CursorTooLarge,
     #[error("RangePosition counter overflow")]
     PositionOverflow,
+    #[error(
+        "replica storage capacity is exhausted: required={required} bytes, limit={limit} bytes"
+    )]
+    DiskCapacityExceeded { required: u64, limit: u64 },
     #[error("replica append has a position gap: expected={expected}, supplied={supplied}")]
     PositionGap {
         expected: RangePosition,
@@ -470,6 +476,17 @@ fn segment_path(directory: &Path, segment: u64) -> PathBuf {
     directory.join(format!("segment-{segment:06}.log"))
 }
 
+fn range_segment_bytes(directory: &Path, active_segment: u64) -> Result<u64, std::io::Error> {
+    let mut total = 0_u64;
+    for segment in 0..=active_segment {
+        let path = segment_path(directory, segment);
+        if path.exists() {
+            total = total.saturating_add(path.metadata()?.len());
+        }
+    }
+    Ok(total)
+}
+
 fn open_segment(directory: &Path, segment: u64) -> Result<File, std::io::Error> {
     OpenOptions::new()
         .create(true)
@@ -659,6 +676,13 @@ fn append(
         message_id: record.message_id,
     };
     let encoded = encode_entry(&decoded)?;
+    if let Some(limit) = inner.options.max_range_bytes {
+        let required = range_segment_bytes(&inner.directory, loaded.persisted.active_segment)?
+            .saturating_add(encoded.len() as u64);
+        if required > limit {
+            return Err(ActiveRangeStoreError::DiskCapacityExceeded { required, limit });
+        }
+    }
     rotate_if_needed(inner, &mut loaded, encoded.len() as u64)?;
     let entry_start = loaded.active_file.seek(SeekFrom::End(0))?;
     loaded.active_file.write_all(&encoded)?;
