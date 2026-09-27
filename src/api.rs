@@ -103,6 +103,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/streams/describe", get(describe_stream))
         .route("/v1/records", get(read_records).post(append_record))
         .route("/v1/feeds/append", post(client_append))
+        .route("/v1/writers/append", post(writer_session_append))
         .route("/v1/feeds/records", get(read_feed_records))
         .route("/v1/admin/wcl", post(execute_admin_wcl))
         .route("/v1/admin/commands", post(execute_admin_commands))
@@ -537,6 +538,57 @@ struct InternalOwnerAppendResponse {
     result: Option<WriterAppendResponse>,
     error: Option<String>,
     retryable: bool,
+}
+
+async fn writer_session_append(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<WriterSessionAppendRequest>,
+) -> Result<Json<WriterAppendResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let writer = state
+        .control
+        .active_writer_by_name(&request.writer)
+        .await
+        .ok_or_else(|| ApiError::bad_request(format!("Writer does not exist: {}", request.writer)))?;
+    let feed = state
+        .control
+        .active_feed_by_id(writer.feed_id)
+        .await
+        .ok_or_else(|| ApiError::bad_request("Writer Feed does not exist"))?;
+    let commands = vec![crate::control::Command::AllocateWriterSequence {
+        writer: request.writer,
+        session_epoch: request.session_epoch,
+    }];
+    let execution = match &state.control_plane {
+        Some(control_plane) => control_plane
+            .execute_commands_with_request_id(commands, request.request_id)
+            .await
+            .map_err(|error| ApiError::bad_request(error.to_string()))?,
+        None => state
+            .control
+            .execute_commands_with_request_id(commands, request.request_id)
+            .await?,
+    };
+    let sequence = execution.results[0].data["sequence"]
+        .as_u64()
+        .ok_or_else(|| ApiError::unavailable("Writer sequence allocation returned no sequence"))?;
+    client_append(
+        State(state),
+        headers,
+        Json(ClientAppendRequest {
+            request_id: request.request_id,
+            feed: feed.name,
+            writer_session_id: writer.writer_id,
+            writer_epoch: request.session_epoch,
+            sequence,
+            event_time_ns: request.event_time_ns,
+            key_base64: request.key_base64,
+            payload_base64: request.payload_base64,
+            metadata_base64: request.metadata_base64,
+        }),
+    )
+    .await
 }
 
 async fn client_append(

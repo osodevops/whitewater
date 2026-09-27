@@ -582,6 +582,16 @@ impl ControlController {
         Ok(writer.clone())
     }
 
+    pub async fn active_feed_by_id(&self, feed_id: Uuid) -> Option<FeedDefinition> {
+        self.state
+            .lock()
+            .await
+            .feeds
+            .get(&feed_id)
+            .filter(|feed| feed.status == ResourceStatus::Active)
+            .cloned()
+    }
+
     pub async fn active_feed_by_name(&self, name: &str) -> Option<FeedDefinition> {
         self.state
             .lock()
