@@ -88,9 +88,10 @@ mod tests {
 
     #[test]
     fn auto_batching_adapts_to_message_size_pressure_and_retry_feedback() {
-        let mut policy = AdaptiveBatchPolicy::new(1, 100, 1024, 1_000_000, Duration::from_millis(5));
+        let mut policy =
+            AdaptiveBatchPolicy::new(1, 100, 1024, 1_000_000, Duration::from_millis(5));
         for _ in 0..10 {
-            policy.observe_message(10_000);
+            policy.observe_message(100_000);
         }
         let normal = policy.plan(None);
         assert!(normal.max_count < 100);

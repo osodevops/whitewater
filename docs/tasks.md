@@ -579,9 +579,9 @@ Autoscaling must never apply one generic removal procedure to all three cases.
 - [x] Bind sessions to immutable WriterId and FeedId.
 - [x] Fence stale or revoked Writer sessions with a monotonically increasing epoch.
 - [x] Allocate and persist idempotent sequence state through Control Plane consensus.
-- [ ] Add typed append SDK API.
-- [ ] Add adaptive `auto` batching that tunes record count and byte size from message-size distribution, observed throughput, target latency, server pressure feedback, retry rate, and bounded in-flight memory; retain explicit latency/throughput/manual modes.
-- [ ] Add server feedback fields for recommended batch bytes/count, pressure, retry delay, and maximum accepted frame size without exposing physical topology.
+- [x] Add topology-free Writer-session append API and typed Rust `WriterSessionClient`.
+- [~] Add adaptive `auto` batching policy that tunes record count, byte size, and linger from message-size distribution, target latency, server pressure, retry rate, and bounded memory; multi-record wire batching remains to be connected.
+- [x] Add server feedback fields for recommended batch bytes/count, pressure, retry delay, and maximum accepted frame size without exposing physical topology.
 - [ ] Add `wcl-cli write` as an API-only frontend.
 - [ ] Add payload, file, stdin, binary, Metadata, and event-time options.
 - [x] Add Writer session inspection through `DESCRIBE WRITER` and epoch-checked revocation.
@@ -594,10 +594,16 @@ Evidence:
 - Restart tests prove session state persists, a newer session fences the previous epoch, and revocation prevents further allocation.
 - Rust `AdminClient` methods and WCL commands expose open, allocate, inspect, and revoke operations through the same typed controller.
 
+Additional evidence:
+
+- `python scripts/test-m2-writer-session.py` verifies session creation, automatic idempotent sequence allocation, append through all three ingress Nodes, stable MessageId, stale-epoch rejection, revocation, and batching feedback.
+- The adaptive policy has unit coverage for message-size, pressure, retry, frame-size, and retry-delay adjustments.
+- Full Rust verification passes with 45 library tests plus all existing integration suites.
+
 Definition of Done:
 
-- [ ] Applications append without knowing owner, range, replica, epoch, or sequence internals.
-- [ ] Ambiguous retry returns original MessageId and Cursor.
+- [x] Applications append without knowing owner, range, replica, ownership epoch, or sequence internals.
+- [x] Ambiguous retry returns original MessageId and Cursor.
 - [ ] CLI and SDK use the same data API.
 
 ## Milestone 3 — Reader sessions and live delivery

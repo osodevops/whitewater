@@ -227,6 +227,28 @@ Kinds are `spaces`, `feeds`, `writers`, `readers`, `roles`, and `grants`.
 
 `DESCRIBE WRITER checkout` returns the immutable WriterId/FeedId binding, current session epoch, next sequence, and active/revoked state. Retrying sequence allocation with the same batch request ID returns the original allocation.
 
+Applications append without managing sequence numbers:
+
+```http
+POST /v1/writers/append
+Authorization: Bearer <api-key>
+Content-Type: application/json
+```
+
+```json
+{
+  "request_id": "018f5f65-5d87-7c2e-a9a3-3af92c48ed21",
+  "writer": "checkout",
+  "session_epoch": 1,
+  "event_time_ns": "1700000000123456789",
+  "key_base64": "b3JkZXItMTIz",
+  "payload_base64": "eyJvcmRlcklkIjoiQTEwMCJ9",
+  "metadata_base64": {}
+}
+```
+
+The Control Plane allocates the sequence idempotently from `request_id`, validates the current epoch and immutable Feed binding, and rejects stale or revoked sessions before encoding. Successful responses include majority durability plus adaptive batching feedback.
+
 ### Inspect and transfer Active Range placement
 
 Placement is an authenticated operator view. Writers and Readers never receive owner or replica topology.

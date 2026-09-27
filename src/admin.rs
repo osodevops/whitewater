@@ -422,10 +422,7 @@ impl WriterSessionClient {
                 writer: self.writer.clone(),
                 session_epoch: self.session_epoch,
                 event_time_ns: event_time_ns.map(|value| value.to_string()),
-                key_base64: base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    key,
-                ),
+                key_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key),
                 payload_base64: base64::Engine::encode(
                     &base64::engine::general_purpose::STANDARD,
                     payload,

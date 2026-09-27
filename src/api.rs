@@ -49,6 +49,7 @@ use crate::{
     domain::{AppendInput, CursorRecord, StorageStats, StoredRecord},
     membership::{JoinResponse, MemberAnnouncement, MemberView, MembershipService},
     storage::{LogStore, StorageError},
+    writer::WriterServerFeedback,
 };
 
 #[derive(Clone)]
@@ -531,6 +532,7 @@ pub struct WriterAppendResponse {
     pub cursor: String,
     pub deduplicated: bool,
     pub durability: String,
+    pub feedback: WriterServerFeedback,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -550,7 +552,9 @@ async fn writer_session_append(
         .control
         .active_writer_by_name(&request.writer)
         .await
-        .ok_or_else(|| ApiError::bad_request(format!("Writer does not exist: {}", request.writer)))?;
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("Writer does not exist: {}", request.writer))
+        })?;
     let feed = state
         .control
         .active_feed_by_id(writer.feed_id)
@@ -565,10 +569,12 @@ async fn writer_session_append(
             .execute_commands_with_request_id(commands, request.request_id)
             .await
             .map_err(|error| ApiError::bad_request(error.to_string()))?,
-        None => state
-            .control
-            .execute_commands_with_request_id(commands, request.request_id)
-            .await?,
+        None => {
+            state
+                .control
+                .execute_commands_with_request_id(commands, request.request_id)
+                .await?
+        }
     };
     let sequence = execution.results[0].data["sequence"]
         .as_u64()
@@ -775,7 +781,24 @@ async fn owner_append_local(
         cursor: result.cursor,
         deduplicated: result.deduplicated,
         durability: "majority_committed".to_owned(),
+        feedback: writer_feedback(&state.demand),
     })
+}
+
+fn writer_feedback(demand: &DemandMetrics) -> WriterServerFeedback {
+    let snapshot = demand.snapshot();
+    let pressure = (snapshot.requests_in_flight as f64 / 100.0).clamp(0.0, 1.0);
+    WriterServerFeedback {
+        recommended_batch_count: if pressure > 0.75 { 16 } else { 100 },
+        recommended_batch_bytes: if pressure > 0.75 {
+            256 * 1024
+        } else {
+            1024 * 1024
+        },
+        pressure,
+        retry_after_ms: if pressure > 0.9 { 50 } else { 0 },
+        max_frame_bytes: crate::codec::MAX_FRAME_BYTES,
+    }
 }
 
 fn deterministic_uuid(request_id: Uuid, label: &str) -> Uuid {
