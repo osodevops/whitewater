@@ -31,10 +31,11 @@ use uuid::Uuid;
 
 use crate::{
     active_range::{
-        AppendIdentity, MajorityAppendCoordinator, MajorityAppendError, ReplicaAppendRequest,
-        ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitRequest, ReplicaCommitResponse,
-        ReplicaProgressRequest, ReplicaProgressResponse, ReplicaReconcileRequest,
-        ReplicaReconcileResponse, StorageNodeId, MAX_REPLICA_FRAME_BASE64_BYTES,
+        AppendIdentity, MajorityAppendCoordinator, MajorityAppendError, RepairExportRequest,
+        RepairExportResponse, RepairFrame, ReplicaAppendRequest, ReplicaAppendResponse,
+        ReplicaAppendService, ReplicaCommitRequest, ReplicaCommitResponse, ReplicaProgressRequest,
+        ReplicaProgressResponse, ReplicaReconcileRequest, ReplicaReconcileResponse, StorageNodeId,
+        MAX_REPLICA_FRAME_BASE64_BYTES,
     },
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
@@ -92,6 +93,10 @@ pub fn router(state: AppState) -> Router {
         state.clone(),
         authorize_replica_append,
     ));
+    let repair_export_route = post(repair_export).layer(middleware::from_fn_with_state(
+        state.clone(),
+        authorize_replica_append,
+    ));
     Router::new()
         .route("/health", get(health))
         .route("/v1/streams", get(list_streams).post(create_stream))
@@ -141,6 +146,7 @@ pub fn router(state: AppState) -> Router {
             "/internal/active-range/recovery/reconcile",
             recovery_reconcile_route,
         )
+        .route("/internal/active-range/repair/export", repair_export_route)
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
         .route(
@@ -452,6 +458,40 @@ async fn recovery_reconcile(
         },
         None => ReplicaReconcileResponse {
             removed_records: None,
+            error: Some("replica storage is not configured".to_owned()),
+        },
+    };
+    Json(response)
+}
+
+async fn repair_export(
+    State(state): State<AppState>,
+    Json(request): Json<RepairExportRequest>,
+) -> Json<RepairExportResponse> {
+    let response = match &state.replica_append {
+        Some(service) => match service
+            .export_committed(request.feed_id, request.after, request.limit)
+            .await
+        {
+            Ok(frames) => RepairExportResponse {
+                frames: frames
+                    .into_iter()
+                    .map(|item| RepairFrame {
+                        position: item.position,
+                        identity: item.identity,
+                        cursor: item.cursor,
+                        frame_base64: STANDARD.encode(item.frame),
+                    })
+                    .collect(),
+                error: None,
+            },
+            Err(error) => RepairExportResponse {
+                frames: Vec::new(),
+                error: Some(error.to_string()),
+            },
+        },
+        None => RepairExportResponse {
+            frames: Vec::new(),
             error: Some("replica storage is not configured".to_owned()),
         },
     };

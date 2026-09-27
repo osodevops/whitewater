@@ -1,6 +1,7 @@
 pub mod majority;
 pub mod model;
 pub mod recovery;
+pub mod repair;
 pub mod replication;
 pub mod store;
 
@@ -19,6 +20,10 @@ pub use recovery::{
     OwnerRecoveryPlan, RecoveryExecutionError, RecoverySupervisor, RecoveryTransport,
     ReplicaProgressRequest, ReplicaProgressResponse, ReplicaReconcileRequest,
     ReplicaReconcileResponse, ReplicaRecoveryStatus,
+};
+pub use repair::{
+    repair_replica, LocalRepairSupervisor, RepairExportRequest, RepairExportResponse, RepairFrame,
+    ReplicaRepairError, ReplicaRepairProgress,
 };
 pub use replication::{
     ReplicaAppendAccepted, ReplicaAppendError, ReplicaAppendErrorCode, ReplicaAppendRequest,

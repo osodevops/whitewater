@@ -235,6 +235,64 @@ impl ReplicaAppendService {
             .map_err(map_store_error)
     }
 
+    pub async fn export_committed(
+        &self,
+        feed_id: Uuid,
+        after: Option<RangePosition>,
+        limit: usize,
+    ) -> Result<Vec<super::StoredRangeFrame>, ReplicaAppendError> {
+        let assignment = self
+            .control
+            .active_range_assignment(feed_id)
+            .await
+            .ok_or_else(|| {
+                ReplicaAppendError::temporary(
+                    ReplicaAppendErrorCode::AssignmentNotFound,
+                    format!("no committed Active Range assignment exists for Feed {feed_id}"),
+                )
+            })?;
+        self.store_for(&assignment)
+            .await?
+            .read_committed(after, limit)
+            .await
+            .map_err(map_store_error)
+    }
+
+    pub async fn quarantine_for_repair(
+        &self,
+        feed_id: Uuid,
+    ) -> Result<Option<PathBuf>, ReplicaAppendError> {
+        let assignment = self
+            .control
+            .active_range_assignment(feed_id)
+            .await
+            .ok_or_else(|| {
+                ReplicaAppendError::temporary(
+                    ReplicaAppendErrorCode::AssignmentNotFound,
+                    format!("no committed Active Range assignment exists for Feed {feed_id}"),
+                )
+            })?;
+        self.stores.write().await.remove(&assignment.range_id);
+        let directory = self
+            .root
+            .join(assignment.feed_id.to_string())
+            .join(assignment.range_id.to_string())
+            .join(format!("generation-{}", assignment.generation.value()));
+        if !directory.exists() {
+            return Ok(None);
+        }
+        let quarantine = directory.with_extension(format!("corrupt-{}", Uuid::new_v4()));
+        tokio::task::spawn_blocking({
+            let directory = directory.clone();
+            let quarantine = quarantine.clone();
+            move || std::fs::rename(directory, &quarantine)
+        })
+        .await
+        .map_err(|error| ReplicaAppendError::storage(error.to_string()))?
+        .map_err(|error| ReplicaAppendError::storage(error.to_string()))?;
+        Ok(Some(quarantine))
+    }
+
     pub async fn read_committed(
         &self,
         feed_id: Uuid,

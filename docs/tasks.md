@@ -344,17 +344,30 @@ Completion evidence:
 
 ## M1.10 — Replica catch-up and repair
 
-- [ ] Detect an under-replicated Active Range.
-- [ ] Request missing committed frames or sealed segments.
-- [ ] Verify transferred checksums.
-- [ ] Catch up before marking a replica healthy.
-- [ ] Rebuild Writer deduplication state where required.
-- [ ] Expose catch-up progress and limiting resource.
+- [x] Connect under-replication detection to automatic local repair scheduling.
+- [x] Request missing committed frames in bounded resumable batches.
+- [x] Verify transferred frame checksums and accepted position/digest.
+- [x] Refuse readiness until target CommitPosition matches the verified source.
+- [x] Rebuild Writer deduplication state from transferred frames.
+- [x] Quarantine a corrupt replica directory before rebuilding from a verified source.
+- [x] Expose transferred records, bytes, source/target CommitPosition, quarantine status, limiting resource, and readiness.
+- [x] Use frame batches for current gaps; sealed-segment transfer remains a Milestone 8 optimization rather than a correctness dependency.
 
-Evidence required:
+Evidence:
 
-- Restarted replica catches up automatically.
-- Corrupt replica is repaired from a verified copy.
+- `src/active_range/repair.rs`
+- `tests/replica_repair.rs`
+- Missing committed frames transfer in configurable batches, preserve exact bytes/Cursors, advance commit evidence, and rebuild deduplication state.
+- Complete-entry corruption fails normal recovery, triggers directory quarantine, and rebuilds from a checksummed healthy source without deleting forensic evidence.
+- Two integration tests prove missing-frame catch-up and corrupt-replica quarantine/rebuild.
+
+Completion evidence:
+
+- Every replica runs a local repair supervisor that compares itself with the current owner and pulls bounded committed-frame batches over an authenticated internal endpoint.
+- A restarted replica remains behind until exact position/digest verification and CommitPosition catch-up complete.
+- Corrupt generations are quarantined before a clean rebuild; forensic bytes are retained.
+- `python scripts/test-m110-replica-catchup.py` stops a non-owner replica, commits three records while it is down, restarts it, and waits until all three records are readable locally.
+- The live three-Node catch-up acceptance test passed.
 
 ## M1.11 — Fault suite
 
@@ -744,7 +757,11 @@ These tests accumulate across milestones and must never regress:
 16. [x] Route Feed reads through committed Active Range storage and return only committed opaque Cursors.
 17. [x] Write M1.9 owner-failure tests for stale-owner fencing, committed-prefix preservation, and uncommitted-tail removal.
 18. [x] Implement automatic owner failure detection, consensus-backed epoch transfer, replica reconciliation, and live Docker acceptance.
-19. [ ] Write the failing M1.10 tests for under-replication detection, missing-frame transfer, checksum verification, and corrupt-replica replacement.
-20. [ ] Implement replica catch-up and repair before marking a replacement healthy.
+19. [x] Write M1.10 tests for missing-frame transfer, checksum verification, readiness gating, deduplication rebuild, and corrupt-replica quarantine.
+20. [x] Implement bounded exact-frame catch-up and repair before marking a replacement ready.
+21. [x] Connect restarted/under-replicated Node detection to automatic repair scheduling and add a live three-Node restart/catch-up test.
+22. [x] Expose repair progress and limiting-resource diagnostics; defer sealed-segment transfer to tiered-history optimization.
+23. [ ] Automate the complete M1.11 crash, network, disk, retry, and restart fault matrix.
+24. [ ] Prove Milestone 1 D1-D10 without acknowledged loss, uncommitted visibility, stale-owner writes, or duplicate logical records.
 
 The first unchecked item in this section is the next task unless a blocking architecture decision is recorded above.

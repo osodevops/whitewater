@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use anyhow::Result;
 use finnstream::{
     active_range::{
-        HttpRecoveryTransport, HttpReplicaTransport, MajorityAppendCoordinator, RecoverySupervisor,
-        ReplicaAppendService, StorageNodeId,
+        HttpRecoveryTransport, HttpReplicaTransport, LocalRepairSupervisor,
+        MajorityAppendCoordinator, RecoverySupervisor, ReplicaAppendService, StorageNodeId,
     },
     admin::AdminAuthenticator,
     api::{router, AppState},
@@ -128,6 +128,22 @@ async fn main() -> Result<()> {
         }
         _ => None,
     };
+    let repair_supervisor = match (
+        replica_append.clone(),
+        config.control_node_id,
+        config.control_plane_key.clone(),
+    ) {
+        (Some(local), Some(node_id), Some(key)) => Some(LocalRepairSupervisor::new(
+            StorageNodeId::try_new(format!("control-{node_id}"))?,
+            local,
+            control.clone(),
+            control_endpoints.clone(),
+            key,
+            Duration::from_secs(5),
+            256,
+        )?),
+        _ => None,
+    };
     if let (Some(control_plane), Some(first_node)) = (
         control_plane.clone(),
         config.control_nodes.iter().map(|(id, _)| *id).min(),
@@ -175,6 +191,30 @@ async fn main() -> Result<()> {
             }
         })
     });
+    let repair_task = repair_supervisor.map(|supervisor| {
+        let mut shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        for result in supervisor.tick().await {
+                            match result {
+                                Ok(progress) if progress.ready => {
+                                    tracing::info!(transferred_records = progress.transferred_records, transferred_bytes = progress.transferred_bytes, "Active Range replica catch-up completed");
+                                }
+                                Ok(_) => {}
+                                Err(error) => tracing::warn!(%error, "Active Range replica repair attempt failed"),
+                            }
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        })
+    });
     let app = router(AppState {
         store,
         membership,
@@ -204,6 +244,9 @@ async fn main() -> Result<()> {
     let _ = membership_task.await;
     if let Some(recovery_task) = recovery_task {
         let _ = recovery_task.await;
+    }
+    if let Some(repair_task) = repair_task {
+        let _ = repair_task.await;
     }
     if let Some(control_plane) = control_plane {
         let _ = control_plane.raft().shutdown().await;
