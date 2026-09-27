@@ -11,3 +11,4 @@ pub mod demand;
 pub mod domain;
 pub mod membership;
 pub mod storage;
+pub mod writer;
