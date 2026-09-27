@@ -575,16 +575,24 @@ Autoscaling must never apply one generic removal procedure to all three cases.
 
 **Status: Current focus**
 
-- [ ] Implement authenticated WriterSession creation.
-- [ ] Bind sessions to immutable WriterId and FeedId.
-- [ ] Fence stale Writer sessions with epoch.
-- [ ] Allocate and persist sequence state.
+- [x] Implement authenticated WriterSession creation through the Admin API and WCL.
+- [x] Bind sessions to immutable WriterId and FeedId.
+- [x] Fence stale or revoked Writer sessions with a monotonically increasing epoch.
+- [x] Allocate and persist idempotent sequence state through Control Plane consensus.
 - [ ] Add typed append SDK API.
 - [ ] Add adaptive `auto` batching that tunes record count and byte size from message-size distribution, observed throughput, target latency, server pressure feedback, retry rate, and bounded in-flight memory; retain explicit latency/throughput/manual modes.
 - [ ] Add server feedback fields for recommended batch bytes/count, pressure, retry delay, and maximum accepted frame size without exposing physical topology.
 - [ ] Add `wcl-cli write` as an API-only frontend.
 - [ ] Add payload, file, stdin, binary, Metadata, and event-time options.
-- [ ] Add Writer session inspection and revocation.
+- [x] Add Writer session inspection through `DESCRIBE WRITER` and epoch-checked revocation.
+
+Evidence:
+
+- Writer definitions persist `session_epoch`, `next_sequence`, and active/revoked state in Control Plane catalog snapshots.
+- Opening a session increments the epoch and resets sequence allocation for the newly fenced incarnation.
+- Sequence allocation is replicated and idempotent by request ID; retry returns the original sequence.
+- Restart tests prove session state persists, a newer session fences the previous epoch, and revocation prevents further allocation.
+- Rust `AdminClient` methods and WCL commands expose open, allocate, inspect, and revoke operations through the same typed controller.
 
 Definition of Done:
 

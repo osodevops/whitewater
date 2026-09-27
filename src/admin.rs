@@ -182,6 +182,40 @@ impl AdminClient {
         .await
     }
 
+    pub async fn open_writer_session(
+        &self,
+        writer: impl Into<String>,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::OpenWriterSession {
+            writer: writer.into(),
+        })
+        .await
+    }
+
+    pub async fn allocate_writer_sequence(
+        &self,
+        writer: impl Into<String>,
+        session_epoch: u64,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::AllocateWriterSequence {
+            writer: writer.into(),
+            session_epoch,
+        })
+        .await
+    }
+
+    pub async fn revoke_writer_session(
+        &self,
+        writer: impl Into<String>,
+        session_epoch: u64,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::RevokeWriterSession {
+            writer: writer.into(),
+            session_epoch,
+        })
+        .await
+    }
+
     pub async fn create_reader(
         &self,
         name: impl Into<String>,

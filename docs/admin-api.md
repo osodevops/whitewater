@@ -217,6 +217,16 @@ Kinds are `spaces`, `feeds`, `writers`, `readers`, `roles`, and `grants`.
 }
 ```
 
+### Writer sessions
+
+```json
+{ "command": "open_writer_session", "writer": "checkout" }
+{ "command": "allocate_writer_sequence", "writer": "checkout", "session_epoch": 1 }
+{ "command": "revoke_writer_session", "writer": "checkout", "session_epoch": 1 }
+```
+
+`DESCRIBE WRITER checkout` returns the immutable WriterId/FeedId binding, current session epoch, next sequence, and active/revoked state. Retrying sequence allocation with the same batch request ID returns the original allocation.
+
 ### Inspect and transfer Active Range placement
 
 Placement is an authenticated operator view. Writers and Readers never receive owner or replica topology.

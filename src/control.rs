@@ -52,6 +52,16 @@ pub struct WriterDefinition {
     pub feed_id: Uuid,
     pub status: ResourceStatus,
     pub created_at_ns: i64,
+    #[serde(default)]
+    pub session_epoch: u64,
+    #[serde(default = "default_writer_sequence")]
+    pub next_sequence: u64,
+    #[serde(default)]
+    pub session_active: bool,
+}
+
+fn default_writer_sequence() -> u64 {
+    1
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -164,6 +174,17 @@ pub enum Command {
     CreateWriter {
         name: String,
         feed: String,
+    },
+    OpenWriterSession {
+        writer: String,
+    },
+    AllocateWriterSequence {
+        writer: String,
+        session_epoch: u64,
+    },
+    RevokeWriterSession {
+        writer: String,
+        session_epoch: u64,
     },
     CreateReader {
         name: String,
@@ -638,11 +659,59 @@ impl ControlController {
                     feed_id,
                     status: ResourceStatus::Active,
                     created_at_ns: issued_at_ns,
+                    session_epoch: 0,
+                    next_sequence: 1,
+                    session_active: false,
                 };
                 state
                     .writers
                     .insert(definition.writer_id, definition.clone());
                 Ok((format!("created Writer {name}"), json!(definition)))
+            }
+            Command::OpenWriterSession { writer } => {
+                let definition = active_writer_mut(state, &writer)?;
+                definition.session_epoch =
+                    definition.session_epoch.checked_add(1).ok_or_else(|| {
+                        ControlError::InvalidOperation("Writer session epoch overflow".to_owned())
+                    })?;
+                definition.next_sequence = 1;
+                definition.session_active = true;
+                Ok((
+                    format!("opened Writer session {writer}"),
+                    json!(definition.clone()),
+                ))
+            }
+            Command::AllocateWriterSequence {
+                writer,
+                session_epoch,
+            } => {
+                let definition = active_writer_mut(state, &writer)?;
+                validate_writer_epoch(definition, session_epoch)?;
+                let sequence = definition.next_sequence;
+                definition.next_sequence = sequence.checked_add(1).ok_or_else(|| {
+                    ControlError::InvalidOperation("Writer sequence overflow".to_owned())
+                })?;
+                Ok((
+                    format!("allocated Writer sequence {sequence} for {writer}"),
+                    json!({
+                        "writer_id": definition.writer_id,
+                        "feed_id": definition.feed_id,
+                        "session_epoch": definition.session_epoch,
+                        "sequence": sequence
+                    }),
+                ))
+            }
+            Command::RevokeWriterSession {
+                writer,
+                session_epoch,
+            } => {
+                let definition = active_writer_mut(state, &writer)?;
+                validate_writer_epoch(definition, session_epoch)?;
+                definition.session_active = false;
+                Ok((
+                    format!("revoked Writer session {writer}"),
+                    json!(definition.clone()),
+                ))
             }
             Command::CreateReader { name, feed, start } => {
                 validate_dotted_name(&name)?;
@@ -1058,6 +1127,39 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 "CREATE supports SPACE, FEED, WRITER, READER, and ROLE".to_owned(),
             )),
         },
+        Some("OPEN") => {
+            expect_keyword(&tokens, 1, "WRITER")?;
+            expect_keyword(&tokens, 2, "SESSION")?;
+            Ok(Command::OpenWriterSession {
+                writer: token(&tokens, 3)?.to_owned(),
+            })
+        }
+        Some("ALLOCATE") => {
+            expect_keyword(&tokens, 1, "WRITER")?;
+            expect_keyword(&tokens, 2, "SEQUENCE")?;
+            expect_keyword(&tokens, 4, "EPOCH")?;
+            Ok(Command::AllocateWriterSequence {
+                writer: token(&tokens, 3)?.to_owned(),
+                session_epoch: token(&tokens, 5)?.parse().map_err(|_| {
+                    ControlError::Syntax(
+                        "Writer session epoch must be an unsigned integer".to_owned(),
+                    )
+                })?,
+            })
+        }
+        Some("REVOKE") => {
+            expect_keyword(&tokens, 1, "WRITER")?;
+            expect_keyword(&tokens, 2, "SESSION")?;
+            expect_keyword(&tokens, 4, "EPOCH")?;
+            Ok(Command::RevokeWriterSession {
+                writer: token(&tokens, 3)?.to_owned(),
+                session_epoch: token(&tokens, 5)?.parse().map_err(|_| {
+                    ControlError::Syntax(
+                        "Writer session epoch must be an unsigned integer".to_owned(),
+                    )
+                })?,
+            })
+        }
         Some("RENAME") => {
             let kind = parse_resource_kind(token(&tokens, 1)?)?;
             expect_keyword(&tokens, 3, "TO")?;
@@ -1333,6 +1435,36 @@ fn active_feed_mut<'a>(
         .ok_or_else(|| ControlError::NotFound(format!("Feed {name}")))
 }
 
+fn active_writer_mut<'a>(
+    state: &'a mut CatalogState,
+    name: &str,
+) -> Result<&'a mut WriterDefinition, ControlError> {
+    state
+        .writers
+        .values_mut()
+        .find(|item| item.name == name && item.status == ResourceStatus::Active)
+        .ok_or_else(|| ControlError::NotFound(format!("Writer {name}")))
+}
+
+fn validate_writer_epoch(
+    writer: &WriterDefinition,
+    session_epoch: u64,
+) -> Result<(), ControlError> {
+    if !writer.session_active {
+        return Err(ControlError::InvalidOperation(format!(
+            "Writer {} has no active session",
+            writer.name
+        )));
+    }
+    if writer.session_epoch != session_epoch {
+        return Err(ControlError::InvalidOperation(format!(
+            "stale Writer session epoch: current={}, supplied={session_epoch}",
+            writer.session_epoch
+        )));
+    }
+    Ok(())
+}
+
 fn active_reader_mut<'a>(
     state: &'a mut CatalogState,
     name: &str,
@@ -1521,6 +1653,9 @@ fn command_label(command: &Command) -> String {
         Command::CreateSpace { .. } => "CREATE SPACE",
         Command::CreateFeed { .. } => "CREATE FEED",
         Command::CreateWriter { .. } => "CREATE WRITER",
+        Command::OpenWriterSession { .. } => "OPEN WRITER SESSION",
+        Command::AllocateWriterSequence { .. } => "ALLOCATE WRITER SEQUENCE",
+        Command::RevokeWriterSession { .. } => "REVOKE WRITER SESSION",
         Command::CreateReader { .. } => "CREATE READER",
         Command::CreateRole { .. } => "CREATE ROLE",
         Command::Rename { .. } => "RENAME",
@@ -1653,6 +1788,58 @@ mod tests {
             .unwrap();
         assert_eq!(result.results[0].data["acknowledged_cursor"], "cursor-a");
         assert_eq!(result.results[1].data["acknowledged_cursor"], "cursor-b");
+    }
+
+    #[tokio::test]
+    async fn writer_sessions_persist_allocate_idempotently_and_fence_stale_epochs() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute(
+                "CREATE SPACE orders; CREATE FEED orders.events; CREATE WRITER checkout TO orders.events; OPEN WRITER SESSION checkout;",
+            )
+            .await
+            .unwrap();
+        let request_id = Uuid::from_u128(8_001);
+        let command = vec![Command::AllocateWriterSequence {
+            writer: "checkout".to_owned(),
+            session_epoch: 1,
+        }];
+        let first = controller
+            .execute_commands_with_request_id(command.clone(), request_id)
+            .await
+            .unwrap();
+        let retry = controller
+            .execute_commands_with_request_id(command, request_id)
+            .await
+            .unwrap();
+        assert_eq!(first.results[0].data, retry.results[0].data);
+        assert_eq!(first.results[0].data["sequence"], 1);
+        drop(controller);
+
+        let reopened = new_controller(&directory);
+        let opened = reopened
+            .execute("OPEN WRITER SESSION checkout;")
+            .await
+            .unwrap();
+        assert_eq!(opened.results[0].data["session_epoch"], 2);
+        assert!(reopened
+            .execute("ALLOCATE WRITER SEQUENCE checkout EPOCH 1;")
+            .await
+            .is_err());
+        let allocated = reopened
+            .execute("ALLOCATE WRITER SEQUENCE checkout EPOCH 2;")
+            .await
+            .unwrap();
+        assert_eq!(allocated.results[0].data["sequence"], 1);
+        reopened
+            .execute("REVOKE WRITER SESSION checkout EPOCH 2;")
+            .await
+            .unwrap();
+        assert!(reopened
+            .execute("ALLOCATE WRITER SEQUENCE checkout EPOCH 2;")
+            .await
+            .is_err());
     }
 
     #[tokio::test]

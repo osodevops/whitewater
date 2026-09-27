@@ -259,6 +259,17 @@ RENAME ROLE orderanalytics TO businessanalytics;
 
 A Space containing active Feeds cannot currently be renamed. Rename or move its Feeds first.
 
+## Writer sessions
+
+```sql
+OPEN WRITER SESSION checkout;
+ALLOCATE WRITER SEQUENCE checkout EPOCH 1;
+DESCRIBE WRITER checkout;
+REVOKE WRITER SESSION checkout EPOCH 1;
+```
+
+Opening a new session increments the Writer epoch and fences every previous session. Sequence allocation is persisted by the Control Plane and idempotent when the caller retries with the same request ID. Revoked or stale epochs cannot allocate further sequences.
+
 ## Seek Readers
 
 ```sql
