@@ -108,6 +108,14 @@ whitewater> CREATE FEED orders.created;
 whitewater> SHOW FEEDS;
 ```
 
+Write through a durable Writer session without managing sequence or topology internals:
+
+```bash
+wwctl write --writer checkout --session-epoch 1 --key order-123 --payload '{"status":"created"}'
+```
+
+Use `--payload-file`, `--payload-stdin`, `--payload-base64`, repeated `--metadata name=base64`, `--event-time-ns`, and `--request-id` for binary and retry-safe workflows.
+
 Or call the controller directly:
 
 ```bash

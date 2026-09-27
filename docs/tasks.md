@@ -582,8 +582,8 @@ Autoscaling must never apply one generic removal procedure to all three cases.
 - [x] Add topology-free Writer-session append API and typed Rust `WriterSessionClient`.
 - [x] Add adaptive `auto` batching policy and bounded multi-record Writer API, tuning count, bytes, and linger from message sizes, target latency, server pressure, retries, and bounded memory.
 - [x] Add server feedback fields for recommended batch bytes/count, pressure, retry delay, and maximum accepted frame size without exposing physical topology.
-- [ ] Add `wcl-cli write` as an API-only frontend.
-- [ ] Add payload, file, stdin, binary, Metadata, and event-time options.
+- [~] Add Writer CLI frontends: `wwctl write` is complete; the standalone PowerShell `wcl-cli write` wrapper remains.
+- [x] Add text/base64 key and payload, file, stdin, binary, Metadata, event-time, request-ID, and JSON response options to `wwctl write`.
 - [x] Add Writer session inspection through `DESCRIBE WRITER` and epoch-checked revocation.
 
 Evidence:
@@ -604,7 +604,7 @@ Definition of Done:
 
 - [x] Applications append without knowing owner, range, replica, ownership epoch, or sequence internals.
 - [x] Ambiguous retry returns original MessageId and Cursor.
-- [ ] CLI and SDK use the same data API.
+- [~] Rust SDK and `wwctl write` use the same data API; PowerShell `wcl-cli write` remains.
 
 ## Milestone 3 — Reader sessions and live delivery
 
