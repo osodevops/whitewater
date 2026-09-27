@@ -1,12 +1,13 @@
 use std::{collections::BTreeSet, env};
 
 use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
     active_range::StorageNodeId,
+    api::{WriterAppendResponse, WriterSessionAppendRequest},
     control::{Command, ControlExecution, PermissionAction, ReaderStart, ResourceKind, ShowKind},
 };
 
@@ -340,15 +341,34 @@ impl AdminClient {
         .await
     }
 
+    pub fn writer_session(
+        &self,
+        writer: impl Into<String>,
+        session_epoch: u64,
+    ) -> WriterSessionClient {
+        WriterSessionClient {
+            admin: self.clone(),
+            writer: writer.into(),
+            session_epoch,
+        }
+    }
+
+    pub async fn append_writer(
+        &self,
+        request: &WriterSessionAppendRequest,
+    ) -> Result<WriterAppendResponse, AdminClientError> {
+        self.post("/v1/writers/append", request).await
+    }
+
     async fn execute_one(&self, command: Command) -> Result<ControlExecution, AdminClientError> {
         self.execute_commands(vec![command]).await
     }
 
-    async fn post<T: Serialize + ?Sized>(
-        &self,
-        path: &str,
-        request: &T,
-    ) -> Result<ControlExecution, AdminClientError> {
+    async fn post<T, R>(&self, path: &str, request: &T) -> Result<R, AdminClientError>
+    where
+        T: Serialize + ?Sized,
+        R: DeserializeOwned,
+    {
         let response = self
             .http
             .post(format!("{}{}", self.endpoint, path))
@@ -377,6 +397,53 @@ impl AdminClient {
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             Err(AdminClientError::Api { status, message })
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct WriterSessionClient {
+    admin: AdminClient,
+    writer: String,
+    session_epoch: u64,
+}
+
+impl WriterSessionClient {
+    pub async fn append(
+        &self,
+        request_id: Uuid,
+        event_time_ns: Option<i64>,
+        key: &[u8],
+        payload: &[u8],
+        metadata: &std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Result<WriterAppendResponse, AdminClientError> {
+        self.admin
+            .append_writer(&WriterSessionAppendRequest {
+                request_id,
+                writer: self.writer.clone(),
+                session_epoch: self.session_epoch,
+                event_time_ns: event_time_ns.map(|value| value.to_string()),
+                key_base64: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    key,
+                ),
+                payload_base64: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    payload,
+                ),
+                metadata_base64: metadata
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.clone(),
+                            base64::Engine::encode(
+                                &base64::engine::general_purpose::STANDARD,
+                                value,
+                            ),
+                        )
+                    })
+                    .collect(),
+            })
+            .await
     }
 }
 
