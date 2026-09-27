@@ -26,6 +26,7 @@ This repository currently contains the Phase 1 correctness foundation and an ear
 - Authenticated bounded internal replica append protocol with exact-frame durability, checksum validation, position fencing, and structured rejection
 - Owner-side concurrent RF3 replication with two-of-three durable frame and CommitPosition evidence before success
 - Topology-free committed-only Feed reads with stateless opaque Cursor continuation
+- Automatic sustained owner-failure recovery with authenticated progress collection, consensus epoch transfer, stale-owner fencing, committed-prefix preservation, and tail truncation
 - Hierarchical Feed namespaces with a prototype legacy stream API
 - Opaque stream-scoped Cursors with independent Reader positions
 - Nanosecond `event_time_ns` and `ingest_time_ns` with legacy millisecond decoding

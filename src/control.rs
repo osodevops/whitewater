@@ -537,6 +537,22 @@ impl ControlController {
         self.state.lock().await.active_ranges.get(&feed_id).cloned()
     }
 
+    pub async fn active_feed_assignments(&self) -> Vec<(String, ActiveRangeAssignment)> {
+        let state = self.state.lock().await;
+        state
+            .feeds
+            .values()
+            .filter(|feed| feed.status == ResourceStatus::Active)
+            .filter_map(|feed| {
+                state
+                    .active_ranges
+                    .get(&feed.feed_id)
+                    .cloned()
+                    .map(|assignment| (feed.name.clone(), assignment))
+            })
+            .collect()
+    }
+
     pub async fn applied_result(&self, request_id: Uuid) -> Option<ReplicatedCommandResult> {
         self.state
             .lock()

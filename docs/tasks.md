@@ -315,15 +315,15 @@ Evidence:
 
 ## M1.9 — Owner failure and fencing
 
-- [ ] Connect sustained owner-unavailability detection to automatic recovery initiation.
+- [x] Connect sustained owner-unavailability detection to automatic recovery initiation.
 - [x] Select an eligible caught-up replica from current RF3 health/progress reports.
 - [x] Commit a higher ownership epoch through a compare-and-set Control Plane command.
 - [x] Fence the old owner before new writes are accepted.
 - [x] Compare replica append and commit positions and derive the highest majority-supported committed prefix.
-- [ ] Collect authenticated live replica progress reports over internal transport.
-- [ ] Discard tails that never reached majority commit on the selected owner and replicas.
+- [x] Collect authenticated live replica progress reports over internal transport.
+- [x] Discard tails that never reached majority commit on the selected owner and replicas.
 - [x] Preserve the majority-supported committed prefix in the recovery plan.
-- [ ] Reconcile local store epochs and resume appends at the next valid position automatically.
+- [x] Reconcile local store epochs and resume appends at the next valid position automatically.
 
 Evidence:
 
@@ -333,12 +333,14 @@ Evidence:
 - The replicated recovery command uses expected owner and epoch as compare-and-set guards, so racing or stale plans cannot overwrite newer ownership.
 - Existing epoch validation fences the previous owner immediately after the Control Plane transition.
 
-Evidence still required for completion:
+Completion evidence:
 
-- Automatic sustained-failure trigger.
-- Authenticated replica progress collection.
-- Committed-prefix reconciliation and uncommitted-tail truncation across the replacement owner and replicas.
-- Restart/fault test proving writes resume at the next valid position.
+- Authenticated internal progress and reconcile endpoints feed a leader-only recovery supervisor.
+- Three consecutive failed owner probes trigger planning; a successful probe resets failure evidence.
+- The Control Plane compare-and-set transition commits the higher epoch before replica reconciliation.
+- Healthy replicas advance to the majority-supported committed prefix, update epoch, and truncate uncommitted tails.
+- Four integration tests cover planning, quorum refusal, stale/racing plans, fencing, epoch reconciliation, committed-prefix preservation, and tail truncation.
+- `python scripts/test-m19-owner-recovery.py` stops the live owner, waits for automatic transfer, verifies one epoch increase, appends with majority durability through a survivor, and always restarts the failed container.
 
 ## M1.10 — Replica catch-up and repair
 
@@ -740,7 +742,9 @@ These tests accumulate across milestones and must never regress:
 14. [x] Convert the M1.7 live owner/non-owner append verification into an automated three-Node integration test.
 15. [x] Write the failing M1.8 tests proving uncommitted frames remain invisible and become readable only after majority commit.
 16. [x] Route Feed reads through committed Active Range storage and return only committed opaque Cursors.
-17. [ ] Write the failing M1.9 owner-failure tests for stale-owner fencing, committed-prefix preservation, and uncommitted-tail removal.
-18. [ ] Implement automatic owner failure detection and consensus-backed epoch transfer.
+17. [x] Write M1.9 owner-failure tests for stale-owner fencing, committed-prefix preservation, and uncommitted-tail removal.
+18. [x] Implement automatic owner failure detection, consensus-backed epoch transfer, replica reconciliation, and live Docker acceptance.
+19. [ ] Write the failing M1.10 tests for under-replication detection, missing-frame transfer, checksum verification, and corrupt-replica replacement.
+20. [ ] Implement replica catch-up and repair before marking a replacement healthy.
 
 The first unchecked item in this section is the next task unless a blocking architecture decision is recorded above.

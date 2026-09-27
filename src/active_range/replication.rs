@@ -174,6 +174,67 @@ impl ReplicaAppendService {
             .map_err(|error| ReplicaAppendError::storage(error.to_string()))
     }
 
+    pub async fn recovery_status(
+        &self,
+        feed_id: Uuid,
+    ) -> Result<super::ReplicaRecoveryStatus, ReplicaAppendError> {
+        let assignment = self
+            .control
+            .active_range_assignment(feed_id)
+            .await
+            .ok_or_else(|| {
+                ReplicaAppendError::temporary(
+                    ReplicaAppendErrorCode::AssignmentNotFound,
+                    format!("no committed Active Range assignment exists for Feed {feed_id}"),
+                )
+            })?;
+        let snapshot = self
+            .store_for(&assignment)
+            .await?
+            .snapshot()
+            .await
+            .map_err(map_store_error)?;
+        Ok(super::ReplicaRecoveryStatus {
+            node: self.local_node.clone(),
+            healthy: true,
+            appended: snapshot.progress.appended(),
+            committed: snapshot.progress.commit_position(),
+        })
+    }
+
+    pub async fn reconcile_recovery(
+        &self,
+        feed_id: Uuid,
+        committed_prefix: CommitPosition,
+    ) -> Result<u64, ReplicaAppendError> {
+        let assignment = self
+            .control
+            .active_range_assignment(feed_id)
+            .await
+            .ok_or_else(|| {
+                ReplicaAppendError::temporary(
+                    ReplicaAppendErrorCode::AssignmentNotFound,
+                    format!("no committed Active Range assignment exists for Feed {feed_id}"),
+                )
+            })?;
+        let store = self.store_for(&assignment).await?;
+        let snapshot = store.snapshot().await.map_err(map_store_error)?;
+        if snapshot.progress.commit_position() < committed_prefix {
+            store
+                .commit(
+                    assignment.generation,
+                    assignment.ownership_epoch,
+                    committed_prefix,
+                )
+                .await
+                .map_err(map_store_error)?;
+        }
+        store
+            .truncate_uncommitted(assignment.generation, assignment.ownership_epoch)
+            .await
+            .map_err(map_store_error)
+    }
+
     pub async fn read_committed(
         &self,
         feed_id: Uuid,

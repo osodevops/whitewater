@@ -1,11 +1,15 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use finnstream::{
     active_range::{
-        plan_owner_recovery, CommitPosition, OwnerRecoveryError, RangePosition,
-        ReplicaRecoveryStatus, StorageNodeId,
+        plan_owner_recovery, AppendIdentity, CommitPosition, OwnerRecoveryError, OwnershipEpoch,
+        RangeGeneration, RangePosition, ReplicaAppendRequest, ReplicaAppendService,
+        ReplicaCommitRequest, ReplicaRecoveryStatus, StorageNodeId,
     },
+    codec::encode_record,
     control::{Command, ControlController, ControlError},
+    domain::StoredRecord,
     storage::{FileLogStore, LogStore},
 };
 use tempfile::TempDir;
@@ -138,4 +142,101 @@ async fn consensus_recovery_command_is_compare_and_set_and_fences_old_owner() {
         }])
         .await;
     assert!(matches!(stale, Err(ControlError::InvalidOperation(_))));
+}
+
+#[tokio::test]
+async fn recovered_replicas_advance_epoch_preserve_commit_and_truncate_tail() {
+    let (directory, controller, assignment) = fixture().await;
+    let controller = Arc::new(controller);
+    let services = ["storage-1", "storage-2", "storage-3"]
+        .into_iter()
+        .map(|value| {
+            let node = node(value);
+            let service = Arc::new(ReplicaAppendService::new(
+                directory.path().join(value),
+                node.clone(),
+                controller.clone(),
+            ));
+            (node, service)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let writer = uuid::Uuid::from_u128(900);
+    let request = |position: u64, sequence: u64| {
+        let record = StoredRecord {
+            message_id: uuid::Uuid::from_u128(1_000 + sequence as u128),
+            producer_id: writer,
+            producer_sequence: sequence,
+            event_time_ns: sequence as i64,
+            ingest_time_ns: sequence as i64,
+            key: b"account-1".to_vec(),
+            payload: format!("event-{sequence}").into_bytes(),
+            metadata: BTreeMap::new(),
+        };
+        ReplicaAppendRequest {
+            feed_id: assignment.feed_id,
+            range_id: assignment.range_id,
+            generation: RangeGeneration::new(1),
+            ownership_epoch: OwnershipEpoch::new(1),
+            append_owner: node("storage-1"),
+            expected_position: RangePosition::new(position),
+            identity: AppendIdentity {
+                writer_session_id: writer,
+                writer_epoch: 1,
+                sequence,
+            },
+            cursor: format!("cursor-{sequence}"),
+            frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+        }
+    };
+    let first = request(1, 1);
+    let mut digest = [0; 32];
+    for service in services.values() {
+        digest = service.append(first.clone()).await.unwrap().frame_digest;
+    }
+    for service in [
+        services[&node("storage-2")].clone(),
+        services[&node("storage-3")].clone(),
+    ] {
+        service
+            .commit(ReplicaCommitRequest {
+                feed_id: assignment.feed_id,
+                range_id: assignment.range_id,
+                generation: assignment.generation,
+                ownership_epoch: assignment.ownership_epoch,
+                append_owner: assignment.owner.clone(),
+                commit_position: CommitPosition::new(1),
+                frame_digest: digest,
+            })
+            .await
+            .unwrap();
+        service.append(request(2, 2)).await.unwrap();
+    }
+    controller
+        .execute_commands(vec![Command::RecoverActiveRangeOwnership {
+            feed: "orders.events".to_owned(),
+            expected_owner: node("storage-1"),
+            expected_epoch: OwnershipEpoch::new(1),
+            new_owner: node("storage-2"),
+        }])
+        .await
+        .unwrap();
+    for service in [
+        services[&node("storage-2")].clone(),
+        services[&node("storage-3")].clone(),
+    ] {
+        assert_eq!(
+            service
+                .reconcile_recovery(assignment.feed_id, CommitPosition::new(1))
+                .await
+                .unwrap(),
+            1
+        );
+        let status = service.recovery_status(assignment.feed_id).await.unwrap();
+        assert_eq!(status.appended, RangePosition::new(1));
+        assert_eq!(status.committed, CommitPosition::new(1));
+    }
+    assert!(services[&node("storage-2")]
+        .append(request(2, 2))
+        .await
+        .is_err());
 }

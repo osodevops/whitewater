@@ -33,7 +33,8 @@ use crate::{
     active_range::{
         AppendIdentity, MajorityAppendCoordinator, MajorityAppendError, ReplicaAppendRequest,
         ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitRequest, ReplicaCommitResponse,
-        StorageNodeId, MAX_REPLICA_FRAME_BASE64_BYTES,
+        ReplicaProgressRequest, ReplicaProgressResponse, ReplicaReconcileRequest,
+        ReplicaReconcileResponse, StorageNodeId, MAX_REPLICA_FRAME_BASE64_BYTES,
     },
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
@@ -83,6 +84,14 @@ pub fn router(state: AppState) -> Router {
         state.clone(),
         authorize_replica_append,
     ));
+    let recovery_progress_route = post(recovery_progress).layer(middleware::from_fn_with_state(
+        state.clone(),
+        authorize_replica_append,
+    ));
+    let recovery_reconcile_route = post(recovery_reconcile).layer(middleware::from_fn_with_state(
+        state.clone(),
+        authorize_replica_append,
+    ));
     Router::new()
         .route("/health", get(health))
         .route("/v1/streams", get(list_streams).post(create_stream))
@@ -124,6 +133,14 @@ pub fn router(state: AppState) -> Router {
             replica_commit_route,
         )
         .route("/internal/active-range/owner/append", owner_append_route)
+        .route(
+            "/internal/active-range/recovery/progress",
+            recovery_progress_route,
+        )
+        .route(
+            "/internal/active-range/recovery/reconcile",
+            recovery_reconcile_route,
+        )
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
         .route(
@@ -390,6 +407,55 @@ async fn replica_commit(
             error: Some(error),
         },
     }))
+}
+
+async fn recovery_progress(
+    State(state): State<AppState>,
+    Json(request): Json<ReplicaProgressRequest>,
+) -> Json<ReplicaProgressResponse> {
+    let response = match &state.replica_append {
+        Some(service) => match service.recovery_status(request.feed_id).await {
+            Ok(status) => ReplicaProgressResponse {
+                status: Some(status),
+                error: None,
+            },
+            Err(error) => ReplicaProgressResponse {
+                status: None,
+                error: Some(error.to_string()),
+            },
+        },
+        None => ReplicaProgressResponse {
+            status: None,
+            error: Some("replica storage is not configured".to_owned()),
+        },
+    };
+    Json(response)
+}
+
+async fn recovery_reconcile(
+    State(state): State<AppState>,
+    Json(request): Json<ReplicaReconcileRequest>,
+) -> Json<ReplicaReconcileResponse> {
+    let response = match &state.replica_append {
+        Some(service) => match service
+            .reconcile_recovery(request.feed_id, request.committed_prefix)
+            .await
+        {
+            Ok(removed_records) => ReplicaReconcileResponse {
+                removed_records: Some(removed_records),
+                error: None,
+            },
+            Err(error) => ReplicaReconcileResponse {
+                removed_records: None,
+                error: Some(error.to_string()),
+            },
+        },
+        None => ReplicaReconcileResponse {
+            removed_records: None,
+            error: Some("replica storage is not configured".to_owned()),
+        },
+    };
+    Json(response)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

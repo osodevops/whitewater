@@ -1,5 +1,16 @@
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
+
+use tokio::sync::Mutex;
+
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
+
+use crate::{
+    control::{Command, ControlController},
+    control_plane::ControlPlane,
+};
 
 use super::{
     ActiveRangeAssignment, CommitPosition, OwnershipEpoch, RangePosition, StorageNodeId,
@@ -93,4 +104,283 @@ pub fn plan_owner_recovery(
         new_epoch,
         committed_prefix: CommitPosition::new(committed_prefix),
     })
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicaProgressRequest {
+    pub feed_id: Uuid,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicaProgressResponse {
+    pub status: Option<ReplicaRecoveryStatus>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicaReconcileRequest {
+    pub feed_id: Uuid,
+    pub committed_prefix: CommitPosition,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReplicaReconcileResponse {
+    pub removed_records: Option<u64>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Error)]
+pub enum RecoveryExecutionError {
+    #[error("Feed or Active Range assignment is unavailable")]
+    AssignmentUnavailable,
+    #[error("recovery planning failed: {0}")]
+    Planning(#[from] OwnerRecoveryError),
+    #[error("Control Plane recovery command failed: {0}")]
+    Control(String),
+    #[error("replica recovery failed: {0}")]
+    Replica(String),
+}
+
+#[async_trait]
+pub trait RecoveryTransport: Send + Sync {
+    async fn progress(
+        &self,
+        node: &StorageNodeId,
+        feed_id: Uuid,
+    ) -> Result<ReplicaRecoveryStatus, String>;
+
+    async fn reconcile(
+        &self,
+        node: &StorageNodeId,
+        request: ReplicaReconcileRequest,
+    ) -> Result<u64, String>;
+}
+
+#[derive(Clone)]
+pub struct OwnerRecoveryExecutor {
+    control: Arc<ControlController>,
+    control_plane: Arc<ControlPlane>,
+    transport: Arc<dyn RecoveryTransport>,
+}
+
+impl OwnerRecoveryExecutor {
+    pub fn new(
+        control: Arc<ControlController>,
+        control_plane: Arc<ControlPlane>,
+        transport: Arc<dyn RecoveryTransport>,
+    ) -> Self {
+        Self {
+            control,
+            control_plane,
+            transport,
+        }
+    }
+
+    pub async fn recover(
+        &self,
+        feed_name: &str,
+        failed_owner: &StorageNodeId,
+    ) -> Result<OwnerRecoveryPlan, RecoveryExecutionError> {
+        let feed = self
+            .control
+            .active_feed_by_name(feed_name)
+            .await
+            .ok_or(RecoveryExecutionError::AssignmentUnavailable)?;
+        let assignment = self
+            .control
+            .active_range_assignment(feed.feed_id)
+            .await
+            .ok_or(RecoveryExecutionError::AssignmentUnavailable)?;
+        if &assignment.owner != failed_owner {
+            return Err(RecoveryExecutionError::Control(
+                "owner changed before recovery began".to_owned(),
+            ));
+        }
+        let mut statuses = Vec::new();
+        for node in assignment.replicas.iter() {
+            if node == failed_owner {
+                statuses.push(ReplicaRecoveryStatus {
+                    node: node.clone(),
+                    healthy: false,
+                    appended: RangePosition::new(0),
+                    committed: CommitPosition::new(0),
+                });
+            } else if let Ok(status) = self.transport.progress(node, feed.feed_id).await {
+                statuses.push(status);
+            }
+        }
+        let plan = plan_owner_recovery(&assignment, &statuses)?;
+        self.control_plane
+            .execute_commands(vec![Command::RecoverActiveRangeOwnership {
+                feed: feed_name.to_owned(),
+                expected_owner: plan.previous_owner.clone(),
+                expected_epoch: plan.previous_epoch,
+                new_owner: plan.new_owner.clone(),
+            }])
+            .await
+            .map_err(|error| RecoveryExecutionError::Control(error.to_string()))?;
+        let request = ReplicaReconcileRequest {
+            feed_id: feed.feed_id,
+            committed_prefix: plan.committed_prefix,
+        };
+        for status in statuses.iter().filter(|status| status.healthy) {
+            self.transport
+                .reconcile(&status.node, request.clone())
+                .await
+                .map_err(RecoveryExecutionError::Replica)?;
+        }
+        Ok(plan)
+    }
+}
+
+#[derive(Clone)]
+pub struct RecoverySupervisor {
+    control: Arc<ControlController>,
+    control_plane: Arc<ControlPlane>,
+    transport: Arc<dyn RecoveryTransport>,
+    executor: OwnerRecoveryExecutor,
+    threshold: u32,
+    failures: Arc<Mutex<BTreeMap<Uuid, (StorageNodeId, u32)>>>,
+}
+
+impl RecoverySupervisor {
+    pub fn new(
+        control: Arc<ControlController>,
+        control_plane: Arc<ControlPlane>,
+        transport: Arc<dyn RecoveryTransport>,
+        threshold: u32,
+    ) -> Self {
+        Self {
+            executor: OwnerRecoveryExecutor::new(
+                control.clone(),
+                control_plane.clone(),
+                transport.clone(),
+            ),
+            control,
+            control_plane,
+            transport,
+            threshold: threshold.max(1),
+            failures: Arc::new(Mutex::new(BTreeMap::new())),
+        }
+    }
+
+    pub async fn tick(&self) -> Vec<Result<OwnerRecoveryPlan, RecoveryExecutionError>> {
+        if self.control_plane.status().await.state != "leader" {
+            return Vec::new();
+        }
+        let mut results = Vec::new();
+        for (feed_name, assignment) in self.control.active_feed_assignments().await {
+            let healthy = self
+                .transport
+                .progress(&assignment.owner, assignment.feed_id)
+                .await
+                .is_ok();
+            let should_recover = {
+                let mut failures = self.failures.lock().await;
+                if healthy {
+                    failures.remove(&assignment.feed_id);
+                    false
+                } else {
+                    let entry = failures
+                        .entry(assignment.feed_id)
+                        .or_insert((assignment.owner.clone(), 0));
+                    if entry.0 != assignment.owner {
+                        *entry = (assignment.owner.clone(), 0);
+                    }
+                    entry.1 = entry.1.saturating_add(1);
+                    entry.1 >= self.threshold
+                }
+            };
+            if should_recover {
+                let result = self.executor.recover(&feed_name, &assignment.owner).await;
+                self.failures.lock().await.remove(&assignment.feed_id);
+                results.push(result);
+            }
+        }
+        results
+    }
+}
+
+#[derive(Clone)]
+pub struct HttpRecoveryTransport {
+    endpoints: Arc<BTreeMap<StorageNodeId, String>>,
+    key: String,
+    http: reqwest::Client,
+}
+
+impl HttpRecoveryTransport {
+    pub fn new(
+        endpoints: BTreeMap<StorageNodeId, String>,
+        key: String,
+        timeout: Duration,
+    ) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            endpoints: Arc::new(endpoints),
+            key,
+            http: reqwest::Client::builder().timeout(timeout).build()?,
+        })
+    }
+
+    async fn post<Request, Response>(
+        &self,
+        node: &StorageNodeId,
+        path: &str,
+        request: &Request,
+    ) -> Result<Response, String>
+    where
+        Request: Serialize + Sync,
+        Response: for<'de> Deserialize<'de>,
+    {
+        let endpoint = self
+            .endpoints
+            .get(node)
+            .ok_or_else(|| format!("Node {node} has no endpoint"))?;
+        self.http
+            .post(format!("{}{}", endpoint.trim_end_matches('/'), path))
+            .header("x-whitewater-control-key", &self.key)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?
+            .json()
+            .await
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[async_trait]
+impl RecoveryTransport for HttpRecoveryTransport {
+    async fn progress(
+        &self,
+        node: &StorageNodeId,
+        feed_id: Uuid,
+    ) -> Result<ReplicaRecoveryStatus, String> {
+        let response: ReplicaProgressResponse = self
+            .post(
+                node,
+                "/internal/active-range/recovery/progress",
+                &ReplicaProgressRequest { feed_id },
+            )
+            .await?;
+        response.status.ok_or_else(|| {
+            response
+                .error
+                .unwrap_or_else(|| "missing progress".to_owned())
+        })
+    }
+
+    async fn reconcile(
+        &self,
+        node: &StorageNodeId,
+        request: ReplicaReconcileRequest,
+    ) -> Result<u64, String> {
+        let response: ReplicaReconcileResponse = self
+            .post(node, "/internal/active-range/recovery/reconcile", &request)
+            .await?;
+        response.removed_records.ok_or_else(|| {
+            response
+                .error
+                .unwrap_or_else(|| "missing reconcile result".to_owned())
+        })
+    }
 }

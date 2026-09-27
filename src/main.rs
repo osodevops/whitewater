@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use anyhow::Result;
 use finnstream::{
     active_range::{
-        HttpReplicaTransport, MajorityAppendCoordinator, ReplicaAppendService, StorageNodeId,
+        HttpRecoveryTransport, HttpReplicaTransport, MajorityAppendCoordinator, RecoverySupervisor,
+        ReplicaAppendService, StorageNodeId,
     },
     admin::AdminAuthenticator,
     api::{router, AppState},
@@ -111,6 +112,22 @@ async fn main() -> Result<()> {
         }
         _ => None,
     };
+    let recovery_supervisor = match (control_plane.clone(), config.control_plane_key.clone()) {
+        (Some(control_plane), Some(key)) => {
+            let transport = Arc::new(HttpRecoveryTransport::new(
+                control_endpoints.clone(),
+                key,
+                Duration::from_secs(2),
+            )?);
+            Some(RecoverySupervisor::new(
+                control.clone(),
+                control_plane,
+                transport,
+                3,
+            ))
+        }
+        _ => None,
+    };
     if let (Some(control_plane), Some(first_node)) = (
         control_plane.clone(),
         config.control_nodes.iter().map(|(id, _)| *id).min(),
@@ -136,6 +153,28 @@ async fn main() -> Result<()> {
     ));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let membership_task = tokio::spawn(membership.clone().run(shutdown_rx));
+    let recovery_task = recovery_supervisor.map(|supervisor| {
+        let mut shutdown = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        for result in supervisor.tick().await {
+                            if let Err(error) = result {
+                                tracing::warn!(%error, "Active Range owner recovery attempt failed");
+                            }
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    });
     let app = router(AppState {
         store,
         membership,
@@ -163,6 +202,9 @@ async fn main() -> Result<()> {
         .with_graceful_shutdown(shutdown_signal(shutdown_tx))
         .await?;
     let _ = membership_task.await;
+    if let Some(recovery_task) = recovery_task {
+        let _ = recovery_task.await;
+    }
     if let Some(control_plane) = control_plane {
         let _ = control_plane.raft().shutdown().await;
     }

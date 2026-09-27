@@ -15,7 +15,10 @@ pub use model::{
     ACTIVE_RANGE_REPLICA_COUNT,
 };
 pub use recovery::{
-    plan_owner_recovery, OwnerRecoveryError, OwnerRecoveryPlan, ReplicaRecoveryStatus,
+    plan_owner_recovery, HttpRecoveryTransport, OwnerRecoveryError, OwnerRecoveryExecutor,
+    OwnerRecoveryPlan, RecoveryExecutionError, RecoverySupervisor, RecoveryTransport,
+    ReplicaProgressRequest, ReplicaProgressResponse, ReplicaReconcileRequest,
+    ReplicaReconcileResponse, ReplicaRecoveryStatus,
 };
 pub use replication::{
     ReplicaAppendAccepted, ReplicaAppendError, ReplicaAppendErrorCode, ReplicaAppendRequest,

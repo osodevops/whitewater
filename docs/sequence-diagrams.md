@@ -160,7 +160,7 @@ A replica may physically contain an uncommitted tail. Physical presence is not p
 
 ## Ownership transfer and stale-owner fencing
 
-**Status: Manual transfer and epoch fencing implemented; automatic failure recovery is M1.9.**
+**Status: Automatic sustained-failure recovery, consensus transfer, epoch fencing, and tail reconciliation implemented through M1.9.**
 
 ```mermaid
 sequenceDiagram
