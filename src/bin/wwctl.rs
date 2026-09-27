@@ -1,7 +1,11 @@
 use std::{
+    collections::BTreeMap,
     env, fs,
-    io::{self, Write},
+    io::{self, Read, Write},
 };
+
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use uuid::Uuid;
 
 use anyhow::{bail, Context, Result};
 use finnstream::{
@@ -13,7 +17,18 @@ struct CliOptions {
     endpoint: String,
     api_key: Option<String>,
     script: Option<String>,
+    write: Option<WriteOptions>,
     json: bool,
+}
+
+struct WriteOptions {
+    writer: String,
+    session_epoch: u64,
+    request_id: Uuid,
+    event_time_ns: Option<i64>,
+    key: Vec<u8>,
+    payload: Vec<u8>,
+    metadata: BTreeMap<String, Vec<u8>>,
 }
 
 impl CliOptions {
@@ -23,9 +38,104 @@ impl CliOptions {
         let mut api_key = env::var(CLIENT_API_KEY_ENV).ok();
         let mut script = None;
         let mut json = false;
+        let mut write_mode = false;
+        let mut writer = None;
+        let mut session_epoch = None;
+        let mut request_id = None;
+        let mut event_time_ns = None;
+        let mut key = None;
+        let mut payload = None;
+        let mut metadata = BTreeMap::new();
         let mut arguments = arguments.into_iter();
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
+                "write" => write_mode = true,
+                "--writer" => writer = Some(arguments.next().context("--writer requires a name")?),
+                "--session-epoch" => {
+                    session_epoch = Some(
+                        arguments
+                            .next()
+                            .context("--session-epoch requires a value")?
+                            .parse()
+                            .context("--session-epoch must be an unsigned integer")?,
+                    )
+                }
+                "--request-id" => {
+                    request_id = Some(
+                        arguments
+                            .next()
+                            .context("--request-id requires a UUID")?
+                            .parse()
+                            .context("--request-id must be a UUID")?,
+                    )
+                }
+                "--event-time-ns" => {
+                    event_time_ns = Some(
+                        arguments
+                            .next()
+                            .context("--event-time-ns requires a value")?
+                            .parse()
+                            .context("--event-time-ns must be a signed integer")?,
+                    )
+                }
+                "--key" => {
+                    key = Some(
+                        arguments
+                            .next()
+                            .context("--key requires text")?
+                            .into_bytes(),
+                    )
+                }
+                "--key-base64" => {
+                    key = Some(
+                        STANDARD
+                            .decode(arguments.next().context("--key-base64 requires a value")?)
+                            .context("invalid --key-base64")?,
+                    )
+                }
+                "--payload" => {
+                    payload = Some(
+                        arguments
+                            .next()
+                            .context("--payload requires text")?
+                            .into_bytes(),
+                    )
+                }
+                "--payload-base64" => {
+                    payload = Some(
+                        STANDARD
+                            .decode(
+                                arguments
+                                    .next()
+                                    .context("--payload-base64 requires a value")?,
+                            )
+                            .context("invalid --payload-base64")?,
+                    )
+                }
+                "--payload-file" => {
+                    let path = arguments.next().context("--payload-file requires a path")?;
+                    payload =
+                        Some(fs::read(&path).with_context(|| format!("failed to read {path}"))?);
+                }
+                "--payload-stdin" => {
+                    let mut bytes = Vec::new();
+                    io::stdin().read_to_end(&mut bytes)?;
+                    payload = Some(bytes);
+                }
+                "--metadata" => {
+                    let value = arguments
+                        .next()
+                        .context("--metadata requires name=base64")?;
+                    let (name, encoded) = value
+                        .split_once('=')
+                        .context("--metadata requires name=base64")?;
+                    metadata.insert(
+                        name.to_owned(),
+                        STANDARD
+                            .decode(encoded)
+                            .context("invalid Metadata base64")?,
+                    );
+                }
                 "--endpoint" => {
                     endpoint = arguments.next().context("--endpoint requires a URL")?;
                 }
@@ -51,10 +161,24 @@ impl CliOptions {
                 value => bail!("unknown argument {value}; use --help"),
             }
         }
+        let write = if write_mode {
+            Some(WriteOptions {
+                writer: writer.context("write requires --writer")?,
+                session_epoch: session_epoch.context("write requires --session-epoch")?,
+                request_id: request_id.unwrap_or_else(Uuid::new_v4),
+                event_time_ns,
+                key: key.context("write requires --key or --key-base64")?,
+                payload: payload.context("write requires a payload source")?,
+                metadata,
+            })
+        } else {
+            None
+        };
         Ok(Some(Self {
             endpoint,
             api_key,
             script,
+            write,
             json,
         }))
     }
@@ -70,7 +194,19 @@ async fn main() -> Result<()> {
         format!("provide --api-key or set the {CLIENT_API_KEY_ENV} environment variable")
     })?;
     let client = AdminClient::new(options.endpoint, api_key);
-    if let Some(script) = options.script {
+    if let Some(write) = options.write {
+        let writer = client.writer_session(write.writer, write.session_epoch);
+        let result = writer
+            .append(
+                write.request_id,
+                write.event_time_ns,
+                &write.key,
+                &write.payload,
+                &write.metadata,
+            )
+            .await?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if let Some(script) = options.script {
         let result = client.execute_wcl(script).await?;
         print_execution(&result, options.json)?;
     } else {
@@ -197,6 +333,33 @@ mod tests {
         assert!(!statement_complete("SHOW FEEDS"));
         assert!(!statement_complete("SEEK READER audit TO CURSOR 'abc;def'"));
         assert!(statement_complete("SEEK READER audit TO CURSOR 'abc;def';"));
+    }
+
+    #[test]
+    fn parses_writer_session_write_mode() {
+        let options = CliOptions::parse(vec![
+            "write".to_owned(),
+            "--api-key".to_owned(),
+            "development-key-long-enough".to_owned(),
+            "--writer".to_owned(),
+            "checkout".to_owned(),
+            "--session-epoch".to_owned(),
+            "2".to_owned(),
+            "--key".to_owned(),
+            "order-1".to_owned(),
+            "--payload".to_owned(),
+            "created".to_owned(),
+            "--metadata".to_owned(),
+            "trace-id=dHJhY2U=".to_owned(),
+        ])
+        .unwrap()
+        .unwrap();
+        let write = options.write.unwrap();
+        assert_eq!(write.writer, "checkout");
+        assert_eq!(write.session_epoch, 2);
+        assert_eq!(write.key, b"order-1");
+        assert_eq!(write.payload, b"created");
+        assert_eq!(write.metadata["trace-id"], b"trace");
     }
 
     #[test]
