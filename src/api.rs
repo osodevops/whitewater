@@ -106,6 +106,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/feeds/append", post(client_append))
         .route("/v1/writers/append", post(writer_session_append))
         .route("/v1/writers/append-batch", post(writer_batch_append))
+        .route("/v1/readers/open", post(reader_open))
+        .route("/v1/readers/fetch", post(reader_fetch))
+        .route("/v1/readers/ack", post(reader_ack))
+        .route("/v1/readers/close", post(reader_close))
         .route("/v1/feeds/records", get(read_feed_records))
         .route("/v1/admin/wcl", post(execute_admin_wcl))
         .route("/v1/admin/commands", post(execute_admin_commands))
@@ -499,6 +503,202 @@ async fn repair_export(
         },
     };
     Json(response)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReaderOpenRequest {
+    pub request_id: Uuid,
+    pub reader: String,
+    pub capacity: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReaderSessionResponse {
+    pub reader_id: Uuid,
+    pub feed_id: Uuid,
+    pub session_epoch: u64,
+    pub capacity: usize,
+    pub delivered_cursor: Option<String>,
+    pub acknowledged_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReaderFetchRequest {
+    pub request_id: Uuid,
+    pub reader: String,
+    pub session_epoch: u64,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReaderFetchResponse {
+    pub records: Vec<RecordResponse>,
+    pub delivered_cursor: Option<String>,
+    pub acknowledged_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReaderAckRequest {
+    pub request_id: Uuid,
+    pub reader: String,
+    pub session_epoch: u64,
+    pub cursor: String,
+}
+
+async fn execute_reader_command(
+    state: &AppState,
+    command: crate::control::Command,
+    request_id: Uuid,
+) -> Result<crate::control::ControlExecution, ApiError> {
+    match &state.control_plane {
+        Some(control_plane) => control_plane
+            .execute_commands_with_request_id(vec![command], request_id)
+            .await
+            .map_err(|error| ApiError::bad_request(error.to_string())),
+        None => state
+            .control
+            .execute_commands_with_request_id(vec![command], request_id)
+            .await
+            .map_err(ApiError::from),
+    }
+}
+
+async fn reader_open(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ReaderOpenRequest>,
+) -> Result<Json<ReaderSessionResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let execution = execute_reader_command(
+        &state,
+        crate::control::Command::OpenReaderSession {
+            reader: request.reader,
+            capacity: request.capacity,
+        },
+        request.request_id,
+    )
+    .await?;
+    let reader: crate::control::ReaderDefinition =
+        serde_json::from_value(execution.results[0].data.clone())
+            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    Ok(Json(reader_session_response(reader)))
+}
+
+async fn reader_fetch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ReaderFetchRequest>,
+) -> Result<Json<ReaderFetchResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let reader = state
+        .control
+        .active_reader_by_name(&request.reader)
+        .await
+        .ok_or_else(|| ApiError::bad_request("Reader does not exist"))?;
+    if !reader.session_active || reader.session_epoch != request.session_epoch {
+        return Err(ApiError::bad_request("Reader session is stale or inactive"));
+    }
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("replica storage is unavailable"))?;
+    let limit = request
+        .limit
+        .unwrap_or(reader.session_capacity)
+        .min(reader.session_capacity)
+        .max(1);
+    let frames = service
+        .read_committed(reader.feed_id, reader.delivered_cursor.as_deref(), limit)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    let records = frames
+        .into_iter()
+        .map(|item| {
+            decode_record(&item.frame).map(|record| {
+                record_response(CursorRecord {
+                    cursor: item.cursor,
+                    record,
+                })
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    let delivered_cursor = records
+        .last()
+        .map(|record| record.cursor.clone())
+        .or(reader.delivered_cursor.clone());
+    if let Some(cursor) = records.last().map(|record| record.cursor.clone()) {
+        execute_reader_command(
+            &state,
+            crate::control::Command::RecordReaderDelivery {
+                reader: request.reader.clone(),
+                session_epoch: request.session_epoch,
+                cursor,
+            },
+            request.request_id,
+        )
+        .await?;
+    }
+    state.demand.record_read(records.len());
+    Ok(Json(ReaderFetchResponse {
+        records,
+        delivered_cursor,
+        acknowledged_cursor: reader.acknowledged_cursor,
+    }))
+}
+
+async fn reader_ack(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ReaderAckRequest>,
+) -> Result<Json<ReaderSessionResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let execution = execute_reader_command(
+        &state,
+        crate::control::Command::AcknowledgeReader {
+            reader: request.reader,
+            session_epoch: request.session_epoch,
+            cursor: request.cursor,
+        },
+        request.request_id,
+    )
+    .await?;
+    let reader: crate::control::ReaderDefinition =
+        serde_json::from_value(execution.results[0].data.clone())
+            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    Ok(Json(reader_session_response(reader)))
+}
+
+async fn reader_close(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ReaderFetchRequest>,
+) -> Result<Json<ReaderSessionResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let execution = execute_reader_command(
+        &state,
+        crate::control::Command::CloseReaderSession {
+            reader: request.reader,
+            session_epoch: request.session_epoch,
+        },
+        request.request_id,
+    )
+    .await?;
+    let reader: crate::control::ReaderDefinition =
+        serde_json::from_value(execution.results[0].data.clone())
+            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    Ok(Json(reader_session_response(reader)))
+}
+
+fn reader_session_response(reader: crate::control::ReaderDefinition) -> ReaderSessionResponse {
+    ReaderSessionResponse {
+        reader_id: reader.reader_id,
+        feed_id: reader.feed_id,
+        session_epoch: reader.session_epoch,
+        capacity: reader.session_capacity,
+        delivered_cursor: reader.delivered_cursor,
+        acknowledged_cursor: reader.acknowledged_cursor,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1049,17 +1249,17 @@ struct ReadQuery {
     limit: Option<usize>,
 }
 
-#[derive(Serialize)]
-struct RecordResponse {
-    cursor: String,
-    message_id: Uuid,
-    producer_id: Uuid,
-    sequence: u64,
-    event_time_ns: String,
-    ingest_time_ns: String,
-    key_base64: String,
-    payload_base64: String,
-    metadata_base64: BTreeMap<String, String>,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecordResponse {
+    pub cursor: String,
+    pub message_id: Uuid,
+    pub producer_id: Uuid,
+    pub sequence: u64,
+    pub event_time_ns: String,
+    pub ingest_time_ns: String,
+    pub key_base64: String,
+    pub payload_base64: String,
+    pub metadata_base64: BTreeMap<String, String>,
 }
 
 async fn read_records(

@@ -8,8 +8,9 @@ use uuid::Uuid;
 use crate::{
     active_range::StorageNodeId,
     api::{
-        WriterAppendResponse, WriterBatchAppendRequest, WriterBatchAppendResponse,
-        WriterSessionAppendRequest,
+        ReaderAckRequest, ReaderFetchRequest, ReaderFetchResponse, ReaderOpenRequest,
+        ReaderSessionResponse, WriterAppendResponse, WriterBatchAppendRequest,
+        WriterBatchAppendResponse, WriterSessionAppendRequest,
     },
     control::{Command, ControlExecution, PermissionAction, ReaderStart, ResourceKind, ShowKind},
 };
@@ -374,6 +375,35 @@ impl AdminClient {
         .await
     }
 
+    pub async fn open_reader_session(
+        &self,
+        request_id: Uuid,
+        reader: impl Into<String>,
+        capacity: usize,
+    ) -> Result<ReaderSessionResponse, AdminClientError> {
+        self.post(
+            "/v1/readers/open",
+            &ReaderOpenRequest {
+                request_id,
+                reader: reader.into(),
+                capacity,
+            },
+        )
+        .await
+    }
+
+    pub fn reader_session(
+        &self,
+        reader: impl Into<String>,
+        session_epoch: u64,
+    ) -> ReaderSessionClient {
+        ReaderSessionClient {
+            admin: self.clone(),
+            reader: reader.into(),
+            session_epoch,
+        }
+    }
+
     async fn execute_one(&self, command: Command) -> Result<ControlExecution, AdminClientError> {
         self.execute_commands(vec![command]).await
     }
@@ -411,6 +441,65 @@ impl AdminClient {
                 .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
             Err(AdminClientError::Api { status, message })
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct ReaderSessionClient {
+    admin: AdminClient,
+    reader: String,
+    session_epoch: u64,
+}
+
+impl ReaderSessionClient {
+    pub async fn fetch(
+        &self,
+        request_id: Uuid,
+        limit: Option<usize>,
+    ) -> Result<ReaderFetchResponse, AdminClientError> {
+        self.admin
+            .post(
+                "/v1/readers/fetch",
+                &ReaderFetchRequest {
+                    request_id,
+                    reader: self.reader.clone(),
+                    session_epoch: self.session_epoch,
+                    limit,
+                },
+            )
+            .await
+    }
+
+    pub async fn acknowledge(
+        &self,
+        request_id: Uuid,
+        cursor: impl Into<String>,
+    ) -> Result<ReaderSessionResponse, AdminClientError> {
+        self.admin
+            .post(
+                "/v1/readers/ack",
+                &ReaderAckRequest {
+                    request_id,
+                    reader: self.reader.clone(),
+                    session_epoch: self.session_epoch,
+                    cursor: cursor.into(),
+                },
+            )
+            .await
+    }
+
+    pub async fn close(&self, request_id: Uuid) -> Result<ReaderSessionResponse, AdminClientError> {
+        self.admin
+            .post(
+                "/v1/readers/close",
+                &ReaderFetchRequest {
+                    request_id,
+                    reader: self.reader.clone(),
+                    session_epoch: self.session_epoch,
+                    limit: None,
+                },
+            )
+            .await
     }
 }
 

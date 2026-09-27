@@ -79,6 +79,14 @@ pub struct ReaderDefinition {
     pub feed_id: Uuid,
     pub start: ReaderStart,
     pub acknowledged_cursor: Option<String>,
+    #[serde(default)]
+    pub delivered_cursor: Option<String>,
+    #[serde(default)]
+    pub session_epoch: u64,
+    #[serde(default)]
+    pub session_capacity: usize,
+    #[serde(default)]
+    pub session_active: bool,
     pub status: ResourceStatus,
     pub created_at_ns: i64,
 }
@@ -190,6 +198,24 @@ pub enum Command {
         name: String,
         feed: String,
         start: ReaderStart,
+    },
+    OpenReaderSession {
+        reader: String,
+        capacity: usize,
+    },
+    RecordReaderDelivery {
+        reader: String,
+        session_epoch: u64,
+        cursor: String,
+    },
+    AcknowledgeReader {
+        reader: String,
+        session_epoch: u64,
+        cursor: String,
+    },
+    CloseReaderSession {
+        reader: String,
+        session_epoch: u64,
     },
     CreateRole {
         name: String,
@@ -544,6 +570,16 @@ impl ControlController {
         self.state.lock().await.revision
     }
 
+    pub async fn active_reader_by_name(&self, name: &str) -> Option<ReaderDefinition> {
+        self.state
+            .lock()
+            .await
+            .readers
+            .values()
+            .find(|reader| reader.name == name && reader.status == ResourceStatus::Active)
+            .cloned()
+    }
+
     pub async fn active_writer_by_name(&self, name: &str) -> Option<WriterDefinition> {
         self.state
             .lock()
@@ -780,7 +816,11 @@ impl ControlController {
                     name: name.clone(),
                     feed_id,
                     start,
-                    acknowledged_cursor,
+                    acknowledged_cursor: acknowledged_cursor.clone(),
+                    delivered_cursor: acknowledged_cursor,
+                    session_epoch: 0,
+                    session_capacity: 0,
+                    session_active: false,
                     status: ResourceStatus::Active,
                     created_at_ns: issued_at_ns,
                 };
@@ -788,6 +828,69 @@ impl ControlController {
                     .readers
                     .insert(definition.reader_id, definition.clone());
                 Ok((format!("created Reader {name}"), json!(definition)))
+            }
+            Command::OpenReaderSession { reader, capacity } => {
+                if capacity == 0 || capacity > 10_000 {
+                    return Err(ControlError::InvalidOperation(
+                        "Reader capacity must be between 1 and 10000".to_owned(),
+                    ));
+                }
+                let definition = active_reader_mut(state, &reader)?;
+                definition.session_epoch =
+                    definition.session_epoch.checked_add(1).ok_or_else(|| {
+                        ControlError::InvalidOperation("Reader session epoch overflow".to_owned())
+                    })?;
+                definition.session_capacity = capacity;
+                definition.session_active = true;
+                definition.delivered_cursor = definition.acknowledged_cursor.clone();
+                Ok((
+                    format!("opened Reader session {reader}"),
+                    json!(definition.clone()),
+                ))
+            }
+            Command::RecordReaderDelivery {
+                reader,
+                session_epoch,
+                cursor,
+            } => {
+                let definition = active_reader_mut(state, &reader)?;
+                validate_reader_epoch(definition, session_epoch)?;
+                definition.delivered_cursor = Some(cursor);
+                Ok((
+                    format!("recorded Reader delivery {reader}"),
+                    json!(definition.clone()),
+                ))
+            }
+            Command::AcknowledgeReader {
+                reader,
+                session_epoch,
+                cursor,
+            } => {
+                let definition = active_reader_mut(state, &reader)?;
+                validate_reader_epoch(definition, session_epoch)?;
+                if definition.delivered_cursor.as_deref() != Some(cursor.as_str()) {
+                    return Err(ControlError::InvalidOperation(
+                        "Reader acknowledgement must match the latest delivered Cursor".to_owned(),
+                    ));
+                }
+                definition.acknowledged_cursor = Some(cursor);
+                Ok((
+                    format!("acknowledged Reader {reader}"),
+                    json!(definition.clone()),
+                ))
+            }
+            Command::CloseReaderSession {
+                reader,
+                session_epoch,
+            } => {
+                let definition = active_reader_mut(state, &reader)?;
+                validate_reader_epoch(definition, session_epoch)?;
+                definition.session_active = false;
+                definition.session_capacity = 0;
+                Ok((
+                    format!("closed Reader session {reader}"),
+                    json!(definition.clone()),
+                ))
             }
             Command::CreateRole { name } => {
                 validate_dotted_name(&name)?;
@@ -1513,6 +1616,25 @@ fn validate_writer_epoch(
     Ok(())
 }
 
+fn validate_reader_epoch(
+    reader: &ReaderDefinition,
+    session_epoch: u64,
+) -> Result<(), ControlError> {
+    if !reader.session_active {
+        return Err(ControlError::InvalidOperation(format!(
+            "Reader {} has no active session",
+            reader.name
+        )));
+    }
+    if reader.session_epoch != session_epoch {
+        return Err(ControlError::InvalidOperation(format!(
+            "stale Reader session epoch: current={}, supplied={session_epoch}",
+            reader.session_epoch
+        )));
+    }
+    Ok(())
+}
+
 fn active_reader_mut<'a>(
     state: &'a mut CatalogState,
     name: &str,
@@ -1705,6 +1827,10 @@ fn command_label(command: &Command) -> String {
         Command::AllocateWriterSequence { .. } => "ALLOCATE WRITER SEQUENCE",
         Command::RevokeWriterSession { .. } => "REVOKE WRITER SESSION",
         Command::CreateReader { .. } => "CREATE READER",
+        Command::OpenReaderSession { .. } => "OPEN READER SESSION",
+        Command::RecordReaderDelivery { .. } => "RECORD READER DELIVERY",
+        Command::AcknowledgeReader { .. } => "ACKNOWLEDGE READER",
+        Command::CloseReaderSession { .. } => "CLOSE READER SESSION",
         Command::CreateRole { .. } => "CREATE ROLE",
         Command::Rename { .. } => "RENAME",
         Command::Drop { .. } => "DROP",
@@ -1836,6 +1962,65 @@ mod tests {
             .unwrap();
         assert_eq!(result.results[0].data["acknowledged_cursor"], "cursor-a");
         assert_eq!(result.results[1].data["acknowledged_cursor"], "cursor-b");
+    }
+
+    #[tokio::test]
+    async fn reader_sessions_separate_delivery_acknowledgement_and_resume_after_restart() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE READER audit FROM orders.events START AT BEGINNING;").await.unwrap();
+        let opened = controller
+            .execute_commands(vec![Command::OpenReaderSession {
+                reader: "audit".to_owned(),
+                capacity: 2,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(opened.results[0].data["session_epoch"], 1);
+        controller
+            .execute_commands(vec![Command::RecordReaderDelivery {
+                reader: "audit".to_owned(),
+                session_epoch: 1,
+                cursor: "cursor-2".to_owned(),
+            }])
+            .await
+            .unwrap();
+        assert!(controller
+            .execute_commands(vec![Command::AcknowledgeReader {
+                reader: "audit".to_owned(),
+                session_epoch: 1,
+                cursor: "cursor-1".to_owned()
+            }])
+            .await
+            .is_err());
+        controller
+            .execute_commands(vec![Command::AcknowledgeReader {
+                reader: "audit".to_owned(),
+                session_epoch: 1,
+                cursor: "cursor-2".to_owned(),
+            }])
+            .await
+            .unwrap();
+        drop(controller);
+        let reopened = new_controller(&directory);
+        let session = reopened
+            .execute_commands(vec![Command::OpenReaderSession {
+                reader: "audit".to_owned(),
+                capacity: 3,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(session.results[0].data["session_epoch"], 2);
+        assert_eq!(session.results[0].data["delivered_cursor"], "cursor-2");
+        assert_eq!(session.results[0].data["acknowledged_cursor"], "cursor-2");
+        assert!(reopened
+            .execute_commands(vec![Command::RecordReaderDelivery {
+                reader: "audit".to_owned(),
+                session_epoch: 1,
+                cursor: "cursor-3".to_owned()
+            }])
+            .await
+            .is_err());
     }
 
     #[tokio::test]

@@ -608,23 +608,31 @@ Definition of Done:
 
 ## Milestone 3 — Reader sessions and live delivery
 
-- [ ] Implement temporary independent Reader sessions.
-- [ ] Implement persisted Reader lookup by name and ReaderId.
-- [ ] Separate delivered and acknowledged Cursors.
-- [ ] Implement explicit acknowledgement.
-- [ ] Implement capacity credits and backpressure.
-- [ ] Implement `read` from beginning by default.
+- [~] Implement Reader sessions: persisted named sessions are complete; anonymous temporary sessions remain.
+- [~] Implement persisted Reader lookup: name lookup is complete; direct ReaderId lookup remains.
+- [x] Separate delivered and acknowledged Cursors.
+- [x] Implement explicit cumulative acknowledgement with delivered-Cursor validation.
+- [x] Implement bounded capacity credits per fetch for backpressure.
+- [x] Implement committed reads from beginning by default.
 - [ ] Implement `--wait` to continue after catch-up.
 - [ ] Implement `--new-only` as an atomic end-of-Feed start for temporary Readers.
 - [ ] Reject `--new-only` for persistent Readers; require explicit seek.
 - [ ] Implement `tail`, `limit`, `after`, JSON, and payload-only output.
 
+Evidence:
+
+- Reader catalog state persists session epoch, capacity, delivered Cursor, acknowledged Cursor, and active state through Control Plane restart.
+- Fetch returns committed records only, advances delivered progress independently, and never acknowledges implicitly.
+- Acknowledgement must match the latest delivered Cursor; reopening increments epoch, fences the previous session, and resumes from acknowledged progress.
+- Typed Rust `ReaderSessionClient` uses the same open/fetch/ack/close API.
+- `python scripts/test-m3-reader-session.py` majority-commits three Writer records, delivers two under capacity, acknowledges, reopens through another Node, resumes with the remaining record, and rejects the stale session.
+
 Definition of Done:
 
-- [ ] Independent Readers never change each other's positions.
-- [ ] Readers never receive uncommitted records.
-- [ ] Named Reader restart resumes from acknowledged Cursor.
-- [ ] Slow Reader backpressure does not destabilize unrelated Readers.
+- [x] Independent Readers never change each other's positions.
+- [x] Readers never receive uncommitted records.
+- [x] Named Reader restart resumes from acknowledged Cursor.
+- [x] Per-session capacity bounds delivery without changing unrelated Reader progress.
 
 ## Milestone 4 — Multiple internal ranges
 

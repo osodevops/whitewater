@@ -217,6 +217,26 @@ Kinds are `spaces`, `feeds`, `writers`, `readers`, `roles`, and `grants`.
 }
 ```
 
+### Reader sessions
+
+Named Reader sessions use the same authenticated API across Nodes:
+
+```json
+POST /v1/readers/open
+{ "request_id": "...", "reader": "audit", "capacity": 100 }
+
+POST /v1/readers/fetch
+{ "request_id": "...", "reader": "audit", "session_epoch": 1, "limit": 100 }
+
+POST /v1/readers/ack
+{ "request_id": "...", "reader": "audit", "session_epoch": 1, "cursor": "..." }
+
+POST /v1/readers/close
+{ "request_id": "...", "reader": "audit", "session_epoch": 1 }
+```
+
+Delivered and acknowledged Cursors are separate. Fetch advances delivered progress only; acknowledgement is explicit and cumulative. Reopening a persistent Reader increments its epoch, fences the old session, resets delivered progress to the acknowledged Cursor, and resumes safely.
+
 ### Writer sessions
 
 ```json
