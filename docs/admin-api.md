@@ -237,6 +237,8 @@ POST /v1/readers/close
 
 Delivered and acknowledged Cursors are separate. Fetch advances delivered progress only; acknowledgement is explicit and cumulative. Reopening a persistent Reader increments its epoch, fences the old session, resets delivered progress to the acknowledged Cursor, and resumes safely.
 
+Anonymous temporary Readers use `POST /v1/readers/temporary/fetch` with `feed`, optional `after`, `limit`, `tail`, `new_only`, and bounded `wait_ms`. They retain no server-side progress. `new_only` atomically returns the current end Cursor without historical records; the caller then waits after that Cursor.
+
 ### Writer sessions
 
 ```json

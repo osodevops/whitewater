@@ -608,16 +608,16 @@ Definition of Done:
 
 ## Milestone 3 — Reader sessions and live delivery
 
-- [~] Implement Reader sessions: persisted named sessions are complete; anonymous temporary sessions remain.
-- [~] Implement persisted Reader lookup: name lookup is complete; direct ReaderId lookup remains.
+- [x] Implement persisted named and anonymous stateless temporary Reader sessions.
+- [x] Implement persisted Reader lookup by name and immutable ReaderId.
 - [x] Separate delivered and acknowledged Cursors.
 - [x] Implement explicit cumulative acknowledgement with delivered-Cursor validation.
 - [x] Implement bounded capacity credits per fetch for backpressure.
 - [x] Implement committed reads from beginning by default.
-- [ ] Implement `--wait` to continue after catch-up.
-- [ ] Implement `--new-only` as an atomic end-of-Feed start for temporary Readers.
-- [ ] Reject `--new-only` for persistent Readers; require explicit seek.
-- [ ] Implement `tail`, `limit`, `after`, JSON, and payload-only output.
+- [~] Implement bounded wait-after-catch-up: API `wait_ms` is complete; CLI `--wait` remains.
+- [x] Implement `new_only` as an atomic end-of-Feed start for temporary Readers.
+- [x] Keep `new_only` absent from persistent Reader APIs; persistent Readers require explicit seek.
+- [~] Implement temporary `tail`, `limit`, `after`, and JSON records; CLI and payload-only output remain.
 
 Evidence:
 
@@ -625,7 +625,7 @@ Evidence:
 - Fetch returns committed records only, advances delivered progress independently, and never acknowledges implicitly.
 - Acknowledgement must match the latest delivered Cursor; reopening increments epoch, fences the previous session, and resumes from acknowledged progress.
 - Typed Rust `ReaderSessionClient` uses the same open/fetch/ack/close API.
-- `python scripts/test-m3-reader-session.py` majority-commits three Writer records, delivers two under capacity, acknowledges, reopens through another Node, resumes with the remaining record, and rejects the stale session.
+- `python scripts/test-m3-reader-session.py` majority-commits Writer records, delivers two under capacity, acknowledges, reopens through another Node, resumes with the remaining record, rejects the stale session, starts a temporary Reader at end-of-Feed, waits for a new record, and tails the last two records.
 
 Definition of Done:
 

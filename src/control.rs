@@ -570,6 +570,16 @@ impl ControlController {
         self.state.lock().await.revision
     }
 
+    pub async fn active_reader_by_id(&self, reader_id: Uuid) -> Option<ReaderDefinition> {
+        self.state
+            .lock()
+            .await
+            .readers
+            .get(&reader_id)
+            .filter(|reader| reader.status == ResourceStatus::Active)
+            .cloned()
+    }
+
     pub async fn active_reader_by_name(&self, name: &str) -> Option<ReaderDefinition> {
         self.state
             .lock()

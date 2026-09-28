@@ -31,7 +31,15 @@ def main():
     if status != 200 or len(second["records"]) != 1: raise AssertionError(second)
     stale_status, _ = post(ENDPOINTS[0], "/v1/readers/fetch", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": epoch})
     if stale_status == 200: raise AssertionError("stale Reader epoch was accepted")
-    print(json.dumps({"status": "ok", "reader": reader, "first_delivery": 2, "resumed_delivery": 1, "acknowledged_cursor": delivered}, indent=2))
+    status, baseline = post(ENDPOINTS[2], "/v1/readers/temporary/fetch", {"feed": feed, "new_only": True, "limit": 10})
+    if status != 200 or baseline["records"] or not baseline["next_cursor"]: raise AssertionError(baseline)
+    status, appended = post(ENDPOINTS[0], "/v1/writers/append", {"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": writer_epoch, "event_time_ns": "4", "key_base64": "aw==", "payload_base64": "dg==", "metadata_base64": {}})
+    if status != 200: raise AssertionError(appended)
+    status, waited = post(ENDPOINTS[1], "/v1/readers/temporary/fetch", {"feed": feed, "after": baseline["next_cursor"], "limit": 10, "wait_ms": 2000})
+    if status != 200 or len(waited["records"]) != 1: raise AssertionError(waited)
+    status, tail = post(ENDPOINTS[2], "/v1/readers/temporary/fetch", {"feed": feed, "tail": True, "limit": 2})
+    if status != 200 or len(tail["records"]) != 2: raise AssertionError(tail)
+    print(json.dumps({"status": "ok", "reader": reader, "first_delivery": 2, "resumed_delivery": 1, "temporary_new_only_delivery": 1, "tail_records": 2, "acknowledged_cursor": delivered}, indent=2))
 
 if __name__ == "__main__":
     try: main()

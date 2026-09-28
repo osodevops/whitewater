@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeMap,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -110,6 +110,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/readers/fetch", post(reader_fetch))
         .route("/v1/readers/ack", post(reader_ack))
         .route("/v1/readers/close", post(reader_close))
+        .route("/v1/readers/temporary/fetch", post(temporary_reader_fetch))
         .route("/v1/feeds/records", get(read_feed_records))
         .route("/v1/admin/wcl", post(execute_admin_wcl))
         .route("/v1/admin/commands", post(execute_admin_commands))
@@ -698,6 +699,95 @@ fn reader_session_response(reader: crate::control::ReaderDefinition) -> ReaderSe
         capacity: reader.session_capacity,
         delivered_cursor: reader.delivered_cursor,
         acknowledged_cursor: reader.acknowledged_cursor,
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TemporaryReaderFetchRequest {
+    pub feed: String,
+    pub after: Option<String>,
+    pub limit: Option<usize>,
+    #[serde(default)]
+    pub new_only: bool,
+    #[serde(default)]
+    pub tail: bool,
+    pub wait_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TemporaryReaderFetchResponse {
+    pub records: Vec<RecordResponse>,
+    pub next_cursor: Option<String>,
+}
+
+async fn temporary_reader_fetch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<TemporaryReaderFetchRequest>,
+) -> Result<Json<TemporaryReaderFetchResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    if request.new_only && request.after.is_some() {
+        return Err(ApiError::bad_request(
+            "new_only cannot be combined with after",
+        ));
+    }
+    let feed = state
+        .control
+        .active_feed_by_name(&request.feed)
+        .await
+        .ok_or_else(|| ApiError::bad_request("Feed does not exist"))?;
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("replica storage is unavailable"))?;
+    let limit = request.limit.unwrap_or(100).clamp(1, 10_000);
+    if request.new_only {
+        let existing = service
+            .read_committed(feed.feed_id, None, 10_000)
+            .await
+            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        return Ok(Json(TemporaryReaderFetchResponse {
+            next_cursor: existing.last().map(|item| item.cursor.clone()),
+            records: Vec::new(),
+        }));
+    }
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(request.wait_ms.unwrap_or(0).min(30_000));
+    loop {
+        let mut frames = service
+            .read_committed(
+                feed.feed_id,
+                request.after.as_deref(),
+                if request.tail { 10_000 } else { limit },
+            )
+            .await
+            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        if request.tail && frames.len() > limit {
+            frames = frames.split_off(frames.len() - limit);
+        }
+        if !frames.is_empty() || tokio::time::Instant::now() >= deadline {
+            let records = frames
+                .into_iter()
+                .map(|item| {
+                    decode_record(&item.frame).map(|record| {
+                        record_response(CursorRecord {
+                            cursor: item.cursor,
+                            record,
+                        })
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            let next_cursor = records
+                .last()
+                .map(|record| record.cursor.clone())
+                .or(request.after.clone());
+            return Ok(Json(TemporaryReaderFetchResponse {
+                records,
+                next_cursor,
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 

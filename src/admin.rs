@@ -9,8 +9,9 @@ use crate::{
     active_range::StorageNodeId,
     api::{
         ReaderAckRequest, ReaderFetchRequest, ReaderFetchResponse, ReaderOpenRequest,
-        ReaderSessionResponse, WriterAppendResponse, WriterBatchAppendRequest,
-        WriterBatchAppendResponse, WriterSessionAppendRequest,
+        ReaderSessionResponse, TemporaryReaderFetchRequest, TemporaryReaderFetchResponse,
+        WriterAppendResponse, WriterBatchAppendRequest, WriterBatchAppendResponse,
+        WriterSessionAppendRequest,
     },
     control::{Command, ControlExecution, PermissionAction, ReaderStart, ResourceKind, ShowKind},
 };
@@ -390,6 +391,13 @@ impl AdminClient {
             },
         )
         .await
+    }
+
+    pub async fn fetch_temporary_reader(
+        &self,
+        request: &TemporaryReaderFetchRequest,
+    ) -> Result<TemporaryReaderFetchResponse, AdminClientError> {
+        self.post("/v1/readers/temporary/fetch", request).await
     }
 
     pub fn reader_session(
