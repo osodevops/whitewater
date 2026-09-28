@@ -116,6 +116,14 @@ wwctl write --writer checkout --session-epoch 1 --key order-123 --payload '{"sta
 
 Use `--payload-file`, `--payload-stdin`, `--payload-base64`, repeated `--metadata name=base64`, `--event-time-ns`, and `--request-id` for binary and retry-safe workflows.
 
+Read committed records with a temporary Reader:
+
+```bash
+wwctl read --feed orders.events --tail --limit 10
+wwctl read --feed orders.events --new-only
+wwctl read --feed orders.events --after "$CURSOR" --wait 30000 --payload-only
+```
+
 Or call the controller directly:
 
 ```bash

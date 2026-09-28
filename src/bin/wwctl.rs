@@ -10,6 +10,7 @@ use uuid::Uuid;
 use anyhow::{bail, Context, Result};
 use finnstream::{
     admin::{AdminClient, CLIENT_API_KEY_ENV},
+    api::TemporaryReaderFetchRequest,
     control::ControlExecution,
 };
 
@@ -18,7 +19,18 @@ struct CliOptions {
     api_key: Option<String>,
     script: Option<String>,
     write: Option<WriteOptions>,
+    read: Option<ReadOptions>,
     json: bool,
+}
+
+struct ReadOptions {
+    feed: String,
+    after: Option<String>,
+    limit: Option<usize>,
+    wait_ms: Option<u64>,
+    new_only: bool,
+    tail: bool,
+    payload_only: bool,
 }
 
 struct WriteOptions {
@@ -39,6 +51,14 @@ impl CliOptions {
         let mut script = None;
         let mut json = false;
         let mut write_mode = false;
+        let mut read_mode = false;
+        let mut feed = None;
+        let mut after = None;
+        let mut limit = None;
+        let mut wait_ms = None;
+        let mut new_only = false;
+        let mut tail = false;
+        let mut payload_only = false;
         let mut writer = None;
         let mut session_epoch = None;
         let mut request_id = None;
@@ -50,6 +70,30 @@ impl CliOptions {
         while let Some(argument) = arguments.next() {
             match argument.as_str() {
                 "write" => write_mode = true,
+                "read" => read_mode = true,
+                "--feed" => feed = Some(arguments.next().context("--feed requires a name")?),
+                "--after" => after = Some(arguments.next().context("--after requires a Cursor")?),
+                "--limit" => {
+                    limit = Some(
+                        arguments
+                            .next()
+                            .context("--limit requires a value")?
+                            .parse()
+                            .context("--limit must be an unsigned integer")?,
+                    )
+                }
+                "--wait" => {
+                    wait_ms = Some(
+                        arguments
+                            .next()
+                            .context("--wait requires milliseconds")?
+                            .parse()
+                            .context("--wait must be an unsigned integer")?,
+                    )
+                }
+                "--new-only" => new_only = true,
+                "--tail" => tail = true,
+                "--payload-only" => payload_only = true,
                 "--writer" => writer = Some(arguments.next().context("--writer requires a name")?),
                 "--session-epoch" => {
                     session_epoch = Some(
@@ -174,11 +218,31 @@ impl CliOptions {
         } else {
             None
         };
+        if write_mode && read_mode {
+            bail!("write and read modes are mutually exclusive");
+        }
+        if new_only && after.is_some() {
+            bail!("--new-only cannot be combined with --after");
+        }
+        let read = if read_mode {
+            Some(ReadOptions {
+                feed: feed.context("read requires --feed")?,
+                after,
+                limit,
+                wait_ms,
+                new_only,
+                tail,
+                payload_only,
+            })
+        } else {
+            None
+        };
         Ok(Some(Self {
             endpoint,
             api_key,
             script,
             write,
+            read,
             json,
         }))
     }
@@ -206,6 +270,26 @@ async fn main() -> Result<()> {
             )
             .await?;
         println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if let Some(read) = options.read {
+        let result = client
+            .fetch_temporary_reader(&TemporaryReaderFetchRequest {
+                feed: read.feed,
+                after: read.after,
+                limit: read.limit,
+                new_only: read.new_only,
+                tail: read.tail,
+                wait_ms: read.wait_ms,
+            })
+            .await?;
+        if read.payload_only {
+            let mut stdout = io::stdout().lock();
+            for record in result.records {
+                stdout.write_all(&STANDARD.decode(record.payload_base64)?)?;
+                stdout.write_all(b"\n")?;
+            }
+        } else {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
     } else if let Some(script) = options.script {
         let result = client.execute_wcl(script).await?;
         print_execution(&result, options.json)?;
@@ -333,6 +417,40 @@ mod tests {
         assert!(!statement_complete("SHOW FEEDS"));
         assert!(!statement_complete("SEEK READER audit TO CURSOR 'abc;def'"));
         assert!(statement_complete("SEEK READER audit TO CURSOR 'abc;def';"));
+    }
+
+    #[test]
+    fn parses_temporary_reader_modes() {
+        let options = CliOptions::parse(vec![
+            "read".to_owned(),
+            "--api-key".to_owned(),
+            "development-key-long-enough".to_owned(),
+            "--feed".to_owned(),
+            "orders.events".to_owned(),
+            "--tail".to_owned(),
+            "--limit".to_owned(),
+            "5".to_owned(),
+            "--wait".to_owned(),
+            "1000".to_owned(),
+            "--payload-only".to_owned(),
+        ])
+        .unwrap()
+        .unwrap();
+        let read = options.read.unwrap();
+        assert_eq!(read.feed, "orders.events");
+        assert_eq!(read.limit, Some(5));
+        assert_eq!(read.wait_ms, Some(1000));
+        assert!(read.tail);
+        assert!(read.payload_only);
+        assert!(CliOptions::parse(vec![
+            "read".to_owned(),
+            "--feed".to_owned(),
+            "orders.events".to_owned(),
+            "--new-only".to_owned(),
+            "--after".to_owned(),
+            "cursor".to_owned()
+        ])
+        .is_err());
     }
 
     #[test]

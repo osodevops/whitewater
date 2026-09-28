@@ -614,10 +614,10 @@ Definition of Done:
 - [x] Implement explicit cumulative acknowledgement with delivered-Cursor validation.
 - [x] Implement bounded capacity credits per fetch for backpressure.
 - [x] Implement committed reads from beginning by default.
-- [~] Implement bounded wait-after-catch-up: API `wait_ms` is complete; CLI `--wait` remains.
+- [x] Implement bounded wait-after-catch-up through API `wait_ms` and CLI `--wait`.
 - [x] Implement `new_only` as an atomic end-of-Feed start for temporary Readers.
 - [x] Keep `new_only` absent from persistent Reader APIs; persistent Readers require explicit seek.
-- [~] Implement temporary `tail`, `limit`, `after`, and JSON records; CLI and payload-only output remain.
+- [x] Implement temporary `tail`, `limit`, `after`, JSON records, and CLI payload-only output.
 
 Evidence:
 
