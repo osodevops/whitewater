@@ -39,6 +39,8 @@ def main():
     if status != 200 or len(waited["records"]) != 1: raise AssertionError(waited)
     status, tail = post(ENDPOINTS[2], "/v1/readers/temporary/fetch", {"feed": feed, "tail": True, "limit": 2})
     if status != 200 or len(tail["records"]) != 2: raise AssertionError(tail)
+    status, timestamped = post(ENDPOINTS[0], "/v1/readers/temporary/fetch", {"feed": feed, "after_event_time_ns": "3", "limit": 10})
+    if status != 200 or len(timestamped["records"]) != 2: raise AssertionError(timestamped)
     print(json.dumps({"status": "ok", "reader": reader, "first_delivery": 2, "resumed_delivery": 1, "temporary_new_only_delivery": 1, "tail_records": 2, "acknowledged_cursor": delivered}, indent=2))
 
 if __name__ == "__main__":

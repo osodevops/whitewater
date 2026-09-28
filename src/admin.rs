@@ -14,6 +14,7 @@ use crate::{
         WriterSessionAppendRequest,
     },
     control::{Command, ControlExecution, PermissionAction, ReaderStart, ResourceKind, ShowKind},
+    reader::ReaderRetryPolicy,
 };
 
 pub const ADMIN_API_KEY_ENV: &str = "FINNSTREAM_ADMIN_API_KEY";
@@ -398,6 +399,25 @@ impl AdminClient {
         request: &TemporaryReaderFetchRequest,
     ) -> Result<TemporaryReaderFetchResponse, AdminClientError> {
         self.post("/v1/readers/temporary/fetch", request).await
+    }
+
+    pub async fn fetch_temporary_reader_with_retry(
+        &self,
+        request: &TemporaryReaderFetchRequest,
+        policy: ReaderRetryPolicy,
+    ) -> Result<TemporaryReaderFetchResponse, AdminClientError> {
+        let mut attempt = 0;
+        loop {
+            match self.fetch_temporary_reader(request).await {
+                Ok(response) => return Ok(response),
+                Err(error) if attempt + 1 < policy.max_attempts => {
+                    tokio::time::sleep(policy.delay(attempt, 0)).await;
+                    attempt += 1;
+                    let _ = error;
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub fn reader_session(

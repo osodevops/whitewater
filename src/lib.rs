@@ -10,5 +10,6 @@ pub mod cursor;
 pub mod demand;
 pub mod domain;
 pub mod membership;
+pub mod reader;
 pub mod storage;
 pub mod writer;

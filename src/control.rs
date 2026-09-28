@@ -70,6 +70,7 @@ pub enum ReaderStart {
     Beginning,
     Now,
     Cursor(String),
+    Timestamp(i64),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -819,7 +820,7 @@ impl ControlController {
                 let feed_id = active_feed(state, &feed)?.feed_id;
                 let acknowledged_cursor = match &start {
                     ReaderStart::Cursor(cursor) => Some(cursor.clone()),
-                    ReaderStart::Beginning | ReaderStart::Now => None,
+                    ReaderStart::Beginning | ReaderStart::Now | ReaderStart::Timestamp(_) => None,
                 };
                 let definition = ReaderDefinition {
                     reader_id: derived_resource_id(request_id, "reader"),
@@ -989,7 +990,7 @@ impl ControlController {
                 let definition = active_reader_mut(state, &reader)?;
                 definition.acknowledged_cursor = match &start {
                     ReaderStart::Cursor(cursor) => Some(cursor.clone()),
-                    ReaderStart::Beginning | ReaderStart::Now => None,
+                    ReaderStart::Beginning | ReaderStart::Now | ReaderStart::Timestamp(_) => None,
                 };
                 definition.start = start;
                 Ok((
@@ -1426,8 +1427,14 @@ fn parse_reader_start(tokens: &[String], index: usize) -> Result<ReaderStart, Co
         "BEGINNING" => Ok(ReaderStart::Beginning),
         "NOW" => Ok(ReaderStart::Now),
         "CURSOR" => Ok(ReaderStart::Cursor(token(tokens, index + 1)?.to_owned())),
+        "TIMESTAMP" => Ok(ReaderStart::Timestamp(
+            token(tokens, index + 1)?.parse().map_err(|_| {
+                ControlError::Syntax("Reader timestamp must be signed epoch nanoseconds".to_owned())
+            })?,
+        )),
         _ => Err(ControlError::Syntax(
-            "Reader position must be BEGINNING, NOW, or CURSOR '<value>'".to_owned(),
+            "Reader position must be BEGINNING, NOW, TIMESTAMP <ns>, or CURSOR '<value>'"
+                .to_owned(),
         )),
     }
 }

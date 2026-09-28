@@ -536,6 +536,8 @@ pub struct ReaderFetchResponse {
     pub records: Vec<RecordResponse>,
     pub delivered_cursor: Option<String>,
     pub acknowledged_cursor: Option<String>,
+    pub recommended_capacity: usize,
+    pub retry_after_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -608,10 +610,30 @@ async fn reader_fetch(
         .unwrap_or(reader.session_capacity)
         .min(reader.session_capacity)
         .max(1);
-    let frames = service
-        .read_committed(reader.feed_id, reader.delivered_cursor.as_deref(), limit)
+    let timestamp_start = match (&reader.start, &reader.delivered_cursor) {
+        (crate::control::ReaderStart::Timestamp(value), None) => Some(*value),
+        _ => None,
+    };
+    let mut frames = service
+        .read_committed(
+            reader.feed_id,
+            reader.delivered_cursor.as_deref(),
+            if timestamp_start.is_some() {
+                10_000
+            } else {
+                limit
+            },
+        )
         .await
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    if let Some(timestamp) = timestamp_start {
+        frames.retain(|item| {
+            decode_record(&item.frame)
+                .map(|record| record.event_time_ns >= timestamp)
+                .unwrap_or(false)
+        });
+        frames.truncate(limit);
+    }
     let records = frames
         .into_iter()
         .map(|item| {
@@ -641,10 +663,17 @@ async fn reader_fetch(
         .await?;
     }
     state.demand.record_read(records.len());
+    let pressure = (state.demand.snapshot().requests_in_flight as f64 / 100.0).clamp(0.0, 1.0);
     Ok(Json(ReaderFetchResponse {
         records,
         delivered_cursor,
         acknowledged_cursor: reader.acknowledged_cursor,
+        recommended_capacity: if pressure > 0.75 {
+            reader.session_capacity.min(16)
+        } else {
+            reader.session_capacity
+        },
+        retry_after_ms: if pressure > 0.9 { 50 } else { 0 },
     }))
 }
 
@@ -712,6 +741,7 @@ pub struct TemporaryReaderFetchRequest {
     #[serde(default)]
     pub tail: bool,
     pub wait_ms: Option<u64>,
+    pub after_event_time_ns: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -731,6 +761,19 @@ async fn temporary_reader_fetch(
             "new_only cannot be combined with after",
         ));
     }
+    if request.after_event_time_ns.is_some() && (request.after.is_some() || request.new_only) {
+        return Err(ApiError::bad_request(
+            "after_event_time_ns cannot be combined with after or new_only",
+        ));
+    }
+    let after_event_time_ns = request
+        .after_event_time_ns
+        .as_deref()
+        .map(str::parse::<i64>)
+        .transpose()
+        .map_err(|_| {
+            ApiError::bad_request("after_event_time_ns must be signed epoch nanoseconds")
+        })?;
     let feed = state
         .control
         .active_feed_by_name(&request.feed)
@@ -758,10 +801,22 @@ async fn temporary_reader_fetch(
             .read_committed(
                 feed.feed_id,
                 request.after.as_deref(),
-                if request.tail { 10_000 } else { limit },
+                if request.tail || after_event_time_ns.is_some() {
+                    10_000
+                } else {
+                    limit
+                },
             )
             .await
             .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        if let Some(timestamp) = after_event_time_ns {
+            frames.retain(|item| {
+                decode_record(&item.frame)
+                    .map(|record| record.event_time_ns >= timestamp)
+                    .unwrap_or(false)
+            });
+            frames.truncate(limit);
+        }
         if request.tail && frames.len() > limit {
             frames = frames.split_off(frames.len() - limit);
         }

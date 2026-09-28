@@ -618,6 +618,8 @@ Definition of Done:
 - [x] Implement `new_only` as an atomic end-of-Feed start for temporary Readers.
 - [x] Keep `new_only` absent from persistent Reader APIs; persistent Readers require explicit seek.
 - [x] Implement temporary `tail`, `limit`, `after`, JSON records, and CLI payload-only output.
+- [x] Implement signed nanosecond timestamp starts/seeks for persistent and temporary Readers.
+- [x] Add bounded exponential reconnect/backoff for stateless Reader fetches and pressure-aware capacity feedback for persistent sessions.
 
 Evidence:
 

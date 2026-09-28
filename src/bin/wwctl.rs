@@ -26,6 +26,7 @@ struct CliOptions {
 struct ReadOptions {
     feed: String,
     after: Option<String>,
+    after_event_time_ns: Option<String>,
     limit: Option<usize>,
     wait_ms: Option<u64>,
     new_only: bool,
@@ -54,6 +55,7 @@ impl CliOptions {
         let mut read_mode = false;
         let mut feed = None;
         let mut after = None;
+        let mut after_event_time_ns = None;
         let mut limit = None;
         let mut wait_ms = None;
         let mut new_only = false;
@@ -73,6 +75,15 @@ impl CliOptions {
                 "read" => read_mode = true,
                 "--feed" => feed = Some(arguments.next().context("--feed requires a name")?),
                 "--after" => after = Some(arguments.next().context("--after requires a Cursor")?),
+                "--after-event-time-ns" => {
+                    let value = arguments
+                        .next()
+                        .context("--after-event-time-ns requires a value")?;
+                    value
+                        .parse::<i64>()
+                        .context("--after-event-time-ns must be signed epoch nanoseconds")?;
+                    after_event_time_ns = Some(value);
+                }
                 "--limit" => {
                     limit = Some(
                         arguments
@@ -224,10 +235,14 @@ impl CliOptions {
         if new_only && after.is_some() {
             bail!("--new-only cannot be combined with --after");
         }
+        if after_event_time_ns.is_some() && (after.is_some() || new_only) {
+            bail!("--after-event-time-ns cannot be combined with --after or --new-only");
+        }
         let read = if read_mode {
             Some(ReadOptions {
                 feed: feed.context("read requires --feed")?,
                 after,
+                after_event_time_ns,
                 limit,
                 wait_ms,
                 new_only,
@@ -279,6 +294,7 @@ async fn main() -> Result<()> {
                 new_only: read.new_only,
                 tail: read.tail,
                 wait_ms: read.wait_ms,
+                after_event_time_ns: read.after_event_time_ns,
             })
             .await?;
         if read.payload_only {
