@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::{
     active_range::{
-        ActiveRangeAssignment, OwnershipEpoch, RangeGeneration, RangeId, ReplicaSet, StorageNodeId,
-        ACTIVE_RANGE_REPLICA_COUNT,
+        ActiveRangeAssignment, OwnershipEpoch, RangeGeneration, RangeId, RangeMap, RangeRoute,
+        ReplicaSet, StorageNodeId, ACTIVE_RANGE_REPLICA_COUNT,
     },
     storage::{LogStore, StorageError},
 };
@@ -130,7 +130,24 @@ struct CatalogState {
     #[serde(default)]
     active_ranges: BTreeMap<Uuid, ActiveRangeAssignment>,
     #[serde(default)]
+    range_maps: BTreeMap<Uuid, RangeMap>,
+    #[serde(default)]
+    range_assignments: BTreeMap<RangeId, ActiveRangeAssignment>,
+    #[serde(default)]
     applied_requests: BTreeMap<Uuid, ReplicatedCommandResult>,
+}
+
+impl CatalogState {
+    fn migrate_range_metadata(&mut self) {
+        for (feed_id, assignment) in &self.active_ranges {
+            self.range_maps
+                .entry(*feed_id)
+                .or_insert_with(|| RangeMap::single(assignment.range_id, assignment.generation));
+            self.range_assignments
+                .entry(assignment.range_id)
+                .or_insert_with(|| assignment.clone());
+        }
+    }
 }
 
 impl Default for CatalogState {
@@ -145,6 +162,8 @@ impl Default for CatalogState {
             roles: BTreeMap::new(),
             grants: BTreeMap::new(),
             active_ranges: BTreeMap::new(),
+            range_maps: BTreeMap::new(),
+            range_assignments: BTreeMap::new(),
             applied_requests: BTreeMap::new(),
         }
     }
@@ -367,11 +386,12 @@ impl ControlController {
         eligible_storage_nodes: Vec<StorageNodeId>,
     ) -> Result<Self, ControlError> {
         let path = path.into();
-        let state = if path.exists() {
+        let mut state = if path.exists() {
             serde_json::from_slice(&fs::read(&path)?)?
         } else {
             CatalogState::default()
         };
+        state.migrate_range_metadata();
         Ok(Self {
             path: Arc::new(path),
             state: Arc::new(Mutex::new(state)),
@@ -561,7 +581,8 @@ impl ControlController {
     }
 
     pub async fn install_snapshot_bytes(&self, bytes: &[u8]) -> Result<(), ControlError> {
-        let state: CatalogState = serde_json::from_slice(bytes)?;
+        let mut state: CatalogState = serde_json::from_slice(bytes)?;
+        state.migrate_range_metadata();
         persist_state(&self.path, &state)?;
         *self.state.lock().await = state;
         Ok(())
@@ -653,6 +674,21 @@ impl ControlController {
         self.state.lock().await.active_ranges.get(&feed_id).cloned()
     }
 
+    pub async fn active_range_map(&self, feed_id: Uuid) -> Option<RangeMap> {
+        self.state.lock().await.range_maps.get(&feed_id).cloned()
+    }
+
+    pub async fn active_range_for_key(
+        &self,
+        feed_id: Uuid,
+        key: &[u8],
+    ) -> Option<(RangeRoute, ActiveRangeAssignment)> {
+        let state = self.state.lock().await;
+        let route = state.range_maps.get(&feed_id)?.route_key(key).clone();
+        let assignment = state.range_assignments.get(&route.range_id)?.clone();
+        Some((route, assignment))
+    }
+
     pub async fn active_feed_assignments(&self) -> Vec<(String, ActiveRangeAssignment)> {
         let state = self.state.lock().await;
         state
@@ -735,6 +771,13 @@ impl ControlController {
                     created_at_ns: issued_at_ns,
                 };
                 state.feeds.insert(feed_id, definition.clone());
+                state.range_maps.insert(
+                    feed_id,
+                    RangeMap::single(assignment.range_id, assignment.generation),
+                );
+                state
+                    .range_assignments
+                    .insert(assignment.range_id, assignment.clone());
                 state.active_ranges.insert(feed_id, assignment);
                 Ok((format!("created Feed {name}"), json!(definition)))
             }
@@ -1003,10 +1046,26 @@ impl ControlController {
                 let assignment = state.active_ranges.get(&feed_id).ok_or_else(|| {
                     ControlError::NotFound(format!("Active Range placement for Feed {feed}"))
                 })?;
-                Ok((
-                    format!("inspected placement for Feed {feed}"),
-                    json!(assignment),
-                ))
+                let mut data = serde_json::to_value(assignment)?;
+                if let Some(object) = data.as_object_mut() {
+                    object.insert(
+                        "range_map".to_owned(),
+                        json!(state.range_maps.get(&feed_id)),
+                    );
+                    object.insert(
+                        "range_assignments".to_owned(),
+                        json!(state
+                            .range_maps
+                            .get(&feed_id)
+                            .map(|map| map
+                                .routes()
+                                .iter()
+                                .filter_map(|route| state.range_assignments.get(&route.range_id))
+                                .collect::<Vec<_>>())
+                            .unwrap_or_default()),
+                    );
+                }
+                Ok((format!("inspected placement for Feed {feed}"), data))
             }
             Command::TransferActiveRangeOwnership { feed, owner } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
@@ -1025,9 +1084,13 @@ impl ControlController {
                 assignment
                     .transfer_ownership(owner, next_epoch)
                     .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let updated = assignment.clone();
+                state
+                    .range_assignments
+                    .insert(updated.range_id, updated.clone());
                 Ok((
                     format!("transferred Active Range ownership for Feed {feed}"),
-                    json!(assignment.clone()),
+                    json!(updated),
                 ))
             }
             Command::RecoverActiveRangeOwnership {
@@ -1054,9 +1117,13 @@ impl ControlController {
                 assignment
                     .transfer_ownership(new_owner, next_epoch)
                     .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let updated = assignment.clone();
+                state
+                    .range_assignments
+                    .insert(updated.range_id, updated.clone());
                 Ok((
                     format!("recovered Active Range ownership for Feed {feed}"),
-                    json!(assignment.clone()),
+                    json!(updated),
                 ))
             }
         }

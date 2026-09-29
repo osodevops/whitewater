@@ -1016,11 +1016,17 @@ async fn client_append(
             request.sequence,
         )
         .await?;
-    let assignment = state
+    let routing_key = decode_base64("key_base64", &request.key_base64)?;
+    if routing_key.is_empty() {
+        return Err(ApiError::bad_request(
+            "key_base64 must contain a non-empty key",
+        ));
+    }
+    let (_, assignment) = state
         .control
-        .active_range_assignment(feed.feed_id)
+        .active_range_for_key(feed.feed_id, &routing_key)
         .await
-        .ok_or_else(|| ApiError::unavailable("Active Range assignment is unavailable"))?;
+        .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
     let local = state.storage_node_id.as_ref().ok_or_else(|| {
         ApiError::unavailable("this Node is not configured for Active Range routing")
     })?;
@@ -1109,23 +1115,24 @@ async fn owner_append_local(
             request.sequence,
         )
         .await?;
-    let assignment = state
+    let routing_key = decode_base64("key_base64", &request.key_base64)?;
+    if routing_key.is_empty() {
+        return Err(ApiError::bad_request(
+            "key_base64 must contain a non-empty key",
+        ));
+    }
+    let (_, assignment) = state
         .control
-        .active_range_assignment(feed.feed_id)
+        .active_range_for_key(feed.feed_id, &routing_key)
         .await
-        .ok_or_else(|| ApiError::unavailable("Active Range assignment is unavailable"))?;
+        .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
     if state.storage_node_id.as_ref() != Some(&assignment.owner) {
         return Err(ApiError::unavailable(format!(
             "Node is not current Append Owner {}; refresh assignment and retry",
             assignment.owner
         )));
     }
-    let key = decode_base64("key_base64", &request.key_base64)?;
-    if key.is_empty() {
-        return Err(ApiError::bad_request(
-            "key_base64 must contain a non-empty key",
-        ));
-    }
+    let key = routing_key;
     let payload = decode_base64("payload_base64", &request.payload_base64)?;
     let metadata = request
         .metadata_base64

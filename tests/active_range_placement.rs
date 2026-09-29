@@ -215,5 +215,15 @@ async fn installed_catalog_snapshot_contains_active_range_placement() {
         .install_snapshot_bytes(&leader.snapshot_bytes().await.unwrap())
         .await
         .unwrap();
-    assert_eq!(placement(&follower).await, placement(&leader).await);
+    let leader_placement = placement(&leader).await;
+    assert_eq!(placement(&follower).await, leader_placement);
+    let feed_id = Uuid::parse_str(leader_placement["feed_id"].as_str().unwrap()).unwrap();
+    let range_map = follower.active_range_map(feed_id).await.unwrap();
+    assert_eq!(range_map.routes().len(), 1);
+    let (route, assignment) = follower
+        .active_range_for_key(feed_id, b"order-123")
+        .await
+        .unwrap();
+    assert_eq!(route.range_id, assignment.range_id);
+    assert_eq!(route.range_id, range_map.routes()[0].range_id);
 }

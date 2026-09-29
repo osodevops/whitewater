@@ -642,8 +642,10 @@ Definition of Done:
 
 - [x] Define a stable 128-bit internal logical keyspace.
 - [x] Map keys deterministically to validated contiguous ranges without exposing topology.
-- [~] Plan online splits with half-open boundaries and generation transitions; Control Plane placement and data movement remain.
-- [ ] Place multiple ranges across N storage Nodes.
+- [x] Persist authoritative per-Feed RangeMaps and RangeId-keyed RF3 assignments through Control Plane snapshots.
+- [x] Route public appends from decoded Keys through the committed RangeMap.
+- [~] Plan online splits with half-open boundaries and generation transitions; activation and data movement remain.
+- [ ] Place multiple active ranges across N storage Nodes.
 - [ ] Split hot ranges online.
 - [ ] Merge cold ranges.
 - [ ] Move ranges while preserving same-Key ordering.
@@ -654,6 +656,8 @@ Evidence:
 
 - `src/active_range/routing.rs` defines portable 128-bit `KeyToken`, half-open `KeyRange`, validated full-coverage `RangeMap`, deterministic routing, and split generation planning.
 - Unit tests prove stable same-key routing, exact split-boundary behavior, total keyspace coverage, invalid gap/overlap rejection, and portable serialization.
+- Feed creation now commits an initial full RangeMap plus a RangeId-keyed assignment; old catalog snapshots migrate from the original per-Feed assignment automatically.
+- Placement snapshot tests prove the RangeMap and assignment recover identically, and append ingress/owner routing resolves assignments from decoded Keys.
 - These types are internal only; Feed, Key, Cursor, Writer, and Reader APIs remain unchanged.
 
 Definition of Done:
