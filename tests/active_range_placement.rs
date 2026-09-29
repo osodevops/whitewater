@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use finnstream::{
-    active_range::StorageNodeId,
-    control::{Command, ControlController, ControlError},
+    active_range::{CommitPosition, KeyToken, StorageNodeId},
+    control::{Command, ControlController, ControlError, RangeSplitPlan, RangeSplitStage},
     storage::{FileLogStore, LogStore},
 };
 use tempfile::TempDir;
@@ -226,4 +226,95 @@ async fn installed_catalog_snapshot_contains_active_range_placement() {
         .unwrap();
     assert_eq!(route.range_id, assignment.range_id);
     assert_eq!(route.range_id, range_map.routes()[0].range_id);
+}
+
+#[tokio::test]
+async fn split_plan_is_consensus_persisted_but_cannot_change_authoritative_routing() {
+    let leader_directory = TempDir::new().unwrap();
+    let follower_directory = TempDir::new().unwrap();
+    let nodes = storage_nodes(&["storage-1", "storage-2", "storage-3"]);
+    let leader = controller(&leader_directory, nodes.clone());
+    let follower = controller(&follower_directory, nodes);
+    create_feed(&leader, Uuid::from_u128(400)).await;
+    let placement_before = placement(&leader).await;
+    let feed_id = Uuid::parse_str(placement_before["feed_id"].as_str().unwrap()).unwrap();
+    let source_owner = placement_before["owner"].as_str().unwrap().to_owned();
+    let request_id = Uuid::from_u128(401);
+    let split_at = KeyToken::from_bytes([0x80; 16]);
+    let command = Command::PrepareActiveRangeSplit {
+        feed: "orders.created".to_owned(),
+        split_at,
+    };
+    let first = leader
+        .execute_commands_with_request_id(vec![command.clone()], request_id)
+        .await
+        .unwrap();
+    let repeated = leader
+        .execute_commands_with_request_id(vec![command], request_id)
+        .await
+        .unwrap();
+    assert_eq!(first.results[0].data, repeated.results[0].data);
+    let plan: RangeSplitPlan = serde_json::from_value(first.results[0].data.clone()).unwrap();
+    assert_eq!(plan.stage, RangeSplitStage::Prepared);
+    assert_eq!(plan.candidate_map.routes().len(), 2);
+    assert_ne!(plan.right_assignment.owner.as_str(), source_owner);
+    assert_eq!(
+        leader
+            .active_range_map(feed_id)
+            .await
+            .unwrap()
+            .routes()
+            .len(),
+        1
+    );
+
+    let catching_up = leader
+        .execute_commands(vec![Command::RecordActiveRangeSplitCatchUp {
+            feed: "orders.created".to_owned(),
+            plan_id: plan.plan_id,
+            source_commit: CommitPosition::new(10),
+            right_commit: CommitPosition::new(9),
+            checksum_verified: true,
+        }])
+        .await
+        .unwrap();
+    assert_eq!(catching_up.results[0].data["stage"], "catching_up");
+    let ready = leader
+        .execute_commands(vec![Command::RecordActiveRangeSplitCatchUp {
+            feed: "orders.created".to_owned(),
+            plan_id: plan.plan_id,
+            source_commit: CommitPosition::new(10),
+            right_commit: CommitPosition::new(10),
+            checksum_verified: true,
+        }])
+        .await
+        .unwrap();
+    assert_eq!(ready.results[0].data["stage"], "ready");
+    assert_eq!(
+        leader
+            .active_range_map(feed_id)
+            .await
+            .unwrap()
+            .routes()
+            .len(),
+        1
+    );
+
+    follower
+        .install_snapshot_bytes(&leader.snapshot_bytes().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        placement(&follower).await["range_split_plan"]["stage"],
+        "ready"
+    );
+    assert_eq!(
+        follower
+            .active_range_map(feed_id)
+            .await
+            .unwrap()
+            .routes()
+            .len(),
+        1
+    );
 }

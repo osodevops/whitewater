@@ -14,8 +14,8 @@ use uuid::Uuid;
 
 use crate::{
     active_range::{
-        ActiveRangeAssignment, OwnershipEpoch, RangeGeneration, RangeId, RangeMap, RangeRoute,
-        ReplicaSet, StorageNodeId, ACTIVE_RANGE_REPLICA_COUNT,
+        ActiveRangeAssignment, CommitPosition, KeyToken, OwnershipEpoch, RangeGeneration, RangeId,
+        RangeMap, RangeRoute, ReplicaSet, StorageNodeId, ACTIVE_RANGE_REPLICA_COUNT,
     },
     storage::{LogStore, StorageError},
 };
@@ -117,6 +117,28 @@ pub struct NamespaceGrant {
     pub created_at_ns: i64,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RangeSplitStage {
+    Prepared,
+    CatchingUp,
+    Ready,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeSplitPlan {
+    pub plan_id: Uuid,
+    pub feed_id: Uuid,
+    pub source_range_id: RangeId,
+    pub split_at: KeyToken,
+    pub candidate_map: RangeMap,
+    pub right_assignment: ActiveRangeAssignment,
+    pub stage: RangeSplitStage,
+    pub source_commit: Option<CommitPosition>,
+    pub right_commit: Option<CommitPosition>,
+    pub checksum_verified: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CatalogState {
     schema_version: u32,
@@ -133,6 +155,8 @@ struct CatalogState {
     range_maps: BTreeMap<Uuid, RangeMap>,
     #[serde(default)]
     range_assignments: BTreeMap<RangeId, ActiveRangeAssignment>,
+    #[serde(default)]
+    range_split_plans: BTreeMap<Uuid, RangeSplitPlan>,
     #[serde(default)]
     applied_requests: BTreeMap<Uuid, ReplicatedCommandResult>,
 }
@@ -164,6 +188,7 @@ impl Default for CatalogState {
             active_ranges: BTreeMap::new(),
             range_maps: BTreeMap::new(),
             range_assignments: BTreeMap::new(),
+            range_split_plans: BTreeMap::new(),
             applied_requests: BTreeMap::new(),
         }
     }
@@ -282,6 +307,17 @@ pub enum Command {
         expected_owner: StorageNodeId,
         expected_epoch: OwnershipEpoch,
         new_owner: StorageNodeId,
+    },
+    PrepareActiveRangeSplit {
+        feed: String,
+        split_at: KeyToken,
+    },
+    RecordActiveRangeSplitCatchUp {
+        feed: String,
+        plan_id: Uuid,
+        source_commit: CommitPosition,
+        right_commit: CommitPosition,
+        checksum_verified: bool,
     },
 }
 
@@ -405,9 +441,12 @@ impl ControlController {
         issued_at_ns: i64,
         command: Command,
     ) -> Result<ReplicatedCommand, ControlError> {
-        let fixed_active_range = matches!(&command, Command::CreateFeed { .. })
-            .then(|| self.select_fixed_active_range())
-            .transpose()?;
+        let fixed_active_range = matches!(
+            &command,
+            Command::CreateFeed { .. } | Command::PrepareActiveRangeSplit { .. }
+        )
+        .then(|| self.select_fixed_active_range())
+        .transpose()?;
         Ok(ReplicatedCommand {
             request_id,
             issued_at_ns,
@@ -1053,6 +1092,10 @@ impl ControlController {
                         json!(state.range_maps.get(&feed_id)),
                     );
                     object.insert(
+                        "range_split_plan".to_owned(),
+                        json!(state.range_split_plans.get(&feed_id)),
+                    );
+                    object.insert(
                         "range_assignments".to_owned(),
                         json!(state
                             .range_maps
@@ -1124,6 +1167,111 @@ impl ControlController {
                 Ok((
                     format!("recovered Active Range ownership for Feed {feed}"),
                     json!(updated),
+                ))
+            }
+            Command::PrepareActiveRangeSplit { feed, split_at } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                if state.range_split_plans.contains_key(&feed_id) {
+                    return Err(ControlError::AlreadyExists(format!(
+                        "Active Range split plan for Feed {feed}"
+                    )));
+                }
+                let current_map = state
+                    .range_maps
+                    .get(&feed_id)
+                    .ok_or_else(|| ControlError::NotFound(format!("RangeMap for Feed {feed}")))?;
+                let source_route = current_map.route_token(split_at).clone();
+                let source_assignment = state
+                    .range_assignments
+                    .get(&source_route.range_id)
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "assignment for source Range {}",
+                            source_route.range_id
+                        ))
+                    })?;
+                let right_range_id =
+                    RangeId::from_uuid(derived_resource_id(request_id, "active-range-split-right"));
+                let candidate_map = current_map
+                    .split(source_route.range_id, split_at, right_range_id)
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let placement = fixed_active_range.ok_or_else(|| {
+                    ControlError::InvalidOperation(
+                        "split preparation has no consensus-prepared RF3 placement".to_owned(),
+                    )
+                })?;
+                let fallback_owner = placement.owner;
+                let replicas = ReplicaSet::try_new(placement.replicas)
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let owner = replicas
+                    .iter()
+                    .find(|node| *node != &source_assignment.owner)
+                    .cloned()
+                    .unwrap_or(fallback_owner);
+                let generation = candidate_map
+                    .routes()
+                    .iter()
+                    .find(|route| route.range_id == right_range_id)
+                    .ok_or_else(|| {
+                        ControlError::InvalidOperation(
+                            "candidate map omitted the right-hand range".to_owned(),
+                        )
+                    })?
+                    .generation;
+                let right_assignment = ActiveRangeAssignment::try_new(
+                    feed_id,
+                    right_range_id,
+                    generation,
+                    owner,
+                    replicas,
+                    OwnershipEpoch::new(1),
+                )
+                .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let plan = RangeSplitPlan {
+                    plan_id: derived_resource_id(request_id, "active-range-split-plan"),
+                    feed_id,
+                    source_range_id: source_route.range_id,
+                    split_at,
+                    candidate_map,
+                    right_assignment,
+                    stage: RangeSplitStage::Prepared,
+                    source_commit: None,
+                    right_commit: None,
+                    checksum_verified: false,
+                };
+                state.range_split_plans.insert(feed_id, plan.clone());
+                Ok((
+                    format!("prepared Active Range split for Feed {feed}"),
+                    json!(plan),
+                ))
+            }
+            Command::RecordActiveRangeSplitCatchUp {
+                feed,
+                plan_id,
+                source_commit,
+                right_commit,
+                checksum_verified,
+            } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                let plan = state.range_split_plans.get_mut(&feed_id).ok_or_else(|| {
+                    ControlError::NotFound(format!("Active Range split plan for Feed {feed}"))
+                })?;
+                if plan.plan_id != plan_id {
+                    return Err(ControlError::InvalidOperation(
+                        "split catch-up evidence belongs to a stale plan".to_owned(),
+                    ));
+                }
+                plan.source_commit = Some(source_commit);
+                plan.right_commit = Some(right_commit);
+                plan.checksum_verified = checksum_verified;
+                plan.stage = if checksum_verified && source_commit == right_commit {
+                    RangeSplitStage::Ready
+                } else {
+                    RangeSplitStage::CatchingUp
+                };
+                Ok((
+                    format!("recorded Active Range split catch-up for Feed {feed}"),
+                    json!(plan.clone()),
                 ))
             }
         }
@@ -1926,6 +2074,8 @@ fn command_label(command: &Command) -> String {
         Command::InspectPlacement { .. } => "INSPECT PLACEMENT",
         Command::TransferActiveRangeOwnership { .. } => "TRANSFER ACTIVE RANGE OWNERSHIP",
         Command::RecoverActiveRangeOwnership { .. } => "RECOVER ACTIVE RANGE OWNERSHIP",
+        Command::PrepareActiveRangeSplit { .. } => "PREPARE ACTIVE RANGE SPLIT",
+        Command::RecordActiveRangeSplitCatchUp { .. } => "RECORD ACTIVE RANGE SPLIT CATCH UP",
     }
     .to_owned()
 }
