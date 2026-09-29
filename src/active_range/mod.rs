@@ -3,6 +3,7 @@ pub mod model;
 pub mod recovery;
 pub mod repair;
 pub mod replication;
+pub mod routing;
 pub mod store;
 
 pub use majority::{
@@ -30,6 +31,7 @@ pub use replication::{
     ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest,
     ReplicaCommitResponse, MAX_REPLICA_FRAME_BASE64_BYTES,
 };
+pub use routing::{KeyRange, KeyToken, RangeMap, RangeMapError, RangeRoute};
 pub use store::{
     ActiveRangeAppend, ActiveRangeAppendResult, ActiveRangeDescriptor, ActiveRangeSnapshot,
     ActiveRangeStore, ActiveRangeStoreError, FileActiveRangeStore, FileActiveRangeStoreOptions,

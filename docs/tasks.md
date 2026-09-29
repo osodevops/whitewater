@@ -21,7 +21,7 @@
 
 ## Current focus
 
-**Milestone 2 — Operational Writers**
+**Milestone 4 — Multiple internal ranges**
 
 The target is deliberately narrow:
 
@@ -573,7 +573,7 @@ Autoscaling must never apply one generic removal procedure to all three cases.
 
 ## Milestone 2 — Operational Writers
 
-**Status: Current focus**
+**Status: Foundation complete; PowerShell Writer wrapper remains**
 
 - [x] Implement authenticated WriterSession creation through the Admin API and WCL.
 - [x] Bind sessions to immutable WriterId and FeedId.
@@ -638,14 +638,23 @@ Definition of Done:
 
 ## Milestone 4 — Multiple internal ranges
 
-- [ ] Define a large logical range space.
-- [ ] Map keys to ranges without exposing topology.
+**Status: Current focus**
+
+- [x] Define a stable 128-bit internal logical keyspace.
+- [x] Map keys deterministically to validated contiguous ranges without exposing topology.
+- [~] Plan online splits with half-open boundaries and generation transitions; Control Plane placement and data movement remain.
 - [ ] Place multiple ranges across N storage Nodes.
 - [ ] Split hot ranges online.
 - [ ] Merge cold ranges.
 - [ ] Move ranges while preserving same-Key ordering.
 - [ ] Keep Cursors valid across generation changes.
 - [ ] Add hot-key detection and isolation.
+
+Evidence:
+
+- `src/active_range/routing.rs` defines portable 128-bit `KeyToken`, half-open `KeyRange`, validated full-coverage `RangeMap`, deterministic routing, and split generation planning.
+- Unit tests prove stable same-key routing, exact split-boundary behavior, total keyspace coverage, invalid gap/overlap rejection, and portable serialization.
+- These types are internal only; Feed, Key, Cursor, Writer, and Reader APIs remain unchanged.
 
 Definition of Done:
 
