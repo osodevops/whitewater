@@ -645,8 +645,8 @@ Definition of Done:
 - [x] Persist authoritative per-Feed RangeMaps and RangeId-keyed RF3 assignments through Control Plane snapshots.
 - [x] Route public appends from decoded Keys through the committed RangeMap.
 - [x] Persist idempotent split plans with candidate maps, deterministic right-hand RF3 placement, and prepared/catching-up/ready stages.
-- [x] Stage the committed right-hand key subset on all three planned replicas with contiguous target positions, exact logical record bytes, sparse Writer dedup rebuild, and checksum evidence.
-- [~] Activate online splits only after verified data movement; planning, RF3 staging, and readiness evidence are complete, while atomic cutover remains.
+- [x] Stage both candidate generations from one captured committed source boundary, with key filtering, contiguous target positions, exact logical record bytes, sparse Writer dedup rebuild, and RF3 checksum evidence.
+- [~] Activate online splits only after verified data movement; planning and complete candidate staging are done, while source freeze, final delta, Writer range-sequence cutover, and atomic map activation remain.
 - [ ] Place multiple active ranges across N storage Nodes.
 - [ ] Split hot ranges online.
 - [ ] Merge cold ranges.
@@ -661,7 +661,7 @@ Evidence:
 - Feed creation now commits an initial full RangeMap plus a RangeId-keyed assignment; old catalog snapshots migrate from the original per-Feed assignment automatically.
 - Placement snapshot tests prove the RangeMap and assignment recover identically, and append ingress/owner routing resolves assignments from decoded Keys.
 - Split-plan tests prove request idempotency, a distinct right-hand owner, candidate two-range coverage, complete source-prefix scanning with verified checksums, snapshot recovery, and no authoritative routing change before cutover.
-- `tests/range_split_staging.rs` proves right-key filtering, sparse Writer-sequence import, contiguous staged positions, byte-identical records across all three replicas, staged commit evidence, and unchanged live routing.
+- `tests/range_split_staging.rs` proves left/right key filtering from one immutable source boundary, sparse Writer-sequence import, contiguous per-range positions, byte-identical records across RF3, staged commit evidence for both candidate generations, and unchanged live routing.
 - These types are internal only; Feed, Key, Cursor, Writer, and Reader APIs remain unchanged.
 
 Definition of Done:

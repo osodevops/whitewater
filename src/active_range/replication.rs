@@ -129,7 +129,7 @@ pub struct ReplicaAppendService {
     root: Arc<PathBuf>,
     local_node: StorageNodeId,
     control: Arc<ControlController>,
-    stores: Arc<RwLock<HashMap<RangeId, FileActiveRangeStore>>>,
+    stores: Arc<RwLock<HashMap<(RangeId, RangeGeneration), FileActiveRangeStore>>>,
 }
 
 impl ReplicaAppendService {
@@ -325,7 +325,10 @@ impl ReplicaAppendService {
                     format!("no committed Active Range assignment exists for Feed {feed_id}"),
                 )
             })?;
-        self.stores.write().await.remove(&assignment.range_id);
+        self.stores
+            .write()
+            .await
+            .retain(|(range_id, _), _| range_id != &assignment.range_id);
         let directory = self
             .root
             .join(assignment.feed_id.to_string())
@@ -556,7 +559,8 @@ impl ReplicaAppendService {
         &self,
         assignment: &ActiveRangeAssignment,
     ) -> Result<FileActiveRangeStore, ReplicaAppendError> {
-        if let Some(store) = self.stores.read().await.get(&assignment.range_id).cloned() {
+        let store_key = (assignment.range_id, assignment.generation);
+        if let Some(store) = self.stores.read().await.get(&store_key).cloned() {
             synchronize_store_epoch(&store, assignment).await?;
             return Ok(store);
         }
@@ -574,7 +578,7 @@ impl ReplicaAppendService {
         .map_err(|error| ReplicaAppendError::storage(error.to_string()))?
         .map_err(|error| ReplicaAppendError::storage(error.to_string()))?;
         let mut stores = self.stores.write().await;
-        Ok(stores.entry(assignment.range_id).or_insert(opened).clone())
+        Ok(stores.entry(store_key).or_insert(opened).clone())
     }
 }
 

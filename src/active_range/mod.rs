@@ -33,7 +33,10 @@ pub use replication::{
     ReplicaCommitResponse, MAX_REPLICA_FRAME_BASE64_BYTES,
 };
 pub use routing::{KeyRange, KeyToken, RangeMap, RangeMapError, RangeRoute};
-pub use split::{stage_right_range, SplitStagingError, SplitStagingResult};
+pub use split::{
+    stage_candidate_ranges, stage_right_range, CandidateSplitStagingResult, SplitStagingError,
+    SplitStagingResult,
+};
 pub use store::{
     ActiveRangeAppend, ActiveRangeAppendResult, ActiveRangeDescriptor, ActiveRangeSnapshot,
     ActiveRangeStore, ActiveRangeStoreError, FileActiveRangeStore, FileActiveRangeStoreOptions,

@@ -132,6 +132,8 @@ pub struct RangeSplitPlan {
     pub source_range_id: RangeId,
     pub split_at: KeyToken,
     pub candidate_map: RangeMap,
+    #[serde(default)]
+    pub left_assignment: Option<ActiveRangeAssignment>,
     pub right_assignment: ActiveRangeAssignment,
     pub stage: RangeSplitStage,
     pub source_commit: Option<CommitPosition>,
@@ -1220,6 +1222,25 @@ impl ControlController {
                         )
                     })?
                     .generation;
+                let left_generation = candidate_map
+                    .routes()
+                    .iter()
+                    .find(|route| route.range_id == source_route.range_id)
+                    .ok_or_else(|| {
+                        ControlError::InvalidOperation(
+                            "candidate map omitted the left-hand range".to_owned(),
+                        )
+                    })?
+                    .generation;
+                let left_assignment = ActiveRangeAssignment::try_new(
+                    feed_id,
+                    source_route.range_id,
+                    left_generation,
+                    source_assignment.owner.clone(),
+                    source_assignment.replicas.clone(),
+                    source_assignment.ownership_epoch,
+                )
+                .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
                 let right_assignment = ActiveRangeAssignment::try_new(
                     feed_id,
                     right_range_id,
@@ -1235,6 +1256,7 @@ impl ControlController {
                     source_range_id: source_route.range_id,
                     split_at,
                     candidate_map,
+                    left_assignment: Some(left_assignment),
                     right_assignment,
                     stage: RangeSplitStage::Prepared,
                     source_commit: None,

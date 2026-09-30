@@ -3,8 +3,9 @@ use std::{collections::BTreeMap, sync::Arc};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use finnstream::{
     active_range::{
-        stage_right_range, AppendIdentity, CommitPosition, KeyToken, RangePosition,
-        ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitRequest, StorageNodeId,
+        stage_candidate_ranges, stage_right_range, AppendIdentity, CommitPosition, KeyToken,
+        RangePosition, ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitRequest,
+        StorageNodeId,
     },
     codec::encode_record,
     control::{Command, ControlController, RangeSplitPlan},
@@ -130,9 +131,24 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
         .await
         .unwrap();
     assert_eq!(staged.source_scanned_through, CommitPosition::new(4));
-    assert_eq!(staged.right_commit, CommitPosition::new(2));
+    assert_eq!(staged.target_commit, CommitPosition::new(2));
     assert_eq!(staged.transferred_records, 2);
     assert_eq!(staged.replicas_verified.len(), 3);
+    let candidate = stage_candidate_ranges(
+        &plan,
+        services[&source_assignment.owner].clone(),
+        &services,
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(candidate.source_commit, CommitPosition::new(4));
+    assert_eq!(candidate.left.target_commit, CommitPosition::new(2));
+    assert_eq!(candidate.right.target_commit, CommitPosition::new(2));
+    assert_eq!(
+        candidate.left.source_scanned_through,
+        candidate.right.source_scanned_through
+    );
     for replica in plan.right_assignment.replicas.iter() {
         let records = services[replica]
             .read_staged_committed(&plan.right_assignment, None, 10)
@@ -149,6 +165,16 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
                 .unwrap()[0]
                 .frame
         );
+    }
+    let left_assignment = plan.left_assignment.as_ref().unwrap();
+    for replica in left_assignment.replicas.iter() {
+        let records = services[replica]
+            .read_staged_committed(left_assignment, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].identity.sequence, 1);
+        assert_eq!(records[1].identity.sequence, 3);
     }
     assert_eq!(
         control
