@@ -155,6 +155,10 @@ pub trait ActiveRangeStore: Send + Sync {
         &self,
         request: ActiveRangeAppend,
     ) -> Result<ActiveRangeAppendResult, ActiveRangeStoreError>;
+    async fn import_split(
+        &self,
+        request: ActiveRangeAppend,
+    ) -> Result<ActiveRangeAppendResult, ActiveRangeStoreError>;
     async fn commit(
         &self,
         generation: RangeGeneration,
@@ -354,7 +358,16 @@ impl ActiveRangeStore for FileActiveRangeStore {
         &self,
         request: ActiveRangeAppend,
     ) -> Result<ActiveRangeAppendResult, ActiveRangeStoreError> {
-        self.blocking(move |inner| append(inner, request)).await
+        self.blocking(move |inner| append(inner, request, false))
+            .await
+    }
+
+    async fn import_split(
+        &self,
+        request: ActiveRangeAppend,
+    ) -> Result<ActiveRangeAppendResult, ActiveRangeStoreError> {
+        self.blocking(move |inner| append(inner, request, true))
+            .await
     }
 
     async fn commit(
@@ -569,6 +582,7 @@ fn snapshot(loaded: &LoadedRange) -> Result<ActiveRangeSnapshot, ActiveRangeStor
 fn append(
     inner: &FileActiveRangeStoreInner,
     request: ActiveRangeAppend,
+    allow_writer_sequence_gap: bool,
 ) -> Result<ActiveRangeAppendResult, ActiveRangeStoreError> {
     if request.cursor.len() > MAX_CURSOR_BYTES {
         return Err(ActiveRangeStoreError::CursorTooLarge);
@@ -659,7 +673,7 @@ fn append(
             .sequence
             .checked_add(1)
             .ok_or(ActiveRangeStoreError::PositionOverflow)?;
-        if request.identity.sequence != expected {
+        if !allow_writer_sequence_gap && request.identity.sequence != expected {
             return Err(ActiveRangeStoreError::WriterSequenceGap {
                 actual: request.identity.sequence,
                 expected,

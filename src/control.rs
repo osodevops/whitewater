@@ -135,6 +135,7 @@ pub struct RangeSplitPlan {
     pub right_assignment: ActiveRangeAssignment,
     pub stage: RangeSplitStage,
     pub source_commit: Option<CommitPosition>,
+    pub source_scanned_through: Option<CommitPosition>,
     pub right_commit: Option<CommitPosition>,
     pub checksum_verified: bool,
 }
@@ -316,6 +317,7 @@ pub enum Command {
         feed: String,
         plan_id: Uuid,
         source_commit: CommitPosition,
+        source_scanned_through: CommitPosition,
         right_commit: CommitPosition,
         checksum_verified: bool,
     },
@@ -1236,6 +1238,7 @@ impl ControlController {
                     right_assignment,
                     stage: RangeSplitStage::Prepared,
                     source_commit: None,
+                    source_scanned_through: None,
                     right_commit: None,
                     checksum_verified: false,
                 };
@@ -1249,6 +1252,7 @@ impl ControlController {
                 feed,
                 plan_id,
                 source_commit,
+                source_scanned_through,
                 right_commit,
                 checksum_verified,
             } => {
@@ -1262,9 +1266,10 @@ impl ControlController {
                     ));
                 }
                 plan.source_commit = Some(source_commit);
+                plan.source_scanned_through = Some(source_scanned_through);
                 plan.right_commit = Some(right_commit);
                 plan.checksum_verified = checksum_verified;
-                plan.stage = if checksum_verified && source_commit == right_commit {
+                plan.stage = if checksum_verified && source_commit == source_scanned_through {
                     RangeSplitStage::Ready
                 } else {
                     RangeSplitStage::CatchingUp

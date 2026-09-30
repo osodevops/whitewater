@@ -273,7 +273,8 @@ async fn split_plan_is_consensus_persisted_but_cannot_change_authoritative_routi
             feed: "orders.created".to_owned(),
             plan_id: plan.plan_id,
             source_commit: CommitPosition::new(10),
-            right_commit: CommitPosition::new(9),
+            source_scanned_through: CommitPosition::new(9),
+            right_commit: CommitPosition::new(4),
             checksum_verified: true,
         }])
         .await
@@ -284,7 +285,8 @@ async fn split_plan_is_consensus_persisted_but_cannot_change_authoritative_routi
             feed: "orders.created".to_owned(),
             plan_id: plan.plan_id,
             source_commit: CommitPosition::new(10),
-            right_commit: CommitPosition::new(10),
+            source_scanned_through: CommitPosition::new(10),
+            right_commit: CommitPosition::new(5),
             checksum_verified: true,
         }])
         .await

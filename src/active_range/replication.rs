@@ -174,6 +174,59 @@ impl ReplicaAppendService {
             .map_err(|error| ReplicaAppendError::storage(error.to_string()))
     }
 
+    pub async fn stage_split_frame(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        position: RangePosition,
+        identity: AppendIdentity,
+        cursor: String,
+        frame: Vec<u8>,
+    ) -> Result<super::ActiveRangeAppendResult, ReplicaAppendError> {
+        if !assignment.replicas.contains(&self.local_node) {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::ReceiverNotReplica,
+                format!("Node {} is not a staged replica", self.local_node),
+            ));
+        }
+        self.store_for(assignment)
+            .await?
+            .import_split(ActiveRangeAppend {
+                generation: assignment.generation,
+                ownership_epoch: assignment.ownership_epoch,
+                expected_position: Some(position),
+                identity,
+                cursor,
+                frame,
+            })
+            .await
+            .map_err(map_store_error)
+    }
+
+    pub async fn read_staged_committed(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        after: Option<RangePosition>,
+        limit: usize,
+    ) -> Result<Vec<super::StoredRangeFrame>, ReplicaAppendError> {
+        self.store_for(assignment)
+            .await?
+            .read_committed(after, limit)
+            .await
+            .map_err(map_store_error)
+    }
+
+    pub async fn commit_staged_split(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        position: CommitPosition,
+    ) -> Result<(), ReplicaAppendError> {
+        self.store_for(assignment)
+            .await?
+            .commit(assignment.generation, assignment.ownership_epoch, position)
+            .await
+            .map_err(map_store_error)
+    }
+
     pub async fn recovery_status(
         &self,
         feed_id: Uuid,
