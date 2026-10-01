@@ -3,8 +3,9 @@ use std::{collections::BTreeMap, sync::Arc};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use finnstream::{
     active_range::{
-        stage_candidate_ranges, stage_right_range, AppendIdentity, CommitPosition, KeyToken,
-        RangePosition, ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitRequest,
+        abort_frozen_split, freeze_and_stage_final_boundary, stage_candidate_ranges,
+        stage_right_range, AppendIdentity, CommitPosition, KeyToken, RangePosition,
+        ReplicaAppendErrorCode, ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitRequest,
         StorageNodeId,
     },
     codec::encode_record,
@@ -72,6 +73,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             break;
         }
     }
+    let post_freeze_key = right_key.clone();
     let writer = Uuid::from_u128(900);
     for (index, key) in [left_key.clone(), right_key.clone(), left_key, right_key]
         .into_iter()
@@ -148,6 +150,57 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
     assert_eq!(
         candidate.left.source_scanned_through,
         candidate.right.source_scanned_through
+    );
+    let source_service = services[&source_assignment.owner].clone();
+    let frozen = freeze_and_stage_final_boundary(
+        &plan,
+        &source_assignment,
+        source_service.clone(),
+        &services,
+        2,
+    )
+    .await
+    .unwrap();
+    assert_eq!(frozen.final_commit, CommitPosition::new(4));
+    assert!(
+        source_service
+            .generation_is_frozen(source_assignment.range_id, source_assignment.generation)
+            .await
+    );
+    let fifth = StoredRecord {
+        message_id: Uuid::from_u128(1_005),
+        producer_id: writer,
+        producer_sequence: 5,
+        event_time_ns: 5,
+        ingest_time_ns: 5,
+        key: post_freeze_key,
+        payload: b"value-5".to_vec(),
+        metadata: BTreeMap::new(),
+    };
+    let frozen_error = source_service
+        .append(ReplicaAppendRequest {
+            feed_id,
+            range_id: source_assignment.range_id,
+            generation: source_assignment.generation,
+            ownership_epoch: source_assignment.ownership_epoch,
+            append_owner: source_assignment.owner.clone(),
+            expected_position: RangePosition::new(5),
+            identity: AppendIdentity {
+                writer_session_id: writer,
+                writer_epoch: 1,
+                sequence: 5,
+            },
+            cursor: "cursor-5".to_owned(),
+            frame_base64: STANDARD.encode(encode_record(&fifth).unwrap()),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(frozen_error.code, ReplicaAppendErrorCode::RangeFrozen);
+    abort_frozen_split(&source_service, &frozen).await;
+    assert!(
+        !source_service
+            .generation_is_frozen(source_assignment.range_id, source_assignment.generation)
+            .await
     );
     for replica in plan.right_assignment.replicas.iter() {
         let records = services[replica]

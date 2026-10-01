@@ -1,8 +1,13 @@
-use std::{collections::HashMap, fmt, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::{codec::MAX_FRAME_BYTES, control::ControlController};
@@ -54,6 +59,7 @@ pub enum ReplicaAppendErrorCode {
     PositionGap,
     PositionConflict,
     WriterSequenceConflict,
+    RangeFrozen,
     StorageFailure,
 }
 
@@ -130,6 +136,8 @@ pub struct ReplicaAppendService {
     local_node: StorageNodeId,
     control: Arc<ControlController>,
     stores: Arc<RwLock<HashMap<(RangeId, RangeGeneration), FileActiveRangeStore>>>,
+    frozen_generations: Arc<RwLock<HashSet<(RangeId, RangeGeneration)>>>,
+    append_gate: Arc<Mutex<()>>,
 }
 
 impl ReplicaAppendService {
@@ -143,11 +151,39 @@ impl ReplicaAppendService {
             local_node,
             control,
             stores: Arc::new(RwLock::new(HashMap::new())),
+            frozen_generations: Arc::new(RwLock::new(HashSet::new())),
+            append_gate: Arc::new(Mutex::new(())),
         }
     }
 
     pub fn local_node(&self) -> &StorageNodeId {
         &self.local_node
+    }
+
+    pub async fn freeze_generation(&self, range_id: RangeId, generation: RangeGeneration) {
+        let _gate = self.append_gate.lock().await;
+        self.frozen_generations
+            .write()
+            .await
+            .insert((range_id, generation));
+    }
+
+    pub async fn unfreeze_generation(&self, range_id: RangeId, generation: RangeGeneration) {
+        self.frozen_generations
+            .write()
+            .await
+            .remove(&(range_id, generation));
+    }
+
+    pub async fn generation_is_frozen(
+        &self,
+        range_id: RangeId,
+        generation: RangeGeneration,
+    ) -> bool {
+        self.frozen_generations
+            .read()
+            .await
+            .contains(&(range_id, generation))
     }
 
     pub async fn next_position(&self, feed_id: Uuid) -> Result<RangePosition, ReplicaAppendError> {
@@ -397,6 +433,16 @@ impl ReplicaAppendService {
         &self,
         request: ReplicaAppendRequest,
     ) -> Result<ReplicaAppendAccepted, ReplicaAppendError> {
+        let _gate = self.append_gate.lock().await;
+        if self
+            .generation_is_frozen(request.range_id, request.generation)
+            .await
+        {
+            return Err(ReplicaAppendError::temporary(
+                ReplicaAppendErrorCode::RangeFrozen,
+                "Active Range generation is frozen for split cutover; retry safely",
+            ));
+        }
         if request.frame_base64.len() > MAX_REPLICA_FRAME_BASE64_BYTES {
             return Err(ReplicaAppendError::rejected(
                 ReplicaAppendErrorCode::FrameTooLarge,

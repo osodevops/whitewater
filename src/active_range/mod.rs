@@ -34,8 +34,8 @@ pub use replication::{
 };
 pub use routing::{KeyRange, KeyToken, RangeMap, RangeMapError, RangeRoute};
 pub use split::{
-    stage_candidate_ranges, stage_right_range, CandidateSplitStagingResult, SplitStagingError,
-    SplitStagingResult,
+    abort_frozen_split, freeze_and_stage_final_boundary, stage_candidate_ranges, stage_right_range,
+    CandidateSplitStagingResult, FrozenSplitBoundary, SplitStagingError, SplitStagingResult,
 };
 pub use store::{
     ActiveRangeAppend, ActiveRangeAppendResult, ActiveRangeDescriptor, ActiveRangeSnapshot,

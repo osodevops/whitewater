@@ -27,6 +27,14 @@ pub struct CandidateSplitStagingResult {
     pub right: SplitStagingResult,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrozenSplitBoundary {
+    pub source_range_id: super::RangeId,
+    pub source_generation: super::RangeGeneration,
+    pub final_commit: CommitPosition,
+    pub staging: CandidateSplitStagingResult,
+}
+
 #[derive(Debug, Error)]
 pub enum SplitStagingError {
     #[error("source range scan failed: {0}")]
@@ -44,6 +52,57 @@ pub enum SplitStagingError {
     MissingLeftAssignment,
     #[error("staged replica accepted a conflicting position or frame digest")]
     VerificationConflict,
+    #[error("source CommitPosition changed after the cutover freeze")]
+    BoundaryMoved,
+}
+
+pub async fn freeze_and_stage_final_boundary(
+    plan: &RangeSplitPlan,
+    source_assignment: &ActiveRangeAssignment,
+    source: Arc<ReplicaAppendService>,
+    targets: &BTreeMap<StorageNodeId, Arc<ReplicaAppendService>>,
+    batch_size: usize,
+) -> Result<FrozenSplitBoundary, SplitStagingError> {
+    source
+        .freeze_generation(source_assignment.range_id, source_assignment.generation)
+        .await;
+    let final_commit = source
+        .recovery_status(plan.feed_id)
+        .await
+        .map_err(|error| SplitStagingError::Source(error.to_string()))?
+        .committed;
+    let staging = match stage_candidate_ranges(plan, source.clone(), targets, batch_size).await {
+        Ok(staging) => staging,
+        Err(error) => {
+            source
+                .unfreeze_generation(source_assignment.range_id, source_assignment.generation)
+                .await;
+            return Err(error);
+        }
+    };
+    let after = source
+        .recovery_status(plan.feed_id)
+        .await
+        .map_err(|error| SplitStagingError::Source(error.to_string()))?
+        .committed;
+    if staging.source_commit != final_commit || after != final_commit {
+        source
+            .unfreeze_generation(source_assignment.range_id, source_assignment.generation)
+            .await;
+        return Err(SplitStagingError::BoundaryMoved);
+    }
+    Ok(FrozenSplitBoundary {
+        source_range_id: source_assignment.range_id,
+        source_generation: source_assignment.generation,
+        final_commit,
+        staging,
+    })
+}
+
+pub async fn abort_frozen_split(source: &ReplicaAppendService, boundary: &FrozenSplitBoundary) {
+    source
+        .unfreeze_generation(boundary.source_range_id, boundary.source_generation)
+        .await;
 }
 
 pub async fn stage_candidate_ranges(
