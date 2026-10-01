@@ -1,12 +1,13 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use finnstream::{
     active_range::{
-        abort_frozen_split, freeze_and_stage_final_boundary, stage_candidate_ranges,
-        stage_right_range, AppendIdentity, CommitPosition, KeyToken, RangePosition,
-        ReplicaAppendErrorCode, ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitRequest,
-        StorageNodeId,
+        abort_frozen_split, freeze_and_stage_final_boundary, orchestrate_split_cutover,
+        stage_candidate_ranges, stage_right_range, AppendIdentity, CommitPosition,
+        FrozenSplitBoundary, KeyToken, RangePosition, ReplicaAppendErrorCode, ReplicaAppendRequest,
+        ReplicaAppendService, ReplicaCommitRequest, SplitCutoverControl, StorageNodeId,
     },
     codec::encode_record,
     control::{Command, ControlController, RangeSplitPlan},
@@ -18,6 +19,51 @@ use uuid::Uuid;
 
 fn node(value: &str) -> StorageNodeId {
     StorageNodeId::try_new(value).unwrap()
+}
+
+struct LocalSplitControl {
+    control: Arc<ControlController>,
+}
+
+#[async_trait]
+impl SplitCutoverControl for LocalSplitControl {
+    async fn mark_ready(
+        &self,
+        feed: &str,
+        plan: &RangeSplitPlan,
+        boundary: &FrozenSplitBoundary,
+    ) -> Result<(), String> {
+        self.control
+            .execute_commands(vec![Command::RecordActiveRangeSplitCatchUp {
+                feed: feed.to_owned(),
+                plan_id: plan.plan_id,
+                source_commit: boundary.final_commit,
+                source_scanned_through: boundary.staging.source_commit,
+                right_commit: boundary.staging.right.target_commit,
+                checksum_verified: true,
+            }])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn activate(
+        &self,
+        feed: &str,
+        plan: &RangeSplitPlan,
+        boundary: &FrozenSplitBoundary,
+    ) -> Result<(), String> {
+        self.control
+            .execute_commands(vec![Command::ActivateActiveRangeSplit {
+                feed: feed.to_owned(),
+                plan_id: plan.plan_id,
+                left_writer_sequences: boundary.staging.left.writer_sequences.clone(),
+                right_writer_sequences: boundary.staging.right.writer_sequences.clone(),
+            }])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[tokio::test]
@@ -238,7 +284,12 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             .len(),
         1
     );
-    let final_boundary = freeze_and_stage_final_boundary(
+    let cutover_control = LocalSplitControl {
+        control: control.clone(),
+    };
+    let final_boundary = orchestrate_split_cutover(
+        &cutover_control,
+        "orders.events",
         &plan,
         &source_assignment,
         source_service.clone(),
@@ -247,26 +298,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
     )
     .await
     .unwrap();
-    control
-        .execute_commands(vec![Command::RecordActiveRangeSplitCatchUp {
-            feed: "orders.events".to_owned(),
-            plan_id: plan.plan_id,
-            source_commit: final_boundary.final_commit,
-            source_scanned_through: final_boundary.staging.source_commit,
-            right_commit: final_boundary.staging.right.target_commit,
-            checksum_verified: true,
-        }])
-        .await
-        .unwrap();
-    control
-        .execute_commands(vec![Command::ActivateActiveRangeSplit {
-            feed: "orders.events".to_owned(),
-            plan_id: plan.plan_id,
-            left_writer_sequences: final_boundary.staging.left.writer_sequences.clone(),
-            right_writer_sequences: final_boundary.staging.right.writer_sequences.clone(),
-        }])
-        .await
-        .unwrap();
+    assert_eq!(final_boundary.final_commit, CommitPosition::new(4));
     assert_eq!(
         control
             .active_range_map(feed_id)

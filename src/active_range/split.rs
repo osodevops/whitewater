@@ -1,9 +1,14 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::{codec::decode_record, control::RangeSplitPlan};
+use crate::{
+    codec::decode_record,
+    control::{Command, RangeSplitPlan},
+    control_plane::ControlPlane,
+};
 
 use super::{
     ActiveRangeAssignment, CommitPosition, RangePosition, RangeRoute, ReplicaAppendService,
@@ -43,6 +48,46 @@ pub struct FrozenSplitBoundary {
     pub staging: CandidateSplitStagingResult,
 }
 
+#[derive(Clone, Debug)]
+pub struct SplitPressureTracker {
+    threshold: u64,
+    sustained_samples: u32,
+    cooldown_samples: u32,
+    evidence: u32,
+    cooldown_remaining: u32,
+}
+
+impl SplitPressureTracker {
+    pub fn new(threshold: u64, sustained_samples: u32, cooldown_samples: u32) -> Self {
+        Self {
+            threshold,
+            sustained_samples: sustained_samples.max(1),
+            cooldown_samples,
+            evidence: 0,
+            cooldown_remaining: 0,
+        }
+    }
+
+    pub fn observe(&mut self, appends_per_second: u64) -> bool {
+        if self.cooldown_remaining > 0 {
+            self.cooldown_remaining -= 1;
+            self.evidence = 0;
+            return false;
+        }
+        if appends_per_second < self.threshold {
+            self.evidence = 0;
+            return false;
+        }
+        self.evidence = self.evidence.saturating_add(1);
+        if self.evidence < self.sustained_samples {
+            return false;
+        }
+        self.evidence = 0;
+        self.cooldown_remaining = self.cooldown_samples;
+        true
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SplitStagingError {
     #[error("source range scan failed: {0}")]
@@ -62,6 +107,8 @@ pub enum SplitStagingError {
     VerificationConflict,
     #[error("source CommitPosition changed after the cutover freeze")]
     BoundaryMoved,
+    #[error("Control Plane split transition failed: {0}")]
+    Control(String),
 }
 
 pub async fn freeze_and_stage_final_boundary(
@@ -111,6 +158,103 @@ pub async fn abort_frozen_split(source: &ReplicaAppendService, boundary: &Frozen
     source
         .unfreeze_generation(boundary.source_range_id, boundary.source_generation)
         .await;
+}
+
+#[async_trait]
+pub trait SplitCutoverControl: Send + Sync {
+    async fn mark_ready(
+        &self,
+        feed: &str,
+        plan: &RangeSplitPlan,
+        boundary: &FrozenSplitBoundary,
+    ) -> Result<(), String>;
+
+    async fn activate(
+        &self,
+        feed: &str,
+        plan: &RangeSplitPlan,
+        boundary: &FrozenSplitBoundary,
+    ) -> Result<(), String>;
+}
+
+#[derive(Clone)]
+pub struct ControlPlaneSplitCutover {
+    control_plane: Arc<ControlPlane>,
+}
+
+impl ControlPlaneSplitCutover {
+    pub fn new(control_plane: Arc<ControlPlane>) -> Self {
+        Self { control_plane }
+    }
+}
+
+#[async_trait]
+impl SplitCutoverControl for ControlPlaneSplitCutover {
+    async fn mark_ready(
+        &self,
+        feed: &str,
+        plan: &RangeSplitPlan,
+        boundary: &FrozenSplitBoundary,
+    ) -> Result<(), String> {
+        self.control_plane
+            .execute_commands(vec![Command::RecordActiveRangeSplitCatchUp {
+                feed: feed.to_owned(),
+                plan_id: plan.plan_id,
+                source_commit: boundary.final_commit,
+                source_scanned_through: boundary.staging.source_commit,
+                right_commit: boundary.staging.right.target_commit,
+                checksum_verified: true,
+            }])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn activate(
+        &self,
+        feed: &str,
+        plan: &RangeSplitPlan,
+        boundary: &FrozenSplitBoundary,
+    ) -> Result<(), String> {
+        self.control_plane
+            .execute_commands(vec![Command::ActivateActiveRangeSplit {
+                feed: feed.to_owned(),
+                plan_id: plan.plan_id,
+                left_writer_sequences: boundary.staging.left.writer_sequences.clone(),
+                right_writer_sequences: boundary.staging.right.writer_sequences.clone(),
+            }])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+pub async fn orchestrate_split_cutover(
+    control: &dyn SplitCutoverControl,
+    feed: &str,
+    plan: &RangeSplitPlan,
+    source_assignment: &ActiveRangeAssignment,
+    source: Arc<ReplicaAppendService>,
+    targets: &BTreeMap<StorageNodeId, Arc<ReplicaAppendService>>,
+    batch_size: usize,
+) -> Result<FrozenSplitBoundary, SplitStagingError> {
+    let boundary = freeze_and_stage_final_boundary(
+        plan,
+        source_assignment,
+        source.clone(),
+        targets,
+        batch_size,
+    )
+    .await?;
+    if let Err(error) = control.mark_ready(feed, plan, &boundary).await {
+        abort_frozen_split(&source, &boundary).await;
+        return Err(SplitStagingError::Control(error));
+    }
+    if let Err(error) = control.activate(feed, plan, &boundary).await {
+        abort_frozen_split(&source, &boundary).await;
+        return Err(SplitStagingError::Control(error));
+    }
+    Ok(boundary)
 }
 
 pub async fn stage_candidate_ranges(
@@ -294,4 +438,24 @@ async fn stage_route(
             )
             .collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pressure_requires_sustained_evidence_and_observes_cooldown() {
+        let mut tracker = SplitPressureTracker::new(1_000, 3, 2);
+        assert!(!tracker.observe(1_100));
+        assert!(!tracker.observe(900));
+        assert!(!tracker.observe(1_100));
+        assert!(!tracker.observe(1_200));
+        assert!(tracker.observe(1_300));
+        assert!(!tracker.observe(2_000));
+        assert!(!tracker.observe(2_000));
+        assert!(!tracker.observe(2_000));
+        assert!(!tracker.observe(2_000));
+        assert!(tracker.observe(2_000));
+    }
 }

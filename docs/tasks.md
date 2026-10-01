@@ -649,7 +649,7 @@ Definition of Done:
 - [x] Add a generation-scoped cutover barrier that drains in-flight appends, freezes generation 1, captures an immutable final CommitPosition, restages both candidates to that boundary, and supports explicit abort/unfreeze.
 - [x] Activate ready splits atomically through consensus, installing both assignments, range-specific Writer sequence state, and the candidate map while generation 1 remains fenced.
 - [x] Place and route multiple active RF3 ranges across storage Nodes.
-- [ ] Split hot ranges online.
+- [~] Split hot ranges online: sustained-pressure evidence and a ControlPlane-backed cutover orchestrator are complete; authenticated remote staging and automatic scheduling remain.
 - [ ] Merge cold ranges.
 - [ ] Move ranges while preserving same-Key ordering.
 - [x] Keep existing opaque Cursors valid across generation changes by merging committed candidate histories in ingest order.
@@ -664,6 +664,8 @@ Evidence:
 - Split-plan tests prove request idempotency, a distinct right-hand owner, candidate two-range coverage, complete source-prefix scanning with verified checksums, snapshot recovery, and no authoritative routing change before cutover.
 - `tests/range_split_staging.rs` proves left/right key filtering from one immutable source boundary, sparse Writer-sequence import, contiguous per-range positions, byte-identical records across RF3, staged commit evidence, generation-scoped freeze/abort behavior, atomic activation, and four-record merged history after cutover.
 - Range-specific Writer sequence maxima are committed with the split, so future appends remain contiguous independently in left and right ranges without exposing sequencing or topology.
+- `ControlPlaneSplitCutover` executes readiness and activation through the Raft-backed Control Plane; `orchestrate_split_cutover` automatically aborts and unfreezes on any pre-activation failure.
+- `SplitPressureTracker` requires sustained pressure, resets evidence below threshold, and enforces cooldown before another automatic split trigger.
 - These types are internal only; Feed, Key, Cursor, Writer, and Reader APIs remain unchanged.
 
 Definition of Done:
