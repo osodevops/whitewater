@@ -292,6 +292,22 @@ async fn split_plan_is_consensus_persisted_but_cannot_change_authoritative_routi
         .await
         .unwrap();
     assert_eq!(ready.results[0].data["stage"], "ready");
+    let activated = leader
+        .execute_commands(vec![Command::ActivateActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            plan_id: plan.plan_id,
+            left_writer_sequences: Vec::new(),
+            right_writer_sequences: Vec::new(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(
+        activated.results[0].data["range_map"]["routes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(
         leader
             .active_range_map(feed_id)
@@ -299,17 +315,14 @@ async fn split_plan_is_consensus_persisted_but_cannot_change_authoritative_routi
             .unwrap()
             .routes()
             .len(),
-        1
+        2
     );
 
     follower
         .install_snapshot_bytes(&leader.snapshot_bytes().await.unwrap())
         .await
         .unwrap();
-    assert_eq!(
-        placement(&follower).await["range_split_plan"]["stage"],
-        "ready"
-    );
+    assert!(placement(&follower).await["range_split_plan"].is_null());
     assert_eq!(
         follower
             .active_range_map(feed_id)
@@ -317,6 +330,6 @@ async fn split_plan_is_consensus_persisted_but_cannot_change_authoritative_routi
             .unwrap()
             .routes()
             .len(),
-        1
+        2
     );
 }

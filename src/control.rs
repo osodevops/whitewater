@@ -15,7 +15,8 @@ use uuid::Uuid;
 use crate::{
     active_range::{
         ActiveRangeAssignment, CommitPosition, KeyToken, OwnershipEpoch, RangeGeneration, RangeId,
-        RangeMap, RangeRoute, ReplicaSet, StorageNodeId, ACTIVE_RANGE_REPLICA_COUNT,
+        RangeMap, RangeRoute, ReplicaSet, StagedWriterSequence, StorageNodeId,
+        ACTIVE_RANGE_REPLICA_COUNT,
     },
     storage::{LogStore, StorageError},
 };
@@ -58,6 +59,8 @@ pub struct WriterDefinition {
     pub next_sequence: u64,
     #[serde(default)]
     pub session_active: bool,
+    #[serde(default)]
+    pub range_next_sequences: BTreeMap<RangeId, u64>,
 }
 
 fn default_writer_sequence() -> u64 {
@@ -238,6 +241,11 @@ pub enum Command {
         writer: String,
         session_epoch: u64,
     },
+    AllocateWriterRangeSequence {
+        writer: String,
+        session_epoch: u64,
+        range_id: RangeId,
+    },
     RevokeWriterSession {
         writer: String,
         session_epoch: u64,
@@ -322,6 +330,12 @@ pub enum Command {
         source_scanned_through: CommitPosition,
         right_commit: CommitPosition,
         checksum_verified: bool,
+    },
+    ActivateActiveRangeSplit {
+        feed: String,
+        plan_id: Uuid,
+        left_writer_sequences: Vec<StagedWriterSequence>,
+        right_writer_sequences: Vec<StagedWriterSequence>,
     },
 }
 
@@ -669,6 +683,7 @@ impl ControlController {
         &self,
         writer_id: Uuid,
         feed_id: Uuid,
+        range_id: RangeId,
         session_epoch: u64,
         sequence: u64,
     ) -> Result<WriterDefinition, ControlError> {
@@ -684,10 +699,14 @@ impl ControlController {
             ));
         }
         validate_writer_epoch(writer, session_epoch)?;
-        if sequence == 0 || sequence >= writer.next_sequence {
+        let next_sequence = writer
+            .range_next_sequences
+            .get(&range_id)
+            .copied()
+            .unwrap_or(writer.next_sequence);
+        if sequence == 0 || sequence >= next_sequence {
             return Err(ControlError::InvalidOperation(format!(
-                "Writer sequence {sequence} was not allocated; next unallocated sequence is {}",
-                writer.next_sequence
+                "Writer sequence {sequence} was not allocated for Range {range_id}; next unallocated sequence is {next_sequence}"
             )));
         }
         Ok(writer.clone())
@@ -719,6 +738,23 @@ impl ControlController {
 
     pub async fn active_range_map(&self, feed_id: Uuid) -> Option<RangeMap> {
         self.state.lock().await.range_maps.get(&feed_id).cloned()
+    }
+
+    pub async fn active_range_assignments_for_feed(
+        &self,
+        feed_id: Uuid,
+    ) -> Vec<ActiveRangeAssignment> {
+        let state = self.state.lock().await;
+        state
+            .range_maps
+            .get(&feed_id)
+            .map(|map| {
+                map.routes()
+                    .iter()
+                    .filter_map(|route| state.range_assignments.get(&route.range_id).cloned())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     pub async fn active_range_for_key(
@@ -843,6 +879,7 @@ impl ControlController {
                     session_epoch: 0,
                     next_sequence: 1,
                     session_active: false,
+                    range_next_sequences: BTreeMap::new(),
                 };
                 state
                     .writers
@@ -856,6 +893,7 @@ impl ControlController {
                         ControlError::InvalidOperation("Writer session epoch overflow".to_owned())
                     })?;
                 definition.next_sequence = 1;
+                definition.range_next_sequences.clear();
                 definition.session_active = true;
                 Ok((
                     format!("opened Writer session {writer}"),
@@ -877,6 +915,31 @@ impl ControlController {
                     json!({
                         "writer_id": definition.writer_id,
                         "feed_id": definition.feed_id,
+                        "session_epoch": definition.session_epoch,
+                        "sequence": sequence
+                    }),
+                ))
+            }
+            Command::AllocateWriterRangeSequence {
+                writer,
+                session_epoch,
+                range_id,
+            } => {
+                let definition = active_writer_mut(state, &writer)?;
+                validate_writer_epoch(definition, session_epoch)?;
+                let sequence = *definition.range_next_sequences.entry(range_id).or_insert(1);
+                definition.range_next_sequences.insert(
+                    range_id,
+                    sequence.checked_add(1).ok_or_else(|| {
+                        ControlError::InvalidOperation("Writer sequence overflow".to_owned())
+                    })?,
+                );
+                Ok((
+                    format!("allocated Writer range sequence {sequence} for {writer}"),
+                    json!({
+                        "writer_id": definition.writer_id,
+                        "feed_id": definition.feed_id,
+                        "range_id": range_id,
                         "session_epoch": definition.session_epoch,
                         "sequence": sequence
                     }),
@@ -1299,6 +1362,72 @@ impl ControlController {
                 Ok((
                     format!("recorded Active Range split catch-up for Feed {feed}"),
                     json!(plan.clone()),
+                ))
+            }
+            Command::ActivateActiveRangeSplit {
+                feed,
+                plan_id,
+                left_writer_sequences,
+                right_writer_sequences,
+            } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                let plan = state
+                    .range_split_plans
+                    .get(&feed_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!("Active Range split plan for Feed {feed}"))
+                    })?;
+                if plan.plan_id != plan_id || plan.stage != RangeSplitStage::Ready {
+                    return Err(ControlError::InvalidOperation(
+                        "split plan is stale or not ready for activation".to_owned(),
+                    ));
+                }
+                let left_assignment = plan.left_assignment.clone().ok_or_else(|| {
+                    ControlError::InvalidOperation(
+                        "split plan has no staged left assignment".to_owned(),
+                    )
+                })?;
+                for (range_id, progress) in [
+                    (left_assignment.range_id, left_writer_sequences),
+                    (plan.right_assignment.range_id, right_writer_sequences),
+                ] {
+                    for writer_progress in progress {
+                        if let Some(writer) =
+                            state.writers.get_mut(&writer_progress.writer_session_id)
+                        {
+                            if writer.session_epoch == writer_progress.writer_epoch {
+                                writer.range_next_sequences.insert(
+                                    range_id,
+                                    writer_progress.max_sequence.checked_add(1).ok_or_else(
+                                        || {
+                                            ControlError::InvalidOperation(
+                                                "Writer range sequence overflow".to_owned(),
+                                            )
+                                        },
+                                    )?,
+                                );
+                            }
+                        }
+                    }
+                }
+                state.range_maps.insert(feed_id, plan.candidate_map.clone());
+                state
+                    .range_assignments
+                    .insert(left_assignment.range_id, left_assignment.clone());
+                state.range_assignments.insert(
+                    plan.right_assignment.range_id,
+                    plan.right_assignment.clone(),
+                );
+                state.active_ranges.insert(feed_id, left_assignment);
+                state.range_split_plans.remove(&feed_id);
+                Ok((
+                    format!("activated Active Range split for Feed {feed}"),
+                    json!({
+                        "range_map": plan.candidate_map,
+                        "left_assignment": plan.left_assignment,
+                        "right_assignment": plan.right_assignment
+                    }),
                 ))
             }
         }
@@ -2084,6 +2213,7 @@ fn command_label(command: &Command) -> String {
         Command::CreateWriter { .. } => "CREATE WRITER",
         Command::OpenWriterSession { .. } => "OPEN WRITER SESSION",
         Command::AllocateWriterSequence { .. } => "ALLOCATE WRITER SEQUENCE",
+        Command::AllocateWriterRangeSequence { .. } => "ALLOCATE WRITER RANGE SEQUENCE",
         Command::RevokeWriterSession { .. } => "REVOKE WRITER SESSION",
         Command::CreateReader { .. } => "CREATE READER",
         Command::OpenReaderSession { .. } => "OPEN READER SESSION",
@@ -2103,6 +2233,7 @@ fn command_label(command: &Command) -> String {
         Command::RecoverActiveRangeOwnership { .. } => "RECOVER ACTIVE RANGE OWNERSHIP",
         Command::PrepareActiveRangeSplit { .. } => "PREPARE ACTIVE RANGE SPLIT",
         Command::RecordActiveRangeSplitCatchUp { .. } => "RECORD ACTIVE RANGE SPLIT CATCH UP",
+        Command::ActivateActiveRangeSplit { .. } => "ACTIVATE ACTIVE RANGE SPLIT",
     }
     .to_owned()
 }

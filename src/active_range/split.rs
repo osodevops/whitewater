@@ -11,6 +11,13 @@ use super::{
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StagedWriterSequence {
+    pub writer_session_id: uuid::Uuid,
+    pub writer_epoch: u64,
+    pub max_sequence: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SplitStagingResult {
     pub source_scanned_through: CommitPosition,
     pub target_commit: CommitPosition,
@@ -18,6 +25,7 @@ pub struct SplitStagingResult {
     pub transferred_bytes: u64,
     pub checksum: [u8; 32],
     pub replicas_verified: Vec<StorageNodeId>,
+    pub writer_sequences: Vec<StagedWriterSequence>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -195,6 +203,7 @@ async fn stage_route(
     let mut source_after = None;
     let mut target_position = 0_u64;
     let mut transferred_bytes = 0_u64;
+    let mut writer_sequences = BTreeMap::<(uuid::Uuid, u64), u64>::new();
     let mut checksum = blake3::Hasher::new();
     while source_after.map_or(0, RangePosition::value) < source_commit.value() {
         let frames = source
@@ -243,6 +252,13 @@ async fn stage_route(
                     return Err(SplitStagingError::VerificationConflict);
                 }
             }
+            writer_sequences
+                .entry((
+                    frame.identity.writer_session_id,
+                    frame.identity.writer_epoch,
+                ))
+                .and_modify(|sequence| *sequence = (*sequence).max(frame.identity.sequence))
+                .or_insert(frame.identity.sequence);
             checksum.update(&frame.position.value().to_be_bytes());
             checksum.update(&expected_digest);
             transferred_bytes = transferred_bytes.saturating_add(frame.frame.len() as u64);
@@ -267,5 +283,15 @@ async fn stage_route(
         transferred_bytes,
         checksum: *checksum.finalize().as_bytes(),
         replicas_verified: assignment.replicas.iter().cloned().collect(),
+        writer_sequences: writer_sequences
+            .into_iter()
+            .map(
+                |((writer_session_id, writer_epoch), max_sequence)| StagedWriterSequence {
+                    writer_session_id,
+                    writer_epoch,
+                    max_sequence,
+                },
+            )
+            .collect(),
     })
 }

@@ -647,12 +647,12 @@ Definition of Done:
 - [x] Persist idempotent split plans with candidate maps, deterministic right-hand RF3 placement, and prepared/catching-up/ready stages.
 - [x] Stage both candidate generations from one captured committed source boundary, with key filtering, contiguous target positions, exact logical record bytes, sparse Writer dedup rebuild, and RF3 checksum evidence.
 - [x] Add a generation-scoped cutover barrier that drains in-flight appends, freezes generation 1, captures an immutable final CommitPosition, restages both candidates to that boundary, and supports explicit abort/unfreeze.
-- [~] Activate online splits only after verified data movement; planning, complete candidate staging, and the final freeze barrier are done, while Writer range-sequence cutover and atomic map activation remain.
-- [ ] Place multiple active ranges across N storage Nodes.
+- [x] Activate ready splits atomically through consensus, installing both assignments, range-specific Writer sequence state, and the candidate map while generation 1 remains fenced.
+- [x] Place and route multiple active RF3 ranges across storage Nodes.
 - [ ] Split hot ranges online.
 - [ ] Merge cold ranges.
 - [ ] Move ranges while preserving same-Key ordering.
-- [ ] Keep Cursors valid across generation changes.
+- [x] Keep existing opaque Cursors valid across generation changes by merging committed candidate histories in ingest order.
 - [ ] Add hot-key detection and isolation.
 
 Evidence:
@@ -662,7 +662,8 @@ Evidence:
 - Feed creation now commits an initial full RangeMap plus a RangeId-keyed assignment; old catalog snapshots migrate from the original per-Feed assignment automatically.
 - Placement snapshot tests prove the RangeMap and assignment recover identically, and append ingress/owner routing resolves assignments from decoded Keys.
 - Split-plan tests prove request idempotency, a distinct right-hand owner, candidate two-range coverage, complete source-prefix scanning with verified checksums, snapshot recovery, and no authoritative routing change before cutover.
-- `tests/range_split_staging.rs` proves left/right key filtering from one immutable source boundary, sparse Writer-sequence import, contiguous per-range positions, byte-identical records across RF3, staged commit evidence for both candidate generations, generation-scoped append rejection during the final barrier, abort/unfreeze recovery, and unchanged live routing.
+- `tests/range_split_staging.rs` proves left/right key filtering from one immutable source boundary, sparse Writer-sequence import, contiguous per-range positions, byte-identical records across RF3, staged commit evidence, generation-scoped freeze/abort behavior, atomic activation, and four-record merged history after cutover.
+- Range-specific Writer sequence maxima are committed with the split, so future appends remain contiguous independently in left and right ranges without exposing sequencing or topology.
 - These types are internal only; Feed, Key, Cursor, Writer, and Reader APIs remain unchanged.
 
 Definition of Done:

@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::{codec::MAX_FRAME_BYTES, control::ControlController};
+use crate::{
+    codec::{decode_record, MAX_FRAME_BYTES},
+    control::ControlController,
+};
 
 use super::{
     ActiveRangeAppend, ActiveRangeAssignment, ActiveRangeDescriptor, ActiveRangeError,
@@ -391,42 +394,58 @@ impl ReplicaAppendService {
         after: Option<&str>,
         limit: usize,
     ) -> Result<Vec<super::StoredRangeFrame>, ReplicaAppendError> {
-        let assignment = self
+        let assignments = self
             .control
-            .active_range_assignment(feed_id)
-            .await
-            .ok_or_else(|| {
-                ReplicaAppendError::temporary(
-                    ReplicaAppendErrorCode::AssignmentNotFound,
-                    format!("no committed Active Range assignment exists for Feed {feed_id}"),
-                )
-            })?;
-        if !assignment.replicas.contains(&self.local_node) {
+            .active_range_assignments_for_feed(feed_id)
+            .await;
+        if assignments.is_empty() {
+            return Err(ReplicaAppendError::temporary(
+                ReplicaAppendErrorCode::AssignmentNotFound,
+                format!("no committed Active Range assignments exist for Feed {feed_id}"),
+            ));
+        }
+        let mut merged = Vec::new();
+        for assignment in assignments
+            .iter()
+            .filter(|assignment| assignment.replicas.contains(&self.local_node))
+        {
+            merged.extend(
+                self.store_for(assignment)
+                    .await?
+                    .read_committed(None, 10_000)
+                    .await
+                    .map_err(map_store_error)?,
+            );
+        }
+        if merged.is_empty()
+            && assignments
+                .iter()
+                .all(|assignment| !assignment.replicas.contains(&self.local_node))
+        {
             return Err(ReplicaAppendError::rejected(
                 ReplicaAppendErrorCode::ReceiverNotReplica,
                 format!("Node {} is not a current replica", self.local_node),
             ));
         }
-        let store = self.store_for(&assignment).await?;
-        let after_position = match after {
-            Some(cursor) => Some(
-                store
-                    .committed_position_for_cursor(cursor)
-                    .await
-                    .map_err(map_store_error)?
-                    .ok_or_else(|| {
-                        ReplicaAppendError::rejected(
-                            ReplicaAppendErrorCode::PositionConflict,
-                            "Cursor is unknown, uncommitted, or belongs to another Feed",
-                        )
-                    })?,
-            ),
-            None => None,
+        merged.sort_by_key(|item| {
+            decode_record(&item.frame)
+                .map(|record| (record.ingest_time_ns, record.message_id))
+                .unwrap_or((i64::MAX, Uuid::nil()))
+        });
+        let start = match after {
+            Some(cursor) => merged
+                .iter()
+                .position(|item| item.cursor == cursor)
+                .map(|index| index + 1)
+                .ok_or_else(|| {
+                    ReplicaAppendError::rejected(
+                        ReplicaAppendErrorCode::PositionConflict,
+                        "Cursor is unknown, uncommitted, or belongs to another Feed",
+                    )
+                })?,
+            None => 0,
         };
-        store
-            .read_committed(after_position, limit)
-            .await
-            .map_err(map_store_error)
+        Ok(merged.into_iter().skip(start).take(limit).collect())
     }
 
     pub async fn append(

@@ -238,4 +238,54 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             .len(),
         1
     );
+    let final_boundary = freeze_and_stage_final_boundary(
+        &plan,
+        &source_assignment,
+        source_service.clone(),
+        &services,
+        2,
+    )
+    .await
+    .unwrap();
+    control
+        .execute_commands(vec![Command::RecordActiveRangeSplitCatchUp {
+            feed: "orders.events".to_owned(),
+            plan_id: plan.plan_id,
+            source_commit: final_boundary.final_commit,
+            source_scanned_through: final_boundary.staging.source_commit,
+            right_commit: final_boundary.staging.right.target_commit,
+            checksum_verified: true,
+        }])
+        .await
+        .unwrap();
+    control
+        .execute_commands(vec![Command::ActivateActiveRangeSplit {
+            feed: "orders.events".to_owned(),
+            plan_id: plan.plan_id,
+            left_writer_sequences: final_boundary.staging.left.writer_sequences.clone(),
+            right_writer_sequences: final_boundary.staging.right.writer_sequences.clone(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(
+        control
+            .active_range_map(feed_id)
+            .await
+            .unwrap()
+            .routes()
+            .len(),
+        2
+    );
+    let merged = source_service
+        .read_committed(feed_id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(merged.len(), 4);
+    assert_eq!(
+        merged
+            .iter()
+            .map(|item| item.identity.sequence)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
 }

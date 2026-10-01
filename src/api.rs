@@ -959,9 +959,21 @@ async fn writer_session_append(
         .active_feed_by_id(writer.feed_id)
         .await
         .ok_or_else(|| ApiError::bad_request("Writer Feed does not exist"))?;
-    let commands = vec![crate::control::Command::AllocateWriterSequence {
+    let routing_key = decode_base64("key_base64", &request.key_base64)?;
+    if routing_key.is_empty() {
+        return Err(ApiError::bad_request(
+            "key_base64 must contain a non-empty key",
+        ));
+    }
+    let (route, _) = state
+        .control
+        .active_range_for_key(feed.feed_id, &routing_key)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
+    let commands = vec![crate::control::Command::AllocateWriterRangeSequence {
         writer: request.writer,
         session_epoch: request.session_epoch,
+        range_id: route.range_id,
     }];
     let execution = match &state.control_plane {
         Some(control_plane) => control_plane
@@ -1007,15 +1019,6 @@ async fn client_append(
         .active_feed_by_name(&request.feed)
         .await
         .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", request.feed)))?;
-    state
-        .control
-        .validate_writer_append(
-            request.writer_session_id,
-            feed.feed_id,
-            request.writer_epoch,
-            request.sequence,
-        )
-        .await?;
     let routing_key = decode_base64("key_base64", &request.key_base64)?;
     if routing_key.is_empty() {
         return Err(ApiError::bad_request(
@@ -1027,6 +1030,16 @@ async fn client_append(
         .active_range_for_key(feed.feed_id, &routing_key)
         .await
         .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
+    state
+        .control
+        .validate_writer_append(
+            request.writer_session_id,
+            feed.feed_id,
+            assignment.range_id,
+            request.writer_epoch,
+            request.sequence,
+        )
+        .await?;
     let local = state.storage_node_id.as_ref().ok_or_else(|| {
         ApiError::unavailable("this Node is not configured for Active Range routing")
     })?;
@@ -1106,15 +1119,6 @@ async fn owner_append_local(
         .active_feed_by_name(&request.feed)
         .await
         .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", request.feed)))?;
-    state
-        .control
-        .validate_writer_append(
-            request.writer_session_id,
-            feed.feed_id,
-            request.writer_epoch,
-            request.sequence,
-        )
-        .await?;
     let routing_key = decode_base64("key_base64", &request.key_base64)?;
     if routing_key.is_empty() {
         return Err(ApiError::bad_request(
@@ -1126,6 +1130,16 @@ async fn owner_append_local(
         .active_range_for_key(feed.feed_id, &routing_key)
         .await
         .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
+    state
+        .control
+        .validate_writer_append(
+            request.writer_session_id,
+            feed.feed_id,
+            assignment.range_id,
+            request.writer_epoch,
+            request.sequence,
+        )
+        .await?;
     if state.storage_node_id.as_ref() != Some(&assignment.owner) {
         return Err(ApiError::unavailable(format!(
             "Node is not current Append Owner {}; refresh assignment and retry",

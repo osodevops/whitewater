@@ -36,6 +36,7 @@ pub use routing::{KeyRange, KeyToken, RangeMap, RangeMapError, RangeRoute};
 pub use split::{
     abort_frozen_split, freeze_and_stage_final_boundary, stage_candidate_ranges, stage_right_range,
     CandidateSplitStagingResult, FrozenSplitBoundary, SplitStagingError, SplitStagingResult,
+    StagedWriterSequence,
 };
 pub use store::{
     ActiveRangeAppend, ActiveRangeAppendResult, ActiveRangeDescriptor, ActiveRangeSnapshot,
