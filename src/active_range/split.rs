@@ -257,6 +257,48 @@ pub async fn orchestrate_split_cutover(
     Ok(boundary)
 }
 
+pub async fn stage_candidate_ranges_local(
+    plan: &RangeSplitPlan,
+    source: Arc<ReplicaAppendService>,
+    local: Arc<ReplicaAppendService>,
+    batch_size: usize,
+    source_commit: CommitPosition,
+) -> Result<CandidateSplitStagingResult, SplitStagingError> {
+    let local_node = local.local_node().clone();
+    let targets = BTreeMap::from([(local_node.clone(), local)]);
+    let left_assignment = plan
+        .left_assignment
+        .as_ref()
+        .ok_or(SplitStagingError::MissingLeftAssignment)?;
+    let left = stage_route(
+        plan.feed_id,
+        left_assignment,
+        route_for(plan, left_assignment)?,
+        source.clone(),
+        &targets,
+        batch_size,
+        source_commit,
+        std::slice::from_ref(&local_node),
+    )
+    .await?;
+    let right = stage_route(
+        plan.feed_id,
+        &plan.right_assignment,
+        route_for(plan, &plan.right_assignment)?,
+        source,
+        &targets,
+        batch_size,
+        source_commit,
+        std::slice::from_ref(&local_node),
+    )
+    .await?;
+    Ok(CandidateSplitStagingResult {
+        source_commit,
+        left,
+        right,
+    })
+}
+
 pub async fn stage_candidate_ranges(
     plan: &RangeSplitPlan,
     source: Arc<ReplicaAppendService>,
@@ -282,6 +324,7 @@ pub async fn stage_candidate_ranges(
         targets,
         batch_size,
         source_commit,
+        left_assignment.replicas.as_array(),
     )
     .await?;
     let right = stage_route(
@@ -292,6 +335,7 @@ pub async fn stage_candidate_ranges(
         targets,
         batch_size,
         source_commit,
+        plan.right_assignment.replicas.as_array(),
     )
     .await?;
     Ok(CandidateSplitStagingResult {
@@ -320,6 +364,7 @@ pub async fn stage_right_range(
         targets,
         batch_size,
         source_commit,
+        plan.right_assignment.replicas.as_array(),
     )
     .await
 }
@@ -335,6 +380,7 @@ fn route_for<'a>(
         .ok_or(SplitStagingError::MissingRoute)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stage_route(
     feed_id: uuid::Uuid,
     assignment: &ActiveRangeAssignment,
@@ -343,6 +389,7 @@ async fn stage_route(
     targets: &BTreeMap<StorageNodeId, Arc<ReplicaAppendService>>,
     batch_size: usize,
     source_commit: CommitPosition,
+    replica_nodes: &[StorageNodeId],
 ) -> Result<SplitStagingResult, SplitStagingError> {
     let mut source_after = None;
     let mut target_position = 0_u64;
@@ -375,7 +422,7 @@ async fn stage_route(
             target_position = target_position.saturating_add(1);
             let position = RangePosition::new(target_position);
             let expected_digest = *blake3::hash(&frame.frame).as_bytes();
-            for node in assignment.replicas.iter() {
+            for node in replica_nodes.iter() {
                 let target = targets
                     .get(node)
                     .ok_or_else(|| SplitStagingError::MissingTarget(node.clone()))?;
@@ -410,7 +457,7 @@ async fn stage_route(
     }
     let target_commit = CommitPosition::new(target_position);
     if target_position > 0 {
-        for node in assignment.replicas.iter() {
+        for node in replica_nodes.iter() {
             targets[node]
                 .commit_staged_split(assignment, target_commit)
                 .await
@@ -426,7 +473,7 @@ async fn stage_route(
         transferred_records: target_position,
         transferred_bytes,
         checksum: *checksum.finalize().as_bytes(),
-        replicas_verified: assignment.replicas.iter().cloned().collect(),
+        replicas_verified: replica_nodes.to_vec(),
         writer_sequences: writer_sequences
             .into_iter()
             .map(

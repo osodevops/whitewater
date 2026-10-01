@@ -106,16 +106,20 @@ impl MajorityAppendCoordinator {
     pub async fn next_position(
         &self,
         feed_id: Uuid,
+        range_id: super::RangeId,
     ) -> Result<super::RangePosition, MajorityAppendError> {
-        self.local.next_position(feed_id).await.map_err(|error| {
-            self.error(
-                MajorityAppendErrorCode::LocalStorageFailure,
-                error.to_string(),
-                error.retryable,
-                vec![],
-                vec![],
-            )
-        })
+        self.local
+            .next_position(feed_id, range_id)
+            .await
+            .map_err(|error| {
+                self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    error.to_string(),
+                    error.retryable,
+                    vec![],
+                    vec![],
+                )
+            })
     }
 
     pub async fn append(
@@ -123,10 +127,12 @@ impl MajorityAppendCoordinator {
         mut request: ReplicaAppendRequest,
     ) -> Result<MajorityAppendResult, MajorityAppendError> {
         let _append_guard = self.append_lock.lock().await;
-        request.expected_position = self.next_position(request.feed_id).await?;
+        request.expected_position = self
+            .next_position(request.feed_id, request.range_id)
+            .await?;
         let assignment = self
             .control
-            .active_range_assignment(request.feed_id)
+            .active_range_assignment_by_id(request.range_id)
             .await
             .ok_or_else(|| {
                 self.error(

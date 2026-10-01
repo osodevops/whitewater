@@ -736,6 +736,18 @@ impl ControlController {
         self.state.lock().await.active_ranges.get(&feed_id).cloned()
     }
 
+    pub async fn active_range_assignment_by_id(
+        &self,
+        range_id: RangeId,
+    ) -> Option<ActiveRangeAssignment> {
+        self.state
+            .lock()
+            .await
+            .range_assignments
+            .get(&range_id)
+            .cloned()
+    }
+
     pub async fn active_range_map(&self, feed_id: Uuid) -> Option<RangeMap> {
         self.state.lock().await.range_maps.get(&feed_id).cloned()
     }

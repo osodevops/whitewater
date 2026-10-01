@@ -649,7 +649,7 @@ Definition of Done:
 - [x] Add a generation-scoped cutover barrier that drains in-flight appends, freezes generation 1, captures an immutable final CommitPosition, restages both candidates to that boundary, and supports explicit abort/unfreeze.
 - [x] Activate ready splits atomically through consensus, installing both assignments, range-specific Writer sequence state, and the candidate map while generation 1 remains fenced.
 - [x] Place and route multiple active RF3 ranges across storage Nodes.
-- [~] Split hot ranges online: sustained-pressure evidence and a ControlPlane-backed cutover orchestrator are complete; authenticated remote staging and automatic scheduling remain.
+- [~] Split hot ranges online: authenticated RF3 staging, Control Plane cutover, live Fabric acceptance, and sustained-pressure gating are complete; automatic metric-to-split scheduling remains.
 - [ ] Merge cold ranges.
 - [ ] Move ranges while preserving same-Key ordering.
 - [x] Keep existing opaque Cursors valid across generation changes by merging committed candidate histories in ingest order.
@@ -666,6 +666,8 @@ Evidence:
 - Range-specific Writer sequence maxima are committed with the split, so future appends remain contiguous independently in left and right ranges without exposing sequencing or topology.
 - `ControlPlaneSplitCutover` executes readiness and activation through the Raft-backed Control Plane; `orchestrate_split_cutover` automatically aborts and unfreezes on any pre-activation failure.
 - `SplitPressureTracker` requires sustained pressure, resets evidence below threshold, and enforces cooldown before another automatic split trigger.
+- Authenticated `/internal/active-range/split/*` endpoints stage and freeze each replica, compare logical evidence across RF3, and unfreeze all contacted Nodes on pre-activation failure.
+- `python scripts/test-m4-live-split.py` writes through all three ingress Nodes, activates a midpoint split, verifies two owners, continues appending through the new map, and reads all 16 records as one Feed.
 - These types are internal only; Feed, Key, Cursor, Writer, and Reader APIs remain unchanged.
 
 Definition of Done:

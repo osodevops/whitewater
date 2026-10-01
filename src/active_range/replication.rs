@@ -189,10 +189,14 @@ impl ReplicaAppendService {
             .contains(&(range_id, generation))
     }
 
-    pub async fn next_position(&self, feed_id: Uuid) -> Result<RangePosition, ReplicaAppendError> {
+    pub async fn next_position(
+        &self,
+        feed_id: Uuid,
+        range_id: RangeId,
+    ) -> Result<RangePosition, ReplicaAppendError> {
         let assignment = self
             .control
-            .active_range_assignment(feed_id)
+            .active_range_assignment_by_id(range_id)
             .await
             .ok_or_else(|| {
                 ReplicaAppendError::temporary(
@@ -485,7 +489,7 @@ impl ReplicaAppendService {
         }
         let assignment = self
             .control
-            .active_range_assignment(request.feed_id)
+            .active_range_assignment_by_id(request.range_id)
             .await
             .ok_or_else(|| {
                 ReplicaAppendError::temporary(
@@ -525,7 +529,7 @@ impl ReplicaAppendService {
     ) -> Result<ReplicaCommitAccepted, ReplicaAppendError> {
         let assignment = self
             .control
-            .active_range_assignment(request.feed_id)
+            .active_range_assignment_by_id(request.range_id)
             .await
             .ok_or_else(|| {
                 ReplicaAppendError::temporary(
