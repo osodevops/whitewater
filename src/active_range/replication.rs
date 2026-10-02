@@ -487,19 +487,35 @@ impl ReplicaAppendService {
                 format!("decoded replica frame exceeds the {MAX_FRAME_BYTES} byte limit"),
             ));
         }
-        let assignment = self
+        let assignment = match self
             .control
             .active_range_assignment_by_id(request.range_id)
             .await
-            .ok_or_else(|| {
-                ReplicaAppendError::temporary(
+        {
+            Some(assignment) if assignment.feed_id == request.feed_id => assignment,
+            Some(_) => {
+                return Err(ReplicaAppendError::temporary(
                     ReplicaAppendErrorCode::AssignmentNotFound,
                     format!(
                         "no committed Active Range assignment exists for Feed {}",
                         request.feed_id
                     ),
-                )
-            })?;
+                ))
+            }
+            None => self
+                .control
+                .active_range_assignment(request.feed_id)
+                .await
+                .ok_or_else(|| {
+                    ReplicaAppendError::temporary(
+                        ReplicaAppendErrorCode::AssignmentNotFound,
+                        format!(
+                            "no committed Active Range assignment exists for Feed {}",
+                            request.feed_id
+                        ),
+                    )
+                })?,
+        };
         self.validate_assignment(&assignment, &request)?;
         let store = self.store_for(&assignment).await?;
         let result = store
@@ -527,19 +543,35 @@ impl ReplicaAppendService {
         &self,
         request: ReplicaCommitRequest,
     ) -> Result<ReplicaCommitAccepted, ReplicaAppendError> {
-        let assignment = self
+        let assignment = match self
             .control
             .active_range_assignment_by_id(request.range_id)
             .await
-            .ok_or_else(|| {
-                ReplicaAppendError::temporary(
+        {
+            Some(assignment) if assignment.feed_id == request.feed_id => assignment,
+            Some(_) => {
+                return Err(ReplicaAppendError::temporary(
                     ReplicaAppendErrorCode::AssignmentNotFound,
                     format!(
                         "no committed Active Range assignment exists for Feed {}",
                         request.feed_id
                     ),
-                )
-            })?;
+                ))
+            }
+            None => self
+                .control
+                .active_range_assignment(request.feed_id)
+                .await
+                .ok_or_else(|| {
+                    ReplicaAppendError::temporary(
+                        ReplicaAppendErrorCode::AssignmentNotFound,
+                        format!(
+                            "no committed Active Range assignment exists for Feed {}",
+                            request.feed_id
+                        ),
+                    )
+                })?,
+        };
         if assignment.range_id != request.range_id {
             return Err(ReplicaAppendError::rejected(
                 ReplicaAppendErrorCode::WrongRange,

@@ -4,7 +4,8 @@ use anyhow::Result;
 use finnstream::{
     active_range::{
         HttpRecoveryTransport, HttpReplicaTransport, LocalRepairSupervisor,
-        MajorityAppendCoordinator, RecoverySupervisor, ReplicaAppendService, StorageNodeId,
+        MajorityAppendCoordinator, RecoverySupervisor, ReplicaAppendService, SplitPressureTracker,
+        StorageNodeId,
     },
     admin::AdminAuthenticator,
     api::{router, AppState},
@@ -167,6 +168,7 @@ async fn main() -> Result<()> {
         config.heartbeat_interval,
         config.member_timeout,
     ));
+    let demand = DemandMetrics::default();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let membership_task = tokio::spawn(membership.clone().run(shutdown_rx));
     let recovery_task = recovery_supervisor.map(|supervisor| {
@@ -215,10 +217,79 @@ async fn main() -> Result<()> {
             }
         })
     });
+    let split_task = control_plane.clone().and_then(|_control_plane| {
+        let admin_key = std::env::var("FINNSTREAM_ADMIN_API_KEY").ok()?;
+        let interval_ms = std::env::var("WHITEWATER_AUTO_SPLIT_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(2_000)
+            .max(100);
+        let threshold = std::env::var("WHITEWATER_AUTO_SPLIT_APPEND_RATE")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10_000);
+        let sustained = std::env::var("WHITEWATER_AUTO_SPLIT_SUSTAINED_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(3);
+        let cooldown = std::env::var("WHITEWATER_AUTO_SPLIT_COOLDOWN_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(30);
+        let mut shutdown = shutdown_tx.subscribe();
+        let demand = demand.clone();
+        let control = control.clone();
+        let endpoint = format!("http://127.0.0.1:{}", config.bind_addr.port());
+        Some(tokio::spawn(async move {
+            let mut trackers = BTreeMap::new();
+            let client = reqwest::Client::new();
+            let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        for sample in demand.take_range_pressure_samples() {
+                            let rate = sample.records.saturating_mul(1_000) / interval_ms;
+                            let tracker = trackers.entry(sample.range_id)
+                                .or_insert_with(|| SplitPressureTracker::new(threshold, sustained, cooldown));
+                            if !tracker.observe(rate) { continue; }
+                            let Some(split_at) = sample.split_token else { continue; };
+                            let Some(feed) = control.active_feed_name_for_range(sample.range_id).await else { continue; };
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            let response = client
+                                .post(format!("{endpoint}/v1/admin/ranges/split"))
+                                .bearer_auth(&admin_key)
+                                .json(&serde_json::json!({
+                                    "request_id": uuid::Uuid::new_v4(),
+                                    "feed": feed,
+                                    "split_at": split_at,
+                                    "batch_size": 256
+                                }))
+                                .send()
+                                .await;
+                            match response {
+                                Ok(response) if response.status().is_success() => {
+                                    tracing::info!(range_id = %sample.range_id, append_rate = rate, "automatic Active Range split activated");
+                                }
+                                Ok(response) => {
+                                    let status = response.status();
+                                    let detail = response.text().await.unwrap_or_default();
+                                    tracing::warn!(range_id = %sample.range_id, %status, %detail, "automatic Active Range split deferred");
+                                }
+                                Err(error) => tracing::warn!(range_id = %sample.range_id, %error, "automatic Active Range split request failed"),
+                            }
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        }))
+    });
     let app = router(AppState {
         store,
         membership,
-        demand: DemandMetrics::default(),
+        demand: demand.clone(),
         autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
         control,
         control_plane: control_plane.clone(),
@@ -247,6 +318,9 @@ async fn main() -> Result<()> {
     }
     if let Some(repair_task) = repair_task {
         let _ = repair_task.await;
+    }
+    if let Some(split_task) = split_task {
+        let _ = split_task.await;
     }
     if let Some(control_plane) = control_plane {
         let _ = control_plane.raft().shutdown().await;

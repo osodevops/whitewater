@@ -649,7 +649,7 @@ Definition of Done:
 - [x] Add a generation-scoped cutover barrier that drains in-flight appends, freezes generation 1, captures an immutable final CommitPosition, restages both candidates to that boundary, and supports explicit abort/unfreeze.
 - [x] Activate ready splits atomically through consensus, installing both assignments, range-specific Writer sequence state, and the candidate map while generation 1 remains fenced.
 - [x] Place and route multiple active RF3 ranges across storage Nodes.
-- [~] Split hot ranges online: authenticated RF3 staging, Control Plane cutover, live Fabric acceptance, and sustained-pressure gating are complete; automatic metric-to-split scheduling remains.
+- [x] Split hot ranges online from sustained per-range append pressure with sampled key-token boundaries, cooldown, authenticated RF3 staging, and Control Plane cutover.
 - [ ] Merge cold ranges.
 - [ ] Move ranges while preserving same-Key ordering.
 - [x] Keep existing opaque Cursors valid across generation changes by merging committed candidate histories in ingest order.
@@ -668,6 +668,8 @@ Evidence:
 - `SplitPressureTracker` requires sustained pressure, resets evidence below threshold, and enforces cooldown before another automatic split trigger.
 - Authenticated `/internal/active-range/split/*` endpoints stage and freeze each replica, compare logical evidence across RF3, and unfreeze all contacted Nodes on pre-activation failure.
 - `python scripts/test-m4-live-split.py` writes through all three ingress Nodes, activates a midpoint split, verifies two owners, continues appending through the new map, and reads all 16 records as one Feed.
+- Per-range metrics collect records, bytes, and a bounded key-token sample; the scheduler applies sustained thresholds and cooldown, then sends the sampled median through the same authenticated split workflow.
+- `python scripts/test-m4-auto-split.py` runs with low test thresholds, generates sustained traffic, observes an automatic one-to-two range transition with two owners, and restores production-like defaults afterward.
 - These types are internal only; Feed, Key, Cursor, Writer, and Reader APIs remain unchanged.
 
 Definition of Done:

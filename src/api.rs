@@ -108,6 +108,10 @@ pub fn router(state: AppState) -> Router {
         state.clone(),
         authorize_replica_append,
     ));
+    let split_freeze_route = post(split_freeze_local).layer(middleware::from_fn_with_state(
+        state.clone(),
+        authorize_replica_append,
+    ));
     Router::new()
         .route("/health", get(health))
         .route("/v1/streams", get(list_streams).post(create_stream))
@@ -173,6 +177,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/internal/active-range/split/unfreeze-local",
             split_unfreeze_route,
+        )
+        .route(
+            "/internal/active-range/split/freeze-local",
+            split_freeze_route,
         )
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
@@ -968,12 +976,67 @@ async fn split_unfreeze_local(
     Json(json!({ "status": "ok" }))
 }
 
+async fn split_freeze_local(
+    State(state): State<AppState>,
+    Json(request): Json<LocalSplitUnfreezeRequest>,
+) -> Result<Json<ReplicaProgressResponse>, ApiError> {
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("replica storage is not configured"))?;
+    service
+        .freeze_generation(
+            request.source_assignment.range_id,
+            request.source_assignment.generation,
+        )
+        .await;
+    let status = service
+        .recovery_status(request.source_assignment.feed_id)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    Ok(Json(ReplicaProgressResponse {
+        status: Some(status),
+        error: None,
+    }))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdminSplitRangeRequest {
     pub request_id: Uuid,
     pub feed: String,
     pub split_at: KeyToken,
     pub batch_size: Option<usize>,
+}
+
+async fn reconcile_split_node(
+    state: &AppState,
+    endpoint: &str,
+    key: &str,
+    request: &ReplicaReconcileRequest,
+) -> Result<(), ApiError> {
+    let mut last_error = "replica reconciliation did not complete".to_owned();
+    for _ in 0..20 {
+        let attempt = state
+            .internal_http
+            .post(format!(
+                "{}/internal/active-range/recovery/reconcile",
+                endpoint.trim_end_matches('/')
+            ))
+            .header("x-whitewater-control-key", key)
+            .json(request)
+            .send()
+            .await;
+        if let Ok(response) = attempt {
+            if let Ok(result) = response.json::<ReplicaReconcileResponse>().await {
+                if result.error.is_none() {
+                    return Ok(());
+                }
+                last_error = result.error.unwrap_or(last_error);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    Err(ApiError::unavailable(last_error))
 }
 
 async fn stage_split_node(
@@ -1060,53 +1123,65 @@ async fn admin_split_range(
         .internal_key
         .as_ref()
         .ok_or_else(|| ApiError::unavailable("internal credential is unavailable"))?;
-    let source_endpoint = state
-        .control_endpoints
-        .get(&source_assignment.owner)
-        .ok_or_else(|| ApiError::unavailable("source owner endpoint is unavailable"))?;
-    let progress: ReplicaProgressResponse = state
-        .internal_http
-        .post(format!(
-            "{}/internal/active-range/recovery/progress",
-            source_endpoint.trim_end_matches('/')
-        ))
-        .header("x-whitewater-control-key", key)
-        .json(&ReplicaProgressRequest {
-            feed_id: plan.feed_id,
-        })
-        .send()
-        .await
-        .map_err(|error| ApiError::unavailable(error.to_string()))?
-        .json()
-        .await
-        .map_err(|error| ApiError::unavailable(error.to_string()))?;
-    let source_commit = progress
-        .status
-        .ok_or_else(|| {
-            ApiError::unavailable(
-                progress
-                    .error
-                    .unwrap_or_else(|| "source progress unavailable".to_owned()),
-            )
-        })?
-        .committed;
+    let mut source_commit = CommitPosition::new(0);
+    for node in source_assignment.replicas.iter() {
+        let endpoint = state.control_endpoints.get(node).ok_or_else(|| {
+            ApiError::unavailable(format!("source replica {node} endpoint is unavailable"))
+        })?;
+        let progress: ReplicaProgressResponse = state
+            .internal_http
+            .post(format!(
+                "{}/internal/active-range/split/freeze-local",
+                endpoint.trim_end_matches('/')
+            ))
+            .header("x-whitewater-control-key", key)
+            .json(&LocalSplitUnfreezeRequest {
+                source_assignment: source_assignment.clone(),
+            })
+            .send()
+            .await
+            .map_err(|error| ApiError::unavailable(error.to_string()))?
+            .json()
+            .await
+            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        let committed = progress
+            .status
+            .ok_or_else(|| ApiError::unavailable("source freeze returned no progress"))?
+            .committed;
+        source_commit = source_commit.max(committed);
+    }
     let mut staged = Vec::new();
     for node in plan.right_assignment.replicas.iter() {
         let attempt = match state.control_endpoints.get(node) {
             Some(endpoint) => {
-                stage_split_node(
+                match reconcile_split_node(
                     &state,
                     endpoint,
                     key,
-                    &LocalSplitStageRequest {
-                        plan: plan.clone(),
-                        source_assignment: source_assignment.clone(),
-                        source_commit,
-                        freeze_source: true,
-                        batch_size: request.batch_size.unwrap_or(256).clamp(1, 10_000),
+                    &ReplicaReconcileRequest {
+                        feed_id: plan.feed_id,
+                        committed_prefix: source_commit,
                     },
                 )
                 .await
+                {
+                    Ok(()) => {
+                        stage_split_node(
+                            &state,
+                            endpoint,
+                            key,
+                            &LocalSplitStageRequest {
+                                plan: plan.clone(),
+                                source_assignment: source_assignment.clone(),
+                                source_commit,
+                                freeze_source: true,
+                                batch_size: request.batch_size.unwrap_or(256).clamp(1, 10_000),
+                            },
+                        )
+                        .await
+                    }
+                    Err(error) => Err(error),
+                }
             }
             None => Err(ApiError::unavailable(format!(
                 "staged replica {node} endpoint is unavailable"
@@ -1292,15 +1367,19 @@ async fn writer_session_append(
         session_epoch: request.session_epoch,
         range_id: route.range_id,
     }];
+    let allocation_request_id = deterministic_uuid(
+        request.request_id,
+        &format!("writer-range:{}", route.range_id),
+    );
     let execution = match &state.control_plane {
         Some(control_plane) => control_plane
-            .execute_commands_with_request_id(commands, request.request_id)
+            .execute_commands_with_request_id(commands, allocation_request_id)
             .await
             .map_err(|error| ApiError::bad_request(error.to_string()))?,
         None => {
             state
                 .control
-                .execute_commands_with_request_id(commands, request.request_id)
+                .execute_commands_with_request_id(commands, allocation_request_id)
                 .await?
         }
     };
@@ -1325,35 +1404,6 @@ async fn writer_session_append(
     .await
 }
 
-async fn validate_writer_append_eventually(
-    state: &AppState,
-    request: &ClientAppendRequest,
-    feed_id: Uuid,
-    range_id: crate::active_range::RangeId,
-) -> Result<(), ApiError> {
-    let mut last_error = None;
-    for _ in 0..20 {
-        match state
-            .control
-            .validate_writer_append(
-                request.writer_session_id,
-                feed_id,
-                range_id,
-                request.writer_epoch,
-                request.sequence,
-            )
-            .await
-        {
-            Ok(_) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    Err(last_error
-        .map(ApiError::from)
-        .unwrap_or_else(|| ApiError::unavailable("Writer allocation is unavailable")))
-}
-
 async fn client_append(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1376,7 +1426,6 @@ async fn client_append(
         .active_range_for_key(feed.feed_id, &routing_key)
         .await
         .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
-    validate_writer_append_eventually(&state, &request, feed.feed_id, assignment.range_id).await?;
     let local = state.storage_node_id.as_ref().ok_or_else(|| {
         ApiError::unavailable("this Node is not configured for Active Range routing")
     })?;
@@ -1467,7 +1516,6 @@ async fn owner_append_local(
         .active_range_for_key(feed.feed_id, &routing_key)
         .await
         .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
-    validate_writer_append_eventually(state, &request, feed.feed_id, assignment.range_id).await?;
     if state.storage_node_id.as_ref() != Some(&assignment.owner) {
         return Err(ApiError::unavailable(format!(
             "Node is not current Append Owner {}; refresh assignment and retry",
@@ -1475,7 +1523,9 @@ async fn owner_append_local(
         )));
     }
     let key = routing_key;
+    let pressure_key = key.clone();
     let payload = decode_base64("payload_base64", &request.payload_base64)?;
+    let pressure_bytes = key.len().saturating_add(payload.len());
     let metadata = request
         .metadata_base64
         .into_iter()
@@ -1524,6 +1574,9 @@ async fn owner_append_local(
         })
         .await
         .map_err(majority_api_error)?;
+    state
+        .demand
+        .record_range_append(assignment.range_id, &pressure_key, pressure_bytes);
     Ok(WriterAppendResponse {
         message_id: result.message_id,
         cursor: result.cursor,

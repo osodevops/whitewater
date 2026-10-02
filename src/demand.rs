@@ -1,7 +1,12 @@
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
 };
+
+use crate::active_range::{KeyToken, RangeId};
 
 use serde::Serialize;
 
@@ -18,6 +23,22 @@ struct DemandCounters {
     append_bytes_total: AtomicU64,
     reads_total: AtomicU64,
     records_read_total: AtomicU64,
+    range_appends: Mutex<BTreeMap<RangeId, RangeAppendWindow>>,
+}
+
+#[derive(Default)]
+struct RangeAppendWindow {
+    records: u64,
+    bytes: u64,
+    key_tokens: Vec<KeyToken>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangePressureSample {
+    pub range_id: RangeId,
+    pub records: u64,
+    pub bytes: u64,
+    pub split_token: Option<KeyToken>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -50,6 +71,39 @@ impl DemandMetrics {
         self.inner
             .append_bytes_total
             .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_range_append(&self, range_id: RangeId, key: &[u8], bytes: usize) {
+        if let Ok(mut ranges) = self.inner.range_appends.lock() {
+            let window = ranges.entry(range_id).or_default();
+            window.records = window.records.saturating_add(1);
+            window.bytes = window.bytes.saturating_add(bytes as u64);
+            if window.key_tokens.len() < 4096 {
+                window.key_tokens.push(KeyToken::from_key(key));
+            }
+        }
+    }
+
+    pub fn take_range_pressure_samples(&self) -> Vec<RangePressureSample> {
+        let Ok(mut ranges) = self.inner.range_appends.lock() else {
+            return Vec::new();
+        };
+        std::mem::take(&mut *ranges)
+            .into_iter()
+            .map(|(range_id, mut window)| {
+                window.key_tokens.sort_unstable();
+                let split_token = window
+                    .key_tokens
+                    .get(window.key_tokens.len().saturating_sub(1) / 2)
+                    .copied();
+                RangePressureSample {
+                    range_id,
+                    records: window.records,
+                    bytes: window.bytes,
+                    split_token,
+                }
+            })
+            .collect()
     }
 
     pub fn record_read(&self, records: usize) {
@@ -104,5 +158,19 @@ mod tests {
                 records_read_total: 3,
             }
         );
+    }
+
+    #[test]
+    fn range_pressure_samples_are_windowed_and_choose_observed_median() {
+        let metrics = DemandMetrics::default();
+        let range_id = RangeId::from_uuid(uuid::Uuid::from_u128(1));
+        metrics.record_range_append(range_id, b"key-a", 10);
+        metrics.record_range_append(range_id, b"key-b", 20);
+        metrics.record_range_append(range_id, b"key-c", 30);
+        let samples = metrics.take_range_pressure_samples();
+        assert_eq!(samples[0].records, 3);
+        assert_eq!(samples[0].bytes, 60);
+        assert!(samples[0].split_token.is_some());
+        assert!(metrics.take_range_pressure_samples().is_empty());
     }
 }

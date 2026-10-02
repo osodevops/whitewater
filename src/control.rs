@@ -752,6 +752,16 @@ impl ControlController {
         self.state.lock().await.range_maps.get(&feed_id).cloned()
     }
 
+    pub async fn active_feed_name_for_range(&self, range_id: RangeId) -> Option<String> {
+        let state = self.state.lock().await;
+        let feed_id = state.range_assignments.get(&range_id)?.feed_id;
+        state
+            .feeds
+            .get(&feed_id)
+            .filter(|feed| feed.status == ResourceStatus::Active)
+            .map(|feed| feed.name.clone())
+    }
+
     pub async fn active_range_assignments_for_feed(
         &self,
         feed_id: Uuid,
