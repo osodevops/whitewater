@@ -10,6 +10,62 @@ use super::{
     StagedWriterSequence, StorageNodeId,
 };
 
+#[derive(Clone, Debug)]
+pub struct ColdRangeTracker {
+    max_rate: u64,
+    sustained_samples: u32,
+    cooldown_samples: u32,
+    evidence: u32,
+    cooldown_remaining: u32,
+}
+
+impl ColdRangeTracker {
+    pub fn new(max_rate: u64, sustained_samples: u32, cooldown_samples: u32) -> Self {
+        Self {
+            max_rate,
+            sustained_samples: sustained_samples.max(1),
+            cooldown_samples,
+            evidence: 0,
+            cooldown_remaining: 0,
+        }
+    }
+
+    pub fn observe(&mut self, left_rate: u64, right_rate: u64) -> bool {
+        if self.cooldown_remaining > 0 {
+            self.cooldown_remaining -= 1;
+            self.evidence = 0;
+            return false;
+        }
+        if left_rate > self.max_rate || right_rate > self.max_rate {
+            self.evidence = 0;
+            return false;
+        }
+        self.evidence = self.evidence.saturating_add(1);
+        if self.evidence < self.sustained_samples {
+            return false;
+        }
+        self.evidence = 0;
+        self.cooldown_remaining = self.cooldown_samples;
+        true
+    }
+}
+
+pub fn cold_adjacent_pairs(
+    range_map: &super::RangeMap,
+    rates: &BTreeMap<super::RangeId, u64>,
+    max_rate: u64,
+) -> Vec<(super::RangeId, super::RangeId)> {
+    range_map
+        .routes()
+        .windows(2)
+        .filter(|routes| {
+            rates.get(&routes[0].range_id).copied().unwrap_or(0) <= max_rate
+                && rates.get(&routes[1].range_id).copied().unwrap_or(0) <= max_rate
+        })
+        .map(|routes| (routes[0].range_id, routes[1].range_id))
+        .collect()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MergeStagingResult {
     pub left_commit: CommitPosition,
@@ -201,4 +257,42 @@ async fn stage_merged_range_inner(
             .collect(),
         replicas_verified: plan.merged_assignment.replicas.iter().cloned().collect(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::active_range::{KeyToken, RangeGeneration, RangeId, RangeMap};
+    use uuid::Uuid;
+
+    fn range(value: u128) -> RangeId {
+        RangeId::from_uuid(Uuid::from_u128(value))
+    }
+
+    #[test]
+    fn cold_evidence_resets_for_hot_samples_and_observes_cooldown() {
+        let mut tracker = ColdRangeTracker::new(10, 3, 2);
+        assert!(!tracker.observe(2, 3));
+        assert!(!tracker.observe(2, 20));
+        assert!(!tracker.observe(2, 3));
+        assert!(!tracker.observe(4, 5));
+        assert!(tracker.observe(6, 7));
+        assert!(!tracker.observe(1, 1));
+        assert!(!tracker.observe(1, 1));
+    }
+
+    #[test]
+    fn selector_only_returns_adjacent_pairs_below_threshold() {
+        let split = KeyToken::from_bytes([0x80; 16]);
+        let map = RangeMap::single(range(1), RangeGeneration::new(1))
+            .split(range(1), split, range(2))
+            .unwrap();
+        let rates = BTreeMap::from([(range(1), 2), (range(2), 3)]);
+        assert_eq!(
+            cold_adjacent_pairs(&map, &rates, 5),
+            vec![(range(1), range(2))]
+        );
+        let hot = BTreeMap::from([(range(1), 2), (range(2), 30)]);
+        assert!(cold_adjacent_pairs(&map, &hot, 5).is_empty());
+    }
 }

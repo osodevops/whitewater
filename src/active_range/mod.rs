@@ -12,7 +12,10 @@ pub use majority::{
     HttpReplicaTransport, MajorityAppendCoordinator, MajorityAppendError, MajorityAppendErrorCode,
     MajorityAppendResult, ReplicaTransport, ReplicaTransportError,
 };
-pub use merge::{abort_merged_range, stage_merged_range, MergeStagingError, MergeStagingResult};
+pub use merge::{
+    abort_merged_range, cold_adjacent_pairs, stage_merged_range, ColdRangeTracker,
+    MergeStagingError, MergeStagingResult,
+};
 pub use model::{
     ActiveRangeAssignment, ActiveRangeError, AppendIdentity, CommitPosition, CommittedAppendResult,
     OwnershipEpoch, RangeGeneration, RangeId, RangePosition, RangeProgress, RecordReplicationModel,
