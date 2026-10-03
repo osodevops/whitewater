@@ -308,6 +308,31 @@ async fn split_plan_is_consensus_persisted_but_cannot_change_authoritative_routi
             .len(),
         2
     );
+    let active_map = leader.active_range_map(feed_id).await.unwrap();
+    assert_eq!(active_map.routes().len(), 2);
+    let merge_request_id = Uuid::from_u128(402);
+    let merge_command = Command::PrepareActiveRangeMerge {
+        feed: "orders.created".to_owned(),
+        left_range_id: active_map.routes()[0].range_id,
+        right_range_id: active_map.routes()[1].range_id,
+    };
+    let merge = leader
+        .execute_commands_with_request_id(vec![merge_command.clone()], merge_request_id)
+        .await
+        .unwrap();
+    let merge_retry = leader
+        .execute_commands_with_request_id(vec![merge_command], merge_request_id)
+        .await
+        .unwrap();
+    assert_eq!(merge.results[0].data, merge_retry.results[0].data);
+    assert_eq!(merge.results[0].data["stage"], "prepared");
+    assert_eq!(
+        merge.results[0].data["candidate_map"]["routes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(
         leader
             .active_range_map(feed_id)
@@ -322,7 +347,9 @@ async fn split_plan_is_consensus_persisted_but_cannot_change_authoritative_routi
         .install_snapshot_bytes(&leader.snapshot_bytes().await.unwrap())
         .await
         .unwrap();
-    assert!(placement(&follower).await["range_split_plan"].is_null());
+    let follower_placement = placement(&follower).await;
+    assert!(follower_placement["range_split_plan"].is_null());
+    assert_eq!(follower_placement["range_merge_plan"]["stage"], "prepared");
     assert_eq!(
         follower
             .active_range_map(feed_id)

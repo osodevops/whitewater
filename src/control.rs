@@ -145,6 +145,25 @@ pub struct RangeSplitPlan {
     pub checksum_verified: bool,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RangeMergeStage {
+    Prepared,
+    Staging,
+    Ready,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeMergePlan {
+    pub plan_id: Uuid,
+    pub feed_id: Uuid,
+    pub left_range_id: RangeId,
+    pub right_range_id: RangeId,
+    pub candidate_map: RangeMap,
+    pub merged_assignment: ActiveRangeAssignment,
+    pub stage: RangeMergeStage,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CatalogState {
     schema_version: u32,
@@ -163,6 +182,8 @@ struct CatalogState {
     range_assignments: BTreeMap<RangeId, ActiveRangeAssignment>,
     #[serde(default)]
     range_split_plans: BTreeMap<Uuid, RangeSplitPlan>,
+    #[serde(default)]
+    range_merge_plans: BTreeMap<Uuid, RangeMergePlan>,
     #[serde(default)]
     applied_requests: BTreeMap<Uuid, ReplicatedCommandResult>,
 }
@@ -195,6 +216,7 @@ impl Default for CatalogState {
             range_maps: BTreeMap::new(),
             range_assignments: BTreeMap::new(),
             range_split_plans: BTreeMap::new(),
+            range_merge_plans: BTreeMap::new(),
             applied_requests: BTreeMap::new(),
         }
     }
@@ -336,6 +358,11 @@ pub enum Command {
         plan_id: Uuid,
         left_writer_sequences: Vec<StagedWriterSequence>,
         right_writer_sequences: Vec<StagedWriterSequence>,
+    },
+    PrepareActiveRangeMerge {
+        feed: String,
+        left_range_id: RangeId,
+        right_range_id: RangeId,
     },
 }
 
@@ -1185,6 +1212,10 @@ impl ControlController {
                         json!(state.range_split_plans.get(&feed_id)),
                     );
                     object.insert(
+                        "range_merge_plan".to_owned(),
+                        json!(state.range_merge_plans.get(&feed_id)),
+                    );
+                    object.insert(
                         "range_assignments".to_owned(),
                         json!(state
                             .range_maps
@@ -1450,6 +1481,68 @@ impl ControlController {
                         "left_assignment": plan.left_assignment,
                         "right_assignment": plan.right_assignment
                     }),
+                ))
+            }
+            Command::PrepareActiveRangeMerge {
+                feed,
+                left_range_id,
+                right_range_id,
+            } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                if state.range_split_plans.contains_key(&feed_id)
+                    || state.range_merge_plans.contains_key(&feed_id)
+                {
+                    return Err(ControlError::AlreadyExists(format!(
+                        "range operation for Feed {feed}"
+                    )));
+                }
+                let current_map = state
+                    .range_maps
+                    .get(&feed_id)
+                    .ok_or_else(|| ControlError::NotFound(format!("RangeMap for Feed {feed}")))?;
+                let candidate_map = current_map
+                    .merge_adjacent(left_range_id, right_range_id)
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let left_assignment = state
+                    .range_assignments
+                    .get(&left_range_id)
+                    .ok_or_else(|| ControlError::NotFound(format!("Range {left_range_id}")))?;
+                state
+                    .range_assignments
+                    .get(&right_range_id)
+                    .ok_or_else(|| ControlError::NotFound(format!("Range {right_range_id}")))?;
+                let generation = candidate_map
+                    .routes()
+                    .iter()
+                    .find(|route| route.range_id == left_range_id)
+                    .ok_or_else(|| {
+                        ControlError::InvalidOperation(
+                            "candidate merge map omitted target range".to_owned(),
+                        )
+                    })?
+                    .generation;
+                let merged_assignment = ActiveRangeAssignment::try_new(
+                    feed_id,
+                    left_range_id,
+                    generation,
+                    left_assignment.owner.clone(),
+                    left_assignment.replicas.clone(),
+                    left_assignment.ownership_epoch,
+                )
+                .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let plan = RangeMergePlan {
+                    plan_id: derived_resource_id(request_id, "active-range-merge-plan"),
+                    feed_id,
+                    left_range_id,
+                    right_range_id,
+                    candidate_map,
+                    merged_assignment,
+                    stage: RangeMergeStage::Prepared,
+                };
+                state.range_merge_plans.insert(feed_id, plan.clone());
+                Ok((
+                    format!("prepared Active Range merge for Feed {feed}"),
+                    json!(plan),
                 ))
             }
         }
@@ -2256,6 +2349,7 @@ fn command_label(command: &Command) -> String {
         Command::PrepareActiveRangeSplit { .. } => "PREPARE ACTIVE RANGE SPLIT",
         Command::RecordActiveRangeSplitCatchUp { .. } => "RECORD ACTIVE RANGE SPLIT CATCH UP",
         Command::ActivateActiveRangeSplit { .. } => "ACTIVATE ACTIVE RANGE SPLIT",
+        Command::PrepareActiveRangeMerge { .. } => "PREPARE ACTIVE RANGE MERGE",
     }
     .to_owned()
 }

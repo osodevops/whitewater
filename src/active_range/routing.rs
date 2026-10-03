@@ -129,6 +129,8 @@ pub enum RangeMapError {
     MissingEnd,
     #[error("split token is outside the selected range or lies on its boundary")]
     InvalidSplit,
+    #[error("ranges selected for merge are missing, identical, or not adjacent in map order")]
+    InvalidMerge,
     #[error("range generation overflow")]
     GenerationOverflow,
 }
@@ -239,6 +241,46 @@ impl RangeMap {
         );
         Self::try_new(routes)
     }
+
+    pub fn merge_adjacent(
+        &self,
+        left_range_id: RangeId,
+        right_range_id: RangeId,
+    ) -> Result<Self, RangeMapError> {
+        let left_index = self
+            .routes
+            .iter()
+            .position(|route| route.range_id == left_range_id)
+            .ok_or(RangeMapError::InvalidMerge)?;
+        if left_index + 1 >= self.routes.len()
+            || self.routes[left_index + 1].range_id != right_range_id
+        {
+            return Err(RangeMapError::InvalidMerge);
+        }
+        let left = &self.routes[left_index];
+        let right = &self.routes[left_index + 1];
+        if left.bounds.end_exclusive != Some(right.bounds.start) {
+            return Err(RangeMapError::InvalidMerge);
+        }
+        let generation = left
+            .generation
+            .max(right.generation)
+            .checked_next()
+            .map_err(|_| RangeMapError::GenerationOverflow)?;
+        let mut routes = self.routes.clone();
+        routes.splice(
+            left_index..=left_index + 1,
+            [RangeRoute {
+                range_id: left_range_id,
+                generation,
+                bounds: KeyRange {
+                    start: left.bounds.start,
+                    end_exclusive: right.bounds.end_exclusive,
+                },
+            }],
+        );
+        Self::try_new(routes)
+    }
 }
 
 #[cfg(test)]
@@ -296,6 +338,23 @@ mod tests {
         assert_eq!(
             map.split(range(1), KeyToken::MIN, range(2)),
             Err(RangeMapError::InvalidSplit)
+        );
+    }
+
+    #[test]
+    fn adjacent_ranges_merge_without_gaps_and_advance_generation() {
+        let split_at = KeyToken::from_bytes([0x80; 16]);
+        let split = RangeMap::single(range(1), RangeGeneration::new(1))
+            .split(range(1), split_at, range(2))
+            .unwrap();
+        let merged = split.merge_adjacent(range(1), range(2)).unwrap();
+        assert_eq!(merged.routes().len(), 1);
+        assert_eq!(merged.routes()[0].range_id, range(1));
+        assert_eq!(merged.routes()[0].generation, RangeGeneration::new(3));
+        assert_eq!(merged.routes()[0].bounds, KeyRange::full());
+        assert_eq!(
+            split.merge_adjacent(range(2), range(1)),
+            Err(RangeMapError::InvalidMerge)
         );
     }
 
