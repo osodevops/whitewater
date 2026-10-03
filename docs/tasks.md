@@ -650,7 +650,7 @@ Definition of Done:
 - [x] Activate ready splits atomically through consensus, installing both assignments, range-specific Writer sequence state, and the candidate map while generation 1 remains fenced.
 - [x] Place and route multiple active RF3 ranges across storage Nodes.
 - [x] Split hot ranges online from sustained per-range append pressure with sampled key-token boundaries, cooldown, authenticated RF3 staging, and Control Plane cutover.
-- [~] Merge cold adjacent ranges: validated plans, dual-source RF3 staging, Writer-state rebuild, freeze, atomic activation, sustained cold evidence, adjacency selection, and cooldown are complete; scheduler wiring remains.
+- [~] Merge cold adjacent ranges: validated plans, dual-source RF3 staging, Writer-state rebuild, freeze/rollback, atomic activation, authenticated merge transport, sustained cold evidence, adjacency selection, and cooldown are complete; cross-owner metric aggregation and scheduler wiring remain.
 - [ ] Move ranges while preserving same-Key ordering.
 - [x] Keep existing opaque Cursors valid across generation changes by merging committed candidate histories in ingest order.
 - [ ] Add hot-key detection and isolation.
@@ -674,6 +674,7 @@ Evidence:
 - Merge staging freezes both source generations, merges committed records by ingest order into one RF3 candidate, preserves Cursors and exact frames, rebuilds Writer sequence state, automatically unfreezes on failure, and activates the one-range map only after checksum evidence is ready.
 - The split/merge integration proves four records survive one-to-two split and two-to-one merge transitions while remaining readable as one logical Feed.
 - `ColdRangeTracker` requires sustained low rates for both ranges, resets on either hot sample, and enforces cooldown; `cold_adjacent_pairs` never proposes non-adjacent merges.
+- Authenticated merge staging runs locally on each planned replica through `/internal/active-range/merge/stage-local`; `/v1/admin/ranges/merge` compares RF3 evidence and commits readiness plus activation through the Control Plane.
 - These types are internal only; Feed, Key, Cursor, Writer, and Reader APIs remain unchanged.
 
 Definition of Done:

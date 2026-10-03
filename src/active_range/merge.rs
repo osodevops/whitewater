@@ -116,6 +116,7 @@ pub async fn stage_merged_range(
         left_source.clone(),
         right_source.clone(),
         targets,
+        plan.merged_assignment.replicas.as_array(),
     )
     .await
     {
@@ -128,6 +129,39 @@ pub async fn stage_merged_range(
                 right_assignment,
             )
             .await;
+            Err(error)
+        }
+    }
+}
+
+pub async fn stage_merged_range_local(
+    plan: &RangeMergePlan,
+    left_assignment: &ActiveRangeAssignment,
+    right_assignment: &ActiveRangeAssignment,
+    local: Arc<ReplicaAppendService>,
+) -> Result<MergeStagingResult, MergeStagingError> {
+    local
+        .freeze_generation(left_assignment.range_id, left_assignment.generation)
+        .await;
+    local
+        .freeze_generation(right_assignment.range_id, right_assignment.generation)
+        .await;
+    let local_node = local.local_node().clone();
+    let targets = BTreeMap::from([(local_node.clone(), local.clone())]);
+    match stage_merged_range_inner(
+        plan,
+        left_assignment,
+        right_assignment,
+        local.clone(),
+        local.clone(),
+        &targets,
+        std::slice::from_ref(&local_node),
+    )
+    .await
+    {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            abort_merged_range(&local, left_assignment, &local, right_assignment).await;
             Err(error)
         }
     }
@@ -154,6 +188,7 @@ async fn stage_merged_range_inner(
     left_source: Arc<ReplicaAppendService>,
     right_source: Arc<ReplicaAppendService>,
     targets: &BTreeMap<StorageNodeId, Arc<ReplicaAppendService>>,
+    replica_nodes: &[StorageNodeId],
 ) -> Result<MergeStagingResult, MergeStagingError> {
     let left_status = left_source
         .recovery_status_for_assignment(left_assignment)
@@ -195,7 +230,7 @@ async fn stage_merged_range_inner(
     for (index, frame) in frames.iter().enumerate() {
         let position = RangePosition::new(index as u64 + 1);
         let digest = *blake3::hash(&frame.frame).as_bytes();
-        for node in plan.merged_assignment.replicas.iter() {
+        for node in replica_nodes.iter() {
             let target = targets
                 .get(node)
                 .ok_or_else(|| MergeStagingError::MissingTarget(node.clone()))?;
@@ -228,7 +263,7 @@ async fn stage_merged_range_inner(
     }
     let merged_commit = CommitPosition::new(frames.len() as u64);
     if !frames.is_empty() {
-        for node in plan.merged_assignment.replicas.iter() {
+        for node in replica_nodes.iter() {
             targets[node]
                 .commit_staged_split(&plan.merged_assignment, merged_commit)
                 .await
@@ -255,7 +290,7 @@ async fn stage_merged_range_inner(
                 },
             )
             .collect(),
-        replicas_verified: plan.merged_assignment.replicas.iter().cloned().collect(),
+        replicas_verified: replica_nodes.to_vec(),
     })
 }
 

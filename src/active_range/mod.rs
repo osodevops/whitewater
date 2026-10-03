@@ -13,8 +13,8 @@ pub use majority::{
     MajorityAppendResult, ReplicaTransport, ReplicaTransportError,
 };
 pub use merge::{
-    abort_merged_range, cold_adjacent_pairs, stage_merged_range, ColdRangeTracker,
-    MergeStagingError, MergeStagingResult,
+    abort_merged_range, cold_adjacent_pairs, stage_merged_range, stage_merged_range_local,
+    ColdRangeTracker, MergeStagingError, MergeStagingResult,
 };
 pub use model::{
     ActiveRangeAssignment, ActiveRangeError, AppendIdentity, CommitPosition, CommittedAppendResult,

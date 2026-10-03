@@ -31,18 +31,18 @@ use uuid::Uuid;
 
 use crate::{
     active_range::{
-        stage_candidate_ranges_local, ActiveRangeAssignment, AppendIdentity,
-        CandidateSplitStagingResult, CommitPosition, KeyToken, MajorityAppendCoordinator,
-        MajorityAppendError, RepairExportRequest, RepairExportResponse, RepairFrame,
-        ReplicaAppendRequest, ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitRequest,
-        ReplicaCommitResponse, ReplicaProgressRequest, ReplicaProgressResponse,
-        ReplicaReconcileRequest, ReplicaReconcileResponse, StorageNodeId,
+        stage_candidate_ranges_local, stage_merged_range_local, ActiveRangeAssignment,
+        AppendIdentity, CandidateSplitStagingResult, CommitPosition, KeyToken,
+        MajorityAppendCoordinator, MajorityAppendError, MergeStagingResult, RepairExportRequest,
+        RepairExportResponse, RepairFrame, ReplicaAppendRequest, ReplicaAppendResponse,
+        ReplicaAppendService, ReplicaCommitRequest, ReplicaCommitResponse, ReplicaProgressRequest,
+        ReplicaProgressResponse, ReplicaReconcileRequest, ReplicaReconcileResponse, StorageNodeId,
         MAX_REPLICA_FRAME_BASE64_BYTES,
     },
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
     codec::{decode_record, encode_record},
-    control::{ControlController, ControlError, RangeSplitPlan, ReplicatedCommand},
+    control::{ControlController, ControlError, RangeMergePlan, RangeSplitPlan, ReplicatedCommand},
     control_plane::{
         ControlNodeId, ControlPlane, ControlPlaneError, ControlTypeConfig, FullSnapshotRequest,
         InternalCommandsRequest, InternalCommandsResponse, InternalWriteResponse,
@@ -112,6 +112,10 @@ pub fn router(state: AppState) -> Router {
         state.clone(),
         authorize_replica_append,
     ));
+    let merge_stage_route = post(merge_stage_local).layer(middleware::from_fn_with_state(
+        state.clone(),
+        authorize_replica_append,
+    ));
     Router::new()
         .route("/health", get(health))
         .route("/v1/streams", get(list_streams).post(create_stream))
@@ -129,6 +133,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/wcl", post(execute_admin_wcl))
         .route("/v1/admin/commands", post(execute_admin_commands))
         .route("/v1/admin/ranges/split", post(admin_split_range))
+        .route("/v1/admin/ranges/merge", post(admin_merge_ranges))
         .route("/v1/admin/control-plane", get(control_plane_status))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route(
@@ -181,6 +186,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/internal/active-range/split/freeze-local",
             split_freeze_route,
+        )
+        .route(
+            "/internal/active-range/merge/stage-local",
+            merge_stage_route,
         )
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
@@ -1248,6 +1257,193 @@ async fn admin_split_range(
         "right_commit": evidence.right.target_commit,
         "range_map": plan.candidate_map
     })))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LocalMergeStageRequest {
+    pub plan: RangeMergePlan,
+    pub left_assignment: ActiveRangeAssignment,
+    pub right_assignment: ActiveRangeAssignment,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LocalMergeStageResponse {
+    pub result: Option<MergeStagingResult>,
+    pub error: Option<String>,
+}
+
+async fn merge_stage_local(
+    State(state): State<AppState>,
+    Json(request): Json<LocalMergeStageRequest>,
+) -> Json<LocalMergeStageResponse> {
+    let Some(service) = &state.replica_append else {
+        return Json(LocalMergeStageResponse {
+            result: None,
+            error: Some("replica storage is not configured".to_owned()),
+        });
+    };
+    match stage_merged_range_local(
+        &request.plan,
+        &request.left_assignment,
+        &request.right_assignment,
+        service.clone(),
+    )
+    .await
+    {
+        Ok(result) => Json(LocalMergeStageResponse {
+            result: Some(result),
+            error: None,
+        }),
+        Err(error) => Json(LocalMergeStageResponse {
+            result: None,
+            error: Some(error.to_string()),
+        }),
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdminMergeRangesRequest {
+    pub request_id: Uuid,
+    pub feed: String,
+    pub left_range_id: crate::active_range::RangeId,
+    pub right_range_id: crate::active_range::RangeId,
+}
+
+async fn unfreeze_merge_nodes(
+    state: &AppState,
+    plan: &RangeMergePlan,
+    left: &ActiveRangeAssignment,
+    right: &ActiveRangeAssignment,
+    key: &str,
+) {
+    for node in plan.merged_assignment.replicas.iter() {
+        if let Some(endpoint) = state.control_endpoints.get(node) {
+            for assignment in [left, right] {
+                let _ = state
+                    .internal_http
+                    .post(format!(
+                        "{}/internal/active-range/split/unfreeze-local",
+                        endpoint.trim_end_matches('/')
+                    ))
+                    .header("x-whitewater-control-key", key)
+                    .json(&LocalSplitUnfreezeRequest {
+                        source_assignment: assignment.clone(),
+                    })
+                    .send()
+                    .await;
+            }
+        }
+    }
+}
+
+async fn admin_merge_ranges(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AdminMergeRangesRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let control_plane = state
+        .control_plane
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Control Plane is unavailable"))?;
+    let prepared = control_plane
+        .execute_commands_with_request_id(
+            vec![crate::control::Command::PrepareActiveRangeMerge {
+                feed: request.feed.clone(),
+                left_range_id: request.left_range_id,
+                right_range_id: request.right_range_id,
+            }],
+            request.request_id,
+        )
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let plan: RangeMergePlan = serde_json::from_value(prepared.results[0].data.clone())
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    let left = state
+        .control
+        .active_range_assignment_by_id(plan.left_range_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("left assignment unavailable"))?;
+    let right = state
+        .control
+        .active_range_assignment_by_id(plan.right_range_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("right assignment unavailable"))?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("internal credential unavailable"))?;
+    let mut evidence = Vec::new();
+    for node in plan.merged_assignment.replicas.iter() {
+        let endpoint = state.control_endpoints.get(node).ok_or_else(|| {
+            ApiError::unavailable(format!("merge replica {node} endpoint unavailable"))
+        })?;
+        let response: LocalMergeStageResponse = state
+            .internal_http
+            .post(format!(
+                "{}/internal/active-range/merge/stage-local",
+                endpoint.trim_end_matches('/')
+            ))
+            .header("x-whitewater-control-key", key)
+            .json(&LocalMergeStageRequest {
+                plan: plan.clone(),
+                left_assignment: left.clone(),
+                right_assignment: right.clone(),
+            })
+            .send()
+            .await
+            .map_err(|error| ApiError::unavailable(error.to_string()))?
+            .json()
+            .await
+            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        evidence.push(response.result.ok_or_else(|| {
+            ApiError::unavailable(
+                response
+                    .error
+                    .unwrap_or_else(|| "merge staging failed".to_owned()),
+            )
+        })?);
+    }
+    let staged = evidence
+        .first()
+        .cloned()
+        .ok_or_else(|| ApiError::unavailable("no merge evidence"))?;
+    if evidence.iter().any(|item| {
+        item.left_commit != staged.left_commit
+            || item.right_commit != staged.right_commit
+            || item.merged_commit != staged.merged_commit
+            || item.checksum != staged.checksum
+            || item.writer_sequences != staged.writer_sequences
+    }) {
+        unfreeze_merge_nodes(&state, &plan, &left, &right, key).await;
+        return Err(ApiError::unavailable(
+            "RF3 merge staging evidence does not match",
+        ));
+    }
+    control_plane
+        .execute_commands(vec![
+            crate::control::Command::RecordActiveRangeMergeStaging {
+                feed: request.feed.clone(),
+                plan_id: plan.plan_id,
+                left_commit: staged.left_commit,
+                right_commit: staged.right_commit,
+                merged_commit: staged.merged_commit,
+                checksum_verified: true,
+            },
+        ])
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    control_plane
+        .execute_commands(vec![crate::control::Command::ActivateActiveRangeMerge {
+            feed: request.feed,
+            plan_id: plan.plan_id,
+            writer_sequences: staged.writer_sequences.clone(),
+        }])
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    Ok(Json(
+        json!({ "status": "activated", "range_map": plan.candidate_map, "merged_commit": staged.merged_commit }),
+    ))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
