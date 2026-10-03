@@ -650,7 +650,7 @@ Definition of Done:
 - [x] Activate ready splits atomically through consensus, installing both assignments, range-specific Writer sequence state, and the candidate map while generation 1 remains fenced.
 - [x] Place and route multiple active RF3 ranges across storage Nodes.
 - [x] Split hot ranges online from sustained per-range append pressure with sampled key-token boundaries, cooldown, authenticated RF3 staging, and Control Plane cutover.
-- [~] Merge cold adjacent ranges: validated candidate maps and consensus-persisted merge plans are complete; dual-source staging, freeze, and activation remain.
+- [~] Merge cold adjacent ranges: validated plans, dual-source RF3 staging, Writer-state rebuild, freeze, and atomic activation are complete; automatic cold-pair scheduling remains.
 - [ ] Move ranges while preserving same-Key ordering.
 - [x] Keep existing opaque Cursors valid across generation changes by merging committed candidate histories in ingest order.
 - [ ] Add hot-key detection and isolation.
@@ -671,6 +671,8 @@ Evidence:
 - Per-range metrics collect records, bytes, and a bounded key-token sample; the scheduler applies sustained thresholds and cooldown, then sends the sampled median through the same authenticated split workflow.
 - `python scripts/test-m4-auto-split.py` runs with low test thresholds, generates sustained traffic, observes an automatic one-to-two range transition with two owners, and restores production-like defaults afterward.
 - Adjacent merge planning rejects reversed/non-adjacent selections, preserves full keyspace coverage, advances generation, persists idempotently through snapshots, and leaves the two-range authoritative map unchanged until data staging is verified.
+- Merge staging freezes both source generations, merges committed records by ingest order into one RF3 candidate, preserves Cursors and exact frames, rebuilds Writer sequence state, automatically unfreezes on failure, and activates the one-range map only after checksum evidence is ready.
+- The split/merge integration proves four records survive one-to-two split and two-to-one merge transitions while remaining readable as one logical Feed.
 - These types are internal only; Feed, Key, Cursor, Writer, and Reader APIs remain unchanged.
 
 Definition of Done:

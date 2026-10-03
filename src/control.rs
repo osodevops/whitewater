@@ -162,6 +162,14 @@ pub struct RangeMergePlan {
     pub candidate_map: RangeMap,
     pub merged_assignment: ActiveRangeAssignment,
     pub stage: RangeMergeStage,
+    #[serde(default)]
+    pub left_commit: Option<CommitPosition>,
+    #[serde(default)]
+    pub right_commit: Option<CommitPosition>,
+    #[serde(default)]
+    pub merged_commit: Option<CommitPosition>,
+    #[serde(default)]
+    pub checksum_verified: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -363,6 +371,19 @@ pub enum Command {
         feed: String,
         left_range_id: RangeId,
         right_range_id: RangeId,
+    },
+    RecordActiveRangeMergeStaging {
+        feed: String,
+        plan_id: Uuid,
+        left_commit: CommitPosition,
+        right_commit: CommitPosition,
+        merged_commit: CommitPosition,
+        checksum_verified: bool,
+    },
+    ActivateActiveRangeMerge {
+        feed: String,
+        plan_id: Uuid,
+        writer_sequences: Vec<StagedWriterSequence>,
     },
 }
 
@@ -1538,11 +1559,98 @@ impl ControlController {
                     candidate_map,
                     merged_assignment,
                     stage: RangeMergeStage::Prepared,
+                    left_commit: None,
+                    right_commit: None,
+                    merged_commit: None,
+                    checksum_verified: false,
                 };
                 state.range_merge_plans.insert(feed_id, plan.clone());
                 Ok((
                     format!("prepared Active Range merge for Feed {feed}"),
                     json!(plan),
+                ))
+            }
+            Command::RecordActiveRangeMergeStaging {
+                feed,
+                plan_id,
+                left_commit,
+                right_commit,
+                merged_commit,
+                checksum_verified,
+            } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                let plan = state.range_merge_plans.get_mut(&feed_id).ok_or_else(|| {
+                    ControlError::NotFound(format!("Active Range merge plan for Feed {feed}"))
+                })?;
+                if plan.plan_id != plan_id {
+                    return Err(ControlError::InvalidOperation(
+                        "merge staging evidence belongs to a stale plan".to_owned(),
+                    ));
+                }
+                plan.left_commit = Some(left_commit);
+                plan.right_commit = Some(right_commit);
+                plan.merged_commit = Some(merged_commit);
+                plan.checksum_verified = checksum_verified;
+                plan.stage = if checksum_verified {
+                    RangeMergeStage::Ready
+                } else {
+                    RangeMergeStage::Staging
+                };
+                Ok((
+                    format!("recorded Active Range merge staging for Feed {feed}"),
+                    json!(plan.clone()),
+                ))
+            }
+            Command::ActivateActiveRangeMerge {
+                feed,
+                plan_id,
+                writer_sequences,
+            } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                let plan = state
+                    .range_merge_plans
+                    .get(&feed_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!("Active Range merge plan for Feed {feed}"))
+                    })?;
+                if plan.plan_id != plan_id || plan.stage != RangeMergeStage::Ready {
+                    return Err(ControlError::InvalidOperation(
+                        "merge plan is stale or not ready for activation".to_owned(),
+                    ));
+                }
+                for progress in writer_sequences {
+                    if let Some(writer) = state.writers.get_mut(&progress.writer_session_id) {
+                        if writer.session_epoch == progress.writer_epoch {
+                            writer.range_next_sequences.insert(
+                                plan.left_range_id,
+                                progress.max_sequence.checked_add(1).ok_or_else(|| {
+                                    ControlError::InvalidOperation(
+                                        "Writer range sequence overflow".to_owned(),
+                                    )
+                                })?,
+                            );
+                            writer.range_next_sequences.remove(&plan.right_range_id);
+                        }
+                    }
+                }
+                state.range_maps.insert(feed_id, plan.candidate_map.clone());
+                state.range_assignments.remove(&plan.right_range_id);
+                state.range_assignments.insert(
+                    plan.merged_assignment.range_id,
+                    plan.merged_assignment.clone(),
+                );
+                state
+                    .active_ranges
+                    .insert(feed_id, plan.merged_assignment.clone());
+                state.range_merge_plans.remove(&feed_id);
+                Ok((
+                    format!("activated Active Range merge for Feed {feed}"),
+                    json!({
+                        "range_map": plan.candidate_map,
+                        "merged_assignment": plan.merged_assignment,
+                        "retired_range_id": plan.right_range_id
+                    }),
                 ))
             }
         }
@@ -2350,6 +2458,8 @@ fn command_label(command: &Command) -> String {
         Command::RecordActiveRangeSplitCatchUp { .. } => "RECORD ACTIVE RANGE SPLIT CATCH UP",
         Command::ActivateActiveRangeSplit { .. } => "ACTIVATE ACTIVE RANGE SPLIT",
         Command::PrepareActiveRangeMerge { .. } => "PREPARE ACTIVE RANGE MERGE",
+        Command::RecordActiveRangeMergeStaging { .. } => "RECORD ACTIVE RANGE MERGE STAGING",
+        Command::ActivateActiveRangeMerge { .. } => "ACTIVATE ACTIVE RANGE MERGE",
     }
     .to_owned()
 }

@@ -5,12 +5,13 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use finnstream::{
     active_range::{
         abort_frozen_split, freeze_and_stage_final_boundary, orchestrate_split_cutover,
-        stage_candidate_ranges, stage_right_range, AppendIdentity, CommitPosition,
-        FrozenSplitBoundary, KeyToken, RangePosition, ReplicaAppendErrorCode, ReplicaAppendRequest,
-        ReplicaAppendService, ReplicaCommitRequest, SplitCutoverControl, StorageNodeId,
+        stage_candidate_ranges, stage_merged_range, stage_right_range, AppendIdentity,
+        CommitPosition, FrozenSplitBoundary, KeyToken, RangePosition, ReplicaAppendErrorCode,
+        ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitRequest, SplitCutoverControl,
+        StorageNodeId,
     },
     codec::encode_record,
-    control::{Command, ControlController, RangeSplitPlan},
+    control::{Command, ControlController, RangeMergePlan, RangeSplitPlan},
     domain::StoredRecord,
     storage::{FileLogStore, LogStore},
 };
@@ -320,4 +321,60 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             .collect::<Vec<_>>(),
         vec![1, 2, 3, 4]
     );
+    let assignments = control.active_range_assignments_for_feed(feed_id).await;
+    let merge_prepared = control
+        .execute_commands(vec![Command::PrepareActiveRangeMerge {
+            feed: "orders.events".to_owned(),
+            left_range_id: assignments[0].range_id,
+            right_range_id: assignments[1].range_id,
+        }])
+        .await
+        .unwrap();
+    let merge_plan: RangeMergePlan =
+        serde_json::from_value(merge_prepared.results[0].data.clone()).unwrap();
+    let merge_staged = stage_merged_range(
+        &merge_plan,
+        &assignments[0],
+        &assignments[1],
+        services[&assignments[0].owner].clone(),
+        services[&assignments[1].owner].clone(),
+        &services,
+    )
+    .await
+    .unwrap();
+    assert_eq!(merge_staged.transferred_records, 4);
+    control
+        .execute_commands(vec![Command::RecordActiveRangeMergeStaging {
+            feed: "orders.events".to_owned(),
+            plan_id: merge_plan.plan_id,
+            left_commit: merge_staged.left_commit,
+            right_commit: merge_staged.right_commit,
+            merged_commit: merge_staged.merged_commit,
+            checksum_verified: true,
+        }])
+        .await
+        .unwrap();
+    control
+        .execute_commands(vec![Command::ActivateActiveRangeMerge {
+            feed: "orders.events".to_owned(),
+            plan_id: merge_plan.plan_id,
+            writer_sequences: merge_staged.writer_sequences.clone(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(
+        control
+            .active_range_map(feed_id)
+            .await
+            .unwrap()
+            .routes()
+            .len(),
+        1
+    );
+    let merged_assignment = control.active_range_assignment(feed_id).await.unwrap();
+    let final_records = services[&merged_assignment.owner]
+        .read_committed(feed_id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(final_records.len(), 4);
 }

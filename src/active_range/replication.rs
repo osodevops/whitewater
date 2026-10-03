@@ -270,6 +270,24 @@ impl ReplicaAppendService {
             .map_err(map_store_error)
     }
 
+    pub async fn recovery_status_for_assignment(
+        &self,
+        assignment: &ActiveRangeAssignment,
+    ) -> Result<super::ReplicaRecoveryStatus, ReplicaAppendError> {
+        let snapshot = self
+            .store_for(assignment)
+            .await?
+            .snapshot()
+            .await
+            .map_err(map_store_error)?;
+        Ok(super::ReplicaRecoveryStatus {
+            node: self.local_node.clone(),
+            healthy: true,
+            appended: snapshot.progress.appended(),
+            committed: snapshot.progress.commit_position(),
+        })
+    }
+
     pub async fn recovery_status(
         &self,
         feed_id: Uuid,
@@ -327,6 +345,19 @@ impl ReplicaAppendService {
         }
         store
             .truncate_uncommitted(assignment.generation, assignment.ownership_epoch)
+            .await
+            .map_err(map_store_error)
+    }
+
+    pub async fn export_assignment_committed(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        after: Option<RangePosition>,
+        limit: usize,
+    ) -> Result<Vec<super::StoredRangeFrame>, ReplicaAppendError> {
+        self.store_for(assignment)
+            .await?
+            .read_committed(after, limit)
             .await
             .map_err(map_store_error)
     }
