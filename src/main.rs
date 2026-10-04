@@ -3,9 +3,9 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use anyhow::Result;
 use finnstream::{
     active_range::{
-        HttpRecoveryTransport, HttpReplicaTransport, LocalRepairSupervisor,
-        MajorityAppendCoordinator, RecoverySupervisor, ReplicaAppendService, SplitPressureTracker,
-        StorageNodeId,
+        cold_adjacent_pairs, ColdRangeTracker, HttpRecoveryTransport, HttpReplicaTransport,
+        LocalRepairSupervisor, MajorityAppendCoordinator, RecoverySupervisor, ReplicaAppendService,
+        SplitPressureTracker, StorageNodeId,
     },
     admin::AdminAuthenticator,
     api::{router, AppState},
@@ -217,7 +217,7 @@ async fn main() -> Result<()> {
             }
         })
     });
-    let split_task = control_plane.clone().and_then(|_control_plane| {
+    let split_task = control_plane.clone().and_then(|control_plane| {
         let admin_key = std::env::var("FINNSTREAM_ADMIN_API_KEY").ok()?;
         let interval_ms = std::env::var("WHITEWATER_AUTO_SPLIT_INTERVAL_MS")
             .ok()
@@ -236,12 +236,28 @@ async fn main() -> Result<()> {
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(30);
+        let cold_threshold = std::env::var("WHITEWATER_AUTO_MERGE_APPEND_RATE")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10);
+        let cold_sustained = std::env::var("WHITEWATER_AUTO_MERGE_SUSTAINED_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(30);
+        let cold_cooldown = std::env::var("WHITEWATER_AUTO_MERGE_COOLDOWN_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(60);
+        let internal_key = config.control_plane_key.clone()?;
+        let peer_endpoints = control_endpoints.clone();
         let mut shutdown = shutdown_tx.subscribe();
         let demand = demand.clone();
         let control = control.clone();
         let endpoint = format!("http://127.0.0.1:{}", config.bind_addr.port());
         Some(tokio::spawn(async move {
-            let mut trackers = BTreeMap::new();
+            let mut split_trackers = BTreeMap::new();
+            let mut cold_trackers = BTreeMap::new();
+            let mut previous_totals = BTreeMap::new();
             let client = reqwest::Client::new();
             let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
             loop {
@@ -249,7 +265,7 @@ async fn main() -> Result<()> {
                     _ = interval.tick() => {
                         for sample in demand.take_range_pressure_samples() {
                             let rate = sample.records.saturating_mul(1_000) / interval_ms;
-                            let tracker = trackers.entry(sample.range_id)
+                            let tracker = split_trackers.entry(sample.range_id)
                                 .or_insert_with(|| SplitPressureTracker::new(threshold, sustained, cooldown));
                             if !tracker.observe(rate) { continue; }
                             let Some(split_at) = sample.split_token else { continue; };
@@ -276,6 +292,61 @@ async fn main() -> Result<()> {
                                     tracing::warn!(range_id = %sample.range_id, %status, %detail, "automatic Active Range split deferred");
                                 }
                                 Err(error) => tracing::warn!(range_id = %sample.range_id, %error, "automatic Active Range split request failed"),
+                            }
+                        }
+                        if control_plane.status().await.state == "leader" {
+                            let mut totals = BTreeMap::new();
+                            for peer in peer_endpoints.values() {
+                                let response = client
+                                    .get(format!("{}/internal/active-range/pressure", peer.trim_end_matches('/')))
+                                    .header("x-whitewater-control-key", &internal_key)
+                                    .send()
+                                    .await;
+                                let Ok(response) = response else { continue; };
+                                let Ok(samples) = response.json::<Vec<finnstream::demand::RangePressureSample>>().await else { continue; };
+                                for sample in samples {
+                                    let entry = totals.entry(sample.range_id).or_insert(0_u64);
+                                    *entry = entry.saturating_add(sample.records);
+                                }
+                            }
+                            let rates = totals
+                                .iter()
+                                .map(|(range_id, total)| {
+                                    let previous = previous_totals.insert(*range_id, *total).unwrap_or(*total);
+                                    (*range_id, total.saturating_sub(previous).saturating_mul(1_000) / interval_ms)
+                                })
+                                .collect::<BTreeMap<_, _>>();
+                            for (feed, map) in control.active_feed_range_maps().await {
+                                for (left, right) in cold_adjacent_pairs(&map, &rates, cold_threshold) {
+                                    let tracker = cold_trackers.entry((left, right)).or_insert_with(|| {
+                                        ColdRangeTracker::new(cold_threshold, cold_sustained, cold_cooldown)
+                                    });
+                                    let left_rate = rates.get(&left).copied().unwrap_or(0);
+                                    let right_rate = rates.get(&right).copied().unwrap_or(0);
+                                    if !tracker.observe(left_rate, right_rate) { continue; }
+                                    let response = client
+                                        .post(format!("{endpoint}/v1/admin/ranges/merge"))
+                                        .bearer_auth(&admin_key)
+                                        .json(&serde_json::json!({
+                                            "request_id": uuid::Uuid::new_v4(),
+                                            "feed": feed,
+                                            "left_range_id": left,
+                                            "right_range_id": right
+                                        }))
+                                        .send()
+                                        .await;
+                                    match response {
+                                        Ok(response) if response.status().is_success() => {
+                                            tracing::info!(%left, %right, left_rate, right_rate, "automatic adjacent range merge activated");
+                                        }
+                                        Ok(response) => {
+                                            let status = response.status();
+                                            let detail = response.text().await.unwrap_or_default();
+                                            tracing::warn!(%left, %right, %status, %detail, "automatic adjacent range merge deferred");
+                                        }
+                                        Err(error) => tracing::warn!(%left, %right, %error, "automatic adjacent range merge request failed"),
+                                    }
+                                }
                             }
                         }
                     }

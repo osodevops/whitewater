@@ -8,7 +8,7 @@ use std::{
 
 use crate::active_range::{KeyToken, RangeId};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default)]
 pub struct DemandMetrics {
@@ -24,6 +24,7 @@ struct DemandCounters {
     reads_total: AtomicU64,
     records_read_total: AtomicU64,
     range_appends: Mutex<BTreeMap<RangeId, RangeAppendWindow>>,
+    range_totals: Mutex<BTreeMap<RangeId, RangeAppendWindow>>,
 }
 
 #[derive(Default)]
@@ -33,7 +34,7 @@ struct RangeAppendWindow {
     key_tokens: Vec<KeyToken>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RangePressureSample {
     pub range_id: RangeId,
     pub records: u64,
@@ -74,12 +75,15 @@ impl DemandMetrics {
     }
 
     pub fn record_range_append(&self, range_id: RangeId, key: &[u8], bytes: usize) {
-        if let Ok(mut ranges) = self.inner.range_appends.lock() {
-            let window = ranges.entry(range_id).or_default();
-            window.records = window.records.saturating_add(1);
-            window.bytes = window.bytes.saturating_add(bytes as u64);
-            if window.key_tokens.len() < 4096 {
-                window.key_tokens.push(KeyToken::from_key(key));
+        let token = KeyToken::from_key(key);
+        for counters in [&self.inner.range_appends, &self.inner.range_totals] {
+            if let Ok(mut ranges) = counters.lock() {
+                let window = ranges.entry(range_id).or_default();
+                window.records = window.records.saturating_add(1);
+                window.bytes = window.bytes.saturating_add(bytes as u64);
+                if window.key_tokens.len() < 4096 {
+                    window.key_tokens.push(token);
+                }
             }
         }
     }
@@ -98,6 +102,26 @@ impl DemandMetrics {
                     .copied();
                 RangePressureSample {
                     range_id,
+                    records: window.records,
+                    bytes: window.bytes,
+                    split_token,
+                }
+            })
+            .collect()
+    }
+
+    pub fn range_pressure_totals(&self) -> Vec<RangePressureSample> {
+        let Ok(ranges) = self.inner.range_totals.lock() else {
+            return Vec::new();
+        };
+        ranges
+            .iter()
+            .map(|(range_id, window)| {
+                let mut tokens = window.key_tokens.clone();
+                tokens.sort_unstable();
+                let split_token = tokens.get(tokens.len().saturating_sub(1) / 2).copied();
+                RangePressureSample {
+                    range_id: *range_id,
                     records: window.records,
                     bytes: window.bytes,
                     split_token,

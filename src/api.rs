@@ -116,6 +116,10 @@ pub fn router(state: AppState) -> Router {
         state.clone(),
         authorize_replica_append,
     ));
+    let range_pressure_route = get(range_pressure_totals).layer(middleware::from_fn_with_state(
+        state.clone(),
+        authorize_replica_append,
+    ));
     Router::new()
         .route("/health", get(health))
         .route("/v1/streams", get(list_streams).post(create_stream))
@@ -191,6 +195,7 @@ pub fn router(state: AppState) -> Router {
             "/internal/active-range/merge/stage-local",
             merge_stage_route,
         )
+        .route("/internal/active-range/pressure", range_pressure_route)
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
         .route(
@@ -1270,6 +1275,12 @@ pub struct LocalMergeStageRequest {
 pub struct LocalMergeStageResponse {
     pub result: Option<MergeStagingResult>,
     pub error: Option<String>,
+}
+
+async fn range_pressure_totals(
+    State(state): State<AppState>,
+) -> Json<Vec<crate::demand::RangePressureSample>> {
+    Json(state.demand.range_pressure_totals())
 }
 
 async fn merge_stage_local(
