@@ -727,6 +727,28 @@ async fn reader_open(
     Ok(Json(reader_session_response(reader)))
 }
 
+fn verify_reader_frontier_result(
+    execution: &crate::control::ControlExecution,
+    cursor: &str,
+    positions: &BTreeMap<RangeId, String>,
+    fetch_request_id: Uuid,
+) -> Result<(), ApiError> {
+    let data = execution
+        .results
+        .first()
+        .map(|result| &result.data)
+        .ok_or_else(|| ApiError::unavailable("Reader frontier commit returned no result"))?;
+    let applied =
+        serde_json::from_value::<BTreeMap<RangeId, String>>(data["positions"].clone()).ok();
+    if applied.as_ref() != Some(positions)
+        || data["fetch_request_id"] != json!(fetch_request_id)
+        || data["reader"]["delivered_cursor"] != json!(cursor)
+    {
+        return Err(ApiError::unavailable("Reader fetch identity resolved to a different delivery; reopen the session from acknowledged progress"));
+    }
+    Ok(())
+}
+
 async fn reader_fetch(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -742,6 +764,13 @@ async fn reader_fetch(
         return Err(ApiError::bad_request("Reader session is stale or inactive"));
     }
     let frontier = state.control.active_reader_frontier(reader.reader_id).await;
+    if frontier
+        .as_ref()
+        .and_then(|value| value.last_fetch_request_id)
+        == Some(request.request_id)
+    {
+        return Err(ApiError::unavailable("Reader fetch request already delivered; reopen the session to replay unacknowledged progress"));
+    }
     let feed = state
         .control
         .active_feed_by_id(reader.feed_id)
@@ -822,12 +851,17 @@ async fn reader_fetch(
         let cursor = delivered_cursor
             .clone()
             .ok_or_else(|| ApiError::unavailable("Reader progress token is unavailable"))?;
+        let expected_frontier = next_frontier.clone();
+        let persisted_token = cursor.clone();
         let command = if let Some(positions) = next_frontier {
             crate::control::Command::RecordReaderFrontier {
                 reader: request.reader.clone(),
                 session_epoch: request.session_epoch,
                 cursor,
                 positions,
+                expected_cursor: reader.delivered_cursor.clone(),
+                fence_delivery: true,
+                fetch_request_id: Some(request.request_id),
             }
         } else {
             crate::control::Command::RecordReaderDelivery {
@@ -836,7 +870,26 @@ async fn reader_fetch(
                 cursor,
             }
         };
-        execute_reader_command(&state, command, request.request_id).await?;
+        let execution = execute_reader_command(&state, command, request.request_id)
+            .await
+            .map_err(|error| {
+                if expected_frontier.is_some() && error.status == StatusCode::BAD_REQUEST {
+                    ApiError::unavailable(format!(
+                        "Reader progress was not committed; reopen the session to retry safely: {}",
+                        error.message
+                    ))
+                } else {
+                    error
+                }
+            })?;
+        if let Some(positions) = expected_frontier {
+            verify_reader_frontier_result(
+                &execution,
+                &persisted_token,
+                &positions,
+                request.request_id,
+            )?;
+        }
     }
     state.demand.record_read(records.len());
     let pressure = (state.demand.snapshot().requests_in_flight as f64 / 100.0).clamp(0.0, 1.0);
@@ -4398,6 +4451,72 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn repeated_fetch_request_cannot_return_a_different_frontier() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let control = ControlController::open_with_storage_nodes(
+            directory.path().join("catalog.json"),
+            store,
+            ["storage-1", "storage-2", "storage-3"]
+                .into_iter()
+                .map(|node| StorageNodeId::try_new(node).unwrap())
+                .collect(),
+        )
+        .unwrap();
+        control.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE READER audit FROM orders.events START AT BEGINNING;").await.unwrap();
+        let reader = control.active_reader_by_name("audit").await.unwrap();
+        let assignment = control
+            .active_range_assignment(reader.feed_id)
+            .await
+            .unwrap();
+        control
+            .execute_commands(vec![Command::OpenReaderSession {
+                reader: "audit".to_owned(),
+                capacity: 2,
+            }])
+            .await
+            .unwrap();
+        let request_id = Uuid::from_u128(7_100);
+        let first = BTreeMap::from([(assignment.range_id, "event-1".to_owned())]);
+        let retry = BTreeMap::from([(assignment.range_id, "event-2".to_owned())]);
+        let delivery = |positions: BTreeMap<RangeId, String>| Command::RecordReaderFrontier {
+            reader: "audit".to_owned(),
+            session_epoch: 1,
+            cursor: "rf1_same-request".to_owned(),
+            positions,
+            expected_cursor: None,
+            fence_delivery: true,
+            fetch_request_id: Some(request_id),
+        };
+        let applied = control
+            .execute_commands_with_request_id(vec![delivery(first.clone())], request_id)
+            .await
+            .unwrap();
+        assert!(
+            verify_reader_frontier_result(&applied, "rf1_same-request", &first, request_id).is_ok()
+        );
+        let repeated = control
+            .execute_commands_with_request_id(vec![delivery(retry.clone())], request_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            verify_reader_frontier_result(&repeated, "rf1_same-request", &retry, request_id)
+                .unwrap_err()
+                .status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            control
+                .active_reader_frontier(reader.reader_id)
+                .await
+                .unwrap()
+                .delivered,
+            first
+        );
+    }
+
     #[test]
     fn complete_feed_merge_orders_remote_frames_and_continues_from_opaque_cursor() {
         let frame = |index: u64, ingest: i64| StoredRangeFrame {
@@ -4989,6 +5108,9 @@ mod tests {
                         session_epoch: 1,
                         cursor: "forged".to_owned(),
                         positions: BTreeMap::new(),
+                        expected_cursor: None,
+                        fence_delivery: true,
+                        fetch_request_id: Some(Uuid::new_v4()),
                     }],
                 })
                 .unwrap(),

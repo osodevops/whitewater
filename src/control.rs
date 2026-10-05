@@ -129,6 +129,8 @@ pub struct ReaderDefinition {
 pub(crate) struct ReaderFrontier {
     pub acknowledged: BTreeMap<RangeId, String>,
     pub delivered: BTreeMap<RangeId, String>,
+    #[serde(default)]
+    pub last_fetch_request_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -391,6 +393,12 @@ pub enum Command {
         session_epoch: u64,
         cursor: String,
         positions: BTreeMap<RangeId, String>,
+        #[serde(default)]
+        expected_cursor: Option<String>,
+        #[serde(default)]
+        fence_delivery: bool,
+        #[serde(default)]
+        fetch_request_id: Option<Uuid>,
     },
     AcknowledgeReader {
         reader: String,
@@ -1352,6 +1360,7 @@ impl ControlController {
                 let updated = definition.clone();
                 if let Some(frontier) = state.reader_frontiers.get_mut(&updated.reader_id) {
                     frontier.delivered = frontier.acknowledged.clone();
+                    frontier.last_fetch_request_id = None;
                 }
                 Ok((format!("opened Reader session {reader}"), json!(updated)))
             }
@@ -1383,10 +1392,16 @@ impl ControlController {
                 session_epoch,
                 cursor,
                 positions,
+                expected_cursor,
+                fence_delivery,
+                fetch_request_id,
             } => {
                 let (reader_id, feed_id) = {
                     let definition = active_reader_mut(state, &reader)?;
                     validate_reader_epoch(definition, session_epoch)?;
+                    if fence_delivery && definition.delivered_cursor != expected_cursor {
+                        return Err(ControlError::InvalidOperation("Reader delivery advanced concurrently; reopen the session before retrying".to_owned()));
+                    }
                     (definition.reader_id, definition.feed_id)
                 };
                 if cursor.is_empty()
@@ -1406,16 +1421,18 @@ impl ControlController {
                         "Reader frontier exceeds bounds or references a stale range".to_owned(),
                     ));
                 }
-                state
-                    .reader_frontiers
-                    .entry(reader_id)
-                    .or_default()
-                    .delivered = positions;
+                let frontier = state.reader_frontiers.entry(reader_id).or_default();
+                if fetch_request_id.is_some() && fetch_request_id == frontier.last_fetch_request_id
+                {
+                    return Err(ControlError::InvalidOperation("Reader fetch request ID was already delivered; reopen the session to redeliver from acknowledged progress".to_owned()));
+                }
+                frontier.delivered = positions.clone();
+                frontier.last_fetch_request_id = fetch_request_id;
                 let definition = active_reader_mut(state, &reader)?;
                 definition.delivered_cursor = Some(cursor);
                 Ok((
                     format!("recorded Reader frontier {reader}"),
-                    json!(definition.clone()),
+                    json!({ "reader": definition.clone(), "positions": positions, "fetch_request_id": fetch_request_id }),
                 ))
             }
             Command::AcknowledgeReader {
@@ -3347,6 +3364,9 @@ mod tests {
             session_epoch: 1,
             cursor: "opaque-reader-progress-1".to_owned(),
             positions: positions.clone(),
+            expected_cursor: None,
+            fence_delivery: true,
+            fetch_request_id: Some(Uuid::from_u128(8_001)),
         };
         let request_id = Uuid::from_u128(7_001);
         assert!(delivery.requires_internal_replica_authority());
@@ -3405,6 +3425,9 @@ mod tests {
                 session_epoch: 1,
                 cursor: "stale".to_owned(),
                 positions: positions.clone(),
+                expected_cursor: Some("opaque-reader-progress-1".to_owned()),
+                fence_delivery: true,
+                fetch_request_id: Some(Uuid::from_u128(8_002)),
             }])
             .await
             .is_err());
@@ -3417,6 +3440,9 @@ mod tests {
                     RangeId::from_uuid(Uuid::from_u128(9_999)),
                     "cursor-2".to_owned()
                 ),]),
+                expected_cursor: Some("opaque-reader-progress-1".to_owned()),
+                fence_delivery: true,
+                fetch_request_id: Some(Uuid::from_u128(8_003)),
             }])
             .await
             .is_err());
@@ -3431,6 +3457,119 @@ mod tests {
             .active_reader_frontier(reader.reader_id)
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn independent_reader_frontiers_fence_concurrent_and_repeated_fetches() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE READER audit FROM orders.events START AT BEGINNING; CREATE READER metrics FROM orders.events START AT BEGINNING;").await.unwrap();
+        let audit = controller.active_reader_by_name("audit").await.unwrap();
+        let metrics = controller.active_reader_by_name("metrics").await.unwrap();
+        let range_id = controller
+            .active_range_assignment(audit.feed_id)
+            .await
+            .unwrap()
+            .range_id;
+        for reader in ["audit", "metrics"] {
+            controller
+                .execute_commands(vec![Command::OpenReaderSession {
+                    reader: reader.to_owned(),
+                    capacity: 2,
+                }])
+                .await
+                .unwrap();
+        }
+        let deliver =
+            |reader: &str,
+             token: &str,
+             event: &str,
+             fetch_id: u128,
+             expected_cursor: Option<&str>| Command::RecordReaderFrontier {
+                reader: reader.to_owned(),
+                session_epoch: 1,
+                cursor: token.to_owned(),
+                positions: BTreeMap::from([(range_id, event.to_owned())]),
+                expected_cursor: expected_cursor.map(str::to_owned),
+                fence_delivery: true,
+                fetch_request_id: Some(Uuid::from_u128(fetch_id)),
+            };
+        controller
+            .execute_commands(vec![deliver("audit", "rf1_a", "event-a", 1, None)])
+            .await
+            .unwrap();
+        controller
+            .execute_commands(vec![deliver("metrics", "rf1_m", "event-m", 2, None)])
+            .await
+            .unwrap();
+        assert!(controller
+            .execute_commands(vec![deliver("audit", "rf1_stale", "event-a2", 3, None)])
+            .await
+            .is_err());
+        assert!(controller
+            .execute_commands(vec![deliver(
+                "audit",
+                "rf1_repeat",
+                "event-a2",
+                1,
+                Some("rf1_a")
+            )])
+            .await
+            .is_err());
+        assert_eq!(
+            controller
+                .active_reader_frontier(audit.reader_id)
+                .await
+                .unwrap()
+                .delivered[&range_id],
+            "event-a"
+        );
+        assert_eq!(
+            controller
+                .active_reader_frontier(metrics.reader_id)
+                .await
+                .unwrap()
+                .delivered[&range_id],
+            "event-m"
+        );
+        controller
+            .execute_commands(vec![Command::AcknowledgeReader {
+                reader: "audit".to_owned(),
+                session_epoch: 1,
+                cursor: "rf1_a".to_owned(),
+            }])
+            .await
+            .unwrap();
+        drop(controller);
+        let reopened = new_controller(&directory);
+        reopened
+            .execute_commands(vec![Command::OpenReaderSession {
+                reader: "audit".to_owned(),
+                capacity: 2,
+            }])
+            .await
+            .unwrap();
+        reopened
+            .execute_commands(vec![Command::OpenReaderSession {
+                reader: "metrics".to_owned(),
+                capacity: 2,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened
+                .active_reader_frontier(audit.reader_id)
+                .await
+                .unwrap()
+                .delivered[&range_id],
+            "event-a"
+        );
+        assert!(reopened
+            .active_reader_frontier(metrics.reader_id)
+            .await
+            .unwrap()
+            .delivered
+            .is_empty());
     }
 
     #[tokio::test]

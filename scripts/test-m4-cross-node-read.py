@@ -159,6 +159,37 @@ def main():
         })
         if status != 200 or empty["records"] or empty["delivered_cursor"] != delivered:
             raise AssertionError(f"Reader redelivered acknowledged history: {empty}")
+        second_name = f"readersecond{suffix}"
+        status, second_created = post(ingress, "/v1/admin/wcl", {
+            "script": f"CREATE READER {second_name} FROM {feed} START AT BEGINNING;"
+        })
+        if status != 200:
+            raise AssertionError(second_created)
+        status, second_open = post(ingress, "/v1/readers/open", {
+            "request_id": str(uuid.uuid4()), "reader": second_name, "capacity": 5,
+        })
+        if status != 200:
+            raise AssertionError(second_open)
+        status, second_first = post(ingress, "/v1/readers/fetch", {
+            "request_id": str(uuid.uuid4()), "reader": second_name,
+            "session_epoch": second_open["session_epoch"], "limit": 5,
+        })
+        if status != 200 or [row["cursor"] for row in second_first["records"]] != cursors[:5]:
+            raise AssertionError(f"independent Reader missed initial history: {second_first}")
+        if second_first["delivered_cursor"] == delivered:
+            raise AssertionError("independent Readers shared a progress token")
+        status, second_ack = post(ingress, "/v1/readers/ack", {
+            "request_id": str(uuid.uuid4()), "reader": second_name,
+            "session_epoch": second_open["session_epoch"], "cursor": second_first["delivered_cursor"],
+        })
+        if status != 200 or second_ack["acknowledged_cursor"] != second_first["delivered_cursor"]:
+            raise AssertionError(f"second Reader acknowledgement affected another Reader: {second_ack}")
+        status, second_next = post(reopened_ingress, "/v1/readers/fetch", {
+            "request_id": str(uuid.uuid4()), "reader": second_name,
+            "session_epoch": second_open["session_epoch"], "limit": 5,
+        })
+        if status != 200 or [row["cursor"] for row in second_next["records"]] != cursors[5:10]:
+            raise AssertionError(f"second Reader did not continue independently: {second_next}")
         status, temporary = post(ingress, "/v1/readers/temporary/fetch", {
             "feed": feed, "after": cursors[10], "limit": 100,
         })
