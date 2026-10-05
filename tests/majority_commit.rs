@@ -650,6 +650,33 @@ async fn committed_range_pages_require_the_current_owner_and_preserve_the_bounda
         .await
         .unwrap();
     assert!(exhausted.is_empty());
+    let (_, resolved, suffix) = owner
+        .read_owned_range_cursor_page(
+            &assignment,
+            Some(&fixture.request.cursor),
+            None,
+            None,
+            None,
+            32,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolved, Some(RangePosition::new(1)));
+    assert!(suffix.is_empty());
+    let (_, start, tail) = owner
+        .read_owned_range_cursor_page(&assignment, None, None, None, Some(1), 32)
+        .await
+        .unwrap();
+    assert_eq!(start, Some(RangePosition::new(0)));
+    assert_eq!(tail[0].cursor, fixture.request.cursor);
+    assert_eq!(
+        owner
+            .read_owned_range_cursor_page(&assignment, Some("unknown"), None, None, None, 32)
+            .await
+            .unwrap_err()
+            .code,
+        ReplicaAppendErrorCode::PositionConflict
+    );
     assert_eq!(
         follower
             .read_owned_range_page(&assignment, None, None)
@@ -657,6 +684,72 @@ async fn committed_range_pages_require_the_current_owner_and_preserve_the_bounda
             .unwrap_err()
             .code,
         ReplicaAppendErrorCode::NotCurrentOwner
+    );
+}
+
+#[tokio::test]
+async fn cursor_pages_continue_after_a_bounded_batch_without_rescanning_the_prefix() {
+    let fixture = Fixture::new().await;
+    let assignment = fixture
+        .control
+        .active_range_assignment(fixture.request.feed_id)
+        .await
+        .unwrap();
+    let owner = fixture.services[&assignment.owner].clone();
+    let coordinator = fixture.coordinator(&[], &[], None);
+    coordinator.append(fixture.request.clone()).await.unwrap();
+    for sequence in 2..=34_u64 {
+        let mut request = fixture.request.clone();
+        request.expected_position = RangePosition::new(sequence);
+        request.identity.sequence = sequence;
+        request.cursor = format!("cursor-{sequence}");
+        request.frame_base64 = STANDARD.encode(
+            encode_record(&StoredRecord {
+                message_id: Uuid::from_u128(700 + sequence as u128),
+                producer_id: fixture.request.identity.writer_session_id,
+                producer_sequence: sequence,
+                event_time_ns: sequence as i64,
+                ingest_time_ns: sequence as i64,
+                key: b"customer-1".to_vec(),
+                payload: Vec::new(),
+                metadata: BTreeMap::new(),
+            })
+            .unwrap(),
+        );
+        coordinator.append(request).await.unwrap();
+    }
+    let (commit, position, page) = owner
+        .read_owned_range_cursor_page(&assignment, Some("cursor-1"), None, None, None, 32)
+        .await
+        .unwrap();
+    assert_eq!(commit, CommitPosition::new(34));
+    assert_eq!(position, Some(RangePosition::new(1)));
+    assert_eq!(page.len(), 32);
+    assert_eq!(page.first().unwrap().cursor, "cursor-2");
+    assert_eq!(page.last().unwrap().cursor, "cursor-33");
+    let (_, _, next) = owner
+        .read_owned_range_cursor_page(
+            &assignment,
+            None,
+            Some(RangePosition::new(33)),
+            Some(commit),
+            None,
+            32,
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].cursor, "cursor-34");
+    let (_, tail_start, tail) = owner
+        .read_owned_range_cursor_page(&assignment, None, None, None, Some(2), 32)
+        .await
+        .unwrap();
+    assert_eq!(tail_start, Some(RangePosition::new(32)));
+    assert_eq!(
+        tail.iter()
+            .map(|frame| frame.cursor.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cursor-33", "cursor-34"]
     );
 }
 

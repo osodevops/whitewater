@@ -22,6 +22,7 @@ use super::{
 };
 
 pub const MAX_REPLICA_FRAME_BASE64_BYTES: usize = MAX_FRAME_BYTES.div_ceil(3) * 4;
+pub const MAX_COMMITTED_READ_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -537,6 +538,98 @@ impl ReplicaAppendService {
             ));
         }
         Ok((boundary, frames))
+    }
+
+    pub async fn read_owned_range_cursor_page(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        cursor: Option<&str>,
+        after: Option<RangePosition>,
+        expected_commit: Option<CommitPosition>,
+        tail_count: Option<usize>,
+        page_limit: usize,
+    ) -> Result<
+        (
+            CommitPosition,
+            Option<RangePosition>,
+            Vec<super::StoredRangeFrame>,
+        ),
+        ReplicaAppendError,
+    > {
+        if self.local_node != assignment.owner
+            || self
+                .control
+                .active_range_assignment_by_id(assignment.range_id)
+                .await
+                != Some(assignment.clone())
+        {
+            return Err(ReplicaAppendError::temporary(
+                ReplicaAppendErrorCode::NotCurrentOwner,
+                "single-range read requires the current committed Append Owner assignment",
+            ));
+        }
+        if (cursor.is_some() && after.is_some())
+            || (tail_count.is_some() && (after.is_some() || cursor.is_some()))
+        {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::InvalidFrame,
+                "Cursor, physical continuation, and tail start cannot be combined",
+            ));
+        }
+        let store = self.store_for(assignment).await?;
+        let committed = store
+            .snapshot()
+            .await
+            .map_err(map_store_error)?
+            .progress
+            .commit_position();
+        if expected_commit.is_some_and(|expected| expected > committed) {
+            return Err(ReplicaAppendError::temporary(
+                ReplicaAppendErrorCode::StorageFailure,
+                "previously committed history is unavailable on the current owner",
+            ));
+        }
+        let boundary = expected_commit.unwrap_or(committed);
+        let start = if let Some(cursor) = cursor {
+            Some(
+                store
+                    .committed_position_for_cursor(cursor)
+                    .await
+                    .map_err(map_store_error)?
+                    .filter(|position| position.value() <= boundary.value())
+                    .ok_or_else(|| {
+                        ReplicaAppendError::rejected(
+                            ReplicaAppendErrorCode::PositionConflict,
+                            "Cursor is unknown, uncommitted, or belongs to another Feed",
+                        )
+                    })?,
+            )
+        } else if let Some(count) = tail_count {
+            Some(RangePosition::new(
+                boundary.value().saturating_sub(count as u64),
+            ))
+        } else {
+            after
+        };
+        let frames = store
+            .read_committed_bounded(start, page_limit.clamp(1, 32), MAX_COMMITTED_READ_BYTES)
+            .await
+            .map_err(map_store_error)?
+            .into_iter()
+            .filter(|frame| frame.position.value() <= boundary.value())
+            .collect();
+        if self
+            .control
+            .active_range_assignment_by_id(assignment.range_id)
+            .await
+            != Some(assignment.clone())
+        {
+            return Err(ReplicaAppendError::temporary(
+                ReplicaAppendErrorCode::NotCurrentOwner,
+                "range placement changed during the committed read; retry safely",
+            ));
+        }
+        Ok((boundary, start, frames))
     }
 
     pub async fn append(

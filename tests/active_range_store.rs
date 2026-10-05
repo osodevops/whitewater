@@ -142,6 +142,125 @@ async fn uncommitted_tail_is_truncated_without_losing_committed_deduplication() 
 }
 
 #[tokio::test]
+async fn cursor_lookup_is_committed_indexed_and_survives_truncation_and_restart() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    for sequence in 1..=3 {
+        store.append(append(sequence, b"value")).await.unwrap();
+        if sequence <= 2 {
+            store
+                .commit(
+                    RangeGeneration::new(1),
+                    OwnershipEpoch::new(1),
+                    CommitPosition::new(sequence),
+                )
+                .await
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        store
+            .committed_position_for_cursor("cursor-2")
+            .await
+            .unwrap(),
+        Some(RangePosition::new(2))
+    );
+    assert_eq!(
+        store
+            .committed_position_for_cursor("cursor-3")
+            .await
+            .unwrap(),
+        None
+    );
+    store
+        .truncate_uncommitted(RangeGeneration::new(1), OwnershipEpoch::new(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .committed_position_for_cursor("cursor-3")
+            .await
+            .unwrap(),
+        None
+    );
+    store.append(append(3, b"value")).await.unwrap();
+    store
+        .commit(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            CommitPosition::new(3),
+        )
+        .await
+        .unwrap();
+    drop(store);
+    let reopened = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    assert_eq!(
+        reopened
+            .committed_position_for_cursor("cursor-2")
+            .await
+            .unwrap(),
+        Some(RangePosition::new(2))
+    );
+    let tail = reopened
+        .read_committed(Some(RangePosition::new(2)), 1)
+        .await
+        .unwrap();
+    assert_eq!(tail.len(), 1);
+    assert_eq!(tail[0].cursor, "cursor-3");
+}
+
+#[tokio::test]
+async fn committed_pages_observe_a_byte_budget_without_skipping_frames() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    store.append(append(1, b"first")).await.unwrap();
+    store.append(append(2, b"second")).await.unwrap();
+    store
+        .commit(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            CommitPosition::new(2),
+        )
+        .await
+        .unwrap();
+    let first = store.read_committed(None, 1).await.unwrap();
+    let budget = first[0].frame.len();
+    let page = store
+        .read_committed_bounded(None, 32, budget)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].cursor, "cursor-1");
+    let next = store
+        .read_committed_bounded(Some(page[0].position), 32, budget + 1)
+        .await
+        .unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].cursor, "cursor-2");
+    assert!(matches!(
+        store.read_committed_bounded(None, 32, budget - 1).await,
+        Err(ActiveRangeStoreError::ReadBudgetExceeded)
+    ));
+}
+
+#[tokio::test]
+async fn one_cursor_cannot_identify_two_positions() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    store.append(append(1, b"first")).await.unwrap();
+    let mut collision = append(2, b"second");
+    collision.cursor = "cursor-1".to_owned();
+    assert!(matches!(
+        store.append(collision).await,
+        Err(ActiveRangeStoreError::InvalidState(_))
+    ));
+    assert_eq!(
+        store.snapshot().await.unwrap().progress.appended(),
+        RangePosition::new(1)
+    );
+}
+
+#[tokio::test]
 async fn range_state_and_writer_deduplication_survive_restart() {
     let directory = TempDir::new().unwrap();
     let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();

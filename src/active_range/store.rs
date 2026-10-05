@@ -119,6 +119,8 @@ pub enum ActiveRangeStoreError {
         "replica storage capacity is exhausted: required={required} bytes, limit={limit} bytes"
     )]
     DiskCapacityExceeded { required: u64, limit: u64 },
+    #[error("committed frame exceeds the bounded read byte budget; streaming larger frames is not available")]
+    ReadBudgetExceeded,
     #[error("replica append has a position gap: expected={expected}, supplied={supplied}")]
     PositionGap {
         expected: RangePosition,
@@ -170,6 +172,12 @@ pub trait ActiveRangeStore: Send + Sync {
         after: Option<RangePosition>,
         limit: usize,
     ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError>;
+    async fn read_committed_bounded(
+        &self,
+        after: Option<RangePosition>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError>;
     async fn committed_position_for_cursor(
         &self,
         cursor: &str,
@@ -206,6 +214,7 @@ struct LoadedRange {
     persisted: PersistedRangeState,
     active_file: File,
     entries: Vec<EntryIndex>,
+    cursor_positions: HashMap<String, RangePosition>,
     deduplication: HashMap<WriterKey, DeduplicationState>,
 }
 
@@ -303,6 +312,15 @@ impl FileActiveRangeStore {
             persisted.ownership_epoch = descriptor.ownership_epoch;
         }
         let (entries, recovered_deduplication) = recover_segments(&directory, &persisted)?;
+        let cursor_positions = entries
+            .iter()
+            .map(|entry| (entry.cursor.clone(), entry.position))
+            .collect::<HashMap<_, _>>();
+        if cursor_positions.len() != entries.len() {
+            return Err(ActiveRangeStoreError::InvalidState(
+                "duplicate Cursor identity".to_owned(),
+            ));
+        }
         let recovered_position = entries.last().map_or(0, |entry| entry.position.value());
         if persisted.committed > recovered_position {
             return Err(ActiveRangeStoreError::InvalidState(format!(
@@ -323,6 +341,7 @@ impl FileActiveRangeStore {
                     persisted,
                     active_file,
                     entries,
+                    cursor_positions,
                     deduplication: recovered_deduplication,
                 }),
             }),
@@ -389,6 +408,16 @@ impl ActiveRangeStore for FileActiveRangeStore {
             .await
     }
 
+    async fn read_committed_bounded(
+        &self,
+        after: Option<RangePosition>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
+        self.blocking(move |inner| read_committed_bounded(inner, after, limit, max_bytes))
+            .await
+    }
+
     async fn committed_position_for_cursor(
         &self,
         cursor: &str,
@@ -400,12 +429,10 @@ impl ActiveRangeStore for FileActiveRangeStore {
                 .lock()
                 .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
             Ok(loaded
-                .entries
-                .iter()
-                .find(|entry| {
-                    entry.cursor == cursor && entry.position.value() <= loaded.persisted.committed
-                })
-                .map(|entry| entry.position))
+                .cursor_positions
+                .get(&cursor)
+                .copied()
+                .filter(|position| position.value() <= loaded.persisted.committed))
         })
         .await
     }
@@ -680,6 +707,11 @@ fn append(
             });
         }
     }
+    if loaded.cursor_positions.contains_key(&request.cursor) {
+        return Err(ActiveRangeStoreError::InvalidState(
+            "Cursor already belongs to another position".to_owned(),
+        ));
+    }
     let position = next_position;
     let decoded = DecodedEntry {
         position,
@@ -725,6 +757,9 @@ fn append(
         cursor: decoded.cursor.clone(),
         frame_digest,
     };
+    loaded
+        .cursor_positions
+        .insert(index.cursor.clone(), position);
     loaded.entries.push(index);
     loaded.deduplication.insert(writer_key, deduplication);
     let mut next = loaded.persisted.clone();
@@ -785,15 +820,56 @@ fn read_committed(
         .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
     let after = after.map_or(0, RangePosition::value);
     let limit = limit.clamp(1, 10_000);
+    let start = loaded
+        .entries
+        .partition_point(|entry| entry.position.value() <= after);
     loaded
         .entries
         .iter()
-        .filter(|entry| {
-            entry.position.value() > after && entry.position.value() <= loaded.persisted.committed
-        })
+        .skip(start)
+        .take_while(|entry| entry.position.value() <= loaded.persisted.committed)
         .take(limit)
         .map(|entry| read_indexed_frame(&inner.directory, entry))
         .collect()
+}
+
+fn read_committed_bounded(
+    inner: &FileActiveRangeStoreInner,
+    after: Option<RangePosition>,
+    limit: usize,
+    max_bytes: usize,
+) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
+    let loaded = inner
+        .loaded
+        .lock()
+        .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+    let start = loaded
+        .entries
+        .partition_point(|entry| entry.position.value() <= after.map_or(0, RangePosition::value));
+    let mut frames = Vec::new();
+    let mut bytes = 0_usize;
+    for entry in loaded
+        .entries
+        .iter()
+        .skip(start)
+        .take_while(|entry| entry.position.value() <= loaded.persisted.committed)
+        .take(limit.clamp(1, 128))
+    {
+        let size = usize::try_from(entry.frame_length)
+            .map_err(|_| ActiveRangeStoreError::ReadBudgetExceeded)?;
+        let next = bytes
+            .checked_add(size)
+            .ok_or(ActiveRangeStoreError::ReadBudgetExceeded)?;
+        if next > max_bytes {
+            if frames.is_empty() {
+                return Err(ActiveRangeStoreError::ReadBudgetExceeded);
+            }
+            break;
+        }
+        frames.push(read_indexed_frame(&inner.directory, entry)?);
+        bytes = next;
+    }
+    Ok(frames)
 }
 
 fn truncate_uncommitted(
@@ -826,6 +902,9 @@ fn truncate_uncommitted(
     loaded
         .entries
         .retain(|entry| entry.position.value() <= committed);
+    loaded
+        .cursor_positions
+        .retain(|_, position| position.value() <= committed);
     loaded.deduplication = deduplication_from_entries(&loaded.entries);
     let mut next = loaded.persisted.clone();
     next.appended = committed;
@@ -1263,5 +1342,73 @@ impl<'a> ByteReader<'a> {
 
     fn is_empty(&self) -> bool {
         self.position == self.bytes.len()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn seed_committed_history(root: &Path, descriptor: &ActiveRangeDescriptor, count: u64) {
+    drop(FileActiveRangeStore::open(root, descriptor.clone()).unwrap());
+    let directory = range_directory(root, descriptor);
+    let writer_session_id = Uuid::from_u128(3);
+    let mut bytes = Vec::new();
+    for sequence in 1..=count {
+        let record = StoredRecord {
+            message_id: Uuid::from_u128(100 + sequence as u128),
+            producer_id: writer_session_id,
+            producer_sequence: sequence,
+            event_time_ns: sequence as i64,
+            ingest_time_ns: sequence as i64,
+            key: b"key".to_vec(),
+            payload: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let frame = crate::codec::encode_record(&record).unwrap();
+        bytes.extend(
+            encode_entry(&DecodedEntry {
+                position: RangePosition::new(sequence),
+                identity: AppendIdentity {
+                    writer_session_id,
+                    writer_epoch: 1,
+                    sequence,
+                },
+                cursor: format!("cursor-{sequence}"),
+                frame_digest: *blake3::hash(&frame).as_bytes(),
+                message_id: record.message_id,
+                frame,
+            })
+            .unwrap(),
+        );
+    }
+    fs::write(segment_path(&directory, 0), bytes).unwrap();
+    let mut persisted = PersistedRangeState::new(descriptor);
+    persisted.appended = count;
+    persisted.flushed = count;
+    persisted.committed = count;
+    persist_state(&directory, &persisted).unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn restart_rebuilds_cursor_index_beyond_ten_thousand_records() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id: Uuid::from_u128(1),
+            range_id: RangeId::from_uuid(Uuid::from_u128(2)),
+            generation: RangeGeneration::new(1),
+            ownership_epoch: OwnershipEpoch::new(1),
+        };
+        seed_committed_history(root.path(), &descriptor, 10_001);
+        let reopened = FileActiveRangeStore::open(root.path(), descriptor).unwrap();
+        let cursor = reopened
+            .committed_position_for_cursor("cursor-10000")
+            .await
+            .unwrap();
+        assert_eq!(cursor, Some(RangePosition::new(10_000)));
+        let page = reopened.read_committed(cursor, 1).await.unwrap();
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].cursor, "cursor-10001");
     }
 }

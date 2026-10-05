@@ -38,7 +38,8 @@ use crate::{
         RepairExportRequest, RepairExportResponse, RepairFrame, ReplicaAppendRequest,
         ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitRequest, ReplicaCommitResponse,
         ReplicaProgressRequest, ReplicaProgressResponse, ReplicaReconcileRequest,
-        ReplicaReconcileResponse, StorageNodeId, StoredRangeFrame, MAX_REPLICA_FRAME_BASE64_BYTES,
+        ReplicaReconcileResponse, StorageNodeId, StoredRangeFrame, MAX_COMMITTED_READ_BYTES,
+        MAX_REPLICA_FRAME_BASE64_BYTES,
     },
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
@@ -756,6 +757,8 @@ async fn reader_fetch(
         } else {
             limit
         },
+        false,
+        timestamp_start.is_some(),
     )
     .await?;
     if let Some(timestamp) = timestamp_start {
@@ -913,7 +916,8 @@ async fn temporary_reader_fetch(
         .ok_or_else(|| ApiError::bad_request("Feed does not exist"))?;
     let limit = request.limit.unwrap_or(100).clamp(1, 10_000);
     if request.new_only {
-        let existing = read_complete_feed(&state, feed.feed_id, &feed.name, None, 10_000).await?;
+        let existing =
+            read_complete_feed(&state, feed.feed_id, &feed.name, None, 1, true, false).await?;
         return Ok(Json(TemporaryReaderFetchResponse {
             next_cursor: existing.last().map(|item| item.cursor.clone()),
             records: Vec::new(),
@@ -927,11 +931,13 @@ async fn temporary_reader_fetch(
             feed.feed_id,
             &feed.name,
             request.after.as_deref(),
-            if request.tail || after_event_time_ns.is_some() {
+            if after_event_time_ns.is_some() {
                 10_000
             } else {
                 limit
             },
+            request.tail && after_event_time_ns.is_none(),
+            after_event_time_ns.is_some(),
         )
         .await?;
         if let Some(timestamp) = after_event_time_ns {
@@ -2917,7 +2923,7 @@ async fn owner_append_local(
         .map_err(|_| ApiError::bad_request("event_time_ns must be a signed 64-bit decimal string"))?
         .unwrap_or(ingest_time_ns);
     let message_id = deterministic_uuid(request.request_id, "message");
-    let cursor = URL_SAFE_NO_PAD.encode(blake3::hash(request.request_id.as_bytes()).as_bytes());
+    let cursor = feed_cursor(feed.feed_id, request.request_id);
     let frame = encode_record(&StoredRecord {
         message_id,
         producer_id: request.writer_session_id,
@@ -2979,6 +2985,14 @@ fn writer_feedback(demand: &DemandMetrics) -> WriterServerFeedback {
     }
 }
 
+fn feed_cursor(feed_id: Uuid, request_id: Uuid) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"whitewater-feed-cursor-v2");
+    hasher.update(feed_id.as_bytes());
+    hasher.update(request_id.as_bytes());
+    URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes())
+}
+
 fn deterministic_uuid(request_id: Uuid, label: &str) -> Uuid {
     let mut bytes: [u8; 16] = blake3::hash(&[request_id.as_bytes(), label.as_bytes()].concat())
         .as_bytes()[..16]
@@ -3000,7 +3014,7 @@ fn majority_api_error(error: MajorityAppendError) -> ApiError {
     }
 }
 
-const MAX_LOGICAL_READ_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LOGICAL_READ_BYTES: usize = MAX_COMMITTED_READ_BYTES;
 const MAX_LOGICAL_READ_FRAMES: usize = 10_000;
 const MAX_LOGICAL_READ_RANGES: usize = 128;
 
@@ -3009,11 +3023,21 @@ struct ReadRangePageRequest {
     assignment: ActiveRangeAssignment,
     after: Option<RangePosition>,
     expected_commit: Option<CommitPosition>,
+    #[serde(default)]
+    after_cursor: Option<String>,
+    #[serde(default)]
+    tail_count: Option<usize>,
+    #[serde(default)]
+    single_range: bool,
+    #[serde(default)]
+    page_limit: Option<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ReadRangePageResponse {
     committed: CommitPosition,
+    #[serde(default)]
+    resolved_after: Option<RangePosition>,
     frames: Vec<RepairFrame>,
 }
 
@@ -3025,10 +3049,35 @@ async fn read_owned_range_page(
         .replica_append
         .as_ref()
         .ok_or_else(|| ApiError::unavailable("Active Range storage is not available"))?;
-    let (committed, frames) = service
-        .read_owned_range_page(&request.assignment, request.after, request.expected_commit)
-        .await
-        .map_err(|error| ApiError::unavailable(error.message))?;
+    let (committed, resolved_after, frames) = if request.single_range {
+        service
+            .read_owned_range_cursor_page(
+                &request.assignment,
+                request.after_cursor.as_deref(),
+                request.after,
+                request.expected_commit,
+                request.tail_count,
+                request.page_limit.unwrap_or(1),
+            )
+            .await
+    } else if request.after_cursor.is_some() || request.tail_count.is_some() {
+        return Err(ApiError::bad_request(
+            "Cursor and tail read modes require single-range routing",
+        ));
+    } else {
+        service
+            .read_owned_range_page(&request.assignment, request.after, request.expected_commit)
+            .await
+            .map(|(commit, frames)| (commit, request.after, frames))
+    }
+    .map_err(|error| ApiError {
+        status: if error.retryable {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_REQUEST
+        },
+        message: error.message,
+    })?;
     if frames
         .iter()
         .any(|frame| frame.frame.len() > MAX_LOGICAL_READ_BYTES)
@@ -3039,6 +3088,7 @@ async fn read_owned_range_page(
     }
     Ok(Json(ReadRangePageResponse {
         committed,
+        resolved_after,
         frames: frames
             .into_iter()
             .map(|frame| RepairFrame {
@@ -3105,6 +3155,51 @@ async fn read_placement(
     Ok(assignments)
 }
 
+async fn fetch_range_page(
+    state: &AppState,
+    request: ReadRangePageRequest,
+) -> Result<ReadRangePageResponse, ApiError> {
+    let service = state.replica_append.as_ref().ok_or_else(|| {
+        ApiError::unavailable("Active Range replica storage is not configured on this Node")
+    })?;
+    if service.local_node() == &request.assignment.owner {
+        return Ok(read_owned_range_page(State(state.clone()), Json(request))
+            .await?
+            .0);
+    }
+    let endpoint = state
+        .control_endpoints
+        .get(&request.assignment.owner)
+        .ok_or_else(|| ApiError::unavailable("current owner endpoint is unavailable"))?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("internal read credential is unavailable"))?;
+    let response = state
+        .internal_http
+        .post(format!(
+            "{}/internal/active-range/read/committed",
+            endpoint.trim_end_matches('/')
+        ))
+        .header("x-whitewater-control-key", key)
+        .json(&request)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    if response.status() == StatusCode::BAD_REQUEST {
+        return Err(ApiError::bad_request(
+            "Cursor is unknown, uncommitted, or belongs to another Feed",
+        ));
+    }
+    response
+        .error_for_status()
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .json::<ReadRangePageResponse>()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))
+}
+
 fn merge_feed_frames(
     mut frames: Vec<StoredRangeFrame>,
     after: Option<&str>,
@@ -3138,17 +3233,131 @@ fn merge_feed_frames(
         .collect())
 }
 
+#[derive(Clone, Copy)]
+struct SingleRangeReadMode {
+    tail: bool,
+    require_complete: bool,
+}
+
+async fn read_single_range(
+    state: &AppState,
+    feed_id: Uuid,
+    feed_name: &str,
+    assignment: &ActiveRangeAssignment,
+    after: Option<&str>,
+    limit: usize,
+    mode: SingleRangeReadMode,
+) -> Result<Vec<StoredRangeFrame>, ApiError> {
+    let mut frames = Vec::new();
+    let mut bytes = 0_usize;
+    let mut after_position = None;
+    let mut boundary = None;
+    let mut after_cursor = after.map(str::to_owned);
+    let limit = limit.min(MAX_LOGICAL_READ_FRAMES);
+    loop {
+        let page = fetch_range_page(
+            state,
+            ReadRangePageRequest {
+                assignment: assignment.clone(),
+                after: after_position,
+                expected_commit: boundary,
+                after_cursor: after_cursor.take(),
+                tail_count: (mode.tail && boundary.is_none()).then_some(limit),
+                single_range: true,
+                page_limit: Some(limit.saturating_sub(frames.len()).clamp(1, 32)),
+            },
+        )
+        .await?;
+        if boundary.is_some_and(|expected| expected != page.committed)
+            || mode.require_complete && page.committed.value() > MAX_LOGICAL_READ_FRAMES as u64
+        {
+            return Err(ApiError::unavailable(
+                "committed range changed or full-history scan exceeds bounded read support",
+            ));
+        }
+        boundary = Some(page.committed);
+        let start = page.resolved_after.map_or(0, RangePosition::value);
+        if start > page.committed.value() {
+            return Err(ApiError::unavailable(
+                "Cursor points beyond the committed range boundary",
+            ));
+        }
+        if limit == 0 || start == page.committed.value() {
+            break;
+        }
+        let before = frames.len();
+        let mut expected = start.saturating_add(1);
+        for frame in page.frames {
+            if frame.position.value() != expected || frame.position.value() > page.committed.value()
+            {
+                return Err(ApiError::unavailable(
+                    "current owner returned a gapped committed range",
+                ));
+            }
+            let decoded = STANDARD
+                .decode(frame.frame_base64.as_bytes())
+                .map_err(|_| {
+                    ApiError::unavailable("current owner returned an invalid frame encoding")
+                })?;
+            bytes = bytes.saturating_add(decoded.len() + frame.cursor.len());
+            if decoded.len() > MAX_LOGICAL_READ_BYTES || bytes > MAX_LOGICAL_READ_BYTES {
+                return Err(ApiError::unavailable(
+                    "Feed page exceeds the bounded read byte budget",
+                ));
+            }
+            frames.push(StoredRangeFrame {
+                position: frame.position,
+                identity: frame.identity,
+                cursor: frame.cursor,
+                frame: decoded,
+            });
+            after_position = Some(frame.position);
+            expected = expected.saturating_add(1);
+        }
+        if frames.len() == before {
+            return Err(ApiError::unavailable(
+                "current owner omitted a committed range frame",
+            ));
+        }
+        if frames.len() >= limit
+            || after_position.is_some_and(|position| position.value() >= page.committed.value())
+        {
+            break;
+        }
+    }
+    if read_placement(state, feed_id, feed_name).await? != vec![assignment.clone()] {
+        return Err(ApiError::unavailable(
+            "Feed placement changed during read; retry with the same Cursor",
+        ));
+    }
+    Ok(frames)
+}
+
 async fn read_complete_feed(
     state: &AppState,
     feed_id: Uuid,
     feed_name: &str,
     after: Option<&str>,
     limit: usize,
+    tail: bool,
+    require_complete: bool,
 ) -> Result<Vec<StoredRangeFrame>, ApiError> {
     let assignments = read_placement(state, feed_id, feed_name).await?;
-    let service = state.replica_append.as_ref().ok_or_else(|| {
-        ApiError::unavailable("Active Range replica storage is not configured on this Node")
-    })?;
+    if assignments.len() == 1 && !(tail && after.is_some()) {
+        return read_single_range(
+            state,
+            feed_id,
+            feed_name,
+            &assignments[0],
+            after,
+            limit,
+            SingleRangeReadMode {
+                tail,
+                require_complete,
+            },
+        )
+        .await;
+    }
     let mut merged = Vec::new();
     let mut bytes = 0_usize;
     for assignment in &assignments {
@@ -3159,39 +3368,12 @@ async fn read_complete_feed(
                 assignment: assignment.clone(),
                 after: after_position,
                 expected_commit: boundary,
+                after_cursor: None,
+                tail_count: None,
+                single_range: false,
+                page_limit: None,
             };
-            let page = if service.local_node() == &assignment.owner {
-                read_owned_range_page(State(state.clone()), Json(request))
-                    .await?
-                    .0
-            } else {
-                let endpoint = state
-                    .control_endpoints
-                    .get(&assignment.owner)
-                    .ok_or_else(|| {
-                        ApiError::unavailable("current owner endpoint is unavailable")
-                    })?;
-                let key = state.internal_key.as_ref().ok_or_else(|| {
-                    ApiError::unavailable("internal read credential is unavailable")
-                })?;
-                state
-                    .internal_http
-                    .post(format!(
-                        "{}/internal/active-range/read/committed",
-                        endpoint.trim_end_matches('/')
-                    ))
-                    .header("x-whitewater-control-key", key)
-                    .json(&request)
-                    .timeout(Duration::from_secs(10))
-                    .send()
-                    .await
-                    .map_err(|error| ApiError::unavailable(error.to_string()))?
-                    .error_for_status()
-                    .map_err(|error| ApiError::unavailable(error.to_string()))?
-                    .json::<ReadRangePageResponse>()
-                    .await
-                    .map_err(|error| ApiError::unavailable(error.to_string()))?
-            };
+            let page = fetch_range_page(state, request).await?;
             if boundary.is_some_and(|expected| expected != page.committed)
                 || page.committed.value() > MAX_LOGICAL_READ_FRAMES as u64
             {
@@ -3240,7 +3422,19 @@ async fn read_complete_feed(
             "Feed placement changed during read; retry with the same Cursor",
         ));
     }
-    merge_feed_frames(merged, after, limit)
+    if tail {
+        let ordered = merge_feed_frames(merged, after, MAX_LOGICAL_READ_FRAMES)?;
+        Ok(ordered
+            .into_iter()
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect())
+    } else {
+        merge_feed_frames(merged, after, limit)
+    }
 }
 
 #[derive(Deserialize)]
@@ -3267,6 +3461,8 @@ async fn read_feed_records(
         &feed.name,
         query.after.as_deref(),
         query.limit.unwrap_or(100),
+        false,
+        false,
     )
     .await?;
     frames
@@ -3682,7 +3878,12 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::{control::Command, membership::MemberAnnouncement, storage::FileLogStore};
+    use crate::{
+        active_range::{store::seed_committed_history, ActiveRangeDescriptor},
+        control::Command,
+        membership::MemberAnnouncement,
+        storage::FileLogStore,
+    };
 
     #[test]
     fn append_request_uses_metadata_and_accepts_the_prototype_header_alias() {
@@ -3755,6 +3956,25 @@ mod tests {
         assert_eq!(json["event_time_ns"], "1000000001");
         assert_eq!(json["ingest_time_ns"], "1000000002");
         assert!(json.get("timestamp_ms").is_none());
+    }
+
+    #[test]
+    fn new_feed_cursors_are_stable_within_one_feed_and_distinct_between_feeds() {
+        let request_id = Uuid::from_u128(5);
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        assert_eq!(
+            feed_cursor(first, request_id),
+            feed_cursor(first, request_id)
+        );
+        assert_ne!(
+            feed_cursor(first, request_id),
+            feed_cursor(second, request_id)
+        );
+        assert_ne!(
+            feed_cursor(first, request_id),
+            URL_SAFE_NO_PAD.encode(blake3::hash(request_id.as_bytes()).as_bytes())
+        );
     }
 
     #[test]
@@ -3880,6 +4100,130 @@ mod tests {
             .unwrap();
         assert_eq!(writer.name, "orders.writer");
         applied.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn single_range_read_continues_beyond_ten_thousand_and_reports_unsupported_full_scan() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store.clone(),
+                ["storage-1", "storage-2", "storage-3"]
+                    .into_iter()
+                    .map(|node| StorageNodeId::try_new(node).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let created = control
+            .execute_commands(vec![
+                Command::CreateSpace {
+                    name: "orders".to_owned(),
+                },
+                Command::CreateFeed {
+                    name: "orders.events".to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+        let feed_id = serde_json::from_value(created.results[1].data["feed_id"].clone()).unwrap();
+        let assignment = control.active_range_assignment(feed_id).await.unwrap();
+        let root = directory.path().join("ranges");
+        seed_committed_history(
+            &root,
+            &ActiveRangeDescriptor {
+                feed_id,
+                range_id: assignment.range_id,
+                generation: assignment.generation,
+                ownership_epoch: assignment.ownership_epoch,
+            },
+            10_001,
+        );
+        let membership = Arc::new(MembershipService::new(
+            MemberAnnouncement {
+                node_id: "test-node".to_owned(),
+                api_url: "http://test-node:7070".to_owned(),
+                capacity: 100,
+            },
+            vec![],
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        ));
+        let state = AppState {
+            store,
+            membership,
+            demand: DemandMetrics::default(),
+            autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+            replica_append: Some(Arc::new(ReplicaAppendService::new(
+                root,
+                assignment.owner.clone(),
+                control.clone(),
+            ))),
+            control,
+            control_plane: None,
+            majority_append: None,
+            storage_node_id: Some(assignment.owner),
+            control_endpoints: Arc::new(BTreeMap::new()),
+            internal_key: None,
+            internal_http: reqwest::Client::new(),
+            admin_auth: AdminAuthenticator::new(Some(
+                "this-is-a-long-development-api-key".to_owned(),
+            ))
+            .unwrap(),
+        };
+        let first = read_complete_feed(&state, feed_id, "orders.events", None, 100, false, false)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 100);
+        assert_eq!(first[0].cursor, "cursor-1");
+        assert_eq!(first[99].cursor, "cursor-100");
+        let continued = read_complete_feed(
+            &state,
+            feed_id,
+            "orders.events",
+            Some("cursor-10000"),
+            100,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(continued.len(), 1);
+        assert_eq!(continued[0].cursor, "cursor-10001");
+        let tail = read_complete_feed(&state, feed_id, "orders.events", None, 2, true, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            tail.iter()
+                .map(|frame| frame.cursor.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cursor-10000", "cursor-10001"]
+        );
+        assert_eq!(
+            read_complete_feed(
+                &state,
+                feed_id,
+                "orders.events",
+                Some("unknown"),
+                1,
+                false,
+                false
+            )
+            .await
+            .unwrap_err()
+            .status,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            read_complete_feed(&state, feed_id, "orders.events", None, 10_000, false, true)
+                .await
+                .unwrap_err()
+                .status,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     fn admin_test_router(directory: &TempDir) -> Router {

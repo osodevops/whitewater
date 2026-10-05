@@ -38,7 +38,7 @@ pub use repair::{
 pub use replication::{
     ReplicaAppendAccepted, ReplicaAppendError, ReplicaAppendErrorCode, ReplicaAppendRequest,
     ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest,
-    ReplicaCommitResponse, MAX_REPLICA_FRAME_BASE64_BYTES,
+    ReplicaCommitResponse, MAX_COMMITTED_READ_BYTES, MAX_REPLICA_FRAME_BASE64_BYTES,
 };
 pub use routing::{KeyRange, KeyToken, RangeMap, RangeMapError, RangeRoute};
 pub use split::{

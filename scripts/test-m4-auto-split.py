@@ -24,12 +24,20 @@ def main():
         split_started = False
         for value in range(30):
             request = {"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": epoch, "event_time_ns": str(value), "key_base64": base64.b64encode(f"key-{value}".encode()).decode(), "payload_base64": "dg==", "metadata_base64": {}}
-            status, result = post(ENDPOINTS[value % 3], "/v1/writers/append", request)
-            if status != 200:
+            for _ in range(20):
+                status, result = post(ENDPOINTS[value % 3], "/v1/writers/append", request)
+                if status == 200:
+                    break
                 if "frozen for split cutover" in result.get("error", ""):
                     split_started = True
                     break
-                raise AssertionError(result)
+                if status != 503:
+                    raise AssertionError(result)
+                time.sleep(0.1)
+            else:
+                raise AssertionError(f"stable Writer request did not resolve after retry: {result}")
+            if split_started:
+                break
             time.sleep(0.1)
         placement = None
         for _ in range(40):
