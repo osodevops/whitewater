@@ -612,8 +612,8 @@ Definition of Done:
 - [x] Implement signed nanosecond timestamp starts/seeks for persistent and temporary Readers.
 - [x] Add bounded exponential reconnect/backoff for stateless Reader fetches and pressure-aware capacity feedback for persistent sessions.
 - [~] Fence concurrent named Reader deliveries and ambiguous duplicate fetch request IDs rather than returning a different page under the same progress token; the prototype now fails closed but does not replay an identical prior fetch response.
-- [ ] Move per-Reader delivered/acknowledged progress and bounded fetch-result deduplication to a ReaderId-sharded RF3 data-plane journal/checkpoint, leaving only Reader definitions and shard placement in the Control Plane; prove epoch fencing, resource bounds, restart and scale-in drain.
-- [ ] Prove independent progress, slow-Reader isolation and attributable CPU/memory/egress with many concurrent Readers and fault/load evidence; no industrial-scale claim from the current single-catalog prototype.
+- [~] Move per-Reader delivered/acknowledged progress and bounded fetch-result deduplication to a ReaderId-sharded RF3 data-plane journal/checkpoint, leaving only Reader definitions and shard placement in the Control Plane. A local transactional Fjall prototype keyed by ReaderId now proves fencing, one bounded retry receipt, independent ack, and restart; it is not replicated, selected as the production engine, or wired to Reader HTTP requests. RF3 ownership, journal/checkpoint recovery, fault-tested cutover, and scale-in drain remain.
+- [~] Build measured per-Reader consumption pacing: a pure bounded policy now slows on replica unavailability, high acknowledgement latency, unacknowledged-byte pressure or Node pressure, and raises credits only after sustained healthy backlog. It is not yet connected to live Reader metrics or API scheduling. Prove independent progress, slow-Reader isolation and attributable CPU/memory/egress with many concurrent Readers and fault/load evidence; no industrial-scale claim from the current single-catalog prototype.
 
 Evidence:
 
@@ -623,6 +623,8 @@ Evidence:
 - Typed Rust `ReaderSessionClient` uses the same open/fetch/ack/close API.
 - `python scripts/test-m3-reader-session.py` majority-commits Writer records, delivers two under capacity, acknowledges, reopens through another Node, resumes with the remaining record, rejects the stale session, starts a temporary Reader at end-of-Feed, waits for a new record, and tails the last two records.
 - `ControlController` rejects stale concurrent frontier writes and repeated fetch identities for each Reader independently. A fetch verifies that the committed request result matches its expected frontier; if an ambiguous retry would return another page, it returns retryable failure rather than misreporting progress. Identical fetch-response replay remains to be implemented outside the global Control Plane. The isolated four-Node cross-Node read suite now checks two independent named Readers on the same Feed.
+- `FjallReaderProgressStore` is an isolated one-keyspace local prototype: `ReaderId`-keyed rows atomically persist an epoch-fenced delivered/acknowledged frontier and bounded last-page Cursor receipt. Unit tests cover two independent Readers, identical and conflicting retries, stale epochs, unacknowledged replay after restart, and size refusal without advancement. It is not RF3 or a live HTTP path.
+- `ReaderPacingController` is a pure per-Reader policy with tests for slow-Reader isolation, hysteretic credit increases, rapid decreases on pressure, byte/capacity limits and replica-outage delay. It has no live metrics or automatic API feedback integration yet.
 
 Definition of Done:
 
