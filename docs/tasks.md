@@ -738,7 +738,9 @@ Definition of Done:
 
 ## Milestone 7 — Subscriptions, Pipes, and atomic effects
 
-- [ ] Implement durable Subscription progress.
+- [x] Declare Space-scoped Subscriptions by logical name and source Feed through typed Control Plane commands and WCL, idempotently across snapshots; `stage=declared` does not allow clients to join or acknowledge. Tests prove a declaration creates no internal/public Feed and refuses cross-Space sources or unsafe Feed drop.
+- [ ] Implement durable Subscription progress in hidden, ReaderId/SubscriptionId-sharded RF3 internal state and mutation journals, not Kafka-style internal Feeds; persist separate expiring member leases, retry identities, and acknowledged frontiers without per-fetch Control Plane writes.
+- [ ] Implement transaction/effect coordinator state in separately bounded and RF3-replicated internal storage, not an application-visible Feed; do not claim atomic consume-and-append from local Fjall transactions.
 - [ ] Implement epoch-fenced small-range leases.
 - [ ] Implement incremental lease transfer.
 - [ ] Implement Pipe definitions.

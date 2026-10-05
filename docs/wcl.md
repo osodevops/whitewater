@@ -13,8 +13,8 @@ Current limitations:
 - Multi-statement scripts commit one successful statement at a time through the Control Plane; they are not atomic control transactions yet.
 - Namespace grants can be created and explained but are not enforced until API-key principals are implemented.
 - `DROP FEED` tombstones catalog metadata and does not purge stored history.
-- Writer and Reader definitions are logical resources; runtime sessions are not implemented yet.
-- Named Reader Cursors are replicated Control Plane metadata; runtime Reader sessions and Subscription leases are not implemented yet.
+- Writer and Reader definitions are logical resources; prototype Writer and Reader sessions exist over the authenticated API.
+- Named Reader Cursors are replicated Control Plane metadata; Subscription definitions are metadata-only (`stage=declared`), with shared progress and member leases still unimplemented.
 - WCL-created Feeds use immutable FeedId-based physical storage names, so rename does not move files.
 
 Every response includes:
@@ -143,6 +143,16 @@ CREATE READER recovery
 
 Every Reader has independent durable prototype progress.
 
+### Subscription declaration
+
+```sql
+CREATE SUBSCRIPTION orders.billing
+  FROM orders.created
+  START AT BEGINNING;
+```
+
+A Subscription belongs to the same Space as its Feed. It currently remains `declared`: it does not create an internal Feed, permit joining members, or establish shared Cursor progress yet. Existing named Readers remain independent and are not silently converted into shared Subscriptions.
+
 ### Role
 
 ```sql
@@ -208,6 +218,7 @@ SHOW SPACES;
 SHOW FEEDS;
 SHOW WRITERS;
 SHOW READERS;
+SHOW SUBSCRIPTIONS;
 SHOW ROLES;
 SHOW GRANTS;
 ```
@@ -221,6 +232,7 @@ DESCRIBE SPACE orders;
 DESCRIBE FEED orders.created;
 DESCRIBE WRITER checkout;
 DESCRIBE READER audit;
+DESCRIBE SUBSCRIPTION orders.billing;
 DESCRIBE ROLE orderanalytics;
 ```
 
@@ -248,6 +260,7 @@ Other logical identities can also be renamed:
 ```sql
 RENAME WRITER checkout TO checkoutapi;
 RENAME READER audit TO complianceaudit;
+RENAME SUBSCRIPTION orders.billing TO orders.billingapi;
 RENAME ROLE orderanalytics TO businessanalytics;
 ```
 
@@ -278,6 +291,7 @@ Seeking one Reader does not affect another Reader.
 
 ```sql
 DROP READER audit;
+DROP SUBSCRIPTION orders.billing;
 DROP WRITER checkout;
 DROP FEED orders.created;
 DROP ROLE orderanalytics;

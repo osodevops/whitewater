@@ -16,6 +16,17 @@ def main():
     status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SPACE {space}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer}; CREATE READER {reader} FROM {feed} START AT BEGINNING;"})
     if status != 200: raise AssertionError(setup)
     writer_epoch = setup["results"][3]["data"]["session_epoch"]
+    subscription = f"{space}.billing"
+    status, before = post(ENDPOINTS[1], "/v1/admin/wcl", {"script": "SHOW FEEDS;"})
+    if status != 200: raise AssertionError(before)
+    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {subscription} FROM {feed};"})
+    if status != 200 or declared["results"][0]["data"]["stage"] != "declared": raise AssertionError(declared)
+    status, after = post(ENDPOINTS[2], "/v1/admin/wcl", {"script": "SHOW FEEDS;"})
+    if status != 200 or {row["feed_id"] for row in after["results"][0]["data"]} != {row["feed_id"] for row in before["results"][0]["data"]}: raise AssertionError("Subscription created an application-visible Feed")
+    status, described = post(ENDPOINTS[2], "/v1/admin/wcl", {"script": f"DESCRIBE SUBSCRIPTION {subscription};"})
+    if status != 200 or described["results"][0]["data"]["subscription_id"] != declared["results"][0]["data"]["subscription_id"]: raise AssertionError(described)
+    status, unsupported = post(ENDPOINTS[2], "/v1/readers/open", {"request_id": str(uuid.uuid4()), "reader": subscription, "capacity": 1})
+    if status == 200: raise AssertionError(f"declared Subscription unexpectedly allowed a Reader session: {unsupported}")
     records = [{"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": writer_epoch, "event_time_ns": str(index), "key_base64": "aw==", "payload_base64": "dg==", "metadata_base64": {}} for index in range(1, 4)]
     status, batch = post(ENDPOINTS[1], "/v1/writers/append-batch", {"records": records})
     if status != 200 or len(batch["results"]) != 3: raise AssertionError(batch)

@@ -23,7 +23,7 @@ Same-Feed/same-Key accepted order is guaranteed; there is no total order across 
 | Admin | Typed commands and WCL converge on the authenticated Control API; request-ID retry returns the original result. | Typed Rust AdminClient and Control Plane available. |
 | Writer | Stable request ID, WriterId and session epoch, per-Key order, idempotent append/batch, original MessageId/Cursor on identical retry, explicit ambiguous errors. | HTTP and Rust WriterSessionClient foundation available. |
 | Reader | Open/fetch/ack/seek/close; delivered is distinct from acknowledged; Cursors remain opaque; bounded capacity and retry-safe ack. | HTTP and Rust ReaderSessionClient foundation available; bounded cross-Node reads fetch missing range owners; single-range Feeds seek deep Cursors and named Readers starting at Beginning have a Control Plane-backed multi-range progress frontier. Temporary/public Feed reads and split/merge frontier translation remain bounded or incomplete. |
-| Subscription | Shared durable acknowledged progress, capacity-aware small epoch-fenced leases, independent progress per Subscription, bounded redelivery. | Planned. |
+| Subscription | One public durable name within a Space; cooperating member sessions share acknowledged progress and small epoch-fenced work leases, while distinct Subscriptions remain independent. | Space-scoped definitions are `declared` in the Control Plane; joining, shared progress, and leases are not implemented. |
 | StateStore | Named primary-Key get and bounded secondary lookup from any Node, freshness/version evidence, no local Fjall directory in application containers. | Only local Fjall prototype and declared metadata. |
 | Pipe / processing effect | Read input, look up versioned state, produce Whitewater output and atomically record input progress with stable effect identity; explicit missing/lagging-state policy. | Planned. |
 
@@ -59,6 +59,12 @@ A Writer's record-attached Cursor identifies one committed event; it does **not*
 For named Readers starting at Beginning, a prototype versioned `delivered_cursor` now references a Control Plane-persisted per-range delivery frontier; acknowledgement copies that frontier to durable acknowledged progress. Records still carry their own Writer-compatible record Cursors. On reopen, the Reader starts from acknowledged progress, so no client manages ranges or a global sequencer. Movement with unchanged range identities works in the isolated four-Node acceptance test. The frontier is internal catalog state, not fields in public Reader definitions.
 
 This is not yet the general solution: a split/merge invalidates frontier topology and fails closed until verified translation exists; old record-Cursor seeks and timestamp starts still use bounded scans; temporary Reader and public Feed-read pagination still have bounded multi-range histories. The prototype fences competing deliveries and refuses a repeated fetch ID that could return a different page; it does not yet replay the exact original fetch response. Retention expiry, page cost, concurrent-append/clock-skew fault evidence, and SDK capability negotiation also remain. None should be reported as shipped parity across all six SDKs.
+
+### Public identity and internal state (partially implemented)
+
+A Subscription's Space-scoped name is the intended single durable identity for an application processing independently or for several cooperating workers. Member sessions/leases remain separate, short-lived and fenced; they are not another user-configured `group.id`. Existing named Reader definitions still operate independently and must be migrated one-to-one without changing their acknowledged progress or silently joining them into a shared Subscription. `CREATE SUBSCRIPTION` currently records `stage=declared` only; it does not open a member session.
+
+Do not create application-visible Feeds or Kafka-like internal topics for Subscription progress, leases, deduplication, or transaction/effect coordinator state. Whitewater may use a small fixed set of internal Fjall keyspaces plus an RF3 internal mutation protocol, checkpoints and recovery; a Fjall-local WAL/transaction is not cross-Node durability and does not atomically commit the separate Feed append. No live replicated progress or transaction coordinator is implemented yet.
 
 ### Industrial multi-Reader gate (not implemented)
 

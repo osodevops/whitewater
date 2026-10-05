@@ -96,6 +96,8 @@ curl -X POST http://localhost:7071/v1/admin/wcl \
 
 `POST /v1/control/execute` remains an authenticated compatibility alias during the prototype and should not be used by new clients.
 
+`CREATE SUBSCRIPTION orders.billing FROM orders.created;` or the typed `create_subscription` command declares one logical Subscription in the same Space as its source Feed. `SHOW SUBSCRIPTIONS`, `DESCRIBE SUBSCRIPTION`, rename and safe drop operate on its metadata; the result has `stage=declared`. No member can join it yet, no shared Cursor or lease is persisted, and no internal/public Feed is created for offsets or transaction decisions. Continue using existing named Reader sessions for working consumption until Subscription delivery is implemented.
+
 ## Execute typed commands
 
 Clients do not need to generate WCL text. They can submit typed JSON commands directly:

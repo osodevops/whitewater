@@ -52,6 +52,52 @@ async fn placement(controller: &ControlController) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn subscription_definition_survives_catalog_snapshot_without_creating_a_feed() {
+    let source_dir = TempDir::new().unwrap();
+    let follower_dir = TempDir::new().unwrap();
+    let nodes = storage_nodes(&["storage-1", "storage-2", "storage-3"]);
+    let source = controller(&source_dir, nodes.clone());
+    let follower = controller(&follower_dir, nodes);
+    create_feed(&source, Uuid::from_u128(9_001)).await;
+    let defined = source
+        .execute("CREATE SUBSCRIPTION orders.billing FROM orders.created;")
+        .await
+        .unwrap();
+    assert_eq!(defined.results[0].data["stage"], "declared");
+    let subscription = source
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    assert_eq!(
+        subscription.feed_id,
+        source
+            .active_feed_by_name("orders.created")
+            .await
+            .unwrap()
+            .feed_id
+    );
+    let feeds = source.execute("SHOW FEEDS;").await.unwrap();
+    assert_eq!(feeds.results[0].data.as_array().unwrap().len(), 1);
+    follower
+        .install_snapshot_bytes(&source.snapshot_bytes().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        follower.active_subscription_by_name("orders.billing").await,
+        Some(subscription)
+    );
+    assert!(follower.execute("DROP FEED orders.created;").await.is_err());
+    follower
+        .execute("DROP SUBSCRIPTION orders.billing; DROP FEED orders.created;")
+        .await
+        .unwrap();
+    assert!(follower
+        .active_subscription_by_name("orders.billing")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
 async fn replicated_feed_creation_produces_one_identical_rf3_assignment_on_every_voter() {
     let directories = [
         TempDir::new().unwrap(),

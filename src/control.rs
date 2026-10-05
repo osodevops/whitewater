@@ -125,6 +125,24 @@ pub struct ReaderDefinition {
     pub created_at_ns: i64,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionStage {
+    Declared,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscriptionDefinition {
+    pub subscription_id: Uuid,
+    pub name: String,
+    pub space_id: Uuid,
+    pub feed_id: Uuid,
+    pub start: ReaderStart,
+    pub stage: SubscriptionStage,
+    pub status: ResourceStatus,
+    pub created_at_ns: i64,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct ReaderFrontier {
     pub acknowledged: BTreeMap<RangeId, String>,
@@ -255,6 +273,8 @@ struct CatalogState {
     writers: BTreeMap<Uuid, WriterDefinition>,
     readers: BTreeMap<Uuid, ReaderDefinition>,
     #[serde(default)]
+    subscriptions: BTreeMap<Uuid, SubscriptionDefinition>,
+    #[serde(default)]
     reader_frontiers: BTreeMap<Uuid, ReaderFrontier>,
     roles: BTreeMap<Uuid, RoleDefinition>,
     grants: BTreeMap<Uuid, NamespaceGrant>,
@@ -303,6 +323,7 @@ impl Default for CatalogState {
             state_stores: BTreeMap::new(),
             writers: BTreeMap::new(),
             readers: BTreeMap::new(),
+            subscriptions: BTreeMap::new(),
             reader_frontiers: BTreeMap::new(),
             roles: BTreeMap::new(),
             grants: BTreeMap::new(),
@@ -327,6 +348,7 @@ pub enum ResourceKind {
     Feed,
     Writer,
     Reader,
+    Subscription,
     Role,
 }
 
@@ -337,6 +359,7 @@ pub enum ShowKind {
     Feeds,
     Writers,
     Readers,
+    Subscriptions,
     Roles,
     Grants,
 }
@@ -375,6 +398,11 @@ pub enum Command {
         session_epoch: u64,
     },
     CreateReader {
+        name: String,
+        feed: String,
+        start: ReaderStart,
+    },
+    CreateSubscription {
         name: String,
         feed: String,
         start: ReaderStart,
@@ -894,6 +922,16 @@ impl ControlController {
             .cloned()
     }
 
+    pub async fn active_subscription_by_name(&self, name: &str) -> Option<SubscriptionDefinition> {
+        self.state
+            .lock()
+            .await
+            .subscriptions
+            .values()
+            .find(|item| item.name == name && item.status == ResourceStatus::Active)
+            .cloned()
+    }
+
     pub(crate) async fn active_reader_frontier(&self, reader_id: Uuid) -> Option<ReaderFrontier> {
         let state = self.state.lock().await;
         state
@@ -1342,6 +1380,43 @@ impl ControlController {
                     .readers
                     .insert(definition.reader_id, definition.clone());
                 Ok((format!("created Reader {name}"), json!(definition)))
+            }
+            Command::CreateSubscription { name, feed, start } => {
+                validate_dotted_name(&name)?;
+                ensure_name_available(
+                    state
+                        .subscriptions
+                        .values()
+                        .map(|item| (&item.name, &item.status)),
+                    &name,
+                )?;
+                let space_id = owning_space(state, &name)?.space_id;
+                let feed_id = {
+                    let source = active_feed(state, &feed)?;
+                    if source.space_id != space_id {
+                        return Err(ControlError::InvalidOperation(
+                            "Subscription and source Feed must belong to the same Space".to_owned(),
+                        ));
+                    }
+                    source.feed_id
+                };
+                let definition = SubscriptionDefinition {
+                    subscription_id: derived_resource_id(request_id, "subscription"),
+                    name: name.clone(),
+                    space_id,
+                    feed_id,
+                    start,
+                    stage: SubscriptionStage::Declared,
+                    status: ResourceStatus::Active,
+                    created_at_ns: issued_at_ns,
+                };
+                state
+                    .subscriptions
+                    .insert(definition.subscription_id, definition.clone());
+                Ok((
+                    format!("declared Subscription {name}; shared consumption is not active"),
+                    json!(definition),
+                ))
             }
             Command::OpenReaderSession { reader, capacity } => {
                 if capacity == 0 || capacity > 10_000 {
@@ -2343,6 +2418,18 @@ impl ControlController {
                     new,
                 )?;
                 let new_space_id = owning_space(state, new)?.space_id;
+                let existing = active_feed(state, current)?;
+                if new_space_id != existing.space_id
+                    && state.subscriptions.values().any(|subscription| {
+                        subscription.status == ResourceStatus::Active
+                            && subscription.feed_id == existing.feed_id
+                    })
+                {
+                    return Err(ControlError::InvalidOperation(
+                        "drop attached Subscriptions before moving a Feed to another Space"
+                            .to_owned(),
+                    ));
+                }
                 let item = active_feed_mut(state, current)?;
                 item.name = new.to_owned();
                 item.space_id = new_space_id;
@@ -2373,6 +2460,20 @@ impl ControlController {
             }
             ResourceKind::Writer => rename_named(&mut state.writers, current, new, "Writer"),
             ResourceKind::Reader => rename_named(&mut state.readers, current, new, "Reader"),
+            ResourceKind::Subscription => {
+                let existing_space = state
+                    .subscriptions
+                    .values()
+                    .find(|item| item.name == current && item.status == ResourceStatus::Active)
+                    .ok_or_else(|| ControlError::NotFound(format!("Subscription {current}")))?
+                    .space_id;
+                if owning_space(state, new)?.space_id != existing_space {
+                    return Err(ControlError::InvalidOperation(
+                        "Subscription cannot be renamed across Spaces".to_owned(),
+                    ));
+                }
+                rename_named(&mut state.subscriptions, current, new, "Subscription")
+            }
             ResourceKind::Role => rename_named(&mut state.roles, current, new, "Role"),
         }
     }
@@ -2393,9 +2494,12 @@ impl ControlController {
                     || state.readers.values().any(|item| {
                         item.status == ResourceStatus::Active && item.feed_id == feed_id
                     })
+                    || state.subscriptions.values().any(|item| {
+                        item.status == ResourceStatus::Active && item.feed_id == feed_id
+                    })
                 {
                     return Err(ControlError::InvalidOperation(
-                        "drop attached Writers and Readers first".to_owned(),
+                        "drop attached Writers, Readers, and Subscriptions first".to_owned(),
                     ));
                 }
                 let item = state.feeds.get_mut(&feed_id).expect("Feed exists");
@@ -2411,9 +2515,12 @@ impl ControlController {
                     .feeds
                     .values()
                     .any(|item| item.status == ResourceStatus::Active && item.space_id == space_id)
+                    || state.subscriptions.values().any(|item| {
+                        item.status == ResourceStatus::Active && item.space_id == space_id
+                    })
                 {
                     return Err(ControlError::InvalidOperation(
-                        "drop child Feeds before dropping a Space".to_owned(),
+                        "drop child Feeds and Subscriptions before dropping a Space".to_owned(),
                     ));
                 }
                 let item = state.spaces.get_mut(&space_id).expect("Space exists");
@@ -2426,6 +2533,9 @@ impl ControlController {
                 let result = drop_named(&mut state.readers, name, "Reader")?;
                 state.reader_frontiers.remove(&reader_id);
                 Ok(result)
+            }
+            ResourceKind::Subscription => {
+                drop_named(&mut state.subscriptions, name, "Subscription")
             }
             ResourceKind::Role => {
                 let role_id = active_role(state, name)?.role_id;
@@ -2541,7 +2651,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                     feed: token(&tokens, 4)?.to_owned(),
                 })
             }
-            Some("READER") => {
+            Some("READER") | Some("SUBSCRIPTION") => {
                 expect_keyword(&tokens, 3, "FROM")?;
                 let start = if tokens.len() == 5 {
                     ReaderStart::Beginning
@@ -2550,14 +2660,16 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                     expect_keyword(&tokens, 6, "AT")?;
                     parse_reader_start(&tokens, 7)?
                 };
-                Ok(Command::CreateReader {
-                    name: token(&tokens, 2)?.to_owned(),
-                    feed: token(&tokens, 4)?.to_owned(),
-                    start,
-                })
+                let name = token(&tokens, 2)?.to_owned();
+                let feed = token(&tokens, 4)?.to_owned();
+                if keyword(1).as_deref() == Some("SUBSCRIPTION") {
+                    Ok(Command::CreateSubscription { name, feed, start })
+                } else {
+                    Ok(Command::CreateReader { name, feed, start })
+                }
             }
             _ => Err(ControlError::Syntax(
-                "CREATE supports SPACE, FEED, WRITER, READER, and ROLE".to_owned(),
+                "CREATE supports SPACE, FEED, WRITER, READER, SUBSCRIPTION, and ROLE".to_owned(),
             )),
         },
         Some("OPEN") => {
@@ -2716,6 +2828,7 @@ fn parse_resource_kind(token: &str) -> Result<ResourceKind, ControlError> {
         "FEED" => Ok(ResourceKind::Feed),
         "WRITER" => Ok(ResourceKind::Writer),
         "READER" => Ok(ResourceKind::Reader),
+        "SUBSCRIPTION" => Ok(ResourceKind::Subscription),
         "ROLE" => Ok(ResourceKind::Role),
         _ => Err(ControlError::Syntax(format!(
             "unsupported resource type {token}"
@@ -2729,6 +2842,7 @@ fn parse_show_kind(token: &str) -> Result<ShowKind, ControlError> {
         "FEEDS" => Ok(ShowKind::Feeds),
         "WRITERS" => Ok(ShowKind::Writers),
         "READERS" => Ok(ShowKind::Readers),
+        "SUBSCRIPTIONS" => Ok(ShowKind::Subscriptions),
         "ROLES" => Ok(ShowKind::Roles),
         "GRANTS" => Ok(ShowKind::Grants),
         _ => Err(ControlError::Syntax(format!(
@@ -2986,6 +3100,7 @@ macro_rules! impl_named_resource {
 
 impl_named_resource!(WriterDefinition);
 impl_named_resource!(ReaderDefinition);
+impl_named_resource!(SubscriptionDefinition);
 impl_named_resource!(RoleDefinition);
 
 fn rename_named<T: Clone + Serialize + NamedResource>(
@@ -3046,6 +3161,11 @@ fn show_resources(state: &CatalogState, kind: ShowKind) -> Value {
             .values()
             .filter(|item| item.status == ResourceStatus::Active)
             .collect::<Vec<_>>()),
+        ShowKind::Subscriptions => json!(state
+            .subscriptions
+            .values()
+            .filter(|item| item.status == ResourceStatus::Active)
+            .collect::<Vec<_>>()),
         ShowKind::Roles => json!(state
             .roles
             .values()
@@ -3075,6 +3195,12 @@ fn describe_resource(
             .find(|item| item.name == name && item.status == ResourceStatus::Active)
             .map(|item| json!(item))
             .ok_or_else(|| ControlError::NotFound(format!("Reader {name}"))),
+        ResourceKind::Subscription => state
+            .subscriptions
+            .values()
+            .find(|item| item.name == name && item.status == ResourceStatus::Active)
+            .map(|item| json!(item))
+            .ok_or_else(|| ControlError::NotFound(format!("Subscription {name}"))),
         ResourceKind::Role => Ok(json!(active_role(state, name)?)),
     }
 }
@@ -3130,6 +3256,7 @@ fn command_label(command: &Command) -> String {
         Command::AllocateWriterRangeSequence { .. } => "ALLOCATE WRITER RANGE SEQUENCE",
         Command::RevokeWriterSession { .. } => "REVOKE WRITER SESSION",
         Command::CreateReader { .. } => "CREATE READER",
+        Command::CreateSubscription { .. } => "CREATE SUBSCRIPTION",
         Command::OpenReaderSession { .. } => "OPEN READER SESSION",
         Command::RecordReaderDelivery { .. } => "RECORD READER DELIVERY",
         Command::RecordReaderFrontier { .. } => "RECORD READER FRONTIER",
@@ -3170,6 +3297,7 @@ fn resource_name(kind: &ResourceKind) -> &'static str {
         ResourceKind::Feed => "Feed",
         ResourceKind::Writer => "Writer",
         ResourceKind::Reader => "Reader",
+        ResourceKind::Subscription => "Subscription",
         ResourceKind::Role => "Role",
     }
 }
@@ -3180,6 +3308,7 @@ fn show_name(kind: &ShowKind) -> &'static str {
         ShowKind::Feeds => "Feeds",
         ShowKind::Writers => "Writers",
         ShowKind::Readers => "Readers",
+        ShowKind::Subscriptions => "Subscriptions",
         ShowKind::Roles => "Roles",
         ShowKind::Grants => "Grants",
     }
@@ -3739,6 +3868,99 @@ mod tests {
                 .source,
             StateStoreSource::Manual,
         );
+    }
+
+    #[tokio::test]
+    async fn subscription_definitions_are_scoped_idempotent_and_keep_feeds_unchanged() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller.execute("CREATE SPACE accounts; CREATE FEED accounts.users; CREATE SPACE other; CREATE FEED other.events;").await.unwrap();
+        let request_id = Uuid::from_u128(77_001);
+        let command = Command::CreateSubscription {
+            name: "accounts.billing".to_owned(),
+            feed: "accounts.users".to_owned(),
+            start: ReaderStart::Beginning,
+        };
+        let first = controller
+            .execute_commands_with_request_id(vec![command.clone()], request_id)
+            .await
+            .unwrap();
+        let retry = controller
+            .execute_commands_with_request_id(vec![command], request_id)
+            .await
+            .unwrap();
+        assert_eq!(first.results[0].data, retry.results[0].data);
+        assert_eq!(first.results[0].data["stage"], "declared");
+        let definition = controller
+            .active_subscription_by_name("accounts.billing")
+            .await
+            .unwrap();
+        assert_eq!(
+            definition.space_id,
+            controller
+                .state
+                .lock()
+                .await
+                .spaces
+                .values()
+                .find(|space| space.name == "accounts")
+                .unwrap()
+                .space_id
+        );
+        assert_eq!(
+            definition.feed_id,
+            controller
+                .active_feed_by_name("accounts.users")
+                .await
+                .unwrap()
+                .feed_id
+        );
+        assert!(controller
+            .execute_commands(vec![Command::CreateSubscription {
+                name: "accounts.billing".to_owned(),
+                feed: "accounts.users".to_owned(),
+                start: ReaderStart::Beginning,
+            }])
+            .await
+            .is_err());
+        assert!(controller
+            .execute_commands(vec![Command::CreateSubscription {
+                name: "accounts.crossspace".to_owned(),
+                feed: "other.events".to_owned(),
+                start: ReaderStart::Beginning,
+            }])
+            .await
+            .is_err());
+        assert!(controller
+            .execute("DROP FEED accounts.users;")
+            .await
+            .is_err());
+        assert!(controller
+            .execute("RENAME SUBSCRIPTION accounts.billing TO other.billing;")
+            .await
+            .is_err());
+        let feeds = controller.execute("SHOW FEEDS;").await.unwrap();
+        assert_eq!(feeds.results[0].data.as_array().unwrap().len(), 2);
+        let subscriptions = controller.execute("SHOW SUBSCRIPTIONS;").await.unwrap();
+        assert_eq!(subscriptions.results[0].data.as_array().unwrap().len(), 1);
+        assert!(controller.state.lock().await.reader_frontiers.is_empty());
+        drop(controller);
+        let reopened = new_controller(&directory);
+        assert_eq!(
+            reopened
+                .active_subscription_by_name("accounts.billing")
+                .await
+                .unwrap(),
+            definition
+        );
+        reopened
+            .execute("DROP SUBSCRIPTION accounts.billing; DROP FEED accounts.users;")
+            .await
+            .unwrap();
+        assert!(reopened
+            .active_subscription_by_name("accounts.billing")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
