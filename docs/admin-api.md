@@ -54,7 +54,7 @@ Production must supply a generated secret through the orchestrator or secret man
 
 ## Replicated Feed records
 
-Append through any Node with `POST /v1/feeds/append`. Read majority-committed records through any current replica:
+Append through any Node with `POST /v1/feeds/append`. Read majority-committed records through any current ingress Node, even if some current ranges are owned elsewhere:
 
 ```http
 GET /v1/feeds/records?feed=orders.events&limit=100
@@ -68,7 +68,7 @@ GET /v1/feeds/records?feed=orders.events&after=<cursor>&limit=100
 Authorization: Bearer <api-key>
 ```
 
-Only records at or below the local durable CommitPosition are returned. A Cursor that is unknown, uncommitted, or belongs to another Feed is rejected rather than exposing an uncommitted tail.
+The ingress retrieves each current range from its Append Owner over authenticated internal HTTP, merges committed frames, and checks placement again before returning; an unavailable/stale owner or incomplete placement fails as retryable rather than returning a partial Feed. An unknown, uncommitted, or wrong-Feed Cursor is rejected. This prototype scans bounded committed prefixes (at most 10,000 records per range and per Feed, 16 MiB total, 128 ranges); it fails closed when the budget is exceeded. Scalable long-history Cursor indexing, efficient pagination, and production inter-Node mTLS remain planned.
 
 ## Execute WCL
 

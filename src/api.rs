@@ -38,7 +38,7 @@ use crate::{
         RepairExportRequest, RepairExportResponse, RepairFrame, ReplicaAppendRequest,
         ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitRequest, ReplicaCommitResponse,
         ReplicaProgressRequest, ReplicaProgressResponse, ReplicaReconcileRequest,
-        ReplicaReconcileResponse, StorageNodeId, MAX_REPLICA_FRAME_BASE64_BYTES,
+        ReplicaReconcileResponse, StorageNodeId, StoredRangeFrame, MAX_REPLICA_FRAME_BASE64_BYTES,
     },
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
@@ -172,6 +172,12 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             authorize_replica_append,
         ));
+    let read_range_route = post(read_owned_range_page)
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
     Router::new()
         .route("/health", get(health))
         .route("/v1/streams", get(list_streams).post(create_stream))
@@ -270,6 +276,7 @@ pub fn router(state: AppState) -> Router {
             "/internal/active-range/owner-move/unfreeze",
             owner_move_unfreeze_route,
         )
+        .route("/internal/active-range/read/committed", read_range_route)
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
         .route(
@@ -725,10 +732,11 @@ async fn reader_fetch(
     if !reader.session_active || reader.session_epoch != request.session_epoch {
         return Err(ApiError::bad_request("Reader session is stale or inactive"));
     }
-    let service = state
-        .replica_append
-        .as_ref()
-        .ok_or_else(|| ApiError::unavailable("replica storage is unavailable"))?;
+    let feed = state
+        .control
+        .active_feed_by_id(reader.feed_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Reader Feed is not applied on this Node"))?;
     let limit = request
         .limit
         .unwrap_or(reader.session_capacity)
@@ -738,18 +746,18 @@ async fn reader_fetch(
         (crate::control::ReaderStart::Timestamp(value), None) => Some(*value),
         _ => None,
     };
-    let mut frames = service
-        .read_committed(
-            reader.feed_id,
-            reader.delivered_cursor.as_deref(),
-            if timestamp_start.is_some() {
-                10_000
-            } else {
-                limit
-            },
-        )
-        .await
-        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    let mut frames = read_complete_feed(
+        &state,
+        reader.feed_id,
+        &feed.name,
+        reader.delivered_cursor.as_deref(),
+        if timestamp_start.is_some() {
+            10_000
+        } else {
+            limit
+        },
+    )
+    .await?;
     if let Some(timestamp) = timestamp_start {
         frames.retain(|item| {
             decode_record(&item.frame)
@@ -903,16 +911,9 @@ async fn temporary_reader_fetch(
         .active_feed_by_name(&request.feed)
         .await
         .ok_or_else(|| ApiError::bad_request("Feed does not exist"))?;
-    let service = state
-        .replica_append
-        .as_ref()
-        .ok_or_else(|| ApiError::unavailable("replica storage is unavailable"))?;
     let limit = request.limit.unwrap_or(100).clamp(1, 10_000);
     if request.new_only {
-        let existing = service
-            .read_committed(feed.feed_id, None, 10_000)
-            .await
-            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        let existing = read_complete_feed(&state, feed.feed_id, &feed.name, None, 10_000).await?;
         return Ok(Json(TemporaryReaderFetchResponse {
             next_cursor: existing.last().map(|item| item.cursor.clone()),
             records: Vec::new(),
@@ -921,18 +922,18 @@ async fn temporary_reader_fetch(
     let deadline = tokio::time::Instant::now()
         + Duration::from_millis(request.wait_ms.unwrap_or(0).min(30_000));
     loop {
-        let mut frames = service
-            .read_committed(
-                feed.feed_id,
-                request.after.as_deref(),
-                if request.tail || after_event_time_ns.is_some() {
-                    10_000
-                } else {
-                    limit
-                },
-            )
-            .await
-            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        let mut frames = read_complete_feed(
+            &state,
+            feed.feed_id,
+            &feed.name,
+            request.after.as_deref(),
+            if request.tail || after_event_time_ns.is_some() {
+                10_000
+            } else {
+                limit
+            },
+        )
+        .await?;
         if let Some(timestamp) = after_event_time_ns {
             frames.retain(|item| {
                 decode_record(&item.frame)
@@ -2661,6 +2662,24 @@ async fn writer_batch_append(
     }))
 }
 
+async fn feed_when_applied(
+    control: &ControlController,
+    name: &str,
+    wait_for_replication: bool,
+) -> Option<crate::control::FeedDefinition> {
+    let mut feed = control.active_feed_by_name(name).await;
+    if feed.is_none() && wait_for_replication {
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            feed = control.active_feed_by_name(name).await;
+            if feed.is_some() {
+                break;
+            }
+        }
+    }
+    feed
+}
+
 async fn writer_when_applied(
     control: &ControlController,
     name: &str,
@@ -2851,11 +2870,18 @@ async fn owner_append_local(
     state: &AppState,
     request: ClientAppendRequest,
 ) -> Result<WriterAppendResponse, ApiError> {
-    let feed = state
-        .control
-        .active_feed_by_name(&request.feed)
+    let feed = feed_when_applied(&state.control, &request.feed, state.control_plane.is_some())
         .await
-        .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", request.feed)))?;
+        .ok_or_else(|| {
+            if state.control_plane.is_some() {
+                ApiError::unavailable(format!(
+                    "Feed {} is not available on this Append Owner; verify it exists or retry with the same request ID",
+                    request.feed
+                ))
+            } else {
+                ApiError::bad_request(format!("Feed does not exist: {}", request.feed))
+            }
+        })?;
     let routing_key = decode_base64("key_base64", &request.key_base64)?;
     if routing_key.is_empty() {
         return Err(ApiError::bad_request(
@@ -2974,6 +3000,249 @@ fn majority_api_error(error: MajorityAppendError) -> ApiError {
     }
 }
 
+const MAX_LOGICAL_READ_BYTES: usize = 16 * 1024 * 1024;
+const MAX_LOGICAL_READ_FRAMES: usize = 10_000;
+const MAX_LOGICAL_READ_RANGES: usize = 128;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReadRangePageRequest {
+    assignment: ActiveRangeAssignment,
+    after: Option<RangePosition>,
+    expected_commit: Option<CommitPosition>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReadRangePageResponse {
+    committed: CommitPosition,
+    frames: Vec<RepairFrame>,
+}
+
+async fn read_owned_range_page(
+    State(state): State<AppState>,
+    Json(request): Json<ReadRangePageRequest>,
+) -> Result<Json<ReadRangePageResponse>, ApiError> {
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Active Range storage is not available"))?;
+    let (committed, frames) = service
+        .read_owned_range_page(&request.assignment, request.after, request.expected_commit)
+        .await
+        .map_err(|error| ApiError::unavailable(error.message))?;
+    if frames
+        .iter()
+        .any(|frame| frame.frame.len() > MAX_LOGICAL_READ_BYTES)
+    {
+        return Err(ApiError::unavailable(
+            "record exceeds the bounded Feed read byte budget",
+        ));
+    }
+    Ok(Json(ReadRangePageResponse {
+        committed,
+        frames: frames
+            .into_iter()
+            .map(|frame| RepairFrame {
+                position: frame.position,
+                identity: frame.identity,
+                cursor: frame.cursor,
+                frame_base64: STANDARD.encode(frame.frame),
+            })
+            .collect(),
+    }))
+}
+
+async fn read_placement(
+    state: &AppState,
+    feed_id: Uuid,
+    feed_name: &str,
+) -> Result<Vec<ActiveRangeAssignment>, ApiError> {
+    let (routes, assignments): (Vec<RangeId>, Vec<ActiveRangeAssignment>) =
+        if let Some(control_plane) = &state.control_plane {
+            let execution = control_plane
+                .execute_commands(vec![crate::control::Command::InspectPlacement {
+                    feed: feed_name.to_owned(),
+                }])
+                .await
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            let data = &execution.results[0].data;
+            let routes = data["range_map"]["routes"]
+                .as_array()
+                .ok_or_else(|| ApiError::unavailable("Control Plane RangeMap is unavailable"))?
+                .iter()
+                .map(|route| serde_json::from_value(route["range_id"].clone()))
+                .collect::<Result<_, _>>()
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            let assignments = serde_json::from_value(data["range_assignments"].clone())
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            (routes, assignments)
+        } else {
+            let map = state
+                .control
+                .active_range_map(feed_id)
+                .await
+                .ok_or_else(|| ApiError::unavailable("Feed RangeMap is unavailable"))?;
+            let routes = map.routes().iter().map(|route| route.range_id).collect();
+            let assignments = state
+                .control
+                .active_range_assignments_for_feed(feed_id)
+                .await;
+            (routes, assignments)
+        };
+    if routes.is_empty()
+        || routes.len() > MAX_LOGICAL_READ_RANGES
+        || routes.len() != assignments.len()
+        || routes
+            .iter()
+            .zip(&assignments)
+            .any(|(range_id, assignment)| {
+                *range_id != assignment.range_id || assignment.feed_id != feed_id
+            })
+    {
+        return Err(ApiError::unavailable(
+            "complete current Feed placement is unavailable or exceeds the bounded read limit",
+        ));
+    }
+    Ok(assignments)
+}
+
+fn merge_feed_frames(
+    mut frames: Vec<StoredRangeFrame>,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Vec<StoredRangeFrame>, ApiError> {
+    let mut ordered = frames
+        .iter()
+        .map(|item| {
+            decode_record(&item.frame)
+                .map(|record| (record.ingest_time_ns, record.message_id))
+                .map_err(|error| ApiError::unavailable(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut indexed = frames.drain(..).zip(ordered.drain(..)).collect::<Vec<_>>();
+    indexed.sort_by_key(|(_, order)| *order);
+    let start = match after {
+        Some(cursor) => indexed
+            .iter()
+            .position(|(item, _)| item.cursor == cursor)
+            .map(|index| index + 1)
+            .ok_or_else(|| {
+                ApiError::bad_request("Cursor is unknown, uncommitted, or belongs to another Feed")
+            })?,
+        None => 0,
+    };
+    Ok(indexed
+        .into_iter()
+        .skip(start)
+        .take(limit.min(MAX_LOGICAL_READ_FRAMES))
+        .map(|(frame, _)| frame)
+        .collect())
+}
+
+async fn read_complete_feed(
+    state: &AppState,
+    feed_id: Uuid,
+    feed_name: &str,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Vec<StoredRangeFrame>, ApiError> {
+    let assignments = read_placement(state, feed_id, feed_name).await?;
+    let service = state.replica_append.as_ref().ok_or_else(|| {
+        ApiError::unavailable("Active Range replica storage is not configured on this Node")
+    })?;
+    let mut merged = Vec::new();
+    let mut bytes = 0_usize;
+    for assignment in &assignments {
+        let mut after_position = None;
+        let mut boundary = None;
+        loop {
+            let request = ReadRangePageRequest {
+                assignment: assignment.clone(),
+                after: after_position,
+                expected_commit: boundary,
+            };
+            let page = if service.local_node() == &assignment.owner {
+                read_owned_range_page(State(state.clone()), Json(request))
+                    .await?
+                    .0
+            } else {
+                let endpoint = state
+                    .control_endpoints
+                    .get(&assignment.owner)
+                    .ok_or_else(|| {
+                        ApiError::unavailable("current owner endpoint is unavailable")
+                    })?;
+                let key = state.internal_key.as_ref().ok_or_else(|| {
+                    ApiError::unavailable("internal read credential is unavailable")
+                })?;
+                state
+                    .internal_http
+                    .post(format!(
+                        "{}/internal/active-range/read/committed",
+                        endpoint.trim_end_matches('/')
+                    ))
+                    .header("x-whitewater-control-key", key)
+                    .json(&request)
+                    .timeout(Duration::from_secs(10))
+                    .send()
+                    .await
+                    .map_err(|error| ApiError::unavailable(error.to_string()))?
+                    .error_for_status()
+                    .map_err(|error| ApiError::unavailable(error.to_string()))?
+                    .json::<ReadRangePageResponse>()
+                    .await
+                    .map_err(|error| ApiError::unavailable(error.to_string()))?
+            };
+            if boundary.is_some_and(|expected| expected != page.committed)
+                || page.committed.value() > MAX_LOGICAL_READ_FRAMES as u64
+            {
+                return Err(ApiError::unavailable(
+                    "committed range boundary changed or exceeds bounded Feed reads",
+                ));
+            }
+            boundary = Some(page.committed);
+            if after_position.map_or(0, RangePosition::value) >= page.committed.value() {
+                break;
+            }
+            let frame = page.frames.into_iter().next().ok_or_else(|| {
+                ApiError::unavailable("current owner omitted a committed range frame")
+            })?;
+            let next = after_position.map_or(1, |position: RangePosition| {
+                position.value().saturating_add(1)
+            });
+            if frame.position.value() != next || frame.position.value() > page.committed.value() {
+                return Err(ApiError::unavailable(
+                    "current owner returned a gapped committed range",
+                ));
+            }
+            let decoded = STANDARD
+                .decode(frame.frame_base64.as_bytes())
+                .map_err(|_| {
+                    ApiError::unavailable("current owner returned an invalid frame encoding")
+                })?;
+            bytes = bytes.saturating_add(decoded.len() + frame.cursor.len());
+            if decoded.len() > MAX_LOGICAL_READ_BYTES
+                || bytes > MAX_LOGICAL_READ_BYTES
+                || merged.len() >= MAX_LOGICAL_READ_FRAMES
+            {
+                return Err(ApiError::unavailable("Feed history exceeds the bounded read budget; scalable continuation is not available"));
+            }
+            merged.push(StoredRangeFrame {
+                position: frame.position,
+                identity: frame.identity,
+                cursor: frame.cursor,
+                frame: decoded,
+            });
+            after_position = Some(frame.position);
+        }
+    }
+    if read_placement(state, feed_id, feed_name).await? != assignments {
+        return Err(ApiError::unavailable(
+            "Feed placement changed during read; retry with the same Cursor",
+        ));
+    }
+    merge_feed_frames(merged, after, limit)
+}
+
 #[derive(Deserialize)]
 struct FeedReadQuery {
     feed: String,
@@ -2992,24 +3261,14 @@ async fn read_feed_records(
         .active_feed_by_name(&query.feed)
         .await
         .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", query.feed)))?;
-    let service = state.replica_append.as_ref().ok_or_else(|| {
-        ApiError::unavailable("Active Range replica storage is not configured on this Node")
-    })?;
-    let frames = service
-        .read_committed(
-            feed.feed_id,
-            query.after.as_deref(),
-            query.limit.unwrap_or(100),
-        )
-        .await
-        .map_err(|error| ApiError {
-            status: if error.retryable {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
-                StatusCode::BAD_REQUEST
-            },
-            message: error.message,
-        })?;
+    let frames = read_complete_feed(
+        &state,
+        feed.feed_id,
+        &feed.name,
+        query.after.as_deref(),
+        query.limit.unwrap_or(100),
+    )
+    .await?;
     frames
         .into_iter()
         .map(|item| {
@@ -3498,6 +3757,86 @@ mod tests {
         assert!(json.get("timestamp_ms").is_none());
     }
 
+    #[test]
+    fn complete_feed_merge_orders_remote_frames_and_continues_from_opaque_cursor() {
+        let frame = |index: u64, ingest: i64| StoredRangeFrame {
+            position: RangePosition::new(index),
+            identity: AppendIdentity {
+                writer_session_id: Uuid::from_u128(1),
+                writer_epoch: 1,
+                sequence: index,
+            },
+            cursor: format!("cursor-{index}"),
+            frame: encode_record(&StoredRecord {
+                message_id: Uuid::from_u128(index as u128),
+                producer_id: Uuid::from_u128(1),
+                producer_sequence: index,
+                event_time_ns: ingest,
+                ingest_time_ns: ingest,
+                key: b"user".to_vec(),
+                payload: Vec::new(),
+                metadata: BTreeMap::new(),
+            })
+            .unwrap(),
+        };
+        let frames = vec![frame(3, 3), frame(1, 1), frame(2, 2)];
+        let resumed = merge_feed_frames(frames.clone(), Some("cursor-1"), 2).unwrap();
+        assert_eq!(
+            resumed
+                .iter()
+                .map(|frame| frame.cursor.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cursor-2", "cursor-3"]
+        );
+        assert_eq!(
+            merge_feed_frames(frames, Some("missing"), 2)
+                .unwrap_err()
+                .status,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn append_owner_waits_for_committed_feed_metadata_to_apply() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store,
+                ["storage-1", "storage-2", "storage-3"]
+                    .into_iter()
+                    .map(|node| StorageNodeId::try_new(node).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        assert!(feed_when_applied(&control, "orders.events", false)
+            .await
+            .is_none());
+        let delayed = control.clone();
+        let applied = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            delayed
+                .execute_commands(vec![
+                    Command::CreateSpace {
+                        name: "orders".to_owned(),
+                    },
+                    Command::CreateFeed {
+                        name: "orders.events".to_owned(),
+                    },
+                ])
+                .await
+                .unwrap();
+        });
+        let feed = feed_when_applied(&control, "orders.events", true)
+            .await
+            .unwrap();
+        assert_eq!(feed.name, "orders.events");
+        applied.await.unwrap();
+    }
+
     #[tokio::test]
     async fn writer_lookup_waits_for_committed_metadata_to_apply_on_ingress() {
         let directory = TempDir::new().unwrap();
@@ -3702,7 +4041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn movement_transport_authenticates_before_decoding_requests() {
+    async fn internal_range_transport_authenticates_before_decoding_requests() {
         let directory = TempDir::new().unwrap();
         let (app, control_plane) = internal_replica_test_router(&directory).await;
         for path in [
@@ -3714,6 +4053,7 @@ mod tests {
             "/internal/active-range/owner-move/freeze",
             "/internal/active-range/owner-move/verify",
             "/internal/active-range/owner-move/unfreeze",
+            "/internal/active-range/read/committed",
         ] {
             let request = |credential: Option<&str>| {
                 let mut builder = Request::builder()

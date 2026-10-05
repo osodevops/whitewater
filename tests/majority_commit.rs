@@ -10,8 +10,8 @@ use finnstream::{
         repair_replica, AppendIdentity, CommitPosition, MajorityAppendCoordinator,
         MajorityAppendErrorCode, OwnerMoveControl, OwnerMoveError, OwnerMoveEvidence,
         OwnerMoveExecutor, OwnershipEpoch, RangeGeneration, RangePosition, ReplicaAppendAccepted,
-        ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest,
-        ReplicaTransport, ReplicaTransportError, StorageNodeId,
+        ReplicaAppendErrorCode, ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitAccepted,
+        ReplicaCommitRequest, ReplicaTransport, ReplicaTransportError, StorageNodeId,
     },
     codec::encode_record,
     control::{Command, ControlController, RangeOwnerMovePlan},
@@ -614,6 +614,49 @@ async fn owner_move_rejects_a_caught_up_follower_with_different_bytes() {
         !target
             .generation_is_frozen(original.range_id, original.generation)
             .await
+    );
+}
+
+#[tokio::test]
+async fn committed_range_pages_require_the_current_owner_and_preserve_the_boundary() {
+    let fixture = Fixture::new().await;
+    let assignment = fixture
+        .control
+        .active_range_assignment(fixture.request.feed_id)
+        .await
+        .unwrap();
+    let owner = fixture.services[&assignment.owner].clone();
+    let follower = fixture.services[&StorageNodeId::try_new("storage-2").unwrap()].clone();
+    let (empty_boundary, empty) = owner
+        .read_owned_range_page(&assignment, None, None)
+        .await
+        .unwrap();
+    assert_eq!(empty_boundary, CommitPosition::new(0));
+    assert!(empty.is_empty());
+    fixture
+        .coordinator(&[], &[], None)
+        .append(fixture.request.clone())
+        .await
+        .unwrap();
+    let (boundary, page) = owner
+        .read_owned_range_page(&assignment, None, None)
+        .await
+        .unwrap();
+    assert_eq!(boundary, CommitPosition::new(1));
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].cursor, fixture.request.cursor);
+    let (_, exhausted) = owner
+        .read_owned_range_page(&assignment, Some(RangePosition::new(1)), Some(boundary))
+        .await
+        .unwrap();
+    assert!(exhausted.is_empty());
+    assert_eq!(
+        follower
+            .read_owned_range_page(&assignment, None, None)
+            .await
+            .unwrap_err()
+            .code,
+        ReplicaAppendErrorCode::NotCurrentOwner
     );
 }
 

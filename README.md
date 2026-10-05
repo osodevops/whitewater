@@ -30,7 +30,7 @@ This repository contains a replicated streaming correctness foundation, internal
 - Consensus-persisted fixed RF3 Active Range placement with epoch-fenced ownership and authenticated inspection
 - Authenticated bounded internal replica append protocol with exact-frame durability, checksum validation, position fencing, and structured rejection
 - Owner-side concurrent RF3 replication with two-of-three durable frame and CommitPosition evidence before success
-- Topology-free committed-only Feed reads with stateless opaque Cursor continuation
+- Topology-free bounded committed Feed reads with authenticated cross-Node owner retrieval and opaque Cursor continuation; long-history pagination is not yet scalable
 - Automatic sustained owner-failure recovery with authenticated progress collection, consensus epoch transfer, stale-owner fencing, committed-prefix preservation, and tail truncation
 - Automatic restarted-replica catch-up with bounded exact-frame transfer, checksum verification, deduplication rebuild, corruption quarantine, and readiness gating
 - Development-only authenticated Append Owner movement after verified frozen-boundary catch-up, with isolated three-Node live acceptance; production inter-Node mTLS and drain remain unfinished
@@ -218,10 +218,11 @@ python scripts/test-m4-live-split.py
 python scripts/test-m4-auto-split.py
 docker compose stop
 python scripts/test-m4-follower-move.py
+python scripts/test-m4-cross-node-read.py
 python scripts/test-m4-owner-move.py
 ```
 
-The M1.11 suite runs M1.7, M1.9, and M1.10 and restarts the isolated Fabric; auto-split force-recreates it with test thresholds and restores defaults. Both movement scripts start and stop their own projects without deleting volumes. `docker compose stop` above only stops the isolated verification Fabric. Never point these scripts at a Fabric containing user data.
+The M1.11 suite runs M1.7, M1.9, and M1.10 and restarts the isolated Fabric; auto-split force-recreates it with test thresholds and restores defaults. The M4 movement and cross-Node read scripts start and stop their own projects without deleting volumes. `docker compose stop` above only stops the isolated verification Fabric. Never point these scripts at a Fabric containing user data.
 
 Without a host Rust toolchain:
 

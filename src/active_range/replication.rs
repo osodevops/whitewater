@@ -484,6 +484,61 @@ impl ReplicaAppendService {
         Ok(merged.into_iter().skip(start).take(limit).collect())
     }
 
+    pub async fn read_owned_range_page(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        after: Option<RangePosition>,
+        expected_commit: Option<CommitPosition>,
+    ) -> Result<(CommitPosition, Vec<super::StoredRangeFrame>), ReplicaAppendError> {
+        if self.local_node != assignment.owner
+            || self
+                .control
+                .active_range_assignment_by_id(assignment.range_id)
+                .await
+                != Some(assignment.clone())
+        {
+            return Err(ReplicaAppendError::temporary(
+                ReplicaAppendErrorCode::NotCurrentOwner,
+                "range read requires the current committed Append Owner assignment",
+            ));
+        }
+        let store = self.store_for(assignment).await?;
+        let committed = store
+            .snapshot()
+            .await
+            .map_err(map_store_error)?
+            .progress
+            .commit_position();
+        if committed.value() > 10_000
+            || expected_commit.is_some_and(|expected| expected > committed)
+        {
+            return Err(ReplicaAppendError::temporary(
+                ReplicaAppendErrorCode::StorageFailure,
+                "range exceeds the bounded 10,000-record read or lost its committed prefix",
+            ));
+        }
+        let boundary = expected_commit.unwrap_or(committed);
+        let frames = store
+            .read_committed(after, 1)
+            .await
+            .map_err(map_store_error)?
+            .into_iter()
+            .filter(|frame| frame.position.value() <= boundary.value())
+            .collect();
+        if self
+            .control
+            .active_range_assignment_by_id(assignment.range_id)
+            .await
+            != Some(assignment.clone())
+        {
+            return Err(ReplicaAppendError::temporary(
+                ReplicaAppendErrorCode::NotCurrentOwner,
+                "range placement changed during the committed read; retry safely",
+            ));
+        }
+        Ok((boundary, frames))
+    }
+
     pub async fn append(
         &self,
         request: ReplicaAppendRequest,
@@ -731,7 +786,7 @@ fn require_all_assignments_locally(
         return Err(ReplicaAppendError::temporary(
             ReplicaAppendErrorCode::ReceiverNotReplica,
             format!(
-                "Node {local} does not have Active Range {}; complete Feed reads require another fully caught-up Node until cross-Node reads are supported",
+                "Node {local} does not have Active Range {}; local-only reads require every assigned range, so use the topology-free Feed read API for cross-Node retrieval",
                 missing.range_id
             ),
         ));
