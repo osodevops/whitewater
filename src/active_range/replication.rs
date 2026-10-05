@@ -139,6 +139,7 @@ pub struct ReplicaAppendService {
     local_node: StorageNodeId,
     control: Arc<ControlController>,
     stores: Arc<RwLock<HashMap<(RangeId, RangeGeneration), FileActiveRangeStore>>>,
+    store_open_gate: Arc<Mutex<()>>,
     frozen_generations: Arc<RwLock<HashSet<(RangeId, RangeGeneration)>>>,
     append_gate: Arc<Mutex<()>>,
 }
@@ -154,6 +155,7 @@ impl ReplicaAppendService {
             local_node,
             control,
             stores: Arc::new(RwLock::new(HashMap::new())),
+            store_open_gate: Arc::new(Mutex::new(())),
             frozen_generations: Arc::new(RwLock::new(HashSet::new())),
             append_gate: Arc::new(Mutex::new(())),
         }
@@ -266,6 +268,17 @@ impl ReplicaAppendService {
         self.store_for(assignment)
             .await?
             .commit(assignment.generation, assignment.ownership_epoch, position)
+            .await
+            .map_err(map_store_error)
+    }
+
+    pub async fn truncate_uncommitted_for_assignment(
+        &self,
+        assignment: &ActiveRangeAssignment,
+    ) -> Result<u64, ReplicaAppendError> {
+        self.store_for(assignment)
+            .await?
+            .truncate_uncommitted(assignment.generation, assignment.ownership_epoch)
             .await
             .map_err(map_store_error)
     }
@@ -692,6 +705,11 @@ impl ReplicaAppendService {
         assignment: &ActiveRangeAssignment,
     ) -> Result<FileActiveRangeStore, ReplicaAppendError> {
         let store_key = (assignment.range_id, assignment.generation);
+        if let Some(store) = self.stores.read().await.get(&store_key).cloned() {
+            synchronize_store_epoch(&store, assignment).await?;
+            return Ok(store);
+        }
+        let _open_guard = self.store_open_gate.lock().await;
         if let Some(store) = self.stores.read().await.get(&store_key).cloned() {
             synchronize_store_epoch(&store, assignment).await?;
             return Ok(store);

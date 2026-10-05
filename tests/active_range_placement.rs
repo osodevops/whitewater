@@ -326,6 +326,14 @@ async fn follower_move_keeps_rf3_until_verified_replacement_and_survives_snapsho
         new_assignment["replicas"]
     );
     assert_eq!(placement(&restarted).await["ownership_epoch"], 2);
+    assert_eq!(
+        restarted
+            .completed_follower_move(range_id)
+            .await
+            .unwrap()
+            .plan_id,
+        plan_id
+    );
 }
 
 #[tokio::test]

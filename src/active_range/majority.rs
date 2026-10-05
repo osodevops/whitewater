@@ -143,8 +143,16 @@ impl MajorityAppendCoordinator {
         self.local
             .freeze_generation(source.range_id, source.generation)
             .await;
-        match self.local.recovery_status_for_assignment(source).await {
-            Ok(status) => Ok(status.committed),
+        let result = async {
+            let status = self.local.recovery_status_for_assignment(source).await?;
+            self.local
+                .truncate_uncommitted_for_assignment(source)
+                .await?;
+            Ok::<_, super::ReplicaAppendError>(status.committed)
+        }
+        .await;
+        match result {
+            Ok(commit) => Ok(commit),
             Err(error) => {
                 self.local
                     .unfreeze_generation(source.range_id, source.generation)

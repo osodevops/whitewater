@@ -616,8 +616,36 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
             .await
             .unwrap();
     }
-    let records = target.read_committed(feed_id, None, 10).await.unwrap();
-    assert_eq!(records.len(), 5);
+    for sequence in 6..=11_u64 {
+        let mut record = next_record.clone();
+        record.message_id = Uuid::from_u128(900 + sequence as u128);
+        record.producer_sequence = sequence;
+        record.event_time_ns = sequence as i64;
+        record.ingest_time_ns = sequence as i64;
+        record.payload = format!("event-{sequence}").into_bytes();
+        let mut request = next_request.clone();
+        request.expected_position = RangePosition::new(sequence);
+        request.identity.sequence = sequence;
+        request.cursor = format!("cursor-{sequence}");
+        request.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+        for node in current.replicas.iter() {
+            let accepted = services[node].append(request.clone()).await.unwrap();
+            services[node]
+                .commit(ReplicaCommitRequest {
+                    feed_id,
+                    range_id: current.range_id,
+                    generation: current.generation,
+                    ownership_epoch: current.ownership_epoch,
+                    append_owner: current.owner.clone(),
+                    commit_position: CommitPosition::new(sequence),
+                    frame_digest: accepted.frame_digest,
+                })
+                .await
+                .unwrap();
+        }
+    }
+    let records = target.read_committed(feed_id, None, 20).await.unwrap();
+    assert_eq!(records.len(), 11);
     assert_eq!(records[3].cursor, "cursor-4");
     assert_eq!(records[4].cursor, "cursor-5");
     assert_eq!(
@@ -629,12 +657,10 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
         node("storage-4"),
         control,
     );
-    assert_eq!(
-        restarted
-            .read_committed(feed_id, None, 10)
-            .await
-            .unwrap()
-            .len(),
-        5
+    let (frames, status) = tokio::join!(
+        restarted.read_committed(feed_id, None, 20),
+        restarted.recovery_status_for_assignment(&current),
     );
+    assert_eq!(frames.unwrap().len(), 11);
+    assert_eq!(status.unwrap().committed, CommitPosition::new(11));
 }

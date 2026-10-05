@@ -217,6 +217,8 @@ struct CatalogState {
     #[serde(default)]
     range_move_plans: BTreeMap<RangeId, RangeMovePlan>,
     #[serde(default)]
+    completed_move_plans: BTreeMap<RangeId, RangeMovePlan>,
+    #[serde(default)]
     applied_requests: BTreeMap<Uuid, ReplicatedCommandResult>,
 }
 
@@ -250,6 +252,7 @@ impl Default for CatalogState {
             range_split_plans: BTreeMap::new(),
             range_merge_plans: BTreeMap::new(),
             range_move_plans: BTreeMap::new(),
+            completed_move_plans: BTreeMap::new(),
             applied_requests: BTreeMap::new(),
         }
     }
@@ -849,6 +852,24 @@ impl ControlController {
             .lock()
             .await
             .range_assignments
+            .get(&range_id)
+            .cloned()
+    }
+
+    pub async fn follower_move_plan(&self, range_id: RangeId) -> Option<RangeMovePlan> {
+        self.state
+            .lock()
+            .await
+            .range_move_plans
+            .get(&range_id)
+            .cloned()
+    }
+
+    pub async fn completed_follower_move(&self, range_id: RangeId) -> Option<RangeMovePlan> {
+        self.state
+            .lock()
+            .await
+            .completed_move_plans
             .get(&range_id)
             .cloned()
     }
@@ -1823,6 +1844,7 @@ impl ControlController {
                     target_commit: None,
                     checksum_verified: false,
                 };
+                state.completed_move_plans.remove(&range_id);
                 state.range_move_plans.insert(range_id, plan.clone());
                 Ok((
                     format!("prepared follower move for Feed {feed}"),
@@ -1891,7 +1913,7 @@ impl ControlController {
                             .to_owned(),
                     ));
                 }
-                let updated = plan.candidate_assignment;
+                let updated = plan.candidate_assignment.clone();
                 state
                     .range_assignments
                     .insert(updated.range_id, updated.clone());
@@ -1904,6 +1926,7 @@ impl ControlController {
                     state.active_ranges.insert(feed_id, updated.clone());
                 }
                 state.range_move_plans.remove(&updated.range_id);
+                state.completed_move_plans.insert(updated.range_id, plan);
                 Ok((
                     format!("activated follower move for Feed {feed}"),
                     json!(updated),

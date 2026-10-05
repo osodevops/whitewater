@@ -245,6 +245,52 @@ async fn follower_move_freeze_drains_majority_append_and_rejects_new_writes() {
 }
 
 #[tokio::test]
+async fn follower_move_freeze_discards_only_the_uncommitted_owner_tail() {
+    let fixture = Fixture::new().await;
+    let owner = fixture.coordinator(&["storage-2", "storage-3"], &[], None);
+    assert_eq!(
+        owner
+            .append(fixture.request.clone())
+            .await
+            .unwrap_err()
+            .code,
+        MajorityAppendErrorCode::NoDurableMajority
+    );
+    let assignment = fixture
+        .control
+        .active_range_assignment(fixture.request.feed_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        owner
+            .next_position(assignment.feed_id, assignment.range_id)
+            .await
+            .unwrap()
+            .value(),
+        2
+    );
+    assert_eq!(
+        owner
+            .freeze_for_follower_move(&assignment)
+            .await
+            .unwrap()
+            .value(),
+        0
+    );
+    assert_eq!(
+        owner
+            .next_position(assignment.feed_id, assignment.range_id)
+            .await
+            .unwrap()
+            .value(),
+        1
+    );
+    fixture.services[&assignment.owner]
+        .unfreeze_generation(assignment.range_id, assignment.generation)
+        .await;
+}
+
+#[tokio::test]
 async fn one_healthy_replica_never_returns_success() {
     let fixture = Fixture::new().await;
     let error = fixture

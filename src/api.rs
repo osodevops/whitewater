@@ -32,8 +32,9 @@ use uuid::Uuid;
 use crate::{
     active_range::{
         stage_candidate_ranges_local, stage_merged_range_local, ActiveRangeAssignment,
-        AppendIdentity, CandidateSplitStagingResult, CommitPosition, KeyToken,
-        MajorityAppendCoordinator, MajorityAppendError, MergeStagingResult, RepairExportRequest,
+        AppendIdentity, CandidateSplitStagingResult, CommitPosition, ControlPlaneFollowerMove,
+        FollowerMoveControl, FollowerMoveCopyResult, KeyToken, MajorityAppendCoordinator,
+        MajorityAppendError, MergeStagingResult, RangeId, RangePosition, RepairExportRequest,
         RepairExportResponse, RepairFrame, ReplicaAppendRequest, ReplicaAppendResponse,
         ReplicaAppendService, ReplicaCommitRequest, ReplicaCommitResponse, ReplicaProgressRequest,
         ReplicaProgressResponse, ReplicaReconcileRequest, ReplicaReconcileResponse, StorageNodeId,
@@ -41,8 +42,11 @@ use crate::{
     },
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
-    codec::{decode_record, encode_record},
-    control::{ControlController, ControlError, RangeMergePlan, RangeSplitPlan, ReplicatedCommand},
+    codec::{decode_record, encode_record, MAX_FRAME_BYTES},
+    control::{
+        ControlController, ControlError, RangeMergePlan, RangeMovePlan, RangeMoveStage,
+        RangeSplitPlan, ReplicatedCommand,
+    },
     control_plane::{
         ControlNodeId, ControlPlane, ControlPlaneError, ControlTypeConfig, FullSnapshotRequest,
         InternalCommandsRequest, InternalCommandsResponse, InternalWriteResponse,
@@ -120,6 +124,30 @@ pub fn router(state: AppState) -> Router {
         state.clone(),
         authorize_replica_append,
     ));
+    let move_export_route = post(move_export)
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
+    let move_stage_route = post(move_stage_local)
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
+    let move_freeze_route = post(move_freeze_owner)
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
+    let move_unfreeze_route = post(move_unfreeze_owner)
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
     Router::new()
         .route("/health", get(health))
         .route("/v1/streams", get(list_streams).post(create_stream))
@@ -138,6 +166,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/commands", post(execute_admin_commands))
         .route("/v1/admin/ranges/split", post(admin_split_range))
         .route("/v1/admin/ranges/merge", post(admin_merge_ranges))
+        .route("/v1/admin/ranges/move-follower", post(admin_move_follower))
         .route("/v1/admin/control-plane", get(control_plane_status))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route(
@@ -196,6 +225,10 @@ pub fn router(state: AppState) -> Router {
             merge_stage_route,
         )
         .route("/internal/active-range/pressure", range_pressure_route)
+        .route("/internal/active-range/move/export", move_export_route)
+        .route("/internal/active-range/move/stage", move_stage_route)
+        .route("/internal/active-range/move/freeze", move_freeze_route)
+        .route("/internal/active-range/move/unfreeze", move_unfreeze_route)
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
         .route(
@@ -1457,6 +1490,562 @@ async fn admin_merge_ranges(
     ))
 }
 
+const MAX_MOVE_HISTORY_RECORDS: u64 = 10_000;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MovePlanRequest {
+    plan_id: Uuid,
+    range_id: RangeId,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MoveExportRequest {
+    plan_id: Uuid,
+    range_id: RangeId,
+    after: Option<RangePosition>,
+    expected_commit: Option<CommitPosition>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MoveExportResponse {
+    source_commit: CommitPosition,
+    frames: Vec<RepairFrame>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct MoveStageRequest {
+    plan_id: Uuid,
+    range_id: RangeId,
+    expected_commit: Option<CommitPosition>,
+}
+
+async fn active_move_plan(
+    state: &AppState,
+    request: &MovePlanRequest,
+) -> Result<RangeMovePlan, ApiError> {
+    for _ in 0..30 {
+        if let Some(plan) = state.control.follower_move_plan(request.range_id).await {
+            if plan.plan_id == request.plan_id {
+                return Ok(plan);
+            }
+            return Err(ApiError::bad_request("follower move plan is stale"));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(ApiError::unavailable(
+        "follower move plan is not applied on this Node",
+    ))
+}
+
+async fn move_export(
+    State(state): State<AppState>,
+    Json(request): Json<MoveExportRequest>,
+) -> Result<Json<MoveExportResponse>, ApiError> {
+    let plan = active_move_plan(
+        &state,
+        &MovePlanRequest {
+            plan_id: request.plan_id,
+            range_id: request.range_id,
+        },
+    )
+    .await?;
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("replica storage unavailable"))?;
+    if service.local_node() != &plan.source_assignment.owner
+        || state
+            .control
+            .active_range_assignment_by_id(request.range_id)
+            .await
+            != Some(plan.source_assignment.clone())
+    {
+        return Err(ApiError::unavailable(
+            "source owner or range assignment changed during movement",
+        ));
+    }
+    let committed = service
+        .recovery_status_for_assignment(&plan.source_assignment)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .committed;
+    if request
+        .expected_commit
+        .is_some_and(|expected| expected != committed)
+    {
+        return Err(ApiError::unavailable(
+            "source CommitPosition moved after movement freeze",
+        ));
+    }
+    let frames = service
+        .export_assignment_committed(&plan.source_assignment, request.after, 1)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .into_iter()
+        .filter(|frame| frame.position.value() <= committed.value())
+        .map(|frame| RepairFrame {
+            position: frame.position,
+            identity: frame.identity,
+            cursor: frame.cursor,
+            frame_base64: STANDARD.encode(frame.frame),
+        })
+        .collect();
+    Ok(Json(MoveExportResponse {
+        source_commit: committed,
+        frames,
+    }))
+}
+
+async fn fetch_move_export(
+    state: &AppState,
+    endpoint: &str,
+    key: &str,
+    request: MoveExportRequest,
+) -> Result<MoveExportResponse, ApiError> {
+    state
+        .internal_http
+        .post(format!(
+            "{}/internal/active-range/move/export",
+            endpoint.trim_end_matches('/')
+        ))
+        .header("x-whitewater-control-key", key)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .error_for_status()
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .json()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))
+}
+
+async fn move_stage_local(
+    State(state): State<AppState>,
+    Json(request): Json<MoveStageRequest>,
+) -> Result<Json<FollowerMoveCopyResult>, ApiError> {
+    let plan = active_move_plan(
+        &state,
+        &MovePlanRequest {
+            plan_id: request.plan_id,
+            range_id: request.range_id,
+        },
+    )
+    .await?;
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("replica storage unavailable"))?;
+    if service.local_node() != &plan.replacement_replica
+        || state
+            .control
+            .active_range_assignment_by_id(request.range_id)
+            .await
+            != Some(plan.source_assignment.clone())
+    {
+        return Err(ApiError::unavailable(
+            "replacement Node or range assignment changed during movement",
+        ));
+    }
+    let endpoint = state
+        .control_endpoints
+        .get(&plan.source_assignment.owner)
+        .ok_or_else(|| ApiError::unavailable("source owner endpoint unavailable"))?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("internal credential unavailable"))?;
+    let first = fetch_move_export(
+        &state,
+        endpoint,
+        key,
+        MoveExportRequest {
+            plan_id: plan.plan_id,
+            range_id: request.range_id,
+            after: None,
+            expected_commit: request.expected_commit,
+        },
+    )
+    .await?;
+    let captured = first.source_commit;
+    if captured.value() > MAX_MOVE_HISTORY_RECORDS {
+        return Err(ApiError::unavailable(
+            "range exceeds the 10,000-record prototype transfer bound; keep the old RF3 assignment until checkpointed streaming movement is available",
+        ));
+    }
+    let prior_commit = service
+        .recovery_status_for_assignment(&plan.candidate_assignment)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .committed;
+    if prior_commit > captured {
+        return Err(ApiError::unavailable(
+            "replacement replica is ahead of source CommitPosition",
+        ));
+    }
+    let mut after = None;
+    let mut checksum = blake3::Hasher::new();
+    let mut transferred_records = 0_u64;
+    let mut transferred_bytes = 0_u64;
+    let mut next = first;
+    while after.map_or(0, RangePosition::value) < captured.value() {
+        if next.frames.is_empty() {
+            return Err(ApiError::unavailable(
+                "source ended before captured CommitPosition",
+            ));
+        }
+        for frame in &next.frames {
+            if frame.position.value() > captured.value() {
+                break;
+            }
+            let expected = after.map_or(1, |position: RangePosition| {
+                position.value().saturating_add(1)
+            });
+            if frame.position.value() != expected {
+                return Err(ApiError::unavailable("source export has a position gap"));
+            }
+            let bytes = STANDARD
+                .decode(frame.frame_base64.as_bytes())
+                .map_err(|_| ApiError::unavailable("source export contains invalid base64"))?;
+            if bytes.len() > MAX_FRAME_BYTES {
+                return Err(ApiError::unavailable(
+                    "source export frame exceeds size limit",
+                ));
+            }
+            let digest = *blake3::hash(&bytes).as_bytes();
+            let accepted = service
+                .stage_split_frame(
+                    &plan.candidate_assignment,
+                    frame.position,
+                    frame.identity.clone(),
+                    frame.cursor.clone(),
+                    bytes.clone(),
+                )
+                .await
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            if accepted.position != frame.position
+                || accepted.frame_digest != digest
+                || accepted.cursor != frame.cursor
+            {
+                return Err(ApiError::unavailable(
+                    "replacement frame verification failed",
+                ));
+            }
+            if frame.position.value() > prior_commit.value() {
+                service
+                    .commit_staged_split(
+                        &plan.candidate_assignment,
+                        CommitPosition::new(frame.position.value()),
+                    )
+                    .await
+                    .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                transferred_records = transferred_records.saturating_add(1);
+                transferred_bytes = transferred_bytes.saturating_add(bytes.len() as u64);
+            }
+            checksum.update(&frame.position.value().to_be_bytes());
+            checksum.update(&digest);
+            after = Some(frame.position);
+        }
+        if after.map_or(0, RangePosition::value) < captured.value() {
+            next = fetch_move_export(
+                &state,
+                endpoint,
+                key,
+                MoveExportRequest {
+                    plan_id: plan.plan_id,
+                    range_id: request.range_id,
+                    after,
+                    expected_commit: request.expected_commit,
+                },
+            )
+            .await?;
+        }
+    }
+    let latest = fetch_move_export(
+        &state,
+        endpoint,
+        key,
+        MoveExportRequest {
+            plan_id: plan.plan_id,
+            range_id: request.range_id,
+            after,
+            expected_commit: request.expected_commit,
+        },
+    )
+    .await?
+    .source_commit;
+    let target_commit = service
+        .recovery_status_for_assignment(&plan.candidate_assignment)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .committed;
+    Ok(Json(FollowerMoveCopyResult {
+        source_commit: latest,
+        target_commit,
+        transferred_records,
+        transferred_bytes,
+        checksum: *checksum.finalize().as_bytes(),
+        ready: latest == captured && target_commit == captured,
+    }))
+}
+
+async fn move_freeze_owner(
+    State(state): State<AppState>,
+    Json(request): Json<MovePlanRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let plan = active_move_plan(&state, &request).await?;
+    let coordinator = state
+        .majority_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Append Owner coordinator is unavailable"))?;
+    let commit = coordinator
+        .freeze_for_follower_move(&plan.source_assignment)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    Ok(Json(json!({ "source_commit": commit })))
+}
+
+async fn move_unfreeze_owner(
+    State(state): State<AppState>,
+    Json(request): Json<MovePlanRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let current = state
+        .control
+        .active_range_assignment_by_id(request.range_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("source range assignment unavailable"))?;
+    let plan = state.control.follower_move_plan(request.range_id).await;
+    let permitted = plan.as_ref().is_some_and(|plan| {
+        plan.plan_id == request.plan_id
+            && plan.source_assignment == current
+            && matches!(
+                plan.stage,
+                RangeMoveStage::Prepared | RangeMoveStage::CatchingUp
+            )
+    }) || plan.is_none()
+        && state
+            .control
+            .completed_follower_move(request.range_id)
+            .await
+            .is_some_and(|completed| {
+                completed.plan_id == request.plan_id && completed.candidate_assignment == current
+            });
+    if !permitted {
+        return Err(ApiError::unavailable(
+            "movement cutover is unresolved; source stays frozen",
+        ));
+    }
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("replica storage unavailable"))?;
+    if service.local_node() != &current.owner {
+        return Err(ApiError::unavailable(
+            "Node is not the current Append Owner",
+        ));
+    }
+    service
+        .unfreeze_generation(current.range_id, current.generation)
+        .await;
+    Ok(Json(json!({ "status": "unfrozen" })))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdminMoveFollowerRequest {
+    pub request_id: Uuid,
+    pub feed: String,
+    pub range_id: RangeId,
+    pub removed_replica: StorageNodeId,
+    pub replacement_replica: StorageNodeId,
+}
+
+async fn post_move_request<T: Serialize>(
+    state: &AppState,
+    endpoint: &str,
+    key: &str,
+    path: &str,
+    request: &T,
+) -> Result<serde_json::Value, ApiError> {
+    let timeout = if path == "/internal/active-range/move/stage" {
+        Duration::from_secs(120)
+    } else {
+        Duration::from_secs(5)
+    };
+    let response = state
+        .internal_http
+        .post(format!("{}{}", endpoint.trim_end_matches('/'), path))
+        .header("x-whitewater-control-key", key)
+        .json(request)
+        .timeout(timeout)
+        .send()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let detail = response.text().await.unwrap_or_default();
+        return Err(ApiError::unavailable(format!(
+            "movement request {path} returned {status}: {}",
+            detail.chars().take(512).collect::<String>()
+        )));
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))
+}
+
+async fn unfreeze_move(
+    state: &AppState,
+    endpoint: &str,
+    key: &str,
+    request: &MovePlanRequest,
+) -> Result<(), ApiError> {
+    for _ in 0..50 {
+        if post_move_request(
+            state,
+            endpoint,
+            key,
+            "/internal/active-range/move/unfreeze",
+            request,
+        )
+        .await
+        .is_ok()
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(ApiError::unavailable(
+        "movement cutover is unresolved; Append Owner remains frozen",
+    ))
+}
+
+async fn admin_move_follower(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AdminMoveFollowerRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let control_plane = state
+        .control_plane
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Control Plane is unavailable"))?;
+    let prepared = control_plane
+        .execute_commands_with_request_id(
+            vec![crate::control::Command::PrepareFollowerMove {
+                feed: request.feed.clone(),
+                range_id: request.range_id,
+                removed_replica: request.removed_replica,
+                replacement_replica: request.replacement_replica,
+            }],
+            request.request_id,
+        )
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let plan: RangeMovePlan = serde_json::from_value(prepared.results[0].data.clone())
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    let source_endpoint = state
+        .control_endpoints
+        .get(&plan.source_assignment.owner)
+        .ok_or_else(|| ApiError::unavailable("source endpoint unavailable"))?;
+    let target_endpoint = state
+        .control_endpoints
+        .get(&plan.replacement_replica)
+        .ok_or_else(|| ApiError::unavailable("replacement endpoint unavailable"))?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("internal credential unavailable"))?;
+    let plan_request = MovePlanRequest {
+        plan_id: plan.plan_id,
+        range_id: plan.source_assignment.range_id,
+    };
+    if state
+        .control
+        .active_range_assignment_by_id(plan_request.range_id)
+        .await
+        == Some(plan.candidate_assignment.clone())
+    {
+        unfreeze_move(&state, source_endpoint, key, &plan_request).await?;
+        return Ok(Json(
+            json!({ "status": "activated", "assignment": plan.candidate_assignment }),
+        ));
+    }
+    post_move_request(
+        &state,
+        target_endpoint,
+        key,
+        "/internal/active-range/move/stage",
+        &MoveStageRequest {
+            plan_id: plan.plan_id,
+            range_id: plan_request.range_id,
+            expected_commit: None,
+        },
+    )
+    .await?;
+    let frozen = post_move_request(
+        &state,
+        source_endpoint,
+        key,
+        "/internal/active-range/move/freeze",
+        &plan_request,
+    )
+    .await?;
+    let boundary: CommitPosition = match serde_json::from_value(frozen["source_commit"].clone()) {
+        Ok(commit) => commit,
+        Err(error) => {
+            unfreeze_move(&state, source_endpoint, key, &plan_request).await?;
+            return Err(ApiError::unavailable(error.to_string()));
+        }
+    };
+    let final_copy = post_move_request(
+        &state,
+        target_endpoint,
+        key,
+        "/internal/active-range/move/stage",
+        &MoveStageRequest {
+            plan_id: plan.plan_id,
+            range_id: plan_request.range_id,
+            expected_commit: Some(boundary),
+        },
+    )
+    .await;
+    let copied: FollowerMoveCopyResult = match final_copy {
+        Ok(data) => match serde_json::from_value(data) {
+            Ok(copied) => copied,
+            Err(error) => {
+                unfreeze_move(&state, source_endpoint, key, &plan_request).await?;
+                return Err(ApiError::unavailable(error.to_string()));
+            }
+        },
+        Err(error) => {
+            unfreeze_move(&state, source_endpoint, key, &plan_request).await?;
+            return Err(error);
+        }
+    };
+    if !copied.ready || copied.source_commit != boundary || copied.target_commit != boundary {
+        unfreeze_move(&state, source_endpoint, key, &plan_request).await?;
+        return Err(ApiError::unavailable(
+            "replacement did not commit the frozen source prefix",
+        ));
+    }
+    let cutover = ControlPlaneFollowerMove::new(control_plane.clone());
+    cutover
+        .record_ready(&request.feed, &plan, &copied)
+        .await
+        .map_err(ApiError::unavailable)?;
+    cutover
+        .activate(&request.feed, &plan)
+        .await
+        .map_err(ApiError::unavailable)?;
+    unfreeze_move(&state, source_endpoint, key, &plan_request).await?;
+    Ok(Json(
+        json!({ "status": "activated", "assignment": plan.candidate_assignment,
+        "committed_position": copied.target_commit, "transferred_records": copied.transferred_records,
+        "transferred_bytes": copied.transferred_bytes }),
+    ))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ClientAppendRequest {
     request_id: Uuid,
@@ -2509,6 +3098,49 @@ mod tests {
             .unwrap();
         assert_ne!(authenticated.status(), StatusCode::UNAUTHORIZED);
         assert!(authenticated.status().is_client_error());
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn follower_move_transport_authenticates_before_decoding_requests() {
+        let directory = TempDir::new().unwrap();
+        let (app, control_plane) = internal_replica_test_router(&directory).await;
+        for path in [
+            "/internal/active-range/move/export",
+            "/internal/active-range/move/stage",
+            "/internal/active-range/move/freeze",
+            "/internal/active-range/move/unfreeze",
+        ] {
+            let request = |credential: Option<&str>| {
+                let mut builder = Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json");
+                if let Some(credential) = credential {
+                    builder = builder.header("x-whitewater-control-key", credential);
+                }
+                builder.body(Body::from("not-json")).unwrap()
+            };
+            assert_eq!(
+                app.clone().oneshot(request(None)).await.unwrap().status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert_eq!(
+                app.clone()
+                    .oneshot(request(Some("wrong-key")))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+            assert!(app
+                .clone()
+                .oneshot(request(Some("this-is-a-long-control-plane-key")))
+                .await
+                .unwrap()
+                .status()
+                .is_client_error());
+        }
         control_plane.raft().shutdown().await.unwrap();
     }
 

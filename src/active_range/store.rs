@@ -1115,6 +1115,19 @@ fn read_indexed_frame(
     entry: &EntryIndex,
 ) -> Result<StoredRangeFrame, ActiveRangeStoreError> {
     let mut file = File::open(segment_path(directory, entry.segment))?;
+    let frame_end = entry
+        .frame_offset
+        .checked_add(entry.frame_length)
+        .ok_or(ActiveRangeStoreError::PositionOverflow)?;
+    if frame_end > file.metadata()?.len() {
+        return Err(corrupt(
+            &segment_path(directory, entry.segment),
+            format!(
+                "stored frame at RangePosition {} extends beyond the segment: offset={}, bytes={}",
+                entry.position, entry.frame_offset, entry.frame_length
+            ),
+        ));
+    }
     file.seek(SeekFrom::Start(entry.frame_offset))?;
     let frame_length: usize = entry
         .frame_length

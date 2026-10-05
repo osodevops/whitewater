@@ -298,6 +298,30 @@ Ownership transfer is epoch-fenced and limited to a current replica:
 
 Repeating the same request ID returns the original result without incrementing the epoch twice.
 
+### Replace a follower replica
+
+An operator can replace **one non-owner follower** after adding a fourth eligible storage-capable Node. This is an administrative operation; Writers and Readers still supply only Feed, Key, and Cursor.
+
+```http
+POST /v1/admin/ranges/move-follower
+Authorization: Bearer <admin-key>
+Content-Type: application/json
+```
+
+```json
+{
+  "request_id": "4ea965f3-17da-48d5-b654-ae1697d35d85",
+  "feed": "orders.created",
+  "range_id": "632a51da-5945-4cac-a541-cdb9e63cd5b4",
+  "removed_replica": "control-3",
+  "replacement_replica": "control-4"
+}
+```
+
+The Control Plane persists the plan but keeps the original RF3 assignment authoritative during bounded, authenticated committed-frame copy. The Append Owner then drains its in-flight quorum writes, freezes the source, truncates only uncommitted tail records, and verifies that the replacement is committed through the final source boundary before one consensus assignment change. The owner is unchanged; the ownership epoch advances, and the removed follower is fenced. The application does not get a topology callback. Retry a failed or timed-out request with the **same** request ID; inspect placement and plan state if the outcome is ambiguous.
+
+The current HTTP staging prototype transfers one bounded record per internal request and refuses ranges above 10,000 committed records; the original RF3 assignment remains active on refusal. The prepared plan remains visible in `INSPECT PLACEMENT`; after confirming activation was not submitted, an operator can clear it with the typed `abort_follower_move` command and its `plan_id`. Checkpointed streaming for larger histories and a foreground-SLO-aware movement budget remain planned. The regular three-Node development Fabric has no spare eligible fourth Node. `compose.m4-move.yml` provides an **isolated, test-only four-voter** Fabric for `python scripts/test-m4-follower-move.py`. This is not production role-separated storage placement. Movement of the append owner and automatic Node drain remain planned.
+
 ### Grant
 
 ```json
