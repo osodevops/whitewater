@@ -121,55 +121,37 @@ Whitewater separates Feed identity, key ordering, active-range ownership, immuta
 
 ### 8. Cleanup policy mixes event history with materialized state
 
-Kafka asks a topic to choose between deletion, compaction, or both. Log compaction can approximate the latest value for each key, but it is asynchronous and remains represented as a log with tombstones and segment cleanup behavior. Applications often rebuild an in-memory or embedded store by replaying a changelog.
+Kafka asks a topic to choose deletion, compaction, or both. Compaction can approximate latest-value state for a key, while Kafka Streams applications commonly maintain local state stores and changelog topics. Whitewater separates these responsibilities instead of offering compacted versus non-compacted *Spaces*.
 
-Whitewater has one Feed model:
+**A Space is an ownership/policy namespace, not a cleanup-policy type.** There is one public **Feed** history model: committed events remain immutable until a History Policy expires or tiers them (the closest Kafka analogy is a delete-retained topic). A Space may contain many Feeds and Indexes and supply inherited quotas, access, retention, and accounting. Neither a Space nor a Feed changes into a compacted history when an Index is added. History Policy, tiering, and expiry are design requirements, not a completed retention implementation.
 
-- A Feed is immutable event history.
-- Events are never rewritten into a different semantic type by a cleanup mode.
-- History lifecycle and tiering are policies, not alternative Feed personalities.
-- Current state and query acceleration are represented by explicit Indexes.
+A **persisted Index layer is core Whitewater storage**, not a later performance trick. It holds current/queryable state derived from Feed history; applications do not have to operate separate compacted Feeds or changelog topics to make their state durable. An Index is a deliberate, named resource because each extra application-defined field/index costs write IO, replication bandwidth, disk, memory, and rebuild time. Not every Feed needs an Index, but the platform must support arbitrary declared secondary indexes as a first-class capability.
 
-There is no public `cleanup.policy`, no compacted Feed type, and no implication that a durable history is also an efficient key-value database.
+### 9. Current state and secondary lookups belong to persisted Indexes
 
-Finite storage still requires explicit lifecycle rules. A Space may inherit a History Policy controlling local hot retention, object-storage tiering, legal retention, and eventual expiry. Expiry removes history according to policy; it does not convert a Feed into a key-value store.
-
-### 9. Current state should be a first-class persisted index
-
-When a Feed needs latest-value-by-key behavior, Whitewater creates a Key Index:
+For example, one Feed can support several application-defined access paths without changing its immutable history:
 
 ```text
-Feed:  commerce.orders.events
-Index: commerce.orders.byid
-Key:   order123
-Value: latest indexed order state
+Space:   commerce
+Feed:    commerce.orders.events        (committed append-only history)
+Primary: FeedId + order Key            (latest derived state for that Key)
+Index:   commerce.orders.bycustomer    (customer_id -> order Keys)
+Index:   commerce.orders.byregiondate  ((region, date) -> order Keys)
 ```
 
-An Index is:
+Primary **Feed records** still live in the replicated sequential Active Range log; each record has a stable MessageId/Cursor and an internal range position. The derived **current-state primary row** is keyed by `FeedId + application Key`, not a public Kafka partition/offset. Secondary entries point to this stable logical identity (or to a stable MessageId for immutable-event indexes), never to a range position that might change after a split. Schema-neutral byte payloads require a declared, deterministic, versioned extractor before indexing a payload field; arbitrary application-specific indexes cannot imply that Whitewater understands every payload automatically.
 
-- Persisted, not merely an in-memory cache.
-- Replicated with an explicit durability contract.
-- Updated continuously as accepted events advance.
-- Checkpointed so restart does not require replaying all history.
-- Rebuildable from retained Feed history for verification or disaster recovery.
-- Independently movable from the active append range.
-- Queryable without scanning every event.
-
-Additional indexes may support exact keys, prefixes, selected fields, time ranges, and explicitly defined projections. Index creation is deliberate because indexes consume write IO, storage, memory, and replication bandwidth.
-
-The event append and required synchronous index mutations need a defined atomicity boundary. An acknowledgement must not claim an index is current unless the replicated index mutation required by that Index's consistency policy is also durable.
+The target Index is persisted, RF3-replicated, independently recoverable, checkpointed by applied Cursor, and queryable by exact value, text prefix, composite leading fields, or bounded range without scanning a Feed. These are **required storage behavior**, not guarantees already implemented in the current prototype. Index creation must work through the same typed Control API/WCL as other resources; see the [Index storage contract](#index-storage-contract-and-fjall-layout) below.
 
 ### 10. Kafka lacks general first-class indexing
 
-Kafka efficiently retrieves sequential records by partition offset and time indexes, but it is not a general queryable event store. Lookup by business key or arbitrary field typically requires another database, Kafka Streams state store, ksqlDB table, search engine, or custom consumer-maintained projection.
-
-Whitewater keeps sequential Feed IO but allows optional first-class replicated Indexes. The Fabric knows which Cursor each Index has applied, can report freshness, can move Index ownership, and can prevent stale replicas from serving strict reads.
+Kafka efficiently retrieves sequential records by partition offset and time indexes, but general lookup by business key or another field typically needs a separate store, Kafka Streams state, ksqlDB, search, or application-maintained projections. Whitewater keeps immutable Feed history while making separately named primary/current-state and secondary Indexes a core query model. An Index's applied Cursor and policy must tell the caller how fresh it is; a strict read must wait or report lag rather than silently returning stale state.
 
 ### 11. Changelog plus reconstructed store duplicates responsibility
 
-Kafka Streams commonly represents state as a local store backed by a changelog topic. Recovery can involve restoring that local store by replaying its changelog. The model is robust, but state, changelog, cache, assignment, and restoration remain separate concerns exposed to the application framework.
+Kafka Streams commonly uses a local store backed by a changelog topic, which applications and their framework must restore. Whitewater's intended recovery source is the **retained Feed history plus replicated Index checkpoints**, so applications do not create a second public changelog Feed to maintain the Index. An Index can catch up from its last applied Cursor; if its persisted derived state is discarded, a controlled rebuild reads the owning Feed(s) in a new Index generation and publishes the replacement only after it is verified and caught up.
 
-Whitewater treats indexed state as a persisted and replicated storage primitive. Feed history remains the audit source, while Index checkpoints and replicas provide fast current state. Memory is a cache above the persisted Index, not the only live representation.
+A Space-scoped `REBUILD INDEXES IN SPACE commerce` would select Indexes owned by that Space and replay their source Feeds; it would **not** erase the Space, clear Feed records, or mean that every Index is rebuildable from data that has already expired. If retained history and a usable checkpoint/backup are insufficient, the rebuild must refuse with an explanation rather than report success from incomplete state. Reset/empty operations require authorization, an explicit retained-history check, audit, and a shadow build instead of exposing an empty live Index.
 
 ### 12. Security has too many optional paths
 
@@ -445,6 +427,56 @@ Developers should not choose a range count, assign a Reader to a range, handle p
 | Tiered storage | Transparent segment lifecycle | Clients keep Feed/Cursor semantics while storage location changes |
 | AdminClient | Control API and `wwctl` | Operates on logical resources, not partitions and broker assignments |
 
+## Index storage contract and Fjall layout
+
+**Status:** This is the required storage architecture, with only the versioned key encoding and mutation planner implemented so far in `src/index.rs`. The current production-path Active Range store is a custom Rust file/segment log; no Fjall dependency, persisted Index, `CREATE INDEX`, or atomic Feed-to-Index commit exists today. The engine choice and integration need fault, durability, and workload evidence before the public API claims these guarantees.
+
+### A small fixed set of engine keyspaces
+
+Fjall is the pure-Rust embedded LSM candidate closest to RocksDB in this design. It supports ordered prefix/range iteration and cross-keyspace atomic operations, but does **not** automatically maintain relational secondary indexes. Whitewater owns the Index catalog, extractors, encoded keys, transactional maintenance, and replay protocol. A Fjall keyspace is a physical LSM tree, so the design uses a **small fixed set** of keyspaces per local Index replica/engine instance, **not one keyspace per user-defined Index**:
+
+```text
+index_primary      [v1][feed_id:16][escaped application_key][00 00] -> current projection + prior indexed tuples + applied Cursor
+index_entries      [v1][posting_tag][index_id:16][typed composite tuple][encoded primary Key] -> empty / stable reference
+index_entries      [v1][unique_tag][index_id:16][typed composite tuple] -> encoded primary Key
+index_checkpoints  [index_id:16][generation] -> source FeedId, applied Cursor, durability/freshness/build state
+```
+
+The shared `index_entries` keyspace clusters entries for a given `(tag, IndexId, value)` so an exact-match lookup scans only a bounded prefix. The final stable logical primary reference disambiguates duplicate values and permits all matching rows. A text-prefix lookup omits the terminator for the final text component; a composite Index can scan by its leftmost complete fields and then a typed range on the next field. Versioned encoding, type tags, signed-integer normalization, escaped zero bytes, explicit terminators, size limits, and declared text collation prevent ambiguous keys and accidental cross-Index scans. Null uniqueness semantics are explicit: multiple rows may carry null without taking a unique-value claim.
+
+`src/index.rs` implements `IndexId`, `PrimaryRef`, `IndexField`, `IndexDefinition`, typed `IndexValue`, primary/posting/unique-claim encoding, prefix and signed-range starts, and `plan_projection_change`. Its tests cover composite order, duplicates, embedded zero bytes, stale-entry removals on update/delete, nullable unique claims, conflicting owner claims, and bounded keys. These are **pure model and layout tests**, not a persistent engine or transaction benchmark. A stable MessageId reference, rather than a physical `(RangeId, RangePosition)`, is the planned variant for secondary indexes over *immutable events*. Internal range position or Kafka-style partition/offset may help locate bytes locally but is not a durable application-visible primary identity.
+
+### Transaction and uniqueness boundary
+
+For an update/delete of one current-state primary row, a **single serializable transaction** must read its old indexed tuples, remove old posting/unique-claim entries, check all new unique claims, write the new primary row and postings, and advance the Index applied Cursor/checkpoint together. A plain atomic `WriteBatch` across Fjall keyspaces is useful for applying *known* changes but is not enough for concurrent read-check-write uniqueness; evaluate a supported transactional Fjall database (single-writer or optimistic) with the intended IO and crash workload. Never acknowledge a strict Index mutation merely because a key was inserted in an unflushed cache; specify the durable flush/replica evidence separately.
+
+**One local Fjall transaction cannot atomically commit the existing independent Active Range file log or a transaction on another Node.** To offer synchronous append-plus-Index consistency, Whitewater must extend the replicated append/commit boundary to include deterministic Index mutation intents and quorum-durable Index application (or replace/co-design the local log and Index journal with one recoverable transaction). On replay the same MessageId/Cursor must apply at most once. For asynchronous Index policies, writes may commit before the Index; strict queries must fence on the requested applied Cursor or return an explicit `index_behind` result. Until that cross-store protocol is implemented and tested, do **not** expose an Index as transactionally current or enable a misleading `CREATE INDEX` path.
+
+A unique value spanning different Active Ranges additionally needs **global ownership** of `(IndexId, encoded value)` and a replicated conditional reservation/commit protocol; separate local serializable transactions cannot enforce global uniqueness. Fail creation of a globally unique Index until this is proven; do not quietly reinterpret it as per-range uniqueness. Composite fields, repeated/duplicate values on different primary keys, null handling, versioned extractors, collation, and Index generation are part of the definition, so changes require validation and often a rebuild.
+
+### Control API, inspection, and safe rebuild
+
+The **proposed, not yet accepted** WCL shape (mirrored by typed Admin API commands) is:
+
+```sql
+CREATE INDEX commerce.orders.bycustomer
+  ON commerce.orders.events (customer_id) NONUNIQUE;
+CREATE UNIQUE INDEX commerce.orders.byexternalid
+  ON commerce.orders.events (external_id);
+INSPECT INDEX commerce.orders.bycustomer;
+REBUILD INDEX commerce.orders.bycustomer FROM FEED commerce.orders.events;
+REBUILD INDEXES IN SPACE commerce;
+```
+
+An Index definition names the immutable FeedId, fields/extractor versions, types/collation, uniqueness, and build/consistency policy. A new Index starts in `building` with a pinned source Cursor and **shadow generation**, scans retained Feed history in bounded batches, catches up with live writes, verifies its primary/posting counts and unique claims on RF3, then switches the catalog's active generation through the Control Plane. Existing queries remain on the old generation until the new one is ready. Any proposed `RESET/EMPTY INDEX` must be implemented as an authorized rebuild that **never makes the live Index silently empty**. A failed build can be resumed or abandoned without changing Feed history; if the source's retained history is insufficient, require an appropriate checkpoint/backup or reject the rebuild. Operators should inspect applied Cursor, lag, build progress, cost, and reason for refusal by logical Space/Feed/Index.
+
+### Proof required before claiming the feature
+
+- Validate per-Index definition/extractor compatibility and deterministic extraction without assuming payload bytes have a schema; compare Fjall against redb and RocksDB on sustained mixed append/read, many declared Indexes, compaction stalls, memory, replication, and recovery cost.
+- Prove transaction rollback after a crash at each primary/posting/unique/checkpoint boundary; stale postings never survive update/delete or an interrupted rebuild.
+- Prove concurrent unique conflicts, idempotent ambiguous retries, multiple nulls, duplicate nonunique values, composite/prefix/range ordering, and split/merge/move of the underlying Feed without changing logical references.
+- Prove RF3 Index catch-up, applied-Cursor fencing for strict reads, restart/checkpoint recovery, retention-blocked rebuilds, and bounded per-Space resource usage. Mark the runtime feature complete only after these tests and the public API pass.
+
 ## Index engine direction
 
 Whitewater should define an internal Index Engine trait before selecting one implementation. Required capabilities include:
@@ -452,7 +484,7 @@ Whitewater should define an internal Index Engine trait before selecting one imp
 - Durable write batches
 - Crash recovery
 - Prefix and range iteration
-- Multiple isolated keyspaces
+- A small fixed set of isolated keyspaces shared by many application-defined Indexes, not one LSM tree per Index
 - Snapshots or MVCC
 - Checksums
 - Explicit fsync/persistence control

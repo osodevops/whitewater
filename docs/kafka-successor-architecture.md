@@ -51,7 +51,7 @@ A Feed has an immutable FeedId and a mutable dotted FeedName. The physical layou
 9. **Coordination and consensus are used only where correctness requires them.**
 10. **Multi-tenancy and workload isolation are foundational, not later additions.**
 11. **Every supported Fabric has at least three Nodes and every active range has at least three replicas.**
-12. **Feed history is immutable; current state and query acceleration are explicit persisted replicated Indexes.**
+12. **Feed history is immutable; arbitrary application-defined secondary Indexes and current state are core persisted replicated storage capabilities, not later query optimizations.** Their [shared keyspace and transaction contract](why-whitewater.md#index-storage-contract-and-fjall-layout) must be implemented before claiming Index availability.
 13. **TLS and scoped API-key authentication are mandatory defaults, not deployment options.**
 14. **Feed identity is immutable while its dotted human-readable name may change.**
 15. **Development uses the same three-Node topology and protocol contracts as production.**

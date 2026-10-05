@@ -23,17 +23,7 @@
 
 **Milestone 4 — Multiple internal ranges**
 
-The target is deliberately narrow:
-
-```text
-One Feed
-One Active Range
-One current Append Owner
-Three replicas
-Two-of-three durable majority commit
-```
-
-Dynamic range splitting, elastic placement, Writer UX, Reader sessions, Indexes, and Pipes are later milestones.
+The current delivery track is multiple internal Active Ranges. In parallel, the core Index model is being specified and encoded under [Milestone 6](#milestone-6--persisted-replicated-indexes): application-defined secondary Indexes are a foundational storage requirement, **not** a future performance optimization. They are not yet persisted or available on the live append/query path; the Index transaction and RF3 boundary must be proven before claiming database-style lookup or `CREATE INDEX` support.
 
 ---
 
@@ -706,14 +696,19 @@ Definition of Done:
 
 ## Milestone 6 — Persisted replicated Indexes
 
-- [ ] Benchmark Fjall, redb, and RocksDB reference workloads.
-- [ ] Select Index Engine through fault and workload evidence.
-- [ ] Implement Key Index.
-- [ ] Implement Index applied-Cursor freshness.
-- [ ] Implement three-replica Index durability.
-- [ ] Implement checkpoints and transfer.
-- [ ] Implement automatic query routing.
-- [ ] Add `CREATE INDEX`, `GET`, and Index inspection APIs.
+**Core storage requirement, not an optional optimization.** [Index storage contract and Fjall key layout](why-whitewater.md#index-storage-contract-and-fjall-layout) defines the work. The model/key codec exists, but the current Feed append path is a separate file log and does **not** transactionally update a persisted Index. Keep M4 as the single current-focus milestone while establishing this parallel foundation; do not expose incomplete Indexes as queryable resources.
+
+- [x] Define an internal IndexId, stable logical primary reference, shared secondary/unique-claim key encoding, composite/prefix/range access, and an update/delete mutation planner with focused unit tests (`src/index.rs`).
+- [ ] Define and persist versioned application-owned Index definitions with typed fields/extractors, collation, consistency, scope, and build state through the Control Plane.
+- [ ] Benchmark vetted Fjall, redb, and RocksDB reference workloads: many user Indexes sharing a bounded number of LSM trees, mixed writes/reads, crashes, compaction stalls, and replication/checkpoint cost.
+- [ ] Select and integrate an Index Engine behind a narrow transactional interface; validate serializable read-modify-write, durable batch semantics, and memory/disk budgets.
+- [ ] Co-design Feed commit and required synchronous primary/secondary Index mutations across the existing file log and replicated Index state; do not claim cross-engine atomicity from a local Fjall write batch.
+- [ ] Implement current-state primary rows and arbitrary declared nonunique secondary Indexes in one shared entries keyspace; atomically remove stale entries on update/delete.
+- [ ] Implement global uniqueness across Active Ranges with a replicated conditional claim protocol; reject UNIQUE definitions until it is proven.
+- [ ] Implement Index applied-Cursor freshness and strict reads that wait or explicitly report `index_behind`.
+- [ ] Implement three-replica Index durability, verified checkpoints, bounded catch-up, and transfer.
+- [ ] Implement controlled shadow-generation rebuild from retained Feed history, including `REBUILD INDEX` and `REBUILD INDEXES IN SPACE`, refusal when history/checkpoints are insufficient, and atomic activation.
+- [ ] Implement automatic logical query routing and expose `CREATE INDEX`, `GET`, exact/prefix/range queries, and Index inspection through typed Admin API and WCL.
 
 Definition of Done:
 
