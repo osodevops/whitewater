@@ -36,7 +36,7 @@ Whitewater separates those responsibilities. Its public abstraction becomes:
 fabric -> space -> feed -> key -> cursor -> subscription
 ```
 
-A Feed has an immutable FeedId and a mutable dotted FeedName. The physical layout, replication strategy, work assignment, and degree of parallelism remain internal implementation details that can change dynamically.
+A Feed has an immutable FeedId and a mutable dotted FeedName. The physical layout, replication strategy, work assignment, and degree of parallelism remain internal implementation details that can change dynamically. For the distinction between Kafka's public partitions and Whitewater's internal Active Ranges, including implementation limits, see [Kafka partitions versus Whitewater Active Ranges](why-whitewater.md#kafka-partitions-versus-whitewater-active-ranges).
 
 ## Design principles
 

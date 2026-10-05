@@ -10,6 +10,7 @@ Design documents:
 - [Whitewater skills and contribution map](skills.md)
 - [Kafka pain points Whitewater must address](docs/kafka-pain-points.md)
 - [Why Whitewater and Kafka equivalents](docs/why-whitewater.md)
+- [Kafka partitions versus Whitewater Active Ranges](docs/why-whitewater.md#kafka-partitions-versus-whitewater-active-ranges)
 - [Humane operational and developer experience](docs/operational-experience.md)
 - [Reddit community introduction and pinned launch post](docs/reddit-whitewater-streams-introduction.md)
 - [Lessons retained from Apache Kafka source](docs/kafka-source-lessons.md)
@@ -18,7 +19,7 @@ Design documents:
 - [Whitewater Control Language v0](docs/wcl.md)
 - [Whitewater architecture](docs/kafka-successor-architecture.md)
 
-This repository currently contains the Phase 1 correctness foundation and an early dynamic-membership prototype:
+This repository contains a replicated streaming correctness foundation, internal multi-range routing, and an early dynamic-membership prototype:
 
 - Durable checksummed binary append log
 - Active Range storage with atomic state, persisted durability positions and Writer deduplication, committed segment rotation, torn-tail recovery, and safe uncommitted-tail truncation
@@ -39,7 +40,7 @@ This repository currently contains the Phase 1 correctness foundation and an ear
 - Persisted local prototype catalog fallback and `wwctl` command runner
 - Three-Node and arbitrary-scale Docker development environments
 
-The standard three-Node Fabric now uses Raft consensus for control metadata. Feed records are not replicated yet; active-range quorum replication remains the next major durability phase.
+The standard three-Node Fabric uses Raft consensus for control metadata and two-of-three durable Active Range quorum commits for Feed writes. This is still a prototype: production transport security, scalable cross-Node Feed reads, complete movement and drain, and broader failure acceptance remain unfinished.
 
 ## Run a development Fabric
 

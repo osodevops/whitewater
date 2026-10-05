@@ -66,7 +66,7 @@ Events with the same key are observed in accepted order.
 Unrelated keys may proceed independently.
 ```
 
-Physical ranges, replicas, files, and placement are internal. They may split, merge, or move without changing a Feed or its client contract.
+Physical ranges, replicas, files, and placement are internal. They may split, merge, or move without changing a Feed or its client contract. The [partition-versus-range comparison](#kafka-partitions-versus-whitewater-active-ranges) below explains the mechanism and current implementation boundaries.
 
 ### 2. Partition counts leak infrastructure into application design
 
@@ -341,6 +341,63 @@ The baseline is three replicas and quorum acknowledgement. Stronger policies may
 ### Encryption Policy
 
 An Encryption Policy specifies transport requirements, at-rest encryption, customer-managed key references, and rotation. Authentication API keys authorize access but are not encryption keys.
+
+## Kafka partitions versus Whitewater Active Ranges
+
+**A range is not a renamed partition.** Both systems use replicated, ordered storage internally, but they put different responsibilities into their public contracts. Kafka exposes a topic's partitions and partition-local offsets to applications; Whitewater presents a Feed and business keys while keeping its Active Ranges, owners, replicas, generations, and positions internal. The distinction is about what an application must depend on, not a claim that Whitewater has no physical divisions.
+
+| Question | Kafka partition | Whitewater Active Range |
+|---|---|---|
+| What does it cover? | One numbered append log within a topic; a producer's partitioner chooses its destination. | One contiguous interval of a Feed's **hashed key-token space**, such as `[start, end)`. |
+| What do clients name? | Topic and, when selecting work or seeking, often partition and offset. A keyed producer can normally let a partitioner choose. | Feed and Key for writes; Feed and opaque Cursor for reads. No RangeId, token, or replica is required in application requests. |
+| What is ordered? | Records within each partition; there is no topic-wide total order across partitions. | The intended public guarantee is accepted order for the **same Feed and Key**; unrelated keys need not have a shared order. |
+| What scales independently? | Partitions provide append and consumer parallelism but also define physical offsets, leader/replica placement, and consumer assignments. | Different ranges can have different append owners. Reader/Subscription work assignment is designed to be independent of storage placement; shared Subscription leases are still roadmap work. |
+| Who chooses the number? | Operators commonly choose a partition count at topic creation; Kafka supports increasing it, but reducing it is not a routine in-place operation. | Applications never choose a range count. The Fabric starts with one full-keyspace route and may change its internal map as capacity needs change. |
+| How does placement change? | Leaders and replicas can move without changing a partition ID; reassignment and count changes remain operational concerns. | The Control Plane tracks range assignments and epochs. Splits/merges change routes; moving replicas or owners changes placement without redefining the Feed. |
+
+### A concrete routing example
+
+A new Feed starts with one internal route covering all 128-bit KeyTokens. Whitewater hashes the **key bytes** with BLAKE3 and uses the first 128 bits of the digest to locate the key's route in the current RangeMap. The same key hashes to the same token, irrespective of which Node receives the append. The map is validated to cover the full keyspace without gaps or overlaps.
+
+The numbers below are **illustrative**, not actual hashes or application-visible identifiers:
+
+```text
+Before:  [0, end)       -> Range A -> owner Node 1
+
+After:   [0, 50)        -> Range A -> owner Node 1
+         [50, end)      -> Range B -> owner Node 2
+
+hash(order-123) = 27    -> Range A
+hash(order-456) = 83    -> Range B
+```
+
+Intervals are half-open: a token exactly equal to `50` belongs to the right-hand range. Ranges describe **which keys route together**, not a time interval, payload prefix, or public slice of a Feed's record offsets. A range has an internal RangeId, generation, append owner, RF3 replica assignment, CommitPosition, storage files, and Writer deduplication state. Feed creation does not ask for any of these.
+
+### Ordering and parallelism: an important difference
+
+Kafka preserves append order **within one partition**; two distinct keys sent to that same partition share that log's order, even if the application does not need an ordering relationship between them. Kafka's default key-based partitioning normally keeps a key on one partition for a stable partition count, but changing the count or partitioner can change where subsequent records for that key go. Applications that rely on per-key history across such changes must account for that behavior.
+
+Whitewater makes the same-Feed/same-Key accepted order the public contract. At any one map generation a key's token maps to exactly one Active Range. Internal splits, merges, and placement changes are intended to preserve that key's order by staging committed history, fencing the old assignment, and changing routing through the Control Plane. Unrelated keys may be processed on different owners; **there is no promised total order over the entire Feed**. In particular, two records accepted on different ranges are not assigned a single public offset sequence. Adding Nodes also does not parallelize one strictly ordered hot key.
+
+The current prototype merges locally available committed range histories for Feed reads using ingest time and MessageId as a presentation order. That is **not** a durable, globally sequenced Feed log or a cross-range ordering guarantee. Readers should use the returned Cursor as an opaque continuation token, not sort by ingest time or infer a range position.
+
+### What changes during a split, merge, or move?
+
+- **Split:** One key-token interval becomes two adjacent intervals. Whitewater stages the committed source history into both candidate generations, filters by key, checks RF3 evidence, briefly freezes the source for the final boundary, then activates the candidate RangeMap through consensus. The split gives unrelated keys opportunities to use separate owners; it does not divide one key.
+- **Merge:** Two adjacent cold intervals become one. A candidate generation combines their committed histories and Writer state before the one-range map is activated. A merge reduces internal overhead; it does not rewrite the Feed's public identity.
+- **Move:** A range can retain its key bounds and RangeId while its replica/owner assignment changes. The current implementation has a consensus-backed **follower replacement foundation** and local four-Node copy/freeze tests; authenticated remote transfer, a live four-Node acceptance test, append-owner movement, and automatic draining are **not yet complete**.
+
+A split or merge can change internal physical positions and generations; Writer sequencing must be reconstructed or scoped internally. A movement can advance an ownership epoch to fence stale replicas or owners. Clients continue addressing the same Feed and Key and retaining their original Cursors. A brief freeze can make an append retryable; the client should retry with the same request identity rather than inventing a new logical record.
+
+### Cursors, readers, and today's limits
+
+A Kafka consumer commonly tracks `(topic, partition, offset)`. A Whitewater Reader instead receives and returns a Cursor associated with a committed record; the client never has to derive a new physical position after a split. The split/merge tests exercise preservation of record-attached Cursors through generation changes, and named Reader sessions track delivered progress separately from acknowledged progress.
+
+This is an **early implementation**, not yet a claim of unlimited cross-Node continuation: the current multi-range read path scans up to 10,000 committed records **per locally available range**, merges that local data, and finds the supplied Cursor in the result. It does not yet fetch every range from remote owners or offer a scalable global read index for arbitrary-length histories. A Cursor outside the scanned/local committed prefix may therefore be reported as unknown. Full cross-Node, long-history Cursor continuity is remaining work; an opaque Cursor is the API shape, not proof that every planned migration and retention scenario is already implemented.
+
+### Operator view versus developer view
+
+Developers should not choose a range count, assign a Reader to a range, handle partition rebalances, or react to range-movement callbacks. Operators can inspect internal placement and in-progress topology plans to diagnose why a Feed is busy or a move is deferred; that inspection is **not** part of the application contract. Whitewater must eventually automate cold/hot placement, bounded movement, failure-domain separation, and safe Node drain rather than merely hiding the corresponding Kafka responsibilities. See [Milestone 4 and its evidence](tasks.md#milestone-4--multiple-internal-ranges) for what is currently implemented, in progress, or planned.
 
 ## Kafka-to-Whitewater equivalents
 

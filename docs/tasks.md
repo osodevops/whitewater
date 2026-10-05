@@ -652,7 +652,7 @@ Definition of Done:
 - [x] Split hot ranges online from sustained per-range append pressure with sampled key-token boundaries, cooldown, authenticated RF3 staging, and Control Plane cutover.
 - [x] Merge cold adjacent ranges using leader-aggregated cross-owner metrics, sustained low-rate evidence, cooldown, authenticated RF3 staging, rollback, Writer-state rebuild, and atomic activation.
 - [~] Move ranges while preserving same-Key ordering: a consensus-persisted follower-replacement plan, bounded verified catch-up, owner-side majority-draining freeze, and evidence-gated RF3 activation are covered in four-Node local tests; authenticated remote transfer, live four-Node acceptance, and append-owner movement remain.
-- [x] Keep existing opaque Cursors valid across generation changes by merging committed candidate histories in ingest order.
+- [~] Keep opaque Cursors usable across range changes: local split/merge tests preserve record-attached Cursors, but scalable cross-Node continuation beyond the locally scanned committed prefix remains.
 - [ ] Add hot-key detection and isolation.
 
 Evidence:
