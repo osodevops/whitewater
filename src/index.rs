@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use fjall::Readable;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -276,6 +277,225 @@ fn bounded(key: Vec<u8>) -> Result<Vec<u8>, IndexKeyError> {
     Ok(key)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexRow {
+    pub reference: PrimaryRef,
+    pub payload: Vec<u8>,
+    pub entries: Vec<IndexEntry>,
+    pub applied_cursor: String,
+}
+
+#[derive(Debug, Error)]
+pub enum IndexStoreError {
+    #[error(transparent)]
+    Key(#[from] IndexKeyError),
+    #[error(transparent)]
+    Engine(#[from] fjall::Error),
+    #[error(transparent)]
+    Serialization(#[from] serde_json::Error),
+    #[error("a secondary Index entry points to a missing or inconsistent primary row")]
+    DanglingPosting,
+    #[error("an Index Cursor is empty or not valid UTF-8")]
+    InvalidCursor,
+    #[error("an Index primary row does not match its logical reference")]
+    CorruptPrimary,
+    #[error("the same Cursor cannot change an Index primary row twice")]
+    CursorConflict,
+    #[error("an Index projection exceeds the 4 MiB local storage limit")]
+    RowTooLarge,
+    #[error("an Index lookup limit must be between 1 and 1,000")]
+    InvalidLimit,
+    #[error("an Index lookup result exceeds the 16 MiB limit")]
+    QueryTooLarge,
+}
+
+pub struct FjallIndexStore {
+    db: fjall::SingleWriterTxDatabase,
+    primary: fjall::SingleWriterTxKeyspace,
+    entries: fjall::SingleWriterTxKeyspace,
+    checkpoints: fjall::SingleWriterTxKeyspace,
+}
+
+impl FjallIndexStore {
+    pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, IndexStoreError> {
+        let db = fjall::SingleWriterTxDatabase::builder(path).open()?;
+        let primary = db.keyspace(PRIMARY_KEYSPACE, fjall::KeyspaceCreateOptions::default)?;
+        let entries = db.keyspace(ENTRIES_KEYSPACE, fjall::KeyspaceCreateOptions::default)?;
+        let checkpoints =
+            db.keyspace(CHECKPOINT_KEYSPACE, fjall::KeyspaceCreateOptions::default)?;
+        Ok(Self {
+            db,
+            primary,
+            entries,
+            checkpoints,
+        })
+    }
+
+    pub fn keyspace_count(&self) -> usize {
+        self.db.keyspace_count()
+    }
+
+    pub fn upsert(
+        &self,
+        reference: &PrimaryRef,
+        payload: &[u8],
+        entries: &[IndexEntry],
+        cursor: &str,
+    ) -> Result<(), IndexStoreError> {
+        if cursor.is_empty() || cursor.len() > 512 {
+            return Err(IndexStoreError::InvalidCursor);
+        }
+        if payload.len() > 4 * 1024 * 1024 || entries.len() > 64 {
+            return Err(IndexStoreError::RowTooLarge);
+        }
+        let key = primary_key(reference)?;
+        plan_projection_change(reference, &[], entries)?;
+        let row = IndexRow {
+            reference: reference.clone(),
+            payload: payload.to_vec(),
+            entries: entries.to_vec(),
+            applied_cursor: cursor.to_owned(),
+        };
+        let encoded = serde_json::to_vec(&row)?;
+        if encoded.len() > 4 * 1024 * 1024 {
+            return Err(IndexStoreError::RowTooLarge);
+        }
+        let mut tx = self
+            .db
+            .write_tx()
+            .durability(Some(fjall::PersistMode::SyncAll));
+        let previous = tx
+            .get(&self.primary, &key)?
+            .map(|bytes| serde_json::from_slice::<IndexRow>(&bytes))
+            .transpose()?;
+        if let Some(previous) = &previous {
+            if previous.reference != *reference {
+                return Err(IndexStoreError::CorruptPrimary);
+            }
+            if previous.applied_cursor == cursor && previous != &row {
+                return Err(IndexStoreError::CursorConflict);
+            }
+        }
+        let previous_entries = previous
+            .as_ref()
+            .map_or(&[][..], |row| row.entries.as_slice());
+        let plan = plan_projection_change(reference, previous_entries, entries)?;
+        for (claim, _) in &plan.unique_claims {
+            let existing = tx.get(&self.entries, claim)?;
+            validate_unique_claim(existing.as_deref(), reference)?;
+        }
+        for key in plan.removals.into_iter().chain(plan.unique_releases) {
+            tx.remove(&self.entries, key);
+        }
+        for (key, _) in plan.insertions {
+            tx.insert(&self.entries, key, plan.primary_key.clone());
+        }
+        for (key, value) in plan.unique_claims {
+            tx.insert(&self.entries, key, value);
+        }
+        tx.insert(&self.primary, key, encoded);
+        for entry in entries {
+            tx.insert(&self.checkpoints, entry.id.0.as_bytes(), cursor.as_bytes());
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete(&self, reference: &PrimaryRef, cursor: &str) -> Result<bool, IndexStoreError> {
+        if cursor.is_empty() || cursor.len() > 512 {
+            return Err(IndexStoreError::InvalidCursor);
+        }
+        let key = primary_key(reference)?;
+        let mut tx = self
+            .db
+            .write_tx()
+            .durability(Some(fjall::PersistMode::SyncAll));
+        let Some(previous) = tx.get(&self.primary, &key)? else {
+            return Ok(false);
+        };
+        let previous: IndexRow = serde_json::from_slice(&previous)?;
+        if previous.reference != *reference {
+            return Err(IndexStoreError::CorruptPrimary);
+        }
+        if previous.applied_cursor == cursor {
+            return Err(IndexStoreError::CursorConflict);
+        }
+        let plan = plan_projection_change(reference, &previous.entries, &[])?;
+        for key in plan.removals.into_iter().chain(plan.unique_releases) {
+            tx.remove(&self.entries, key);
+        }
+        tx.remove(&self.primary, key);
+        for entry in &previous.entries {
+            tx.insert(&self.checkpoints, entry.id.0.as_bytes(), cursor.as_bytes());
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+
+    pub fn get(&self, reference: &PrimaryRef) -> Result<Option<IndexRow>, IndexStoreError> {
+        let key = primary_key(reference)?;
+        let Some(bytes) = self.db.read_tx().get(&self.primary, key)? else {
+            return Ok(None);
+        };
+        let row: IndexRow = serde_json::from_slice(&bytes)?;
+        if row.reference != *reference {
+            return Err(IndexStoreError::CorruptPrimary);
+        }
+        Ok(Some(row))
+    }
+
+    pub fn lookup_exact(
+        &self,
+        id: IndexId,
+        values: &[IndexValue],
+        limit: usize,
+    ) -> Result<Vec<IndexRow>, IndexStoreError> {
+        validate_fields(values)?;
+        if !(1..=1_000).contains(&limit) {
+            return Err(IndexStoreError::InvalidLimit);
+        }
+        let prefix = posting_prefix(id, values)?;
+        let snapshot = self.db.read_tx();
+        let mut rows = Vec::new();
+        let mut bytes_seen = 0_usize;
+        for entry in snapshot.prefix(&self.entries, prefix).take(limit) {
+            let (_, reference_key) = entry.into_inner()?;
+            let stored = snapshot
+                .get(&self.primary, &reference_key)?
+                .ok_or(IndexStoreError::DanglingPosting)?;
+            bytes_seen = bytes_seen
+                .checked_add(stored.len())
+                .ok_or(IndexStoreError::QueryTooLarge)?;
+            if bytes_seen > 16 * 1024 * 1024 {
+                return Err(IndexStoreError::QueryTooLarge);
+            }
+            let row: IndexRow = serde_json::from_slice(&stored)?;
+            if primary_key(&row.reference)?.as_slice() != &*reference_key
+                || !row
+                    .entries
+                    .iter()
+                    .any(|entry| entry.id == id && entry.values == values)
+            {
+                return Err(IndexStoreError::DanglingPosting);
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    pub fn last_applied(&self, id: IndexId) -> Result<Option<String>, IndexStoreError> {
+        self.db
+            .read_tx()
+            .get(&self.checkpoints, id.0.as_bytes())?
+            .map(|bytes| {
+                std::str::from_utf8(&bytes)
+                    .map(str::to_owned)
+                    .map_err(|_| IndexStoreError::InvalidCursor)
+            })
+            .transpose()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,5 +676,160 @@ mod tests {
             plan_projection_change(&reference(b"k"), &[value.clone(), value], &[]),
             Err(IndexKeyError::DuplicateIndex(IndexId(Uuid::from_u128(2))))
         );
+    }
+
+    #[test]
+    fn fjall_primary_and_city_index_survive_restart_without_a_keyspace_per_index() {
+        let directory = tempfile::tempdir().unwrap();
+        let city = entry(IndexValue::Text("London".to_owned()), false);
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+        for (key, location) in [
+            (b"alice".as_slice(), "London"),
+            (b"bob".as_slice(), "London"),
+            (b"charlie".as_slice(), "Paris"),
+        ] {
+            store
+                .upsert(
+                    &reference(key),
+                    location.as_bytes(),
+                    &[entry(IndexValue::Text(location.to_owned()), false)],
+                    "cursor-1",
+                )
+                .unwrap();
+        }
+        let age = IndexEntry {
+            id: IndexId(Uuid::from_u128(3)),
+            values: vec![IndexValue::I64(23)],
+            unique: false,
+        };
+        store
+            .upsert(
+                &reference(b"alice"),
+                b"London",
+                &[city.clone(), age.clone()],
+                "cursor-2",
+            )
+            .unwrap();
+        assert_eq!(store.keyspace_count(), 3);
+        assert_eq!(
+            store.lookup_exact(age.id, &age.values, 10).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            store.lookup_exact(city.id, &city.values, 10).unwrap().len(),
+            2
+        );
+        drop(store);
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+        let london = store.lookup_exact(city.id, &city.values, 10).unwrap();
+        assert_eq!(
+            london
+                .iter()
+                .map(|row| row.reference.application_key.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"alice".as_slice(), b"bob".as_slice()]
+        );
+        assert_eq!(
+            store.get(&reference(b"charlie")).unwrap().unwrap().payload,
+            b"Paris"
+        );
+        assert_eq!(
+            store.last_applied(city.id).unwrap().as_deref(),
+            Some("cursor-2")
+        );
+    }
+
+    #[test]
+    fn fjall_single_writer_transaction_serializes_local_unique_claims() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+        let unique = entry(IndexValue::Text("same".to_owned()), true);
+        let (alice, bob) = std::thread::scope(|threads| {
+            let first = threads.spawn(|| {
+                store.upsert(
+                    &reference(b"alice"),
+                    b"first",
+                    std::slice::from_ref(&unique),
+                    "cursor-a",
+                )
+            });
+            let second = threads.spawn(|| {
+                store.upsert(
+                    &reference(b"bob"),
+                    b"second",
+                    std::slice::from_ref(&unique),
+                    "cursor-b",
+                )
+            });
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        assert!(alice.is_ok() ^ bob.is_ok());
+        assert_eq!(
+            store
+                .lookup_exact(unique.id, &unique.values, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn fjall_update_delete_and_conflict_leave_no_stale_postings() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+        let london = entry(IndexValue::Text("London".to_owned()), true);
+        let paris = entry(IndexValue::Text("Paris".to_owned()), true);
+        store
+            .upsert(
+                &reference(b"alice"),
+                b"original",
+                std::slice::from_ref(&london),
+                "cursor-1",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.upsert(
+                &reference(b"alice"),
+                b"changed-without-new-cursor",
+                std::slice::from_ref(&london),
+                "cursor-1",
+            ),
+            Err(IndexStoreError::CursorConflict)
+        ));
+        assert!(store
+            .upsert(
+                &reference(b"bob"),
+                b"conflict",
+                std::slice::from_ref(&london),
+                "cursor-2"
+            )
+            .is_err());
+        assert!(store.get(&reference(b"bob")).unwrap().is_none());
+        assert_eq!(
+            store.last_applied(london.id).unwrap().as_deref(),
+            Some("cursor-1")
+        );
+        store
+            .upsert(
+                &reference(b"alice"),
+                b"moved",
+                std::slice::from_ref(&paris),
+                "cursor-3",
+            )
+            .unwrap();
+        assert!(store
+            .lookup_exact(london.id, &london.values, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.lookup_exact(paris.id, &paris.values, 10).unwrap()[0].payload,
+            b"moved"
+        );
+        assert!(store.delete(&reference(b"alice"), "cursor-4").unwrap());
+        assert!(store
+            .lookup_exact(paris.id, &paris.values, 10)
+            .unwrap()
+            .is_empty());
+        assert!(store.get(&reference(b"alice")).unwrap().is_none());
     }
 }

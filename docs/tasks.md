@@ -23,7 +23,7 @@
 
 **Milestone 4 — Multiple internal ranges**
 
-The current delivery track is multiple internal Active Ranges. In parallel, the core Index model is being specified and encoded under [Milestone 6](#milestone-6--persisted-replicated-indexes): application-defined secondary Indexes are a foundational storage requirement, **not** a future performance optimization. They are not yet persisted or available on the live append/query path; the Index transaction and RF3 boundary must be proven before claiming database-style lookup or `CREATE INDEX` support.
+The current delivery track is multiple internal Active Ranges. In parallel, the core Index model is being specified and encoded under [Milestone 6](#milestone-6--persisted-replicated-indexes): application-defined secondary Indexes are a foundational storage requirement, **not** a future performance optimization. An isolated Fjall prototype persists primary rows and shared secondary entries with local transactions, but no Index is yet available on the live Feed append/query path; the cross-store commit and RF3 boundary must be proven before claiming database-style lookup or `CREATE INDEX` support.
 
 ---
 
@@ -696,9 +696,10 @@ Definition of Done:
 
 ## Milestone 6 — Persisted replicated Indexes
 
-**Core storage requirement, not an optional optimization.** [Index storage contract and Fjall key layout](why-whitewater.md#index-storage-contract-and-fjall-layout) defines the work. The model/key codec exists, but the current Feed append path is a separate file log and does **not** transactionally update a persisted Index. Keep M4 as the single current-focus milestone while establishing this parallel foundation; do not expose incomplete Indexes as queryable resources.
+**Core storage requirement, not an optional optimization.** [Index storage contract and Fjall key layout](why-whitewater.md#index-storage-contract-and-fjall-layout) defines the work. The model/key codec and an isolated local Fjall Index prototype exist, but the current Feed append path is a separate file log and does **not** transactionally update the Index. Keep M4 as the single current-focus milestone while prioritizing production Index delivery before role-aware elasticity; do not expose this prototype as an application-queryable resource.
 
 - [x] Define an internal IndexId, stable logical primary reference, shared secondary/unique-claim key encoding, composite/prefix/range access, and an update/delete mutation planner with focused unit tests (`src/index.rs`).
+- [x] Prototype a locally durable Fjall-backed Index with a fixed three-keyspace layout, serializable primary/posting/checkpoint upserts and deletes, bounded exact secondary lookups, local uniqueness checks, and restart/concurrent-conflict tests (`src/index.rs`). This does not implement distributed uniqueness or Feed-to-Index atomicity.
 - [ ] Define and persist versioned application-owned Index definitions with typed fields/extractors, collation, consistency, scope, and build state through the Control Plane.
 - [ ] Benchmark vetted Fjall, redb, and RocksDB reference workloads: many user Indexes sharing a bounded number of LSM trees, mixed writes/reads, crashes, compaction stalls, and replication/checkpoint cost.
 - [ ] Select and integrate an Index Engine behind a narrow transactional interface; validate serializable read-modify-write, durable batch semantics, and memory/disk budgets.

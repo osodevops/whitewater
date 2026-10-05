@@ -25,6 +25,7 @@ This repository contains a replicated streaming correctness foundation, internal
 
 - Durable checksummed binary append log
 - Active Range storage with atomic state, persisted durability positions and Writer deduplication, committed segment rotation, torn-tail recovery, and safe uncommitted-tail truncation
+- Isolated local Fjall Index prototype with transactional current-state primary rows and shared secondary entries; not wired to replicated Feed commits or public Index queries
 - Consensus-persisted fixed RF3 Active Range placement with epoch-fenced ownership and authenticated inspection
 - Authenticated bounded internal replica append protocol with exact-frame durability, checksum validation, position fencing, and structured rejection
 - Owner-side concurrent RF3 replication with two-of-three durable frame and CommitPosition evidence before success

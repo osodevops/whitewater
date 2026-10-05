@@ -13,6 +13,7 @@ axum = { version = "0.7.9", features = ["macros"] }
 base64 = "0.22.1"
 blake3 = "1.5.5"
 crc32fast = "1.4.2"
+fjall = "=3.1.10"
 openraft = { version = "=0.9.21", features = ["serde"] }
 reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0.217", features = ["derive"] }
