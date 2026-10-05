@@ -1,8 +1,8 @@
 # Whitewater Streams and cross-language client contract
 
-**Status:** Product contract and delivery plan. The Rust Admin/Writer/Reader HTTP client foundation exists; there is no supported Python, Java, or C# library yet. Shared Subscriptions, Pipes, replicated StateStore queries, and atomic processing effects are not implemented. Illustrative processing flows below are **not runnable APIs**.
+**Status:** Product contract and delivery plan. The Rust Admin/Writer/Reader HTTP client foundation exists; there are no supported Python, Java, C#, Node.js/TypeScript, or Go libraries yet. Shared Subscriptions, Pipes, replicated StateStore queries, and atomic processing effects are not implemented. Illustrative processing flows below are **not runnable APIs**.
 
-Whitewater Streams should not repeat Kafka Streams' Java-only experience. Rust, Python, Java, and C# applications must have the **same logical operations and guarantees**, with idiomatic language syntax. Server-side Pipes and StateStores are shared Fabric capabilities, not four unrelated implementations of local state or co-partitioning. See [Kafka pain points](kafka-pain-points.md) and the [Index storage contract](why-whitewater.md#index-storage-contract-and-fjall-layout).
+Whitewater Streams should not repeat Kafka Streams' Java-only experience. Rust, Python, Java, C#, Node.js/TypeScript, and Go applications must have the **same logical operations and guarantees**, with idiomatic language syntax. Server-side Pipes and StateStores are shared Fabric capabilities, not six unrelated implementations of local state or co-partitioning. See [Kafka pain points](kafka-pain-points.md) and the [Index storage contract](why-whitewater.md#index-storage-contract-and-fjall-layout).
 
 ## Public model and ownership
 
@@ -16,7 +16,7 @@ Writers submit Feed, application Key, bytes, Metadata, event time, and a stable 
 
 Same-Feed/same-Key accepted order is guaranteed; there is no total order across unrelated Keys or Feeds. A Reader can receive a record again after an ambiguous result or crash. Whitewater must deduplicate committed **effects**, not promise that every delivery occurs once. External databases, email, and other outside side effects are not part of a Whitewater transaction.
 
-## One semantic protocol, four idiomatic libraries
+## One semantic protocol, six idiomatic libraries
 
 | Operation | Semantics every SDK must preserve | Current server status |
 |---|---|---|
@@ -29,7 +29,7 @@ Same-Feed/same-Key accepted order is guaranteed; there is no total order across 
 
 The wire format is an implementation detail; today's HTTP/JSON must have a versioned, language-neutral schema and conformance fixtures before any SDK claims parity. Library versions negotiate supported server capabilities and **fail explicitly** rather than silently omitting an operation or weakening durability.
 
-Every language maps bytes to native byte arrays, a UUID to the native UUID type, signed nanosecond time to a full signed 64-bit integer, and an opaque Cursor to an uninterpreted value. Metadata contains bounded names and byte values; `Headers` is reserved for HTTP. A schema/JSON convenience layer is optional and must not change byte-level Writer/Reader behavior.
+Every language maps bytes to native byte arrays, a UUID to a native UUID type or canonical string, signed nanosecond time to a full signed 64-bit integer, and an opaque Cursor to an uninterpreted value. Node.js/TypeScript must use `bigint` (and decimal strings over JSON), **not** a JavaScript `number` that loses precision at nanosecond epoch values. Metadata contains bounded names and byte values; `Headers` is reserved for HTTP. A schema/JSON convenience layer is optional and must not change byte-level Writer/Reader behavior.
 
 ### Idiomatic façades, identical state transitions
 
@@ -37,6 +37,10 @@ Every language maps bytes to native byte arrays, a UUID to the native UUID type,
 - **Python:** provide `async` and synchronous façades around the same semantics, context-managed sessions, native `bytes`, `uuid.UUID`, integer nanoseconds, bounded streaming and cancellation. A Python example script is not an SDK.
 - **Java:** provide asynchronous `CompletionStage`/stream consumption and optional blocking wrappers. No privileged server features, embedded mandatory RocksDB, or Java-only Pipe DSL.
 - **C#:** provide `Task`/`IAsyncEnumerable`, `byte[]`/`ReadOnlyMemory<byte>`, `Guid`, `long` nanoseconds, cancellation tokens, and the same Writer/Reader/processing effect guarantees.
+- **Node.js/TypeScript:** provide typed Promise/AsyncIterable APIs, `Buffer`/`Uint8Array`, `bigint` nanoseconds, `AbortSignal`, bounded backpressure, stable request IDs across reconnects, and explicit TLS/capability failures. Publish JavaScript consumption from the same supported Node package; never convert 64-bit record times to `number`.
+- **Go:** provide `context.Context` cancellation, `[]byte` payload/Metadata, signed `int64` nanoseconds, bounded Reader iteration, and the same explicit retry/ambiguity contract without exposing internal placement.
+
+A browser JavaScript SDK is **not** automatically the Node.js SDK: browser clients must not hold server-side admin keys. Consider a separate browser-safe gateway/scoped short-lived identity contract after production authentication is proven. C, C++, Ruby, PHP, and other language packages can follow demonstrated demand and the same conformance gate; adding their names does not silently commit Whitewater to supporting untested runtimes.
 
 Keep shared behavior in a small language-neutral contract and per-language conformance suites, not a requirement to imitate one language's API names. Generated wire DTOs may share a schema; retry state, cancellation, and user-facing APIs should remain idiomatic and independently tested.
 

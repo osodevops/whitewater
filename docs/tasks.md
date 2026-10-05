@@ -733,7 +733,7 @@ Definition of Done:
 - [ ] Implement deterministic retry after ambiguous result.
 - [ ] Implement a topology-free point-lookup enrichment Pipe: read a Feed, extract userId, fetch a versioned user StateStore row regardless of storage range, write an output Feed, and atomically record input progress plus output identity. Missing user or lagging state follows an explicit retry/quarantine policy.
 - [ ] Run a live three-Node acceptance with User Writer updates, Reader redelivery, Node restart/owner change, userId enrichment, and same-request retries; prove exactly one committed output effect and no acknowledged input loss without co-partition configuration.
-- [ ] Require the same enrichment semantics, retry/error contract, and runnable guide in Rust, Python, Java, and C# through the [shared SDK conformance plan](streams-clients.md) before calling Whitewater Streams supported.
+- [ ] Require the same enrichment semantics, retry/error contract, and runnable guide in Rust, Python, Java, C#, Node.js/TypeScript, and Go through the [shared SDK conformance plan](streams-clients.md) before calling Whitewater Streams supported.
 
 Definition of Done:
 
@@ -744,7 +744,7 @@ Definition of Done:
 
 ## Cross-cutting delivery — Whitewater Streams SDK parity and guides
 
-[Contract and guide sequence](streams-clients.md). This is scheduled product work across M2/M3 (existing Rust Writer/Reader), M6 (replicated StateStores), M7 (Subscriptions/Pipes/effects), and M9 (security/compatibility). It is not a second current-focus milestone and does not imply that Python, Java, or C# packages exist today. Unlike Kafka Streams, no language is a privileged processing runtime.
+[Contract and guide sequence](streams-clients.md). This is scheduled product work across M2/M3 (existing Rust Writer/Reader), M6 (replicated StateStores), M7 (Subscriptions/Pipes/effects), and M9 (security/compatibility). It is not a second current-focus milestone and does not imply that Python, Java, C#, Node.js/TypeScript, or Go packages exist today. Unlike Kafka Streams, no language is a privileged processing runtime.
 
 - [x] Define the intended language-neutral Writer, Reader, Subscription, StateStore, Pipe, Cursor, ordering, and idempotent effect semantics; publish the guide/conformance delivery plan (`docs/streams-clients.md`).
 - [ ] Version and publish canonical language-neutral request/response schemas, capability negotiation, TLS/auth defaults, byte/Metadata/nanosecond encodings, and bounded transport limits without exposing Active Range topology.
@@ -753,13 +753,15 @@ Definition of Done:
 - [ ] Implement Python async and sync clients with the same server contract and a runnable Writer/Reader quickstart, then the same StateStore/Pipe guide when implemented.
 - [ ] Implement Java asynchronous and optional blocking clients with the same server contract; no Java-only Pipe or local-state semantics.
 - [ ] Implement C# Task/IAsyncEnumerable clients with the same server contract, cancellation, and native byte/Guid/long representations.
-- [ ] Run one shared three-Node conformance suite for all four libraries: exact bytes/time/Cursor results, identical duplicate and conflicting retries, stale epochs, Reader redelivery/ack, bounded capacity, loss of an owner, restart, authentication errors, and later atomic enrichment/state freshness.
+- [ ] Implement a Node.js/TypeScript client with Promise/AsyncIterable, Buffer/Uint8Array, AbortSignal, and `bigint` nanoseconds serialized as decimal JSON strings; never expose 64-bit time as an imprecise JS number.
+- [ ] Implement a Go client with context.Context cancellation, []byte records/Metadata, int64 nanoseconds, bounded iteration, and the same ambiguity/idempotency guarantees.
+- [ ] Run one shared three-Node conformance suite for all six libraries: exact bytes/time/Cursor results, identical duplicate and conflicting retries, stale epochs, Reader redelivery/ack, bounded capacity, loss of an owner, restart, authentication errors, and later atomic enrichment/state freshness.
 - [ ] Provide per-language unit-test doubles and publish matching runnable user guides for append/read/replay, state/index queries, enrichment, failure policy, migration from Kafka Streams, and safe operator diagnostics; mark chapters unsupported until server and SDK evidence passes.
 - [ ] Verify package compatibility across supported runtimes, reproducible releases, and a published support matrix so no language quietly lacks a documented core operation.
 
 Definition of Done:
 
-- [ ] Rust, Python, Java, and C# applications can run the same named Whitewater Streams scenarios with equivalent results and retry safety, without choosing a range or co-partitioning.
+- [ ] Rust, Python, Java, C#, Node.js/TypeScript, and Go applications can run the same named Whitewater Streams scenarios with equivalent results and retry safety, without choosing a range or co-partitioning.
 - [ ] Every published guide is executable against a supported three-Node Fabric, and unsupported operations fail explicitly.
 
 ## Milestone 8 — Tiered history

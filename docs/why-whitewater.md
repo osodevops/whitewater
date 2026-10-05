@@ -550,7 +550,8 @@ The selection must still follow benchmarks and fault tests using Whitewater's re
 - Server-advertised backoff and overload signals
 - Small binary protocol with negotiated extensions
 - Generated clients from optional schemas
-- First-class async Rust, Java, .NET, Go, Python, JavaScript, and C clients
+- First-class Rust, Python, Java, C#, Node.js/TypeScript, and Go clients with the same [Whitewater Streams semantics and shared conformance suite](streams-clients.md)
+- Evaluate C/C++ and other clients after a stable protocol/ABI and demonstrated demand, without weakening core language parity
 - Connection migration without application-visible ownership events
 
 ### Operations
