@@ -71,15 +71,34 @@ The program never aligns partitions or installs Fjall on its application Node. W
 
 The SDKs and managed Pipe must call **the same server-defined effect boundary**. An application must not simulate exactly-once by calling independent `append` then `ack`: a crash between those calls can duplicate output or lose input. Until server-side atomic effects exist, examples must clearly label separate calls as at-least-once with idempotent output and must not describe them as equivalent to a managed Pipe.
 
+## User guide: rolling state without window plumbing (target contract, not implemented)
+
+A user should express business intent such as **"count events per user in the last five minutes"**. Whitewater should make that a managed Pipe and a queryable, replicated StateStore view. The client must supply a Key/field, aggregation, and business duration; Whitewater cannot infer whether the product needs five minutes or thirty days. The client must **not** choose a slide interval, pane size, partition/co-partition layout, local Fjall store, changelog, timer schedule, or checkpoint strategy. A language-neutral conceptual request is:
+
+```text
+from activity.events
+key by userId
+count last 5m
+materialize as analytics.recent_user_activity
+```
+
+`last 5m` means a rolling interval `(event_time - 5m, event_time]` evaluated for each accepted event, not five-minute tumbling buckets. Event time uses `event_time_ns` by default; an explicitly chosen ingest-time view has different replay semantics. All six SDKs must express the same `last(duration)`/`count`, `sum`, or `average` intent as a typed server-side Pipe definition, not separately implement window engines in six languages. A materialized view's StateStore/Index may answer current per-Key queries, with an applied Cursor/state version and a reported freshness policy.
+
+The Pipe runtime owns bounded incremental aggregates, internally chosen panes, expiry even when no new events arrive, and output updates. A documented bounded lateness/watermark policy belongs to the Pipe or inherited Feed/Space policy; users can override *business lateness* where necessary, but no event may be silently ignored. Late-but-admissible events require idempotent revised results; events beyond policy need an explicit retry/quarantine/final-disposition rule. The retained Feed/checkpoint horizon must cover the window plus allowed lateness and recovery headroom, or admission/rebuild fails clearly. Limit active Keys, state bytes, backfill rate, and CPU per Space; expose cost, watermark, backlog, lateness, and limiting resource.
+
+The **three-Node baseline remains supported**. A fourth Node is not a permanent "window worker" or extra durability quorum. Whitewater assigns small epoch-fenced processing leases to compute-capable Nodes and may move or add compute capacity when pressure warrants it; a fourth Node can carry compute work if present. The RF3 StateStore and input/output progress remain durable on storage Nodes. Worker failure transfers leases and resumes from verified progress without duplicating committed Whitewater effects or weakening availability; compute scale-in cannot remove unique state. A single strictly ordered hot userId still cannot be parallelized automatically.
+
+A managed rolling view is not currently implemented. It depends on RF3 StateStores, Pipe definitions, watermark/lateness handling, and atomic Reader-progress/output/state effects; local Fjall index tests alone do not demonstrate any of these guarantees.
+
 ## Guide set to publish with each SDK
 
-Each language's documentation must run the **same named acceptance scenarios** and show matching results: install/authentication and secure configuration; create or inspect logical resources; idempotent Writer append and batch; temporary and named Reader fetch/ack/replay; shared Subscription and capacity; logical StateStore primary/secondary lookup; manual and Feed-derived state; enrichment Pipe and retry/quarantine; restart/failure recovery; error handling; and migration from Kafka clients/Streams without co-partitioning. Unimplemented chapters are marked planned, not presented as runnable samples. Supply SDK test doubles for application unit tests without a live Fabric, but run every example against a real three-Node Fabric in CI before publishing it.
+Each language's documentation must run the **same named acceptance scenarios** and show matching results: install/authentication and secure configuration; create or inspect logical resources; idempotent Writer append and batch; temporary and named Reader fetch/ack/replay; shared Subscription and capacity; logical StateStore primary/secondary lookup; manual and Feed-derived state; enrichment Pipe and rolling-window count/sum/average with late-event policy; retry/quarantine and restart/failure recovery; error handling; and migration from Kafka clients/Streams without co-partitioning. Unimplemented chapters are marked planned, not presented as runnable samples. Supply SDK test doubles for application unit tests without a live Fabric, but run every example against a real three-Node Fabric in CI before publishing it.
 
 ## Shared release and conformance gate
 
 1. Specify canonical request/response schemas, protocol version/capability negotiation, typed error codes (`retryable`, `ambiguous`, `fenced`, `index_behind`, `authorization`), authentication/TLS, size bounds, and a golden fixture set. No API key is embedded in guides or test fixtures.
 2. Run every SDK against the same three-Node server and the same fixtures: binary Keys/payload/Metadata, negative/large nanosecond times, stable Cursor round trips, duplicate and conflicting Writer retries, stale epochs, Reader redelivery and ack, capacity/cancellation, unavailable Node, mid-flight timeout, and restart.
-3. Add StateStore and Pipe fixtures only when RF3 and atomic processing are implemented: multi-Index update/delete, remote lookup, state version, missing user, state lag, cross-Node routing, unique conflict (when supported), and snapshot/rebuild refusal when history is insufficient.
+3. Add StateStore and Pipe fixtures only when RF3 and atomic processing are implemented: multi-Index update/delete, remote lookup, state version, missing user, state lag, cross-Node routing, unique conflict (when supported), rolling-window boundary and idle expiry, admissible/too-late events, compute-lease failover, and snapshot/rebuild refusal when history is insufficient.
 4. A supported-language release cannot quietly lack a documented core operation. If one language is experimental or a server capability is not ready, say so in its README, version negotiation, and published support matrix. Require package-version compatibility, tests on supported language runtimes, and reproducible build/publish provenance.
 
 The Operations Advisor is not a data plane or SDK substitute; failures of optional tooling must not affect Writers, Readers, or StateStores.

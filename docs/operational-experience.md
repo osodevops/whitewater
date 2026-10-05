@@ -387,12 +387,15 @@ Whitewater response:
 - Index freshness is represented by an applied Cursor.
 - Query routing follows ownership automatically.
 - Checkpoints transfer before replaying the remaining Feed tail.
+- Managed rolling-window Pipes keep durable StateStore state on RF3 storage replicas while epoch-fenced compute leases can run on the baseline three Nodes or move to added compute capacity; no dedicated fourth Node is required.
+- Users choose a business Key, duration, and aggregate, not window panes/slide, co-partitioning, or an application-maintained changelog. Watermarks, late events, state cost, and recovery progress are explained.
 
 Acceptance criteria:
 
 - A point lookup does not scan a Feed.
-- Moving an Index does not require application routing changes.
+- Moving an Index or a rolling-window compute lease does not require application routing changes.
 - Strict reads reject stale replicas rather than silently returning old state.
+- A three-Node Fabric runs the same window contract as a scaled-out Fabric, while late-event handling and compute/state resource costs remain visible.
 
 ### Disaster recovery requiring parallel offset translation
 

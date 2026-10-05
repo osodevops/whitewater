@@ -684,7 +684,7 @@ Definition of Done:
 - [ ] Integrate Node capabilities into placement.
 - [ ] Keep Control voters out of automatic replica-count scaling.
 - [ ] Add storage-capable Nodes gradually when storage/append pressure is high.
-- [ ] Add stateless compute/gateway Nodes when processing or connection pressure is high.
+- [ ] Add stateless compute/gateway Nodes when processing or connection pressure is high; a fourth Node may take rolling-window Pipe leases but is never required or a single window master.
 - [ ] Drain according to capability before scale-in.
 - [ ] Preserve configured baseline pools.
 - [ ] Explain every scaling decision and constrained resource.
@@ -732,16 +732,20 @@ Definition of Done:
 - [ ] Implement atomic consume-and-append.
 - [ ] Include co-located Index mutations in the defined atomic boundary.
 - [ ] Implement deterministic retry after ambiguous result.
+- [ ] Add built-in per-Key rolling-window count/sum/average as managed Pipe/StateStore views: declare the business duration, Key, and aggregation, while Whitewater chooses pane/slide/checkpoint/lease layout; do not require a fourth Node or client-side Fjall.
+- [ ] Define event-time default from `event_time_ns`, optional ingest-time policy, exact rolling boundaries, bounded watermark/grace, idle expiry, late-event revisions or explicit quarantine, versioned results, and retention/rebuild headroom.
+- [ ] Attribute per-Space window state/CPU/backfill cost, enforce active-Key and byte limits, and schedule epoch-fenced compute leases on the supported three-Node baseline with optional role-aware scale-out.
+- [ ] Prove window boundary/overflow, duplicate and out-of-order input, late events, crash/restart, owner change, compute-lease migration, no-input expiry, bounded memory, and a three-to-four-Node run without changing the SDK contract.
 - [ ] Implement a topology-free point-lookup enrichment Pipe: read a Feed, extract userId, fetch a versioned user StateStore row regardless of storage range, write an output Feed, and atomically record input progress plus output identity. Missing user or lagging state follows an explicit retry/quarantine policy.
 - [ ] Run a live three-Node acceptance with User Writer updates, Reader redelivery, Node restart/owner change, userId enrichment, and same-request retries; prove exactly one committed output effect and no acknowledged input loss without co-partition configuration.
-- [ ] Require the same enrichment semantics, retry/error contract, and runnable guide in Rust, Python, Java, C#, Node.js/TypeScript, and Go through the [shared SDK conformance plan](streams-clients.md) before calling Whitewater Streams supported.
+- [ ] Require the same enrichment and rolling-window semantics, retry/error contract, and runnable guide in Rust, Python, Java, C#, Node.js/TypeScript, and Go through the [shared SDK conformance plan](streams-clients.md) before calling Whitewater Streams supported.
 
 Definition of Done:
 
 - [ ] Membership change does not globally pause processing.
 - [ ] Stale Reader cannot acknowledge after lease transfer.
 - [ ] Input progress and Whitewater output effects commit together.
-- [ ] Enrichment never requires a user-defined partition count, topology callback, or application-maintained Fjall/changelog copy.
+- [ ] Enrichment and rolling windows never require a user-defined partition count, co-partition plan, window slide/pane configuration, topology callback, or application-maintained Fjall/changelog copy.
 
 ## Cross-cutting delivery — Whitewater Streams SDK parity and guides
 
@@ -757,7 +761,7 @@ Definition of Done:
 - [ ] Implement a Node.js/TypeScript client with Promise/AsyncIterable, Buffer/Uint8Array, AbortSignal, and `bigint` nanoseconds serialized as decimal JSON strings; never expose 64-bit time as an imprecise JS number.
 - [ ] Implement a Go client with context.Context cancellation, []byte records/Metadata, int64 nanoseconds, bounded iteration, and the same ambiguity/idempotency guarantees.
 - [ ] Run one shared three-Node conformance suite for all six libraries: exact bytes/time/Cursor results, identical duplicate and conflicting retries, stale epochs, Reader redelivery/ack, bounded capacity, loss of an owner, restart, authentication errors, and later atomic enrichment/state freshness.
-- [ ] Provide per-language unit-test doubles and publish matching runnable user guides for append/read/replay, state/index queries, enrichment, failure policy, migration from Kafka Streams, and safe operator diagnostics; mark chapters unsupported until server and SDK evidence passes.
+- [ ] Provide per-language unit-test doubles and publish matching runnable user guides for append/read/replay, state/index queries, enrichment, rolling-window aggregation, late-event policy, failure handling, migration from Kafka Streams, and safe operator diagnostics; mark chapters unsupported until server and SDK evidence passes.
 - [ ] Verify package compatibility across supported runtimes, reproducible releases, and a published support matrix so no language quietly lacks a documented core operation.
 
 Definition of Done:
@@ -813,7 +817,7 @@ These accepted product requirements need dependency review and explicit mileston
 
 - [ ] Define first-class Subscription retry, delayed-delivery, quarantine, skip, and final-disposition workflows.
 - [ ] Define a Schema Policy milestone covering identity, compatibility, admission validation, evolution, and generated clients.
-- [ ] Expand Pipe work into explicit join, window, watermark, grace-period, and late-arrival contracts.
+- [ ] Expand Pipe work beyond M7's scheduled rolling-window/watermark/grace core into stream-to-stream joins, session windows, and cross-Feed event-time alignment/retractions.
 - [ ] Define logical-resource cost attribution for storage, replication, movement, egress, Subscriptions, Pipes, and Indexes.
 - [ ] Define richer Feed inspection, time seek, bounded search, and single-event investigation workflows.
 - [ ] Define end-to-end business-flow tracing through Metadata and logical resource IDs.
