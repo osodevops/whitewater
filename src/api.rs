@@ -34,18 +34,18 @@ use crate::{
         stage_candidate_ranges_local, stage_merged_range_local, ActiveRangeAssignment,
         AppendIdentity, CandidateSplitStagingResult, CommitPosition, ControlPlaneFollowerMove,
         FollowerMoveControl, FollowerMoveCopyResult, KeyToken, MajorityAppendCoordinator,
-        MajorityAppendError, MergeStagingResult, RangeId, RangePosition, RepairExportRequest,
-        RepairExportResponse, RepairFrame, ReplicaAppendRequest, ReplicaAppendResponse,
-        ReplicaAppendService, ReplicaCommitRequest, ReplicaCommitResponse, ReplicaProgressRequest,
-        ReplicaProgressResponse, ReplicaReconcileRequest, ReplicaReconcileResponse, StorageNodeId,
-        MAX_REPLICA_FRAME_BASE64_BYTES,
+        MajorityAppendError, MergeStagingResult, OwnerMoveEvidence, RangeId, RangePosition,
+        RepairExportRequest, RepairExportResponse, RepairFrame, ReplicaAppendRequest,
+        ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitRequest, ReplicaCommitResponse,
+        ReplicaProgressRequest, ReplicaProgressResponse, ReplicaReconcileRequest,
+        ReplicaReconcileResponse, StorageNodeId, MAX_REPLICA_FRAME_BASE64_BYTES,
     },
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
     codec::{decode_record, encode_record, MAX_FRAME_BYTES},
     control::{
         ControlController, ControlError, RangeMergePlan, RangeMovePlan, RangeMoveStage,
-        RangeSplitPlan, ReplicatedCommand,
+        RangeOwnerMovePlan, RangeSplitPlan, ReplicatedCommand,
     },
     control_plane::{
         ControlNodeId, ControlPlane, ControlPlaneError, ControlTypeConfig, FullSnapshotRequest,
@@ -148,6 +148,30 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             authorize_replica_append,
         ));
+    let owner_move_export_route = post(owner_move_export)
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
+    let owner_move_freeze_route = post(owner_move_freeze)
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
+    let owner_move_verify_route = post(owner_move_verify)
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
+    let owner_move_unfreeze_route = post(owner_move_unfreeze)
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
     Router::new()
         .route("/health", get(health))
         .route("/v1/streams", get(list_streams).post(create_stream))
@@ -167,6 +191,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/ranges/split", post(admin_split_range))
         .route("/v1/admin/ranges/merge", post(admin_merge_ranges))
         .route("/v1/admin/ranges/move-follower", post(admin_move_follower))
+        .route("/v1/admin/ranges/move-owner", post(admin_move_owner))
         .route("/v1/admin/control-plane", get(control_plane_status))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route(
@@ -229,6 +254,22 @@ pub fn router(state: AppState) -> Router {
         .route("/internal/active-range/move/stage", move_stage_route)
         .route("/internal/active-range/move/freeze", move_freeze_route)
         .route("/internal/active-range/move/unfreeze", move_unfreeze_route)
+        .route(
+            "/internal/active-range/owner-move/export",
+            owner_move_export_route,
+        )
+        .route(
+            "/internal/active-range/owner-move/freeze",
+            owner_move_freeze_route,
+        )
+        .route(
+            "/internal/active-range/owner-move/verify",
+            owner_move_verify_route,
+        )
+        .route(
+            "/internal/active-range/owner-move/unfreeze",
+            owner_move_unfreeze_route,
+        )
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
         .route(
@@ -1875,7 +1916,12 @@ async fn post_move_request<T: Serialize>(
     path: &str,
     request: &T,
 ) -> Result<serde_json::Value, ApiError> {
-    let timeout = if path == "/internal/active-range/move/stage" {
+    let timeout = if path.ends_with("/unfreeze") {
+        Duration::from_millis(750)
+    } else if matches!(
+        path,
+        "/internal/active-range/move/stage" | "/internal/active-range/owner-move/verify"
+    ) {
         Duration::from_secs(120)
     } else {
         Duration::from_secs(5)
@@ -2055,6 +2101,483 @@ async fn admin_move_follower(
     ))
 }
 
+async fn active_owner_move_plan(
+    state: &AppState,
+    request: &MovePlanRequest,
+) -> Result<RangeOwnerMovePlan, ApiError> {
+    for _ in 0..30 {
+        if let Some(plan) = state.control.owner_move_plan(request.range_id).await {
+            if plan.plan_id == request.plan_id {
+                return Ok(plan);
+            }
+            return Err(ApiError::bad_request("owner move plan is stale"));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(ApiError::unavailable(
+        "owner move plan is not applied on this Node",
+    ))
+}
+
+async fn owner_move_export(
+    State(state): State<AppState>,
+    Json(request): Json<MoveExportRequest>,
+) -> Result<Json<MoveExportResponse>, ApiError> {
+    let plan = active_owner_move_plan(
+        &state,
+        &MovePlanRequest {
+            plan_id: request.plan_id,
+            range_id: request.range_id,
+        },
+    )
+    .await?;
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("replica storage unavailable"))?;
+    if service.local_node() != &plan.source_assignment.owner
+        || state
+            .control
+            .active_range_assignment_by_id(request.range_id)
+            .await
+            != Some(plan.source_assignment.clone())
+        || !service
+            .generation_is_frozen(request.range_id, plan.source_assignment.generation)
+            .await
+    {
+        return Err(ApiError::unavailable(
+            "owner move source is not frozen at the current assignment",
+        ));
+    }
+    let committed = service
+        .recovery_status_for_assignment(&plan.source_assignment)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .committed;
+    if request.expected_commit != Some(committed) {
+        return Err(ApiError::unavailable(
+            "source CommitPosition differs from frozen boundary",
+        ));
+    }
+    let frames = service
+        .export_assignment_committed(&plan.source_assignment, request.after, 1)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .into_iter()
+        .filter(|frame| frame.position.value() <= committed.value())
+        .map(|frame| RepairFrame {
+            position: frame.position,
+            identity: frame.identity,
+            cursor: frame.cursor,
+            frame_base64: STANDARD.encode(frame.frame),
+        })
+        .collect();
+    Ok(Json(MoveExportResponse {
+        source_commit: committed,
+        frames,
+    }))
+}
+
+async fn fetch_owner_move_export(
+    state: &AppState,
+    endpoint: &str,
+    key: &str,
+    request: MoveExportRequest,
+) -> Result<MoveExportResponse, ApiError> {
+    state
+        .internal_http
+        .post(format!(
+            "{}/internal/active-range/owner-move/export",
+            endpoint.trim_end_matches('/')
+        ))
+        .header("x-whitewater-control-key", key)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .error_for_status()
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .json()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))
+}
+
+async fn owner_move_freeze(
+    State(state): State<AppState>,
+    Json(request): Json<MovePlanRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let plan = active_owner_move_plan(&state, &request).await?;
+    let coordinator = state
+        .majority_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Append Owner coordinator is unavailable"))?;
+    let commit = coordinator
+        .freeze_for_follower_move(&plan.source_assignment)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    Ok(Json(json!({ "source_commit": commit })))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OwnerMoveVerifyRequest {
+    plan_id: Uuid,
+    range_id: RangeId,
+    expected_commit: CommitPosition,
+}
+
+async fn owner_move_verify(
+    State(state): State<AppState>,
+    Json(request): Json<OwnerMoveVerifyRequest>,
+) -> Result<Json<OwnerMoveEvidence>, ApiError> {
+    if request.expected_commit.value() > MAX_MOVE_HISTORY_RECORDS {
+        return Err(ApiError::unavailable(
+            "range exceeds the 10,000-record prototype verification bound",
+        ));
+    }
+    let plan = active_owner_move_plan(
+        &state,
+        &MovePlanRequest {
+            plan_id: request.plan_id,
+            range_id: request.range_id,
+        },
+    )
+    .await?;
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("replica storage unavailable"))?;
+    if service.local_node() != &plan.candidate_assignment.owner
+        || state
+            .control
+            .active_range_assignment_by_id(request.range_id)
+            .await
+            != Some(plan.source_assignment.clone())
+    {
+        return Err(ApiError::unavailable(
+            "candidate owner or range placement has changed",
+        ));
+    }
+    service
+        .freeze_generation(request.range_id, plan.source_assignment.generation)
+        .await;
+    let target_commit = service
+        .recovery_status_for_assignment(&plan.source_assignment)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .committed;
+    if target_commit != request.expected_commit {
+        return Err(ApiError::unavailable(
+            "candidate owner is not committed through frozen source boundary",
+        ));
+    }
+    service
+        .truncate_uncommitted_for_assignment(&plan.source_assignment)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    let endpoint = state
+        .control_endpoints
+        .get(&plan.source_assignment.owner)
+        .ok_or_else(|| ApiError::unavailable("current owner endpoint unavailable"))?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("internal credential unavailable"))?;
+    let mut after = None;
+    let mut checksum = blake3::Hasher::new();
+    while after.map_or(0, RangePosition::value) < request.expected_commit.value() {
+        let exported = fetch_owner_move_export(
+            &state,
+            endpoint,
+            key,
+            MoveExportRequest {
+                plan_id: plan.plan_id,
+                range_id: request.range_id,
+                after,
+                expected_commit: Some(request.expected_commit),
+            },
+        )
+        .await?;
+        let frame = exported
+            .frames
+            .first()
+            .ok_or_else(|| ApiError::unavailable("source ended before frozen boundary"))?;
+        let expected = after.map_or(1, |position: RangePosition| {
+            position.value().saturating_add(1)
+        });
+        if frame.position.value() != expected
+            || frame.position.value() > request.expected_commit.value()
+        {
+            return Err(ApiError::unavailable(
+                "source export has a position gap or crossed frozen boundary",
+            ));
+        }
+        let bytes = STANDARD
+            .decode(frame.frame_base64.as_bytes())
+            .map_err(|_| ApiError::unavailable("invalid source frame encoding"))?;
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(ApiError::unavailable("source frame exceeds the size limit"));
+        }
+        let local = service
+            .read_staged_committed(&plan.source_assignment, after, 1)
+            .await
+            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        let target = local
+            .first()
+            .ok_or_else(|| ApiError::unavailable("candidate owner is missing a committed frame"))?;
+        if target.position != frame.position
+            || target.identity != frame.identity
+            || target.cursor != frame.cursor
+            || target.frame != bytes
+        {
+            return Err(ApiError::unavailable(
+                "candidate owner committed bytes differ from source",
+            ));
+        }
+        let digest = blake3::hash(&bytes);
+        checksum.update(&frame.position.value().to_be_bytes());
+        checksum.update(digest.as_bytes());
+        after = Some(frame.position);
+    }
+    let latest = fetch_owner_move_export(
+        &state,
+        endpoint,
+        key,
+        MoveExportRequest {
+            plan_id: plan.plan_id,
+            range_id: request.range_id,
+            after,
+            expected_commit: Some(request.expected_commit),
+        },
+    )
+    .await?
+    .source_commit;
+    let target_commit = service
+        .recovery_status_for_assignment(&plan.source_assignment)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .committed;
+    if latest != request.expected_commit || target_commit != request.expected_commit {
+        return Err(ApiError::unavailable(
+            "owner move CommitPosition changed during verification",
+        ));
+    }
+    Ok(Json(OwnerMoveEvidence {
+        source_commit: latest,
+        target_commit,
+        checksum: *checksum.finalize().as_bytes(),
+        ready: true,
+    }))
+}
+
+async fn owner_move_unfreeze(
+    State(state): State<AppState>,
+    Json(request): Json<MovePlanRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let current = state
+        .control
+        .active_range_assignment_by_id(request.range_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("source assignment unavailable"))?;
+    let plan = state.control.owner_move_plan(request.range_id).await;
+    let permitted = plan.as_ref().is_some_and(|plan| {
+        plan.plan_id == request.plan_id
+            && plan.source_assignment == current
+            && matches!(
+                plan.stage,
+                RangeMoveStage::Prepared | RangeMoveStage::CatchingUp
+            )
+    }) || plan.is_none()
+        && state
+            .control
+            .completed_owner_move(request.range_id)
+            .await
+            .is_some_and(|completed| {
+                completed.plan_id == request.plan_id && completed.candidate_assignment == current
+            });
+    if !permitted {
+        return Err(ApiError::unavailable(
+            "owner movement cutover is unresolved; replica stays frozen",
+        ));
+    }
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("replica storage unavailable"))?;
+    if !current.replicas.contains(service.local_node()) {
+        return Err(ApiError::unavailable("Node is not a current replica"));
+    }
+    service
+        .unfreeze_generation(current.range_id, current.generation)
+        .await;
+    Ok(Json(json!({ "status": "unfrozen" })))
+}
+
+async fn unfreeze_owner_move(
+    state: &AppState,
+    endpoint: &str,
+    key: &str,
+    request: &MovePlanRequest,
+) -> Result<(), ApiError> {
+    for _ in 0..10 {
+        if post_move_request(
+            state,
+            endpoint,
+            key,
+            "/internal/active-range/owner-move/unfreeze",
+            request,
+        )
+        .await
+        .is_ok()
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err(ApiError::unavailable(
+        "owner movement is unresolved; replica remains frozen",
+    ))
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AdminMoveOwnerRequest {
+    pub request_id: Uuid,
+    pub feed: String,
+    pub range_id: RangeId,
+    pub new_owner: StorageNodeId,
+}
+
+async fn admin_move_owner(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AdminMoveOwnerRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let control_plane = state
+        .control_plane
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Control Plane is unavailable"))?;
+    let prepared = control_plane
+        .execute_commands_with_request_id(
+            vec![crate::control::Command::PrepareOwnerMove {
+                feed: request.feed.clone(),
+                range_id: request.range_id,
+                new_owner: request.new_owner,
+            }],
+            request.request_id,
+        )
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let plan: RangeOwnerMovePlan = serde_json::from_value(prepared.results[0].data.clone())
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    let source_endpoint = state
+        .control_endpoints
+        .get(&plan.source_assignment.owner)
+        .ok_or_else(|| ApiError::unavailable("source owner endpoint unavailable"))?;
+    let target_endpoint = state
+        .control_endpoints
+        .get(&plan.candidate_assignment.owner)
+        .ok_or_else(|| ApiError::unavailable("candidate owner endpoint unavailable"))?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("internal credential unavailable"))?;
+    let plan_request = MovePlanRequest {
+        plan_id: plan.plan_id,
+        range_id: plan.source_assignment.range_id,
+    };
+    if state
+        .control
+        .active_range_assignment_by_id(plan_request.range_id)
+        .await
+        == Some(plan.candidate_assignment.clone())
+    {
+        unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
+        unfreeze_owner_move(&state, target_endpoint, key, &plan_request).await?;
+        return Ok(Json(
+            json!({ "status": "activated", "assignment": plan.candidate_assignment }),
+        ));
+    }
+    let frozen = match post_move_request(
+        &state,
+        source_endpoint,
+        key,
+        "/internal/active-range/owner-move/freeze",
+        &plan_request,
+    )
+    .await
+    {
+        Ok(frozen) => frozen,
+        Err(error) => {
+            unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
+            return Err(error);
+        }
+    };
+    let boundary: CommitPosition = match serde_json::from_value(frozen["source_commit"].clone()) {
+        Ok(commit) => commit,
+        Err(error) => {
+            unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
+            return Err(ApiError::unavailable(error.to_string()));
+        }
+    };
+    let evidence = post_move_request(
+        &state,
+        target_endpoint,
+        key,
+        "/internal/active-range/owner-move/verify",
+        &OwnerMoveVerifyRequest {
+            plan_id: plan.plan_id,
+            range_id: plan_request.range_id,
+            expected_commit: boundary,
+        },
+    )
+    .await;
+    let evidence: OwnerMoveEvidence = match evidence {
+        Ok(data) => match serde_json::from_value(data) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
+                unfreeze_owner_move(&state, target_endpoint, key, &plan_request).await?;
+                return Err(ApiError::unavailable(error.to_string()));
+            }
+        },
+        Err(error) => {
+            unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
+            unfreeze_owner_move(&state, target_endpoint, key, &plan_request).await?;
+            return Err(error);
+        }
+    };
+    if !evidence.ready || evidence.source_commit != boundary || evidence.target_commit != boundary {
+        unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
+        unfreeze_owner_move(&state, target_endpoint, key, &plan_request).await?;
+        return Err(ApiError::unavailable(
+            "candidate owner is not verified through frozen source boundary",
+        ));
+    }
+    control_plane
+        .execute_commands(vec![crate::control::Command::RecordOwnerMoveCatchUp {
+            feed: request.feed.clone(),
+            plan_id: plan.plan_id,
+            source_commit: evidence.source_commit,
+            target_commit: evidence.target_commit,
+            checksum_verified: evidence.ready,
+        }])
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    control_plane
+        .execute_commands(vec![crate::control::Command::ActivateOwnerMove {
+            feed: request.feed,
+            plan_id: plan.plan_id,
+        }])
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
+    unfreeze_owner_move(&state, target_endpoint, key, &plan_request).await?;
+    Ok(Json(
+        json!({ "status": "activated", "assignment": plan.candidate_assignment,
+        "committed_position": evidence.target_commit }),
+    ))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ClientAppendRequest {
     request_id: Uuid,
@@ -2138,19 +2661,42 @@ async fn writer_batch_append(
     }))
 }
 
+async fn writer_when_applied(
+    control: &ControlController,
+    name: &str,
+    wait_for_replication: bool,
+) -> Option<crate::control::WriterDefinition> {
+    let mut writer = control.active_writer_by_name(name).await;
+    if writer.is_none() && wait_for_replication {
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            writer = control.active_writer_by_name(name).await;
+            if writer.is_some() {
+                break;
+            }
+        }
+    }
+    writer
+}
+
 async fn writer_session_append(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<WriterSessionAppendRequest>,
 ) -> Result<Json<WriterAppendResponse>, ApiError> {
     authorize_admin(&state, &headers)?;
-    let writer = state
-        .control
-        .active_writer_by_name(&request.writer)
+    let writer = writer_when_applied(&state.control, &request.writer, state.control_plane.is_some())
         .await
         .ok_or_else(|| {
+        if state.control_plane.is_some() {
+            ApiError::unavailable(format!(
+                "Writer {} is not available on this ingress Node; verify it exists or retry with the same request ID",
+                request.writer
+            ))
+        } else {
             ApiError::bad_request(format!("Writer does not exist: {}", request.writer))
-        })?;
+        }
+    })?;
     let feed = state
         .control
         .active_feed_by_id(writer.feed_id)
@@ -2952,6 +3498,51 @@ mod tests {
         assert!(json.get("timestamp_ms").is_none());
     }
 
+    #[tokio::test]
+    async fn writer_lookup_waits_for_committed_metadata_to_apply_on_ingress() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store,
+                ["storage-1", "storage-2", "storage-3"]
+                    .into_iter()
+                    .map(|node| StorageNodeId::try_new(node).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        assert!(writer_when_applied(&control, "orders.writer", false)
+            .await
+            .is_none());
+        let delayed = control.clone();
+        let applied = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            delayed
+                .execute_commands(vec![
+                    Command::CreateSpace {
+                        name: "orders".to_owned(),
+                    },
+                    Command::CreateFeed {
+                        name: "orders.events".to_owned(),
+                    },
+                    Command::CreateWriter {
+                        name: "orders.writer".to_owned(),
+                        feed: "orders.events".to_owned(),
+                    },
+                ])
+                .await
+                .unwrap();
+        });
+        let writer = writer_when_applied(&control, "orders.writer", true)
+            .await
+            .unwrap();
+        assert_eq!(writer.name, "orders.writer");
+        applied.await.unwrap();
+    }
+
     fn admin_test_router(directory: &TempDir) -> Router {
         let store: Arc<dyn LogStore> =
             Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
@@ -3111,7 +3702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn follower_move_transport_authenticates_before_decoding_requests() {
+    async fn movement_transport_authenticates_before_decoding_requests() {
         let directory = TempDir::new().unwrap();
         let (app, control_plane) = internal_replica_test_router(&directory).await;
         for path in [
@@ -3119,6 +3710,10 @@ mod tests {
             "/internal/active-range/move/stage",
             "/internal/active-range/move/freeze",
             "/internal/active-range/move/unfreeze",
+            "/internal/active-range/owner-move/export",
+            "/internal/active-range/owner-move/freeze",
+            "/internal/active-range/owner-move/verify",
+            "/internal/active-range/owner-move/unfreeze",
         ] {
             let request = |credential: Option<&str>| {
                 let mut builder = Request::builder()

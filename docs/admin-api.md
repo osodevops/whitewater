@@ -300,7 +300,30 @@ Placement is an authenticated operator view. Writers and Readers never receive o
 
 The result contains the internal RangeId, generation, current owner, RF3 replica set, ownership epoch, and any candidate owner-movement plans. The standard development Fabric currently treats its three statically configured Control Plane Nodes as storage-capable placement candidates.
 
-The old `transfer_active_range_ownership` typed command is now refused: changing the epoch alone can promote a lagging follower. Internal owner-move planning and local frozen-boundary verification exist, but **no authenticated remote owner-movement endpoint is available yet**. The public typed Admin API rejects owner recovery/readiness/activation commands that require internal Node authority; operators should not attempt to synthesize catch-up evidence or use `recover_active_range_ownership` to move a healthy owner. A guarded admin workflow will be exposed only after live three-Node cutover and retry tests pass.
+The old `transfer_active_range_ownership` typed command is refused: changing the epoch alone can promote a lagging follower. The public typed Admin API also rejects owner recovery/readiness/activation commands requiring internal Node authority; operators must not synthesize catch-up evidence.
+
+### Move the Append Owner (development workflow)
+
+After ensuring that the chosen **current RF3 follower** has caught up, use the authenticated workflow rather than the old metadata-only command:
+
+```http
+POST /v1/admin/ranges/move-owner
+Authorization: Bearer <admin-key>
+Content-Type: application/json
+```
+
+```json
+{
+  "request_id": "98ab0cdf-80c2-45a9-bf62-04e7a2aa137b",
+  "feed": "orders.created",
+  "range_id": "632a51da-5945-4cac-a541-cdb9e63cd5b4",
+  "new_owner": "control-2"
+}
+```
+
+The Control Plane persists an idempotent plan while the old RF3 assignment remains authoritative. The current owner drains in-flight majority appends, freezes its generation, captures its committed boundary, and the candidate freezes and checks identical committed positions, record bytes, identities, and Cursors one frame at a time. Only verified readiness allows compare-and-set activation with a higher ownership epoch; a definite pre-readiness failure unfreezes both, while ambiguous readiness/activation leaves them frozen until the plan is resolved. Retry using the **same request ID** and inspect placement. The owner can change without changing the Feed, RF3 set, or application Cursor.
+
+This is a correctness-first development workflow: the history scan refuses ranges above 10,000 committed records, and development inter-Node HTTP uses a shared internal credential without production mTLS/verified Node identity. `python scripts/test-m4-owner-move.py` exercises an **isolated three-Node** Fabric (ports 7271–7273), including an unavailable target, retry, continued writes, Cursor reads, and a new-owner restart without touching the standard Compose Fabric. Checkpointed large-history verification, throughput budgets, drain scheduling, and production transport security remain planned.
 
 ### Replace a follower replica
 
@@ -324,7 +347,7 @@ Content-Type: application/json
 
 The Control Plane persists the plan but keeps the original RF3 assignment authoritative during bounded, authenticated committed-frame copy. The Append Owner then drains its in-flight quorum writes, freezes the source, truncates only uncommitted tail records, and verifies that the replacement is committed through the final source boundary before one consensus assignment change. The owner is unchanged; the ownership epoch advances, and the removed follower is fenced. The application does not get a topology callback. Retry a failed or timed-out request with the **same** request ID; inspect placement and plan state if the outcome is ambiguous.
 
-The current HTTP staging prototype transfers one bounded record per internal request and refuses ranges above 10,000 committed records; the original RF3 assignment remains active on refusal. The prepared plan remains visible in `INSPECT PLACEMENT`; after confirming activation was not submitted, an operator can clear it with the typed `abort_follower_move` command and its `plan_id`. Checkpointed streaming for larger histories and a foreground-SLO-aware movement budget remain planned. The regular three-Node development Fabric has no spare eligible fourth Node. `compose.m4-move.yml` provides an **isolated, test-only four-voter** Fabric for `python scripts/test-m4-follower-move.py`. This is not production role-separated storage placement. Movement of the append owner and automatic Node drain remain planned.
+The current HTTP staging prototype transfers one bounded record per internal request and refuses ranges above 10,000 committed records; the original RF3 assignment remains active on refusal. The prepared plan remains visible in `INSPECT PLACEMENT`; after confirming activation was not submitted, an operator can clear it with the typed `abort_follower_move` command and its `plan_id`. Checkpointed streaming for larger histories and a foreground-SLO-aware movement budget remain planned. The regular three-Node development Fabric has no spare eligible fourth Node. `compose.m4-move.yml` provides an **isolated, test-only four-voter** Fabric for `python scripts/test-m4-follower-move.py`. This is not production role-separated storage placement. Append Owner movement uses the authenticated development workflow above; automatic Node drain remains planned.
 
 ### Grant
 

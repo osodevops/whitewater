@@ -33,6 +33,7 @@ This repository contains a replicated streaming correctness foundation, internal
 - Topology-free committed-only Feed reads with stateless opaque Cursor continuation
 - Automatic sustained owner-failure recovery with authenticated progress collection, consensus epoch transfer, stale-owner fencing, committed-prefix preservation, and tail truncation
 - Automatic restarted-replica catch-up with bounded exact-frame transfer, checksum verification, deduplication rebuild, corruption quarantine, and readiness gating
+- Development-only authenticated Append Owner movement after verified frozen-boundary catch-up, with isolated three-Node live acceptance; production inter-Node mTLS and drain remain unfinished
 - Hierarchical Feed namespaces with a prototype legacy stream API
 - Opaque stream-scoped Cursors with independent Reader positions
 - Nanosecond `event_time_ns` and `ingest_time_ns` with legacy millisecond decoding
@@ -205,11 +206,22 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
 
-Run the automated M1.7 topology-free three-Node append acceptance test against the Compose Fabric:
+For the complete live acceptance/fault gate, use the separate `compose.verify.yml` Fabric (ports 7371–7373) rather than restarting the standard development Fabric. Set `COMPOSE_FILE=compose.verify.yml` and `WHITEWATER_TEST_BASE_PORT=7371` in the shell running the default three-Node scripts; on PowerShell use `$env:COMPOSE_FILE` and `$env:WHITEWATER_TEST_BASE_PORT`. Run the scripts sequentially:
 
 ```bash
-python scripts/test-m17-topology-free-append.py
+export COMPOSE_FILE=compose.verify.yml WHITEWATER_TEST_BASE_PORT=7371
+docker compose up --build -d
+python scripts/test-m111-fault-suite.py
+python scripts/test-m2-writer-session.py
+python scripts/test-m3-reader-session.py
+python scripts/test-m4-live-split.py
+python scripts/test-m4-auto-split.py
+docker compose stop
+python scripts/test-m4-follower-move.py
+python scripts/test-m4-owner-move.py
 ```
+
+The M1.11 suite runs M1.7, M1.9, and M1.10 and restarts the isolated Fabric; auto-split force-recreates it with test thresholds and restores defaults. Both movement scripts start and stop their own projects without deleting volumes. `docker compose stop` above only stops the isolated verification Fabric. Never point these scripts at a Fabric containing user data.
 
 Without a host Rust toolchain:
 

@@ -3,6 +3,7 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 use async_trait::async_trait;
+use futures_util::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
@@ -243,6 +244,23 @@ pub struct RecoverySupervisor {
     failures: Arc<Mutex<BTreeMap<Uuid, (StorageNodeId, u32)>>>,
 }
 
+async fn probe_active_owners(
+    transport: &dyn RecoveryTransport,
+    assignments: Vec<(String, ActiveRangeAssignment)>,
+) -> Vec<(String, ActiveRangeAssignment, bool)> {
+    stream::iter(assignments)
+        .map(|(feed_name, assignment)| async move {
+            let healthy = transport
+                .progress(&assignment.owner, assignment.feed_id)
+                .await
+                .is_ok();
+            (feed_name, assignment, healthy)
+        })
+        .buffer_unordered(16)
+        .collect()
+        .await
+}
+
 impl RecoverySupervisor {
     pub fn new(
         control: Arc<ControlController>,
@@ -268,13 +286,13 @@ impl RecoverySupervisor {
         if self.control_plane.status().await.state != "leader" {
             return Vec::new();
         }
-        let mut results = Vec::new();
-        for (feed_name, assignment) in self.control.active_feed_assignments().await {
-            let healthy = self
-                .transport
-                .progress(&assignment.owner, assignment.feed_id)
-                .await
-                .is_ok();
+        let mut pending = Vec::new();
+        let probes = probe_active_owners(
+            self.transport.as_ref(),
+            self.control.active_feed_assignments().await,
+        )
+        .await;
+        for (feed_name, assignment, healthy) in probes {
             let should_recover = {
                 let mut failures = self.failures.lock().await;
                 if healthy {
@@ -292,12 +310,18 @@ impl RecoverySupervisor {
                 }
             };
             if should_recover {
-                let result = self.executor.recover(&feed_name, &assignment.owner).await;
-                self.failures.lock().await.remove(&assignment.feed_id);
-                results.push(result);
+                pending.push((feed_name, assignment));
             }
         }
-        results
+        stream::iter(pending)
+            .map(|(feed_name, assignment)| async move {
+                let result = self.executor.recover(&feed_name, &assignment.owner).await;
+                self.failures.lock().await.remove(&assignment.feed_id);
+                result
+            })
+            .buffer_unordered(4)
+            .collect()
+            .await
     }
 }
 
@@ -382,5 +406,90 @@ impl RecoveryTransport for HttpRecoveryTransport {
                 .error
                 .unwrap_or_else(|| "missing reconcile result".to_owned())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::Notify;
+
+    use super::*;
+    use crate::active_range::{RangeGeneration, RangeId, ReplicaSet};
+
+    struct BlockedProbe {
+        first: Uuid,
+        first_seen: Arc<Notify>,
+        second_seen: Arc<Notify>,
+        release_first: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl RecoveryTransport for BlockedProbe {
+        async fn progress(
+            &self,
+            _node: &StorageNodeId,
+            feed_id: Uuid,
+        ) -> Result<ReplicaRecoveryStatus, String> {
+            if feed_id == self.first {
+                self.first_seen.notify_one();
+                self.release_first.notified().await;
+            } else {
+                self.second_seen.notify_one();
+            }
+            Err("owner unavailable".to_owned())
+        }
+
+        async fn reconcile(
+            &self,
+            _node: &StorageNodeId,
+            _request: ReplicaReconcileRequest,
+        ) -> Result<u64, String> {
+            Err("reconcile is not used by a health probe".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_owner_probe_does_not_block_other_feeds() {
+        let first = Uuid::from_u128(1);
+        let transport = Arc::new(BlockedProbe {
+            first,
+            first_seen: Arc::new(Notify::new()),
+            second_seen: Arc::new(Notify::new()),
+            release_first: Arc::new(Notify::new()),
+        });
+        let assignments = [first, Uuid::from_u128(2)]
+            .into_iter()
+            .map(|feed_id| {
+                let owner = StorageNodeId::try_new("storage-1").unwrap();
+                let assignment = ActiveRangeAssignment::try_new(
+                    feed_id,
+                    RangeId::from_uuid(Uuid::new_v4()),
+                    RangeGeneration::new(1),
+                    owner.clone(),
+                    ReplicaSet::try_new([
+                        owner,
+                        StorageNodeId::try_new("storage-2").unwrap(),
+                        StorageNodeId::try_new("storage-3").unwrap(),
+                    ])
+                    .unwrap(),
+                    OwnershipEpoch::new(1),
+                )
+                .unwrap();
+                (format!("feed-{feed_id}"), assignment)
+            })
+            .collect();
+        let probe = transport.clone();
+        let task =
+            tokio::spawn(async move { probe_active_owners(probe.as_ref(), assignments).await });
+        tokio::time::timeout(Duration::from_secs(1), transport.first_seen.notified())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), transport.second_seen.notified())
+            .await
+            .unwrap();
+        transport.release_first.notify_one();
+        let results = task.await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|(_, _, healthy)| !healthy));
     }
 }

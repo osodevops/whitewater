@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import time
@@ -9,7 +10,8 @@ SCRIPTS = [
     "scripts/test-m19-owner-recovery.py",
     "scripts/test-m110-replica-catchup.py",
 ]
-ENDPOINTS = ["http://localhost:7071", "http://localhost:7072", "http://localhost:7073"]
+BASE_PORT = int(os.environ.get("WHITEWATER_TEST_BASE_PORT", "7071"))
+ENDPOINTS = [f"http://localhost:{BASE_PORT + offset}" for offset in range(3)]
 
 
 def main():

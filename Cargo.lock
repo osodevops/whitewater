@@ -522,6 +522,7 @@ dependencies = [
  "blake3",
  "crc32fast",
  "fjall",
+ "futures-util",
  "openraft",
  "reqwest",
  "serde",

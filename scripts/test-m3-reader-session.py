@@ -1,6 +1,7 @@
-import json, sys, time, urllib.error, urllib.request, uuid
+import json, os, sys, time, urllib.error, urllib.request, uuid
 
-ENDPOINTS = ["http://localhost:7071", "http://localhost:7072", "http://localhost:7073"]
+BASE_PORT = int(os.environ.get("WHITEWATER_TEST_BASE_PORT", "7071"))
+ENDPOINTS = [f"http://localhost:{BASE_PORT + offset}" for offset in range(3)]
 KEY = "whitewater-local-development-admin-key"
 
 def post(endpoint, path, body):

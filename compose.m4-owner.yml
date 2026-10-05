@@ -1,0 +1,55 @@
+name: whitewater-m4-owner-test
+
+x-node: &node
+  build:
+    context: .
+  environment: &node-environment
+    FINNSTREAM_SEEDS: node1:7070,node2:7070,node3:7070
+    FINNSTREAM_NODE_CAPACITY: 100
+    FINNSTREAM_ADMIN_API_KEY: ${FINNSTREAM_ADMIN_API_KEY:-whitewater-local-development-admin-key}
+    FINNSTREAM_CONTROL_NODES: 1@node1:7070,2@node2:7070,3@node3:7070
+    FINNSTREAM_CONTROL_PLANE_KEY: ${FINNSTREAM_CONTROL_PLANE_KEY:-whitewater-local-development-control-key}
+    WHITEWATER_AUTO_SPLIT_APPEND_RATE: 1000000000
+    WHITEWATER_AUTO_MERGE_SUSTAINED_SAMPLES: 1000000000
+
+services:
+  node1:
+    <<: *node
+    ports:
+      - "7271:7070"
+    environment:
+      <<: *node-environment
+      FINNSTREAM_NODE_ID: whitewater-owner-node1
+      FINNSTREAM_CONTROL_NODE_ID: 1
+      FINNSTREAM_ADVERTISE_URL: http://node1:7070
+    volumes:
+      - node1-data:/var/lib/finnstream
+
+  node2:
+    <<: *node
+    ports:
+      - "7272:7070"
+    environment:
+      <<: *node-environment
+      FINNSTREAM_NODE_ID: whitewater-owner-node2
+      FINNSTREAM_CONTROL_NODE_ID: 2
+      FINNSTREAM_ADVERTISE_URL: http://node2:7070
+    volumes:
+      - node2-data:/var/lib/finnstream
+
+  node3:
+    <<: *node
+    ports:
+      - "7273:7070"
+    environment:
+      <<: *node-environment
+      FINNSTREAM_NODE_ID: whitewater-owner-node3
+      FINNSTREAM_CONTROL_NODE_ID: 3
+      FINNSTREAM_ADVERTISE_URL: http://node3:7070
+    volumes:
+      - node3-data:/var/lib/finnstream
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
