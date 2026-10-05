@@ -125,6 +125,12 @@ pub struct ReaderDefinition {
     pub created_at_ns: i64,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ReaderFrontier {
+    pub acknowledged: BTreeMap<RangeId, String>,
+    pub delivered: BTreeMap<RangeId, String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoleDefinition {
     pub role_id: Uuid,
@@ -246,6 +252,8 @@ struct CatalogState {
     state_stores: BTreeMap<Uuid, StateStoreDefinition>,
     writers: BTreeMap<Uuid, WriterDefinition>,
     readers: BTreeMap<Uuid, ReaderDefinition>,
+    #[serde(default)]
+    reader_frontiers: BTreeMap<Uuid, ReaderFrontier>,
     roles: BTreeMap<Uuid, RoleDefinition>,
     grants: BTreeMap<Uuid, NamespaceGrant>,
     #[serde(default)]
@@ -293,6 +301,7 @@ impl Default for CatalogState {
             state_stores: BTreeMap::new(),
             writers: BTreeMap::new(),
             readers: BTreeMap::new(),
+            reader_frontiers: BTreeMap::new(),
             roles: BTreeMap::new(),
             grants: BTreeMap::new(),
             active_ranges: BTreeMap::new(),
@@ -376,6 +385,12 @@ pub enum Command {
         reader: String,
         session_epoch: u64,
         cursor: String,
+    },
+    RecordReaderFrontier {
+        reader: String,
+        session_epoch: u64,
+        cursor: String,
+        positions: BTreeMap<RangeId, String>,
     },
     AcknowledgeReader {
         reader: String,
@@ -525,7 +540,8 @@ impl Command {
     pub fn requires_internal_replica_authority(&self) -> bool {
         matches!(
             self,
-            Self::TransferActiveRangeOwnership { .. }
+            Self::RecordReaderFrontier { .. }
+                | Self::TransferActiveRangeOwnership { .. }
                 | Self::RecoverActiveRangeOwnership { .. }
                 | Self::RecordActiveRangeSplitCatchUp { .. }
                 | Self::ActivateActiveRangeSplit { .. }
@@ -868,6 +884,15 @@ impl ControlController {
             .values()
             .find(|reader| reader.name == name && reader.status == ResourceStatus::Active)
             .cloned()
+    }
+
+    pub(crate) async fn active_reader_frontier(&self, reader_id: Uuid) -> Option<ReaderFrontier> {
+        let state = self.state.lock().await;
+        state
+            .readers
+            .get(&reader_id)
+            .filter(|reader| reader.status == ResourceStatus::Active)?;
+        state.reader_frontiers.get(&reader_id).cloned()
     }
 
     pub async fn active_writer_by_name(&self, name: &str) -> Option<WriterDefinition> {
@@ -1324,21 +1349,72 @@ impl ControlController {
                 definition.session_capacity = capacity;
                 definition.session_active = true;
                 definition.delivered_cursor = definition.acknowledged_cursor.clone();
-                Ok((
-                    format!("opened Reader session {reader}"),
-                    json!(definition.clone()),
-                ))
+                let updated = definition.clone();
+                if let Some(frontier) = state.reader_frontiers.get_mut(&updated.reader_id) {
+                    frontier.delivered = frontier.acknowledged.clone();
+                }
+                Ok((format!("opened Reader session {reader}"), json!(updated)))
             }
             Command::RecordReaderDelivery {
                 reader,
                 session_epoch,
                 cursor,
             } => {
+                let reader_id = {
+                    let definition = active_reader_mut(state, &reader)?;
+                    validate_reader_epoch(definition, session_epoch)?;
+                    definition.reader_id
+                };
+                if state.reader_frontiers.contains_key(&reader_id) {
+                    return Err(ControlError::InvalidOperation(
+                        "Reader frontier cannot be replaced with a single-record delivery"
+                            .to_owned(),
+                    ));
+                }
                 let definition = active_reader_mut(state, &reader)?;
-                validate_reader_epoch(definition, session_epoch)?;
                 definition.delivered_cursor = Some(cursor);
                 Ok((
                     format!("recorded Reader delivery {reader}"),
+                    json!(definition.clone()),
+                ))
+            }
+            Command::RecordReaderFrontier {
+                reader,
+                session_epoch,
+                cursor,
+                positions,
+            } => {
+                let (reader_id, feed_id) = {
+                    let definition = active_reader_mut(state, &reader)?;
+                    validate_reader_epoch(definition, session_epoch)?;
+                    (definition.reader_id, definition.feed_id)
+                };
+                if cursor.is_empty()
+                    || cursor.len() > 256
+                    || positions.is_empty()
+                    || positions.len() > 128
+                    || positions.values().any(|value| value.len() > 256)
+                    || state.range_maps.get(&feed_id).is_none_or(|map| {
+                        positions.len() != map.routes().len()
+                            || map
+                                .routes()
+                                .iter()
+                                .any(|route| !positions.contains_key(&route.range_id))
+                    })
+                {
+                    return Err(ControlError::InvalidOperation(
+                        "Reader frontier exceeds bounds or references a stale range".to_owned(),
+                    ));
+                }
+                state
+                    .reader_frontiers
+                    .entry(reader_id)
+                    .or_default()
+                    .delivered = positions;
+                let definition = active_reader_mut(state, &reader)?;
+                definition.delivered_cursor = Some(cursor);
+                Ok((
+                    format!("recorded Reader frontier {reader}"),
                     json!(definition.clone()),
                 ))
             }
@@ -1355,10 +1431,11 @@ impl ControlController {
                     ));
                 }
                 definition.acknowledged_cursor = Some(cursor);
-                Ok((
-                    format!("acknowledged Reader {reader}"),
-                    json!(definition.clone()),
-                ))
+                let updated = definition.clone();
+                if let Some(frontier) = state.reader_frontiers.get_mut(&updated.reader_id) {
+                    frontier.acknowledged = frontier.delivered.clone();
+                }
+                Ok((format!("acknowledged Reader {reader}"), json!(updated)))
             }
             Command::CloseReaderSession {
                 reader,
@@ -1463,10 +1540,10 @@ impl ControlController {
                     ReaderStart::Beginning | ReaderStart::Now | ReaderStart::Timestamp(_) => None,
                 };
                 definition.start = start;
-                Ok((
-                    format!("moved Reader {reader} position"),
-                    json!(definition.clone()),
-                ))
+                definition.delivered_cursor = definition.acknowledged_cursor.clone();
+                let updated = definition.clone();
+                state.reader_frontiers.remove(&updated.reader_id);
+                Ok((format!("moved Reader {reader} position"), json!(updated)))
             }
             Command::InspectPlacement { feed } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
@@ -2327,7 +2404,12 @@ impl ControlController {
                 Ok((format!("dropped Space {name}"), json!(item.clone())))
             }
             ResourceKind::Writer => drop_named(&mut state.writers, name, "Writer"),
-            ResourceKind::Reader => drop_named(&mut state.readers, name, "Reader"),
+            ResourceKind::Reader => {
+                let reader_id = active_reader_mut(state, name)?.reader_id;
+                let result = drop_named(&mut state.readers, name, "Reader")?;
+                state.reader_frontiers.remove(&reader_id);
+                Ok(result)
+            }
             ResourceKind::Role => {
                 let role_id = active_role(state, name)?.role_id;
                 state.grants.retain(|_, grant| grant.role_id != role_id);
@@ -3033,6 +3115,7 @@ fn command_label(command: &Command) -> String {
         Command::CreateReader { .. } => "CREATE READER",
         Command::OpenReaderSession { .. } => "OPEN READER SESSION",
         Command::RecordReaderDelivery { .. } => "RECORD READER DELIVERY",
+        Command::RecordReaderFrontier { .. } => "RECORD READER FRONTIER",
         Command::AcknowledgeReader { .. } => "ACKNOWLEDGE READER",
         Command::CloseReaderSession { .. } => "CLOSE READER SESSION",
         Command::CreateRole { .. } => "CREATE ROLE",
@@ -3239,6 +3322,115 @@ mod tests {
             }])
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn reader_frontier_is_internal_bounded_acknowledged_and_restart_safe() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE READER audit FROM orders.events START AT BEGINNING;").await.unwrap();
+        let reader = controller.active_reader_by_name("audit").await.unwrap();
+        let assignment = controller
+            .active_range_assignment(reader.feed_id)
+            .await
+            .unwrap();
+        controller
+            .execute_commands(vec![Command::OpenReaderSession {
+                reader: "audit".to_owned(),
+                capacity: 10,
+            }])
+            .await
+            .unwrap();
+        let positions = BTreeMap::from([(assignment.range_id, "cursor-1".to_owned())]);
+        let delivery = Command::RecordReaderFrontier {
+            reader: "audit".to_owned(),
+            session_epoch: 1,
+            cursor: "opaque-reader-progress-1".to_owned(),
+            positions: positions.clone(),
+        };
+        let request_id = Uuid::from_u128(7_001);
+        assert!(delivery.requires_internal_replica_authority());
+        controller
+            .execute_commands_with_request_id(vec![delivery.clone()], request_id)
+            .await
+            .unwrap();
+        controller
+            .execute_commands_with_request_id(vec![delivery], request_id)
+            .await
+            .unwrap();
+        let frontier = controller
+            .active_reader_frontier(reader.reader_id)
+            .await
+            .unwrap();
+        assert!(frontier.acknowledged.is_empty());
+        assert_eq!(frontier.delivered, positions);
+        assert!(controller
+            .execute_commands(vec![Command::AcknowledgeReader {
+                reader: "audit".to_owned(),
+                session_epoch: 1,
+                cursor: "cursor-1".to_owned(),
+            }])
+            .await
+            .is_err());
+        controller
+            .execute_commands(vec![Command::AcknowledgeReader {
+                reader: "audit".to_owned(),
+                session_epoch: 1,
+                cursor: "opaque-reader-progress-1".to_owned(),
+            }])
+            .await
+            .unwrap();
+        drop(controller);
+        let reopened = new_controller(&directory);
+        let session = reopened
+            .execute_commands(vec![Command::OpenReaderSession {
+                reader: "audit".to_owned(),
+                capacity: 10,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(
+            session.results[0].data["delivered_cursor"],
+            "opaque-reader-progress-1"
+        );
+        let frontier = reopened
+            .active_reader_frontier(reader.reader_id)
+            .await
+            .unwrap();
+        assert_eq!(frontier.acknowledged, positions);
+        assert_eq!(frontier.delivered, positions);
+        assert!(reopened
+            .execute_commands(vec![Command::RecordReaderFrontier {
+                reader: "audit".to_owned(),
+                session_epoch: 1,
+                cursor: "stale".to_owned(),
+                positions: positions.clone(),
+            }])
+            .await
+            .is_err());
+        assert!(reopened
+            .execute_commands(vec![Command::RecordReaderFrontier {
+                reader: "audit".to_owned(),
+                session_epoch: 2,
+                cursor: "invalid".to_owned(),
+                positions: BTreeMap::from([(
+                    RangeId::from_uuid(Uuid::from_u128(9_999)),
+                    "cursor-2".to_owned()
+                ),]),
+            }])
+            .await
+            .is_err());
+        reopened
+            .execute_commands(vec![Command::SeekReader {
+                reader: "audit".to_owned(),
+                start: ReaderStart::Beginning,
+            }])
+            .await
+            .unwrap();
+        assert!(reopened
+            .active_reader_frontier(reader.reader_id)
+            .await
+            .is_none());
     }
 
     #[tokio::test]

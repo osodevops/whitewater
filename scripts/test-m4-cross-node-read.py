@@ -120,16 +120,45 @@ def main():
         if status != 200:
             raise AssertionError(reader)
         status, opened = post(ingress, "/v1/readers/open", {
-            "request_id": str(uuid.uuid4()), "reader": f"reader{suffix}", "capacity": 100,
+            "request_id": str(uuid.uuid4()), "reader": f"reader{suffix}", "capacity": 7,
         })
         if status != 200:
             raise AssertionError(opened)
-        status, fetched = post(ingress, "/v1/readers/fetch", {
-            "request_id": str(uuid.uuid4()), "reader": f"reader{suffix}",
-            "session_epoch": opened["session_epoch"], "limit": 100,
+        read_cursors = []
+        delivered = None
+        for _ in range(6):
+            status, fetched = post(ingress, "/v1/readers/fetch", {
+                "request_id": str(uuid.uuid4()), "reader": f"reader{suffix}",
+                "session_epoch": opened["session_epoch"], "limit": 7,
+            })
+            if status != 200 or not fetched["records"]:
+                raise AssertionError(f"Reader stopped before complete Feed: {fetched}")
+            read_cursors.extend(row["cursor"] for row in fetched["records"])
+            delivered = fetched["delivered_cursor"]
+            if not delivered.startswith("rf1_") or delivered == fetched["records"][-1]["cursor"]:
+                raise AssertionError(f"Reader progress is not an opaque frontier: {fetched}")
+            status, ack = post(ingress, "/v1/readers/ack", {
+                "request_id": str(uuid.uuid4()), "reader": f"reader{suffix}",
+                "session_epoch": opened["session_epoch"], "cursor": delivered,
+            })
+            if status != 200 or ack["acknowledged_cursor"] != delivered:
+                raise AssertionError(f"Reader frontier acknowledgement failed: {ack}")
+            if len(read_cursors) >= len(cursors):
+                break
+        if read_cursors != cursors:
+            raise AssertionError(f"Reader omitted or repeated a range: {read_cursors}")
+        reopened_ingress = NODES["control-3" if removed != "control-3" else "control-2"]
+        status, reopened = post(reopened_ingress, "/v1/readers/open", {
+            "request_id": str(uuid.uuid4()), "reader": f"reader{suffix}", "capacity": 7,
         })
-        if status != 200 or [row["cursor"] for row in fetched["records"]] != cursors:
-            raise AssertionError(f"Reader omitted remote range: {fetched}")
+        if status != 200 or reopened["delivered_cursor"] != delivered:
+            raise AssertionError(f"Reader lost acknowledged frontier on reopen: {reopened}")
+        status, empty = post(reopened_ingress, "/v1/readers/fetch", {
+            "request_id": str(uuid.uuid4()), "reader": f"reader{suffix}",
+            "session_epoch": reopened["session_epoch"], "limit": 7,
+        })
+        if status != 200 or empty["records"] or empty["delivered_cursor"] != delivered:
+            raise AssertionError(f"Reader redelivered acknowledged history: {empty}")
         status, temporary = post(ingress, "/v1/readers/temporary/fetch", {
             "feed": feed, "after": cursors[10], "limit": 100,
         })

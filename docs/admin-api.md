@@ -249,7 +249,7 @@ POST /v1/readers/close
 { "request_id": "...", "reader": "audit", "session_epoch": 1 }
 ```
 
-Delivered and acknowledged Cursors are separate. Fetch advances delivered progress only; acknowledgement is explicit and cumulative. Reopening a persistent Reader increments its epoch, fences the old session, resets delivered progress to the acknowledged Cursor, and resumes safely.
+Delivered and acknowledged Cursors are separate. Fetch advances delivered progress only; acknowledgement is explicit and cumulative. Always acknowledge the fetch response's `delivered_cursor`, not `records[-1].cursor`: on a multi-range named Reader starting at Beginning, the former is a versioned opaque progress token and the latter identifies one record. The underlying bounded per-range frontier is persisted through the Control Plane without exposing range placement in public Reader definitions. Reopening a persistent Reader increments its epoch, fences the old session, resets delivered progress to the acknowledged frontier, and resumes on another Node. A split/merge currently fails a frontier read closed until translation is implemented; public/temporary and legacy seek paths retain their documented multi-range history bounds.
 
 Anonymous temporary Readers use `POST /v1/readers/temporary/fetch` with `feed`, optional `after`, signed nanosecond `after_event_time_ns`, `limit`, `tail`, `new_only`, and bounded `wait_ms`. They retain no server-side progress. `new_only` atomically returns the current end Cursor without historical records; the caller then waits after that Cursor.
 

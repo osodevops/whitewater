@@ -741,6 +741,7 @@ async fn reader_fetch(
     if !reader.session_active || reader.session_epoch != request.session_epoch {
         return Err(ApiError::bad_request("Reader session is stale or inactive"));
     }
+    let frontier = state.control.active_reader_frontier(reader.reader_id).await;
     let feed = state
         .control
         .active_feed_by_id(reader.feed_id)
@@ -755,20 +756,38 @@ async fn reader_fetch(
         (crate::control::ReaderStart::Timestamp(value), None) => Some(*value),
         _ => None,
     };
-    let mut frames = read_complete_feed(
-        &state,
-        reader.feed_id,
-        &feed.name,
-        reader.delivered_cursor.as_deref(),
-        if timestamp_start.is_some() {
-            10_000
-        } else {
-            limit
-        },
-        false,
-        timestamp_start.is_some(),
-    )
-    .await?;
+    let use_frontier = frontier.is_some()
+        || timestamp_start.is_none()
+            && reader.delivered_cursor.is_none()
+            && matches!(&reader.start, crate::control::ReaderStart::Beginning)
+            && read_placement(&state, reader.feed_id, &feed.name)
+                .await?
+                .len()
+                > 1;
+    let (mut frames, next_frontier) = if use_frontier {
+        let previous = frontier.map(|value| value.delivered).unwrap_or_default();
+        let (frames, progress) =
+            read_reader_frontier(&state, reader.feed_id, &feed.name, &previous, limit).await?;
+        (frames, Some(progress))
+    } else {
+        (
+            read_complete_feed(
+                &state,
+                reader.feed_id,
+                &feed.name,
+                reader.delivered_cursor.as_deref(),
+                if timestamp_start.is_some() {
+                    10_000
+                } else {
+                    limit
+                },
+                false,
+                timestamp_start.is_some(),
+            )
+            .await?,
+            None,
+        )
+    };
     if let Some(timestamp) = timestamp_start {
         frames.retain(|item| {
             decode_record(&item.frame)
@@ -791,19 +810,33 @@ async fn reader_fetch(
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     let delivered_cursor = records
         .last()
-        .map(|record| record.cursor.clone())
+        .map(|record| {
+            if next_frontier.is_some() {
+                reader_frontier_cursor(reader.reader_id, request.session_epoch, request.request_id)
+            } else {
+                record.cursor.clone()
+            }
+        })
         .or(reader.delivered_cursor.clone());
-    if let Some(cursor) = records.last().map(|record| record.cursor.clone()) {
-        execute_reader_command(
-            &state,
+    if !records.is_empty() {
+        let cursor = delivered_cursor
+            .clone()
+            .ok_or_else(|| ApiError::unavailable("Reader progress token is unavailable"))?;
+        let command = if let Some(positions) = next_frontier {
+            crate::control::Command::RecordReaderFrontier {
+                reader: request.reader.clone(),
+                session_epoch: request.session_epoch,
+                cursor,
+                positions,
+            }
+        } else {
             crate::control::Command::RecordReaderDelivery {
                 reader: request.reader.clone(),
                 session_epoch: request.session_epoch,
                 cursor,
-            },
-            request.request_id,
-        )
-        .await?;
+            }
+        };
+        execute_reader_command(&state, command, request.request_id).await?;
     }
     state.demand.record_read(records.len());
     let pressure = (state.demand.snapshot().requests_in_flight as f64 / 100.0).clamp(0.0, 1.0);
@@ -3001,6 +3034,18 @@ fn feed_cursor(feed_id: Uuid, request_id: Uuid) -> String {
     URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes())
 }
 
+fn reader_frontier_cursor(reader_id: Uuid, session_epoch: u64, request_id: Uuid) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"whitewater-reader-frontier-v1");
+    hasher.update(reader_id.as_bytes());
+    hasher.update(&session_epoch.to_be_bytes());
+    hasher.update(request_id.as_bytes());
+    format!(
+        "rf1_{}",
+        URL_SAFE_NO_PAD.encode(hasher.finalize().as_bytes())
+    )
+}
+
 fn deterministic_uuid(request_id: Uuid, label: &str) -> Uuid {
     let mut bytes: [u8; 16] = blake3::hash(&[request_id.as_bytes(), label.as_bytes()].concat())
         .as_bytes()[..16]
@@ -3462,6 +3507,177 @@ async fn read_single_range(
         ));
     }
     Ok(frames)
+}
+
+struct ReaderRangeHead {
+    assignment: ActiveRangeAssignment,
+    committed: CommitPosition,
+    next: Option<(StoredRangeFrame, (i64, Uuid))>,
+}
+
+async fn reader_range_head(
+    state: &AppState,
+    assignment: &ActiveRangeAssignment,
+    after_cursor: Option<&str>,
+    after: Option<RangePosition>,
+    boundary: Option<CommitPosition>,
+) -> Result<(CommitPosition, Option<(StoredRangeFrame, (i64, Uuid))>), ApiError> {
+    let page = fetch_range_page(
+        state,
+        ReadRangePageRequest {
+            assignment: assignment.clone(),
+            after,
+            expected_commit: boundary,
+            after_cursor: after_cursor.map(str::to_owned),
+            tail_count: None,
+            single_range: true,
+            page_limit: Some(1),
+        },
+    )
+    .await?;
+    if boundary.is_some_and(|expected| expected != page.committed) {
+        return Err(ApiError::unavailable(
+            "range read boundary changed; retry with the same Reader session",
+        ));
+    }
+    let start = page.resolved_after.map_or(0, RangePosition::value);
+    if start > page.committed.value() {
+        return Err(ApiError::unavailable(
+            "Reader frontier is beyond the committed range",
+        ));
+    }
+    let Some(frame) = page.frames.into_iter().next() else {
+        if start == page.committed.value() {
+            return Ok((page.committed, None));
+        }
+        return Err(ApiError::unavailable(
+            "current owner omitted a committed Reader frame",
+        ));
+    };
+    if frame.position.value() != start.saturating_add(1)
+        || frame.position.value() > page.committed.value()
+    {
+        return Err(ApiError::unavailable(
+            "current owner returned a gapped Reader frame",
+        ));
+    }
+    let decoded = STANDARD
+        .decode(frame.frame_base64.as_bytes())
+        .map_err(|_| ApiError::unavailable("invalid committed Reader frame encoding"))?;
+    let record =
+        decode_record(&decoded).map_err(|error| ApiError::unavailable(error.to_string()))?;
+    Ok((
+        page.committed,
+        Some((
+            StoredRangeFrame {
+                position: frame.position,
+                identity: frame.identity,
+                cursor: frame.cursor,
+                frame: decoded,
+            },
+            (record.ingest_time_ns, record.message_id),
+        )),
+    ))
+}
+
+async fn read_reader_frontier(
+    state: &AppState,
+    feed_id: Uuid,
+    feed_name: &str,
+    previous: &BTreeMap<RangeId, String>,
+    limit: usize,
+) -> Result<(Vec<StoredRangeFrame>, BTreeMap<RangeId, String>), ApiError> {
+    let assignments = read_placement(state, feed_id, feed_name).await?;
+    if !previous.is_empty()
+        && (previous.len() != assignments.len()
+            || assignments
+                .iter()
+                .any(|assignment| !previous.contains_key(&assignment.range_id)))
+    {
+        return Err(ApiError::unavailable(
+            "Reader topology changed; retry after frontier translation or seek explicitly",
+        ));
+    }
+    let mut progress = assignments
+        .iter()
+        .map(|assignment| {
+            (
+                assignment.range_id,
+                previous
+                    .get(&assignment.range_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut heads = Vec::with_capacity(assignments.len());
+    let mut bytes = 0_usize;
+    for assignment in &assignments {
+        let cursor = progress
+            .get(&assignment.range_id)
+            .filter(|value| !value.is_empty());
+        let (committed, next) =
+            reader_range_head(state, assignment, cursor.map(String::as_str), None, None).await?;
+        if let Some((frame, _)) = &next {
+            bytes = bytes.saturating_add(frame.frame.len() + frame.cursor.len());
+            if bytes > MAX_LOGICAL_READ_BYTES {
+                return Err(ApiError::unavailable(
+                    "Reader range heads exceed the bounded read byte budget",
+                ));
+            }
+        }
+        heads.push(ReaderRangeHead {
+            assignment: assignment.clone(),
+            committed,
+            next,
+        });
+    }
+    let mut records = Vec::new();
+    while records.len() < limit.min(MAX_LOGICAL_READ_FRAMES) {
+        let Some(index) = heads
+            .iter()
+            .enumerate()
+            .filter_map(|(index, head)| head.next.as_ref().map(|(_, key)| (index, *key)))
+            .min_by_key(|(index, key)| (*key, *index))
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let head = &mut heads[index];
+        let (record, _) = head
+            .next
+            .take()
+            .ok_or_else(|| ApiError::unavailable("Reader head disappeared"))?;
+        progress.insert(head.assignment.range_id, record.cursor.clone());
+        let after = record.position;
+        records.push(record);
+        if records.len() == limit.min(MAX_LOGICAL_READ_FRAMES) {
+            break;
+        }
+        let (_, next) = reader_range_head(
+            state,
+            &head.assignment,
+            None,
+            Some(after),
+            Some(head.committed),
+        )
+        .await?;
+        if let Some((frame, _)) = &next {
+            bytes = bytes.saturating_add(frame.frame.len() + frame.cursor.len());
+            if bytes > MAX_LOGICAL_READ_BYTES {
+                return Err(ApiError::unavailable(
+                    "Reader page exceeds the bounded read byte budget",
+                ));
+            }
+        }
+        head.next = next;
+    }
+    if read_placement(state, feed_id, feed_name).await? != assignments {
+        return Err(ApiError::unavailable(
+            "Feed placement changed during Reader fetch; retry with the same session",
+        ));
+    }
+    Ok((records, progress))
 }
 
 async fn read_complete_feed(
@@ -4169,6 +4385,20 @@ mod tests {
     }
 
     #[test]
+    fn reader_frontier_tokens_are_stable_and_scoped_to_reader_session() {
+        let reader = Uuid::from_u128(4);
+        let request = Uuid::from_u128(5);
+        let token = reader_frontier_cursor(reader, 1, request);
+        assert!(token.starts_with("rf1_"));
+        assert_eq!(token, reader_frontier_cursor(reader, 1, request));
+        assert_ne!(token, reader_frontier_cursor(reader, 2, request));
+        assert_ne!(
+            token,
+            reader_frontier_cursor(Uuid::from_u128(6), 1, request)
+        );
+    }
+
+    #[test]
     fn complete_feed_merge_orders_remote_frames_and_continues_from_opaque_cursor() {
         let frame = |index: u64, ingest: i64| StoredRangeFrame {
             position: RangePosition::new(index),
@@ -4743,6 +4973,30 @@ mod tests {
             .unwrap();
         let execution: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(execution["results"][1]["data"]["stage"], "declared");
+    }
+
+    #[tokio::test]
+    async fn public_admin_commands_cannot_forge_reader_frontiers() {
+        let directory = TempDir::new().unwrap();
+        let app = admin_test_router(&directory);
+        let response = app
+            .oneshot(admin_request(
+                "/v1/admin/commands",
+                serde_json::to_value(CommandBatchRequest {
+                    request_id: Some(Uuid::new_v4()),
+                    commands: vec![Command::RecordReaderFrontier {
+                        reader: "audit".to_owned(),
+                        session_epoch: 1,
+                        cursor: "forged".to_owned(),
+                        positions: BTreeMap::new(),
+                    }],
+                })
+                .unwrap(),
+                Some("this-is-a-long-development-api-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

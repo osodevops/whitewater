@@ -30,7 +30,7 @@ This repository contains a replicated streaming correctness foundation, internal
 - Consensus-persisted fixed RF3 Active Range placement with epoch-fenced ownership and authenticated inspection
 - Authenticated bounded internal replica append protocol with exact-frame durability, checksum validation, position fencing, and structured rejection
 - Owner-side concurrent RF3 replication with two-of-three durable frame and CommitPosition evidence before success
-- Topology-free committed Feed reads with authenticated cross-Node owner retrieval, indexed long-history Cursor paging for single-range Feeds, and bounded multi-range merging; durable global multi-range ordering remains planned
+- Topology-free committed Feed reads with authenticated cross-Node owner retrieval, indexed single-range paging, and prototype durable multi-range named Reader frontiers; public/temporary long-history continuation and split/merge frontier translation remain planned
 - Automatic sustained owner-failure recovery with authenticated progress collection, consensus epoch transfer, stale-owner fencing, committed-prefix preservation, and tail truncation
 - Automatic restarted-replica catch-up with bounded exact-frame transfer, checksum verification, deduplication rebuild, corruption quarantine, and readiness gating
 - Development-only authenticated Append Owner movement after verified frozen-boundary catch-up, with isolated three-Node live acceptance; production inter-Node mTLS and drain remain unfinished
