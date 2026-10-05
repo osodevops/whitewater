@@ -153,6 +153,10 @@ Kafka Streams commonly uses a local store backed by a changelog topic, which app
 
 A Space-scoped `REBUILD INDEXES IN SPACE commerce` would select Indexes owned by that Space and replay their source Feeds; it would **not** erase the Space, clear Feed records, or mean that every Index is rebuildable from data that has already expired. If retained history and a usable checkpoint/backup are insufficient, the rebuild must refuse with an explanation rather than report success from incomplete state. Reset/empty operations require authorization, an explicit retained-history check, audit, and a shadow build instead of exposing an empty live Index.
 
+A Space owns Feeds and StateStores; it has no single log of its own. A **Feed-derived** StateStore replays its explicitly named source Feed(s) with versioned deterministic extraction. A **manual** StateStore instead needs a Whitewater-managed replicated mutation journal and checkpoint: manual `PUT`/`DELETE` operations cannot be recreated from unrelated Feeds. The Control Plane can currently persist a `declared` manual or same-Space Feed-derived StateStore definition, but it cannot yet accept StateStore writes, replicate Fjall state, or serve lookups.
+
+The intended enrichment experience is topology-free: a Reader obtains an event from `activity.events`, looks up `users[userId]` at a recorded state version through any Node, and writes to `activity.enriched` with an atomic input-progress/output effect. An internal owner may fetch state remotely or optimize placement; application code supplies no range, owner, partition count, or co-partitioning plan. An unavailable/lagging user store must not silently produce an unenriched output. This Pipe/runtime workflow and its cross-Node consistency tests remain planned, not implemented.
+
 ### 12. Security has too many optional paths
 
 Kafka can be deployed securely, but it can also expose plaintext listeners, and operators choose among TLS, mTLS, SASL mechanisms, JAAS configuration, ACL systems, and external identity integrations.
@@ -311,6 +315,10 @@ A Pipe is managed processing from one or more Feeds into Feeds and Indexes. Atom
 ### Index
 
 An Index is a named, persisted, replicated projection over a Feed or Pipe output. A Key Index replaces the common compacted-topic/KTable/latest-value use case without changing Feed history semantics.
+
+### StateStore
+
+A StateStore is a named current-state resource owned by a Space, with an application primary Key and optional declared secondary Indexes. Its source is either specified Feed history (processed by a deterministic versioned projection) or manually submitted mutations recorded in a Whitewater-managed replicated journal. It is logically queryable from any Node without co-partitioning; ownership, placement, replay, and Index storage remain internal. The current Control Plane only persists `declared` definitions; it does not yet replicate or serve StateStore data.
 
 ### History Policy
 

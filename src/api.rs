@@ -3233,6 +3233,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_state_store_declarations_require_admin_access_and_remain_declared() {
+        let directory = TempDir::new().unwrap();
+        let app = admin_test_router(&directory);
+        let request = json!({
+            "request_id": Uuid::new_v4(),
+            "commands": [
+                { "command": "create_space", "name": "accounts" },
+                { "command": "define_state_store", "name": "accounts.users", "source": { "kind": "manual" } }
+            ]
+        });
+        let unauthorized = app
+            .clone()
+            .oneshot(admin_request("/v1/admin/commands", request.clone(), None))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .oneshot(admin_request(
+                "/v1/admin/commands",
+                request,
+                Some("this-is-a-long-development-api-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let execution: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(execution["results"][1]["data"]["stage"], "declared");
+    }
+
+    #[tokio::test]
     async fn typed_admin_commands_use_the_same_controller() {
         let directory = TempDir::new().unwrap();
         let app = admin_test_router(&directory);

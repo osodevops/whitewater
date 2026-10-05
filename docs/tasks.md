@@ -23,7 +23,7 @@
 
 **Milestone 4 — Multiple internal ranges**
 
-The current delivery track is multiple internal Active Ranges. In parallel, the core Index model is being specified and encoded under [Milestone 6](#milestone-6--persisted-replicated-indexes): application-defined secondary Indexes are a foundational storage requirement, **not** a future performance optimization. An isolated Fjall prototype persists primary rows and shared secondary entries with local transactions, but no Index is yet available on the live Feed append/query path; the cross-store commit and RF3 boundary must be proven before claiming database-style lookup or `CREATE INDEX` support.
+The current delivery track is multiple internal Active Ranges. In parallel, [Milestone 6](#milestone-6--persisted-replicated-indexes) treats replicated StateStores and secondary Indexes as core storage, **not** future performance optimizations. An isolated Fjall prototype persists primary rows and shared secondary entries locally, and a StateStore can be declared through a typed Control Plane command. Neither is available on the live Feed append/query path; RF3 durability, logical cross-Node lookup, and the cross-store processing boundary must be proven before claiming carefree enrichment or `CREATE INDEX` support.
 
 ---
 
@@ -700,7 +700,11 @@ Definition of Done:
 
 - [x] Define an internal IndexId, stable logical primary reference, shared secondary/unique-claim key encoding, composite/prefix/range access, and an update/delete mutation planner with focused unit tests (`src/index.rs`).
 - [x] Prototype a locally durable Fjall-backed Index with a fixed three-keyspace layout, serializable primary/posting/checkpoint upserts and deletes, bounded exact secondary lookups, local uniqueness checks, and restart/concurrent-conflict tests (`src/index.rs`). This does not implement distributed uniqueness or Feed-to-Index atomicity.
-- [ ] Define and persist versioned application-owned Index definitions with typed fields/extractors, collation, consistency, scope, and build state through the Control Plane.
+- [x] Persist idempotent Space-scoped StateStore declarations with manual or same-Space Feed source in Control Plane catalogs and snapshots; their `declared` stage explicitly cannot serve data (`src/control.rs`).
+- [ ] Define and persist versioned application-owned secondary Index definitions with typed fields/extractors, collation, consistency, scope, and build state through the Control Plane.
+- [ ] Replicate manual StateStore mutations and their idempotency identities on RF3 with a Whitewater-managed durable journal; never claim a manually populated store can be recreated from unrelated Feed history.
+- [ ] Replay Feed-derived StateStores from verified source FeedId/Cursor and bounded checkpoints, refusing rebuild if required history is gone.
+- [ ] Route primary and secondary StateStore lookups from any ingress Node without application topology or co-partition configuration; bound scatter/gather and report freshness, network cost, and unavailable/lagging state.
 - [ ] Benchmark vetted Fjall, redb, and RocksDB reference workloads: many user Indexes sharing a bounded number of LSM trees, mixed writes/reads, crashes, compaction stalls, and replication/checkpoint cost.
 - [ ] Select and integrate an Index Engine behind a narrow transactional interface; validate serializable read-modify-write, durable batch semantics, and memory/disk budgets.
 - [ ] Co-design Feed commit and required synchronous primary/secondary Index mutations across the existing file log and replicated Index state; do not claim cross-engine atomicity from a local Fjall write batch.
@@ -726,12 +730,15 @@ Definition of Done:
 - [ ] Implement atomic consume-and-append.
 - [ ] Include co-located Index mutations in the defined atomic boundary.
 - [ ] Implement deterministic retry after ambiguous result.
+- [ ] Implement a topology-free point-lookup enrichment Pipe: read a Feed, extract userId, fetch a versioned user StateStore row regardless of storage range, write an output Feed, and atomically record input progress plus output identity. Missing user or lagging state follows an explicit retry/quarantine policy.
+- [ ] Run a live three-Node acceptance with User Writer updates, Reader redelivery, Node restart/owner change, userId enrichment, and same-request retries; prove exactly one committed output effect and no acknowledged input loss without co-partition configuration.
 
 Definition of Done:
 
 - [ ] Membership change does not globally pause processing.
 - [ ] Stale Reader cannot acknowledge after lease transfer.
 - [ ] Input progress and Whitewater output effects commit together.
+- [ ] Enrichment never requires a user-defined partition count, topology callback, or application-maintained Fjall/changelog copy.
 
 ## Milestone 8 — Tiered history
 

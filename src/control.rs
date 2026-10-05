@@ -47,6 +47,36 @@ pub struct FeedDefinition {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StateStoreSourceRequest {
+    Manual,
+    Feed { feed: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StateStoreSource {
+    Manual,
+    Feed { feed_id: Uuid },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StateStoreStage {
+    Declared,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StateStoreDefinition {
+    pub store_id: Uuid,
+    pub name: String,
+    pub space_id: Uuid,
+    pub source: StateStoreSource,
+    pub stage: StateStoreStage,
+    pub created_at_ns: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriterDefinition {
     pub writer_id: Uuid,
     pub name: String,
@@ -200,6 +230,8 @@ struct CatalogState {
     revision: u64,
     spaces: BTreeMap<Uuid, SpaceDefinition>,
     feeds: BTreeMap<Uuid, FeedDefinition>,
+    #[serde(default)]
+    state_stores: BTreeMap<Uuid, StateStoreDefinition>,
     writers: BTreeMap<Uuid, WriterDefinition>,
     readers: BTreeMap<Uuid, ReaderDefinition>,
     roles: BTreeMap<Uuid, RoleDefinition>,
@@ -242,6 +274,7 @@ impl Default for CatalogState {
             revision: 0,
             spaces: BTreeMap::new(),
             feeds: BTreeMap::new(),
+            state_stores: BTreeMap::new(),
             writers: BTreeMap::new(),
             readers: BTreeMap::new(),
             roles: BTreeMap::new(),
@@ -287,6 +320,10 @@ pub enum Command {
     },
     CreateFeed {
         name: String,
+    },
+    DefineStateStore {
+        name: String,
+        source: StateStoreSourceRequest,
     },
     CreateWriter {
         name: String,
@@ -840,6 +877,16 @@ impl ControlController {
             .cloned()
     }
 
+    pub async fn declared_state_store_by_name(&self, name: &str) -> Option<StateStoreDefinition> {
+        self.state
+            .lock()
+            .await
+            .state_stores
+            .values()
+            .find(|store| store.name == name)
+            .cloned()
+    }
+
     pub async fn active_range_assignment(&self, feed_id: Uuid) -> Option<ActiveRangeAssignment> {
         self.state.lock().await.active_ranges.get(&feed_id).cloned()
     }
@@ -1023,6 +1070,42 @@ impl ControlController {
                     .insert(assignment.range_id, assignment.clone());
                 state.active_ranges.insert(feed_id, assignment);
                 Ok((format!("created Feed {name}"), json!(definition)))
+            }
+            Command::DefineStateStore { name, source } => {
+                validate_dotted_name(&name)?;
+                if state.state_stores.values().any(|item| item.name == name) {
+                    return Err(ControlError::AlreadyExists(name));
+                }
+                let space_id = owning_space(state, &name)?.space_id;
+                let source = match source {
+                    StateStoreSourceRequest::Manual => StateStoreSource::Manual,
+                    StateStoreSourceRequest::Feed { feed } => {
+                        let definition = active_feed(state, &feed)?;
+                        if definition.space_id != space_id {
+                            return Err(ControlError::InvalidOperation(
+                                "StateStore source Feed must belong to its Space".to_owned(),
+                            ));
+                        }
+                        StateStoreSource::Feed {
+                            feed_id: definition.feed_id,
+                        }
+                    }
+                };
+                let definition = StateStoreDefinition {
+                    store_id: derived_resource_id(request_id, "state-store"),
+                    name: name.clone(),
+                    space_id,
+                    source,
+                    stage: StateStoreStage::Declared,
+                    created_at_ns: issued_at_ns,
+                };
+                state
+                    .state_stores
+                    .insert(definition.store_id, definition.clone());
+                Ok((
+                    format!("declared StateStore {name}; no data is served until RF3 activation"),
+                    json!(definition),
+                ))
             }
             Command::CreateWriter { name, feed } => {
                 validate_dotted_name(&name)?;
@@ -2730,6 +2813,7 @@ fn command_label(command: &Command) -> String {
     match command {
         Command::CreateSpace { .. } => "CREATE SPACE",
         Command::CreateFeed { .. } => "CREATE FEED",
+        Command::DefineStateStore { .. } => "DEFINE STATE STORE",
         Command::CreateWriter { .. } => "CREATE WRITER",
         Command::OpenWriterSession { .. } => "OPEN WRITER SESSION",
         Command::AllocateWriterSequence { .. } => "ALLOCATE WRITER SEQUENCE",
@@ -3018,6 +3102,97 @@ mod tests {
         let repeated = left.apply_replicated(request.clone()).await;
         assert_eq!(repeated, left_result);
         assert_eq!(left.revision().await, 1);
+    }
+
+    #[tokio::test]
+    async fn state_store_sources_are_scoped_idempotent_and_survive_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let follower_directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader.execute("CREATE SPACE accounts; CREATE FEED accounts.users; CREATE SPACE other; CREATE FEED other.users;").await.unwrap();
+        let request_id = Uuid::from_u128(11_223);
+        let command = vec![Command::DefineStateStore {
+            name: "accounts.profiles".to_owned(),
+            source: StateStoreSourceRequest::Feed {
+                feed: "accounts.users".to_owned(),
+            },
+        }];
+        let first = leader
+            .execute_commands_with_request_id(command.clone(), request_id)
+            .await
+            .unwrap();
+        let repeated = leader
+            .execute_commands_with_request_id(command, request_id)
+            .await
+            .unwrap();
+        assert_eq!(first.results[0].data, repeated.results[0].data);
+        assert_eq!(first.results[0].data["stage"], "declared");
+        assert_eq!(first.results[0].data["source"]["kind"], "feed");
+        assert!(leader
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.profiles".to_owned(),
+                source: StateStoreSourceRequest::Manual,
+            }])
+            .await
+            .is_err());
+        let feed_id = leader
+            .active_feed_by_name("accounts.users")
+            .await
+            .unwrap()
+            .feed_id;
+        assert_eq!(
+            first.results[0].data["source"]["feed_id"],
+            feed_id.to_string()
+        );
+        assert!(leader
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.manual".to_owned(),
+                source: StateStoreSourceRequest::Manual,
+            }])
+            .await
+            .is_ok());
+        assert!(leader
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.invalid".to_owned(),
+                source: StateStoreSourceRequest::Feed {
+                    feed: "other.users".to_owned()
+                },
+            }])
+            .await
+            .is_err());
+        assert!(leader
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.unknown".to_owned(),
+                source: StateStoreSourceRequest::Feed {
+                    feed: "accounts.missing".to_owned()
+                },
+            }])
+            .await
+            .is_err());
+        let follower = new_controller(&follower_directory);
+        follower
+            .install_snapshot_bytes(&leader.snapshot_bytes().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(follower.state.lock().await.state_stores.len(), 2);
+        assert_eq!(
+            follower
+                .declared_state_store_by_name("accounts.profiles")
+                .await
+                .unwrap()
+                .source,
+            StateStoreSource::Feed { feed_id },
+        );
+        drop(leader);
+        let reopened = new_controller(&directory);
+        assert_eq!(
+            reopened
+                .declared_state_store_by_name("accounts.manual")
+                .await
+                .unwrap()
+                .source,
+            StateStoreSource::Manual,
+        );
     }
 
     #[tokio::test]
