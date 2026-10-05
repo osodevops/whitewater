@@ -452,11 +452,9 @@ impl ReplicaAppendService {
                 format!("no committed Active Range assignments exist for Feed {feed_id}"),
             ));
         }
+        require_all_assignments_locally(&assignments, &self.local_node)?;
         let mut merged = Vec::new();
-        for assignment in assignments
-            .iter()
-            .filter(|assignment| assignment.replicas.contains(&self.local_node))
-        {
+        for assignment in &assignments {
             merged.extend(
                 self.store_for(assignment)
                     .await?
@@ -464,16 +462,6 @@ impl ReplicaAppendService {
                     .await
                     .map_err(map_store_error)?,
             );
-        }
-        if merged.is_empty()
-            && assignments
-                .iter()
-                .all(|assignment| !assignment.replicas.contains(&self.local_node))
-        {
-            return Err(ReplicaAppendError::rejected(
-                ReplicaAppendErrorCode::ReceiverNotReplica,
-                format!("Node {} is not a current replica", self.local_node),
-            ));
         }
         merged.sort_by_key(|item| {
             decode_record(&item.frame)
@@ -732,6 +720,25 @@ impl ReplicaAppendService {
     }
 }
 
+fn require_all_assignments_locally(
+    assignments: &[ActiveRangeAssignment],
+    local: &StorageNodeId,
+) -> Result<(), ReplicaAppendError> {
+    if let Some(missing) = assignments
+        .iter()
+        .find(|assignment| !assignment.replicas.contains(local))
+    {
+        return Err(ReplicaAppendError::temporary(
+            ReplicaAppendErrorCode::ReceiverNotReplica,
+            format!(
+                "Node {local} does not have Active Range {}; complete Feed reads require another fully caught-up Node until cross-Node reads are supported",
+                missing.range_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
 async fn synchronize_store_epoch(
     store: &FileActiveRangeStore,
     assignment: &ActiveRangeAssignment,
@@ -814,5 +821,49 @@ fn map_store_error(error: ActiveRangeStoreError) -> ReplicaAppendError {
             error.to_string(),
         ),
         other => ReplicaAppendError::storage(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::active_range::ReplicaSet;
+
+    #[test]
+    fn a_partially_local_multi_range_feed_cannot_appear_complete() {
+        let feed_id = Uuid::from_u128(1);
+        let first = StorageNodeId::try_new("node-1").unwrap();
+        let second = StorageNodeId::try_new("node-2").unwrap();
+        let third = StorageNodeId::try_new("node-3").unwrap();
+        let fourth = StorageNodeId::try_new("node-4").unwrap();
+        let left = ActiveRangeAssignment::try_new(
+            feed_id,
+            RangeId::from_uuid(Uuid::from_u128(2)),
+            RangeGeneration::new(1),
+            first.clone(),
+            ReplicaSet::try_new([first.clone(), second.clone(), third.clone()]).unwrap(),
+            OwnershipEpoch::new(1),
+        )
+        .unwrap();
+        let right = ActiveRangeAssignment::try_new(
+            feed_id,
+            RangeId::from_uuid(Uuid::from_u128(3)),
+            RangeGeneration::new(1),
+            second.clone(),
+            ReplicaSet::try_new([second.clone(), third, fourth.clone()]).unwrap(),
+            OwnershipEpoch::new(2),
+        )
+        .unwrap();
+        assert!(require_all_assignments_locally(std::slice::from_ref(&left), &first).is_ok());
+        assert!(require_all_assignments_locally(&[left.clone(), right.clone()], &second).is_ok());
+        let missing_right =
+            require_all_assignments_locally(&[left.clone(), right.clone()], &first).unwrap_err();
+        assert_eq!(
+            missing_right.code,
+            ReplicaAppendErrorCode::ReceiverNotReplica
+        );
+        assert!(missing_right.retryable);
+        assert!(missing_right.message.contains(&right.range_id.to_string()));
+        assert!(require_all_assignments_locally(&[left, right], &fourth).is_err());
     }
 }

@@ -642,7 +642,7 @@ Definition of Done:
 - [x] Split hot ranges online from sustained per-range append pressure with sampled key-token boundaries, cooldown, authenticated RF3 staging, and Control Plane cutover.
 - [x] Merge cold adjacent ranges using leader-aggregated cross-owner metrics, sustained low-rate evidence, cooldown, authenticated RF3 staging, rollback, Writer-state rebuild, and atomic activation.
 - [~] Move ranges while preserving same-Key ordering: a consensus-persisted follower-replacement plan, bounded authenticated remote catch-up, owner-side majority-draining freeze, and evidence-gated RF3 activation pass four-Node live acceptance; checkpointed movement beyond the 10,000-record prototype bound, append-owner movement, role-separated storage placement, automatic drain, and movement budgets remain.
-- [~] Keep opaque Cursors usable across range changes: local split/merge tests preserve record-attached Cursors, but scalable cross-Node continuation beyond the locally scanned committed prefix remains.
+- [~] Keep opaque Cursors usable across range changes: local split/merge tests preserve record-attached Cursors, and reads now fail rather than silently omit remotely placed ranges; scalable cross-Node continuation beyond the locally scanned committed prefix remains.
 - [ ] Add hot-key detection and isolation.
 
 Evidence:
@@ -669,6 +669,7 @@ Evidence:
 - Follower movement keeps the current owner and the two retained replicas authoritative during bounded committed-prefix transfer to a fourth eligible Node. A generation-scoped freeze under the majority append lock captures final commit progress, then a consensus compare-and-set can install the RF3 replacement and higher ownership epoch. A failed final copy unfreezes the old owner; ambiguous readiness or activation leaves it frozen pending Control Plane resolution.
 - `tests/active_range_placement.rs`, `tests/majority_commit.rs`, and `tests/replica_repair.rs` cover plan idempotency, stale-epoch refusal, snapshot recovery, catch-up gating, frozen-boundary behavior, failed-target rollback, ambiguity safety, Cursor-preserving restart, and continued ordered appends on the replacement. Authenticated internal movement export/stage/freeze endpoints gate Control Plane cutover, while a persisted completed-plan record makes retry-safe unfreeze possible after activation.
 - `python scripts/test-m4-follower-move.py` runs an isolated four-voter development Fabric, tests target outage before activation and retry using the same request ID, replaces one follower while maintaining RF3, appends through all ingress Nodes, verifies Cursor continuation on the new replica, and restarts it. It stops its containers without deleting persistent test volumes. The standard three-Node Fabric is untouched. Append-owner movement and production role separation are not yet implemented.
+- `active_range::replication` refuses a Feed read when even one current range is absent locally; a unit test covers a two-range Feed after one follower moves. This prevents silent partial histories, but remote range retrieval and global continuation still need implementation.
 - These types are internal only; Feed, Key, Cursor, Writer, and Reader APIs remain unchanged.
 
 Definition of Done:
@@ -732,6 +733,7 @@ Definition of Done:
 - [ ] Implement deterministic retry after ambiguous result.
 - [ ] Implement a topology-free point-lookup enrichment Pipe: read a Feed, extract userId, fetch a versioned user StateStore row regardless of storage range, write an output Feed, and atomically record input progress plus output identity. Missing user or lagging state follows an explicit retry/quarantine policy.
 - [ ] Run a live three-Node acceptance with User Writer updates, Reader redelivery, Node restart/owner change, userId enrichment, and same-request retries; prove exactly one committed output effect and no acknowledged input loss without co-partition configuration.
+- [ ] Require the same enrichment semantics, retry/error contract, and runnable guide in Rust, Python, Java, and C# through the [shared SDK conformance plan](streams-clients.md) before calling Whitewater Streams supported.
 
 Definition of Done:
 
@@ -739,6 +741,26 @@ Definition of Done:
 - [ ] Stale Reader cannot acknowledge after lease transfer.
 - [ ] Input progress and Whitewater output effects commit together.
 - [ ] Enrichment never requires a user-defined partition count, topology callback, or application-maintained Fjall/changelog copy.
+
+## Cross-cutting delivery — Whitewater Streams SDK parity and guides
+
+[Contract and guide sequence](streams-clients.md). This is scheduled product work across M2/M3 (existing Rust Writer/Reader), M6 (replicated StateStores), M7 (Subscriptions/Pipes/effects), and M9 (security/compatibility). It is not a second current-focus milestone and does not imply that Python, Java, or C# packages exist today. Unlike Kafka Streams, no language is a privileged processing runtime.
+
+- [x] Define the intended language-neutral Writer, Reader, Subscription, StateStore, Pipe, Cursor, ordering, and idempotent effect semantics; publish the guide/conformance delivery plan (`docs/streams-clients.md`).
+- [ ] Version and publish canonical language-neutral request/response schemas, capability negotiation, TLS/auth defaults, byte/Metadata/nanosecond encodings, and bounded transport limits without exposing Active Range topology.
+- [ ] Define stable structured error codes, scope, retryability, ambiguous-commit handling, backoff, and next safe action; refuse unsupported server capabilities instead of silently downgrading safety.
+- [ ] Complete the Rust application SDK beyond AdminClient: ergonomic Writer, Reader, StateStore, Subscription, and processing-effect façades once the underlying services pass tests.
+- [ ] Implement Python async and sync clients with the same server contract and a runnable Writer/Reader quickstart, then the same StateStore/Pipe guide when implemented.
+- [ ] Implement Java asynchronous and optional blocking clients with the same server contract; no Java-only Pipe or local-state semantics.
+- [ ] Implement C# Task/IAsyncEnumerable clients with the same server contract, cancellation, and native byte/Guid/long representations.
+- [ ] Run one shared three-Node conformance suite for all four libraries: exact bytes/time/Cursor results, identical duplicate and conflicting retries, stale epochs, Reader redelivery/ack, bounded capacity, loss of an owner, restart, authentication errors, and later atomic enrichment/state freshness.
+- [ ] Provide per-language unit-test doubles and publish matching runnable user guides for append/read/replay, state/index queries, enrichment, failure policy, migration from Kafka Streams, and safe operator diagnostics; mark chapters unsupported until server and SDK evidence passes.
+- [ ] Verify package compatibility across supported runtimes, reproducible releases, and a published support matrix so no language quietly lacks a documented core operation.
+
+Definition of Done:
+
+- [ ] Rust, Python, Java, and C# applications can run the same named Whitewater Streams scenarios with equivalent results and retry safety, without choosing a range or co-partitioning.
+- [ ] Every published guide is executable against a supported three-Node Fabric, and unsupported operations fail explicitly.
 
 ## Milestone 8 — Tiered history
 
@@ -792,9 +814,7 @@ These accepted product requirements need dependency review and explicit mileston
 - [ ] Define logical-resource cost attribution for storage, replication, movement, egress, Subscriptions, Pipes, and Indexes.
 - [ ] Define richer Feed inspection, time seek, bounded search, and single-event investigation workflows.
 - [ ] Define end-to-end business-flow tracing through Metadata and logical resource IDs.
-- [ ] Define a versioned language-neutral data protocol, cross-language SDK sequence, and shared conformance suite.
-- [ ] Define protocol-wide structured errors covering cause, scope, impact, retry safety, and next safe action.
-- [ ] Define lightweight SDK test doubles so application logic does not always require a running Fabric.
+Versioned protocol, structured errors, cross-language SDKs, conformance, and test doubles are scheduled under [Whitewater Streams SDK parity and guides](#cross-cutting-delivery--whitewater-streams-sdk-parity-and-guides), rather than left in this unscheduled backlog.
 
 Source: [Kafka pain points and delivery traceability](kafka-pain-points.md).
 

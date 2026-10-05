@@ -12,6 +12,7 @@ Design documents:
 - [Why Whitewater and Kafka equivalents](docs/why-whitewater.md)
 - [Kafka partitions versus Whitewater Active Ranges](docs/why-whitewater.md#kafka-partitions-versus-whitewater-active-ranges)
 - [Core Index storage contract and proposed Fjall key layout](docs/why-whitewater.md#index-storage-contract-and-fjall-layout)
+- [Whitewater Streams and cross-language client contract](docs/streams-clients.md)
 - [Humane operational and developer experience](docs/operational-experience.md)
 - [Proposed Whitewater Operations Advisor](docs/operations-advisor.md)
 - [Reddit community introduction and pinned launch post](docs/reddit-whitewater-streams-introduction.md)
