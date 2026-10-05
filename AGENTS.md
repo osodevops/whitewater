@@ -25,5 +25,5 @@
 - Standard development and membership testing use `compose.cluster.yml` with at least three Nodes via `docker compose up --scale node=N`.
 - The current gossip-style membership is discovery only, not consensus or record replication.
 - Autoscaling must use sustained thresholds, hysteresis, cooldowns, and one-node steps.
-- Never scale in a node unless ownership/data draining has completed and the node reports safe-to-remove.
+- Never scale in a node unless ownership/data draining has completed and the node reports safe-to-remove. Do not use the legacy metadata-only owner transfer as an operator shortcut; owner moves require a verified frozen committed boundary and a compare-and-set Control Plane cutover.
 - Infrastructure scaling runs outside data nodes; do not mount Docker or orchestrator credentials into a data node.

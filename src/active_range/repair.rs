@@ -7,7 +7,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    control::{Command, ControlController, RangeMovePlan},
+    control::{Command, ControlController, RangeMovePlan, RangeOwnerMovePlan},
     control_plane::ControlPlane,
 };
 
@@ -210,6 +210,261 @@ impl FollowerMoveExecutor {
 
     async fn unfreeze(&self, plan: &RangeMovePlan) {
         self.source
+            .unfreeze_generation(
+                plan.source_assignment.range_id,
+                plan.source_assignment.generation,
+            )
+            .await;
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OwnerMoveEvidence {
+    pub source_commit: CommitPosition,
+    pub target_commit: CommitPosition,
+    pub checksum: [u8; 32],
+    pub ready: bool,
+}
+
+#[async_trait]
+pub trait OwnerMoveControl: Send + Sync {
+    async fn record_ready(
+        &self,
+        feed: &str,
+        plan: &RangeOwnerMovePlan,
+        evidence: &OwnerMoveEvidence,
+    ) -> Result<(), String>;
+    async fn activate(&self, feed: &str, plan: &RangeOwnerMovePlan) -> Result<(), String>;
+}
+
+pub struct ControlPlaneOwnerMove {
+    control_plane: Arc<ControlPlane>,
+}
+
+impl ControlPlaneOwnerMove {
+    pub fn new(control_plane: Arc<ControlPlane>) -> Self {
+        Self { control_plane }
+    }
+}
+
+#[async_trait]
+impl OwnerMoveControl for ControlPlaneOwnerMove {
+    async fn record_ready(
+        &self,
+        feed: &str,
+        plan: &RangeOwnerMovePlan,
+        evidence: &OwnerMoveEvidence,
+    ) -> Result<(), String> {
+        self.control_plane
+            .execute_commands(vec![Command::RecordOwnerMoveCatchUp {
+                feed: feed.to_owned(),
+                plan_id: plan.plan_id,
+                source_commit: evidence.source_commit,
+                target_commit: evidence.target_commit,
+                checksum_verified: evidence.ready,
+            }])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn activate(&self, feed: &str, plan: &RangeOwnerMovePlan) -> Result<(), String> {
+        self.control_plane
+            .execute_commands(vec![Command::ActivateOwnerMove {
+                feed: feed.to_owned(),
+                plan_id: plan.plan_id,
+            }])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum OwnerMoveError {
+    #[error("owner movement source and target must match the committed plan")]
+    PlanMismatch,
+    #[error("could not freeze the current Append Owner: {0}")]
+    Freeze(String),
+    #[error("could not verify the target follower: {0}")]
+    Target(String),
+    #[error("target follower is not committed through the frozen source boundary")]
+    CatchingUp,
+    #[error("target committed history differs from the current owner")]
+    VerificationFailed,
+    #[error("owner movement readiness is ambiguous; both Nodes remain frozen: {0}")]
+    Readiness(String),
+    #[error("owner movement activation is ambiguous; both Nodes remain frozen: {0}")]
+    AmbiguousActivation(String),
+}
+
+pub struct OwnerMoveExecutor {
+    control: Arc<ControlController>,
+    coordinator: Arc<MajorityAppendCoordinator>,
+    source: Arc<ReplicaAppendService>,
+    target: Arc<ReplicaAppendService>,
+}
+
+impl OwnerMoveExecutor {
+    pub fn new(
+        control: Arc<ControlController>,
+        coordinator: Arc<MajorityAppendCoordinator>,
+        source: Arc<ReplicaAppendService>,
+        target: Arc<ReplicaAppendService>,
+    ) -> Self {
+        Self {
+            control,
+            coordinator,
+            source,
+            target,
+        }
+    }
+
+    pub async fn finalize(
+        &self,
+        control: &dyn OwnerMoveControl,
+        feed: &str,
+        plan: &RangeOwnerMovePlan,
+    ) -> Result<OwnerMoveEvidence, OwnerMoveError> {
+        if self.source.local_node() != &plan.source_assignment.owner
+            || self.target.local_node() != &plan.candidate_assignment.owner
+            || self
+                .control
+                .owner_move_plan(plan.source_assignment.range_id)
+                .await
+                != Some(plan.clone())
+        {
+            return Err(OwnerMoveError::PlanMismatch);
+        }
+        let frozen_commit = self
+            .coordinator
+            .freeze_for_follower_move(&plan.source_assignment)
+            .await
+            .map_err(|error| OwnerMoveError::Freeze(error.to_string()))?;
+        self.target
+            .freeze_generation(
+                plan.source_assignment.range_id,
+                plan.source_assignment.generation,
+            )
+            .await;
+        let evidence = match self.verify(plan, frozen_commit).await {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                self.unfreeze(plan).await;
+                return Err(error);
+            }
+        };
+        if let Err(error) = control.record_ready(feed, plan, &evidence).await {
+            return Err(OwnerMoveError::Readiness(error));
+        }
+        if let Err(error) = control.activate(feed, plan).await {
+            return Err(OwnerMoveError::AmbiguousActivation(error));
+        }
+        for _ in 0..50 {
+            if self
+                .control
+                .active_range_assignment_by_id(plan.source_assignment.range_id)
+                .await
+                == Some(plan.candidate_assignment.clone())
+            {
+                self.unfreeze(plan).await;
+                return Ok(evidence);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(OwnerMoveError::AmbiguousActivation(
+            "committed owner placement has not applied on the former owner".to_owned(),
+        ))
+    }
+
+    async fn verify(
+        &self,
+        plan: &RangeOwnerMovePlan,
+        frozen_commit: CommitPosition,
+    ) -> Result<OwnerMoveEvidence, OwnerMoveError> {
+        if frozen_commit.value() > 10_000 {
+            return Err(OwnerMoveError::Target(
+                "range exceeds the 10,000-record prototype verification bound".to_owned(),
+            ));
+        }
+        let assignment = &plan.source_assignment;
+        let target_status = self
+            .target
+            .recovery_status_for_assignment(assignment)
+            .await
+            .map_err(|error| OwnerMoveError::Target(error.to_string()))?;
+        if target_status.committed != frozen_commit {
+            return Err(OwnerMoveError::CatchingUp);
+        }
+        self.target
+            .truncate_uncommitted_for_assignment(assignment)
+            .await
+            .map_err(|error| OwnerMoveError::Target(error.to_string()))?;
+        let mut after = None;
+        let mut checksum = blake3::Hasher::new();
+        while after.map_or(0, RangePosition::value) < frozen_commit.value() {
+            let source = self
+                .source
+                .export_assignment_committed(assignment, after, 1)
+                .await
+                .map_err(|error| OwnerMoveError::Freeze(error.to_string()))?;
+            if source.is_empty() {
+                return Err(OwnerMoveError::VerificationFailed);
+            }
+            let target = self
+                .target
+                .read_staged_committed(assignment, after, source.len())
+                .await
+                .map_err(|error| OwnerMoveError::Target(error.to_string()))?;
+            if source.len() != target.len() {
+                return Err(OwnerMoveError::VerificationFailed);
+            }
+            for (source, target) in source.into_iter().zip(target) {
+                if source.position != target.position
+                    || source.identity != target.identity
+                    || source.cursor != target.cursor
+                    || source.frame != target.frame
+                    || source.position.value() > frozen_commit.value()
+                {
+                    return Err(OwnerMoveError::VerificationFailed);
+                }
+                let digest = blake3::hash(&source.frame);
+                checksum.update(&source.position.value().to_be_bytes());
+                checksum.update(digest.as_bytes());
+                after = Some(source.position);
+            }
+        }
+        let source_commit = self
+            .source
+            .recovery_status_for_assignment(assignment)
+            .await
+            .map_err(|error| OwnerMoveError::Freeze(error.to_string()))?
+            .committed;
+        let target_commit = self
+            .target
+            .recovery_status_for_assignment(assignment)
+            .await
+            .map_err(|error| OwnerMoveError::Target(error.to_string()))?
+            .committed;
+        if source_commit != frozen_commit || target_commit != frozen_commit {
+            return Err(OwnerMoveError::CatchingUp);
+        }
+        Ok(OwnerMoveEvidence {
+            source_commit,
+            target_commit,
+            checksum: *checksum.finalize().as_bytes(),
+            ready: true,
+        })
+    }
+
+    async fn unfreeze(&self, plan: &RangeOwnerMovePlan) {
+        self.source
+            .unfreeze_generation(
+                plan.source_assignment.range_id,
+                plan.source_assignment.generation,
+            )
+            .await;
+        self.target
             .unfreeze_generation(
                 plan.source_assignment.range_id,
                 plan.source_assignment.generation,

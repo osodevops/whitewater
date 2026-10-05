@@ -166,40 +166,182 @@ async fn feed_creation_is_refused_when_three_storage_nodes_are_not_available() {
 }
 
 #[tokio::test]
-async fn ownership_transfer_increments_epoch_and_is_idempotent_by_request_id() {
+async fn owner_move_requires_a_verified_caught_up_target_and_atomic_placement_change() {
+    let leader_dir = TempDir::new().unwrap();
+    let follower_dir = TempDir::new().unwrap();
+    let nodes = storage_nodes(&["storage-1", "storage-2", "storage-3"]);
+    let leader = controller(&leader_dir, nodes.clone());
+    let follower = controller(&follower_dir, nodes);
+    create_feed(&leader, Uuid::from_u128(190)).await;
+    let original = placement(&leader).await;
+    let range_id = serde_json::from_value(original["range_id"].clone()).unwrap();
+    let request_id = Uuid::from_u128(191);
+    let command = Command::PrepareOwnerMove {
+        feed: "orders.created".to_owned(),
+        range_id,
+        new_owner: StorageNodeId::try_new("storage-2").unwrap(),
+    };
+    let prepared = leader
+        .execute_commands_with_request_id(vec![command.clone()], request_id)
+        .await
+        .unwrap();
+    let retry = leader
+        .execute_commands_with_request_id(vec![command], request_id)
+        .await
+        .unwrap();
+    assert_eq!(prepared.results[0].data, retry.results[0].data);
+    assert_eq!(placement(&leader).await["owner"], original["owner"]);
+    let plan_id = serde_json::from_value(prepared.results[0].data["plan_id"].clone()).unwrap();
+    let activate = || Command::ActivateOwnerMove {
+        feed: "orders.created".to_owned(),
+        plan_id,
+    };
+    assert!(leader.execute_commands(vec![activate()]).await.is_err());
+    leader
+        .execute_commands(vec![Command::RecordOwnerMoveCatchUp {
+            feed: "orders.created".to_owned(),
+            plan_id,
+            source_commit: CommitPosition::new(4),
+            target_commit: CommitPosition::new(3),
+            checksum_verified: true,
+        }])
+        .await
+        .unwrap();
+    assert!(leader.execute_commands(vec![activate()]).await.is_err());
+    leader
+        .execute_commands(vec![Command::RecordOwnerMoveCatchUp {
+            feed: "orders.created".to_owned(),
+            plan_id,
+            source_commit: CommitPosition::new(4),
+            target_commit: CommitPosition::new(4),
+            checksum_verified: true,
+        }])
+        .await
+        .unwrap();
+    follower
+        .install_snapshot_bytes(&leader.snapshot_bytes().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        placement(&follower).await["owner_move_plans"][0]["stage"],
+        "ready"
+    );
+    let moved = leader
+        .execute_commands(vec![activate()])
+        .await
+        .unwrap()
+        .results
+        .remove(0)
+        .data;
+    assert_eq!(moved["owner"], "storage-2");
+    assert_eq!(moved["ownership_epoch"], 2);
+    assert_eq!(moved["replicas"], original["replicas"]);
+    assert!(placement(&leader).await["owner_move_plans"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn owner_move_plan_cannot_overwrite_newer_recovery_placement() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3", "storage-4"]),
+    );
+    create_feed(&control, Uuid::from_u128(202)).await;
+    let original = placement(&control).await;
+    let range_id = serde_json::from_value(original["range_id"].clone()).unwrap();
+    let prepared = control
+        .execute_commands(vec![Command::PrepareOwnerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            new_owner: StorageNodeId::try_new("storage-2").unwrap(),
+        }])
+        .await
+        .unwrap();
+    let plan_id = serde_json::from_value(prepared.results[0].data["plan_id"].clone()).unwrap();
+    assert!(control
+        .execute_commands(vec![Command::PrepareFollowerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            removed_replica: StorageNodeId::try_new("storage-3").unwrap(),
+            replacement_replica: StorageNodeId::try_new("storage-4").unwrap(),
+        }])
+        .await
+        .is_err());
+    control
+        .execute_commands(vec![Command::RecordOwnerMoveCatchUp {
+            feed: "orders.created".to_owned(),
+            plan_id,
+            source_commit: CommitPosition::new(3),
+            target_commit: CommitPosition::new(3),
+            checksum_verified: true,
+        }])
+        .await
+        .unwrap();
+    control
+        .execute_commands(vec![Command::RecoverActiveRangeOwnership {
+            feed: "orders.created".to_owned(),
+            expected_owner: StorageNodeId::try_new("storage-1").unwrap(),
+            expected_epoch: finnstream::active_range::OwnershipEpoch::new(1),
+            new_owner: StorageNodeId::try_new("storage-3").unwrap(),
+        }])
+        .await
+        .unwrap();
+    assert!(control
+        .execute_commands(vec![Command::ActivateOwnerMove {
+            feed: "orders.created".to_owned(),
+            plan_id,
+        }])
+        .await
+        .is_err());
+    assert_eq!(placement(&control).await["owner"], "storage-3");
+    control
+        .execute_commands(vec![Command::AbortOwnerMove {
+            feed: "orders.created".to_owned(),
+            plan_id,
+        }])
+        .await
+        .unwrap();
+    assert!(placement(&control).await["owner_move_plans"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn direct_owner_transfer_is_refused_without_verified_catch_up() {
     let directory = TempDir::new().unwrap();
     let controller = controller(
         &directory,
         storage_nodes(&["storage-1", "storage-2", "storage-3"]),
     );
     create_feed(&controller, Uuid::from_u128(200)).await;
-    let request_id = Uuid::from_u128(201);
-    let command = Command::TransferActiveRangeOwnership {
-        feed: "orders.created".to_owned(),
-        owner: StorageNodeId::try_new("storage-2").unwrap(),
-    };
-
-    let first = controller
-        .execute_commands_with_request_id(vec![command.clone()], request_id)
-        .await
-        .unwrap();
-    let repeated = controller
-        .execute_commands_with_request_id(vec![command], request_id)
-        .await
-        .unwrap();
-    assert_eq!(first.results[0].data, repeated.results[0].data);
-    assert_eq!(first.results[0].data["owner"], "storage-2");
-    assert_eq!(first.results[0].data["ownership_epoch"], 2);
-    assert_eq!(placement(&controller).await["ownership_epoch"], 2);
-
-    let invalid = controller
+    let original = placement(&controller).await;
+    let result = controller
         .execute_commands(vec![Command::TransferActiveRangeOwnership {
             feed: "orders.created".to_owned(),
-            owner: StorageNodeId::try_new("storage-4").unwrap(),
+            owner: StorageNodeId::try_new("storage-2").unwrap(),
         }])
         .await;
-    assert!(matches!(invalid, Err(ControlError::InvalidOperation(_))));
-    assert_eq!(placement(&controller).await["ownership_epoch"], 2);
+    assert!(
+        matches!(result, Err(ControlError::InvalidOperation(message)) if message.contains("verified owner-movement"))
+    );
+    assert_eq!(placement(&controller).await["owner"], original["owner"]);
+    assert_eq!(
+        placement(&controller).await["ownership_epoch"],
+        original["ownership_epoch"]
+    );
+    let range_id = serde_json::from_value(original["range_id"].clone()).unwrap();
+    assert!(controller
+        .execute_commands(vec![Command::PrepareOwnerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            new_owner: StorageNodeId::try_new("storage-4").unwrap(),
+        }])
+        .await
+        .is_err());
 }
 
 #[tokio::test]
@@ -421,9 +563,11 @@ async fn follower_move_cannot_overwrite_newer_ownership() {
         .await
         .unwrap();
     control
-        .execute_commands(vec![Command::TransferActiveRangeOwnership {
+        .execute_commands(vec![Command::RecoverActiveRangeOwnership {
             feed: "orders.created".to_owned(),
-            owner: storage_nodes(&["storage-2"]).remove(0),
+            expected_owner: storage_nodes(&["storage-1"]).remove(0),
+            expected_epoch: finnstream::active_range::OwnershipEpoch::new(1),
+            new_owner: storage_nodes(&["storage-2"]).remove(0),
         }])
         .await
         .unwrap();

@@ -295,6 +295,9 @@ impl AdminClient {
             .await
     }
 
+    #[deprecated(
+        note = "direct owner transfer is refused; a verified movement workflow is required"
+    )]
     pub async fn transfer_active_range_ownership(
         &self,
         feed: impl Into<String>,

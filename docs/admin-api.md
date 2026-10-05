@@ -287,7 +287,7 @@ The Control Plane allocates the sequence idempotently from `request_id`, validat
 
 Send a bounded ordered batch with `POST /v1/writers/append-batch` and `{ "records": [...] }`. The initial implementation commits records sequentially in request order, stops at the first failure, and relies on each record's stable request ID for safe retry of a partially completed batch. `WriterSessionClient::append_batch` uses the same endpoint.
 
-### Inspect and transfer Active Range placement
+### Inspect Active Range placement
 
 Placement is an authenticated operator view. Writers and Readers never receive owner or replica topology.
 
@@ -298,19 +298,9 @@ Placement is an authenticated operator view. Writers and Readers never receive o
 }
 ```
 
-The result contains the internal RangeId, generation, current owner, RF3 replica set, and ownership epoch. The standard development Fabric currently treats its three statically configured Control Plane Nodes as storage-capable placement candidates.
+The result contains the internal RangeId, generation, current owner, RF3 replica set, ownership epoch, and any candidate owner-movement plans. The standard development Fabric currently treats its three statically configured Control Plane Nodes as storage-capable placement candidates.
 
-Ownership transfer is epoch-fenced and limited to a current replica:
-
-```json
-{
-  "command": "transfer_active_range_ownership",
-  "feed": "orders.created",
-  "owner": "control-2"
-}
-```
-
-Repeating the same request ID returns the original result without incrementing the epoch twice.
+The old `transfer_active_range_ownership` typed command is now refused: changing the epoch alone can promote a lagging follower. Internal owner-move planning and local frozen-boundary verification exist, but **no authenticated remote owner-movement endpoint is available yet**. The public typed Admin API rejects owner recovery/readiness/activation commands that require internal Node authority; operators should not attempt to synthesize catch-up evidence or use `recover_active_range_ownership` to move a healthy owner. A guarded admin workflow will be exposed only after live three-Node cutover and retry tests pass.
 
 ### Replace a follower replica
 

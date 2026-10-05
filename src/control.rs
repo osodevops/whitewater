@@ -224,6 +224,18 @@ pub struct RangeMovePlan {
     pub checksum_verified: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeOwnerMovePlan {
+    pub plan_id: Uuid,
+    pub feed_id: Uuid,
+    pub source_assignment: ActiveRangeAssignment,
+    pub candidate_assignment: ActiveRangeAssignment,
+    pub stage: RangeMoveStage,
+    pub source_commit: Option<CommitPosition>,
+    pub target_commit: Option<CommitPosition>,
+    pub checksum_verified: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CatalogState {
     schema_version: u32,
@@ -250,6 +262,10 @@ struct CatalogState {
     range_move_plans: BTreeMap<RangeId, RangeMovePlan>,
     #[serde(default)]
     completed_move_plans: BTreeMap<RangeId, RangeMovePlan>,
+    #[serde(default)]
+    owner_move_plans: BTreeMap<RangeId, RangeOwnerMovePlan>,
+    #[serde(default)]
+    completed_owner_move_plans: BTreeMap<RangeId, RangeOwnerMovePlan>,
     #[serde(default)]
     applied_requests: BTreeMap<Uuid, ReplicatedCommandResult>,
 }
@@ -286,6 +302,8 @@ impl Default for CatalogState {
             range_merge_plans: BTreeMap::new(),
             range_move_plans: BTreeMap::new(),
             completed_move_plans: BTreeMap::new(),
+            owner_move_plans: BTreeMap::new(),
+            completed_owner_move_plans: BTreeMap::new(),
             applied_requests: BTreeMap::new(),
         }
     }
@@ -471,6 +489,26 @@ pub enum Command {
         feed: String,
         plan_id: Uuid,
     },
+    PrepareOwnerMove {
+        feed: String,
+        range_id: RangeId,
+        new_owner: StorageNodeId,
+    },
+    RecordOwnerMoveCatchUp {
+        feed: String,
+        plan_id: Uuid,
+        source_commit: CommitPosition,
+        target_commit: CommitPosition,
+        checksum_verified: bool,
+    },
+    ActivateOwnerMove {
+        feed: String,
+        plan_id: Uuid,
+    },
+    AbortOwnerMove {
+        feed: String,
+        plan_id: Uuid,
+    },
 }
 
 impl Command {
@@ -481,6 +519,24 @@ impl Command {
                 | Self::Describe { .. }
                 | Self::ExplainAccess { .. }
                 | Self::InspectPlacement { .. }
+        )
+    }
+
+    pub fn requires_internal_replica_authority(&self) -> bool {
+        matches!(
+            self,
+            Self::TransferActiveRangeOwnership { .. }
+                | Self::RecoverActiveRangeOwnership { .. }
+                | Self::RecordActiveRangeSplitCatchUp { .. }
+                | Self::ActivateActiveRangeSplit { .. }
+                | Self::RecordActiveRangeMergeStaging { .. }
+                | Self::ActivateActiveRangeMerge { .. }
+                | Self::RecordFollowerMoveCatchUp { .. }
+                | Self::ActivateFollowerMove { .. }
+                | Self::PrepareOwnerMove { .. }
+                | Self::RecordOwnerMoveCatchUp { .. }
+                | Self::ActivateOwnerMove { .. }
+                | Self::AbortOwnerMove { .. }
         )
     }
 }
@@ -917,6 +973,24 @@ impl ControlController {
             .lock()
             .await
             .completed_move_plans
+            .get(&range_id)
+            .cloned()
+    }
+
+    pub async fn owner_move_plan(&self, range_id: RangeId) -> Option<RangeOwnerMovePlan> {
+        self.state
+            .lock()
+            .await
+            .owner_move_plans
+            .get(&range_id)
+            .cloned()
+    }
+
+    pub async fn completed_owner_move(&self, range_id: RangeId) -> Option<RangeOwnerMovePlan> {
+        self.state
+            .lock()
+            .await
+            .completed_owner_move_plans
             .get(&range_id)
             .cloned()
     }
@@ -1422,6 +1496,14 @@ impl ControlController {
                             .collect::<Vec<_>>()),
                     );
                     object.insert(
+                        "owner_move_plans".to_owned(),
+                        json!(state
+                            .owner_move_plans
+                            .values()
+                            .filter(|plan| plan.feed_id == feed_id)
+                            .collect::<Vec<_>>()),
+                    );
+                    object.insert(
                         "range_assignments".to_owned(),
                         json!(state
                             .range_maps
@@ -1436,32 +1518,10 @@ impl ControlController {
                 }
                 Ok((format!("inspected placement for Feed {feed}"), data))
             }
-            Command::TransferActiveRangeOwnership { feed, owner } => {
-                let feed_id = active_feed(state, &feed)?.feed_id;
-                let assignment = state.active_ranges.get_mut(&feed_id).ok_or_else(|| {
-                    ControlError::NotFound(format!("Active Range placement for Feed {feed}"))
-                })?;
-                if assignment.owner == owner {
-                    return Err(ControlError::InvalidOperation(format!(
-                        "Node {owner} already owns the Active Range for Feed {feed}"
-                    )));
-                }
-                let next_epoch = assignment
-                    .ownership_epoch
-                    .checked_next()
-                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
-                assignment
-                    .transfer_ownership(owner, next_epoch)
-                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
-                let updated = assignment.clone();
-                state
-                    .range_assignments
-                    .insert(updated.range_id, updated.clone());
-                Ok((
-                    format!("transferred Active Range ownership for Feed {feed}"),
-                    json!(updated),
-                ))
-            }
+            Command::TransferActiveRangeOwnership { .. } => Err(ControlError::InvalidOperation(
+                "direct owner transfer is unsafe; use the verified owner-movement workflow"
+                    .to_owned(),
+            )),
             Command::RecoverActiveRangeOwnership {
                 feed,
                 expected_owner,
@@ -1497,13 +1557,7 @@ impl ControlController {
             }
             Command::PrepareActiveRangeSplit { feed, split_at } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
-                if state.range_split_plans.contains_key(&feed_id)
-                    || state.range_merge_plans.contains_key(&feed_id)
-                    || state
-                        .range_move_plans
-                        .values()
-                        .any(|plan| plan.feed_id == feed_id)
-                {
+                if range_operation_pending(state, feed_id) {
                     return Err(ControlError::AlreadyExists(format!(
                         "range operation for Feed {feed}"
                     )));
@@ -1701,13 +1755,7 @@ impl ControlController {
                 right_range_id,
             } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
-                if state.range_split_plans.contains_key(&feed_id)
-                    || state.range_merge_plans.contains_key(&feed_id)
-                    || state
-                        .range_move_plans
-                        .values()
-                        .any(|plan| plan.feed_id == feed_id)
-                {
+                if range_operation_pending(state, feed_id) {
                     return Err(ControlError::AlreadyExists(format!(
                         "range operation for Feed {feed}"
                     )));
@@ -1848,6 +1896,162 @@ impl ControlController {
                     }),
                 ))
             }
+            Command::PrepareOwnerMove {
+                feed,
+                range_id,
+                new_owner,
+            } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                if range_operation_pending(state, feed_id) {
+                    return Err(ControlError::AlreadyExists(format!(
+                        "range operation for Feed {feed}"
+                    )));
+                }
+                let map = state
+                    .range_maps
+                    .get(&feed_id)
+                    .ok_or_else(|| ControlError::NotFound(format!("RangeMap for Feed {feed}")))?;
+                if !map.routes().iter().any(|route| route.range_id == range_id) {
+                    return Err(ControlError::NotFound(format!(
+                        "active Range {range_id} for Feed {feed}"
+                    )));
+                }
+                let source = state.range_assignments.get(&range_id).ok_or_else(|| {
+                    ControlError::NotFound(format!("placement for active Range {range_id}"))
+                })?;
+                if source.feed_id != feed_id
+                    || source.owner == new_owner
+                    || !source.replicas.contains(&new_owner)
+                {
+                    return Err(ControlError::InvalidOperation(
+                        "owner movement requires a different current RF3 follower".to_owned(),
+                    ));
+                }
+                let epoch = source
+                    .ownership_epoch
+                    .checked_next()
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let mut candidate = source.clone();
+                candidate
+                    .transfer_ownership(new_owner, epoch)
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let plan = RangeOwnerMovePlan {
+                    plan_id: derived_resource_id(request_id, "owner-move-plan"),
+                    feed_id,
+                    source_assignment: source.clone(),
+                    candidate_assignment: candidate,
+                    stage: RangeMoveStage::Prepared,
+                    source_commit: None,
+                    target_commit: None,
+                    checksum_verified: false,
+                };
+                state.completed_owner_move_plans.remove(&range_id);
+                state.owner_move_plans.insert(range_id, plan.clone());
+                Ok((format!("prepared owner move for Feed {feed}"), json!(plan)))
+            }
+            Command::RecordOwnerMoveCatchUp {
+                feed,
+                plan_id,
+                source_commit,
+                target_commit,
+                checksum_verified,
+            } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                let plan = state
+                    .owner_move_plans
+                    .values_mut()
+                    .find(|plan| plan.plan_id == plan_id && plan.feed_id == feed_id)
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "owner movement plan {plan_id} for Feed {feed}"
+                        ))
+                    })?;
+                if source_commit < plan.source_commit.unwrap_or_default()
+                    || target_commit < plan.target_commit.unwrap_or_default()
+                    || target_commit > source_commit
+                {
+                    return Err(ControlError::InvalidOperation(
+                        "owner movement evidence is backwards or target is ahead of source"
+                            .to_owned(),
+                    ));
+                }
+                plan.source_commit = Some(source_commit);
+                plan.target_commit = Some(target_commit);
+                plan.checksum_verified = checksum_verified;
+                plan.stage = if checksum_verified && target_commit == source_commit {
+                    RangeMoveStage::Ready
+                } else {
+                    RangeMoveStage::CatchingUp
+                };
+                Ok((
+                    format!("recorded owner move catch-up for Feed {feed}"),
+                    json!(plan.clone()),
+                ))
+            }
+            Command::ActivateOwnerMove { feed, plan_id } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                let plan = state
+                    .owner_move_plans
+                    .values()
+                    .find(|plan| plan.plan_id == plan_id && plan.feed_id == feed_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "owner movement plan {plan_id} for Feed {feed}"
+                        ))
+                    })?;
+                if plan.stage != RangeMoveStage::Ready
+                    || !plan.checksum_verified
+                    || plan.source_commit.is_none()
+                    || plan.source_commit != plan.target_commit
+                    || state
+                        .range_assignments
+                        .get(&plan.source_assignment.range_id)
+                        != Some(&plan.source_assignment)
+                {
+                    return Err(ControlError::InvalidOperation(
+                        "owner movement is not verified or its source placement changed; recheck catch-up".to_owned(),
+                    ));
+                }
+                let updated = plan.candidate_assignment.clone();
+                state
+                    .range_assignments
+                    .insert(updated.range_id, updated.clone());
+                if state
+                    .active_ranges
+                    .get(&feed_id)
+                    .map(|assignment| assignment.range_id)
+                    == Some(updated.range_id)
+                {
+                    state.active_ranges.insert(feed_id, updated.clone());
+                }
+                state.owner_move_plans.remove(&updated.range_id);
+                state
+                    .completed_owner_move_plans
+                    .insert(updated.range_id, plan);
+                Ok((
+                    format!("activated owner move for Feed {feed}"),
+                    json!(updated),
+                ))
+            }
+            Command::AbortOwnerMove { feed, plan_id } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                let range_id = state
+                    .owner_move_plans
+                    .iter()
+                    .find(|(_, plan)| plan.plan_id == plan_id && plan.feed_id == feed_id)
+                    .map(|(range_id, _)| *range_id)
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "owner movement plan {plan_id} for Feed {feed}"
+                        ))
+                    })?;
+                state.owner_move_plans.remove(&range_id);
+                Ok((
+                    format!("aborted owner move for Feed {feed}"),
+                    json!({"plan_id": plan_id}),
+                ))
+            }
             Command::PrepareFollowerMove {
                 feed,
                 range_id,
@@ -1855,13 +2059,7 @@ impl ControlController {
                 replacement_replica,
             } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
-                if state.range_split_plans.contains_key(&feed_id)
-                    || state.range_merge_plans.contains_key(&feed_id)
-                    || state
-                        .range_move_plans
-                        .values()
-                        .any(|plan| plan.feed_id == feed_id)
-                {
+                if range_operation_pending(state, feed_id) {
                     return Err(ControlError::AlreadyExists(format!(
                         "range operation for Feed {feed}"
                     )));
@@ -2519,6 +2717,19 @@ fn ensure_name_available<'a>(
     }
 }
 
+fn range_operation_pending(state: &CatalogState, feed_id: Uuid) -> bool {
+    state.range_split_plans.contains_key(&feed_id)
+        || state.range_merge_plans.contains_key(&feed_id)
+        || state
+            .range_move_plans
+            .values()
+            .any(|plan| plan.feed_id == feed_id)
+        || state
+            .owner_move_plans
+            .values()
+            .any(|plan| plan.feed_id == feed_id)
+}
+
 fn owning_space<'a>(
     state: &'a CatalogState,
     feed: &str,
@@ -2845,6 +3056,10 @@ fn command_label(command: &Command) -> String {
         Command::RecordFollowerMoveCatchUp { .. } => "RECORD FOLLOWER MOVE CATCH UP",
         Command::ActivateFollowerMove { .. } => "ACTIVATE FOLLOWER MOVE",
         Command::AbortFollowerMove { .. } => "ABORT FOLLOWER MOVE",
+        Command::PrepareOwnerMove { .. } => "PREPARE OWNER MOVE",
+        Command::RecordOwnerMoveCatchUp { .. } => "RECORD OWNER MOVE CATCH UP",
+        Command::ActivateOwnerMove { .. } => "ACTIVATE OWNER MOVE",
+        Command::AbortOwnerMove { .. } => "ABORT OWNER MOVE",
     }
     .to_owned()
 }

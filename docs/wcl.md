@@ -224,21 +224,15 @@ DESCRIBE READER audit;
 DESCRIBE ROLE orderanalytics;
 ```
 
-## Inspect and transfer Active Range placement
+## Inspect Active Range placement
 
-Placement commands are authenticated operator controls. Application Writers and Readers do not receive physical topology.
+Placement inspection is an authenticated operator control. Application Writers and Readers do not receive physical topology.
 
 ```sql
 INSPECT PLACEMENT FOR FEED orders.created;
 ```
 
-The standard three-Node Fabric creates one RF3 Active Range at Feed creation. Ownership transfer selects another current replica and commits a higher fencing epoch:
-
-```sql
-TRANSFER ACTIVE RANGE OWNERSHIP
-  FOR FEED orders.created
-  TO control-2;
-```
+The standard three-Node Fabric creates one RF3 Active Range at Feed creation. The legacy `TRANSFER ACTIVE RANGE OWNERSHIP` syntax is still recognized but deliberately rejected: metadata-only transfer could promote a follower without verified committed history. Local owner-movement verification exists, but an authenticated live operator cutover is not yet available.
 
 ## Rename resources
 

@@ -284,6 +284,15 @@ async fn execute_admin_commands(
     Json(request): Json<CommandBatchRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     authorize_admin(&state, &headers)?;
+    if request
+        .commands
+        .iter()
+        .any(crate::control::Command::requires_internal_replica_authority)
+    {
+        return Err(ApiError::bad_request(
+            "replica recovery and movement cutover require internal Node authority",
+        ));
+    }
     let _request = state.demand.begin_request();
     let request_id = request.request_id.unwrap_or_else(Uuid::new_v4);
     Ok(Json(match &state.control_plane {
@@ -3263,6 +3272,35 @@ mod tests {
             .unwrap();
         let execution: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(execution["results"][1]["data"]["stage"], "declared");
+    }
+
+    #[tokio::test]
+    async fn public_admin_commands_cannot_forge_owner_cutover_evidence() {
+        let directory = TempDir::new().unwrap();
+        let app = admin_test_router(&directory);
+        let response = app
+            .oneshot(admin_request(
+                "/v1/admin/commands",
+                serde_json::to_value(CommandBatchRequest {
+                    request_id: Some(Uuid::new_v4()),
+                    commands: vec![Command::RecordOwnerMoveCatchUp {
+                        feed: "orders.events".to_owned(),
+                        plan_id: Uuid::new_v4(),
+                        source_commit: CommitPosition::new(1),
+                        target_commit: CommitPosition::new(1),
+                        checksum_verified: true,
+                    }],
+                })
+                .unwrap(),
+                Some("this-is-a-long-development-api-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("internal Node authority"));
     }
 
     #[tokio::test]

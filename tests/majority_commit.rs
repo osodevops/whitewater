@@ -7,13 +7,14 @@ use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use finnstream::{
     active_range::{
-        AppendIdentity, MajorityAppendCoordinator, MajorityAppendErrorCode, OwnershipEpoch,
-        RangeGeneration, RangePosition, ReplicaAppendAccepted, ReplicaAppendRequest,
-        ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest, ReplicaTransport,
-        ReplicaTransportError, StorageNodeId,
+        repair_replica, AppendIdentity, CommitPosition, MajorityAppendCoordinator,
+        MajorityAppendErrorCode, OwnerMoveControl, OwnerMoveError, OwnerMoveEvidence,
+        OwnerMoveExecutor, OwnershipEpoch, RangeGeneration, RangePosition, ReplicaAppendAccepted,
+        ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest,
+        ReplicaTransport, ReplicaTransportError, StorageNodeId,
     },
     codec::encode_record,
-    control::{Command, ControlController},
+    control::{Command, ControlController, RangeOwnerMovePlan},
     domain::StoredRecord,
     storage::{FileLogStore, LogStore},
 };
@@ -72,6 +73,59 @@ impl ReplicaTransport for DirectTransport {
                 message: error.message,
                 retryable: error.retryable,
             })
+    }
+}
+
+struct LocalOwnerMoveControl(Arc<ControlController>);
+
+#[async_trait]
+impl OwnerMoveControl for LocalOwnerMoveControl {
+    async fn record_ready(
+        &self,
+        feed: &str,
+        plan: &RangeOwnerMovePlan,
+        evidence: &OwnerMoveEvidence,
+    ) -> Result<(), String> {
+        self.0
+            .execute_commands(vec![Command::RecordOwnerMoveCatchUp {
+                feed: feed.to_owned(),
+                plan_id: plan.plan_id,
+                source_commit: evidence.source_commit,
+                target_commit: evidence.target_commit,
+                checksum_verified: evidence.ready,
+            }])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn activate(&self, feed: &str, plan: &RangeOwnerMovePlan) -> Result<(), String> {
+        self.0
+            .execute_commands(vec![Command::ActivateOwnerMove {
+                feed: feed.to_owned(),
+                plan_id: plan.plan_id,
+            }])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+struct UncertainOwnerMoveControl;
+
+#[async_trait]
+impl OwnerMoveControl for UncertainOwnerMoveControl {
+    async fn record_ready(
+        &self,
+        _feed: &str,
+        _plan: &RangeOwnerMovePlan,
+        _evidence: &OwnerMoveEvidence,
+    ) -> Result<(), String> {
+        Err("readiness response was lost".to_owned())
+    }
+
+    async fn activate(&self, _feed: &str, _plan: &RangeOwnerMovePlan) -> Result<(), String> {
+        Err("activation must not run without readiness".to_owned())
     }
 }
 
@@ -288,6 +342,279 @@ async fn follower_move_freeze_discards_only_the_uncommitted_owner_tail() {
     fixture.services[&assignment.owner]
         .unfreeze_generation(assignment.range_id, assignment.generation)
         .await;
+}
+
+#[tokio::test]
+async fn owner_move_fences_old_owner_only_after_verified_catch_up() {
+    let fixture = Fixture::new().await;
+    let original = fixture
+        .control
+        .active_range_assignment(fixture.request.feed_id)
+        .await
+        .unwrap();
+    let source = fixture.services[&original.owner].clone();
+    let target = fixture.services[&StorageNodeId::try_new("storage-2").unwrap()].clone();
+    let owner = Arc::new(fixture.coordinator(&[], &["storage-2"], None));
+    owner.append(fixture.request.clone()).await.unwrap();
+    let prepared = fixture
+        .control
+        .execute_commands(vec![Command::PrepareOwnerMove {
+            feed: "orders.events".to_owned(),
+            range_id: original.range_id,
+            new_owner: target.local_node().clone(),
+        }])
+        .await
+        .unwrap();
+    let plan: RangeOwnerMovePlan =
+        serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+    let executor = OwnerMoveExecutor::new(
+        fixture.control.clone(),
+        owner.clone(),
+        source.clone(),
+        target.clone(),
+    );
+    let mut forged = plan.clone();
+    forged.candidate_assignment.ownership_epoch = OwnershipEpoch::new(99);
+    assert!(matches!(
+        executor
+            .finalize(
+                &LocalOwnerMoveControl(fixture.control.clone()),
+                "orders.events",
+                &forged
+            )
+            .await,
+        Err(OwnerMoveError::PlanMismatch)
+    ));
+    assert!(
+        !source
+            .generation_is_frozen(original.range_id, original.generation)
+            .await
+    );
+    assert!(matches!(
+        executor
+            .finalize(
+                &LocalOwnerMoveControl(fixture.control.clone()),
+                "orders.events",
+                &plan
+            )
+            .await,
+        Err(OwnerMoveError::CatchingUp)
+    ));
+    assert!(
+        !source
+            .generation_is_frozen(original.range_id, original.generation)
+            .await
+    );
+    assert!(
+        !target
+            .generation_is_frozen(original.range_id, original.generation)
+            .await
+    );
+    assert_eq!(
+        fixture
+            .control
+            .active_range_assignment(original.feed_id)
+            .await
+            .unwrap(),
+        original
+    );
+    repair_replica(&original, source.clone(), target.clone(), 1)
+        .await
+        .unwrap();
+    assert!(matches!(
+        executor
+            .finalize(&UncertainOwnerMoveControl, "orders.events", &plan)
+            .await,
+        Err(OwnerMoveError::Readiness(_))
+    ));
+    assert!(
+        source
+            .generation_is_frozen(original.range_id, original.generation)
+            .await
+    );
+    assert!(
+        target
+            .generation_is_frozen(original.range_id, original.generation)
+            .await
+    );
+    assert_eq!(
+        fixture
+            .control
+            .active_range_assignment(original.feed_id)
+            .await
+            .unwrap(),
+        original
+    );
+    source
+        .unfreeze_generation(original.range_id, original.generation)
+        .await;
+    target
+        .unfreeze_generation(original.range_id, original.generation)
+        .await;
+    let moved = executor
+        .finalize(
+            &LocalOwnerMoveControl(fixture.control.clone()),
+            "orders.events",
+            &plan,
+        )
+        .await
+        .unwrap();
+    assert!(moved.ready);
+    assert_eq!(moved.target_commit, CommitPosition::new(1));
+    let current = fixture
+        .control
+        .active_range_assignment(original.feed_id)
+        .await
+        .unwrap();
+    assert_eq!(current.owner, *target.local_node());
+    assert_eq!(current.ownership_epoch.value(), 2);
+    assert_eq!(current.replicas, original.replicas);
+    assert!(
+        !source
+            .generation_is_frozen(original.range_id, original.generation)
+            .await
+    );
+    assert!(
+        !target
+            .generation_is_frozen(original.range_id, original.generation)
+            .await
+    );
+    assert_eq!(
+        owner
+            .append(fixture.request.clone())
+            .await
+            .unwrap_err()
+            .code,
+        MajorityAppendErrorCode::NotCurrentOwner
+    );
+    let record = StoredRecord {
+        message_id: Uuid::from_u128(702),
+        producer_id: fixture.request.identity.writer_session_id,
+        producer_sequence: 2,
+        event_time_ns: 2,
+        ingest_time_ns: 3,
+        key: b"customer-1".to_vec(),
+        payload: b"updated".to_vec(),
+        metadata: BTreeMap::new(),
+    };
+    let mut request = fixture.request.clone();
+    request.ownership_epoch = current.ownership_epoch;
+    request.append_owner = current.owner.clone();
+    request.expected_position = RangePosition::new(2);
+    request.identity.sequence = 2;
+    request.cursor = "cursor-2".to_owned();
+    request.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+    let transport = DirectTransport {
+        services: Arc::new(fixture.services.clone()),
+        append_down: Arc::new(BTreeSet::new()),
+        commit_down: Arc::new(BTreeSet::new()),
+        corrupt_digest: None,
+    };
+    let new_owner = MajorityAppendCoordinator::new(
+        target.clone(),
+        fixture.control.clone(),
+        Arc::new(transport),
+    );
+    assert_eq!(new_owner.append(request).await.unwrap().position.value(), 2);
+    let frames = target
+        .read_committed(original.feed_id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| frame.cursor.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cursor-1", "cursor-2"]
+    );
+}
+
+#[tokio::test]
+async fn owner_move_rejects_a_caught_up_follower_with_different_bytes() {
+    let fixture = Fixture::new().await;
+    let original = fixture
+        .control
+        .active_range_assignment(fixture.request.feed_id)
+        .await
+        .unwrap();
+    let source = fixture.services[&original.owner].clone();
+    let target = fixture.services[&StorageNodeId::try_new("storage-2").unwrap()].clone();
+    let owner = Arc::new(fixture.coordinator(&[], &[], None));
+    owner.append(fixture.request.clone()).await.unwrap();
+    target
+        .quarantine_for_repair(original.feed_id)
+        .await
+        .unwrap();
+    let mut conflicting = fixture.request.clone();
+    let record = StoredRecord {
+        message_id: Uuid::from_u128(701),
+        producer_id: conflicting.identity.writer_session_id,
+        producer_sequence: 1,
+        event_time_ns: 1,
+        ingest_time_ns: 2,
+        key: b"customer-1".to_vec(),
+        payload: b"different".to_vec(),
+        metadata: BTreeMap::new(),
+    };
+    conflicting.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+    let accepted = target.append(conflicting).await.unwrap();
+    target
+        .commit(ReplicaCommitRequest {
+            feed_id: original.feed_id,
+            range_id: original.range_id,
+            generation: original.generation,
+            ownership_epoch: original.ownership_epoch,
+            append_owner: original.owner.clone(),
+            commit_position: CommitPosition::new(1),
+            frame_digest: accepted.frame_digest,
+        })
+        .await
+        .unwrap();
+    let prepared = fixture
+        .control
+        .execute_commands(vec![Command::PrepareOwnerMove {
+            feed: "orders.events".to_owned(),
+            range_id: original.range_id,
+            new_owner: target.local_node().clone(),
+        }])
+        .await
+        .unwrap();
+    let plan: RangeOwnerMovePlan =
+        serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+    let executor = OwnerMoveExecutor::new(
+        fixture.control.clone(),
+        owner,
+        source.clone(),
+        target.clone(),
+    );
+    assert!(matches!(
+        executor
+            .finalize(
+                &LocalOwnerMoveControl(fixture.control.clone()),
+                "orders.events",
+                &plan
+            )
+            .await,
+        Err(OwnerMoveError::VerificationFailed)
+    ));
+    assert_eq!(
+        fixture
+            .control
+            .active_range_assignment(original.feed_id)
+            .await
+            .unwrap(),
+        original
+    );
+    assert!(
+        !source
+            .generation_is_frozen(original.range_id, original.generation)
+            .await
+    );
+    assert!(
+        !target
+            .generation_is_frozen(original.range_id, original.generation)
+            .await
+    );
 }
 
 #[tokio::test]

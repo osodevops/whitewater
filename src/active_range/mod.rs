@@ -29,8 +29,9 @@ pub use recovery::{
     ReplicaReconcileResponse, ReplicaRecoveryStatus,
 };
 pub use repair::{
-    copy_follower_move, repair_replica, ControlPlaneFollowerMove, FollowerMoveControl,
-    FollowerMoveCopyResult, FollowerMoveError, FollowerMoveExecutor, LocalRepairSupervisor,
+    copy_follower_move, repair_replica, ControlPlaneFollowerMove, ControlPlaneOwnerMove,
+    FollowerMoveControl, FollowerMoveCopyResult, FollowerMoveError, FollowerMoveExecutor,
+    LocalRepairSupervisor, OwnerMoveControl, OwnerMoveError, OwnerMoveEvidence, OwnerMoveExecutor,
     RepairExportRequest, RepairExportResponse, RepairFrame, ReplicaRepairError,
     ReplicaRepairProgress,
 };
