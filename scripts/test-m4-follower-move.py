@@ -1,4 +1,5 @@
 import base64
+import http.client
 import json
 import subprocess
 import time
@@ -48,7 +49,7 @@ def wait_for_fabric():
         try:
             if all(urllib.request.urlopen(f"{node}/health", timeout=2).status == 200 for node in NODES):
                 return
-        except (urllib.error.URLError, TimeoutError):
+        except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
             pass
         time.sleep(1)
     raise AssertionError("four-Node Fabric did not become healthy")

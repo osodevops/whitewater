@@ -3,12 +3,55 @@ use std::{collections::BTreeMap, time::Duration};
 use finnstream::{
     active_range::RangeId,
     reader::{
-        FjallReaderProgressStore, ReaderDeliveryMutation, ReaderDeliveryReceipt,
-        ReaderPacingController, ReaderPressureSample, ReaderProgressEngine, ReaderProgressError,
+        FjallReaderProgressStore, FjallSubscriptionProgressReplica, ReaderDeliveryMutation,
+        ReaderDeliveryReceipt, ReaderPacingController, ReaderPressureSample, ReaderProgressEngine,
+        ReaderProgressError, SubscriptionProgressError, SubscriptionProgressMutation,
     },
 };
 use tempfile::TempDir;
 use uuid::Uuid;
+
+#[test]
+fn prepared_subscription_progress_remains_invisible_after_replica_restart() {
+    let first_dir = TempDir::new().unwrap();
+    let second_dir = TempDir::new().unwrap();
+    let first = FjallSubscriptionProgressReplica::open(first_dir.path()).unwrap();
+    let second = FjallSubscriptionProgressReplica::open(second_dir.path()).unwrap();
+    let subscription_id = Uuid::from_u128(101);
+    let mutation = SubscriptionProgressMutation {
+        subscription_id,
+        feed_id: Uuid::from_u128(102),
+        ownership_epoch: 1,
+        sequence: 1,
+        request_id: Uuid::from_u128(103),
+        expected_cursor: None,
+        cursor: "rf1_progress".to_owned(),
+        positions: BTreeMap::from([(
+            RangeId::from_uuid(Uuid::from_u128(104)),
+            "event-1".to_owned(),
+        )]),
+    };
+    let vote = first.prepare(mutation.clone()).unwrap();
+    assert_eq!(
+        vote.digest,
+        second.prepare(mutation.clone()).unwrap().digest
+    );
+    assert!(first.local_committed(subscription_id).unwrap().is_none());
+    drop(first);
+    let reopened = FjallSubscriptionProgressReplica::open(first_dir.path()).unwrap();
+    assert!(reopened.local_committed(subscription_id).unwrap().is_none());
+    assert_eq!(
+        reopened.prepare(mutation.clone()).unwrap().digest,
+        vote.digest
+    );
+    let mut conflicting = mutation.clone();
+    conflicting.cursor = "another-page".to_owned();
+    assert!(matches!(
+        reopened.prepare(conflicting),
+        Err(SubscriptionProgressError::Conflict)
+    ));
+    assert!(second.local_committed(subscription_id).unwrap().is_none());
+}
 
 fn delivery(
     reader_id: Uuid,

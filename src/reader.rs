@@ -590,9 +590,325 @@ impl ReaderProgressEngine for FjallReaderProgressStore {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscriptionProgressMutation {
+    pub subscription_id: Uuid,
+    pub feed_id: Uuid,
+    pub ownership_epoch: u64,
+    pub sequence: u64,
+    pub request_id: Uuid,
+    pub expected_cursor: Option<String>,
+    pub cursor: String,
+    pub positions: BTreeMap<RangeId, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SubscriptionProgressReplicaRow {
+    subscription_id: Uuid,
+    feed_id: Uuid,
+    ownership_epoch: u64,
+    committed: Option<SubscriptionProgressMutation>,
+    prepared: Option<SubscriptionProgressMutation>,
+}
+
+#[derive(Debug, Error)]
+pub enum SubscriptionProgressError {
+    #[error(transparent)]
+    Engine(#[from] fjall::Error),
+    #[error(transparent)]
+    Serialization(#[from] serde_json::Error),
+    #[error("Subscription progress has a conflicting identity, request, or Cursor")]
+    Conflict,
+    #[error("Subscription progress ownership changed; reconcile before retrying")]
+    StaleEpoch,
+    #[error("Subscription progress sequence has a gap or overflow")]
+    Sequence,
+    #[error("Subscription progress exceeds its bounded storage budget")]
+    TooLarge,
+    #[error("Subscription progress has no valid two-replica commit evidence")]
+    NoQuorum,
+}
+
+pub struct SubscriptionPrepareVote {
+    pub subscription_id: Uuid,
+    pub request_id: Uuid,
+    pub digest: [u8; 32],
+}
+
+pub struct SubscriptionCommitEvidence {
+    votes: [(crate::active_range::StorageNodeId, [u8; 32]); 2],
+    subscription_id: Uuid,
+    request_id: Uuid,
+}
+
+pub struct FjallSubscriptionProgressReplica {
+    db: fjall::SingleWriterTxDatabase,
+    progress: fjall::SingleWriterTxKeyspace,
+}
+
+impl FjallSubscriptionProgressReplica {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, SubscriptionProgressError> {
+        let db = fjall::SingleWriterTxDatabase::builder(path).open()?;
+        let progress = db.keyspace(
+            "subscription_progress",
+            fjall::KeyspaceCreateOptions::default,
+        )?;
+        Ok(Self { db, progress })
+    }
+
+    pub fn local_committed(
+        &self,
+        subscription_id: Uuid,
+    ) -> Result<Option<SubscriptionProgressMutation>, SubscriptionProgressError> {
+        let row = self
+            .db
+            .read_tx()
+            .get(&self.progress, subscription_id.as_bytes())?
+            .map(|bytes| serde_json::from_slice::<SubscriptionProgressReplicaRow>(&bytes))
+            .transpose()?;
+        match row {
+            Some(row) if row.subscription_id != subscription_id => {
+                Err(SubscriptionProgressError::Conflict)
+            }
+            Some(row) => Ok(row.committed),
+            None => Ok(None),
+        }
+    }
+
+    pub fn prepare(
+        &self,
+        mutation: SubscriptionProgressMutation,
+    ) -> Result<SubscriptionPrepareVote, SubscriptionProgressError> {
+        if mutation.ownership_epoch == 0
+            || mutation.sequence == 0
+            || mutation.cursor.is_empty()
+            || mutation.cursor.len() > 256
+            || mutation.positions.is_empty()
+            || mutation.positions.len() > 128
+            || mutation.positions.values().any(|value| value.len() > 256)
+        {
+            return Err(SubscriptionProgressError::TooLarge);
+        }
+        let bytes = serde_json::to_vec(&mutation)?;
+        if bytes.len() > 256 * 1024 {
+            return Err(SubscriptionProgressError::TooLarge);
+        }
+        let vote = SubscriptionPrepareVote {
+            subscription_id: mutation.subscription_id,
+            request_id: mutation.request_id,
+            digest: *blake3::hash(&bytes).as_bytes(),
+        };
+        let mut tx = self
+            .db
+            .write_tx()
+            .durability(Some(fjall::PersistMode::SyncAll));
+        let previous = tx
+            .get(&self.progress, mutation.subscription_id.as_bytes())?
+            .map(|bytes| serde_json::from_slice::<SubscriptionProgressReplicaRow>(&bytes))
+            .transpose()?;
+        let mut row = match previous {
+            Some(row) => row,
+            None => SubscriptionProgressReplicaRow {
+                subscription_id: mutation.subscription_id,
+                feed_id: mutation.feed_id,
+                ownership_epoch: mutation.ownership_epoch,
+                committed: None,
+                prepared: None,
+            },
+        };
+        if row.subscription_id != mutation.subscription_id || row.feed_id != mutation.feed_id {
+            return Err(SubscriptionProgressError::Conflict);
+        }
+        if row.ownership_epoch != mutation.ownership_epoch {
+            return Err(SubscriptionProgressError::StaleEpoch);
+        }
+        if let Some(committed) = &row.committed {
+            if committed.request_id == mutation.request_id {
+                return if committed == &mutation {
+                    Ok(vote)
+                } else {
+                    Err(SubscriptionProgressError::Conflict)
+                };
+            }
+        }
+        if let Some(prepared) = &row.prepared {
+            return if prepared == &mutation {
+                Ok(vote)
+            } else {
+                Err(SubscriptionProgressError::Conflict)
+            };
+        }
+        let prior_sequence = row.committed.as_ref().map_or(0, |prior| prior.sequence);
+        if prior_sequence.checked_add(1) != Some(mutation.sequence) {
+            return Err(SubscriptionProgressError::Sequence);
+        }
+        if row.committed.as_ref().map(|prior| prior.cursor.as_str())
+            != mutation.expected_cursor.as_deref()
+        {
+            return Err(SubscriptionProgressError::Conflict);
+        }
+        row.prepared = Some(mutation);
+        let encoded = serde_json::to_vec(&row)?;
+        if encoded.len() > 256 * 1024 {
+            return Err(SubscriptionProgressError::TooLarge);
+        }
+        tx.insert(&self.progress, row.subscription_id.as_bytes(), encoded);
+        tx.commit()?;
+        Ok(vote)
+    }
+
+    pub fn commit_with_quorum(
+        &self,
+        evidence: SubscriptionCommitEvidence,
+    ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
+        let mut tx = self
+            .db
+            .write_tx()
+            .durability(Some(fjall::PersistMode::SyncAll));
+        let bytes = tx
+            .get(&self.progress, evidence.subscription_id.as_bytes())?
+            .ok_or(SubscriptionProgressError::Conflict)?;
+        let mut row: SubscriptionProgressReplicaRow = serde_json::from_slice(&bytes)?;
+        if row.subscription_id != evidence.subscription_id {
+            return Err(SubscriptionProgressError::Conflict);
+        }
+        let candidate = row
+            .prepared
+            .as_ref()
+            .filter(|value| value.request_id == evidence.request_id)
+            .or_else(|| {
+                row.committed
+                    .as_ref()
+                    .filter(|value| value.request_id == evidence.request_id)
+            })
+            .ok_or(SubscriptionProgressError::Conflict)?;
+        let digest = *blake3::hash(&serde_json::to_vec(candidate)?).as_bytes();
+        if evidence.request_id != candidate.request_id
+            || evidence.votes[0].0 == evidence.votes[1].0
+            || evidence.votes.iter().any(|(_, value)| *value != digest)
+        {
+            return Err(SubscriptionProgressError::NoQuorum);
+        }
+        if row
+            .prepared
+            .as_ref()
+            .is_none_or(|value| value.request_id != evidence.request_id)
+        {
+            return row.committed.ok_or(SubscriptionProgressError::Conflict);
+        }
+        let committed = row
+            .prepared
+            .take()
+            .ok_or(SubscriptionProgressError::Conflict)?;
+        row.committed = Some(committed.clone());
+        tx.insert(
+            &self.progress,
+            row.subscription_id.as_bytes(),
+            serde_json::to_vec(&row)?,
+        );
+        tx.commit()?;
+        Ok(committed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_progress_never_exposes_prepared_state_and_requires_distinct_votes() {
+        use crate::active_range::StorageNodeId;
+
+        let a = tempfile::TempDir::new().unwrap();
+        let b = tempfile::TempDir::new().unwrap();
+        let c = tempfile::TempDir::new().unwrap();
+        let first = FjallSubscriptionProgressReplica::open(a.path()).unwrap();
+        let second = FjallSubscriptionProgressReplica::open(b.path()).unwrap();
+        let third = FjallSubscriptionProgressReplica::open(c.path()).unwrap();
+        let subscription_id = Uuid::from_u128(1);
+        let mutation = SubscriptionProgressMutation {
+            subscription_id,
+            feed_id: Uuid::from_u128(2),
+            ownership_epoch: 1,
+            sequence: 1,
+            request_id: Uuid::from_u128(3),
+            expected_cursor: None,
+            cursor: "rf1_one".to_owned(),
+            positions: BTreeMap::from([(
+                RangeId::from_uuid(Uuid::from_u128(4)),
+                "record-one".to_owned(),
+            )]),
+        };
+        let first_vote = first.prepare(mutation.clone()).unwrap();
+        let second_vote = second.prepare(mutation.clone()).unwrap();
+        assert_eq!(first_vote.digest, second_vote.digest);
+        assert_eq!(
+            first.prepare(mutation.clone()).unwrap().digest,
+            first_vote.digest
+        );
+        assert!(first.local_committed(subscription_id).unwrap().is_none());
+        assert!(second.local_committed(subscription_id).unwrap().is_none());
+        assert!(third.local_committed(subscription_id).unwrap().is_none());
+        let node_a = StorageNodeId::try_new("storage-a").unwrap();
+        let node_b = StorageNodeId::try_new("storage-b").unwrap();
+        assert!(matches!(
+            first.commit_with_quorum(SubscriptionCommitEvidence {
+                subscription_id,
+                request_id: mutation.request_id,
+                votes: [
+                    (node_a.clone(), first_vote.digest),
+                    (node_a.clone(), second_vote.digest)
+                ],
+            }),
+            Err(SubscriptionProgressError::NoQuorum)
+        ));
+        assert!(first.local_committed(subscription_id).unwrap().is_none());
+        let proof = || SubscriptionCommitEvidence {
+            subscription_id,
+            request_id: mutation.request_id,
+            votes: [
+                (node_a.clone(), first_vote.digest),
+                (node_b.clone(), second_vote.digest),
+            ],
+        };
+        assert_eq!(first.commit_with_quorum(proof()).unwrap(), mutation);
+        assert_eq!(first.commit_with_quorum(proof()).unwrap(), mutation);
+        assert_eq!(second.commit_with_quorum(proof()).unwrap(), mutation);
+        assert!(third.local_committed(subscription_id).unwrap().is_none());
+        drop(first);
+        let reopened = FjallSubscriptionProgressReplica::open(a.path()).unwrap();
+        assert_eq!(
+            reopened.local_committed(subscription_id).unwrap(),
+            Some(mutation.clone())
+        );
+        assert_eq!(
+            reopened.prepare(mutation.clone()).unwrap().digest,
+            first_vote.digest
+        );
+        let mut next = mutation.clone();
+        next.sequence = 2;
+        next.request_id = Uuid::from_u128(5);
+        next.expected_cursor = Some(mutation.cursor.clone());
+        next.cursor = "rf1_two".to_owned();
+        reopened.prepare(next.clone()).unwrap();
+        assert_eq!(reopened.commit_with_quorum(proof()).unwrap(), mutation);
+        assert_eq!(
+            reopened.local_committed(subscription_id).unwrap(),
+            Some(mutation.clone())
+        );
+        let mut conflicting = next.clone();
+        conflicting.request_id = Uuid::from_u128(6);
+        assert!(matches!(
+            reopened.prepare(conflicting),
+            Err(SubscriptionProgressError::Conflict)
+        ));
+        let mut future_epoch = next;
+        future_epoch.ownership_epoch = 2;
+        assert!(matches!(
+            reopened.prepare(future_epoch),
+            Err(SubscriptionProgressError::StaleEpoch)
+        ));
+    }
 
     #[test]
     fn retry_backoff_is_bounded_and_respects_server_delay() {
