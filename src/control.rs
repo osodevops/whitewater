@@ -172,6 +172,28 @@ pub struct RangeMergePlan {
     pub checksum_verified: bool,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RangeMoveStage {
+    Prepared,
+    CatchingUp,
+    Ready,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeMovePlan {
+    pub plan_id: Uuid,
+    pub feed_id: Uuid,
+    pub source_assignment: ActiveRangeAssignment,
+    pub candidate_assignment: ActiveRangeAssignment,
+    pub removed_replica: StorageNodeId,
+    pub replacement_replica: StorageNodeId,
+    pub stage: RangeMoveStage,
+    pub source_commit: Option<CommitPosition>,
+    pub target_commit: Option<CommitPosition>,
+    pub checksum_verified: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CatalogState {
     schema_version: u32,
@@ -192,6 +214,8 @@ struct CatalogState {
     range_split_plans: BTreeMap<Uuid, RangeSplitPlan>,
     #[serde(default)]
     range_merge_plans: BTreeMap<Uuid, RangeMergePlan>,
+    #[serde(default)]
+    range_move_plans: BTreeMap<RangeId, RangeMovePlan>,
     #[serde(default)]
     applied_requests: BTreeMap<Uuid, ReplicatedCommandResult>,
 }
@@ -225,6 +249,7 @@ impl Default for CatalogState {
             range_assignments: BTreeMap::new(),
             range_split_plans: BTreeMap::new(),
             range_merge_plans: BTreeMap::new(),
+            range_move_plans: BTreeMap::new(),
             applied_requests: BTreeMap::new(),
         }
     }
@@ -385,6 +410,27 @@ pub enum Command {
         plan_id: Uuid,
         writer_sequences: Vec<StagedWriterSequence>,
     },
+    PrepareFollowerMove {
+        feed: String,
+        range_id: RangeId,
+        removed_replica: StorageNodeId,
+        replacement_replica: StorageNodeId,
+    },
+    RecordFollowerMoveCatchUp {
+        feed: String,
+        plan_id: Uuid,
+        source_commit: CommitPosition,
+        target_commit: CommitPosition,
+        checksum_verified: bool,
+    },
+    ActivateFollowerMove {
+        feed: String,
+        plan_id: Uuid,
+    },
+    AbortFollowerMove {
+        feed: String,
+        plan_id: Uuid,
+    },
 }
 
 impl Command {
@@ -507,6 +553,17 @@ impl ControlController {
         issued_at_ns: i64,
         command: Command,
     ) -> Result<ReplicatedCommand, ControlError> {
+        if let Command::PrepareFollowerMove {
+            replacement_replica,
+            ..
+        } = &command
+        {
+            if !self.eligible_storage_nodes.contains(replacement_replica) {
+                return Err(ControlError::InvalidOperation(format!(
+                    "replacement Node {replacement_replica} is not eligible for storage"
+                )));
+            }
+        }
         let fixed_active_range = matches!(
             &command,
             Command::CreateFeed { .. } | Command::PrepareActiveRangeSplit { .. }
@@ -1253,6 +1310,14 @@ impl ControlController {
                         json!(state.range_merge_plans.get(&feed_id)),
                     );
                     object.insert(
+                        "range_move_plans".to_owned(),
+                        json!(state
+                            .range_move_plans
+                            .values()
+                            .filter(|plan| plan.feed_id == feed_id)
+                            .collect::<Vec<_>>()),
+                    );
+                    object.insert(
                         "range_assignments".to_owned(),
                         json!(state
                             .range_maps
@@ -1328,9 +1393,15 @@ impl ControlController {
             }
             Command::PrepareActiveRangeSplit { feed, split_at } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
-                if state.range_split_plans.contains_key(&feed_id) {
+                if state.range_split_plans.contains_key(&feed_id)
+                    || state.range_merge_plans.contains_key(&feed_id)
+                    || state
+                        .range_move_plans
+                        .values()
+                        .any(|plan| plan.feed_id == feed_id)
+                {
                     return Err(ControlError::AlreadyExists(format!(
-                        "Active Range split plan for Feed {feed}"
+                        "range operation for Feed {feed}"
                     )));
                 }
                 let current_map = state
@@ -1528,6 +1599,10 @@ impl ControlController {
                 let feed_id = active_feed(state, &feed)?.feed_id;
                 if state.range_split_plans.contains_key(&feed_id)
                     || state.range_merge_plans.contains_key(&feed_id)
+                    || state
+                        .range_move_plans
+                        .values()
+                        .any(|plan| plan.feed_id == feed_id)
                 {
                     return Err(ControlError::AlreadyExists(format!(
                         "range operation for Feed {feed}"
@@ -1667,6 +1742,189 @@ impl ControlController {
                         "merged_assignment": plan.merged_assignment,
                         "retired_range_id": plan.right_range_id
                     }),
+                ))
+            }
+            Command::PrepareFollowerMove {
+                feed,
+                range_id,
+                removed_replica,
+                replacement_replica,
+            } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                if state.range_split_plans.contains_key(&feed_id)
+                    || state.range_merge_plans.contains_key(&feed_id)
+                    || state
+                        .range_move_plans
+                        .values()
+                        .any(|plan| plan.feed_id == feed_id)
+                {
+                    return Err(ControlError::AlreadyExists(format!(
+                        "range operation for Feed {feed}"
+                    )));
+                }
+                let map = state
+                    .range_maps
+                    .get(&feed_id)
+                    .ok_or_else(|| ControlError::NotFound(format!("RangeMap for Feed {feed}")))?;
+                if !map.routes().iter().any(|route| route.range_id == range_id) {
+                    return Err(ControlError::NotFound(format!(
+                        "active Range {range_id} for Feed {feed}"
+                    )));
+                }
+                let source = state.range_assignments.get(&range_id).ok_or_else(|| {
+                    ControlError::NotFound(format!("placement for active Range {range_id}"))
+                })?;
+                if source.feed_id != feed_id
+                    || removed_replica == source.owner
+                    || !source.replicas.contains(&removed_replica)
+                    || source.replicas.contains(&replacement_replica)
+                {
+                    return Err(ControlError::InvalidOperation(
+                        "follower movement requires an assigned non-owner follower and a distinct replacement Node"
+                            .to_owned(),
+                    ));
+                }
+                let replicas = source
+                    .replicas
+                    .iter()
+                    .filter(|node| **node != removed_replica)
+                    .cloned()
+                    .chain(std::iter::once(replacement_replica.clone()))
+                    .collect::<Vec<_>>();
+                let replicas: [StorageNodeId; ACTIVE_RANGE_REPLICA_COUNT] =
+                    replicas.try_into().map_err(|_| {
+                        ControlError::InvalidOperation(
+                            "RF3 movement has invalid replica count".to_owned(),
+                        )
+                    })?;
+                let epoch = source
+                    .ownership_epoch
+                    .checked_next()
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let candidate_assignment = ActiveRangeAssignment::try_new(
+                    feed_id,
+                    range_id,
+                    source.generation,
+                    source.owner.clone(),
+                    ReplicaSet::try_new(replicas)
+                        .map_err(|error| ControlError::InvalidOperation(error.to_string()))?,
+                    epoch,
+                )
+                .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let plan = RangeMovePlan {
+                    plan_id: derived_resource_id(request_id, "follower-move-plan"),
+                    feed_id,
+                    source_assignment: source.clone(),
+                    candidate_assignment,
+                    removed_replica,
+                    replacement_replica,
+                    stage: RangeMoveStage::Prepared,
+                    source_commit: None,
+                    target_commit: None,
+                    checksum_verified: false,
+                };
+                state.range_move_plans.insert(range_id, plan.clone());
+                Ok((
+                    format!("prepared follower move for Feed {feed}"),
+                    json!(plan),
+                ))
+            }
+            Command::RecordFollowerMoveCatchUp {
+                feed,
+                plan_id,
+                source_commit,
+                target_commit,
+                checksum_verified,
+            } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                let plan = state
+                    .range_move_plans
+                    .values_mut()
+                    .find(|plan| plan.plan_id == plan_id && plan.feed_id == feed_id)
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "follower movement plan {plan_id} for Feed {feed}"
+                        ))
+                    })?;
+                if source_commit < plan.source_commit.unwrap_or_default()
+                    || target_commit < plan.target_commit.unwrap_or_default()
+                {
+                    return Err(ControlError::InvalidOperation(
+                        "follower movement evidence cannot move backwards".to_owned(),
+                    ));
+                }
+                plan.source_commit = Some(source_commit);
+                plan.target_commit = Some(target_commit);
+                plan.checksum_verified = checksum_verified;
+                plan.stage = if checksum_verified && target_commit == source_commit {
+                    RangeMoveStage::Ready
+                } else {
+                    RangeMoveStage::CatchingUp
+                };
+                Ok((
+                    format!("recorded follower move catch-up for Feed {feed}"),
+                    json!(plan.clone()),
+                ))
+            }
+            Command::ActivateFollowerMove { feed, plan_id } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                let plan = state
+                    .range_move_plans
+                    .values()
+                    .find(|plan| plan.plan_id == plan_id && plan.feed_id == feed_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "follower movement plan {plan_id} for Feed {feed}"
+                        ))
+                    })?;
+                if plan.stage != RangeMoveStage::Ready
+                    || !plan.checksum_verified
+                    || plan.source_commit != plan.target_commit
+                    || state
+                        .range_assignments
+                        .get(&plan.source_assignment.range_id)
+                        != Some(&plan.source_assignment)
+                {
+                    return Err(ControlError::InvalidOperation(
+                        "follower movement is not verified or its source placement changed; recheck catch-up"
+                            .to_owned(),
+                    ));
+                }
+                let updated = plan.candidate_assignment;
+                state
+                    .range_assignments
+                    .insert(updated.range_id, updated.clone());
+                if state
+                    .active_ranges
+                    .get(&feed_id)
+                    .map(|assignment| assignment.range_id)
+                    == Some(updated.range_id)
+                {
+                    state.active_ranges.insert(feed_id, updated.clone());
+                }
+                state.range_move_plans.remove(&updated.range_id);
+                Ok((
+                    format!("activated follower move for Feed {feed}"),
+                    json!(updated),
+                ))
+            }
+            Command::AbortFollowerMove { feed, plan_id } => {
+                let feed_id = active_feed(state, &feed)?.feed_id;
+                let range_id = state
+                    .range_move_plans
+                    .iter()
+                    .find(|(_, plan)| plan.plan_id == plan_id && plan.feed_id == feed_id)
+                    .map(|(range_id, _)| *range_id)
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "follower movement plan {plan_id} for Feed {feed}"
+                        ))
+                    })?;
+                state.range_move_plans.remove(&range_id);
+                Ok((
+                    format!("aborted follower move for Feed {feed}"),
+                    json!({"plan_id": plan_id}),
                 ))
             }
         }
@@ -2476,6 +2734,10 @@ fn command_label(command: &Command) -> String {
         Command::PrepareActiveRangeMerge { .. } => "PREPARE ACTIVE RANGE MERGE",
         Command::RecordActiveRangeMergeStaging { .. } => "RECORD ACTIVE RANGE MERGE STAGING",
         Command::ActivateActiveRangeMerge { .. } => "ACTIVATE ACTIVE RANGE MERGE",
+        Command::PrepareFollowerMove { .. } => "PREPARE FOLLOWER MOVE",
+        Command::RecordFollowerMoveCatchUp { .. } => "RECORD FOLLOWER MOVE CATCH UP",
+        Command::ActivateFollowerMove { .. } => "ACTIVATE FOLLOWER MOVE",
+        Command::AbortFollowerMove { .. } => "ABORT FOLLOWER MOVE",
     }
     .to_owned()
 }

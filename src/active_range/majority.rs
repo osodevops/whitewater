@@ -122,6 +122,44 @@ impl MajorityAppendCoordinator {
             })
     }
 
+    pub async fn freeze_for_follower_move(
+        &self,
+        source: &super::ActiveRangeAssignment,
+    ) -> Result<CommitPosition, MajorityAppendError> {
+        let _append_guard = self.append_lock.lock().await;
+        let current = self
+            .control
+            .active_range_assignment_by_id(source.range_id)
+            .await;
+        if current.as_ref() != Some(source) || source.owner != *self.local.local_node() {
+            return Err(self.error(
+                MajorityAppendErrorCode::NotCurrentOwner,
+                "Active Range placement changed before movement freeze",
+                true,
+                vec![],
+                vec![],
+            ));
+        }
+        self.local
+            .freeze_generation(source.range_id, source.generation)
+            .await;
+        match self.local.recovery_status_for_assignment(source).await {
+            Ok(status) => Ok(status.committed),
+            Err(error) => {
+                self.local
+                    .unfreeze_generation(source.range_id, source.generation)
+                    .await;
+                Err(self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    error.to_string(),
+                    error.retryable,
+                    vec![],
+                    vec![],
+                ))
+            }
+        }
+    }
+
     pub async fn append(
         &self,
         mut request: ReplicaAppendRequest,

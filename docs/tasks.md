@@ -651,7 +651,7 @@ Definition of Done:
 - [x] Place and route multiple active RF3 ranges across storage Nodes.
 - [x] Split hot ranges online from sustained per-range append pressure with sampled key-token boundaries, cooldown, authenticated RF3 staging, and Control Plane cutover.
 - [x] Merge cold adjacent ranges using leader-aggregated cross-owner metrics, sustained low-rate evidence, cooldown, authenticated RF3 staging, rollback, Writer-state rebuild, and atomic activation.
-- [ ] Move ranges while preserving same-Key ordering.
+- [~] Move ranges while preserving same-Key ordering: a consensus-persisted follower-replacement plan, bounded verified catch-up, owner-side majority-draining freeze, and evidence-gated RF3 activation are covered in four-Node local tests; authenticated remote transfer, live four-Node acceptance, and append-owner movement remain.
 - [x] Keep existing opaque Cursors valid across generation changes by merging committed candidate histories in ingest order.
 - [ ] Add hot-key detection and isolation.
 
@@ -676,6 +676,8 @@ Evidence:
 - `ColdRangeTracker` requires sustained low rates for both ranges, resets on either hot sample, and enforces cooldown; `cold_adjacent_pairs` never proposes non-adjacent merges.
 - Authenticated merge staging runs locally on each planned replica through `/internal/active-range/merge/stage-local`; `/v1/admin/ranges/merge` compares RF3 evidence and commits readiness plus activation through the Control Plane.
 - The Control Plane leader aggregates cumulative per-range counters from `/internal/active-range/pressure`, computes owner-independent rates, and invokes merge only after both adjacent ranges remain cold through the configured sustained window and cooldown policy.
+- Follower movement keeps the current owner and the two retained replicas authoritative during bounded committed-prefix transfer to a fourth eligible Node. A generation-scoped freeze under the majority append lock captures final commit progress, then a consensus compare-and-set can install the RF3 replacement and higher ownership epoch. A failed final copy unfreezes the old owner; ambiguous readiness or activation leaves it frozen pending Control Plane resolution.
+- `tests/active_range_placement.rs`, `tests/majority_commit.rs`, and `tests/replica_repair.rs` cover plan idempotency, stale-epoch refusal, snapshot recovery, catch-up gating, frozen-boundary behavior, failed-target rollback, ambiguity safety, Cursor-preserving restart, and continued ordered appends on the replacement. The transport-backed four-Node workflow and owner movement are not yet available.
 - These types are internal only; Feed, Key, Cursor, Writer, and Reader APIs remain unchanged.
 
 Definition of Done:

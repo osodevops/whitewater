@@ -203,6 +203,234 @@ async fn ownership_transfer_increments_epoch_and_is_idempotent_by_request_id() {
 }
 
 #[tokio::test]
+async fn follower_move_keeps_rf3_until_verified_replacement_and_survives_snapshot() {
+    let leader_dir = TempDir::new().unwrap();
+    let follower_dir = TempDir::new().unwrap();
+    let four_nodes = storage_nodes(&["storage-1", "storage-2", "storage-3", "storage-4"]);
+    let leader = controller(&leader_dir, four_nodes);
+    let follower = controller(
+        &follower_dir,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    create_feed(&leader, Uuid::from_u128(500)).await;
+    let original = placement(&leader).await;
+    let range_id = serde_json::from_value(original["range_id"].clone()).unwrap();
+    let move_command = Command::PrepareFollowerMove {
+        feed: "orders.created".to_owned(),
+        range_id,
+        removed_replica: storage_nodes(&["storage-3"]).remove(0),
+        replacement_replica: storage_nodes(&["storage-4"]).remove(0),
+    };
+    let request_id = Uuid::from_u128(501);
+    let first = leader
+        .execute_commands_with_request_id(vec![move_command.clone()], request_id)
+        .await
+        .unwrap();
+    let retry = leader
+        .execute_commands_with_request_id(vec![move_command], request_id)
+        .await
+        .unwrap();
+    assert_eq!(first.results[0].data, retry.results[0].data);
+    let plan_id = serde_json::from_value(first.results[0].data["plan_id"].clone()).unwrap();
+    assert_eq!(first.results[0].data["stage"], "prepared");
+    assert_eq!(
+        first.results[0].data["candidate_assignment"]["ownership_epoch"],
+        2
+    );
+    assert_eq!(
+        first.results[0].data["candidate_assignment"]["replicas"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(placement(&leader).await["replicas"], original["replicas"]);
+    assert!(leader
+        .execute_commands(vec![Command::ActivateFollowerMove {
+            feed: "orders.created".to_owned(),
+            plan_id,
+        }])
+        .await
+        .is_err());
+    leader
+        .execute_commands(vec![Command::RecordFollowerMoveCatchUp {
+            feed: "orders.created".to_owned(),
+            plan_id,
+            source_commit: CommitPosition::new(8),
+            target_commit: CommitPosition::new(7),
+            checksum_verified: true,
+        }])
+        .await
+        .unwrap();
+    assert_eq!(
+        placement(&leader).await["range_move_plans"][0]["stage"],
+        "catching_up"
+    );
+    assert!(leader
+        .execute_commands(vec![Command::ActivateFollowerMove {
+            feed: "orders.created".to_owned(),
+            plan_id,
+        }])
+        .await
+        .is_err());
+    leader
+        .execute_commands(vec![Command::RecordFollowerMoveCatchUp {
+            feed: "orders.created".to_owned(),
+            plan_id,
+            source_commit: CommitPosition::new(8),
+            target_commit: CommitPosition::new(8),
+            checksum_verified: true,
+        }])
+        .await
+        .unwrap();
+    follower
+        .install_snapshot_bytes(&leader.snapshot_bytes().await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        placement(&follower).await["range_move_plans"][0]["stage"],
+        "ready"
+    );
+    let new_assignment = follower
+        .execute_commands(vec![Command::ActivateFollowerMove {
+            feed: "orders.created".to_owned(),
+            plan_id,
+        }])
+        .await
+        .unwrap()
+        .results
+        .remove(0)
+        .data;
+    assert_eq!(new_assignment["owner"], original["owner"]);
+    assert_eq!(new_assignment["generation"], original["generation"]);
+    assert_eq!(new_assignment["ownership_epoch"], 2);
+    assert_eq!(
+        new_assignment["replicas"],
+        serde_json::json!(["storage-1", "storage-2", "storage-4"])
+    );
+    assert!(placement(&follower).await["range_move_plans"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        placement(&follower).await["range_map"],
+        original["range_map"]
+    );
+    drop(follower);
+    let restarted = controller(
+        &follower_dir,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    assert_eq!(
+        placement(&restarted).await["replicas"],
+        new_assignment["replicas"]
+    );
+    assert_eq!(placement(&restarted).await["ownership_epoch"], 2);
+}
+
+#[tokio::test]
+async fn follower_move_rejects_owner_replacement_ineligible_node_and_conflicting_plan() {
+    let dir = TempDir::new().unwrap();
+    let control = controller(
+        &dir,
+        storage_nodes(&["storage-1", "storage-2", "storage-3", "storage-4"]),
+    );
+    create_feed(&control, Uuid::from_u128(510)).await;
+    let current = placement(&control).await;
+    let range_id = serde_json::from_value(current["range_id"].clone()).unwrap();
+    for (removed, replacement) in [
+        ("storage-1", "storage-4"),
+        ("storage-3", "storage-2"),
+        ("storage-3", "storage-5"),
+    ] {
+        assert!(control
+            .execute_commands(vec![Command::PrepareFollowerMove {
+                feed: "orders.created".to_owned(),
+                range_id,
+                removed_replica: storage_nodes(&[removed]).remove(0),
+                replacement_replica: storage_nodes(&[replacement]).remove(0),
+            }])
+            .await
+            .is_err());
+    }
+    let prepared = control
+        .execute_commands(vec![Command::PrepareFollowerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            removed_replica: storage_nodes(&["storage-3"]).remove(0),
+            replacement_replica: storage_nodes(&["storage-4"]).remove(0),
+        }])
+        .await
+        .unwrap();
+    let plan_id = serde_json::from_value(prepared.results[0].data["plan_id"].clone()).unwrap();
+    assert!(control
+        .execute_commands(vec![Command::PrepareFollowerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            removed_replica: storage_nodes(&["storage-2"]).remove(0),
+            replacement_replica: storage_nodes(&["storage-4"]).remove(0),
+        }])
+        .await
+        .is_err());
+    control
+        .execute_commands(vec![Command::AbortFollowerMove {
+            feed: "orders.created".to_owned(),
+            plan_id,
+        }])
+        .await
+        .unwrap();
+    assert_eq!(placement(&control).await["replicas"], current["replicas"]);
+}
+
+#[tokio::test]
+async fn follower_move_cannot_overwrite_newer_ownership() {
+    let dir = TempDir::new().unwrap();
+    let control = controller(
+        &dir,
+        storage_nodes(&["storage-1", "storage-2", "storage-3", "storage-4"]),
+    );
+    create_feed(&control, Uuid::from_u128(520)).await;
+    let original = placement(&control).await;
+    let range_id = serde_json::from_value(original["range_id"].clone()).unwrap();
+    let prepared = control
+        .execute_commands(vec![Command::PrepareFollowerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            removed_replica: storage_nodes(&["storage-3"]).remove(0),
+            replacement_replica: storage_nodes(&["storage-4"]).remove(0),
+        }])
+        .await
+        .unwrap();
+    let plan_id = serde_json::from_value(prepared.results[0].data["plan_id"].clone()).unwrap();
+    control
+        .execute_commands(vec![Command::RecordFollowerMoveCatchUp {
+            feed: "orders.created".to_owned(),
+            plan_id,
+            source_commit: CommitPosition::new(3),
+            target_commit: CommitPosition::new(3),
+            checksum_verified: true,
+        }])
+        .await
+        .unwrap();
+    control
+        .execute_commands(vec![Command::TransferActiveRangeOwnership {
+            feed: "orders.created".to_owned(),
+            owner: storage_nodes(&["storage-2"]).remove(0),
+        }])
+        .await
+        .unwrap();
+    assert!(control
+        .execute_commands(vec![Command::ActivateFollowerMove {
+            feed: "orders.created".to_owned(),
+            plan_id,
+        }])
+        .await
+        .is_err());
+    assert_eq!(placement(&control).await["owner"], "storage-2");
+    assert_eq!(placement(&control).await["replicas"], original["replicas"]);
+}
+
+#[tokio::test]
 async fn installed_catalog_snapshot_contains_active_range_placement() {
     let leader_directory = TempDir::new().unwrap();
     let follower_directory = TempDir::new().unwrap();

@@ -1,16 +1,20 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::control::ControlController;
+use crate::{
+    control::{Command, ControlController, RangeMovePlan},
+    control_plane::ControlPlane,
+};
 
 use super::{
-    ActiveRangeAssignment, CommitPosition, RangePosition, ReplicaAppendRequest,
-    ReplicaAppendService, ReplicaCommitRequest, ReplicaProgressRequest, ReplicaProgressResponse,
-    StorageNodeId,
+    ActiveRangeAssignment, CommitPosition, MajorityAppendCoordinator, RangePosition,
+    ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitRequest, ReplicaProgressRequest,
+    ReplicaProgressResponse, StorageNodeId,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,6 +59,261 @@ pub enum ReplicaRepairError {
     TargetAhead,
     #[error("transferred frame position or checksum did not match")]
     VerificationFailed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FollowerMoveCopyResult {
+    pub source_commit: CommitPosition,
+    pub target_commit: CommitPosition,
+    pub transferred_records: u64,
+    pub transferred_bytes: u64,
+    pub checksum: [u8; 32],
+    pub ready: bool,
+}
+
+#[async_trait]
+pub trait FollowerMoveControl: Send + Sync {
+    async fn record_ready(
+        &self,
+        feed: &str,
+        plan: &RangeMovePlan,
+        copied: &FollowerMoveCopyResult,
+    ) -> Result<(), String>;
+    async fn activate(&self, feed: &str, plan: &RangeMovePlan) -> Result<(), String>;
+}
+
+pub struct ControlPlaneFollowerMove {
+    control_plane: Arc<ControlPlane>,
+}
+
+impl ControlPlaneFollowerMove {
+    pub fn new(control_plane: Arc<ControlPlane>) -> Self {
+        Self { control_plane }
+    }
+}
+
+#[async_trait]
+impl FollowerMoveControl for ControlPlaneFollowerMove {
+    async fn record_ready(
+        &self,
+        feed: &str,
+        plan: &RangeMovePlan,
+        copied: &FollowerMoveCopyResult,
+    ) -> Result<(), String> {
+        self.control_plane
+            .execute_commands(vec![Command::RecordFollowerMoveCatchUp {
+                feed: feed.to_owned(),
+                plan_id: plan.plan_id,
+                source_commit: copied.source_commit,
+                target_commit: copied.target_commit,
+                checksum_verified: copied.ready,
+            }])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    async fn activate(&self, feed: &str, plan: &RangeMovePlan) -> Result<(), String> {
+        self.control_plane
+            .execute_commands(vec![Command::ActivateFollowerMove {
+                feed: feed.to_owned(),
+                plan_id: plan.plan_id,
+            }])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum FollowerMoveError {
+    #[error("could not freeze the current append owner: {0}")]
+    Freeze(String),
+    #[error(transparent)]
+    Copy(#[from] ReplicaRepairError),
+    #[error("the replacement is not committed through the frozen source boundary")]
+    CatchingUp,
+    #[error("follower movement readiness is ambiguous; source remains frozen until Control Plane state is resolved: {0}")]
+    Readiness(String),
+    #[error("follower movement activation is ambiguous; source remains frozen until assignment is resolved: {0}")]
+    AmbiguousActivation(String),
+}
+
+pub struct FollowerMoveExecutor {
+    control: Arc<ControlController>,
+    coordinator: Arc<MajorityAppendCoordinator>,
+    source: Arc<ReplicaAppendService>,
+    replacement: Arc<ReplicaAppendService>,
+}
+
+impl FollowerMoveExecutor {
+    pub fn new(
+        control: Arc<ControlController>,
+        coordinator: Arc<MajorityAppendCoordinator>,
+        source: Arc<ReplicaAppendService>,
+        replacement: Arc<ReplicaAppendService>,
+    ) -> Self {
+        Self {
+            control,
+            coordinator,
+            source,
+            replacement,
+        }
+    }
+
+    pub async fn finalize(
+        &self,
+        control: &dyn FollowerMoveControl,
+        feed: &str,
+        plan: &RangeMovePlan,
+        batch_size: usize,
+    ) -> Result<FollowerMoveCopyResult, FollowerMoveError> {
+        let frozen_commit = self
+            .coordinator
+            .freeze_for_follower_move(&plan.source_assignment)
+            .await
+            .map_err(|error| FollowerMoveError::Freeze(error.to_string()))?;
+        let copied =
+            match copy_follower_move(plan, &self.source, &self.replacement, batch_size).await {
+                Ok(copied) => copied,
+                Err(error) => {
+                    self.unfreeze(plan).await;
+                    return Err(error.into());
+                }
+            };
+        if !copied.ready || copied.source_commit != frozen_commit {
+            self.unfreeze(plan).await;
+            return Err(FollowerMoveError::CatchingUp);
+        }
+        if let Err(error) = control.record_ready(feed, plan, &copied).await {
+            return Err(FollowerMoveError::Readiness(error));
+        }
+        if let Err(error) = control.activate(feed, plan).await {
+            return Err(FollowerMoveError::AmbiguousActivation(error));
+        }
+        for _ in 0..50 {
+            if self
+                .control
+                .active_range_assignment_by_id(plan.source_assignment.range_id)
+                .await
+                == Some(plan.candidate_assignment.clone())
+            {
+                self.unfreeze(plan).await;
+                return Ok(copied);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(FollowerMoveError::AmbiguousActivation(
+            "committed candidate placement has not applied on the source owner".to_owned(),
+        ))
+    }
+
+    async fn unfreeze(&self, plan: &RangeMovePlan) {
+        self.source
+            .unfreeze_generation(
+                plan.source_assignment.range_id,
+                plan.source_assignment.generation,
+            )
+            .await;
+    }
+}
+
+pub async fn copy_follower_move(
+    plan: &RangeMovePlan,
+    source: &ReplicaAppendService,
+    replacement: &ReplicaAppendService,
+    batch_size: usize,
+) -> Result<FollowerMoveCopyResult, ReplicaRepairError> {
+    if source.local_node() != &plan.source_assignment.owner
+        || replacement.local_node() != &plan.replacement_replica
+    {
+        return Err(ReplicaRepairError::Target(
+            "movement source must be the Append Owner and target must be the planned replacement"
+                .to_owned(),
+        ));
+    }
+    let source_commit = source
+        .recovery_status_for_assignment(&plan.source_assignment)
+        .await
+        .map_err(|error| ReplicaRepairError::Source(error.to_string()))?
+        .committed;
+    let target_commit = replacement
+        .recovery_status_for_assignment(&plan.candidate_assignment)
+        .await
+        .map_err(|error| ReplicaRepairError::Target(error.to_string()))?
+        .committed;
+    if target_commit > source_commit {
+        return Err(ReplicaRepairError::TargetAhead);
+    }
+    let mut checksum = blake3::Hasher::new();
+    let mut transferred_records = 0_u64;
+    let mut transferred_bytes = 0_u64;
+    let mut after = None;
+    while after.map_or(0, RangePosition::value) < source_commit.value() {
+        let frames = source
+            .export_assignment_committed(&plan.source_assignment, after, batch_size.clamp(1, 256))
+            .await
+            .map_err(|error| ReplicaRepairError::Source(error.to_string()))?;
+        if frames.is_empty() {
+            return Err(ReplicaRepairError::Source(
+                "source ended before captured CommitPosition".to_owned(),
+            ));
+        }
+        for frame in frames
+            .into_iter()
+            .take_while(|frame| frame.position.value() <= source_commit.value())
+        {
+            let digest = *blake3::hash(&frame.frame).as_bytes();
+            let accepted = replacement
+                .stage_split_frame(
+                    &plan.candidate_assignment,
+                    frame.position,
+                    frame.identity,
+                    frame.cursor.clone(),
+                    frame.frame.clone(),
+                )
+                .await
+                .map_err(|error| ReplicaRepairError::Target(error.to_string()))?;
+            if accepted.position != frame.position
+                || accepted.frame_digest != digest
+                || accepted.cursor != frame.cursor
+            {
+                return Err(ReplicaRepairError::VerificationFailed);
+            }
+            if frame.position.value() > target_commit.value() {
+                replacement
+                    .commit_staged_split(
+                        &plan.candidate_assignment,
+                        CommitPosition::new(frame.position.value()),
+                    )
+                    .await
+                    .map_err(|error| ReplicaRepairError::Target(error.to_string()))?;
+                transferred_records = transferred_records.saturating_add(1);
+                transferred_bytes = transferred_bytes.saturating_add(frame.frame.len() as u64);
+            }
+            checksum.update(&frame.position.value().to_be_bytes());
+            checksum.update(&digest);
+            after = Some(frame.position);
+        }
+    }
+    let latest_source = source
+        .recovery_status_for_assignment(&plan.source_assignment)
+        .await
+        .map_err(|error| ReplicaRepairError::Source(error.to_string()))?
+        .committed;
+    let latest_target = replacement
+        .recovery_status_for_assignment(&plan.candidate_assignment)
+        .await
+        .map_err(|error| ReplicaRepairError::Target(error.to_string()))?
+        .committed;
+    Ok(FollowerMoveCopyResult {
+        source_commit: latest_source,
+        target_commit: latest_target,
+        transferred_records,
+        transferred_bytes,
+        checksum: *checksum.finalize().as_bytes(),
+        ready: latest_source == source_commit && latest_target == source_commit,
+    })
 }
 
 pub async fn repair_replica(

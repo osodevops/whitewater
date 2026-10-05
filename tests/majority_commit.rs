@@ -219,6 +219,32 @@ async fn either_follower_can_form_a_two_of_three_majority_with_the_owner() {
 }
 
 #[tokio::test]
+async fn follower_move_freeze_drains_majority_append_and_rejects_new_writes() {
+    let fixture = Fixture::new().await;
+    let coordinator = fixture.coordinator(&[], &[], None);
+    coordinator.append(fixture.request.clone()).await.unwrap();
+    let assignment = fixture
+        .control
+        .active_range_assignment(fixture.request.feed_id)
+        .await
+        .unwrap();
+    let committed = coordinator
+        .freeze_for_follower_move(&assignment)
+        .await
+        .unwrap();
+    assert_eq!(committed.value(), 1);
+    let error = coordinator
+        .append(fixture.request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, MajorityAppendErrorCode::LocalStorageFailure);
+    assert!(error.retryable);
+    fixture.services[&assignment.owner]
+        .unfreeze_generation(assignment.range_id, assignment.generation)
+        .await;
+}
+
+#[tokio::test]
 async fn one_healthy_replica_never_returns_success() {
     let fixture = Fixture::new().await;
     let error = fixture
