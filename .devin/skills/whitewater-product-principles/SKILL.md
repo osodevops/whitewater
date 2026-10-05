@@ -89,7 +89,18 @@ If a proposal does not reduce a documented pain, justify why it belongs in White
 - Keep unsafe Rust out of the implementation unless no safe alternative exists; every unsafe block requires a documented invariant and focused tests.
 - Follow standard naming, formatting, Clippy, and rustdoc conventions; optimize only from measured evidence.
 - Prefer deterministic tests with temporary directories and explicit fault boundaries over sleeps or timing assumptions.
-- Run `cargo fmt --check`, Clippy with warnings denied, and all tests before completion.
+- Use targeted tests for iteration, but never treat them as final verification.
+
+## Mandatory final verification
+
+Run the full gate **after the last edit**, not just earlier in development, before marking a Whitewater task complete or committing:
+
+1. Run `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`.
+2. Run `cargo test --all-targets`; this covers the repository's Rust unit and integration test targets. Run with the supported Rust Docker image if the host lacks Rust.
+3. Run every repository-maintained Python/Docker integration, fault, and live acceptance script in `scripts/test-*.py` sequentially against an isolated disposable test Fabric. The M1.11 fault suite invokes other scripts and restarts Compose; the M4 auto-split test `--force-recreate`s the default Fabric; other scripts stop/restart Nodes. Inspect exact side effects, project name, ports, data volumes, and credentials first. Never run them against the user's live Fabric or destroy/recreate persistent resources without specific approval. Do not let repeated suites share mutable state unsafely.
+4. If any final verification fails, fix the cause and rerun the affected tests **and the full gate** after the change. Report each command and outcome; if Docker, isolation, authentication, permissions, or another safety condition blocks a suite, state exactly what was not run and why. Never say "all tests passed" or check off live acceptance if any required suite was skipped.
+
+This final gate applies to implementation work even if focused tests passed earlier. For documentation-only changes also verify links and `git diff --check`, and do not silently claim that unrun integration scripts passed.
 
 ## Completion check
 
