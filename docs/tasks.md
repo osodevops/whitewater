@@ -757,6 +757,27 @@ Definition of Done:
 - [ ] Implement redacted support bundles.
 - [ ] Run long-duration, disk-full, corruption, and chaos suites.
 
+## Milestone 10 — Whitewater Operations Advisor (proposed)
+
+Design: [Whitewater Operations Advisor](operations-advisor.md). This is **not implemented**. It follows the structured health explanations, scoped identity/audit controls, and safe drain/movement gates in earlier milestones; it does not replace deterministic Control Plane recovery or block the current M4 focus.
+
+- [ ] Define versioned, correlated diagnostic schemas for Nodes, Control Plane, storage, Writers, Readers, and later Subscriptions/Indexes/Pipes, including cause, risk, automatic action, and next safe step.
+- [ ] Define a correlated health-explanation API spanning Writer, quorum, storage, Index, Subscription, and Reader stages.
+- [ ] Add bounded, redacted, authorized metrics/log/trace retrieval by Fabric, Space, Feed, Node, and time window; treat returned content as untrusted.
+- [ ] Expose read-only Whitewater health/explanation/recommendation tools via MCP, backed by the authenticated Admin API rather than a separate catalog.
+- [ ] Correlate scoped Kubernetes and network evidence through a least-privilege external integration without mounting infrastructure credentials in data Nodes.
+- [ ] Detect recurring busy/quiet schedules and incidents using bounded aggregates, confidence, drift detection, separate thresholds, hysteresis, and human feedback.
+- [ ] Produce evidence-linked recommendations with alternatives, cost, capacity/SLO impact, durability risk, and an explicit verification/rollback plan; keep read-only advice as the default.
+- [ ] Add typed action proposals, policy allowlists, human approval, short-lived scoped execution identities, immutable audit history, and an idempotent action ledger.
+- [ ] Permit only pre-approved, individually proven low-risk actions via the existing Control API or a separate Operator actuator, with independent quorum/epoch/replica/drain/budget precondition checks and a kill switch.
+- [ ] Test false positives, prompt injection in logs and tool responses, tenant isolation, stale evidence, model/Kubernetes outage, ambiguous action results, restart, and production-style fault scenarios.
+
+Definition of Done:
+
+- [ ] An operator or developer can trace a concrete Node/Writer/Reader symptom to a sourced, scoped diagnosis and safe next step without exposing internal placement to application APIs.
+- [ ] No recommendation mutates state by default; approval/authorization cannot bypass RF3, Cursor/ordering, retention, or Control Plane guarantees.
+- [ ] Unavailable or disabled Advisor leaves core appends, reads, and deterministic recovery unaffected.
+
 ## Unscheduled pain-point backlog
 
 These accepted product requirements need dependency review and explicit milestone placement. They do not supersede the current focus or the first unchecked immediate action.
@@ -764,7 +785,6 @@ These accepted product requirements need dependency review and explicit mileston
 - [ ] Define first-class Subscription retry, delayed-delivery, quarantine, skip, and final-disposition workflows.
 - [ ] Define a Schema Policy milestone covering identity, compatibility, admission validation, evolution, and generated clients.
 - [ ] Expand Pipe work into explicit join, window, watermark, grace-period, and late-arrival contracts.
-- [ ] Define a correlated health-explanation API spanning Writer, quorum, storage, Index, Subscription, and Reader stages.
 - [ ] Define logical-resource cost attribution for storage, replication, movement, egress, Subscriptions, Pipes, and Indexes.
 - [ ] Define richer Feed inspection, time seek, bounded search, and single-event investigation workflows.
 - [ ] Define end-to-end business-flow tracing through Metadata and logical resource IDs.

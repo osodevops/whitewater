@@ -572,7 +572,7 @@ whitewater.upgrade.plan
 whitewater.dr.status
 ```
 
-Mutating MCP tools must require explicit authorization and confirmation, and they must invoke the same idempotent control APIs as every other client. MCP is not the consensus, reconciliation, or real-time autoscaling protocol.
+Mutating MCP tools must require explicit authorization and confirmation, and they must invoke the same idempotent control APIs as every other client. MCP is not the consensus, reconciliation, or real-time autoscaling protocol. The proposed [Whitewater Operations Advisor](operations-advisor.md) expands this read-only-first interface into evidence-backed investigation, schedule learning, and policy-gated remediation; it is not implemented yet.
 
 ## Research sources and lessons
 

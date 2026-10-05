@@ -12,6 +12,7 @@ Design documents:
 - [Why Whitewater and Kafka equivalents](docs/why-whitewater.md)
 - [Kafka partitions versus Whitewater Active Ranges](docs/why-whitewater.md#kafka-partitions-versus-whitewater-active-ranges)
 - [Humane operational and developer experience](docs/operational-experience.md)
+- [Proposed Whitewater Operations Advisor](docs/operations-advisor.md)
 - [Reddit community introduction and pinned launch post](docs/reddit-whitewater-streams-introduction.md)
 - [Lessons retained from Apache Kafka source](docs/kafka-source-lessons.md)
 - [Authenticated Whitewater Admin API v1](docs/admin-api.md)
