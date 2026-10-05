@@ -17,6 +17,7 @@ use base64::{
     engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD},
     Engine,
 };
+use futures_util::future::join_all;
 use openraft::{
     error::{InstallSnapshotError, RaftError},
     raft::{
@@ -35,11 +36,11 @@ use crate::{
         AppendIdentity, CandidateSplitStagingResult, CommitPosition, ControlPlaneFollowerMove,
         FollowerMoveControl, FollowerMoveCopyResult, KeyToken, MajorityAppendCoordinator,
         MajorityAppendError, MergeStagingResult, OwnerMoveEvidence, RangeId, RangePosition,
-        RepairExportRequest, RepairExportResponse, RepairFrame, ReplicaAppendRequest,
-        ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitRequest, ReplicaCommitResponse,
-        ReplicaProgressRequest, ReplicaProgressResponse, ReplicaReconcileRequest,
-        ReplicaReconcileResponse, StorageNodeId, StoredRangeFrame, MAX_COMMITTED_READ_BYTES,
-        MAX_REPLICA_FRAME_BASE64_BYTES,
+        ReadReplicaEvidence, RepairExportRequest, RepairExportResponse, RepairFrame,
+        ReplicaAppendRequest, ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitRequest,
+        ReplicaCommitResponse, ReplicaProgressRequest, ReplicaProgressResponse,
+        ReplicaReconcileRequest, ReplicaReconcileResponse, StorageNodeId, StoredRangeFrame,
+        MAX_COMMITTED_READ_BYTES, MAX_REPLICA_FRAME_BASE64_BYTES,
     },
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
@@ -179,6 +180,12 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             authorize_replica_append,
         ));
+    let read_evidence_route = post(read_range_evidence)
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
     Router::new()
         .route("/health", get(health))
         .route("/v1/streams", get(list_streams).post(create_stream))
@@ -278,6 +285,7 @@ pub fn router(state: AppState) -> Router {
             owner_move_unfreeze_route,
         )
         .route("/internal/active-range/read/committed", read_range_route)
+        .route("/internal/active-range/read/evidence", read_evidence_route)
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
         .route(
@@ -3041,6 +3049,119 @@ struct ReadRangePageResponse {
     frames: Vec<RepairFrame>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReadRangeEvidenceRequest {
+    assignment: ActiveRangeAssignment,
+    position: CommitPosition,
+}
+
+async fn read_range_evidence(
+    State(state): State<AppState>,
+    Json(request): Json<ReadRangeEvidenceRequest>,
+) -> Result<Json<ReadReplicaEvidence>, ApiError> {
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("replica storage is not available"))?;
+    service
+        .read_replica_evidence(&request.assignment, request.position)
+        .await
+        .map(Json)
+        .map_err(|error| ApiError::unavailable(error.message))
+}
+
+fn require_read_quorum(
+    assignment: &ActiveRangeAssignment,
+    position: CommitPosition,
+    owner: &ReadReplicaEvidence,
+    followers: &[ReadReplicaEvidence],
+) -> Result<(), ApiError> {
+    if owner.node != assignment.owner
+        || owner.committed < position
+        || position.value() > 0 && owner.digest.is_none()
+    {
+        return Err(ApiError::unavailable(
+            "Append Owner cannot prove its committed read boundary",
+        ));
+    }
+    let mut confirmed = false;
+    for follower in followers {
+        if follower.node == owner.node || !assignment.replicas.contains(&follower.node) {
+            return Err(ApiError::unavailable(
+                "read evidence came from a non-replica Node",
+            ));
+        }
+        if follower.committed > owner.committed {
+            return Err(ApiError::unavailable(
+                "Append Owner is behind another committed replica; retry after repair or recovery",
+            ));
+        }
+        if follower.committed >= position && follower.digest == owner.digest {
+            confirmed = true;
+        }
+    }
+    if !confirmed {
+        return Err(ApiError::unavailable(
+            "no other replica confirms the committed prefix and digest; retry after catch-up",
+        ));
+    }
+    Ok(())
+}
+
+async fn verify_read_quorum(
+    state: &AppState,
+    assignment: &ActiveRangeAssignment,
+    position: CommitPosition,
+) -> Result<(), ApiError> {
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("owner replica storage is not available"))?;
+    let owner = service
+        .read_replica_evidence(assignment, position)
+        .await
+        .map_err(|error| ApiError::unavailable(error.message))?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("read evidence credential is unavailable"))?;
+    let followers = join_all(
+        assignment
+            .replicas
+            .iter()
+            .filter(|node| **node != assignment.owner)
+            .map(|node| async {
+                let endpoint = state.control_endpoints.get(node)?;
+                let response = state
+                    .internal_http
+                    .post(format!(
+                        "{}/internal/active-range/read/evidence",
+                        endpoint.trim_end_matches('/')
+                    ))
+                    .header("x-whitewater-control-key", key)
+                    .json(&ReadRangeEvidenceRequest {
+                        assignment: assignment.clone(),
+                        position,
+                    })
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                    .ok()?
+                    .error_for_status()
+                    .ok()?
+                    .json::<ReadReplicaEvidence>()
+                    .await
+                    .ok()?;
+                (response.node == *node).then_some(response)
+            }),
+    )
+    .await
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    require_read_quorum(assignment, position, &owner, &followers)
+}
+
 async fn read_owned_range_page(
     State(state): State<AppState>,
     Json(request): Json<ReadRangePageRequest>,
@@ -3049,13 +3170,23 @@ async fn read_owned_range_page(
         .replica_append
         .as_ref()
         .ok_or_else(|| ApiError::unavailable("Active Range storage is not available"))?;
+    let expected_commit = if request.expected_commit.is_none() && state.control_plane.is_some() {
+        let owner = service
+            .read_replica_evidence(&request.assignment, CommitPosition::new(0))
+            .await
+            .map_err(|error| ApiError::unavailable(error.message))?;
+        verify_read_quorum(&state, &request.assignment, owner.committed).await?;
+        Some(owner.committed)
+    } else {
+        request.expected_commit
+    };
     let (committed, resolved_after, frames) = if request.single_range {
         service
             .read_owned_range_cursor_page(
                 &request.assignment,
                 request.after_cursor.as_deref(),
                 request.after,
-                request.expected_commit,
+                expected_commit,
                 request.tail_count,
                 request.page_limit.unwrap_or(1),
             )
@@ -3066,7 +3197,7 @@ async fn read_owned_range_page(
         ));
     } else {
         service
-            .read_owned_range_page(&request.assignment, request.after, request.expected_commit)
+            .read_owned_range_page(&request.assignment, request.after, expected_commit)
             .await
             .map(|(commit, frames)| (commit, request.after, frames))
     }
@@ -3879,7 +4010,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        active_range::{store::seed_committed_history, ActiveRangeDescriptor},
+        active_range::{
+            store::seed_committed_history, ActiveRangeDescriptor, OwnershipEpoch, RangeGeneration,
+            ReplicaSet,
+        },
         control::Command,
         membership::MemberAnnouncement,
         storage::FileLogStore,
@@ -3975,6 +4109,63 @@ mod tests {
             feed_cursor(first, request_id),
             URL_SAFE_NO_PAD.encode(blake3::hash(request_id.as_bytes()).as_bytes())
         );
+    }
+
+    #[test]
+    fn read_quorum_refuses_a_lost_or_behind_owner_and_digest_disagreement() {
+        let nodes = ["storage-1", "storage-2", "storage-3"]
+            .map(|name| StorageNodeId::try_new(name).unwrap());
+        let assignment = ActiveRangeAssignment::try_new(
+            Uuid::from_u128(1),
+            RangeId::from_uuid(Uuid::from_u128(2)),
+            RangeGeneration::new(1),
+            nodes[0].clone(),
+            ReplicaSet::try_new(nodes.clone()).unwrap(),
+            OwnershipEpoch::new(1),
+        )
+        .unwrap();
+        let evidence =
+            |node: StorageNodeId, committed: u64, digest: Option<[u8; 32]>| ReadReplicaEvidence {
+                node,
+                committed: CommitPosition::new(committed),
+                digest,
+            };
+        let owner = evidence(nodes[0].clone(), 5, Some([7; 32]));
+        let caught_up = evidence(nodes[1].clone(), 5, Some([7; 32]));
+        assert!(require_read_quorum(
+            &assignment,
+            CommitPosition::new(5),
+            &owner,
+            std::slice::from_ref(&caught_up)
+        )
+        .is_ok());
+        let lost = evidence(nodes[0].clone(), 0, None);
+        let ahead = evidence(nodes[2].clone(), 5, Some([7; 32]));
+        assert!(require_read_quorum(
+            &assignment,
+            CommitPosition::new(0),
+            &lost,
+            &[caught_up.clone(), ahead]
+        )
+        .is_err());
+        let ahead = evidence(nodes[2].clone(), 6, Some([8; 32]));
+        assert!(require_read_quorum(
+            &assignment,
+            CommitPosition::new(5),
+            &owner,
+            &[caught_up.clone(), ahead]
+        )
+        .is_err());
+        let divergent = evidence(nodes[1].clone(), 5, Some([9; 32]));
+        let behind = evidence(nodes[2].clone(), 4, None);
+        assert!(require_read_quorum(
+            &assignment,
+            CommitPosition::new(5),
+            &owner,
+            &[divergent, behind]
+        )
+        .is_err());
+        assert!(require_read_quorum(&assignment, CommitPosition::new(5), &owner, &[]).is_err());
     }
 
     #[test]
@@ -4398,6 +4589,7 @@ mod tests {
             "/internal/active-range/owner-move/verify",
             "/internal/active-range/owner-move/unfreeze",
             "/internal/active-range/read/committed",
+            "/internal/active-range/read/evidence",
         ] {
             let request = |credential: Option<&str>| {
                 let mut builder = Request::builder()

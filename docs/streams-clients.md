@@ -52,6 +52,12 @@ Keep shared behavior in a small language-neutral contract and per-language confo
 
 These operations are currently available at the prototype level; client TLS, role-based authorization, remote long-history Cursor continuation, and shared Subscription leases are not complete. See [Writer/Reader endpoints](admin-api.md) and [M2–M4 status](tasks.md#milestone-2--operational-writers).
 
+## Multi-range Cursor continuation (design gate, not implemented)
+
+A Writer's record-attached Cursor identifies one committed event; it does **not** encode progress in every other range. Sorting each owner's events by ingest time and seeking after that one record cannot safely continue a busy multi-range Feed: a concurrent append on another owner can arrive with an earlier sort key. Whitewater promises same-Key order, not a public total Feed order. Do not convert a record Cursor into a guessed offset or silently skip another Key's history.
+
+The planned server-managed path is a versioned, opaque read frontier/checkpoint that records bounded per-range delivered progress under a consistent committed boundary, and can be translated through split, merge, movement, and owner recovery using retained record identities. Before adopting it, specify how a new Reader frontier relates to existing Writer-returned and persisted record Cursors, how an initial seek derives the frontier, and how old Cursors remain usable. Checkpoint replication, expiry, size limits, read-capacity cost, and recovery refusal when history or lineage is missing are part of the contract. Avoid a mandatory per-event global sequencer that would serialize unrelated Keys. Until this passes restart/fault tests, multi-range long-history reads retain their explicit fail-closed bound. The six SDKs must share one Cursor/resume behavior.
+
 ## User guide: enrich by userId (target contract, not implemented)
 
 ```text

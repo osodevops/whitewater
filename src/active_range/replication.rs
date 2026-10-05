@@ -134,6 +134,13 @@ pub struct ReplicaCommitResponse {
     pub error: Option<ReplicaAppendError>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadReplicaEvidence {
+    pub node: StorageNodeId,
+    pub committed: CommitPosition,
+    pub digest: Option<[u8; 32]>,
+}
+
 #[derive(Clone)]
 pub struct ReplicaAppendService {
     root: Arc<PathBuf>,
@@ -630,6 +637,61 @@ impl ReplicaAppendService {
             ));
         }
         Ok((boundary, start, frames))
+    }
+
+    pub async fn read_replica_evidence(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        position: CommitPosition,
+    ) -> Result<ReadReplicaEvidence, ReplicaAppendError> {
+        if !assignment.replicas.contains(&self.local_node)
+            || self
+                .control
+                .active_range_assignment_by_id(assignment.range_id)
+                .await
+                != Some(assignment.clone())
+        {
+            return Err(ReplicaAppendError::temporary(
+                ReplicaAppendErrorCode::ReceiverNotReplica,
+                "replica no longer hosts the current committed range assignment",
+            ));
+        }
+        let store = self.store_for(assignment).await?;
+        let committed = store
+            .snapshot()
+            .await
+            .map_err(map_store_error)?
+            .progress
+            .commit_position();
+        let digest = if position.value() > 0 && committed >= position {
+            Some(
+                store
+                    .frame_digest(RangePosition::new(position.value()))
+                    .await
+                    .map_err(map_store_error)?
+                    .ok_or_else(|| {
+                        ReplicaAppendError::storage("committed frame digest is unavailable")
+                    })?,
+            )
+        } else {
+            None
+        };
+        if self
+            .control
+            .active_range_assignment_by_id(assignment.range_id)
+            .await
+            != Some(assignment.clone())
+        {
+            return Err(ReplicaAppendError::temporary(
+                ReplicaAppendErrorCode::NotCurrentOwner,
+                "range placement changed during read evidence collection; retry safely",
+            ));
+        }
+        Ok(ReadReplicaEvidence {
+            node: self.local_node.clone(),
+            committed,
+            digest,
+        })
     }
 
     pub async fn append(

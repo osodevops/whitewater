@@ -688,6 +688,48 @@ async fn committed_range_pages_require_the_current_owner_and_preserve_the_bounda
 }
 
 #[tokio::test]
+async fn read_evidence_exposes_owner_data_loss_instead_of_claiming_empty_history() {
+    let fixture = Fixture::new().await;
+    let assignment = fixture
+        .control
+        .active_range_assignment(fixture.request.feed_id)
+        .await
+        .unwrap();
+    fixture
+        .coordinator(&[], &[], None)
+        .append(fixture.request.clone())
+        .await
+        .unwrap();
+    let owner = fixture.services[&assignment.owner].clone();
+    let follower = fixture.services[&StorageNodeId::try_new("storage-2").unwrap()].clone();
+    let boundary = CommitPosition::new(1);
+    let original = owner
+        .read_replica_evidence(&assignment, boundary)
+        .await
+        .unwrap();
+    let corroborated = follower
+        .read_replica_evidence(&assignment, boundary)
+        .await
+        .unwrap();
+    assert_eq!(original.committed, boundary);
+    assert_eq!(original.digest, corroborated.digest);
+    owner
+        .quarantine_for_repair(assignment.feed_id)
+        .await
+        .unwrap();
+    let lost = owner
+        .read_replica_evidence(&assignment, CommitPosition::new(0))
+        .await
+        .unwrap();
+    let surviving = follower
+        .read_replica_evidence(&assignment, CommitPosition::new(0))
+        .await
+        .unwrap();
+    assert_eq!(lost.committed, CommitPosition::new(0));
+    assert!(surviving.committed > lost.committed);
+}
+
+#[tokio::test]
 async fn cursor_pages_continue_after_a_bounded_batch_without_rescanning_the_prefix() {
     let fixture = Fixture::new().await;
     let assignment = fixture
