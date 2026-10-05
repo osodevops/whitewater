@@ -125,6 +125,180 @@ impl ReaderPacingController {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscriptionWorkLease {
+    pub work_id: Uuid,
+    pub member_id: Uuid,
+    pub member_epoch: u64,
+    pub lease_epoch: u64,
+    pub expires_at_tick: u64,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum SubscriptionLeaseError {
+    #[error("work is currently leased to another member")]
+    Busy,
+    #[error("member lease is stale or expired")]
+    StaleLease,
+    #[error("lease budget is exhausted")]
+    Capacity,
+    #[error("lease clock moved backwards or counter overflowed")]
+    InvalidClock,
+}
+
+pub struct SubscriptionLeaseTracker {
+    leases: BTreeMap<Uuid, SubscriptionWorkLease>,
+    member_epochs: BTreeMap<Uuid, u64>,
+    last_tick: u64,
+    max_work: usize,
+    max_members: usize,
+}
+
+impl SubscriptionLeaseTracker {
+    pub fn new(max_work: usize) -> Self {
+        let max_work = max_work.clamp(1, 65_536);
+        Self {
+            leases: BTreeMap::new(),
+            member_epochs: BTreeMap::new(),
+            last_tick: 0,
+            max_work,
+            max_members: max_work.saturating_mul(4).min(65_536),
+        }
+    }
+
+    pub fn fence_member(
+        &mut self,
+        member_id: Uuid,
+        new_epoch: u64,
+    ) -> Result<(), SubscriptionLeaseError> {
+        if new_epoch == 0
+            || self
+                .member_epochs
+                .get(&member_id)
+                .is_some_and(|current| *current >= new_epoch)
+        {
+            return Err(SubscriptionLeaseError::StaleLease);
+        }
+        if !self.member_epochs.contains_key(&member_id)
+            && self.member_epochs.len() >= self.max_members
+        {
+            return Err(SubscriptionLeaseError::Capacity);
+        }
+        self.member_epochs.insert(member_id, new_epoch);
+        for lease in self
+            .leases
+            .values_mut()
+            .filter(|lease| lease.member_id == member_id)
+        {
+            lease.expires_at_tick = self.last_tick;
+        }
+        Ok(())
+    }
+
+    pub fn claim(
+        &mut self,
+        work_id: Uuid,
+        member_id: Uuid,
+        member_epoch: u64,
+        now_tick: u64,
+        lease_ticks: u64,
+        max_member_work: usize,
+    ) -> Result<SubscriptionWorkLease, SubscriptionLeaseError> {
+        self.check_tick(now_tick, lease_ticks)?;
+        if self.member_epochs.get(&member_id) != Some(&member_epoch) {
+            return Err(SubscriptionLeaseError::StaleLease);
+        }
+        if max_member_work == 0 {
+            return Err(SubscriptionLeaseError::Capacity);
+        }
+        if let Some(existing) = self.leases.get(&work_id) {
+            if now_tick < existing.expires_at_tick {
+                if existing.member_id == member_id && existing.member_epoch == member_epoch {
+                    return Ok(existing.clone());
+                }
+                return Err(SubscriptionLeaseError::Busy);
+            }
+        } else if self.leases.len() >= self.max_work {
+            return Err(SubscriptionLeaseError::Capacity);
+        }
+        let active_for_member = self
+            .leases
+            .values()
+            .filter(|lease| {
+                lease.member_id == member_id
+                    && lease.member_epoch == member_epoch
+                    && now_tick < lease.expires_at_tick
+            })
+            .count();
+        if active_for_member >= max_member_work {
+            return Err(SubscriptionLeaseError::Capacity);
+        }
+        let lease_epoch = self.leases.get(&work_id).map_or(Ok(1), |previous| {
+            previous
+                .lease_epoch
+                .checked_add(1)
+                .ok_or(SubscriptionLeaseError::InvalidClock)
+        })?;
+        let expires_at_tick = now_tick
+            .checked_add(lease_ticks)
+            .ok_or(SubscriptionLeaseError::InvalidClock)?;
+        let granted = SubscriptionWorkLease {
+            work_id,
+            member_id,
+            member_epoch,
+            lease_epoch,
+            expires_at_tick,
+        };
+        self.leases.insert(work_id, granted.clone());
+        self.last_tick = now_tick;
+        Ok(granted)
+    }
+
+    pub fn renew(
+        &mut self,
+        grant: &SubscriptionWorkLease,
+        now_tick: u64,
+        lease_ticks: u64,
+    ) -> Result<SubscriptionWorkLease, SubscriptionLeaseError> {
+        self.check_tick(now_tick, lease_ticks)?;
+        if !self.can_ack(grant, now_tick) {
+            return Err(SubscriptionLeaseError::StaleLease);
+        }
+        let expires_at_tick = now_tick
+            .checked_add(lease_ticks)
+            .ok_or(SubscriptionLeaseError::InvalidClock)?;
+        let current = self
+            .leases
+            .get_mut(&grant.work_id)
+            .ok_or(SubscriptionLeaseError::StaleLease)?;
+        current.expires_at_tick = expires_at_tick;
+        self.last_tick = now_tick;
+        Ok(current.clone())
+    }
+
+    pub fn can_ack(&self, grant: &SubscriptionWorkLease, now_tick: u64) -> bool {
+        now_tick >= self.last_tick
+            && self.member_epochs.get(&grant.member_id) == Some(&grant.member_epoch)
+            && self.leases.get(&grant.work_id).is_some_and(|current| {
+                current.member_id == grant.member_id
+                    && current.member_epoch == grant.member_epoch
+                    && current.lease_epoch == grant.lease_epoch
+                    && now_tick < current.expires_at_tick
+            })
+    }
+
+    fn check_tick(&self, now_tick: u64, lease_ticks: u64) -> Result<(), SubscriptionLeaseError> {
+        if now_tick < self.last_tick
+            || lease_ticks == 0
+            || now_tick.checked_add(lease_ticks).is_none()
+        {
+            Err(SubscriptionLeaseError::InvalidClock)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReaderDeliveryReceipt {
     pub request_id: Uuid,
     pub cursor: String,
@@ -478,6 +652,97 @@ mod tests {
         );
         assert!(oversized.record_exceeds_budget);
         assert_eq!(oversized.max_records, 0);
+    }
+
+    #[test]
+    fn subscription_work_leases_fence_stale_members_and_limit_capacity() {
+        let mut leases = SubscriptionLeaseTracker::new(2);
+        let first_member = Uuid::from_u128(1);
+        let second_member = Uuid::from_u128(2);
+        let first_work = Uuid::from_u128(3);
+        let second_work = Uuid::from_u128(4);
+        assert_eq!(
+            leases
+                .claim(first_work, first_member, 1, 100, 20, 1)
+                .unwrap_err(),
+            SubscriptionLeaseError::StaleLease
+        );
+        leases.fence_member(first_member, 1).unwrap();
+        leases.fence_member(second_member, 1).unwrap();
+        let first = leases
+            .claim(first_work, first_member, 1, 100, 20, 1)
+            .unwrap();
+        assert_eq!(
+            leases
+                .claim(first_work, first_member, 1, 100, 20, 1)
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            leases
+                .claim(first_work, second_member, 1, 101, 20, 1)
+                .unwrap_err(),
+            SubscriptionLeaseError::Busy
+        );
+        assert_eq!(
+            leases
+                .claim(second_work, first_member, 1, 101, 20, 1)
+                .unwrap_err(),
+            SubscriptionLeaseError::Capacity
+        );
+        let second = leases
+            .claim(second_work, second_member, 1, 102, 20, 1)
+            .unwrap();
+        assert!(leases.can_ack(&first, 103));
+        assert!(leases.can_ack(&second, 103));
+        leases.fence_member(first_member, 2).unwrap();
+        assert!(!leases.can_ack(&first, 103));
+        assert_eq!(
+            leases
+                .claim(first_work, first_member, 1, 103, 20, 1)
+                .unwrap_err(),
+            SubscriptionLeaseError::StaleLease
+        );
+        let renewed_session = leases
+            .claim(first_work, first_member, 2, 103, 20, 1)
+            .unwrap();
+        assert!(renewed_session.lease_epoch > first.lease_epoch);
+        assert!(!leases.can_ack(&first, 104));
+        assert_eq!(
+            leases.renew(&first, 104, 20).unwrap_err(),
+            SubscriptionLeaseError::StaleLease
+        );
+        assert_eq!(
+            leases
+                .claim(first_work, second_member, 1, 110, 20, 1)
+                .unwrap_err(),
+            SubscriptionLeaseError::Busy
+        );
+        let replacement = leases
+            .claim(first_work, second_member, 1, 123, 20, 2)
+            .unwrap();
+        assert!(replacement.lease_epoch > renewed_session.lease_epoch);
+        assert!(!leases.can_ack(&renewed_session, 124));
+        assert!(!leases.can_ack(&second, 124));
+        assert_eq!(
+            leases
+                .claim(Uuid::from_u128(5), first_member, 2, 125, 20, 1)
+                .unwrap_err(),
+            SubscriptionLeaseError::Capacity
+        );
+        assert_eq!(
+            leases
+                .claim(first_work, second_member, 1, 120, 20, 2)
+                .unwrap_err(),
+            SubscriptionLeaseError::InvalidClock
+        );
+        assert_eq!(
+            leases
+                .claim(first_work, second_member, 1, u64::MAX, 2, 2)
+                .unwrap_err(),
+            SubscriptionLeaseError::InvalidClock
+        );
+        assert_eq!(SubscriptionLeaseTracker::new(usize::MAX).max_work, 65_536);
     }
 
     #[test]

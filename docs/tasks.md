@@ -741,7 +741,7 @@ Definition of Done:
 - [x] Declare Space-scoped Subscriptions by logical name and source Feed through typed Control Plane commands and WCL, idempotently across snapshots; `stage=declared` does not allow clients to join or acknowledge. Tests prove a declaration creates no internal/public Feed and refuses cross-Space sources or unsafe Feed drop.
 - [ ] Implement durable Subscription progress in hidden, ReaderId/SubscriptionId-sharded RF3 internal state and mutation journals, not Kafka-style internal Feeds; persist separate expiring member leases, retry identities, and acknowledged frontiers without per-fetch Control Plane writes.
 - [ ] Implement transaction/effect coordinator state in separately bounded and RF3-replicated internal storage, not an application-visible Feed; do not claim atomic consume-and-append from local Fjall transactions.
-- [ ] Implement epoch-fenced small-range leases.
+- [~] Implement epoch-fenced small-work leases: `SubscriptionLeaseTracker` now locally proves member-session fencing, bounded claims, non-overlapping grants, idempotent claim, expiry, stale-ack rejection, renewal and checked-clock behavior. It is an isolated state-machine prototype; RF3 journal/placement, verified time source, failover recovery, authenticated transport and public member joins remain.
 - [ ] Implement incremental lease transfer.
 - [ ] Implement Pipe definitions.
 - [ ] Implement atomic consume-and-append.

@@ -1,4 +1,4 @@
-import base64, json, os, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid
+import base64, http.client, json, os, subprocess, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 
 BASE_PORT = int(os.environ.get("WHITEWATER_TEST_BASE_PORT", "7071"))
 ENDPOINTS = {f"control-{index}": f"http://localhost:{BASE_PORT + index - 1}" for index in range(1, 4)}
@@ -19,7 +19,15 @@ def call(endpoint, path, body=None):
 def main():
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:6]}"
     space, feed = f"m110{suffix}", f"m110{suffix}.events"
-    created = call(ENDPOINTS["control-1"], "/v1/admin/wcl", {"script": f"CREATE SPACE {space}; CREATE FEED {feed}; INSPECT PLACEMENT FOR FEED {feed};"})
+    setup = {"request_id": str(uuid.uuid4()), "script": f"CREATE SPACE {space}; CREATE FEED {feed}; INSPECT PLACEMENT FOR FEED {feed};"}
+    for _ in range(30):
+        try:
+            created = call(ENDPOINTS["control-1"], "/v1/admin/wcl", setup)
+            break
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.RemoteDisconnected):
+            time.sleep(0.5)
+    else:
+        raise AssertionError("Control Plane setup remained unavailable after restart")
     owner = created["results"][-1]["data"]["owner"]
     target = next(node for node in ENDPOINTS if node != owner)
     target_service = f"node{target.removeprefix('control-')}"
@@ -40,7 +48,7 @@ def main():
             records = call(ENDPOINTS[target], f"/v1/feeds/records?feed={encoded}&limit=10")
             if len(records) == 3:
                 break
-        except (urllib.error.URLError, TimeoutError):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.RemoteDisconnected):
             pass
         time.sleep(2)
     if records is None or len(records) != 3:
