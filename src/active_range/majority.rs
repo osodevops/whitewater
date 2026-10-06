@@ -126,6 +126,20 @@ impl MajorityAppendCoordinator {
         &self,
         source: &super::ActiveRangeAssignment,
     ) -> Result<CommitPosition, MajorityAppendError> {
+        self.freeze_for_cutover(source).await
+    }
+
+    pub async fn freeze_for_split(
+        &self,
+        source: &super::ActiveRangeAssignment,
+    ) -> Result<CommitPosition, MajorityAppendError> {
+        self.freeze_for_cutover(source).await
+    }
+
+    async fn freeze_for_cutover(
+        &self,
+        source: &super::ActiveRangeAssignment,
+    ) -> Result<CommitPosition, MajorityAppendError> {
         let _append_guard = self.append_lock.lock().await;
         let current = self
             .control
@@ -134,7 +148,7 @@ impl MajorityAppendCoordinator {
         if current.as_ref() != Some(source) || source.owner != *self.local.local_node() {
             return Err(self.error(
                 MajorityAppendErrorCode::NotCurrentOwner,
-                "Active Range placement changed before movement freeze",
+                "Active Range placement changed before cutover freeze",
                 true,
                 vec![],
                 vec![],

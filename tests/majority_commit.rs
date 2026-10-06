@@ -27,6 +27,14 @@ struct DirectTransport {
     append_down: Arc<BTreeSet<StorageNodeId>>,
     commit_down: Arc<BTreeSet<StorageNodeId>>,
     corrupt_digest: Option<StorageNodeId>,
+    commit_pause: Option<CommitPause>,
+}
+
+#[derive(Clone)]
+struct CommitPause {
+    node: StorageNodeId,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait]
@@ -65,6 +73,14 @@ impl ReplicaTransport for DirectTransport {
                 message: "commit unavailable".to_owned(),
                 retryable: true,
             });
+        }
+        if let Some(pause) = self
+            .commit_pause
+            .as_ref()
+            .filter(|pause| &pause.node == replica)
+        {
+            pause.entered.notify_one();
+            pause.release.notified().await;
         }
         self.services[replica]
             .commit(request)
@@ -219,6 +235,16 @@ impl Fixture {
         commit_down: &[&str],
         corrupt_digest: Option<&str>,
     ) -> MajorityAppendCoordinator {
+        self.coordinator_with_pause(append_down, commit_down, corrupt_digest, None)
+    }
+
+    fn coordinator_with_pause(
+        &self,
+        append_down: &[&str],
+        commit_down: &[&str],
+        corrupt_digest: Option<&str>,
+        commit_pause: Option<CommitPause>,
+    ) -> MajorityAppendCoordinator {
         let transport = DirectTransport {
             services: Arc::new(self.services.clone()),
             append_down: Arc::new(
@@ -234,6 +260,7 @@ impl Fixture {
                     .collect(),
             ),
             corrupt_digest: corrupt_digest.map(|node| StorageNodeId::try_new(node).unwrap()),
+            commit_pause,
         };
         MajorityAppendCoordinator::new(
             self.services[&StorageNodeId::try_new("storage-1").unwrap()].clone(),
@@ -296,6 +323,57 @@ async fn follower_move_freeze_drains_majority_append_and_rejects_new_writes() {
     fixture.services[&assignment.owner]
         .unfreeze_generation(assignment.range_id, assignment.generation)
         .await;
+}
+
+#[tokio::test]
+async fn split_freeze_waits_for_in_flight_majority_commit_before_truncating_owner() {
+    let fixture = Fixture::new().await;
+    let assignment = fixture
+        .control
+        .active_range_assignment(fixture.request.feed_id)
+        .await
+        .unwrap();
+    let pause = CommitPause {
+        node: StorageNodeId::try_new("storage-2").unwrap(),
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    };
+    let coordinator = Arc::new(fixture.coordinator_with_pause(&[], &[], None, Some(pause.clone())));
+    let pending = tokio::spawn({
+        let coordinator = coordinator.clone();
+        let request = fixture.request.clone();
+        async move { coordinator.append(request).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), pause.entered.notified())
+        .await
+        .unwrap();
+    let freeze = coordinator.freeze_for_split(&assignment);
+    tokio::pin!(freeze);
+    tokio::select! {
+        biased;
+        result = &mut freeze => panic!("split froze before in-flight append committed: {result:?}"),
+        _ = tokio::task::yield_now() => {},
+    }
+    pause.release.notify_one();
+    let appended = pending.await.unwrap().unwrap();
+    let committed = freeze.await.unwrap();
+    assert_eq!(committed.value(), appended.position.value());
+    assert_eq!(
+        fixture.services[&assignment.owner]
+            .recovery_status_for_assignment(&assignment)
+            .await
+            .unwrap()
+            .committed,
+        committed
+    );
+    assert_eq!(
+        fixture.services[&assignment.owner]
+            .read_staged_committed(&assignment, None, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -509,6 +587,7 @@ async fn owner_move_fences_old_owner_only_after_verified_catch_up() {
         append_down: Arc::new(BTreeSet::new()),
         commit_down: Arc::new(BTreeSet::new()),
         corrupt_digest: None,
+        commit_pause: None,
     };
     let new_owner = MajorityAppendCoordinator::new(
         target.clone(),

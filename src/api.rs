@@ -1253,12 +1253,22 @@ async fn split_freeze_local(
         .replica_append
         .as_ref()
         .ok_or_else(|| ApiError::unavailable("replica storage is not configured"))?;
-    service
-        .freeze_generation(
-            request.source_assignment.range_id,
-            request.source_assignment.generation,
-        )
-        .await;
+    if service.local_node() == &request.source_assignment.owner {
+        state
+            .majority_append
+            .as_ref()
+            .ok_or_else(|| ApiError::unavailable("majority append is not configured"))?
+            .freeze_for_split(&request.source_assignment)
+            .await
+            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    } else {
+        service
+            .freeze_generation(
+                request.source_assignment.range_id,
+                request.source_assignment.generation,
+            )
+            .await;
+    }
     let status = service
         .recovery_status(request.source_assignment.feed_id)
         .await
@@ -1361,6 +1371,18 @@ async fn unfreeze_split_nodes(
     }
 }
 
+fn split_freeze_order(assignment: &ActiveRangeAssignment) -> Vec<StorageNodeId> {
+    let mut nodes = vec![assignment.owner.clone()];
+    nodes.extend(
+        assignment
+            .replicas
+            .iter()
+            .filter(|node| *node != &assignment.owner)
+            .cloned(),
+    );
+    nodes
+}
+
 async fn admin_split_range(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1393,8 +1415,8 @@ async fn admin_split_range(
         .as_ref()
         .ok_or_else(|| ApiError::unavailable("internal credential is unavailable"))?;
     let mut source_commit = CommitPosition::new(0);
-    for node in source_assignment.replicas.iter() {
-        let endpoint = state.control_endpoints.get(node).ok_or_else(|| {
+    for node in split_freeze_order(&source_assignment) {
+        let endpoint = state.control_endpoints.get(&node).ok_or_else(|| {
             ApiError::unavailable(format!("source replica {node} endpoint is unavailable"))
         })?;
         let progress: ReplicaProgressResponse = state
@@ -4448,6 +4470,25 @@ mod tests {
         assert_ne!(
             feed_cursor(first, request_id),
             URL_SAFE_NO_PAD.encode(blake3::hash(request_id.as_bytes()).as_bytes())
+        );
+    }
+
+    #[test]
+    fn split_freeze_order_drains_moved_owner_before_other_replicas() {
+        let nodes = ["storage-1", "storage-2", "storage-3"]
+            .map(|name| StorageNodeId::try_new(name).unwrap());
+        let assignment = ActiveRangeAssignment::try_new(
+            Uuid::from_u128(81),
+            RangeId::from_uuid(Uuid::from_u128(82)),
+            RangeGeneration::new(1),
+            nodes[1].clone(),
+            ReplicaSet::try_new(nodes.clone()).unwrap(),
+            OwnershipEpoch::new(2),
+        )
+        .unwrap();
+        assert_eq!(
+            split_freeze_order(&assignment),
+            vec![nodes[1].clone(), nodes[0].clone(), nodes[2].clone()]
         );
     }
 
