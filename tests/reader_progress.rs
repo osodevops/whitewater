@@ -12,7 +12,7 @@ use finnstream::{
         ReaderDeliveryReceipt, ReaderPacingController, ReaderPressureSample, ReaderProgressEngine,
         ReaderProgressError, SubscriptionCommitEvidence, SubscriptionPrepareVote,
         SubscriptionProgressAssignment, SubscriptionProgressCoordinator, SubscriptionProgressError,
-        SubscriptionProgressMutation, SubscriptionProgressTransport,
+        SubscriptionProgressMutation, SubscriptionProgressTransport, SubscriptionReplicaReply,
     },
     storage::{FileLogStore, LogStore},
 };
@@ -25,6 +25,9 @@ struct TestProgressTransport {
     commit_down: Mutex<BTreeSet<StorageNodeId>>,
     read_down: Mutex<BTreeSet<StorageNodeId>>,
     read_override: Mutex<BTreeMap<StorageNodeId, Option<SubscriptionProgressMutation>>>,
+    wrong_prepare_node: Mutex<Option<StorageNodeId>>,
+    wrong_commit_node: Mutex<Option<StorageNodeId>>,
+    wrong_read_node: Mutex<Option<StorageNodeId>>,
     corrupt_vote: Mutex<Option<StorageNodeId>>,
 }
 
@@ -42,8 +45,22 @@ impl TestProgressTransport {
             commit_down: Mutex::new(BTreeSet::new()),
             read_down: Mutex::new(BTreeSet::new()),
             read_override: Mutex::new(BTreeMap::new()),
+            wrong_prepare_node: Mutex::new(None),
+            wrong_commit_node: Mutex::new(None),
+            wrong_read_node: Mutex::new(None),
             corrupt_vote: Mutex::new(None),
         }
+    }
+
+    fn claimed_node(
+        override_node: &Mutex<Option<StorageNodeId>>,
+        node: &StorageNodeId,
+    ) -> StorageNodeId {
+        override_node
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| node.clone())
     }
 }
 
@@ -53,7 +70,7 @@ impl SubscriptionProgressTransport for TestProgressTransport {
         &self,
         node: &StorageNodeId,
         mutation: SubscriptionProgressMutation,
-    ) -> Result<SubscriptionPrepareVote, SubscriptionProgressError> {
+    ) -> Result<SubscriptionReplicaReply<SubscriptionPrepareVote>, SubscriptionProgressError> {
         if self.prepare_down.lock().unwrap().contains(node) {
             return Err(SubscriptionProgressError::Unavailable);
         }
@@ -62,20 +79,28 @@ impl SubscriptionProgressTransport for TestProgressTransport {
             .get(node)
             .cloned()
             .ok_or(SubscriptionProgressError::InvalidAssignment)?;
+        let subscription_id = mutation.subscription_id;
+        let ownership_epoch = mutation.ownership_epoch;
         let mut vote = tokio::task::spawn_blocking(move || store.prepare(mutation))
             .await
             .map_err(|_| SubscriptionProgressError::Unavailable)??;
         if self.corrupt_vote.lock().unwrap().as_ref() == Some(node) {
             vote.digest[0] ^= 1;
         }
-        Ok(vote)
+        Ok(SubscriptionReplicaReply {
+            replica: Self::claimed_node(&self.wrong_prepare_node, node),
+            subscription_id,
+            ownership_epoch,
+            result: vote,
+        })
     }
 
     async fn commit(
         &self,
         node: &StorageNodeId,
         evidence: SubscriptionCommitEvidence,
-    ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
+    ) -> Result<SubscriptionReplicaReply<SubscriptionProgressMutation>, SubscriptionProgressError>
+    {
         if self.commit_down.lock().unwrap().contains(node) {
             return Err(SubscriptionProgressError::Unavailable);
         }
@@ -84,31 +109,48 @@ impl SubscriptionProgressTransport for TestProgressTransport {
             .get(node)
             .cloned()
             .ok_or(SubscriptionProgressError::InvalidAssignment)?;
-        tokio::task::spawn_blocking(move || store.commit_with_quorum(evidence))
+        let result = tokio::task::spawn_blocking(move || store.commit_with_quorum(evidence))
             .await
-            .map_err(|_| SubscriptionProgressError::Unavailable)?
+            .map_err(|_| SubscriptionProgressError::Unavailable)??;
+        Ok(SubscriptionReplicaReply {
+            replica: Self::claimed_node(&self.wrong_commit_node, node),
+            subscription_id: result.subscription_id,
+            ownership_epoch: result.ownership_epoch,
+            result,
+        })
     }
 
     async fn committed(
         &self,
         node: &StorageNodeId,
         subscription_id: Uuid,
-        _ownership_epoch: u64,
-    ) -> Result<Option<SubscriptionProgressMutation>, SubscriptionProgressError> {
+        ownership_epoch: u64,
+    ) -> Result<
+        SubscriptionReplicaReply<Option<SubscriptionProgressMutation>>,
+        SubscriptionProgressError,
+    > {
         if self.read_down.lock().unwrap().contains(node) {
             return Err(SubscriptionProgressError::Unavailable);
         }
-        if let Some(value) = self.read_override.lock().unwrap().get(node).cloned() {
-            return Ok(value);
-        }
-        let store = self
-            .stores
-            .get(node)
-            .cloned()
-            .ok_or(SubscriptionProgressError::InvalidAssignment)?;
-        tokio::task::spawn_blocking(move || store.local_committed(subscription_id))
-            .await
-            .map_err(|_| SubscriptionProgressError::Unavailable)?
+        let override_value = self.read_override.lock().unwrap().get(node).cloned();
+        let result = if let Some(value) = override_value {
+            value
+        } else {
+            let store = self
+                .stores
+                .get(node)
+                .cloned()
+                .ok_or(SubscriptionProgressError::InvalidAssignment)?;
+            tokio::task::spawn_blocking(move || store.local_committed(subscription_id))
+                .await
+                .map_err(|_| SubscriptionProgressError::Unavailable)??
+        };
+        Ok(SubscriptionReplicaReply {
+            replica: Self::claimed_node(&self.wrong_read_node, node),
+            subscription_id,
+            ownership_epoch,
+            result,
+        })
     }
 }
 
@@ -304,6 +346,67 @@ async fn quorum_subscription_read_fails_closed_on_loss_disagreement_and_ambiguou
     transport.commit_down.lock().unwrap().clear();
     coordinator.apply(next.clone()).await.unwrap();
     assert_eq!(coordinator.read_committed().await.unwrap(), Some(next));
+}
+
+#[tokio::test]
+async fn progress_coordinator_refuses_replies_claiming_another_replica() {
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = progress_nodes();
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let subscription_id = Uuid::from_u128(981);
+    let assignment = SubscriptionProgressAssignment::try_new(
+        subscription_id,
+        nodes[0].clone(),
+        ReplicaSet::try_new(nodes.clone()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let coordinator = SubscriptionProgressCoordinator::new(assignment, transport.clone());
+    let mutation = SubscriptionProgressMutation {
+        subscription_id,
+        feed_id: Uuid::from_u128(982),
+        ownership_epoch: 1,
+        sequence: 1,
+        request_id: Uuid::from_u128(983),
+        expected_cursor: None,
+        cursor: "rf1_a".to_owned(),
+        positions: BTreeMap::from([(
+            RangeId::from_uuid(Uuid::from_u128(984)),
+            "event-a".to_owned(),
+        )]),
+    };
+    *transport.wrong_prepare_node.lock().unwrap() = Some(nodes[1].clone());
+    assert!(matches!(
+        coordinator.apply(mutation.clone()).await,
+        Err(SubscriptionProgressError::InvalidAssignment)
+    ));
+    assert!(transport.stores[&nodes[0]]
+        .local_committed(subscription_id)
+        .unwrap()
+        .is_none());
+    *transport.wrong_prepare_node.lock().unwrap() = None;
+    *transport.wrong_commit_node.lock().unwrap() = Some(nodes[1].clone());
+    assert!(matches!(
+        coordinator.apply(mutation.clone()).await,
+        Err(SubscriptionProgressError::InvalidAssignment)
+    ));
+    assert!(matches!(
+        coordinator.read_committed().await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+    *transport.wrong_commit_node.lock().unwrap() = None;
+    coordinator.apply(mutation.clone()).await.unwrap();
+    *transport.wrong_read_node.lock().unwrap() = Some(nodes[1].clone());
+    assert!(matches!(
+        coordinator.read_committed().await,
+        Err(SubscriptionProgressError::InvalidAssignment)
+    ));
+    *transport.wrong_read_node.lock().unwrap() = None;
+    assert_eq!(coordinator.read_committed().await.unwrap(), Some(mutation));
 }
 
 #[tokio::test]

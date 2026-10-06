@@ -645,6 +645,15 @@ pub struct SubscriptionPrepareVote {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct SubscriptionReplicaReply<T> {
+    pub replica: crate::active_range::StorageNodeId,
+    pub subscription_id: Uuid,
+    pub ownership_epoch: u64,
+    pub result: T,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubscriptionCommitEvidence {
     votes: [(crate::active_range::StorageNodeId, [u8; 32]); 2],
     subscription_id: Uuid,
@@ -899,14 +908,15 @@ impl SubscriptionProgressReplicaService {
     pub async fn prepare(
         &self,
         request: SubscriptionPrepareRequest,
-    ) -> Result<SubscriptionPrepareVote, SubscriptionProgressError> {
-        self.check_placement(
-            request.mutation.subscription_id,
-            &request.owner,
-            &request.receiver,
-            request.mutation.ownership_epoch,
-        )
-        .await?;
+    ) -> Result<SubscriptionReplicaReply<SubscriptionPrepareVote>, SubscriptionProgressError> {
+        let assignment = self
+            .check_placement(
+                request.mutation.subscription_id,
+                &request.owner,
+                &request.receiver,
+                request.mutation.ownership_epoch,
+            )
+            .await?;
         if self
             .control
             .active_subscription_feed_by_id(request.mutation.subscription_id)
@@ -916,15 +926,22 @@ impl SubscriptionProgressReplicaService {
             return Err(SubscriptionProgressError::Conflict);
         }
         let replica = self.replica.clone();
-        tokio::task::spawn_blocking(move || replica.prepare(request.mutation))
+        let result = tokio::task::spawn_blocking(move || replica.prepare(request.mutation))
             .await
-            .map_err(|_| SubscriptionProgressError::Unavailable)?
+            .map_err(|_| SubscriptionProgressError::Unavailable)??;
+        Ok(SubscriptionReplicaReply {
+            replica: self.local_node.clone(),
+            subscription_id: assignment.subscription_id,
+            ownership_epoch: assignment.ownership_epoch,
+            result,
+        })
     }
 
     pub async fn commit(
         &self,
         request: SubscriptionCommitRequest,
-    ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
+    ) -> Result<SubscriptionReplicaReply<SubscriptionProgressMutation>, SubscriptionProgressError>
+    {
         let assignment = self
             .check_placement(
                 request.subscription_id,
@@ -948,22 +965,33 @@ impl SubscriptionProgressReplicaService {
             return Err(SubscriptionProgressError::InvalidAssignment);
         }
         let replica = self.replica.clone();
-        tokio::task::spawn_blocking(move || replica.commit_with_quorum(request.evidence))
-            .await
-            .map_err(|_| SubscriptionProgressError::Unavailable)?
+        let result =
+            tokio::task::spawn_blocking(move || replica.commit_with_quorum(request.evidence))
+                .await
+                .map_err(|_| SubscriptionProgressError::Unavailable)??;
+        Ok(SubscriptionReplicaReply {
+            replica: self.local_node.clone(),
+            subscription_id: assignment.subscription_id,
+            ownership_epoch: assignment.ownership_epoch,
+            result,
+        })
     }
 
     pub async fn committed(
         &self,
         request: SubscriptionCommittedReadRequest,
-    ) -> Result<Option<SubscriptionProgressMutation>, SubscriptionProgressError> {
-        self.check_placement(
-            request.subscription_id,
-            &request.owner,
-            &request.receiver,
-            request.ownership_epoch,
-        )
-        .await?;
+    ) -> Result<
+        SubscriptionReplicaReply<Option<SubscriptionProgressMutation>>,
+        SubscriptionProgressError,
+    > {
+        let assignment = self
+            .check_placement(
+                request.subscription_id,
+                &request.owner,
+                &request.receiver,
+                request.ownership_epoch,
+            )
+            .await?;
         let feed_id = self
             .control
             .active_subscription_feed_by_id(request.subscription_id)
@@ -983,7 +1011,12 @@ impl SubscriptionProgressReplicaService {
                 return Err(SubscriptionProgressError::StaleEpoch);
             }
         }
-        Ok(committed)
+        Ok(SubscriptionReplicaReply {
+            replica: self.local_node.clone(),
+            subscription_id: assignment.subscription_id,
+            ownership_epoch: assignment.ownership_epoch,
+            result: committed,
+        })
     }
 }
 
@@ -1020,20 +1053,23 @@ pub trait SubscriptionProgressTransport: Send + Sync {
         &self,
         replica: &crate::active_range::StorageNodeId,
         mutation: SubscriptionProgressMutation,
-    ) -> Result<SubscriptionPrepareVote, SubscriptionProgressError>;
+    ) -> Result<SubscriptionReplicaReply<SubscriptionPrepareVote>, SubscriptionProgressError>;
 
     async fn commit(
         &self,
         replica: &crate::active_range::StorageNodeId,
         evidence: SubscriptionCommitEvidence,
-    ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError>;
+    ) -> Result<SubscriptionReplicaReply<SubscriptionProgressMutation>, SubscriptionProgressError>;
 
     async fn committed(
         &self,
         replica: &crate::active_range::StorageNodeId,
         subscription_id: Uuid,
         ownership_epoch: u64,
-    ) -> Result<Option<SubscriptionProgressMutation>, SubscriptionProgressError>;
+    ) -> Result<
+        SubscriptionReplicaReply<Option<SubscriptionProgressMutation>>,
+        SubscriptionProgressError,
+    >;
 }
 
 pub struct HttpSubscriptionProgressTransport {
@@ -1111,7 +1147,7 @@ impl SubscriptionProgressTransport for HttpSubscriptionProgressTransport {
         &self,
         replica: &crate::active_range::StorageNodeId,
         mutation: SubscriptionProgressMutation,
-    ) -> Result<SubscriptionPrepareVote, SubscriptionProgressError> {
+    ) -> Result<SubscriptionReplicaReply<SubscriptionPrepareVote>, SubscriptionProgressError> {
         if mutation.subscription_id != self.assignment.subscription_id
             || mutation.ownership_epoch != self.assignment.ownership_epoch
         {
@@ -1133,7 +1169,8 @@ impl SubscriptionProgressTransport for HttpSubscriptionProgressTransport {
         &self,
         replica: &crate::active_range::StorageNodeId,
         evidence: SubscriptionCommitEvidence,
-    ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
+    ) -> Result<SubscriptionReplicaReply<SubscriptionProgressMutation>, SubscriptionProgressError>
+    {
         if evidence.subscription_id != self.assignment.subscription_id {
             return Err(SubscriptionProgressError::InvalidAssignment);
         }
@@ -1156,7 +1193,10 @@ impl SubscriptionProgressTransport for HttpSubscriptionProgressTransport {
         replica: &crate::active_range::StorageNodeId,
         subscription_id: Uuid,
         ownership_epoch: u64,
-    ) -> Result<Option<SubscriptionProgressMutation>, SubscriptionProgressError> {
+    ) -> Result<
+        SubscriptionReplicaReply<Option<SubscriptionProgressMutation>>,
+        SubscriptionProgressError,
+    > {
         if subscription_id != self.assignment.subscription_id
             || ownership_epoch != self.assignment.ownership_epoch
         {
@@ -1219,7 +1259,14 @@ impl SubscriptionProgressCoordinator {
                 )
                 .await
             {
-                Ok(progress) => {
+                Ok(reply) => {
+                    if reply.replica != *node
+                        || reply.subscription_id != self.assignment.subscription_id
+                        || reply.ownership_epoch != self.assignment.ownership_epoch
+                    {
+                        return Err(SubscriptionProgressError::InvalidAssignment);
+                    }
+                    let progress = reply.result;
                     if let Some(mutation) = progress.as_ref() {
                         if mutation.subscription_id != self.assignment.subscription_id {
                             return Err(SubscriptionProgressError::Conflict);
@@ -1259,7 +1306,14 @@ impl SubscriptionProgressCoordinator {
         let mut prepared = Vec::with_capacity(3);
         for node in self.assignment.replicas.iter() {
             match self.transport.prepare(node, mutation.clone()).await {
-                Ok(vote) => {
+                Ok(reply) => {
+                    if reply.replica != *node
+                        || reply.subscription_id != self.assignment.subscription_id
+                        || reply.ownership_epoch != self.assignment.ownership_epoch
+                    {
+                        return Err(SubscriptionProgressError::InvalidAssignment);
+                    }
+                    let vote = reply.result;
                     if vote.subscription_id != mutation.subscription_id
                         || vote.request_id != mutation.request_id
                         || vote.digest != digest
@@ -1294,7 +1348,14 @@ impl SubscriptionProgressCoordinator {
         let mut committed = Vec::with_capacity(3);
         for (node, _) in prepared {
             match self.transport.commit(&node, evidence.clone()).await {
-                Ok(applied) if applied == mutation => committed.push(node),
+                Ok(reply)
+                    if reply.replica != node
+                        || reply.subscription_id != self.assignment.subscription_id
+                        || reply.ownership_epoch != self.assignment.ownership_epoch =>
+                {
+                    return Err(SubscriptionProgressError::InvalidAssignment);
+                }
+                Ok(reply) if reply.result == mutation => committed.push(node),
                 Ok(_) => return Err(SubscriptionProgressError::Conflict),
                 Err(SubscriptionProgressError::Unavailable) => {}
                 Err(error) => return Err(error),
@@ -1407,7 +1468,13 @@ mod tests {
             Err(SubscriptionProgressError::Conflict)
         ));
         let vote = service.prepare(valid).await.unwrap();
-        assert!(service.committed(read.clone()).await.unwrap().is_none());
+        assert_eq!(vote.replica, assignment.owner);
+        assert!(service
+            .committed(read.clone())
+            .await
+            .unwrap()
+            .result
+            .is_none());
         let invalid = SubscriptionCommitRequest {
             owner: assignment.owner.clone(),
             receiver: assignment.owner.clone(),
@@ -1417,8 +1484,11 @@ mod tests {
                 subscription_id: subscription.subscription_id,
                 request_id: mutation.request_id,
                 votes: [
-                    (assignment.owner.clone(), vote.digest),
-                    (StorageNodeId::try_new("foreign-node").unwrap(), vote.digest),
+                    (assignment.owner.clone(), vote.result.digest),
+                    (
+                        StorageNodeId::try_new("foreign-node").unwrap(),
+                        vote.result.digest,
+                    ),
                 ],
             },
         };
@@ -1432,9 +1502,9 @@ mod tests {
             .is_none());
         let mut accepted = invalid;
         accepted.evidence.votes[1].0 = follower;
-        assert_eq!(service.commit(accepted).await.unwrap(), mutation);
+        assert_eq!(service.commit(accepted).await.unwrap().result, mutation);
         assert_eq!(
-            service.committed(read).await.unwrap(),
+            service.committed(read).await.unwrap().result,
             Some(mutation.clone())
         );
         drop(service);

@@ -615,7 +615,10 @@ fn subscription_progress_api_error(error: SubscriptionProgressError) -> ApiError
 async fn subscription_prepare_local(
     State(state): State<AppState>,
     Json(request): Json<SubscriptionPrepareRequest>,
-) -> Result<Json<crate::reader::SubscriptionPrepareVote>, ApiError> {
+) -> Result<
+    Json<crate::reader::SubscriptionReplicaReply<crate::reader::SubscriptionPrepareVote>>,
+    ApiError,
+> {
     let service = state
         .subscription_progress
         .as_ref()
@@ -631,7 +634,10 @@ async fn subscription_prepare_local(
 async fn subscription_commit_local(
     State(state): State<AppState>,
     Json(request): Json<SubscriptionCommitRequest>,
-) -> Result<Json<crate::reader::SubscriptionProgressMutation>, ApiError> {
+) -> Result<
+    Json<crate::reader::SubscriptionReplicaReply<crate::reader::SubscriptionProgressMutation>>,
+    ApiError,
+> {
     let service = state
         .subscription_progress
         .as_ref()
@@ -647,7 +653,14 @@ async fn subscription_commit_local(
 async fn subscription_committed_local(
     State(state): State<AppState>,
     Json(request): Json<SubscriptionCommittedReadRequest>,
-) -> Result<Json<Option<crate::reader::SubscriptionProgressMutation>>, ApiError> {
+) -> Result<
+    Json<
+        crate::reader::SubscriptionReplicaReply<
+            Option<crate::reader::SubscriptionProgressMutation>,
+        >,
+    >,
+    ApiError,
+> {
     let service = state
         .subscription_progress
         .as_ref()
@@ -5176,12 +5189,14 @@ mod tests {
         let bytes = axum::body::to_bytes(accepted.into_body(), 1024)
             .await
             .unwrap();
-        let vote: crate::reader::SubscriptionPrepareVote = serde_json::from_slice(&bytes).unwrap();
+        let vote: crate::reader::SubscriptionReplicaReply<crate::reader::SubscriptionPrepareVote> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(vote.replica, local);
         assert!(replica
             .local_committed(subscription.subscription_id)
             .unwrap()
             .is_none());
-        let evidence = json!({"votes": [[assignment.owner, vote.digest], [follower, vote.digest]],
+        let evidence = json!({"votes": [[assignment.owner, vote.result.digest], [follower, vote.result.digest]],
             "subscription_id": subscription.subscription_id, "request_id": mutation.request_id});
         let commit = json!({"owner": assignment.owner, "receiver": local,
             "subscription_id": subscription.subscription_id,
@@ -5250,7 +5265,8 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(vote.request_id, mutation.request_id);
+        assert_eq!(vote.replica, local);
+        assert_eq!(vote.result.request_id, mutation.request_id);
         assert!(replica
             .local_committed(subscription.subscription_id)
             .unwrap()
@@ -5263,6 +5279,7 @@ mod tests {
         )
         .await
         .unwrap()
+        .result
         .is_none());
         let other = assignment
             .replicas
@@ -5271,7 +5288,7 @@ mod tests {
             .unwrap()
             .clone();
         let evidence: crate::reader::SubscriptionCommitEvidence = serde_json::from_value(json!({
-            "votes": [[assignment.owner, vote.digest], [other, vote.digest]],
+            "votes": [[assignment.owner, vote.result.digest], [other, vote.result.digest]],
             "subscription_id": subscription.subscription_id, "request_id": mutation.request_id,
         }))
         .unwrap();
@@ -5279,7 +5296,9 @@ mod tests {
             crate::reader::SubscriptionProgressTransport::commit(&transport, &local, evidence)
                 .await
                 .unwrap();
-        assert_eq!(committed, mutation);
+        assert_eq!(committed.replica, local);
+        assert_eq!(committed.ownership_epoch, assignment.ownership_epoch);
+        assert_eq!(committed.result, mutation);
         assert_eq!(
             replica
                 .local_committed(subscription.subscription_id)
@@ -5294,7 +5313,8 @@ mod tests {
                 assignment.ownership_epoch,
             )
             .await
-            .unwrap(),
+            .unwrap()
+            .result,
             Some(mutation.clone())
         );
         let wrong_key = crate::reader::HttpSubscriptionProgressTransport::new(
