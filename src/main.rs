@@ -15,6 +15,7 @@ use finnstream::{
     control_plane::ControlPlane,
     demand::DemandMetrics,
     membership::{MemberAnnouncement, MembershipService},
+    reader::{FjallSubscriptionProgressReplica, SubscriptionProgressReplicaService},
     storage::{FileLogStore, LogStore},
 };
 use openraft::BasicNode;
@@ -86,6 +87,19 @@ async fn main() -> Result<()> {
             })
         })
         .transpose()?;
+    let subscription_progress = if let Some(local) = &replica_append {
+        let path = config.data_dir.join("subscription-progress");
+        let replica =
+            tokio::task::spawn_blocking(move || FjallSubscriptionProgressReplica::open(path))
+                .await??;
+        Some(Arc::new(SubscriptionProgressReplicaService::new(
+            local.local_node().clone(),
+            control.clone(),
+            Arc::new(replica),
+        )))
+    } else {
+        None
+    };
     let control_endpoints = config
         .control_nodes
         .iter()
@@ -368,6 +382,7 @@ async fn main() -> Result<()> {
             .as_ref()
             .map(|service| service.local_node().clone()),
         replica_append,
+        subscription_progress,
         majority_append,
         control_endpoints: Arc::new(control_endpoints),
         internal_key: config.control_plane_key.clone(),

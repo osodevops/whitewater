@@ -20,7 +20,7 @@ use tempfile::TempDir;
 use uuid::Uuid;
 
 struct TestProgressTransport {
-    stores: BTreeMap<StorageNodeId, FjallSubscriptionProgressReplica>,
+    stores: BTreeMap<StorageNodeId, Arc<FjallSubscriptionProgressReplica>>,
     prepare_down: Mutex<BTreeSet<StorageNodeId>>,
     commit_down: Mutex<BTreeSet<StorageNodeId>>,
     corrupt_vote: Mutex<Option<StorageNodeId>>,
@@ -33,7 +33,7 @@ impl TestProgressTransport {
                 .iter()
                 .cloned()
                 .zip(directories.iter().map(|directory| {
-                    FjallSubscriptionProgressReplica::open(directory.path()).unwrap()
+                    Arc::new(FjallSubscriptionProgressReplica::open(directory.path()).unwrap())
                 }))
                 .collect(),
             prepare_down: Mutex::new(BTreeSet::new()),
@@ -43,8 +43,9 @@ impl TestProgressTransport {
     }
 }
 
+#[async_trait::async_trait]
 impl SubscriptionProgressTransport for TestProgressTransport {
-    fn prepare(
+    async fn prepare(
         &self,
         node: &StorageNodeId,
         mutation: SubscriptionProgressMutation,
@@ -55,15 +56,18 @@ impl SubscriptionProgressTransport for TestProgressTransport {
         let store = self
             .stores
             .get(node)
+            .cloned()
             .ok_or(SubscriptionProgressError::InvalidAssignment)?;
-        let mut vote = store.prepare(mutation)?;
+        let mut vote = tokio::task::spawn_blocking(move || store.prepare(mutation))
+            .await
+            .map_err(|_| SubscriptionProgressError::Unavailable)??;
         if self.corrupt_vote.lock().unwrap().as_ref() == Some(node) {
             vote.digest[0] ^= 1;
         }
         Ok(vote)
     }
 
-    fn commit(
+    async fn commit(
         &self,
         node: &StorageNodeId,
         evidence: SubscriptionCommitEvidence,
@@ -71,10 +75,14 @@ impl SubscriptionProgressTransport for TestProgressTransport {
         if self.commit_down.lock().unwrap().contains(node) {
             return Err(SubscriptionProgressError::Unavailable);
         }
-        self.stores
+        let store = self
+            .stores
             .get(node)
-            .ok_or(SubscriptionProgressError::InvalidAssignment)?
-            .commit_with_quorum(evidence)
+            .cloned()
+            .ok_or(SubscriptionProgressError::InvalidAssignment)?;
+        tokio::task::spawn_blocking(move || store.commit_with_quorum(evidence))
+            .await
+            .map_err(|_| SubscriptionProgressError::Unavailable)?
     }
 }
 
@@ -126,10 +134,7 @@ async fn subscription_coordinator_uses_private_catalog_placement_and_refuses_leg
             "record".to_owned(),
         )]),
     };
-    let committed = tokio::task::spawn_blocking(move || coordinator.apply(mutation))
-        .await
-        .unwrap()
-        .unwrap();
+    let committed = coordinator.apply(mutation).await.unwrap();
     assert_eq!(committed.len(), 3);
 
     let mut legacy: serde_json::Value =
@@ -162,8 +167,8 @@ async fn subscription_coordinator_uses_private_catalog_placement_and_refuses_leg
     ));
 }
 
-#[test]
-fn subscription_progress_coordinator_requires_matching_prepare_and_commit_majorities() {
+#[tokio::test]
+async fn subscription_progress_coordinator_requires_matching_prepare_and_commit_majorities() {
     let dirs = [
         TempDir::new().unwrap(),
         TempDir::new().unwrap(),
@@ -199,7 +204,7 @@ fn subscription_progress_coordinator_requires_matching_prepare_and_commit_majori
         .unwrap()
         .extend([nodes[1].clone(), nodes[2].clone()]);
     assert!(matches!(
-        coordinator.apply(mutation.clone()),
+        coordinator.apply(mutation.clone()).await,
         Err(SubscriptionProgressError::NoQuorum)
     ));
     assert!(transport.stores[&nodes[0]]
@@ -207,7 +212,7 @@ fn subscription_progress_coordinator_requires_matching_prepare_and_commit_majori
         .unwrap()
         .is_none());
     transport.prepare_down.lock().unwrap().remove(&nodes[1]);
-    assert_eq!(coordinator.apply(mutation.clone()).unwrap().len(), 2);
+    assert_eq!(coordinator.apply(mutation.clone()).await.unwrap().len(), 2);
     assert_eq!(
         transport.stores[&nodes[0]]
             .local_committed(subscription_id)
@@ -235,7 +240,7 @@ fn subscription_progress_coordinator_requires_matching_prepare_and_commit_majori
         .unwrap()
         .insert(nodes[1].clone());
     assert!(matches!(
-        coordinator.apply(next.clone()),
+        coordinator.apply(next.clone()).await,
         Err(SubscriptionProgressError::AmbiguousCommit)
     ));
     assert_eq!(
@@ -251,7 +256,7 @@ fn subscription_progress_coordinator_requires_matching_prepare_and_commit_majori
         Some(next.clone())
     );
     transport.commit_down.lock().unwrap().remove(&nodes[1]);
-    assert_eq!(coordinator.apply(next.clone()).unwrap().len(), 2);
+    assert_eq!(coordinator.apply(next.clone()).await.unwrap().len(), 2);
     assert_eq!(
         transport.stores[&nodes[1]]
             .local_committed(subscription_id)
@@ -260,8 +265,8 @@ fn subscription_progress_coordinator_requires_matching_prepare_and_commit_majori
     );
 }
 
-#[test]
-fn subscription_progress_coordinator_refuses_contradictory_replica_evidence() {
+#[tokio::test]
+async fn subscription_progress_coordinator_refuses_contradictory_replica_evidence() {
     let dirs = [
         TempDir::new().unwrap(),
         TempDir::new().unwrap(),
@@ -293,7 +298,7 @@ fn subscription_progress_coordinator_refuses_contradictory_replica_evidence() {
     };
     *transport.corrupt_vote.lock().unwrap() = Some(nodes[1].clone());
     assert!(matches!(
-        coordinator.apply(mutation.clone()),
+        coordinator.apply(mutation.clone()).await,
         Err(SubscriptionProgressError::Conflict)
     ));
     for node in &nodes {
@@ -307,7 +312,7 @@ fn subscription_progress_coordinator_refuses_contradictory_replica_evidence() {
         ..mutation
     };
     assert!(matches!(
-        coordinator.apply(stale),
+        coordinator.apply(stale).await,
         Err(SubscriptionProgressError::InvalidAssignment)
     ));
 }

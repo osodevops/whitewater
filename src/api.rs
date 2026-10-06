@@ -56,6 +56,10 @@ use crate::{
     demand::{DemandMetrics, DemandSnapshot},
     domain::{AppendInput, CursorRecord, StorageStats, StoredRecord},
     membership::{JoinResponse, MemberAnnouncement, MemberView, MembershipService},
+    reader::{
+        SubscriptionCommitRequest, SubscriptionPrepareRequest, SubscriptionProgressError,
+        SubscriptionProgressReplicaService,
+    },
     storage::{LogStore, StorageError},
     writer::WriterServerFeedback,
 };
@@ -69,6 +73,7 @@ pub struct AppState {
     pub control: Arc<ControlController>,
     pub control_plane: Option<Arc<ControlPlane>>,
     pub replica_append: Option<Arc<ReplicaAppendService>>,
+    pub subscription_progress: Option<Arc<SubscriptionProgressReplicaService>>,
     pub majority_append: Option<Arc<MajorityAppendCoordinator>>,
     pub storage_node_id: Option<StorageNodeId>,
     pub control_endpoints: Arc<BTreeMap<StorageNodeId, String>>,
@@ -90,6 +95,18 @@ pub fn router(state: AppState) -> Router {
         state.clone(),
         authorize_replica_append,
     ));
+    let subscription_prepare_route = post(subscription_prepare_local)
+        .layer(DefaultBodyLimit::max(512 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
+    let subscription_commit_route = post(subscription_commit_local)
+        .layer(DefaultBodyLimit::max(512 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
     let owner_append_route = post(owner_append).layer(middleware::from_fn_with_state(
         state.clone(),
         authorize_replica_append,
@@ -236,6 +253,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/internal/active-range/replica/commit",
             replica_commit_route,
+        )
+        .route(
+            "/internal/subscription-progress/prepare",
+            subscription_prepare_route,
+        )
+        .route(
+            "/internal/subscription-progress/commit",
+            subscription_commit_route,
         )
         .route("/internal/active-range/owner/append", owner_append_route)
         .route(
@@ -561,6 +586,52 @@ async fn replica_commit(
             error: Some(error),
         },
     }))
+}
+
+fn subscription_progress_api_error(error: SubscriptionProgressError) -> ApiError {
+    let status = match error {
+        SubscriptionProgressError::Unavailable
+        | SubscriptionProgressError::AmbiguousCommit
+        | SubscriptionProgressError::Engine(_)
+        | SubscriptionProgressError::Serialization(_) => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::CONFLICT,
+    };
+    ApiError {
+        status,
+        message: error.to_string(),
+    }
+}
+
+async fn subscription_prepare_local(
+    State(state): State<AppState>,
+    Json(request): Json<SubscriptionPrepareRequest>,
+) -> Result<Json<crate::reader::SubscriptionPrepareVote>, ApiError> {
+    let service = state
+        .subscription_progress
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Subscription progress replica is not configured"))?;
+    Ok(Json(
+        service
+            .prepare(request)
+            .await
+            .map_err(subscription_progress_api_error)?,
+    ))
+}
+
+async fn subscription_commit_local(
+    State(state): State<AppState>,
+    Json(request): Json<SubscriptionCommitRequest>,
+) -> Result<Json<crate::reader::SubscriptionProgressMutation>, ApiError> {
+    let service = state
+        .subscription_progress
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Subscription progress replica is not configured"))?;
+    Ok(Json(
+        service
+            .commit(request)
+            .await
+            .map_err(subscription_progress_api_error)?,
+    ))
 }
 
 async fn recovery_progress(
@@ -4705,6 +4776,7 @@ mod tests {
             control,
             control_plane: None,
             majority_append: None,
+            subscription_progress: None,
             storage_node_id: Some(assignment.owner),
             control_endpoints: Arc::new(BTreeMap::new()),
             internal_key: None,
@@ -4799,6 +4871,7 @@ mod tests {
             control_plane: None,
             replica_append: None,
             majority_append: None,
+            subscription_progress: None,
             storage_node_id: None,
             control_endpoints: Arc::new(BTreeMap::new()),
             internal_key: None,
@@ -4810,7 +4883,14 @@ mod tests {
         })
     }
 
-    async fn internal_replica_test_router(directory: &TempDir) -> (Router, Arc<ControlPlane>) {
+    async fn internal_replica_test_router(
+        directory: &TempDir,
+    ) -> (
+        Router,
+        Arc<ControlPlane>,
+        Arc<ControlController>,
+        Arc<crate::reader::FjallSubscriptionProgressReplica>,
+    ) {
         let store: Arc<dyn LogStore> =
             Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
         let control = Arc::new(
@@ -4821,6 +4901,13 @@ mod tests {
                     .into_iter()
                     .map(|node| crate::active_range::StorageNodeId::try_new(node).unwrap())
                     .collect(),
+            )
+            .unwrap(),
+        );
+        control.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+        let subscription_replica = Arc::new(
+            crate::reader::FjallSubscriptionProgressReplica::open(
+                directory.path().join("subscription-progress"),
             )
             .unwrap(),
         );
@@ -4854,16 +4941,22 @@ mod tests {
             crate::active_range::StorageNodeId::try_new("control-1").unwrap(),
             control.clone(),
         ));
+        let subscription_progress = Arc::new(SubscriptionProgressReplicaService::new(
+            crate::active_range::StorageNodeId::try_new("control-1").unwrap(),
+            control.clone(),
+            subscription_replica.clone(),
+        ));
         (
             router(AppState {
                 store,
                 membership,
                 demand: DemandMetrics::default(),
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
-                control,
+                control: control.clone(),
                 control_plane: Some(control_plane.clone()),
                 replica_append: Some(replica_append),
                 majority_append: None,
+                subscription_progress: Some(subscription_progress),
                 storage_node_id: Some(
                     crate::active_range::StorageNodeId::try_new("control-1").unwrap(),
                 ),
@@ -4876,6 +4969,8 @@ mod tests {
                 .unwrap(),
             }),
             control_plane,
+            control,
+            subscription_replica,
         )
     }
 
@@ -4895,7 +4990,7 @@ mod tests {
     #[tokio::test]
     async fn replica_append_authentication_runs_before_json_body_decoding() {
         let directory = TempDir::new().unwrap();
-        let (app, control_plane) = internal_replica_test_router(&directory).await;
+        let (app, control_plane, _, _) = internal_replica_test_router(&directory).await;
         let request = |credential: Option<&str>| {
             let mut request = Request::builder()
                 .method("POST")
@@ -4925,9 +5020,216 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscription_progress_internal_routes_authenticate_and_fence_placement() {
+        let directory = TempDir::new().unwrap();
+        let (app, control_plane, control, replica) = internal_replica_test_router(&directory).await;
+        let subscription = control
+            .active_subscription_by_name("orders.billing")
+            .await
+            .unwrap();
+        let assignment = control
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        let local = crate::active_range::StorageNodeId::try_new("control-1").unwrap();
+        let follower = assignment
+            .replicas
+            .iter()
+            .find(|node| *node != &assignment.owner)
+            .unwrap()
+            .clone();
+        let mutation = crate::reader::SubscriptionProgressMutation {
+            subscription_id: subscription.subscription_id,
+            feed_id: subscription.feed_id,
+            ownership_epoch: assignment.ownership_epoch,
+            sequence: 1,
+            request_id: Uuid::from_u128(877),
+            expected_cursor: None,
+            cursor: "rf1_test".to_owned(),
+            positions: BTreeMap::from([(
+                RangeId::from_uuid(Uuid::from_u128(878)),
+                "event-1".to_owned(),
+            )]),
+        };
+        let prepare = SubscriptionPrepareRequest {
+            owner: assignment.owner.clone(),
+            receiver: local.clone(),
+            mutation: mutation.clone(),
+        };
+        let request = |path: &str, body: serde_json::Value, key: Option<&str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                builder = builder.header("x-whitewater-control-key", key);
+            }
+            builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let path = "/internal/subscription-progress/prepare";
+        let missing = app
+            .clone()
+            .oneshot(request(path, json!(prepare), None))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        let mut wrong = prepare.clone();
+        wrong.receiver = assignment
+            .replicas
+            .iter()
+            .find(|node| *node != &local)
+            .unwrap()
+            .clone();
+        let rejected = app
+            .clone()
+            .oneshot(request(
+                path,
+                json!(wrong),
+                Some("this-is-a-long-control-plane-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        assert!(replica
+            .local_committed(subscription.subscription_id)
+            .unwrap()
+            .is_none());
+        let accepted = app
+            .clone()
+            .oneshot(request(
+                path,
+                json!(prepare),
+                Some("this-is-a-long-control-plane-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(accepted.into_body(), 1024)
+            .await
+            .unwrap();
+        let vote: crate::reader::SubscriptionPrepareVote = serde_json::from_slice(&bytes).unwrap();
+        assert!(replica
+            .local_committed(subscription.subscription_id)
+            .unwrap()
+            .is_none());
+        let evidence = json!({"votes": [[assignment.owner, vote.digest], [follower, vote.digest]],
+            "subscription_id": subscription.subscription_id, "request_id": mutation.request_id});
+        let commit = json!({"owner": assignment.owner, "receiver": local,
+            "subscription_id": subscription.subscription_id,
+            "ownership_epoch": assignment.ownership_epoch, "evidence": evidence});
+        let result = app
+            .oneshot(request(
+                "/internal/subscription-progress/commit",
+                commit,
+                Some("this-is-a-long-control-plane-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.status(), StatusCode::OK);
+        assert_eq!(
+            replica
+                .local_committed(subscription.subscription_id)
+                .unwrap(),
+            Some(mutation)
+        );
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_progress_http_transport_targets_authoritative_replica() {
+        let directory = TempDir::new().unwrap();
+        let (app, control_plane, control, replica) = internal_replica_test_router(&directory).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let subscription = control
+            .active_subscription_by_name("orders.billing")
+            .await
+            .unwrap();
+        let assignment = control
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        let local = crate::active_range::StorageNodeId::try_new("control-1").unwrap();
+        let endpoints = BTreeMap::from([(local.clone(), endpoint)]);
+        let transport = crate::reader::HttpSubscriptionProgressTransport::new(
+            assignment.clone(),
+            endpoints.clone(),
+            "this-is-a-long-control-plane-key".to_owned(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let mutation = crate::reader::SubscriptionProgressMutation {
+            subscription_id: subscription.subscription_id,
+            feed_id: subscription.feed_id,
+            ownership_epoch: assignment.ownership_epoch,
+            sequence: 1,
+            request_id: Uuid::from_u128(900),
+            expected_cursor: None,
+            cursor: "rf1_page".to_owned(),
+            positions: BTreeMap::from([(
+                RangeId::from_uuid(Uuid::from_u128(901)),
+                "record".to_owned(),
+            )]),
+        };
+        let vote = crate::reader::SubscriptionProgressTransport::prepare(
+            &transport,
+            &local,
+            mutation.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(vote.request_id, mutation.request_id);
+        assert!(replica
+            .local_committed(subscription.subscription_id)
+            .unwrap()
+            .is_none());
+        let other = assignment
+            .replicas
+            .iter()
+            .find(|node| *node != &assignment.owner)
+            .unwrap()
+            .clone();
+        let evidence: crate::reader::SubscriptionCommitEvidence = serde_json::from_value(json!({
+            "votes": [[assignment.owner, vote.digest], [other, vote.digest]],
+            "subscription_id": subscription.subscription_id, "request_id": mutation.request_id,
+        }))
+        .unwrap();
+        let committed =
+            crate::reader::SubscriptionProgressTransport::commit(&transport, &local, evidence)
+                .await
+                .unwrap();
+        assert_eq!(committed, mutation);
+        assert_eq!(
+            replica
+                .local_committed(subscription.subscription_id)
+                .unwrap(),
+            Some(mutation.clone())
+        );
+        let wrong_key = crate::reader::HttpSubscriptionProgressTransport::new(
+            assignment,
+            endpoints,
+            "not-the-control-key".to_owned(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(matches!(
+            crate::reader::SubscriptionProgressTransport::prepare(&wrong_key, &local, mutation)
+                .await,
+            Err(SubscriptionProgressError::Unavailable)
+        ));
+        server.abort();
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn internal_range_transport_authenticates_before_decoding_requests() {
         let directory = TempDir::new().unwrap();
-        let (app, control_plane) = internal_replica_test_router(&directory).await;
+        let (app, control_plane, _, _) = internal_replica_test_router(&directory).await;
         for path in [
             "/internal/active-range/move/export",
             "/internal/active-range/move/stage",
@@ -4939,6 +5241,8 @@ mod tests {
             "/internal/active-range/owner-move/unfreeze",
             "/internal/active-range/read/committed",
             "/internal/active-range/read/evidence",
+            "/internal/subscription-progress/prepare",
+            "/internal/subscription-progress/commit",
         ] {
             let request = |credential: Option<&str>| {
                 let mut builder = Request::builder()
