@@ -23,6 +23,8 @@ struct TestProgressTransport {
     stores: BTreeMap<StorageNodeId, Arc<FjallSubscriptionProgressReplica>>,
     prepare_down: Mutex<BTreeSet<StorageNodeId>>,
     commit_down: Mutex<BTreeSet<StorageNodeId>>,
+    read_down: Mutex<BTreeSet<StorageNodeId>>,
+    read_override: Mutex<BTreeMap<StorageNodeId, Option<SubscriptionProgressMutation>>>,
     corrupt_vote: Mutex<Option<StorageNodeId>>,
 }
 
@@ -38,6 +40,8 @@ impl TestProgressTransport {
                 .collect(),
             prepare_down: Mutex::new(BTreeSet::new()),
             commit_down: Mutex::new(BTreeSet::new()),
+            read_down: Mutex::new(BTreeSet::new()),
+            read_override: Mutex::new(BTreeMap::new()),
             corrupt_vote: Mutex::new(None),
         }
     }
@@ -81,6 +85,28 @@ impl SubscriptionProgressTransport for TestProgressTransport {
             .cloned()
             .ok_or(SubscriptionProgressError::InvalidAssignment)?;
         tokio::task::spawn_blocking(move || store.commit_with_quorum(evidence))
+            .await
+            .map_err(|_| SubscriptionProgressError::Unavailable)?
+    }
+
+    async fn committed(
+        &self,
+        node: &StorageNodeId,
+        subscription_id: Uuid,
+        _ownership_epoch: u64,
+    ) -> Result<Option<SubscriptionProgressMutation>, SubscriptionProgressError> {
+        if self.read_down.lock().unwrap().contains(node) {
+            return Err(SubscriptionProgressError::Unavailable);
+        }
+        if let Some(value) = self.read_override.lock().unwrap().get(node).cloned() {
+            return Ok(value);
+        }
+        let store = self
+            .stores
+            .get(node)
+            .cloned()
+            .ok_or(SubscriptionProgressError::InvalidAssignment)?;
+        tokio::task::spawn_blocking(move || store.local_committed(subscription_id))
             .await
             .map_err(|_| SubscriptionProgressError::Unavailable)?
     }
@@ -165,6 +191,119 @@ async fn subscription_coordinator_uses_private_catalog_placement_and_refuses_leg
         .await,
         Err(SubscriptionProgressError::InvalidAssignment)
     ));
+}
+
+#[tokio::test]
+async fn quorum_subscription_read_fails_closed_on_loss_disagreement_and_ambiguous_retry() {
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = progress_nodes();
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let subscription_id = Uuid::from_u128(801);
+    let assignment = SubscriptionProgressAssignment::try_new(
+        subscription_id,
+        nodes[0].clone(),
+        ReplicaSet::try_new(nodes.clone()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let coordinator = SubscriptionProgressCoordinator::new(assignment.clone(), transport.clone());
+    assert!(coordinator.read_committed().await.unwrap().is_none());
+    transport.read_down.lock().unwrap().insert(nodes[0].clone());
+    assert!(matches!(
+        coordinator.read_committed().await,
+        Err(SubscriptionProgressError::NoQuorum)
+    ));
+    transport.read_down.lock().unwrap().clear();
+    let mutation = SubscriptionProgressMutation {
+        subscription_id,
+        feed_id: Uuid::from_u128(802),
+        ownership_epoch: 1,
+        sequence: 1,
+        request_id: Uuid::from_u128(803),
+        expected_cursor: None,
+        cursor: "rf1_a".to_owned(),
+        positions: BTreeMap::from([(
+            RangeId::from_uuid(Uuid::from_u128(804)),
+            "event-a".to_owned(),
+        )]),
+    };
+    coordinator.apply(mutation.clone()).await.unwrap();
+    assert_eq!(
+        coordinator.read_committed().await.unwrap(),
+        Some(mutation.clone())
+    );
+    transport.read_down.lock().unwrap().insert(nodes[2].clone());
+    assert_eq!(
+        coordinator.read_committed().await.unwrap(),
+        Some(mutation.clone())
+    );
+    transport.read_down.lock().unwrap().clear();
+    transport.read_down.lock().unwrap().insert(nodes[0].clone());
+    assert_eq!(
+        coordinator.read_committed().await.unwrap(),
+        Some(mutation.clone())
+    );
+    transport.read_down.lock().unwrap().insert(nodes[1].clone());
+    assert!(matches!(
+        coordinator.read_committed().await,
+        Err(SubscriptionProgressError::NoQuorum)
+    ));
+    transport.read_down.lock().unwrap().clear();
+    transport
+        .read_override
+        .lock()
+        .unwrap()
+        .insert(nodes[2].clone(), None);
+    assert!(matches!(
+        coordinator.read_committed().await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+    transport.read_override.lock().unwrap().clear();
+    let mut stale = mutation.clone();
+    stale.ownership_epoch = 2;
+    transport
+        .read_override
+        .lock()
+        .unwrap()
+        .insert(nodes[2].clone(), Some(stale));
+    assert!(matches!(
+        coordinator.read_committed().await,
+        Err(SubscriptionProgressError::StaleEpoch)
+    ));
+    transport.read_override.lock().unwrap().clear();
+    drop(coordinator);
+    drop(transport);
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::new(assignment, transport.clone());
+    assert_eq!(
+        coordinator.read_committed().await.unwrap(),
+        Some(mutation.clone())
+    );
+    let mut next = mutation.clone();
+    next.sequence = 2;
+    next.request_id = Uuid::from_u128(805);
+    next.expected_cursor = Some(mutation.cursor);
+    next.cursor = "rf1_b".to_owned();
+    transport
+        .commit_down
+        .lock()
+        .unwrap()
+        .extend([nodes[1].clone(), nodes[2].clone()]);
+    assert!(matches!(
+        coordinator.apply(next.clone()).await,
+        Err(SubscriptionProgressError::AmbiguousCommit)
+    ));
+    assert!(matches!(
+        coordinator.read_committed().await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+    transport.commit_down.lock().unwrap().clear();
+    coordinator.apply(next.clone()).await.unwrap();
+    assert_eq!(coordinator.read_committed().await.unwrap(), Some(next));
 }
 
 #[tokio::test]

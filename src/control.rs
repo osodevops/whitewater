@@ -1013,6 +1013,19 @@ impl ControlController {
         .ok()
     }
 
+    pub(crate) async fn active_subscription_feed_by_id(
+        &self,
+        subscription_id: Uuid,
+    ) -> Option<Uuid> {
+        self.state
+            .lock()
+            .await
+            .subscriptions
+            .get(&subscription_id)
+            .filter(|item| item.status == ResourceStatus::Active)
+            .map(|item| item.feed_id)
+    }
+
     pub(crate) async fn active_reader_frontier(&self, reader_id: Uuid) -> Option<ReaderFrontier> {
         let state = self.state.lock().await;
         state

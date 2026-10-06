@@ -57,8 +57,8 @@ use crate::{
     domain::{AppendInput, CursorRecord, StorageStats, StoredRecord},
     membership::{JoinResponse, MemberAnnouncement, MemberView, MembershipService},
     reader::{
-        SubscriptionCommitRequest, SubscriptionPrepareRequest, SubscriptionProgressError,
-        SubscriptionProgressReplicaService,
+        SubscriptionCommitRequest, SubscriptionCommittedReadRequest, SubscriptionPrepareRequest,
+        SubscriptionProgressError, SubscriptionProgressReplicaService,
     },
     storage::{LogStore, StorageError},
     writer::WriterServerFeedback,
@@ -103,6 +103,12 @@ pub fn router(state: AppState) -> Router {
         ));
     let subscription_commit_route = post(subscription_commit_local)
         .layer(DefaultBodyLimit::max(512 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
+    let subscription_committed_route = post(subscription_committed_local)
+        .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(middleware::from_fn_with_state(
             state.clone(),
             authorize_replica_append,
@@ -261,6 +267,10 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/internal/subscription-progress/commit",
             subscription_commit_route,
+        )
+        .route(
+            "/internal/subscription-progress/committed",
+            subscription_committed_route,
         )
         .route("/internal/active-range/owner/append", owner_append_route)
         .route(
@@ -629,6 +639,22 @@ async fn subscription_commit_local(
     Ok(Json(
         service
             .commit(request)
+            .await
+            .map_err(subscription_progress_api_error)?,
+    ))
+}
+
+async fn subscription_committed_local(
+    State(state): State<AppState>,
+    Json(request): Json<SubscriptionCommittedReadRequest>,
+) -> Result<Json<Option<crate::reader::SubscriptionProgressMutation>>, ApiError> {
+    let service = state
+        .subscription_progress
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Subscription progress replica is not configured"))?;
+    Ok(Json(
+        service
+            .committed(request)
             .await
             .map_err(subscription_progress_api_error)?,
     ))
@@ -5229,6 +5255,15 @@ mod tests {
             .local_committed(subscription.subscription_id)
             .unwrap()
             .is_none());
+        assert!(crate::reader::SubscriptionProgressTransport::committed(
+            &transport,
+            &local,
+            subscription.subscription_id,
+            assignment.ownership_epoch,
+        )
+        .await
+        .unwrap()
+        .is_none());
         let other = assignment
             .replicas
             .iter()
@@ -5251,6 +5286,17 @@ mod tests {
                 .unwrap(),
             Some(mutation.clone())
         );
+        assert_eq!(
+            crate::reader::SubscriptionProgressTransport::committed(
+                &transport,
+                &local,
+                subscription.subscription_id,
+                assignment.ownership_epoch,
+            )
+            .await
+            .unwrap(),
+            Some(mutation.clone())
+        );
         let wrong_key = crate::reader::HttpSubscriptionProgressTransport::new(
             assignment,
             endpoints,
@@ -5263,8 +5309,56 @@ mod tests {
                 .await,
             Err(SubscriptionProgressError::Unavailable)
         ));
+        assert!(matches!(
+            crate::reader::SubscriptionProgressTransport::committed(
+                &wrong_key,
+                &local,
+                subscription.subscription_id,
+                1,
+            )
+            .await,
+            Err(SubscriptionProgressError::Unavailable)
+        ));
         server.abort();
         control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_progress_transport_refuses_oversized_replica_response() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let app = Router::new().route(
+            "/internal/subscription-progress/committed",
+            post(|| async { "x".repeat(512 * 1024 + 1) }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let nodes = ["storage-1", "storage-2", "storage-3"]
+            .map(|name| StorageNodeId::try_new(name).unwrap());
+        let assignment = crate::reader::SubscriptionProgressAssignment::try_new(
+            Uuid::from_u128(951),
+            nodes[0].clone(),
+            ReplicaSet::try_new(nodes.clone()).unwrap(),
+            1,
+        )
+        .unwrap();
+        let transport = crate::reader::HttpSubscriptionProgressTransport::new(
+            assignment,
+            BTreeMap::from([(nodes[0].clone(), endpoint)]),
+            "test-development-key".to_owned(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert!(matches!(
+            crate::reader::SubscriptionProgressTransport::committed(
+                &transport,
+                &nodes[0],
+                Uuid::from_u128(951),
+                1,
+            )
+            .await,
+            Err(SubscriptionProgressError::TooLarge)
+        ));
+        server.abort();
     }
 
     #[tokio::test]
@@ -5284,6 +5378,7 @@ mod tests {
             "/internal/active-range/read/evidence",
             "/internal/subscription-progress/prepare",
             "/internal/subscription-progress/commit",
+            "/internal/subscription-progress/committed",
         ] {
             let request = |credential: Option<&str>| {
                 let mut builder = Request::builder()
