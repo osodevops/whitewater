@@ -627,6 +627,12 @@ pub enum SubscriptionProgressError {
     TooLarge,
     #[error("Subscription progress has no valid two-replica commit evidence")]
     NoQuorum,
+    #[error("Subscription progress replica placement or owner is invalid")]
+    InvalidAssignment,
+    #[error("Subscription progress replica is unavailable; retry the same request identity")]
+    Unavailable,
+    #[error("Subscription progress commit result is ambiguous; retry the same request identity")]
+    AmbiguousCommit,
 }
 
 pub struct SubscriptionPrepareVote {
@@ -635,6 +641,7 @@ pub struct SubscriptionPrepareVote {
     pub digest: [u8; 32],
 }
 
+#[derive(Clone)]
 pub struct SubscriptionCommitEvidence {
     votes: [(crate::active_range::StorageNodeId, [u8; 32]); 2],
     subscription_id: Uuid,
@@ -807,6 +814,124 @@ impl FjallSubscriptionProgressReplica {
             serde_json::to_vec(&row)?,
         );
         tx.commit()?;
+        Ok(committed)
+    }
+}
+
+#[derive(Clone)]
+pub struct SubscriptionProgressAssignment {
+    pub subscription_id: Uuid,
+    pub owner: crate::active_range::StorageNodeId,
+    pub replicas: crate::active_range::ReplicaSet,
+    pub ownership_epoch: u64,
+}
+
+impl SubscriptionProgressAssignment {
+    pub fn try_new(
+        subscription_id: Uuid,
+        owner: crate::active_range::StorageNodeId,
+        replicas: crate::active_range::ReplicaSet,
+        ownership_epoch: u64,
+    ) -> Result<Self, SubscriptionProgressError> {
+        if ownership_epoch == 0 || !replicas.contains(&owner) {
+            return Err(SubscriptionProgressError::InvalidAssignment);
+        }
+        Ok(Self {
+            subscription_id,
+            owner,
+            replicas,
+            ownership_epoch,
+        })
+    }
+}
+
+pub trait SubscriptionProgressTransport: Send + Sync {
+    fn prepare(
+        &self,
+        replica: &crate::active_range::StorageNodeId,
+        mutation: SubscriptionProgressMutation,
+    ) -> Result<SubscriptionPrepareVote, SubscriptionProgressError>;
+
+    fn commit(
+        &self,
+        replica: &crate::active_range::StorageNodeId,
+        evidence: SubscriptionCommitEvidence,
+    ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError>;
+}
+
+pub struct SubscriptionProgressCoordinator {
+    assignment: SubscriptionProgressAssignment,
+    transport: std::sync::Arc<dyn SubscriptionProgressTransport>,
+}
+
+impl SubscriptionProgressCoordinator {
+    pub fn new(
+        assignment: SubscriptionProgressAssignment,
+        transport: std::sync::Arc<dyn SubscriptionProgressTransport>,
+    ) -> Self {
+        Self {
+            assignment,
+            transport,
+        }
+    }
+
+    pub fn apply(
+        &self,
+        mutation: SubscriptionProgressMutation,
+    ) -> Result<Vec<crate::active_range::StorageNodeId>, SubscriptionProgressError> {
+        if mutation.subscription_id != self.assignment.subscription_id
+            || mutation.ownership_epoch != self.assignment.ownership_epoch
+        {
+            return Err(SubscriptionProgressError::InvalidAssignment);
+        }
+        let digest = *blake3::hash(&serde_json::to_vec(&mutation)?).as_bytes();
+        let mut prepared = Vec::with_capacity(3);
+        for node in self.assignment.replicas.iter() {
+            match self.transport.prepare(node, mutation.clone()) {
+                Ok(vote) => {
+                    if vote.subscription_id != mutation.subscription_id
+                        || vote.request_id != mutation.request_id
+                        || vote.digest != digest
+                    {
+                        return Err(SubscriptionProgressError::Conflict);
+                    }
+                    prepared.push((node.clone(), vote.digest));
+                }
+                Err(SubscriptionProgressError::Unavailable) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if prepared.len() < 2
+            || !prepared
+                .iter()
+                .any(|(node, _)| node == &self.assignment.owner)
+        {
+            return Err(SubscriptionProgressError::NoQuorum);
+        }
+        let other = prepared
+            .iter()
+            .find(|(node, _)| node != &self.assignment.owner)
+            .ok_or(SubscriptionProgressError::NoQuorum)?;
+        let evidence = SubscriptionCommitEvidence {
+            subscription_id: mutation.subscription_id,
+            request_id: mutation.request_id,
+            votes: [
+                (self.assignment.owner.clone(), digest),
+                (other.0.clone(), other.1),
+            ],
+        };
+        let mut committed = Vec::with_capacity(3);
+        for (node, _) in prepared {
+            match self.transport.commit(&node, evidence.clone()) {
+                Ok(applied) if applied == mutation => committed.push(node),
+                Ok(_) => return Err(SubscriptionProgressError::Conflict),
+                Err(SubscriptionProgressError::Unavailable) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if committed.len() < 2 || !committed.contains(&self.assignment.owner) {
+            return Err(SubscriptionProgressError::AmbiguousCommit);
+        }
         Ok(committed)
     }
 }

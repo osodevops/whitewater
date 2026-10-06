@@ -1,15 +1,234 @@
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use finnstream::{
-    active_range::RangeId,
+    active_range::{RangeId, ReplicaSet, StorageNodeId},
     reader::{
         FjallReaderProgressStore, FjallSubscriptionProgressReplica, ReaderDeliveryMutation,
         ReaderDeliveryReceipt, ReaderPacingController, ReaderPressureSample, ReaderProgressEngine,
-        ReaderProgressError, SubscriptionProgressError, SubscriptionProgressMutation,
+        ReaderProgressError, SubscriptionCommitEvidence, SubscriptionPrepareVote,
+        SubscriptionProgressAssignment, SubscriptionProgressCoordinator, SubscriptionProgressError,
+        SubscriptionProgressMutation, SubscriptionProgressTransport,
     },
 };
 use tempfile::TempDir;
 use uuid::Uuid;
+
+struct TestProgressTransport {
+    stores: BTreeMap<StorageNodeId, FjallSubscriptionProgressReplica>,
+    prepare_down: Mutex<BTreeSet<StorageNodeId>>,
+    commit_down: Mutex<BTreeSet<StorageNodeId>>,
+    corrupt_vote: Mutex<Option<StorageNodeId>>,
+}
+
+impl TestProgressTransport {
+    fn new(directories: &[TempDir; 3], nodes: &[StorageNodeId; 3]) -> Self {
+        Self {
+            stores: nodes
+                .iter()
+                .cloned()
+                .zip(directories.iter().map(|directory| {
+                    FjallSubscriptionProgressReplica::open(directory.path()).unwrap()
+                }))
+                .collect(),
+            prepare_down: Mutex::new(BTreeSet::new()),
+            commit_down: Mutex::new(BTreeSet::new()),
+            corrupt_vote: Mutex::new(None),
+        }
+    }
+}
+
+impl SubscriptionProgressTransport for TestProgressTransport {
+    fn prepare(
+        &self,
+        node: &StorageNodeId,
+        mutation: SubscriptionProgressMutation,
+    ) -> Result<SubscriptionPrepareVote, SubscriptionProgressError> {
+        if self.prepare_down.lock().unwrap().contains(node) {
+            return Err(SubscriptionProgressError::Unavailable);
+        }
+        let store = self
+            .stores
+            .get(node)
+            .ok_or(SubscriptionProgressError::InvalidAssignment)?;
+        let mut vote = store.prepare(mutation)?;
+        if self.corrupt_vote.lock().unwrap().as_ref() == Some(node) {
+            vote.digest[0] ^= 1;
+        }
+        Ok(vote)
+    }
+
+    fn commit(
+        &self,
+        node: &StorageNodeId,
+        evidence: SubscriptionCommitEvidence,
+    ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
+        if self.commit_down.lock().unwrap().contains(node) {
+            return Err(SubscriptionProgressError::Unavailable);
+        }
+        self.stores
+            .get(node)
+            .ok_or(SubscriptionProgressError::InvalidAssignment)?
+            .commit_with_quorum(evidence)
+    }
+}
+
+fn progress_nodes() -> [StorageNodeId; 3] {
+    ["storage-a", "storage-b", "storage-c"].map(|name| StorageNodeId::try_new(name).unwrap())
+}
+
+#[test]
+fn subscription_progress_coordinator_requires_matching_prepare_and_commit_majorities() {
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = progress_nodes();
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let subscription_id = Uuid::from_u128(201);
+    let assignment = SubscriptionProgressAssignment::try_new(
+        subscription_id,
+        nodes[0].clone(),
+        ReplicaSet::try_new(nodes.clone()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let coordinator = SubscriptionProgressCoordinator::new(assignment, transport.clone());
+    let mutation = SubscriptionProgressMutation {
+        subscription_id,
+        feed_id: Uuid::from_u128(202),
+        ownership_epoch: 1,
+        sequence: 1,
+        request_id: Uuid::from_u128(203),
+        expected_cursor: None,
+        cursor: "rf1_a".to_owned(),
+        positions: BTreeMap::from([(
+            RangeId::from_uuid(Uuid::from_u128(204)),
+            "event-a".to_owned(),
+        )]),
+    };
+    transport
+        .prepare_down
+        .lock()
+        .unwrap()
+        .extend([nodes[1].clone(), nodes[2].clone()]);
+    assert!(matches!(
+        coordinator.apply(mutation.clone()),
+        Err(SubscriptionProgressError::NoQuorum)
+    ));
+    assert!(transport.stores[&nodes[0]]
+        .local_committed(subscription_id)
+        .unwrap()
+        .is_none());
+    transport.prepare_down.lock().unwrap().remove(&nodes[1]);
+    assert_eq!(coordinator.apply(mutation.clone()).unwrap().len(), 2);
+    assert_eq!(
+        transport.stores[&nodes[0]]
+            .local_committed(subscription_id)
+            .unwrap(),
+        Some(mutation.clone())
+    );
+    assert_eq!(
+        transport.stores[&nodes[1]]
+            .local_committed(subscription_id)
+            .unwrap(),
+        Some(mutation.clone())
+    );
+    assert!(transport.stores[&nodes[2]]
+        .local_committed(subscription_id)
+        .unwrap()
+        .is_none());
+    let mut next = mutation.clone();
+    next.sequence = 2;
+    next.request_id = Uuid::from_u128(205);
+    next.expected_cursor = Some(mutation.cursor);
+    next.cursor = "rf1_b".to_owned();
+    transport
+        .commit_down
+        .lock()
+        .unwrap()
+        .insert(nodes[1].clone());
+    assert!(matches!(
+        coordinator.apply(next.clone()),
+        Err(SubscriptionProgressError::AmbiguousCommit)
+    ));
+    assert_eq!(
+        transport.stores[&nodes[0]]
+            .local_committed(subscription_id)
+            .unwrap(),
+        Some(next.clone())
+    );
+    assert_ne!(
+        transport.stores[&nodes[1]]
+            .local_committed(subscription_id)
+            .unwrap(),
+        Some(next.clone())
+    );
+    transport.commit_down.lock().unwrap().remove(&nodes[1]);
+    assert_eq!(coordinator.apply(next.clone()).unwrap().len(), 2);
+    assert_eq!(
+        transport.stores[&nodes[1]]
+            .local_committed(subscription_id)
+            .unwrap(),
+        Some(next)
+    );
+}
+
+#[test]
+fn subscription_progress_coordinator_refuses_contradictory_replica_evidence() {
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = progress_nodes();
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let subscription_id = Uuid::from_u128(301);
+    let assignment = SubscriptionProgressAssignment::try_new(
+        subscription_id,
+        nodes[0].clone(),
+        ReplicaSet::try_new(nodes.clone()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let coordinator = SubscriptionProgressCoordinator::new(assignment, transport.clone());
+    let mutation = SubscriptionProgressMutation {
+        subscription_id,
+        feed_id: Uuid::from_u128(302),
+        ownership_epoch: 1,
+        sequence: 1,
+        request_id: Uuid::from_u128(303),
+        expected_cursor: None,
+        cursor: "rf1_a".to_owned(),
+        positions: BTreeMap::from([(
+            RangeId::from_uuid(Uuid::from_u128(304)),
+            "event-a".to_owned(),
+        )]),
+    };
+    *transport.corrupt_vote.lock().unwrap() = Some(nodes[1].clone());
+    assert!(matches!(
+        coordinator.apply(mutation.clone()),
+        Err(SubscriptionProgressError::Conflict)
+    ));
+    for node in &nodes {
+        assert!(transport.stores[node]
+            .local_committed(subscription_id)
+            .unwrap()
+            .is_none());
+    }
+    let stale = SubscriptionProgressMutation {
+        ownership_epoch: 2,
+        ..mutation
+    };
+    assert!(matches!(
+        coordinator.apply(stale),
+        Err(SubscriptionProgressError::InvalidAssignment)
+    ));
+}
 
 #[test]
 fn prepared_subscription_progress_remains_invisible_after_replica_restart() {
