@@ -56,8 +56,11 @@ async fn subscription_definition_survives_catalog_snapshot_without_creating_a_fe
     let source_dir = TempDir::new().unwrap();
     let follower_dir = TempDir::new().unwrap();
     let nodes = storage_nodes(&["storage-1", "storage-2", "storage-3"]);
-    let source = controller(&source_dir, nodes.clone());
-    let follower = controller(&follower_dir, nodes);
+    let source = controller(&source_dir, nodes);
+    let follower = controller(
+        &follower_dir,
+        storage_nodes(&["storage-4", "storage-3", "storage-2", "storage-1"]),
+    );
     create_feed(&source, Uuid::from_u128(9_001)).await;
     let defined = source
         .execute("CREATE SUBSCRIPTION orders.billing FROM orders.created;")
@@ -76,15 +79,30 @@ async fn subscription_definition_survives_catalog_snapshot_without_creating_a_fe
             .unwrap()
             .feed_id
     );
+    assert!(defined.results[0].data.get("replicas").is_none());
     let feeds = source.execute("SHOW FEEDS;").await.unwrap();
     assert_eq!(feeds.results[0].data.as_array().unwrap().len(), 1);
+    let source_snapshot = source.snapshot_bytes().await.unwrap();
+    let snapshot: serde_json::Value = serde_json::from_slice(&source_snapshot).unwrap();
+    let subscription_key = subscription.subscription_id.to_string();
+    let progress_assignment = snapshot["subscription_progress_assignments"]
+        .get(subscription_key.as_str())
+        .unwrap();
+    assert_eq!(progress_assignment["ownership_epoch"], 1);
+    assert_eq!(progress_assignment["replicas"].as_array().unwrap().len(), 3);
     follower
-        .install_snapshot_bytes(&source.snapshot_bytes().await.unwrap())
+        .install_snapshot_bytes(&source_snapshot)
         .await
         .unwrap();
     assert_eq!(
         follower.active_subscription_by_name("orders.billing").await,
         Some(subscription)
+    );
+    let installed: serde_json::Value =
+        serde_json::from_slice(&follower.snapshot_bytes().await.unwrap()).unwrap();
+    assert_eq!(
+        installed["subscription_progress_assignments"][subscription_key.as_str()],
+        *progress_assignment
     );
     assert!(follower.execute("DROP FEED orders.created;").await.is_err());
     follower

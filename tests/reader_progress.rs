@@ -6,6 +6,7 @@ use std::{
 
 use finnstream::{
     active_range::{RangeId, ReplicaSet, StorageNodeId},
+    control::ControlController,
     reader::{
         FjallReaderProgressStore, FjallSubscriptionProgressReplica, ReaderDeliveryMutation,
         ReaderDeliveryReceipt, ReaderPacingController, ReaderPressureSample, ReaderProgressEngine,
@@ -13,6 +14,7 @@ use finnstream::{
         SubscriptionProgressAssignment, SubscriptionProgressCoordinator, SubscriptionProgressError,
         SubscriptionProgressMutation, SubscriptionProgressTransport,
     },
+    storage::{FileLogStore, LogStore},
 };
 use tempfile::TempDir;
 use uuid::Uuid;
@@ -78,6 +80,86 @@ impl SubscriptionProgressTransport for TestProgressTransport {
 
 fn progress_nodes() -> [StorageNodeId; 3] {
     ["storage-a", "storage-b", "storage-c"].map(|name| StorageNodeId::try_new(name).unwrap())
+}
+
+#[tokio::test]
+async fn subscription_coordinator_uses_private_catalog_placement_and_refuses_legacy_missing_placement(
+) {
+    let directory = TempDir::new().unwrap();
+    let store: Arc<dyn LogStore> =
+        Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+    let nodes = progress_nodes();
+    let controller = ControlController::open_with_storage_nodes(
+        directory.path().join("catalog.json"),
+        store,
+        nodes.to_vec(),
+    )
+    .unwrap();
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let mutation = SubscriptionProgressMutation {
+        subscription_id: subscription.subscription_id,
+        feed_id: subscription.feed_id,
+        ownership_epoch: 1,
+        sequence: 1,
+        request_id: Uuid::from_u128(500),
+        expected_cursor: None,
+        cursor: "rf1_page".to_owned(),
+        positions: BTreeMap::from([(
+            RangeId::from_uuid(Uuid::from_u128(501)),
+            "record".to_owned(),
+        )]),
+    };
+    let committed = tokio::task::spawn_blocking(move || coordinator.apply(mutation))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(committed.len(), 3);
+
+    let mut legacy: serde_json::Value =
+        serde_json::from_slice(&controller.snapshot_bytes().await.unwrap()).unwrap();
+    legacy
+        .as_object_mut()
+        .unwrap()
+        .remove("subscription_progress_assignments");
+    let legacy_dir = TempDir::new().unwrap();
+    let legacy_store: Arc<dyn LogStore> =
+        Arc::new(FileLogStore::open(legacy_dir.path().join("data")).unwrap());
+    let legacy_controller = ControlController::open_with_storage_nodes(
+        legacy_dir.path().join("catalog.json"),
+        legacy_store,
+        nodes.to_vec(),
+    )
+    .unwrap();
+    legacy_controller
+        .install_snapshot_bytes(&serde_json::to_vec(&legacy).unwrap())
+        .await
+        .unwrap();
+    assert!(matches!(
+        SubscriptionProgressCoordinator::for_subscription(
+            &legacy_controller,
+            subscription.subscription_id,
+            transport,
+        )
+        .await,
+        Err(SubscriptionProgressError::InvalidAssignment)
+    ));
 }
 
 #[test]

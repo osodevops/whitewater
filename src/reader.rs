@@ -818,7 +818,7 @@ impl FjallSubscriptionProgressReplica {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubscriptionProgressAssignment {
     pub subscription_id: Uuid,
     pub owner: crate::active_range::StorageNodeId,
@@ -865,6 +865,18 @@ pub struct SubscriptionProgressCoordinator {
 }
 
 impl SubscriptionProgressCoordinator {
+    pub async fn for_subscription(
+        control: &crate::control::ControlController,
+        subscription_id: Uuid,
+        transport: std::sync::Arc<dyn SubscriptionProgressTransport>,
+    ) -> Result<Self, SubscriptionProgressError> {
+        let assignment = control
+            .active_subscription_progress_assignment_by_id(subscription_id)
+            .await
+            .ok_or(SubscriptionProgressError::InvalidAssignment)?;
+        Ok(Self::new(assignment, transport))
+    }
+
     pub fn new(
         assignment: SubscriptionProgressAssignment,
         transport: std::sync::Arc<dyn SubscriptionProgressTransport>,

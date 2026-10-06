@@ -18,6 +18,7 @@ use crate::{
         RangeMap, RangeRoute, ReplicaSet, StagedWriterSequence, StorageNodeId,
         ACTIVE_RANGE_REPLICA_COUNT,
     },
+    reader::SubscriptionProgressAssignment,
     storage::{LogStore, StorageError},
 };
 
@@ -275,6 +276,8 @@ struct CatalogState {
     #[serde(default)]
     subscriptions: BTreeMap<Uuid, SubscriptionDefinition>,
     #[serde(default)]
+    subscription_progress_assignments: BTreeMap<Uuid, SubscriptionProgressAssignment>,
+    #[serde(default)]
     reader_frontiers: BTreeMap<Uuid, ReaderFrontier>,
     roles: BTreeMap<Uuid, RoleDefinition>,
     grants: BTreeMap<Uuid, NamespaceGrant>,
@@ -324,6 +327,7 @@ impl Default for CatalogState {
             writers: BTreeMap::new(),
             readers: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
+            subscription_progress_assignments: BTreeMap::new(),
             reader_frontiers: BTreeMap::new(),
             roles: BTreeMap::new(),
             grants: BTreeMap::new(),
@@ -932,6 +936,27 @@ impl ControlController {
             .cloned()
     }
 
+    pub(crate) async fn active_subscription_progress_assignment_by_id(
+        &self,
+        subscription_id: Uuid,
+    ) -> Option<SubscriptionProgressAssignment> {
+        let state = self.state.lock().await;
+        state
+            .subscriptions
+            .get(&subscription_id)
+            .filter(|item| item.status == ResourceStatus::Active)?;
+        let assignment = state
+            .subscription_progress_assignments
+            .get(&subscription_id)?;
+        SubscriptionProgressAssignment::try_new(
+            subscription_id,
+            assignment.owner.clone(),
+            assignment.replicas.clone(),
+            assignment.ownership_epoch,
+        )
+        .ok()
+    }
+
     pub(crate) async fn active_reader_frontier(&self, reader_id: Uuid) -> Option<ReaderFrontier> {
         let state = self.state.lock().await;
         state
@@ -1400,8 +1425,38 @@ impl ControlController {
                     }
                     source.feed_id
                 };
+                let subscription_id = derived_resource_id(request_id, "subscription");
+                let range_id = state
+                    .range_maps
+                    .get(&feed_id)
+                    .and_then(|map| map.routes().first())
+                    .map(|route| route.range_id)
+                    .ok_or_else(|| {
+                        ControlError::InvalidOperation(
+                            "Subscription source Feed has no committed range placement".to_owned(),
+                        )
+                    })?;
+                let range = state
+                    .range_assignments
+                    .get(&range_id)
+                    .filter(|assignment| assignment.feed_id == feed_id)
+                    .ok_or_else(|| {
+                        ControlError::InvalidOperation(
+                            "Subscription source Feed placement is not applied".to_owned(),
+                        )
+                    })?;
+                let replicas = range.replicas.clone();
+                let owner_index =
+                    usize::from(subscription_id.as_bytes()[0]) % ACTIVE_RANGE_REPLICA_COUNT;
+                let placement = SubscriptionProgressAssignment::try_new(
+                    subscription_id,
+                    replicas.as_array()[owner_index].clone(),
+                    replicas,
+                    1,
+                )
+                .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
                 let definition = SubscriptionDefinition {
-                    subscription_id: derived_resource_id(request_id, "subscription"),
+                    subscription_id,
                     name: name.clone(),
                     space_id,
                     feed_id,
@@ -1411,8 +1466,11 @@ impl ControlController {
                     created_at_ns: issued_at_ns,
                 };
                 state
+                    .subscription_progress_assignments
+                    .insert(subscription_id, placement);
+                state
                     .subscriptions
-                    .insert(definition.subscription_id, definition.clone());
+                    .insert(subscription_id, definition.clone());
                 Ok((
                     format!("declared Subscription {name}; shared consumption is not active"),
                     json!(definition),
@@ -2535,7 +2593,17 @@ impl ControlController {
                 Ok(result)
             }
             ResourceKind::Subscription => {
-                drop_named(&mut state.subscriptions, name, "Subscription")
+                let subscription_id = state
+                    .subscriptions
+                    .values()
+                    .find(|item| item.name == name && item.status == ResourceStatus::Active)
+                    .ok_or_else(|| ControlError::NotFound(format!("Subscription {name}")))?
+                    .subscription_id;
+                let result = drop_named(&mut state.subscriptions, name, "Subscription")?;
+                state
+                    .subscription_progress_assignments
+                    .remove(&subscription_id);
+                Ok(result)
             }
             ResourceKind::Role => {
                 let role_id = active_role(state, name)?.role_id;
@@ -3915,6 +3983,14 @@ mod tests {
                 .unwrap()
                 .feed_id
         );
+        let placement = controller
+            .active_subscription_progress_assignment_by_id(definition.subscription_id)
+            .await
+            .unwrap();
+        assert_eq!(placement.ownership_epoch, 1);
+        assert!(placement.replicas.contains(&placement.owner));
+        assert!(first.results[0].data.get("owner").is_none());
+        assert!(first.results[0].data.get("replicas").is_none());
         assert!(controller
             .execute_commands(vec![Command::CreateSubscription {
                 name: "accounts.billing".to_owned(),
@@ -3944,6 +4020,26 @@ mod tests {
         let subscriptions = controller.execute("SHOW SUBSCRIPTIONS;").await.unwrap();
         assert_eq!(subscriptions.results[0].data.as_array().unwrap().len(), 1);
         assert!(controller.state.lock().await.reader_frontiers.is_empty());
+        let legacy_dir = TempDir::new().unwrap();
+        let mut legacy: Value =
+            serde_json::from_slice(&controller.snapshot_bytes().await.unwrap()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("subscription_progress_assignments");
+        let legacy_controller = new_controller(&legacy_dir);
+        legacy_controller
+            .install_snapshot_bytes(&serde_json::to_vec(&legacy).unwrap())
+            .await
+            .unwrap();
+        assert!(legacy_controller
+            .active_subscription_by_name("accounts.billing")
+            .await
+            .is_some());
+        assert!(legacy_controller
+            .active_subscription_progress_assignment_by_id(definition.subscription_id)
+            .await
+            .is_none());
         drop(controller);
         let reopened = new_controller(&directory);
         assert_eq!(
@@ -3953,12 +4049,22 @@ mod tests {
                 .unwrap(),
             definition
         );
+        assert_eq!(
+            reopened
+                .active_subscription_progress_assignment_by_id(definition.subscription_id)
+                .await,
+            Some(placement)
+        );
         reopened
             .execute("DROP SUBSCRIPTION accounts.billing; DROP FEED accounts.users;")
             .await
             .unwrap();
         assert!(reopened
             .active_subscription_by_name("accounts.billing")
+            .await
+            .is_none());
+        assert!(reopened
+            .active_subscription_progress_assignment_by_id(definition.subscription_id)
             .await
             .is_none());
     }
