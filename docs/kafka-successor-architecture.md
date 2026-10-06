@@ -2,7 +2,7 @@
 
 Visual companion: [Whitewater sequence diagrams](sequence-diagrams.md).
 
-> A clean-sheet design for a distributed event fabric that keeps Kafka's durable ordered-history model while removing the architectural coupling that makes Kafka difficult to scale, operate, and evolve.
+> A clean-sheet design for a distributed event platform that keeps Kafka's durable ordered-history model while removing the architectural coupling that makes Kafka difficult to scale, operate, and evolve.
 
 ## Document status
 
@@ -33,7 +33,7 @@ This coupling is the source of much of Kafka's operational and application compl
 Whitewater separates those responsibilities. Its public abstraction becomes:
 
 ```text
-fabric -> space -> feed -> key -> cursor -> subscription
+riverbed -> space -> feed -> key -> cursor -> subscription
 ```
 
 A Feed has an immutable FeedId and a mutable dotted FeedName. The physical layout, replication strategy, work assignment, and degree of parallelism remain internal implementation details that can change dynamically. For the distinction between Kafka's public partitions and Whitewater's internal Active Ranges, including implementation limits, see [Kafka partitions versus Whitewater Active Ranges](why-whitewater.md#kafka-partitions-versus-whitewater-active-ranges).
@@ -50,7 +50,7 @@ A Feed has an immutable FeedId and a mutable dotted FeedName. The physical layou
 8. **Recent data is fast; old data is cheap; the distinction is transparent to applications.**
 9. **Coordination and consensus are used only where correctness requires them.**
 10. **Multi-tenancy and workload isolation are foundational, not later additions.**
-11. **Every supported Fabric has at least three Nodes and every active range has at least three replicas.**
+11. **Every supported Riverbed has at least three Nodes and every active range has at least three replicas.**
 12. **Feed history is immutable; arbitrary application-defined secondary Indexes and current state are core persisted replicated storage capabilities, not later query optimizations.** Their [shared keyspace and transaction contract](why-whitewater.md#index-storage-contract-and-fjall-layout) must be implemented before claiming Index availability.
 13. **TLS and scoped API-key authentication are mandatory defaults, not deployment options.**
 14. **Feed identity is immutable while its dotted human-readable name may change.**
@@ -408,7 +408,7 @@ Hysteresis, minimum and maximum cluster sizes, disruption budgets, and explicit 
 The application developer should think in these terms:
 
 ```text
-fabric -> space -> feed -> key -> cursor -> subscription
+riverbed -> space -> feed -> key -> cursor -> subscription
 
 feed
   -> immutable identity with a mutable dotted name
@@ -485,9 +485,9 @@ Atomic consume-and-append is straightforward only when its coordination boundary
 
 ## Suggested prototype sequence
 
-### Phase 1: Three-Node Fabric and local correctness
+### Phase 1: Three-Node Riverbed and local correctness
 
-- Standard three-Node development Fabric
+- Standard three-Node development Riverbed
 - Append-only segmented log on each Node
 - FeedId, dotted FeedName, keys, and Cursors
 - Writer identities and sequence-based deduplication

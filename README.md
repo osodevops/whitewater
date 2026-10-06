@@ -1,6 +1,6 @@
 # Whitewater
 
-Whitewater by FinnStream is a clean-sheet distributed database and partitionless streaming platform built around `fabric -> space -> feed -> key -> cursor -> subscription`. Applications do not create or manage partitions.
+Whitewater is a clean-sheet distributed database and partitionless streaming platform built around `riverbed -> space -> feed -> key -> cursor -> subscription`. Applications do not create or manage partitions.
 
 Design documents:
 
@@ -45,11 +45,11 @@ This repository contains a replicated streaming correctness foundation, internal
 - Persisted local prototype catalog fallback and `wwctl` command runner
 - Three-Node and arbitrary-scale Docker development environments
 
-The standard three-Node Fabric uses Raft consensus for control metadata and two-of-three durable Active Range quorum commits for Feed writes. This is still a prototype: production transport security, scalable cross-Node Feed reads, complete movement and drain, and broader failure acceptance remain unfinished.
+The standard three-Node Riverbed uses Raft consensus for control metadata and two-of-three durable Active Range quorum commits for Feed writes. This is still a prototype: production transport security, scalable cross-Node Feed reads, complete movement and drain, and broader failure acceptance remain unfinished.
 
-## Run a development Fabric
+## Run a development Riverbed
 
-A supported Fabric always has at least three Nodes. The standard development setup publishes Nodes on ports `7071`, `7072`, and `7073`:
+A supported Riverbed always has at least three Nodes. The standard development setup publishes Nodes on ports `7071`, `7072`, and `7073`:
 
 ```bash
 docker compose up --build -d
@@ -206,7 +206,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 ```
 
-For the complete live acceptance/fault gate, use the separate `compose.verify.yml` Fabric (ports 7371–7373) rather than restarting the standard development Fabric. Set `COMPOSE_FILE=compose.verify.yml` and `WHITEWATER_TEST_BASE_PORT=7371` in the shell running the default three-Node scripts; on PowerShell use `$env:COMPOSE_FILE` and `$env:WHITEWATER_TEST_BASE_PORT`. Run the scripts sequentially:
+For the complete live acceptance/fault gate, use the separate `compose.verify.yml` Riverbed (ports 7371–7373) rather than restarting the standard development Riverbed. Set `COMPOSE_FILE=compose.verify.yml` and `WHITEWATER_TEST_BASE_PORT=7371` in the shell running the default three-Node scripts; on PowerShell use `$env:COMPOSE_FILE` and `$env:WHITEWATER_TEST_BASE_PORT`. Run the scripts sequentially:
 
 ```bash
 export COMPOSE_FILE=compose.verify.yml WHITEWATER_TEST_BASE_PORT=7371
@@ -222,7 +222,7 @@ python scripts/test-m4-cross-node-read.py
 python scripts/test-m4-owner-move.py
 ```
 
-The M1.11 suite runs M1.7, M1.9, and M1.10 and restarts the isolated Fabric; auto-split force-recreates it with test thresholds and restores defaults. The M4 movement and cross-Node read scripts start and stop their own projects without deleting volumes. `docker compose stop` above only stops the isolated verification Fabric. Never point these scripts at a Fabric containing user data.
+The M1.11 suite runs M1.7, M1.9, and M1.10 and restarts the isolated Riverbed; auto-split force-recreates it with test thresholds and restores defaults. The M4 movement and cross-Node read scripts start and stop their own projects without deleting volumes. `docker compose stop` above only stops the isolated verification Riverbed. Never point these scripts at a Riverbed containing user data.
 
 Without a host Rust toolchain:
 

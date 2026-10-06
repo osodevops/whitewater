@@ -1,6 +1,6 @@
 # Whitewater Operations Advisor
 
-> Proposed agentic analysis and **policy-gated** assistance for operating a Fabric. This is a design and roadmap item, **not an implemented service or MCP server**.
+> Proposed agentic analysis and **policy-gated** assistance for operating a Riverbed. This is a design and roadmap item, **not an implemented service or MCP server**.
 
 ## Why it exists
 
@@ -32,11 +32,11 @@ Node / Writer / Reader / Control Plane / Index / Subscription signals (as availa
 
 ## What it investigates
 
-Start with structured, bounded, timestamped observations keyed by Fabric, Space, Feed, Node, and correlation/request ID. Potential signals include:
+Start with structured, bounded, timestamped observations keyed by Riverbed, Space, Feed, Node, and correlation/request ID. Potential signals include:
 
 | Scope | Examples of useful evidence |
 |---|---|
-| Fabric and Control Plane | quorum and leader health, catalog revision, Node membership, ownership epochs, recovery plans, rejected control decisions |
+| Riverbed and Control Plane | quorum and leader health, catalog revision, Node membership, ownership epochs, recovery plans, rejected control decisions |
 | Active Range and storage | owner/replica progress, committed versus uncommitted positions, RF3 health, repair/movement status, disk headroom, IO/CPU pressure, range hotness |
 | Writers | admission/throttling, retryable versus permanent errors, append and quorum latency, session fencing, deduplication, uneven Key concentration |
 | Readers and future Subscriptions | delivered versus acknowledged Cursor, capacity credits, wait time, replay/seek demand, lease state and delay cause when Subscriptions exist |
@@ -45,7 +45,7 @@ Start with structured, bounded, timestamped observations keyed by Fabric, Space,
 
 The first diagnostic question is **what is happening, to whom, why, what Whitewater already did, what remains at risk, and what a person can safely do next**. For example, a slow Reader is not automatically a Reader bug: the cause may be insufficient credits, a hot Key, remote history retrieval, a storage quorum delay, or a failing network path. Distinguish measured facts from hypotheses, and link each conclusion to a bounded observation window, source, and confidence level. Never imply causality from a single correlated metric.
 
-Ground explanations in versioned Whitewater architecture, the running Fabric's feature/compatibility state, validated runbooks, and relevant Kubernetes API, scheduling, CNI/DNS, CSI/storage, TLS, and network-failure knowledge. Show the source and version used for a claim; Kubernetes or networking expertise must not be presented as certainty about a particular cluster without corresponding observations. Outdated runbooks and retrieved documents are untrusted evidence, not permission to act.
+Ground explanations in versioned Whitewater architecture, the running Riverbed's feature/compatibility state, validated runbooks, and relevant Kubernetes API, scheduling, CNI/DNS, CSI/storage, TLS, and network-failure knowledge. Show the source and version used for a claim; Kubernetes or networking expertise must not be presented as certainty about a particular cluster without corresponding observations. Outdated runbooks and retrieved documents are untrusted evidence, not permission to act.
 
 Logs and traces are fetched **on demand**, only for the affected scope and time window after structured signals indicate what to inspect. Redact credentials, payloads, Keys and sensitive Metadata by default; enforce size, time, and cost limits. Treat log lines, record Metadata, runbook text, MCP responses, and external tickets as **untrusted input**, never instructions to the agent or authorization to use another tool.
 
@@ -63,7 +63,7 @@ Aggregates should have retention and cardinality limits, per-Space access bounda
 
 ## Recommendation and action policy
 
-Use an explicit action ladder; deployment defaults to level 0. Policies are versioned, scoped to an identity and Fabric/Space, and auditable.
+Use an explicit action ladder; deployment defaults to level 0. Policies are versioned, scoped to an identity and Riverbed/Space, and auditable.
 
 | Level | Behavior | Examples |
 |---|---|---|
@@ -81,8 +81,8 @@ A proposed action includes: scope and immutable resource IDs; observed evidence 
 A possible first MCP surface is read-only, using the authenticated Whitewater Admin API and purpose-built structured diagnostics:
 
 ```text
-whitewater.fabric.health
-whitewater.fabric.explain_pressure
+whitewater.riverbed.health
+whitewater.riverbed.explain_pressure
 whitewater.feed.describe
 whitewater.writer.explain_retries
 whitewater.reader.explain_delay
@@ -98,7 +98,7 @@ Kubernetes/network tools should expose only the namespaces, clusters, resource t
 - Separate recommendation identity from execution identity; use least privilege, per-Space isolation, explicit human confirmation, and an immutable audit trail for proposals, approvals, denials, tool calls, and outcomes. Present operational internal topology only to authorized operators, never in application Writer/Reader APIs.
 - Fail closed on stale snapshots, lost Control Plane quorum, inconsistent Node evidence, unknown TLS/peer identity, missing approval, or missing rollback preconditions. External service-mesh transport is acceptable only when identity, encryption, rotation, audit, and downgrade prevention meet Whitewater's security contract.
 - Limit model prompts, retrieved logs, tool calls, concurrent investigations, movement bandwidth, and spending. Foreground appends and Reader delivery take precedence; an analysis surge must not cause a cluster incident.
-- Support an immediate per-Fabric/Space kill switch and audit-safe manual override. Restarting the Advisor must not replay non-idempotent actions; a durable action ledger and authoritative-state check are required before any mutation.
+- Support an immediate per-Riverbed/Space kill switch and audit-safe manual override. Restarting the Advisor must not replay non-idempotent actions; a durable action ledger and authoritative-state check are required before any mutation.
 - Report costs and charge inference, storage, log retrieval, egress, and movement to logical owners where possible. The Advisor should be useful without sending customer data to an external model; deployment policy controls model location and data egress.
 
 ## Example investigations

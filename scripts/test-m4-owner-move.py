@@ -52,7 +52,7 @@ def wait_for_fabric():
         except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
             pass
         time.sleep(1)
-    raise AssertionError("isolated owner-movement Fabric did not become healthy")
+    raise AssertionError("isolated owner-movement Riverbed did not become healthy")
 
 
 def main():

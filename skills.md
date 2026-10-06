@@ -6,7 +6,7 @@ Whitewater is both a distributed database and a partitionless streaming platform
 
 Every contributor should understand these project-wide rules:
 
-- Public applications use `fabric -> space -> feed -> key -> cursor -> subscription`.
+- Public applications use `riverbed -> space -> feed -> key -> cursor -> subscription`.
 - Physical partitions are never exposed.
 - Keys define ordering.
 - Readers and Subscriptions maintain independent Cursor positions; Readers cooperating in one Subscription share only that Subscription's durable progress.
@@ -14,7 +14,7 @@ Every contributor should understand these project-wide rules:
 - FeedId is immutable; dotted FeedName is mutable.
 - Feed history is immutable temporal data.
 - Persisted replicated Indexes provide current and queryable state.
-- Supported Fabrics have at least three Nodes and three active replicas.
+- Supported Riverbeds have at least three Nodes and three active replicas.
 - TLS and scoped API-key authentication are mandatory defaults.
 - Correctness contracts come before throughput optimization.
 - Expected operational change should be gradual, explainable, and safe.
@@ -124,7 +124,7 @@ Required knowledge:
 Whitewater Index requirements:
 
 - Persisted and replicated
-- Named Fabric resources
+- Named Riverbed resources
 - Applied-Cursor freshness
 - Automatic query routing
 - Transferable checkpoints

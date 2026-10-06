@@ -1,6 +1,6 @@
 # Why Whitewater
 
-> Whitewater is FinnStream's clean-sheet distributed database and streaming platform: a self-managing, partitionless event fabric built around durable feeds, key-defined ordering, opaque cursors, first-class indexes, secure defaults, and incremental elasticity.
+> Whitewater is a clean-sheet distributed database and streaming platform: a self-managing, partitionless event platform built around durable feeds, key-defined ordering, opaque cursors, first-class indexes, secure defaults, and incremental elasticity.
 
 ## Document status
 
@@ -9,7 +9,7 @@
 - **Company and package namespace:** FinnStream / `finnstream`
 - **Architecture source:** [Whitewater architecture](kafka-successor-architecture.md)
 - **Operational experience:** [Humane operations and day-two requirements](operational-experience.md)
-- **Public model:** `fabric -> space -> feed -> key -> cursor -> subscription`
+- **Public model:** `riverbed -> space -> feed -> key -> cursor -> subscription`
 - **Implementation:** Rust
 
 This document explains why Whitewater exists, how it differs from Kafka, and how familiar Kafka concepts translate into the Whitewater model. It distinguishes committed principles from areas that still require prototyping and benchmarking.
@@ -72,7 +72,7 @@ Physical ranges, replicas, files, and placement are internal. They may split, me
 
 Kafka clients and operators must understand partition counts, leaders, replicas, assignment, and partition-local offsets. Capacity planning becomes part of topic creation, and changing capacity can alter behavior.
 
-A Whitewater Writer selects a Feed and key. A Reader selects a Feed or Feed pattern. The Fabric decides placement and parallelism.
+A Whitewater Writer selects a Feed and key. A Reader selects a Feed or Feed pattern. The Riverbed decides placement and parallelism.
 
 ### 3. Consumer-group rebalancing interrupts unrelated work
 
@@ -111,7 +111,7 @@ Whitewater chooses safe defaults as protocol behavior. Expert controls may exist
 
 Kafka has evolved from ZooKeeper coordination to KRaft, with brokers, controllers, process roles, listener matrices, quorum configuration, and migration history. KRaft is a substantial improvement, but operators still manage topology that applications should not need to understand.
 
-Whitewater runs one Node binary. Nodes may hold control-plane, data-plane, or mixed responsibilities internally, but role placement is reconciled by the Fabric. An orchestrator manages container count; it does not define Whitewater's logical data model.
+Whitewater runs one Node binary. Nodes may hold control-plane, data-plane, or mixed responsibilities internally, but role placement is reconciled by the Riverbed. An orchestrator manages container count; it does not define Whitewater's logical data model.
 
 ### 7. Elasticity is not transparent
 
@@ -180,7 +180,7 @@ An API key must not be used directly as an encryption key. If a Feed requires a 
 Whitewater requires at least three Nodes. Active data has at least three replicas across distinct eligible Nodes, and normal durable acknowledgement requires a quorum.
 
 ```text
-minimum Fabric size:     3 Nodes
+minimum Riverbed size:     3 Nodes
 minimum active replicas: 3
 normal write quorum:      2 of 3
 ```
@@ -189,7 +189,7 @@ These are baseline invariants rather than per-Feed tuning. A future Durability P
 
 Development also runs three Nodes. Three containers on one laptop validate topology and failure logic but do not create three physical failure domains. Production placement must spread replicas across machines and, where available, zones.
 
-A single-Node mode may exist only as a storage-engine unit-test harness. It is not a supported Fabric deployment and must not silently present production durability semantics.
+A single-Node mode may exist only as a storage-engine unit-test harness. It is not a supported Riverbed deployment and must not silently present production durability semantics.
 
 ### 14. Renaming should not rewrite data
 
@@ -241,7 +241,7 @@ Rust does not automatically make Whitewater faster. Algorithms, disk layout, rep
 
 Kafka development environments often use weaker replication, fewer controllers, different listeners, and different security than production. Problems then emerge only after deployment.
 
-Whitewater's standard development Fabric uses three Nodes, TLS, API-key authentication, membership, replication topology, and the same protocol as production. Local tooling may automate certificates and credentials, but it must not replace the architecture with a different single-Node product.
+Whitewater's standard development Riverbed uses three Nodes, TLS, API-key authentication, membership, replication topology, and the same protocol as production. Local tooling may automate certificates and credentials, but it must not replace the architecture with a different single-Node product.
 
 ### 17. Schemas should be first-class but not mandatory in storage
 
@@ -253,7 +253,7 @@ A Feed can accept arbitrary bytes or reference a Schema Policy. Schema enforceme
 
 Whitewater Spaces are policy and accounting boundaries from the beginning. CPU, memory, local IO, object-store IO, network bandwidth, connection count, Feed count, Index cost, and retained bytes must be attributable to a Space.
 
-Schedulers protect small workloads from noisy neighbours and prevent one hot Feed or key from consuming an entire Fabric unnoticed.
+Schedulers protect small workloads from noisy neighbours and prevent one hot Feed or key from consuming an entire Riverbed unnoticed.
 
 ### 19. Operational feedback should explain causes, not just lag
 
@@ -274,9 +274,9 @@ Capacity-aware subscriptions and protocol credits become control inputs, while m
 
 ## Whitewater foundations
 
-### Fabric
+### Riverbed
 
-A Fabric is one cooperating Whitewater installation. It has a stable FabricId, a control-plane quorum, at least three Nodes, and one security and policy domain.
+A Riverbed is one cooperating Whitewater installation. It has a stable RiverbedId, a control-plane quorum, at least three Nodes, and one security and policy domain.
 
 ### Node
 
@@ -344,7 +344,7 @@ An Encryption Policy specifies transport requirements, at-rest encryption, custo
 | What do clients name? | Topic and, when selecting work or seeking, often partition and offset. A keyed producer can normally let a partitioner choose. | Feed and Key for writes; Feed and opaque Cursor for reads. No RangeId, token, or replica is required in application requests. |
 | What is ordered? | Records within each partition; there is no topic-wide total order across partitions. | The intended public guarantee is accepted order for the **same Feed and Key**; unrelated keys need not have a shared order. |
 | What scales independently? | Partitions provide append and consumer parallelism but also define physical offsets, leader/replica placement, and consumer assignments. | Different ranges can have different append owners. Reader/Subscription work assignment is designed to be independent of storage placement; shared Subscription leases are still roadmap work. |
-| Who chooses the number? | Operators commonly choose a partition count at topic creation; Kafka supports increasing it, but reducing it is not a routine in-place operation. | Applications never choose a range count. The Fabric starts with one full-keyspace route and may change its internal map as capacity needs change. |
+| Who chooses the number? | Operators commonly choose a partition count at topic creation; Kafka supports increasing it, but reducing it is not a routine in-place operation. | Applications never choose a range count. The Riverbed starts with one full-keyspace route and may change its internal map as capacity needs change. |
 | How does placement change? | Leaders and replicas can move without changing a partition ID; reassignment and count changes remain operational concerns. | The Control Plane tracks range assignments and epochs. Splits/merges change routes; moving replicas or owners changes placement without redefining the Feed. |
 
 ### A concrete routing example
@@ -385,7 +385,7 @@ A split or merge can change internal physical positions and generations; Writer 
 
 A Kafka consumer commonly tracks `(topic, partition, offset)`. A Whitewater Reader instead receives and returns a Cursor associated with a committed record; the client never has to derive a new physical position after a split. The split/merge tests exercise preservation of record-attached Cursors through generation changes, and named Reader sessions track delivered progress separately from acknowledged progress. Named Readers starting at Beginning on a multi-range Feed now return a different opaque `delivered_cursor` token representing Control Plane-backed progress across current ranges; the Cursor attached to each event still identifies that event. The application acknowledges the delivered token, never the hidden placement.
 
-This is an **early implementation**, not yet a claim of unlimited cross-Node continuation: the ingress checks the Control Plane's current RangeMap and retrieves committed frames from **every current range owner**, even if the ingress does not host that range. It merges those records and finds the supplied Cursor in the complete bounded result. A missing, stale, or unavailable owner fails the read as retryable rather than returning a misleading partial Feed; a placement change mid-read also fails closed. On Control Plane Fabrics the owner must corroborate its committed boundary and frame digest with another RF3 replica, rejecting lost owner history or an observed replica ahead. This does not yet establish an authoritative committed watermark if multiple copies have already been lost. A single-range Feed can seek an existing committed Cursor beyond the first 10,000 records using an owner-local index rebuilt on restart, then page forward or read the tail within a 10,000-record/16 MiB response budget. Public Feed, temporary Reader, and legacy record-Cursor multi-range merged reads still refuse histories above 10,000 records per range or Feed, 16 MiB total decoded bytes, or 128 ranges; the named Reader frontier path instead bounds each page while continuing over a longer history. Full-history timestamp scans beyond the bound also refuse instead of returning an incomplete result. Thus remote retrieval and bounded Cursor continuation work after movement, but a durable global multi-range order/index, checkpointed long-history recovery, and historical retention semantics remain. An opaque Cursor is the API shape, not proof that every planned migration and retention scenario is already implemented.
+This is an **early implementation**, not yet a claim of unlimited cross-Node continuation: the ingress checks the Control Plane's current RangeMap and retrieves committed frames from **every current range owner**, even if the ingress does not host that range. It merges those records and finds the supplied Cursor in the complete bounded result. A missing, stale, or unavailable owner fails the read as retryable rather than returning a misleading partial Feed; a placement change mid-read also fails closed. On Control Plane Riverbeds the owner must corroborate its committed boundary and frame digest with another RF3 replica, rejecting lost owner history or an observed replica ahead. This does not yet establish an authoritative committed watermark if multiple copies have already been lost. A single-range Feed can seek an existing committed Cursor beyond the first 10,000 records using an owner-local index rebuilt on restart, then page forward or read the tail within a 10,000-record/16 MiB response budget. Public Feed, temporary Reader, and legacy record-Cursor multi-range merged reads still refuse histories above 10,000 records per range or Feed, 16 MiB total decoded bytes, or 128 ranges; the named Reader frontier path instead bounds each page while continuing over a longer history. Full-history timestamp scans beyond the bound also refuse instead of returning an incomplete result. Thus remote retrieval and bounded Cursor continuation work after movement, but a durable global multi-range order/index, checkpointed long-history recovery, and historical retention semantics remain. An opaque Cursor is the API shape, not proof that every planned migration and retention scenario is already implemented.
 
 ### Operator view versus developer view
 
@@ -395,7 +395,7 @@ Developers should not choose a range count, assign a Reader to a range, handle p
 
 | Kafka concept | Whitewater concept | Difference |
 |---|---|---|
-| Kafka cluster | Fabric | Self-managing installation with a stable FabricId and minimum three Nodes |
+| Kafka cluster | Riverbed | Self-managing installation with a stable RiverbedId and minimum three Nodes |
 | Broker | Node | Replaceable capacity; applications do not target storage owners |
 | KRaft controller | Control plane | Small consensus scope for identity, ownership, epochs, membership, and recovery decisions |
 | Topic | Feed | Immutable history with an immutable FeedId and mutable dotted name |
@@ -413,7 +413,7 @@ Developers should not choose a range count, assign a Reader to a range, handle p
 | Group rebalance | Lease transfer | Only affected internal ranges move; unrelated work continues |
 | Group generation | Lease epoch | Fences stale Readers at the smallest practical ownership boundary |
 | Consumer lag | Cursor distance and delay breakdown | Reports storage, replication, Index, delivery, and processing causes |
-| Bootstrap servers | Fabric endpoint/discovery | Clients discover healthy Nodes and need no broker topology knowledge |
+| Bootstrap servers | Riverbed endpoint/discovery | Clients discover healthy Nodes and need no broker topology knowledge |
 | Replication factor | Durability Policy | Minimum three replicas; no unsafe lower setting |
 | `acks` | Durability Policy | Safe quorum behavior is standard rather than a producer tuning choice |
 | ISR | Replica health | Internal operational state, not an application configuration concern |
@@ -564,7 +564,7 @@ The selection must still follow benchmarks and fault tests using Whitewater's re
 - Drain-before-remove guarantees
 - Failure-domain-aware placement
 - Continuous replica verification and self-healing
-- Built-in fault injection for development Fabrics
+- Built-in fault injection for development Riverbeds
 - Explainable pressure and placement decisions
 - Deterministic configuration snapshots and audit history
 - No unsafe production configuration combinations
@@ -583,7 +583,7 @@ The selection must still follow benchmarks and fault tests using Whitewater's re
 
 ### Developer experience
 
-- Three-Node development Fabric by default
+- Three-Node development Riverbed by default
 - One command to start, inspect, test failure, and reset
 - Feed names that can be renamed without migration
 - No partition-count decision during creation
@@ -596,12 +596,12 @@ The selection must still follow benchmarks and fault tests using Whitewater's re
 
 ### Directional decisions
 
-- Product name is Whitewater by FinnStream.
-- Public resources are Fabric, Space, Feed, Key, Cursor, Subscription, Pipe, Index, and Node.
+- Product name is Whitewater.
+- Public resources are Riverbed, Space, Feed, Key, Cursor, Subscription, Pipe, Index, and Node.
 - Feed identity is immutable and separate from mutable dotted naming.
 - Keys define ordering.
 - Partitions are not public.
-- Minimum supported Fabric size is three Nodes.
+- Minimum supported Riverbed size is three Nodes.
 - Baseline active replication is three copies with quorum acknowledgement.
 - TLS is mandatory.
 - Scoped API keys are the baseline client-authentication mechanism.
@@ -640,4 +640,4 @@ process through a Subscription or Pipe
 add an Index when queryable state is needed
 ```
 
-The Fabric owns placement, replicas, files, leases, tiering, batching, and scaling. Safe behavior is the default rather than the outcome of correctly tuning a large configuration matrix.
+The Riverbed owns placement, replicas, files, leases, tiering, batching, and scaling. Safe behavior is the default rather than the outcome of correctly tuning a large configuration matrix.

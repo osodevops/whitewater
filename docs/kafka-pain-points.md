@@ -5,7 +5,7 @@
 ## Document status
 
 - **Status:** Product problem catalogue and design input
-- **Product:** Whitewater by FinnStream
+- **Product:** Whitewater
 - **Audience:** Product designers, contributors, application developers, platform engineers, SREs, security engineers, and FinOps
 - **Companion documents:** [Why Whitewater](why-whitewater.md), [Whitewater operational experience](operational-experience.md), and [Whitewater architecture](kafka-successor-architecture.md)
 
@@ -32,8 +32,8 @@ The tables below group related pains so that the response remains readable. They
 | Many separately operated components and role-specific processes | One Rust Node binary with internally assigned Control, Storage, Compute, Gateway, and Cache capabilities; one typed control contract serves WCL, APIs, CLIs, SDKs, Operators, and future MCP tools. | **Foundation** | One Node binary and typed `ControlController` exist; role-aware placement is Milestone 5. |
 | Partition counts must be chosen early | Feeds expose keys and ordering, never partition counts. Internal Active Ranges split and merge without changing the Feed contract. | **Foundation** | Feed administration is partitionless; fixed Active Range work is Milestone 1 and online split/merge is Milestone 4. |
 | Repartitioning and reassignment hammer disk and network | Internal range movement is incremental, resumable, checksum-verified, and bounded by foreground SLO and disruption budgets. | **Designed** | Active Range recovery is specified; catch-up is M1.10 and general movement is Milestones 4–5. |
-| Hot partitions and uneven placement | The Fabric detects hot ranges and keys, isolates unrelated keys, and rebalances movable ranges by capacity and failure domain. It reports honestly that one strictly ordered hot key cannot be parallelized automatically. | **Planned** | Hot-key detection and multiple ranges are Milestone 4; role-aware placement is Milestone 5. |
-| Adding brokers does not automatically redistribute useful work | Nodes advertise capabilities and pressure; the Fabric places or moves only the work that addresses the measured bottleneck. | **Foundation** | Membership, demand telemetry, and hysteretic recommendations exist; useful role-aware scaling is Milestone 5. |
+| Hot partitions and uneven placement | The Riverbed detects hot ranges and keys, isolates unrelated keys, and rebalances movable ranges by capacity and failure domain. It reports honestly that one strictly ordered hot key cannot be parallelized automatically. | **Planned** | Hot-key detection and multiple ranges are Milestone 4; role-aware placement is Milestone 5. |
+| Adding brokers does not automatically redistribute useful work | Nodes advertise capabilities and pressure; the Riverbed places or moves only the work that addresses the measured bottleneck. | **Foundation** | Membership, demand telemetry, and hysteretic recommendations exist; useful role-aware scaling is Milestone 5. |
 | Capacity planning couples many hidden constraints | Capacity is reported by logical resource and constrained capability, with slow bounded recommendations rather than partition arithmetic. | **Foundation** | Node demand and storage telemetry exist; attribution and capability-specific pressure remain Milestone 5 work. |
 | Retention, compaction, replication, or producers fill disks unexpectedly | Reserve recovery headroom, project growth, admit writes safely, tier sealed history, and identify the responsible Space and Feed before exhaustion. | **Designed** | Operational contract exists; tiered history is Milestone 8 and disk-full suites are Milestone 9. |
 | Broker replacement and recovery are operational projects | A replacement Node catches up verified committed ranges automatically; stale owners are epoch-fenced and scale-in is refused until drain completes. | **Foundation** | Fencing and recovery models exist; owner recovery is M1.9, repair is M1.10, and general drain is Milestone 5. |
@@ -49,7 +49,7 @@ The tables below group related pains so that the response remains readable. They
 | Exactly-once marketing hides operational consequences | Whitewater names the actual boundary: idempotent append for duplicate-safe writes and atomic consume-and-append for effects wholly inside Whitewater; external effects retain explicit ambiguity. | **Foundation** | Local append deduplication exists; replicated retry safety is Milestone 1 and atomic effects are Milestone 7. |
 | Observability is fragmented across products and dashboards | Metrics, traces, logs, events, and automatic decisions share logical IDs and feed a built-in “why?” explanation. | **Designed** | Basic tracing and metrics exist; correlated explanation, bounded cardinality, and support bundles remain Milestone 9 or a roadmap gap. |
 | Managed Kafka costs scale sharply; self-hosting hides human cost | Attribute storage, replication, egress, movement, Subscription, Pipe, and Index cost to logical owners; automate routine operations safely. | **Designed** | FinOps requirements exist; complete cost attribution has no dedicated milestone and Index cost begins in Milestone 6. |
-| Production-like testing is expensive | A standard three-Node local Fabric uses the same topology and correctness paths as production, automated by Docker Compose. | **Prototype** | The three-Node Compose Fabric is implemented and health checked; TLS and record replication are not yet production-equivalent. |
+| Production-like testing is expensive | A standard three-Node local Riverbed uses the same topology and correctness paths as production, automated by Docker Compose. | **Prototype** | The three-Node Compose Riverbed is implemented and health checked; TLS and record replication are not yet production-equivalent. |
 | Incidents are obscure while components look healthy | Every diagnostic states what is happening, scope, cause, automatic action, current durability/availability risk, and next safe action. | **Designed** | Required output is documented; end-to-end implementation remains a roadmap gap. |
 
 ### Software-developer traceability
@@ -69,7 +69,7 @@ The tables below group related pains so that the response remains readable. They
 | Client configuration is enormous | SDKs negotiate safe behavior and adapt batching from observed traffic; applications configure intent and policy rather than transport internals. | **Planned** | Writer SDK begins in Milestone 2; production SDK coverage remains incomplete. |
 | Serialization errors appear far from their source | Optional Feed Schema Policy validates at admission and reports the offending field, compatibility rule, impact, and correction. | **Roadmap gap** | Schema behavior is designed but has no explicit implementation milestone. |
 | Schema Registry and schema formats add separate tooling | Schema identity, compatibility, validation, and generated clients live under the Whitewater control model while storage remains format-neutral. | **Roadmap gap** | No explicit schema milestone exists yet. |
-| Local development and integration tests are heavy | One Compose command starts the supported three-Node topology; client logic should also be testable against SDK abstractions without a Fabric. | **Prototype** | Three-Node Compose exists; lightweight SDK test doubles are not scheduled. |
+| Local development and integration tests are heavy | One Compose command starts the supported three-Node topology; client logic should also be testable against SDK abstractions without a Riverbed. | **Prototype** | Three-Node Compose exists; lightweight SDK test doubles are not scheduled. |
 | Kafka Streams state, changelogs, and repartition topics are magical | Pipes expose computation; persisted replicated Indexes expose current state and applied-Cursor freshness without application-managed changelog stores. | **Designed** | Indexes are Milestone 6; Pipes and atomic effects are Milestone 7. |
 | Stream joins, windows, grace periods, and late arrivals are difficult | Pipes expose business-duration rolling windows with managed panes, state, watermarks, lateness, and explainable cost rather than SDK-local window engines. | **Planned** | Rolling windows and late-event policy are scheduled in Milestone 7 with [six-language semantics](streams-clients.md); stream joins/session windows remain an explicit backlog gap. |
 | Replaying or deleting data becomes offset manipulation | Readers seek by opaque Cursor or time-oriented API; History Policy governs lifecycle separately from current-state Indexes. | **Foundation** | Cursor reads and WCL seek exist; time seek and complete replay UX are Milestone 3 or unscheduled, while lifecycle is Milestone 8. |
@@ -212,7 +212,7 @@ For software developers, Kafka's largest problem is that its implementation mode
 
 The shared problem is expertise amplification: once a workload leaves the happy path, both operators and developers must understand Kafka internals to preserve correctness and availability.
 
-Whitewater's opportunity is to make partitions, balancing, recovery, schemas, retries, state, observability, and scaling implementation details rather than mandatory expertise. Hiding those concepts is not enough. Whitewater must provide safe automation, stable public contracts, bounded behavior, and explanations of what the Fabric is doing and why.
+Whitewater's opportunity is to make partitions, balancing, recovery, schemas, retries, state, observability, and scaling implementation details rather than mandatory expertise. Hiding those concepts is not enough. Whitewater must provide safe automation, stable public contracts, bounded behavior, and explanations of what the Riverbed is doing and why.
 
 ## Product test for Whitewater work
 
@@ -221,7 +221,7 @@ For every feature, design, or operational control, ask:
 1. Which pain in this catalogue does the work remove or reduce?
 2. Does it eliminate responsibility, safely automate it, or merely rename it?
 3. What stable user-facing contract replaces the Kafka-specific knowledge?
-4. How does the Fabric explain automatic decisions and degraded states?
+4. How does the Riverbed explain automatic decisions and degraded states?
 5. What unit, integration, fault, or acceptance test proves the improvement?
 6. Does the happy path remain simple without making failure behavior obscure?
 7. Does the solution work consistently for operators and developers, including non-Java clients?

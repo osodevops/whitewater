@@ -54,7 +54,7 @@ def wait_for_fabric():
         except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
             pass
         time.sleep(1)
-    raise AssertionError("isolated four-Node Fabric did not become healthy")
+    raise AssertionError("isolated four-Node Riverbed did not become healthy")
 
 
 def main():

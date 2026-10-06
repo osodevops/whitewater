@@ -34,7 +34,7 @@ def main():
             pass
         time.sleep(1)
     if not healthy:
-        raise AssertionError("complete Fabric restart did not restore three healthy Nodes")
+        raise AssertionError("complete Riverbed restart did not restore three healthy Nodes")
     print(json.dumps({
         "status": "ok",
         "completed_suites": completed,

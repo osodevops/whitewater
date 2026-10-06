@@ -1,6 +1,6 @@
 # Whitewater Control Plane
 
-Whitewater presents one Fabric-wide **Control Plane**. Internally, three control voters use Raft majority consensus, but applications and operators do not manage a user-visible “quorum” resource.
+Each Whitewater Riverbed has one **Control Plane**. Internally, three control voters use Raft majority consensus, but applications and operators do not manage a user-visible “quorum” resource.
 
 ## Responsibilities
 
@@ -18,7 +18,7 @@ It does not replicate Feed records yet. Active-range data replication remains a 
 
 ## Three-voter baseline
 
-The standard development Fabric configures three voters:
+The standard development Riverbed configures three voters:
 
 ```text
 Node 1: node1:7070
@@ -200,11 +200,11 @@ FINNSTREAM_CONTROL_NODES=1@node1:7070,2@node2:7070,3@node3:7070
 
 Dynamic learner addition and joint-consensus membership changes are future work. Arbitrary data capacity Nodes do not automatically become Control Plane voters.
 
-For M1.4 fixed placement, the standard three configured Control Plane Nodes are also treated as storage-capable Nodes with stable internal IDs `control-1`, `control-2`, and `control-3`. Capability-aware placement across additional storage Nodes is Milestone 5 work; M1.4 deliberately proves consensus ownership before dynamic scheduling.
+For M1.4 fixed placement, the standard three configured Control Plane Nodes are also treated as storage-capable Nodes with stable internal IDs `control-1`, `control-2`, and `control-3`. The Control Plane now fixes each new Subscription progress replica set from the full configured eligible Node pool by SubscriptionId, while retaining RF3 per Subscription; 3/12/24-candidate tests are placement-only. Feed creation still initially takes the first three eligible Nodes, and current executable configuration derives eligible storage Nodes from the static Control Node list. Capability-aware placement, distinct storage roles, dynamic voter membership, and live 12/24-Node acceptance are Milestone 5 work—not a shipped promise of unlimited Riverbed size. Placement alone does not prove transport identity, recovery, or sustained capacity.
 
 ## Verified scenarios
 
-The three-Node Docker Fabric has demonstrated:
+The three-Node Docker Riverbed has demonstrated:
 
 - Initial leader election
 - Three-voter membership agreement
@@ -214,7 +214,7 @@ The three-Node Docker Fabric has demonstrated:
 - Identical FeedId/catalog state on every Node
 - Identical fixed RF3 Active Range assignment on every Node
 - Authenticated placement inspection through every voter
-- Placement recovery after complete Fabric restart
+- Placement recovery after complete Riverbed restart
 - Leader stop and new leader election
 - Successful mutation after leader failure
 - Restart and catch-up of the former leader

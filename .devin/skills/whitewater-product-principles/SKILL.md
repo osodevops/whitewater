@@ -44,7 +44,7 @@ If a proposal does not reduce a documented pain, justify why it belongs in White
 
 ## Non-negotiable experience principles
 
-- Preserve `fabric -> space -> feed -> key -> cursor -> subscription`; never expose physical partitions.
+- Preserve `riverbed -> space -> feed -> key -> cursor -> subscription`; never expose physical partitions.
 - Feed creation never asks for partition counts or physical placement.
 - Keys define ordering; physical ranges may split, merge, and move without changing the client contract.
 - Use opaque Cursors rather than public physical offsets.
@@ -97,7 +97,7 @@ Run the full gate **after the last edit**, not just earlier in development, befo
 
 1. Run `cargo fmt --check` and `cargo clippy --all-targets --all-features -- -D warnings`.
 2. Run `cargo test --all-targets`; this covers the repository's Rust unit and integration test targets. Run with the supported Rust Docker image if the host lacks Rust.
-3. Run every repository-maintained Python/Docker integration, fault, and live acceptance script in `scripts/test-*.py` sequentially against an isolated disposable test Fabric. The M1.11 fault suite invokes other scripts and restarts Compose; the M4 auto-split test `--force-recreate`s the default Fabric; other scripts stop/restart Nodes. Inspect exact side effects, project name, ports, data volumes, and credentials first. Never run them against the user's live Fabric or destroy/recreate persistent resources without specific approval. Do not let repeated suites share mutable state unsafely.
+3. Run every repository-maintained Python/Docker integration, fault, and live acceptance script in `scripts/test-*.py` sequentially against an isolated disposable test Riverbed. The M1.11 fault suite invokes other scripts and restarts Compose; the M4 auto-split test `--force-recreate`s the default Riverbed; other scripts stop/restart Nodes. Inspect exact side effects, project name, ports, data volumes, and credentials first. Never run them against the user's live Riverbed or destroy/recreate persistent resources without specific approval. Do not let repeated suites share mutable state unsafely.
 4. If any final verification fails, fix the cause and rerun the affected tests **and the full gate** after the change. Report each command and outcome; if Docker, isolation, authentication, permissions, or another safety condition blocks a suite, state exactly what was not run and why. Never say "all tests passed" or check off live acceptance if any required suite was skipped.
 
 This final gate applies to implementation work even if focused tests passed earlier. For documentation-only changes also verify links and `git diff --check`, and do not silently claim that unrun integration scripts passed.

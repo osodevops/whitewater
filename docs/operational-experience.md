@@ -5,7 +5,7 @@
 ## Document status
 
 - **Status:** Experience goals and design requirements
-- **Product:** Whitewater by FinnStream
+- **Product:** Whitewater
 - **Category:** Distributed database and partitionless streaming platform
 - **Companion documents:** [Sequence diagrams](sequence-diagrams.md), [Kafka pain points](kafka-pain-points.md), [Why Whitewater](why-whitewater.md), and [Whitewater architecture](kafka-successor-architecture.md)
 - **Audience:** Application developers, platform engineers, SREs, security teams, data engineers, FinOps, and incident responders
@@ -78,7 +78,7 @@ The platform engineer wants a service that behaves like a modern orchestrated wo
 Whitewater promise:
 
 - Nodes contribute capacity and advertise failure domains.
-- The Fabric incrementally places and moves internal ranges.
+- The Riverbed incrementally places and moves internal ranges.
 - Movement yields to foreground SLOs and has a disruption budget.
 - Scale-in is blocked until the candidate is drained and verified.
 - Desired state is declarative and reconciled through an orchestrator adapter.
@@ -114,7 +114,7 @@ Diagnostic output must include:
 
 1. What is happening
 2. Which logical resources are affected
-3. Why the Fabric believes it is happening
+3. Why the Riverbed believes it is happening
 4. What automatic action is in progress
 5. Whether durability or availability is reduced
 6. What a person can safely do next
@@ -137,7 +137,7 @@ Whitewater promise:
 - Dangerous durability reductions are not ordinary runtime settings.
 - Recovery actions expose expected data-loss and availability consequences before execution.
 - Every long-running control-plane action has progress, pause, cancel, and rollback semantics where correctness permits.
-- The Fabric automatically stops background movement when foreground health degrades.
+- The Riverbed automatically stops background movement when foreground health degrades.
 - Support bundles are automatically redacted and contain the relevant decision history.
 
 ### Security engineer
@@ -215,7 +215,7 @@ Acceptance criteria:
 
 - Adding one Node requires no Feed-level plan.
 - Foreground latency remains within its configured movement budget.
-- The Fabric reports bytes remaining, estimated completion range, and limiting resource.
+- The Riverbed reports bytes remaining, estimated completion range, and limiting resource.
 - A failed move resumes or rolls back without leaving ambiguous ownership.
 
 ### Consumer deployment causing a processing pause
@@ -263,7 +263,7 @@ Whitewater response:
 - Storage admission reserves emergency and recovery headroom.
 - Sealed segments tier continuously according to policy.
 - Placement considers projected growth, not only current bytes.
-- The Fabric begins evacuation before a hard threshold.
+- The Riverbed begins evacuation before a hard threshold.
 - Background Index maintenance and historical reads yield to active writes.
 - A full device is isolated; the Node remains available for unaffected resources where safe.
 
@@ -322,7 +322,7 @@ Whitewater response:
 Acceptance criteria:
 
 - One hot key does not obscure pressure from the rest of the Feed.
-- The Fabric never claims that adding Nodes can parallelize one strictly ordered key.
+- The Riverbed never claims that adding Nodes can parallelize one strictly ordered key.
 
 ### Replication settings trading durability for availability unexpectedly
 
@@ -364,7 +364,7 @@ Kafka security may involve listener-specific TLS and SASL settings, JAAS, keysto
 
 Whitewater response:
 
-- A development Fabric bootstraps a local CA and short-lived credentials automatically.
+- A development Riverbed bootstraps a local CA and short-lived credentials automatically.
 - Production integrates with an external CA/KMS but uses the same protocol.
 - Credential rotation supports overlapping validity.
 - Authorization policy can be simulated before activation.
@@ -382,7 +382,7 @@ Compacted topics preserve eventual latest values but do not provide a direct poi
 
 Whitewater response:
 
-- Key and secondary Indexes are Fabric resources.
+- Key and secondary Indexes are Riverbed resources.
 - Index state is persisted and replicated directly.
 - Index freshness is represented by an applied Cursor.
 - Query routing follows ownership automatically.
@@ -395,7 +395,7 @@ Acceptance criteria:
 - A point lookup does not scan a Feed.
 - Moving an Index or a rolling-window compute lease does not require application routing changes.
 - Strict reads reject stale replicas rather than silently returning old state.
-- A three-Node Fabric runs the same window contract as a scaled-out Fabric, while late-event handling and compute/state resource costs remain visible.
+- A three-Node Riverbed runs the same window contract as a scaled-out Riverbed, while late-event handling and compute/state resource costs remain visible.
 
 ### Disaster recovery requiring parallel offset translation
 
@@ -403,7 +403,7 @@ Cross-cluster Kafka DR commonly needs a replication system, topic naming policy,
 
 Whitewater response:
 
-- FeedId and Cursor formats are designed for Fabric/region identity from the beginning.
+- FeedId and Cursor formats are designed for Riverbed/region identity from the beginning.
 - A DR policy declares RPO, RTO, directionality, and conflict rules.
 - Remote replicas and Cursor checkpoints are control-plane resources rather than separately assembled connectors.
 - Failover and failback are exercised continuously with non-production probes.
@@ -435,7 +435,7 @@ Kafka operations often combine JMX metrics, exporter mappings, consumer-lag tool
 
 Whitewater response:
 
-- Metrics, traces, logs, events, and control-plane decisions share Fabric, Space, FeedId, SubscriptionId, PipeId, IndexId, and NodeId dimensions.
+- Metrics, traces, logs, events, and control-plane decisions share Riverbed, Space, FeedId, SubscriptionId, PipeId, IndexId, and NodeId dimensions.
 - High-cardinality key diagnostics are sampled and bounded.
 - Every automatic action records its inputs, policy, decision, and result.
 - A built-in health explanation API answers “why is this delayed?”
@@ -480,7 +480,7 @@ Errors should be actionable without requiring source-code archaeology. Runbooks 
 
 ### Preserve quiet systems
 
-A small Feed should remain cheap even inside a large Fabric. Background balancing, metrics, and metadata should not turn low-volume workloads into constant noise.
+A small Feed should remain cheap even inside a large Riverbed. Background balancing, metrics, and metadata should not turn low-volume workloads into constant noise.
 
 ### Keep development honest
 
@@ -534,7 +534,7 @@ Whitewater is not operationally better merely because its diagrams are cleaner. 
 
 - Roll forward and backward across every supported adjacent version.
 - Pause an upgrade automatically when replica health degrades.
-- Promote a remote Fabric and report measured RPO/RTO.
+- Promote a remote Riverbed and report measured RPO/RTO.
 - Fail back without name changes or manual Cursor translation.
 - Exercise DR automatically and prove the standby is usable.
 
@@ -565,8 +565,8 @@ Whitewater should expose stable machine interfaces before building a large UI:
 An MCP server may expose read-only inspection and recommendation tools for engineers and assistants:
 
 ```text
-whitewater.fabric.health
-whitewater.fabric.explain_pressure
+whitewater.riverbed.health
+whitewater.riverbed.explain_pressure
 whitewater.feed.describe
 whitewater.subscription.explain_delay
 whitewater.index.freshness

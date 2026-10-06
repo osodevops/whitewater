@@ -11,10 +11,10 @@ If this is a new Reddit **community/subreddit**, Reddit community names are perm
 ```text
 r/WhitewaterStreams
 r/WhitewaterDB
-r/WhitewaterFabric
+r/WhitewaterRiverbed
 ```
 
-The product remains **Whitewater by FinnStream** regardless of the community name.
+The product remains **Whitewater** regardless of the community name.
 
 ## Short community description
 
@@ -22,7 +22,7 @@ Whitewater is a clean-sheet Rust project for a distributed database and partitio
 
 ## Short channel description
 
-Discussing Whitewater by FinnStream: a Rust-based distributed database and streaming platform designed around Feeds, Keys, Cursors, Subscriptions, and first-class Indexes—with no public partitions or brokers.
+Discussing Whitewater: a Rust-based distributed database and streaming platform designed around Feeds, Keys, Cursors, Subscriptions, and first-class Indexes—with no public partitions or brokers.
 
 ## Suggested pinned-post title
 
@@ -39,10 +39,10 @@ Whitewater is intended to be both:
 
 The goal is not to reproduce the Kafka API in Rust. The goal is to remove the architectural coupling that makes Kafka powerful but difficult to evolve and operate.
 
-The public model is:
+The public model starts at the Riverbed boundary:
 
 ```text
-fabric -> space -> feed -> key -> cursor -> subscription
+riverbed -> space -> feed -> key -> cursor -> subscription
 ```
 
 Applications should not know which server owns their data, how many physical ranges exist, where replicas live, or how work moved after capacity changed.
@@ -184,7 +184,7 @@ Cursor       = opaque position in temporal history
 
 Kafka compacted topics can preserve eventual latest values, but a topic is not itself a point-query database. Kafka Streams commonly materializes local RocksDB state backed by compacted changelog topics, and applications still need to solve remote query routing and restoration.
 
-Whitewater makes an **Index** a first-class Fabric resource:
+Whitewater makes an **Index** a first-class Riverbed resource:
 
 ```text
 Feed:  commerce.orders.events
@@ -222,17 +222,17 @@ This separates event history from current state instead of asking one log-cleani
 
 ## Safer durability as the baseline
 
-A supported Whitewater Fabric always has at least three Nodes.
+A supported Whitewater Riverbed always has at least three Nodes.
 
 ```text
-minimum Fabric size:     3 Nodes
+minimum Riverbed size:     3 Nodes
 minimum active replicas: 3
 normal write quorum:      2 of 3
 ```
 
 This is the development topology too. Three containers on one laptop do not provide three physical failure domains, but they exercise the same membership and replication shape as production.
 
-There is no supported single-Node Fabric that quietly presents weaker durability under the same success response.
+There is no supported single-Node Riverbed that quietly presents weaker durability under the same success response.
 
 ## Security should not be an optional assembly exercise
 
@@ -362,7 +362,7 @@ The current Phase 1 Rust prototype includes:
 - Read-after-Cursor HTTP API
 - DNS-seeded Node discovery
 - Membership heartbeats, expiry, and graceful leave
-- Three-Node Docker development Fabric
+- Three-Node Docker development Riverbed
 - Arbitrary Docker replica scaling
 - Slow hysteresis-based scale recommendations
 - Node demand and storage-safety telemetry
@@ -401,7 +401,7 @@ Current Docker membership demonstrates discovery and control-loop behavior, not 
 - Durable segmented log
 - Opaque Cursors
 - Writer deduplication
-- Three-Node development Fabric
+- Three-Node development Riverbed
 - Failure and corruption tests
 
 ### Phase 2 — real distributed durability
@@ -453,7 +453,7 @@ Kafka:
 cluster -> broker -> topic -> partition -> offset -> consumer group
 
 Whitewater:
-fabric -> space -> feed -> key -> cursor -> subscription
+riverbed -> space -> feed -> key -> cursor -> subscription
 ```
 
 That is a larger and riskier project than implementing a faster broker. It may also create room for substantially simpler applications and operations.
@@ -482,7 +482,7 @@ No. A single strictly ordered Key remains sequential. Whitewater aims to isolate
 
 ### Are Indexes just Kafka Streams state stores?
 
-They solve related problems, but Whitewater intends Indexes to be persisted, replicated, queryable Fabric resources with automatic routing and explicit freshness—not application-local stores whose remote query API is left to each application.
+They solve related problems, but Whitewater intends Indexes to be persisted, replicated, queryable Riverbed resources with automatic routing and explicit freshness—not application-local stores whose remote query API is left to each application.
 
 ### Is the core schema-specific?
 

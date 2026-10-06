@@ -6,7 +6,7 @@ See the [Whitewater Admin API](admin-api.md) for authentication, typed JSON comm
 
 ## Prototype status
 
-WCL v0 uses the persistent three-Node Control Plane in the standard development Fabric. Requests may reach any Node, are forwarded to the elected leader, and complete after majority commit.
+WCL v0 uses the persistent three-Node Control Plane in the standard development Riverbed. Requests may reach any Node, are forwarded to the elected leader, and complete after majority commit.
 
 Current limitations:
 
@@ -244,7 +244,7 @@ Placement inspection is an authenticated operator control. Application Writers a
 INSPECT PLACEMENT FOR FEED orders.created;
 ```
 
-The standard three-Node Fabric creates one RF3 Active Range at Feed creation. The legacy `TRANSFER ACTIVE RANGE OWNERSHIP` syntax is still recognized but deliberately rejected: metadata-only transfer could promote a follower without verified committed history. Local owner-movement verification exists, but an authenticated live operator cutover is not yet available.
+The standard three-Node Riverbed creates one RF3 Active Range at Feed creation. The legacy `TRANSFER ACTIVE RANGE OWNERSHIP` syntax is still recognized but deliberately rejected: metadata-only transfer could promote a follower without verified committed history. Local owner-movement verification exists, but an authenticated live operator cutover is not yet available.
 
 ## Rename resources
 

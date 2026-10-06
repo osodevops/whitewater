@@ -10,7 +10,7 @@ WCL / wwctl / Rust AdminClient / any HTTP client / future MCP
     -> control-plane transaction
 ```
 
-The standard three-Node Fabric uses a persistent OpenRaft Control Plane. Commands submitted to any Node are forwarded to the elected leader and return only after majority commit. Nodes started without Control Plane configuration retain an explicit `local_prototype` fallback for isolated tests.
+The standard three-Node Riverbed uses a persistent OpenRaft Control Plane. Commands submitted to any Node are forwarded to the elected leader and return only after majority commit. Nodes started without Control Plane configuration retain an explicit `local_prototype` fallback for isolated tests.
 
 ## Authentication
 
@@ -68,7 +68,7 @@ GET /v1/feeds/records?feed=orders.events&after=<cursor>&limit=100
 Authorization: Bearer <api-key>
 ```
 
-The ingress retrieves each current range from its Append Owner over authenticated internal HTTP, merges committed frames, and checks placement again before returning. On Control Plane Fabrics, the first range page requires another current RF3 replica to confirm the owner's committed boundary and frame digest; an owner behind another replica, disagreement, missing corroboration, unavailable owner, or incomplete placement fails as retryable rather than returning a partial Feed. This per-read evidence is not yet a durable committed-frontier proof after multiple replica losses. New Cursors are derived from stable FeedId and request identity; older persisted tokens remain usable. An unknown, uncommitted, or wrong-Feed Cursor is rejected when it cannot resolve in that Feed. Single-range Feeds now seek an opaque committed Cursor through a rebuilt owner-side index and stream up to 32 records per byte-bounded internal page; the same path supports tail/new-only reads past record 10,000. Responses remain limited to 10,000 records and 16 MiB. Multi-range reads still scan bounded committed prefixes (at most 10,000 records per range and Feed, 16 MiB total, 128 ranges) and fail closed when the bound is exceeded. A full-history timestamp scan past the bound also fails rather than presenting an incomplete answer. Durable global multi-range ordering, checkpointed Cursor-index recovery, and production inter-Node mTLS remain planned.
+The ingress retrieves each current range from its Append Owner over authenticated internal HTTP, merges committed frames, and checks placement again before returning. On Control Plane Riverbeds, the first range page requires another current RF3 replica to confirm the owner's committed boundary and frame digest; an owner behind another replica, disagreement, missing corroboration, unavailable owner, or incomplete placement fails as retryable rather than returning a partial Feed. This per-read evidence is not yet a durable committed-frontier proof after multiple replica losses. New Cursors are derived from stable FeedId and request identity; older persisted tokens remain usable. An unknown, uncommitted, or wrong-Feed Cursor is rejected when it cannot resolve in that Feed. Single-range Feeds now seek an opaque committed Cursor through a rebuilt owner-side index and stream up to 32 records per byte-bounded internal page; the same path supports tail/new-only reads past record 10,000. Responses remain limited to 10,000 records and 16 MiB. Multi-range reads still scan bounded committed prefixes (at most 10,000 records per range and Feed, 16 MiB total, 128 ranges) and fail closed when the bound is exceeded. A full-history timestamp scan past the bound also fails rather than presenting an incomplete answer. Durable global multi-range ordering, checkpointed Cursor-index recovery, and production inter-Node mTLS remain planned.
 
 ## Execute WCL
 
@@ -300,7 +300,7 @@ Placement is an authenticated operator view. Writers and Readers never receive o
 }
 ```
 
-The result contains the internal RangeId, generation, current owner, RF3 replica set, ownership epoch, and any candidate owner-movement plans. The standard development Fabric currently treats its three statically configured Control Plane Nodes as storage-capable placement candidates.
+The result contains the internal RangeId, generation, current owner, RF3 replica set, ownership epoch, and any candidate owner-movement plans. The standard development Riverbed currently treats its three statically configured Control Plane Nodes as storage-capable placement candidates.
 
 The old `transfer_active_range_ownership` typed command is refused: changing the epoch alone can promote a lagging follower. The public typed Admin API also rejects owner recovery/readiness/activation commands requiring internal Node authority; operators must not synthesize catch-up evidence.
 
@@ -325,7 +325,7 @@ Content-Type: application/json
 
 The Control Plane persists an idempotent plan while the old RF3 assignment remains authoritative. The current owner drains in-flight majority appends, freezes its generation, captures its committed boundary, and the candidate freezes and checks identical committed positions, record bytes, identities, and Cursors one frame at a time. Only verified readiness allows compare-and-set activation with a higher ownership epoch; a definite pre-readiness failure unfreezes both, while ambiguous readiness/activation leaves them frozen until the plan is resolved. Retry using the **same request ID** and inspect placement. The owner can change without changing the Feed, RF3 set, or application Cursor.
 
-This is a correctness-first development workflow: the history scan refuses ranges above 10,000 committed records, and development inter-Node HTTP uses a shared internal credential without production mTLS/verified Node identity. `python scripts/test-m4-owner-move.py` exercises an **isolated three-Node** Fabric (ports 7271–7273), including an unavailable target, retry, continued writes, Cursor reads, and a new-owner restart without touching the standard Compose Fabric. Checkpointed large-history verification, throughput budgets, drain scheduling, and production transport security remain planned.
+This is a correctness-first development workflow: the history scan refuses ranges above 10,000 committed records, and development inter-Node HTTP uses a shared internal credential without production mTLS/verified Node identity. `python scripts/test-m4-owner-move.py` exercises an **isolated three-Node** Riverbed (ports 7271–7273), including an unavailable target, retry, continued writes, Cursor reads, and a new-owner restart without touching the standard Compose Riverbed. Checkpointed large-history verification, throughput budgets, drain scheduling, and production transport security remain planned.
 
 ### Replace a follower replica
 
@@ -349,7 +349,7 @@ Content-Type: application/json
 
 The Control Plane persists the plan but keeps the original RF3 assignment authoritative during bounded, authenticated committed-frame copy. The Append Owner then drains its in-flight quorum writes, freezes the source, truncates only uncommitted tail records, and verifies that the replacement is committed through the final source boundary before one consensus assignment change. The owner is unchanged; the ownership epoch advances, and the removed follower is fenced. The application does not get a topology callback. Retry a failed or timed-out request with the **same** request ID; inspect placement and plan state if the outcome is ambiguous.
 
-The current HTTP staging prototype transfers one bounded record per internal request and refuses ranges above 10,000 committed records; the original RF3 assignment remains active on refusal. The prepared plan remains visible in `INSPECT PLACEMENT`; after confirming activation was not submitted, an operator can clear it with the typed `abort_follower_move` command and its `plan_id`. Checkpointed streaming for larger histories and a foreground-SLO-aware movement budget remain planned. The regular three-Node development Fabric has no spare eligible fourth Node. `compose.m4-move.yml` provides an **isolated, test-only four-voter** Fabric for `python scripts/test-m4-follower-move.py`. This is not production role-separated storage placement. Append Owner movement uses the authenticated development workflow above; automatic Node drain remains planned.
+The current HTTP staging prototype transfers one bounded record per internal request and refuses ranges above 10,000 committed records; the original RF3 assignment remains active on refusal. The prepared plan remains visible in `INSPECT PLACEMENT`; after confirming activation was not submitted, an operator can clear it with the typed `abort_follower_move` command and its `plan_id`. Checkpointed streaming for larger histories and a foreground-SLO-aware movement budget remain planned. The regular three-Node development Riverbed has no spare eligible fourth Node. `compose.m4-move.yml` provides an **isolated, test-only four-voter** Riverbed for `python scripts/test-m4-follower-move.py`. This is not production role-separated storage placement. Append Owner movement uses the authenticated development workflow above; automatic Node drain remains planned.
 
 ### Grant
 
@@ -570,7 +570,7 @@ wcl-cli
 
 Persist those exports in `~/.zshrc` or the shell's equivalent. Use a secret manager rather than a shell profile for production credentials.
 
-Endpoint failover is safe for the standard three-Node Fabric because every Node routes through one replicated Control Plane. Nodes deliberately started without Control Plane configuration report `local_prototype`; do not mix those isolated test Nodes into an endpoint list.
+Endpoint failover is safe for the standard three-Node Riverbed because every Node routes through one replicated Control Plane. Nodes deliberately started without Control Plane configuration report `local_prototype`; do not mix those isolated test Nodes into an endpoint list.
 
 ## Any language can use the API
 
@@ -641,7 +641,7 @@ The development key proves the authenticated interface boundary. Production iden
 - Rate limiting
 - Replicated authentication state
 
-Until these exist, the current Admin key is one Fabric-wide prototype credential. Namespace grants are modeled and explainable but are not yet enforced against that credential.
+Until these exist, the current Admin key is one Riverbed-wide prototype credential. Namespace grants are modeled and explainable but are not yet enforced against that credential.
 
 ## Control-plane roadmap
 

@@ -32,7 +32,7 @@ The current delivery track is multiple internal Active Ranges. In parallel, [Mil
 ## F0 — Product and architecture
 
 - [x] Name the product Whitewater under FinnStream.
-- [x] Define the public model: `fabric -> space -> feed -> key -> cursor -> subscription`.
+- [x] Define the public model: `riverbed -> space -> feed -> key -> cursor -> subscription`.
 - [x] Replace Topic with Feed, Headers with Metadata, and Offset with opaque Cursor terminology.
 - [x] Define immutable FeedId and mutable dotted FeedName.
 - [x] Define lowercase dotted names and 512-byte maximum.
@@ -72,7 +72,7 @@ Evidence:
 
 - [x] Implement DNS-seeded Node discovery.
 - [x] Implement heartbeats, expiry, and graceful leave.
-- [x] Provide a fixed three-Node development Fabric.
+- [x] Provide a fixed three-Node development Riverbed.
 - [x] Provide arbitrary Docker membership scaling.
 - [x] Add demand and safe-to-remove telemetry.
 - [x] Add slow hysteresis-based scale recommendations.
@@ -109,7 +109,7 @@ Evidence:
 
 - [x] Name the public subsystem Control Plane; keep Raft/quorum terminology internal.
 - [x] Add persistent OpenRaft metadata consensus.
-- [x] Configure three static voters in the standard development Fabric.
+- [x] Configure three static voters in the standard development Riverbed.
 - [x] Implement leader election and authenticated internal Raft RPC.
 - [x] Forward Admin commands received by followers to the elected leader.
 - [x] Replicate deterministic commands and resource IDs.
@@ -222,7 +222,7 @@ Evidence:
 - Authenticated API tests prove placement inspection rejects unauthenticated requests.
 - Placement is prepared once by the leader and embedded in the replicated command; followers never derive it from local gossip or Node-local state.
 - Full verification passes with formatting, Clippy warnings denied, 42 library tests, 2 CLI tests, 5 placement integration tests, 9 Active Range store integration tests, and the storage restart test.
-- The rebuilt three-Node Docker Fabric returned one identical assignment from all voters and retained it across complete Fabric restart.
+- The rebuilt three-Node Docker Riverbed returned one identical assignment from all voters and retained it across complete Riverbed restart.
 
 ## M1.5 — Internal replica append protocol
 
@@ -246,7 +246,7 @@ Evidence:
 - API tests prove authentication runs before JSON body decoding.
 - Every durable response returns the BLAKE3 digest of the exact encoded frame persisted by `ActiveRangeStore`.
 - Full verification passes with formatting, Clippy warnings denied, 43 library tests, 2 CLI tests, 5 placement integration tests, 9 Active Range store integration tests, 6 replica protocol integration tests, and the storage restart test.
-- The rebuilt three-Node Docker Fabric rejected missing credentials before JSON decoding and durably persisted one live encoded frame on all three assigned replicas with an identical digest.
+- The rebuilt three-Node Docker Riverbed rejected missing credentials before JSON decoding and durably persisted one live encoded frame on all three assigned replicas with an identical digest.
 
 ## M1.6 — Majority commit
 
@@ -268,7 +268,7 @@ Evidence:
 - CommitPosition evidence is accepted only when the exact frame digest is already durable at that position on the current replica.
 - The production coordinator is wired to a bounded authenticated HTTP transport; M1.7 will expose the client append route.
 - Full verification passes with formatting, Clippy warnings denied, 43 library tests, 2 CLI tests, 5 placement tests, 9 Active Range store tests, 6 replica protocol tests, 6 majority-commit tests, and the storage restart test.
-- The rebuilt three-Node Docker Fabric durably accepted matching CommitPosition evidence for the same exact frame on all three replicas.
+- The rebuilt three-Node Docker Riverbed durably accepted matching CommitPosition evidence for the same exact frame on all three replicas.
 
 ## M1.7 — Route append through any Node
 
@@ -284,7 +284,7 @@ Evidence:
 
 - `POST /v1/feeds/append` accepts only Feed, Writer identity/epoch/sequence, key, payload, Metadata, event time, and request ID.
 - Non-owner ingress forwards the unchanged request over authenticated internal transport; only the owner encodes and majority-commits the record.
-- The rebuilt three-Node Fabric returned the same MessageId, Cursor, deduplication result, and `majority_committed` durability through the owner and both non-owner Nodes.
+- The rebuilt three-Node Riverbed returned the same MessageId, Cursor, deduplication result, and `majority_committed` durability through the owner and both non-owner Nodes.
 - Cross-Node retry with the same request ID and Writer sequence returned the original result without a duplicate.
 - `python scripts/test-m17-topology-free-append.py` automates three-Node health, authentication refusal, unique Feed creation, owner and both non-owner ingress paths, stable MessageId/Cursor, majority durability, deduplication, and unknown-Feed rejection.
 
@@ -374,7 +374,7 @@ Completion evidence:
 - [x] Network partitions owner from one follower.
 - [x] Network partitions owner from both followers.
 - [x] Same Writer sequence retries across pre-commit, ambiguous-commit, lost-response, and recovered-owner boundaries.
-- [x] Complete Fabric restarts and recovers committed data.
+- [x] Complete Riverbed restarts and recovers committed data.
 
 Evidence:
 
@@ -383,7 +383,7 @@ Evidence:
 - `tests/replica_append_protocol.rs` covers gaps, conflicting positions, invalid checksums, stale epochs, wrong owners, and committed-only visibility.
 - `tests/owner_recovery.rs` covers owner loss, CAS epoch transfer, stale-owner fencing, committed-prefix preservation, and tail removal.
 - `tests/replica_repair.rs` covers missing-frame catch-up and corruption quarantine/rebuild.
-- `python scripts/test-m111-fault-suite.py` runs topology-free append/retry, live owner failure, live replica restart/catch-up, and complete Fabric restart suites.
+- `python scripts/test-m111-fault-suite.py` runs topology-free append/retry, live owner failure, live replica restart/catch-up, and complete Riverbed restart suites.
 - The aggregate automated suite passed with no acknowledged record loss, uncommitted visibility, stale-owner success, or duplicate logical record.
 
 ## Milestone 1 Definition of Done
@@ -407,7 +407,7 @@ Do not begin Milestone 2 until D1–D10 are checked.
 
 ## What replication factor 3 means
 
-Replication factor 3 applies to each Active Range, not to the whole Fabric:
+Replication factor 3 applies to each Active Range, not to the whole Riverbed:
 
 ```text
 Active Range A -> Nodes 1, 2, 3
@@ -431,7 +431,7 @@ For one RF3 range:
 0 replicas healthy -> data unavailable
 ```
 
-A five-Node Fabric with RF3 has more placement and capacity options, but each range still tolerates only the failures allowed by its own three-replica set. Five cluster Nodes do not mean every range can tolerate two arbitrary Node failures while remaining writable. That stronger guarantee requires five replicas and a three-of-five majority.
+A five-Node Riverbed with RF3 has more placement and capacity options, but each range still tolerates only the failures allowed by its own three-replica set. Five cluster Nodes do not mean every range can tolerate two arbitrary Node failures while remaining writable. That stronger guarantee requires five replicas and a three-of-five majority.
 
 ## Recommended Node capability model
 
@@ -456,7 +456,7 @@ Cache capability
 
 A Node may combine capabilities.
 
-### Small development Fabric
+### Small development Riverbed
 
 ```text
 3 Nodes
@@ -649,7 +649,7 @@ Definition of Done:
 - [x] Split hot ranges online from sustained per-range append pressure with sampled key-token boundaries, cooldown, authenticated RF3 staging, and Control Plane cutover.
 - [x] Merge cold adjacent ranges using leader-aggregated cross-owner metrics, sustained low-rate evidence, cooldown, authenticated RF3 staging, rollback, Writer-state rebuild, and atomic activation.
 - [~] Move ranges while preserving same-Key ordering: authenticated follower replacement passes four-Node live acceptance, and authenticated frozen-boundary Append Owner cutover passes isolated three-Node live acceptance with unavailable-target retry and Cursor continuity. Unsafe metadata-only owner transfer remains refused. Checkpointed transfer/verification beyond the 10,000-record prototype bound, role-separated placement, automatic drain, movement budgets, and production Node identity/encryption remain.
-- [~] Keep opaque Cursors usable across range changes: the ingress fetches missing range owners for Feed/Reader reads, and a four-Node live test verifies continuation after follower movement. Control Plane Fabrics now require owner progress and frame-digest corroboration from another RF3 replica before serving a range; owner loss or lag fails closed. Single-range Feeds resolve committed Cursors through a rebuilt local index beyond the old 10,000-record prefix. Named Readers starting at Beginning now persist a versioned opaque delivered/acknowledged per-range frontier through the Control Plane and fetch bounded pages from current owners without rescanning a 10,000-record Feed prefix. Split/merge frontier translation, legacy deep Cursor seek, temporary/public Feed pagination, durable committed-frontier proof, bounded timestamp scans, and checkpointed index recovery remain.
+- [~] Keep opaque Cursors usable across range changes: the ingress fetches missing range owners for Feed/Reader reads, and a four-Node live test verifies continuation after follower movement. Control Plane Riverbeds now require owner progress and frame-digest corroboration from another RF3 replica before serving a range; owner loss or lag fails closed. Single-range Feeds resolve committed Cursors through a rebuilt local index beyond the old 10,000-record prefix. Named Readers starting at Beginning now persist a versioned opaque delivered/acknowledged per-range frontier through the Control Plane and fetch bounded pages from current owners without rescanning a 10,000-record Feed prefix. Split/merge frontier translation, legacy deep Cursor seek, temporary/public Feed pagination, durable committed-frontier proof, bounded timestamp scans, and checkpointed index recovery remain.
 - [~] Define and prove a versioned opaque multi-range read continuation/frontier without exposing placement: named Reader sessions now persist the frontier and return a Reader progress token distinct from record Cursors. Historical Writer Cursor seek, temporary/public Feed pagination, split/merge translation, retry identity, and concurrent-append/clock-skew fault evidence remain.
 - [ ] Persist an authoritative committed-frontier proof that survives loss of two local copies; current per-read RF3 corroboration cannot prove history that has already disappeared from a majority.
 - [ ] Add hot-key detection and isolation.
@@ -677,13 +677,13 @@ Evidence:
 - The Control Plane leader aggregates cumulative per-range counters from `/internal/active-range/pressure`, computes owner-independent rates, and invokes merge only after both adjacent ranges remain cold through the configured sustained window and cooldown policy.
 - Follower movement keeps the current owner and the two retained replicas authoritative during bounded committed-prefix transfer to a fourth eligible Node. A generation-scoped freeze under the majority append lock captures final commit progress, then a consensus compare-and-set can install the RF3 replacement and higher ownership epoch. A failed final copy unfreezes the old owner; ambiguous readiness or activation leaves it frozen pending Control Plane resolution.
 - `tests/active_range_placement.rs`, `tests/majority_commit.rs`, and `tests/replica_repair.rs` cover plan idempotency, stale-epoch refusal, snapshot recovery, catch-up gating, frozen-boundary behavior, failed-target rollback, ambiguity safety, Cursor-preserving restart, and continued ordered appends on the replacement. Authenticated internal movement export/stage/freeze endpoints gate Control Plane cutover, while a persisted completed-plan record makes retry-safe unfreeze possible after activation.
-- `python scripts/test-m4-follower-move.py` runs an isolated four-voter development Fabric, tests target outage before activation and retry using the same request ID, replaces one follower while maintaining RF3, appends through all ingress Nodes, verifies Cursor continuation on the new replica, and restarts it. It stops its containers without deleting persistent test volumes. The standard three-Node Fabric is untouched. Append-owner movement and production role separation are not yet implemented.
+- `python scripts/test-m4-follower-move.py` runs an isolated four-voter development Riverbed, tests target outage before activation and retry using the same request ID, replaces one follower while maintaining RF3, appends through all ingress Nodes, verifies Cursor continuation on the new replica, and restarts it. It stops its containers without deleting persistent test volumes. The standard three-Node Riverbed is untouched. Append-owner movement and production role separation are not yet implemented.
 - `active_range::replication` still refuses standalone local Feed reads when one range is absent, but public Feed and Reader endpoints now use a linearizable Control Plane placement check and authenticated owner-only per-range pages, returning a complete bounded merged result or retryable failure. Public Feed, temporary Reader, and legacy seek multi-range reads still refuse histories above 10,000 records per range or Feed, 16 MiB of decoded data, or 128 ranges; named Reader frontier reads use bounded per-range pages. Single-range reads page from a committed Cursor or the tail without rescanning earlier frames, within a per-response 10,000-record/16 MiB budget. Scalable global Cursor ordering/indexing remains unimplemented.
-- `python scripts/test-m4-cross-node-read.py` uses the isolated four-Node Fabric to split a Feed, move one follower so an ingress Node hosts only one of two ranges, then verify full Feed reads, Cursor continuation, named and temporary Readers, and no partial successful read when the remote owner is unavailable.
+- `python scripts/test-m4-cross-node-read.py` uses the isolated four-Node Riverbed to split a Feed, move one follower so an ingress Node hosts only one of two ranges, then verify full Feed reads, Cursor continuation, named and temporary Readers, and no partial successful read when the remote owner is unavailable.
 - `src/active_range/store.rs` rebuilds a committed Cursor-to-position index from the checked log on restart; storage tests verify truncation/collision safety and reconstruction past record 10,000. `api::tests::single_range_read_continues_beyond_ten_thousand_and_reports_unsupported_full_scan` verifies indexed start/tail continuation past the old prefix while refusing a full-history timestamp scan that cannot be served completely. Owner pages enforce a byte budget before materializing up to 32 frames. New Cursors bind stable FeedId as well as request identity, while persisted older tokens remain record-attached; a unit test checks cross-Feed distinction. Multi-range ordering still needs a durable logical read index.
 - Authenticated `/internal/active-range/read/evidence` provides assignment-fenced replica CommitPosition and digest at the read boundary. Before the first page, the current owner requires one other assigned replica to corroborate the committed prefix; any observed replica ahead of the owner or a mismatched checksum fails the read as retryable. `api::tests::read_quorum_refuses_a_lost_or_behind_owner_and_digest_disagreement` checks failure boundaries; `tests/majority_commit.rs` quarantines an owner store in a temporary directory and observes its lost progress against a surviving replica. This guards single-copy loss but is not a persisted quorum watermark after two-copy loss.
-- `ControlController` persists a bounded per-Reader delivery/acknowledgement frontier separately from public Reader definitions, restores acknowledged progress on session reopen, rejects stale session epochs and forged public typed commands, and clears the frontier on seek/drop. Named multi-range Reader fetch keeps a quorum-validated bounded head for every current range, merges only those heads for presentation, advances only the delivered range, and returns a versioned opaque `delivered_cursor`; per-record Cursors stay record-attached. `python scripts/test-m4-cross-node-read.py` verifies paging, acknowledgement, and reopening on another ingress Node on a split four-Node Fabric. It does not yet prove a >10,000-record multi-range Fabric, split/merge frontier migration, or identical fetch-response replay for the same request ID.
-- Owner-move planning persists an idempotent source assignment and higher-epoch candidate on the same RF3 set. Local finalization drains appends and freezes the source and target, refuses a lagging target, compares committed record bytes/Cursors/identities through the final boundary, then activates by Control Plane compare-and-set. `tests/active_range_placement.rs` covers readiness gating, snapshot recovery, operation conflicts, stale recovery placement, and legacy direct-transfer refusal; `tests/majority_commit.rs` covers lagging-target rollback, corrupt-but-caught-up target refusal, ambiguous readiness keeping both frozen, repair, old-owner fencing, and subsequent ordered appends. Verification reads one bounded frame at a time. Authenticated `/internal/active-range/owner-move/*` endpoints verify the frozen source and target over the network; `/v1/admin/ranges/move-owner` commits the plan and cutover, and `python scripts/test-m4-owner-move.py` passes against a separate three-Node Compose Fabric (ports 7271–7273), proving target-outage retry, continued appends, identical RF3 placement, Cursor continuity on every Node, and restart of the new owner. Production-grade Node authentication/encryption and large-history movement remain.
+- `ControlController` persists a bounded per-Reader delivery/acknowledgement frontier separately from public Reader definitions, restores acknowledged progress on session reopen, rejects stale session epochs and forged public typed commands, and clears the frontier on seek/drop. Named multi-range Reader fetch keeps a quorum-validated bounded head for every current range, merges only those heads for presentation, advances only the delivered range, and returns a versioned opaque `delivered_cursor`; per-record Cursors stay record-attached. `python scripts/test-m4-cross-node-read.py` verifies paging, acknowledgement, and reopening on another ingress Node on a split four-Node Riverbed. It does not yet prove a >10,000-record multi-range Riverbed, split/merge frontier migration, or identical fetch-response replay for the same request ID.
+- Owner-move planning persists an idempotent source assignment and higher-epoch candidate on the same RF3 set. Local finalization drains appends and freezes the source and target, refuses a lagging target, compares committed record bytes/Cursors/identities through the final boundary, then activates by Control Plane compare-and-set. `tests/active_range_placement.rs` covers readiness gating, snapshot recovery, operation conflicts, stale recovery placement, and legacy direct-transfer refusal; `tests/majority_commit.rs` covers lagging-target rollback, corrupt-but-caught-up target refusal, ambiguous readiness keeping both frozen, repair, old-owner fencing, and subsequent ordered appends. Verification reads one bounded frame at a time. Authenticated `/internal/active-range/owner-move/*` endpoints verify the frozen source and target over the network; `/v1/admin/ranges/move-owner` commits the plan and cutover, and `python scripts/test-m4-owner-move.py` passes against a separate three-Node Compose Riverbed (ports 7271–7273), proving target-outage retry, continued appends, identical RF3 placement, Cursor continuity on every Node, and restart of the new owner. Production-grade Node authentication/encryption and large-history movement remain.
 - These types are internal only; Feed, Key, Cursor, Writer, and Reader APIs remain unchanged.
 
 Definition of Done:
@@ -696,7 +696,7 @@ Definition of Done:
 
 - [ ] Integrate Node capabilities into placement.
 - [ ] Keep Control voters out of automatic replica-count scaling.
-- [ ] Demonstrate 12- and 24-Node live Fabrics with independently placed RF3 Feed ranges and Subscription progress shards, failure-domain separation, bounded Control Plane metadata/egress, and verified scale-in; the current eligible storage pool comes from statically configured Control Nodes and Feed creation still initially selects the first three. Do not claim an unbounded Node count from placement-only tests.
+- [ ] Demonstrate 12- and 24-Node live Riverbeds with independently placed RF3 Feed ranges and Subscription progress shards, failure-domain separation, bounded Control Plane metadata/egress, and verified scale-in; the current eligible storage pool comes from statically configured Control Nodes and Feed creation still initially selects the first three. Do not claim an unbounded Node count from placement-only tests.
 - [ ] Add storage-capable Nodes gradually when storage/append pressure is high.
 - [ ] Add stateless compute/gateway Nodes when processing or connection pressure is high; a fourth Node may take rolling-window Pipe leases but is never required or a single window master.
 - [ ] Drain according to capability before scale-in.
@@ -740,7 +740,7 @@ Definition of Done:
 ## Milestone 7 — Subscriptions, Pipes, and atomic effects
 
 - [x] Declare Space-scoped Subscriptions by logical name and source Feed through typed Control Plane commands and WCL, idempotently across snapshots; `stage=declared` does not allow clients to join or acknowledge. Tests prove a declaration creates no internal/public Feed and refuses cross-Space sources or unsafe Feed drop.
-- [~] Implement durable Subscription progress in hidden, ReaderId/SubscriptionId-sharded RF3 internal state and mutation journals, not Kafka-style internal Feeds. A local Fjall `subscription_progress` replica prototype now durably prepares one bounded, epoch-fenced mutation per SubscriptionId and keeps it invisible until a separate commit step with two distinct matching prepare votes; deterministic unit and restart integration tests reject conflicting retries, stale epochs and one-copy evidence. An in-process coordinator now checks a supplied three-replica assignment, requires the owner plus another matching durable prepare and commit result, and returns ambiguous failure if only one commit succeeds; deterministic integration tests cover one unavailable replica, contradictory votes, and retry after a partial commit. New declarations now persist a private initial owner, three replicas, and ownership epoch in Control Plane state, leader-selected over all configured eligible storage Nodes using SubscriptionId-scoped rendezvous scoring and replicated as fixed command placement; public Subscription definitions expose none of that topology. Snapshot/restart tests preserve this placement despite different local Node candidates, and older declarations without it fail closed. Deterministic tests with 3, 12, and 24 eligible candidates verify each Subscription still has RF3 while different Subscriptions spread across the configured pool; this is placement logic only, not a live 12/24-Node Fabric or an unbounded capacity claim. Each Control Plane Node now opens a private durable `subscription-progress` Fjall directory and exposes bounded internal prepare/commit endpoints protected by the development Control Plane key; receiver/owner/epoch and vote membership are checked against current private placement before blocking Fjall writes run off Tokio. An async HTTP transport targets assigned Node endpoints, and unit/router tests cover credential rejection, placement fencing, local persistence and request delivery. This is **not** production RF3: the shared development key does not verify sender Node identity or encrypt traffic, replica votes are not authenticated, the HTTP transport is not wired to a public consume path, and placement movement/drain and quorum-backed read/recovery remain absent. Member joins stay disabled. Persist separate expiring member leases, retry identities, and acknowledged frontiers without per-fetch Control Plane writes before enabling joins.
+- [~] Implement durable Subscription progress in hidden, ReaderId/SubscriptionId-sharded RF3 internal state and mutation journals, not Kafka-style internal Feeds. A local Fjall `subscription_progress` replica prototype now durably prepares one bounded, epoch-fenced mutation per SubscriptionId and keeps it invisible until a separate commit step with two distinct matching prepare votes; deterministic unit and restart integration tests reject conflicting retries, stale epochs and one-copy evidence. An in-process coordinator now checks a supplied three-replica assignment, requires the owner plus another matching durable prepare and commit result, and returns ambiguous failure if only one commit succeeds; deterministic integration tests cover one unavailable replica, contradictory votes, and retry after a partial commit. New declarations now persist a private initial owner, three replicas, and ownership epoch in Control Plane state, leader-selected over all configured eligible storage Nodes using SubscriptionId-scoped rendezvous scoring and replicated as fixed command placement; public Subscription definitions expose none of that topology. Snapshot/restart tests preserve this placement despite different local Node candidates, and older declarations without it fail closed. Deterministic tests with 3, 12, and 24 eligible candidates verify each Subscription still has RF3 while different Subscriptions spread across the configured pool; this is placement logic only, not a live 12/24-Node Riverbed or an unbounded capacity claim. Each Control Plane Node now opens a private durable `subscription-progress` Fjall directory and exposes bounded internal prepare/commit endpoints protected by the development Control Plane key; receiver/owner/epoch and vote membership are checked against current private placement before blocking Fjall writes run off Tokio. An async HTTP transport targets assigned Node endpoints, and unit/router tests cover credential rejection, placement fencing, local persistence and request delivery. This is **not** production RF3: the shared development key does not verify sender Node identity or encrypt traffic, replica votes are not authenticated, the HTTP transport is not wired to a public consume path, and placement movement/drain and quorum-backed read/recovery remain absent. Member joins stay disabled. Persist separate expiring member leases, retry identities, and acknowledged frontiers without per-fetch Control Plane writes before enabling joins.
 - [ ] Implement transaction/effect coordinator state in separately bounded and RF3-replicated internal storage, not an application-visible Feed; do not claim atomic consume-and-append from local Fjall transactions.
 - [~] Implement epoch-fenced small-work leases: `SubscriptionLeaseTracker` now locally proves member-session fencing, bounded claims, non-overlapping grants, idempotent claim, expiry, stale-ack rejection, renewal and checked-clock behavior. It is an isolated state-machine prototype; RF3 journal/placement, verified time source, failover recovery, authenticated transport and public member joins remain.
 - [ ] Implement incremental lease transfer.
@@ -783,7 +783,7 @@ Definition of Done:
 Definition of Done:
 
 - [ ] Rust, Python, Java, C#, Node.js/TypeScript, and Go applications can run the same named Whitewater Streams scenarios with equivalent results and retry safety, without choosing a range or co-partitioning.
-- [ ] Every published guide is executable against a supported three-Node Fabric, and unsupported operations fail explicitly.
+- [ ] Every published guide is executable against a supported three-Node Riverbed, and unsupported operations fail explicitly.
 
 ## Milestone 8 — Tiered history
 
@@ -812,7 +812,7 @@ Design: [Whitewater Operations Advisor](operations-advisor.md). This is **not im
 
 - [ ] Define versioned, correlated diagnostic schemas for Nodes, Control Plane, storage, Writers, Readers, and later Subscriptions/Indexes/Pipes, including cause, risk, automatic action, and next safe step.
 - [ ] Define a correlated health-explanation API spanning Writer, quorum, storage, Index, Subscription, and Reader stages.
-- [ ] Add bounded, redacted, authorized metrics/log/trace retrieval by Fabric, Space, Feed, Node, and time window; treat returned content as untrusted.
+- [ ] Add bounded, redacted, authorized metrics/log/trace retrieval by Riverbed, Space, Feed, Node, and time window; treat returned content as untrusted.
 - [ ] Expose read-only Whitewater health/explanation/recommendation tools via MCP, backed by the authenticated Admin API rather than a separate catalog.
 - [ ] Correlate scoped Kubernetes and network evidence through a least-privilege external integration without mounting infrastructure credentials in data Nodes.
 - [ ] Detect recurring busy/quiet schedules and incidents using bounded aggregates, confidence, drift detection, separate thresholds, hysteresis, and human feedback.
@@ -864,7 +864,7 @@ These tests accumulate across milestones and must never regress:
 - [ ] Historical replay during live traffic
 - [ ] Scale-out during peak traffic
 - [ ] Scale-in with under-replicated data
-- [ ] Complete Fabric restart
+- [ ] Complete Riverbed restart
 
 # Immediate next actions
 
@@ -873,7 +873,7 @@ These tests accumulate across milestones and must never regress:
 3. [x] Implement M1.2 domain types with unit tests.
 4. [x] Create the first failing torn-tail and uncommitted-tail truncation tests.
 5. [x] Implement and verify `ActiveRangeStore` from the tested recovery contract.
-6. [x] Write the failing M1.4 test that requires Feed creation to commit one identical RF3 Active Range assignment on every Control Plane voter and recover it after complete Fabric restart.
+6. [x] Write the failing M1.4 test that requires Feed creation to commit one identical RF3 Active Range assignment on every Control Plane voter and recover it after complete Riverbed restart.
 7. [x] Persist fixed Active Range placement and ownership epoch through the Control Plane.
 8. [x] Write the failing M1.5 replica protocol tests for identical bytes, position gaps, conflicts, invalid checksums, wrong generation, and stale ownership epoch.
 9. [x] Define the authenticated internal replica append request and response around the committed assignment.

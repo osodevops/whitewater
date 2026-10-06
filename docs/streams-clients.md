@@ -2,12 +2,12 @@
 
 **Status:** Product contract and delivery plan. The Rust Admin/Writer/Reader HTTP client foundation exists; there are no supported Python, Java, C#, Node.js/TypeScript, or Go libraries yet. Shared Subscriptions, Pipes, replicated StateStore queries, and atomic processing effects are not implemented. Illustrative processing flows below are **not runnable APIs**.
 
-Whitewater Streams should not repeat Kafka Streams' Java-only experience. Rust, Python, Java, C#, Node.js/TypeScript, and Go applications must have the **same logical operations and guarantees**, with idiomatic language syntax. Server-side Pipes and StateStores are shared Fabric capabilities, not six unrelated implementations of local state or co-partitioning. See [Kafka pain points](kafka-pain-points.md) and the [Index storage contract](why-whitewater.md#index-storage-contract-and-fjall-layout).
+Whitewater Streams should not repeat Kafka Streams' Java-only experience. Rust, Python, Java, C#, Node.js/TypeScript, and Go applications must have the **same logical operations and guarantees**, with idiomatic language syntax. Server-side Pipes and StateStores are shared Riverbed capabilities, not six unrelated implementations of local state or co-partitioning. See [Kafka pain points](kafka-pain-points.md) and the [Index storage contract](why-whitewater.md#index-storage-contract-and-fjall-layout).
 
 ## Public model and ownership
 
 ```text
-Fabric -> Space -> Feed -> Key -> Cursor -> Subscription
+Riverbed -> Space -> Feed -> Key -> Cursor -> Subscription
                         \-> StateStore / Index (named Space resources)
                         \-> Pipe (managed processing)
 ```
@@ -46,7 +46,7 @@ Keep shared behavior in a small language-neutral contract and per-language confo
 
 ## User guide: append and consume today
 
-1. Start the supported three-Node development Fabric and use the authenticated Admin API/WCL to create a Space, Feed, Writer, and Reader. The Rust `AdminClient` or `wwctl` exercises this existing path; Python acceptance scripts are not a published client.
+1. Start the supported three-Node development Riverbed and use the authenticated Admin API/WCL to create a Space, Feed, Writer, and Reader. The Rust `AdminClient` or `wwctl` exercises this existing path; Python acceptance scripts are not a published client.
 2. Open a Writer session and append a Key and bytes. Retain the request ID across timeout/reconnect retries. Do not derive a new request ID for an ambiguous append. The returned MessageId and Cursor identify the same committed record on an identical retry.
 3. Open a Reader session, fetch only committed records under a bounded capacity, process them, then acknowledge the response's **`delivered_cursor`** (not necessarily the Cursor on the last record). A multi-range named Reader can return an opaque progress token distinct from any Writer's record Cursor. Unacknowledged work may be delivered again after restart; do not infer physical positions from either token.
 
@@ -81,7 +81,7 @@ output Feed:    activity.enriched
 
 for each committed input event:
     extract userId with a versioned field definition
-    get accounts.users[userId] through the Fabric at an explicit state version/consistency
+    get accounts.users[userId] through the Riverbed at an explicit state version/consistency
     if absent or behind: follow declared retry/quarantine policy, do not ack success
     else: derive enriched output
     commit(input Cursor, output event, effect identity, chosen state version) as one Whitewater effect
@@ -112,7 +112,7 @@ A managed rolling view is not currently implemented. It depends on RF3 StateStor
 
 ## Guide set to publish with each SDK
 
-Each language's documentation must run the **same named acceptance scenarios** and show matching results: install/authentication and secure configuration; create or inspect logical resources; idempotent Writer append and batch; temporary and named Reader fetch/ack/replay; shared Subscription and capacity; logical StateStore primary/secondary lookup; manual and Feed-derived state; enrichment Pipe and rolling-window count/sum/average with late-event policy; retry/quarantine and restart/failure recovery; error handling; and migration from Kafka clients/Streams without co-partitioning. Unimplemented chapters are marked planned, not presented as runnable samples. Supply SDK test doubles for application unit tests without a live Fabric, but run every example against a real three-Node Fabric in CI before publishing it.
+Each language's documentation must run the **same named acceptance scenarios** and show matching results: install/authentication and secure configuration; create or inspect logical resources; idempotent Writer append and batch; temporary and named Reader fetch/ack/replay; shared Subscription and capacity; logical StateStore primary/secondary lookup; manual and Feed-derived state; enrichment Pipe and rolling-window count/sum/average with late-event policy; retry/quarantine and restart/failure recovery; error handling; and migration from Kafka clients/Streams without co-partitioning. Unimplemented chapters are marked planned, not presented as runnable samples. Supply SDK test doubles for application unit tests without a live Riverbed, but run every example against a real three-Node Riverbed in CI before publishing it.
 
 ## Shared release and conformance gate
 
