@@ -27,7 +27,7 @@ use openraft::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex, Semaphore};
 use uuid::Uuid;
 
 use crate::{
@@ -45,6 +45,7 @@ use crate::{
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
     codec::{decode_record, encode_record, MAX_FRAME_BYTES},
+    config::SubscriptionMtlsConfig,
     control::{
         ControlController, ControlError, RangeMergePlan, RangeMovePlan, RangeMoveStage,
         RangeOwnerMovePlan, RangeSplitPlan, ReplicatedCommand,
@@ -65,6 +66,9 @@ use crate::{
 };
 
 #[derive(Clone)]
+pub struct AuthenticatedSubscriptionPeer(pub StorageNodeId);
+
+#[derive(Clone)]
 pub struct AppState {
     pub store: Arc<dyn LogStore>,
     pub membership: Arc<MembershipService>,
@@ -74,12 +78,147 @@ pub struct AppState {
     pub control_plane: Option<Arc<ControlPlane>>,
     pub replica_append: Option<Arc<ReplicaAppendService>>,
     pub subscription_progress: Option<Arc<SubscriptionProgressReplicaService>>,
+    pub subscription_mtls_enabled: bool,
     pub majority_append: Option<Arc<MajorityAppendCoordinator>>,
     pub storage_node_id: Option<StorageNodeId>,
     pub control_endpoints: Arc<BTreeMap<StorageNodeId, String>>,
     pub internal_key: Option<String>,
     pub internal_http: reqwest::Client,
     pub admin_auth: AdminAuthenticator,
+}
+
+pub struct SubscriptionTlsServer {
+    acceptor: tokio_rustls::TlsAcceptor,
+    peer_pins: Arc<BTreeMap<StorageNodeId, std::collections::BTreeSet<[u8; 32]>>>,
+}
+
+impl SubscriptionTlsServer {
+    pub async fn from_config(
+        config: &SubscriptionMtlsConfig,
+        local_node: &StorageNodeId,
+    ) -> anyhow::Result<Self> {
+        use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+        let mut files = Vec::new();
+        for path in [&config.cert_path, &config.key_path, &config.ca_path] {
+            if tokio::fs::metadata(path).await?.len() > 1024 * 1024 {
+                anyhow::bail!("Subscription mTLS certificate material exceeds the 1 MiB limit");
+            }
+            files.push(tokio::fs::read(path).await?);
+        }
+        let certs = CertificateDer::pem_slice_iter(&files[0]).collect::<Result<Vec<_>, _>>()?;
+        let leaf = certs
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Subscription mTLS certificate is missing"))?;
+        if config
+            .peer_pins
+            .get(local_node)
+            .is_none_or(|pins| !pins.contains(blake3::hash(leaf.as_ref()).as_bytes()))
+        {
+            anyhow::bail!("local Subscription mTLS certificate does not match this Node's pin");
+        }
+        let mut all_pins = std::collections::BTreeSet::new();
+        for pins in config.peer_pins.values() {
+            if pins.is_empty() || pins.iter().any(|pin| !all_pins.insert(*pin)) {
+                anyhow::bail!("Subscription mTLS peer certificates must map to one Node each");
+            }
+        }
+        let key = PrivateKeyDer::from_pem_slice(&files[1])?;
+        let mut roots = rustls::RootCertStore::empty();
+        for ca in CertificateDer::pem_slice_iter(&files[2]) {
+            roots.add(ca?)?;
+        }
+        if roots.is_empty() {
+            anyhow::bail!("Subscription mTLS trust roots are missing");
+        }
+        let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
+        let mut server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()?
+        .with_client_cert_verifier(verifier)
+        .with_single_cert(certs, key)?;
+        server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Ok(Self {
+            acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
+            peer_pins: Arc::new(config.peer_pins.clone()),
+        })
+    }
+
+    pub async fn serve(
+        self,
+        listener: tokio::net::TcpListener,
+        app: Router,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> anyhow::Result<()> {
+        let capacity = Arc::new(Semaphore::new(128));
+        if *shutdown.borrow() {
+            return Ok(());
+        }
+        loop {
+            let permit = tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { break; }
+                    continue;
+                }
+                permit = capacity.clone().acquire_owned() => permit?,
+            };
+            let (socket, _) = tokio::select! {
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { break; }
+                    continue;
+                }
+                accepted = listener.accept() => accepted?,
+            };
+            let acceptor = self.acceptor.clone();
+            let pins = self.peer_pins.clone();
+            let app = app.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let stream =
+                    match tokio::time::timeout(Duration::from_secs(5), acceptor.accept(socket))
+                        .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "Subscription mTLS handshake rejected");
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::warn!("Subscription mTLS handshake timed out");
+                            return;
+                        }
+                    };
+                let Some(leaf) = stream
+                    .get_ref()
+                    .1
+                    .peer_certificates()
+                    .and_then(|chain| chain.first())
+                else {
+                    tracing::warn!("Subscription mTLS peer certificate is missing");
+                    return;
+                };
+                let fingerprint = blake3::hash(leaf.as_ref());
+                let Some(node) = pins.iter().find_map(|(node, pin)| {
+                    pin.contains(fingerprint.as_bytes()).then(|| node.clone())
+                }) else {
+                    tracing::warn!("Subscription mTLS peer certificate is not pinned to a Node");
+                    return;
+                };
+                let service = hyper_util::service::TowerToHyperService::new(
+                    app.layer(axum::Extension(AuthenticatedSubscriptionPeer(node))),
+                );
+                if let Err(error) = hyper_util::server::conn::auto::Builder::new(
+                    hyper_util::rt::TokioExecutor::new(),
+                )
+                .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                .await
+                {
+                    tracing::warn!(%error, "Subscription mTLS connection failed");
+                }
+            });
+        }
+        Ok(())
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -209,7 +348,7 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             authorize_replica_append,
         ));
-    Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/v1/streams", get(list_streams).post(create_stream))
         .route("/v1/streams/describe", get(describe_stream))
@@ -259,18 +398,6 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/internal/active-range/replica/commit",
             replica_commit_route,
-        )
-        .route(
-            "/internal/subscription-progress/prepare",
-            subscription_prepare_route,
-        )
-        .route(
-            "/internal/subscription-progress/commit",
-            subscription_commit_route,
-        )
-        .route(
-            "/internal/subscription-progress/committed",
-            subscription_committed_route,
         )
         .route("/internal/active-range/owner/append", owner_append_route)
         .route(
@@ -328,7 +455,39 @@ pub fn router(state: AppState) -> Router {
             post(autoscale_recommendation),
         )
         .route("/v1/cluster/join", post(cluster_join))
-        .route("/v1/cluster/leave", post(cluster_leave))
+        .route("/v1/cluster/leave", post(cluster_leave));
+    if !state.subscription_mtls_enabled {
+        app = app
+            .route(
+                "/internal/subscription-progress/prepare",
+                subscription_prepare_route,
+            )
+            .route(
+                "/internal/subscription-progress/commit",
+                subscription_commit_route,
+            )
+            .route(
+                "/internal/subscription-progress/committed",
+                subscription_committed_route,
+            );
+    }
+    app.with_state(state)
+}
+
+pub fn subscription_mtls_router(state: AppState) -> Router {
+    Router::new()
+        .route(
+            "/internal/subscription-progress/prepare",
+            post(subscription_prepare_local).layer(DefaultBodyLimit::max(512 * 1024)),
+        )
+        .route(
+            "/internal/subscription-progress/commit",
+            post(subscription_commit_local).layer(DefaultBodyLimit::max(512 * 1024)),
+        )
+        .route(
+            "/internal/subscription-progress/committed",
+            post(subscription_committed_local).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .with_state(state)
 }
 
@@ -598,6 +757,20 @@ async fn replica_commit(
     }))
 }
 
+fn check_subscription_peer(
+    state: &AppState,
+    peer: Option<&AuthenticatedSubscriptionPeer>,
+    owner: &StorageNodeId,
+) -> Result<(), ApiError> {
+    if state.subscription_mtls_enabled && peer.is_none_or(|peer| &peer.0 != owner) {
+        return Err(ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            message: "Subscription progress requires the assigned owner's mTLS identity".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn subscription_progress_api_error(error: SubscriptionProgressError) -> ApiError {
     let status = match error {
         SubscriptionProgressError::Unavailable
@@ -614,11 +787,13 @@ fn subscription_progress_api_error(error: SubscriptionProgressError) -> ApiError
 
 async fn subscription_prepare_local(
     State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
     Json(request): Json<SubscriptionPrepareRequest>,
 ) -> Result<
     Json<crate::reader::SubscriptionReplicaReply<crate::reader::SubscriptionPrepareVote>>,
     ApiError,
 > {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0), &request.owner)?;
     let service = state
         .subscription_progress
         .as_ref()
@@ -633,11 +808,13 @@ async fn subscription_prepare_local(
 
 async fn subscription_commit_local(
     State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
     Json(request): Json<SubscriptionCommitRequest>,
 ) -> Result<
     Json<crate::reader::SubscriptionReplicaReply<crate::reader::SubscriptionProgressMutation>>,
     ApiError,
 > {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0), &request.owner)?;
     let service = state
         .subscription_progress
         .as_ref()
@@ -652,6 +829,7 @@ async fn subscription_commit_local(
 
 async fn subscription_committed_local(
     State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
     Json(request): Json<SubscriptionCommittedReadRequest>,
 ) -> Result<
     Json<
@@ -661,6 +839,7 @@ async fn subscription_committed_local(
     >,
     ApiError,
 > {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0), &request.owner)?;
     let service = state
         .subscription_progress
         .as_ref()
@@ -4857,6 +5036,7 @@ mod tests {
             control_plane: None,
             majority_append: None,
             subscription_progress: None,
+            subscription_mtls_enabled: false,
             storage_node_id: Some(assignment.owner),
             control_endpoints: Arc::new(BTreeMap::new()),
             internal_key: None,
@@ -4952,6 +5132,7 @@ mod tests {
             replica_append: None,
             majority_append: None,
             subscription_progress: None,
+            subscription_mtls_enabled: false,
             storage_node_id: None,
             control_endpoints: Arc::new(BTreeMap::new()),
             internal_key: None,
@@ -4963,10 +5144,10 @@ mod tests {
         })
     }
 
-    async fn internal_replica_test_router(
+    async fn internal_replica_test_state(
         directory: &TempDir,
     ) -> (
-        Router,
+        AppState,
         Arc<ControlPlane>,
         Arc<ControlController>,
         Arc<crate::reader::FjallSubscriptionProgressReplica>,
@@ -5027,7 +5208,7 @@ mod tests {
             subscription_replica.clone(),
         ));
         (
-            router(AppState {
+            AppState {
                 store,
                 membership,
                 demand: DemandMetrics::default(),
@@ -5037,6 +5218,7 @@ mod tests {
                 replica_append: Some(replica_append),
                 majority_append: None,
                 subscription_progress: Some(subscription_progress),
+                subscription_mtls_enabled: false,
                 storage_node_id: Some(
                     crate::active_range::StorageNodeId::try_new("control-1").unwrap(),
                 ),
@@ -5047,11 +5229,23 @@ mod tests {
                     "this-is-a-long-development-api-key".to_owned(),
                 ))
                 .unwrap(),
-            }),
+            },
             control_plane,
             control,
             subscription_replica,
         )
+    }
+
+    async fn internal_replica_test_router(
+        directory: &TempDir,
+    ) -> (
+        Router,
+        Arc<ControlPlane>,
+        Arc<ControlController>,
+        Arc<crate::reader::FjallSubscriptionProgressReplica>,
+    ) {
+        let (state, plane, control, replica) = internal_replica_test_state(directory).await;
+        (router(state), plane, control, replica)
     }
 
     fn admin_request(path: &str, body: Value, api_key: Option<&str>) -> Request<Body> {
@@ -5340,6 +5534,387 @@ mod tests {
             Err(SubscriptionProgressError::Unavailable)
         ));
         server.abort();
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_mtls_refuses_downgrade_unpinned_peers_and_wrong_owner() {
+        let directory = TempDir::new().unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params =
+            rcgen::CertificateParams::new(vec!["riverbed-test-ca".to_owned()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let nodes = ["control-1", "control-2", "control-3"]
+            .map(|name| StorageNodeId::try_new(name).unwrap());
+        let mut pins = BTreeMap::new();
+        let mut certificates = BTreeMap::new();
+        for node in &nodes {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec![node.as_str().to_owned()]).unwrap();
+            params.extended_key_usages = vec![
+                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            ];
+            let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
+            pins.insert(
+                node.clone(),
+                std::collections::BTreeSet::from([*blake3::hash(cert.der().as_ref()).as_bytes()]),
+            );
+            certificates.insert(
+                node.clone(),
+                format!("{}{}", cert.pem(), key.serialize_pem()),
+            );
+            if node == &nodes[0] {
+                tokio::fs::write(directory.path().join("node.pem"), cert.pem())
+                    .await
+                    .unwrap();
+                tokio::fs::write(directory.path().join("node.key"), key.serialize_pem())
+                    .await
+                    .unwrap();
+            }
+        }
+        tokio::fs::write(directory.path().join("ca.pem"), ca.pem())
+            .await
+            .unwrap();
+        let config = SubscriptionMtlsConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            cert_path: directory.path().join("node.pem"),
+            key_path: directory.path().join("node.key"),
+            ca_path: directory.path().join("ca.pem"),
+            peer_pins: pins,
+        };
+        let mut wrong_config = config.clone();
+        wrong_config.peer_pins.insert(
+            nodes[0].clone(),
+            std::collections::BTreeSet::from([*blake3::hash(b"wrong").as_bytes()]),
+        );
+        assert!(SubscriptionTlsServer::from_config(&wrong_config, &nodes[0])
+            .await
+            .is_err());
+        let server = SubscriptionTlsServer::from_config(&config, &nodes[0])
+            .await
+            .unwrap();
+        let (mut state, control_plane, control, replica) =
+            internal_replica_test_state(&directory).await;
+        state.subscription_mtls_enabled = true;
+        let public = router(state.clone());
+        let unauthenticated = public
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/subscription-progress/prepare")
+                    .header(
+                        "x-whitewater-control-key",
+                        "this-is-a-long-control-plane-key",
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::NOT_FOUND);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let tls_task = tokio::spawn(server.serve(
+            listener,
+            subscription_mtls_router(state.clone()),
+            shutdown_rx,
+        ));
+        let endpoint = format!(
+            "https://control-1:{}/internal/subscription-progress",
+            address.port()
+        );
+        let make_client = |identity: Option<&str>| {
+            let mut builder = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(reqwest::Certificate::from_pem(ca.pem().as_bytes()).unwrap())
+                .resolve("control-1", address);
+            if let Some(identity) = identity {
+                builder =
+                    builder.identity(reqwest::Identity::from_pem(identity.as_bytes()).unwrap());
+            }
+            builder.build().unwrap()
+        };
+        let subscription = control
+            .active_subscription_by_name("orders.billing")
+            .await
+            .unwrap();
+        let assignment = control
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        let mutation = crate::reader::SubscriptionProgressMutation {
+            subscription_id: subscription.subscription_id,
+            feed_id: subscription.feed_id,
+            ownership_epoch: assignment.ownership_epoch,
+            sequence: 1,
+            request_id: Uuid::from_u128(960),
+            expected_cursor: None,
+            cursor: "rf1_page".to_owned(),
+            positions: BTreeMap::from([(
+                RangeId::from_uuid(Uuid::from_u128(961)),
+                "record".to_owned(),
+            )]),
+        };
+        let request = SubscriptionPrepareRequest {
+            owner: assignment.owner.clone(),
+            receiver: nodes[0].clone(),
+            mutation: mutation.clone(),
+        };
+        let no_peer = subscription_mtls_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/subscription-progress/prepare")
+                    .header(
+                        "x-whitewater-control-key",
+                        "this-is-a-long-control-plane-key",
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(no_peer.status(), StatusCode::UNAUTHORIZED);
+        assert!(matches!(
+            crate::reader::HttpSubscriptionProgressTransport::new_mtls(
+                assignment.clone(),
+                BTreeMap::from([(nodes[0].clone(), "http://control-1:7070".to_owned())]),
+                ca.pem().as_bytes(),
+                certificates[&assignment.owner].as_bytes(),
+                Duration::from_secs(2),
+            ),
+            Err(SubscriptionProgressError::InvalidAssignment)
+        ));
+        assert!(crate::reader::HttpSubscriptionProgressTransport::new_mtls(
+            assignment.clone(),
+            BTreeMap::from([(nodes[0].clone(), "https://control-1:7070".to_owned())]),
+            ca.pem().as_bytes(),
+            certificates[&assignment.owner].as_bytes(),
+            Duration::from_secs(2),
+        )
+        .is_ok());
+        assert!(make_client(None)
+            .post(format!("{endpoint}/prepare"))
+            .json(&request)
+            .send()
+            .await
+            .is_err());
+        let other = nodes
+            .iter()
+            .find(|node| *node != &assignment.owner)
+            .unwrap();
+        let other_client = make_client(Some(&certificates[other]));
+        assert_eq!(
+            other_client
+                .post(format!("{endpoint}/prepare"))
+                .header(
+                    "x-whitewater-control-key",
+                    "this-is-a-long-control-plane-key"
+                )
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let rogue_key = rcgen::KeyPair::generate().unwrap();
+        let rogue_cert = rcgen::CertificateParams::new(vec!["rogue-node".to_owned()])
+            .unwrap()
+            .signed_by(&rogue_key, &ca, &ca_key)
+            .unwrap();
+        let rogue_identity = format!("{}{}", rogue_cert.pem(), rogue_key.serialize_pem());
+        assert!(make_client(Some(&rogue_identity))
+            .post(format!("{endpoint}/prepare"))
+            .json(&request)
+            .send()
+            .await
+            .is_err());
+        let owner_client = make_client(Some(&certificates[&assignment.owner]));
+        let mut claimed_other = request.clone();
+        claimed_other.owner = other.clone();
+        assert_eq!(
+            owner_client
+                .post(format!("{endpoint}/prepare"))
+                .json(&claimed_other)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let accepted = owner_client
+            .post(format!("{endpoint}/prepare"))
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let vote: crate::reader::SubscriptionReplicaReply<crate::reader::SubscriptionPrepareVote> =
+            accepted.json().await.unwrap();
+        assert_eq!(vote.replica, nodes[0]);
+        assert_eq!(vote.result.request_id, mutation.request_id);
+        assert!(replica
+            .local_committed(subscription.subscription_id)
+            .unwrap()
+            .is_none());
+        let read = SubscriptionCommittedReadRequest {
+            owner: assignment.owner.clone(),
+            receiver: nodes[0].clone(),
+            subscription_id: subscription.subscription_id,
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        let uncommitted: crate::reader::SubscriptionReplicaReply<
+            Option<crate::reader::SubscriptionProgressMutation>,
+        > = owner_client
+            .post(format!("{endpoint}/committed"))
+            .json(&read)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(uncommitted.result.is_none());
+        assert_eq!(
+            other_client
+                .post(format!("{endpoint}/committed"))
+                .json(&read)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let evidence = json!({
+            "votes": [[assignment.owner, vote.result.digest], [other, vote.result.digest]],
+            "subscription_id": subscription.subscription_id, "request_id": mutation.request_id,
+        });
+        let commit = json!({"owner": assignment.owner, "receiver": nodes[0],
+            "subscription_id": subscription.subscription_id,
+            "ownership_epoch": assignment.ownership_epoch, "evidence": evidence});
+        assert_eq!(
+            other_client
+                .post(format!("{endpoint}/commit"))
+                .json(&commit)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let committed: crate::reader::SubscriptionReplicaReply<
+            crate::reader::SubscriptionProgressMutation,
+        > = owner_client
+            .post(format!("{endpoint}/commit"))
+            .json(&commit)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(committed.result, mutation);
+        let observed: crate::reader::SubscriptionReplicaReply<
+            Option<crate::reader::SubscriptionProgressMutation>,
+        > = owner_client
+            .post(format!("{endpoint}/committed"))
+            .json(&read)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(observed.result, Some(mutation.clone()));
+        let wrong_server = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(reqwest::Certificate::from_pem(ca.pem().as_bytes()).unwrap())
+            .identity(
+                reqwest::Identity::from_pem(certificates[&assignment.owner].as_bytes()).unwrap(),
+            )
+            .resolve("control-2", address)
+            .build()
+            .unwrap();
+        assert!(wrong_server
+            .post(format!(
+                "https://control-2:{}/internal/subscription-progress/committed",
+                address.port()
+            ))
+            .json(&read)
+            .send()
+            .await
+            .is_err());
+        shutdown_tx.send(true).unwrap();
+        tls_task.await.unwrap().unwrap();
+        let rotated_key = rcgen::KeyPair::generate().unwrap();
+        let mut rotated_params =
+            rcgen::CertificateParams::new(vec!["control-1".to_owned()]).unwrap();
+        rotated_params.extended_key_usages = vec![
+            rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+            rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+        ];
+        let rotated = rotated_params
+            .signed_by(&rotated_key, &ca, &ca_key)
+            .unwrap();
+        let mut rotating_config = config.clone();
+        rotating_config
+            .peer_pins
+            .get_mut(&nodes[0])
+            .unwrap()
+            .insert(*blake3::hash(rotated.der().as_ref()).as_bytes());
+        tokio::fs::write(&config.cert_path, rotated.pem())
+            .await
+            .unwrap();
+        tokio::fs::write(&config.key_path, rotated_key.serialize_pem())
+            .await
+            .unwrap();
+        let new_server = SubscriptionTlsServer::from_config(&rotating_config, &nodes[0])
+            .await
+            .unwrap();
+        let new_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let new_address = new_listener.local_addr().unwrap();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let new_task =
+            tokio::spawn(new_server.serve(new_listener, subscription_mtls_router(state), stop_rx));
+        let rotation_client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(3))
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(reqwest::Certificate::from_pem(ca.pem().as_bytes()).unwrap())
+            .identity(
+                reqwest::Identity::from_pem(certificates[&assignment.owner].as_bytes()).unwrap(),
+            )
+            .resolve("control-1", new_address)
+            .build()
+            .unwrap();
+        let after_rotation: crate::reader::SubscriptionReplicaReply<
+            Option<crate::reader::SubscriptionProgressMutation>,
+        > = rotation_client
+            .post(format!(
+                "https://control-1:{}/internal/subscription-progress/committed",
+                new_address.port()
+            ))
+            .json(&read)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(after_rotation.result, Some(mutation));
+        stop_tx.send(true).unwrap();
+        new_task.await.unwrap().unwrap();
         control_plane.raft().shutdown().await.unwrap();
     }
 

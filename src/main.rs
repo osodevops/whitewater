@@ -8,7 +8,7 @@ use finnstream::{
         SplitPressureTracker, StorageNodeId,
     },
     admin::AdminAuthenticator,
-    api::{router, AppState},
+    api::{router, subscription_mtls_router, AppState, SubscriptionTlsServer},
     autoscale::AutoscaleController,
     config::NodeConfig,
     control::ControlController,
@@ -371,7 +371,14 @@ async fn main() -> Result<()> {
             }
         }))
     });
-    let app = router(AppState {
+    let subscription_tls = match (&config.subscription_mtls, &replica_append) {
+        (Some(tls), Some(local)) => {
+            Some(SubscriptionTlsServer::from_config(tls, local.local_node()).await?)
+        }
+        (Some(_), None) => anyhow::bail!("Subscription mTLS requires a storage replica"),
+        _ => None,
+    };
+    let app_state = AppState {
         store,
         membership,
         demand: demand.clone(),
@@ -383,6 +390,7 @@ async fn main() -> Result<()> {
             .map(|service| service.local_node().clone()),
         replica_append,
         subscription_progress,
+        subscription_mtls_enabled: config.subscription_mtls.is_some(),
         majority_append,
         control_endpoints: Arc::new(control_endpoints),
         internal_key: config.control_plane_key.clone(),
@@ -390,14 +398,46 @@ async fn main() -> Result<()> {
             .timeout(Duration::from_secs(5))
             .build()?,
         admin_auth,
-    })
-    .layer(TraceLayer::new_for_http());
+    };
+    let tls_router = config
+        .subscription_mtls
+        .as_ref()
+        .map(|_| subscription_mtls_router(app_state.clone()));
+    let app = router(app_state).layer(TraceLayer::new_for_http());
     let listener = TcpListener::bind(config.bind_addr).await?;
+    let tls_task = match (subscription_tls, tls_router, &config.subscription_mtls) {
+        (Some(server), Some(router), Some(tls)) => {
+            let listener = TcpListener::bind(tls.bind_addr).await?;
+            let shutdown = shutdown_tx.subscribe();
+            Some(tokio::spawn(async move {
+                server.serve(listener, router, shutdown).await
+            }))
+        }
+        _ => None,
+    };
     info!(node_id = %config.node_id, bind = %config.bind_addr, advertise = %config.advertise_url, "FinnStream node started");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal(shutdown_tx))
-        .await?;
+    let public =
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()));
+    if let Some(mut tls_task) = tls_task {
+        let public = std::future::IntoFuture::into_future(public);
+        tokio::pin!(public);
+        tokio::select! {
+            result = &mut public => {
+                result?;
+                tls_task.await??;
+            }
+            result = &mut tls_task => {
+                result??;
+                if !*shutdown_tx.borrow() {
+                    anyhow::bail!("Subscription mTLS listener stopped unexpectedly");
+                }
+                public.await?;
+            }
+        }
+    } else {
+        public.await?;
+    }
     let _ = membership_task.await;
     if let Some(recovery_task) = recovery_task {
         let _ = recovery_task.await;

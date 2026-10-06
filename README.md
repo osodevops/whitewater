@@ -41,6 +41,7 @@ This repository contains a replicated streaming correctness foundation, internal
 - Read-after-cursor HTTP API
 - DNS-seeded node discovery, heartbeats, expiry, and graceful leave
 - WCL v0 controller for Domains, Feeds, Writers, Readers, declared-only Subscriptions, Roles, namespace grants, rename, seek, show, describe, explain, and safe drop; shared Subscription delivery is not implemented
+- Optional certificate-pinned mTLS listener for internal Subscription progress, without shared-key downgrade in that mode; quorum recovery, signed forwarded votes, and Riverbed-wide production transport security remain open
 - Persistent OpenRaft Control Plane with three-voter majority commit, leader election, follower forwarding, and restart recovery
 - Persisted local prototype catalog fallback and `wwctl` command runner
 - Three-Node and arbitrary-scale Docker development environments

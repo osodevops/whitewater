@@ -181,6 +181,22 @@ Production work still requires authenticated encryption for internal transport, 
 
 The deployment may provide inter-Node encryption through Whitewater-native mTLS, a trusted service mesh/sidecar, or an orchestrator/private-network transport with equivalent authenticated-encryption, identity, rotation, audit, and downgrade-prevention guarantees. Native mTLS is the default and recommended mechanism. The mechanism is configurable, but plaintext production traffic is not: Whitewater must fail closed if the selected transport cannot prove both encryption and peer identity.
 
+### Subscription-only mTLS boundary
+
+An optional dedicated listener now protects internal Subscription progress prepare, commit, and committed-read requests. Configure all five values together on each participating Control Node; supplying only part of the set fails startup:
+
+```text
+FINNSTREAM_SUBSCRIPTION_MTLS_BIND
+FINNSTREAM_SUBSCRIPTION_MTLS_CERT
+FINNSTREAM_SUBSCRIPTION_MTLS_KEY
+FINNSTREAM_SUBSCRIPTION_MTLS_CA
+FINNSTREAM_SUBSCRIPTION_MTLS_PEER_PINS
+```
+
+The bind address must differ from the public listener. The certificate/key and CA are PEM file paths; never place private keys in source control. Peer pins map each internal NodeId to one or more BLAKE3 digests of its leaf certificate's DER bytes, e.g. `control-1@<digest>|<next-digest>,control-2@<digest>`. An overlapping old/new pin set permits a deliberate rolling certificate restart; the listener loads new certificate material at startup, not on file changes. The outbound mTLS client requires HTTPS endpoints whose DNS hostname equals the assigned NodeId, using normal CA and hostname verification. The listener requires a CA-validated, pinned client certificate and checks that identity against the current Subscription owner. When mTLS is configured, the shared-key HTTP listener does not serve Subscription progress routes, so a failed TLS handshake cannot fall back to plaintext.
+
+This is **only a Subscription transport boundary**. The current Control Plane, Active Range, and other internal endpoints still use the development shared-key HTTP path, and forwarded Subscription commit-vote evidence is not independently signed. No public Subscription join or acknowledgement API is enabled; production-wide identity, audit, automated rotation, and quorum recovery remain open.
+
 ## Static membership limitation
 
 Control voter membership is currently configured statically:

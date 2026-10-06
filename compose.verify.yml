@@ -58,3 +58,9 @@ volumes:
   node1-data:
   node2-data:
   node3-data:
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: ${WHITEWATER_VERIFY_SUBNET:-10.250.247.0/24}

@@ -1075,7 +1075,7 @@ pub trait SubscriptionProgressTransport: Send + Sync {
 pub struct HttpSubscriptionProgressTransport {
     assignment: SubscriptionProgressAssignment,
     endpoints: BTreeMap<crate::active_range::StorageNodeId, String>,
-    key: String,
+    key: Option<String>,
     client: reqwest::Client,
 }
 
@@ -1089,8 +1089,42 @@ impl HttpSubscriptionProgressTransport {
         Ok(Self {
             assignment,
             endpoints,
-            key,
+            key: Some(key),
             client: reqwest::Client::builder().timeout(timeout).build()?,
+        })
+    }
+
+    pub fn new_mtls(
+        assignment: SubscriptionProgressAssignment,
+        endpoints: BTreeMap<crate::active_range::StorageNodeId, String>,
+        ca_pem: &[u8],
+        identity_pem: &[u8],
+        timeout: Duration,
+    ) -> Result<Self, SubscriptionProgressError> {
+        for (node, endpoint) in &endpoints {
+            let url = reqwest::Url::parse(endpoint)
+                .map_err(|_| SubscriptionProgressError::InvalidAssignment)?;
+            if url.scheme() != "https" || url.host_str() != Some(node.as_str()) {
+                return Err(SubscriptionProgressError::InvalidAssignment);
+            }
+        }
+        let ca = reqwest::Certificate::from_pem(ca_pem)
+            .map_err(|_| SubscriptionProgressError::InvalidAssignment)?;
+        let identity = reqwest::Identity::from_pem(identity_pem)
+            .map_err(|_| SubscriptionProgressError::InvalidAssignment)?;
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .https_only(true)
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(ca)
+            .identity(identity)
+            .build()
+            .map_err(|_| SubscriptionProgressError::InvalidAssignment)?;
+        Ok(Self {
+            assignment,
+            endpoints,
+            key: None,
+            client,
         })
     }
 
@@ -1107,11 +1141,14 @@ impl HttpSubscriptionProgressTransport {
             .endpoints
             .get(node)
             .ok_or(SubscriptionProgressError::Unavailable)?;
-        let mut response = self
+        let mut request = self
             .client
             .post(format!("{}{path}", endpoint.trim_end_matches('/')))
-            .header("x-whitewater-control-key", &self.key)
-            .json(body)
+            .json(body);
+        if let Some(key) = &self.key {
+            request = request.header("x-whitewater-control-key", key);
+        }
+        let mut response = request
             .send()
             .await
             .map_err(|_| SubscriptionProgressError::Unavailable)?;
