@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use finnstream::{
     active_range::{CommitPosition, KeyToken, StorageNodeId},
-    control::{Command, ControlController, ControlError, RangeSplitPlan, RangeSplitStage},
+    control::{
+        Command, ControlController, ControlError, RangeSplitPlan, RangeSplitStage, ReaderStart,
+    },
     storage::{FileLogStore, LogStore},
 };
 use tempfile::TempDir;
@@ -49,6 +51,115 @@ async fn placement(controller: &ControlController) -> serde_json::Value {
         .results
         .remove(0)
         .data
+}
+
+#[tokio::test]
+async fn subscription_progress_uses_the_full_candidate_pool_without_changing_rf3() {
+    for candidate_count in [3, 12, 24] {
+        let directory = TempDir::new().unwrap();
+        let nodes = (0..candidate_count)
+            .map(|index| format!("storage-{index:02}"))
+            .collect::<Vec<_>>();
+        let node_ids = nodes
+            .iter()
+            .map(|name| StorageNodeId::try_new(name.clone()).unwrap())
+            .collect::<Vec<_>>();
+        let control = controller(&directory, node_ids.clone());
+        create_feed(&control, Uuid::from_u128(30_000 + candidate_count as u128)).await;
+        let mut selected = std::collections::BTreeSet::new();
+        for index in 0..96 {
+            let result = control
+                .execute_commands_with_request_id(
+                    vec![Command::CreateSubscription {
+                        name: format!("orders.sub{index}"),
+                        feed: "orders.created".to_owned(),
+                        start: ReaderStart::Beginning,
+                    }],
+                    Uuid::from_u128(40_000 + index),
+                )
+                .await
+                .unwrap();
+            let public = &result.results[0].data;
+            assert!(public.get("replicas").is_none());
+            assert!(public.get("owner").is_none());
+            let snapshot: serde_json::Value =
+                serde_json::from_slice(&control.snapshot_bytes().await.unwrap()).unwrap();
+            let subscription_id = public["subscription_id"].as_str().unwrap();
+            let assignment = &snapshot["subscription_progress_assignments"][subscription_id];
+            let replicas = assignment["replicas"].as_array().unwrap();
+            assert_eq!(replicas.len(), 3);
+            let assigned = replicas
+                .iter()
+                .map(|node| node.as_str().unwrap().to_owned())
+                .collect::<std::collections::BTreeSet<_>>();
+            assert_eq!(assigned.len(), 3);
+            assert!(assigned.contains(assignment["owner"].as_str().unwrap()));
+            assert!(assigned.iter().all(|node| nodes.contains(node)));
+            selected.extend(assigned);
+        }
+        assert!(
+            selected.len() == 3 && candidate_count == 3
+                || candidate_count == 12 && selected.len() >= 8
+                || candidate_count == 24 && selected.len() >= 16
+        );
+    }
+}
+
+#[tokio::test]
+async fn follower_uses_leader_subscription_placement_not_local_candidates() {
+    let leader_dir = TempDir::new().unwrap();
+    let follower_dir = TempDir::new().unwrap();
+    let leader_nodes = (0..24)
+        .map(|index| format!("storage-{index:02}"))
+        .collect::<Vec<_>>();
+    let leader = controller(
+        &leader_dir,
+        leader_nodes
+            .iter()
+            .map(|node| StorageNodeId::try_new(node.clone()).unwrap())
+            .collect(),
+    );
+    let follower = controller(
+        &follower_dir,
+        storage_nodes(&["storage-97", "storage-98", "storage-99"]),
+    );
+    create_feed(&leader, Uuid::from_u128(50_000)).await;
+    follower
+        .install_snapshot_bytes(&leader.snapshot_bytes().await.unwrap())
+        .await
+        .unwrap();
+    let command = leader
+        .prepare_replicated(
+            Uuid::from_u128(50_001),
+            1_700_000_000,
+            Command::CreateSubscription {
+                name: "orders.billing".to_owned(),
+                feed: "orders.created".to_owned(),
+                start: ReaderStart::Beginning,
+            },
+        )
+        .unwrap();
+    let fixed = command.fixed_subscription_progress.as_ref().unwrap();
+    assert!(fixed
+        .replicas
+        .iter()
+        .all(|node| leader_nodes.iter().any(|name| name == node.as_str())));
+    assert_eq!(
+        leader.apply_replicated(command.clone()).await,
+        follower.apply_replicated(command).await
+    );
+    let left: serde_json::Value =
+        serde_json::from_slice(&leader.snapshot_bytes().await.unwrap()).unwrap();
+    let right: serde_json::Value =
+        serde_json::from_slice(&follower.snapshot_bytes().await.unwrap()).unwrap();
+    assert_eq!(
+        left["subscription_progress_assignments"],
+        right["subscription_progress_assignments"]
+    );
+    assert!(leader
+        .active_subscription_by_name("orders.billing")
+        .await
+        .is_some());
 }
 
 #[tokio::test]

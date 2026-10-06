@@ -604,12 +604,20 @@ pub struct FixedActiveRangePlacement {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FixedSubscriptionProgressPlacement {
+    pub owner: StorageNodeId,
+    pub replicas: [StorageNodeId; ACTIVE_RANGE_REPLICA_COUNT],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicatedCommand {
     pub request_id: Uuid,
     pub issued_at_ns: i64,
     pub command: Command,
     #[serde(default)]
     pub fixed_active_range: Option<FixedActiveRangePlacement>,
+    #[serde(default)]
+    pub fixed_subscription_progress: Option<FixedSubscriptionProgressPlacement>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -722,11 +730,20 @@ impl ControlController {
         )
         .then(|| self.select_fixed_active_range())
         .transpose()?;
+        let fixed_subscription_progress = matches!(&command, Command::CreateSubscription { .. })
+            .then(|| {
+                self.select_fixed_subscription_progress(derived_resource_id(
+                    request_id,
+                    "subscription",
+                ))
+            })
+            .transpose()?;
         Ok(ReplicatedCommand {
             request_id,
             issued_at_ns,
             command,
             fixed_active_range,
+            fixed_subscription_progress,
         })
     }
 
@@ -746,6 +763,38 @@ impl ControlController {
             },
         )?;
         Ok(FixedActiveRangePlacement {
+            owner: replicas[0].clone(),
+            replicas,
+        })
+    }
+
+    fn select_fixed_subscription_progress(
+        &self,
+        subscription_id: Uuid,
+    ) -> Result<FixedSubscriptionProgressPlacement, ControlError> {
+        let mut ranked = self
+            .eligible_storage_nodes
+            .iter()
+            .map(|node| {
+                let mut hash = blake3::Hasher::new();
+                hash.update(b"whitewater-subscription-progress-v1");
+                hash.update(subscription_id.as_bytes());
+                hash.update(node.as_str().as_bytes());
+                (*hash.finalize().as_bytes(), node.clone())
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_unstable_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
+        });
+        let replicas: [StorageNodeId; ACTIVE_RANGE_REPLICA_COUNT] = ranked.into_iter()
+            .take(ACTIVE_RANGE_REPLICA_COUNT).map(|(_, node)| node).collect::<Vec<_>>()
+            .try_into().map_err(|replicas: Vec<StorageNodeId>| {
+                ControlError::InvalidOperation(format!(
+                    "Subscription progress requires at least three eligible storage Nodes; only {} are configured",
+                    replicas.len(),
+                ))
+            })?;
+        Ok(FixedSubscriptionProgressPlacement {
             owner: replicas[0].clone(),
             replicas,
         })
@@ -827,7 +876,7 @@ impl ControlController {
         let statement = command_label(&command);
         let mut state = self.state.lock().await;
         let (message, data) = self
-            .apply(&mut state, command, Uuid::nil(), 0, None)
+            .apply(&mut state, command, Uuid::nil(), 0, None, None)
             .await?;
         Ok(StatementResult {
             statement,
@@ -848,6 +897,7 @@ impl ControlController {
             issued_at_ns,
             command,
             fixed_active_range,
+            fixed_subscription_progress,
         } = request;
         let statement = command_label(&command);
         let response = match self
@@ -857,6 +907,7 @@ impl ControlController {
                 request_id,
                 issued_at_ns,
                 fixed_active_range,
+                fixed_subscription_progress,
             )
             .await
         {
@@ -1181,6 +1232,7 @@ impl ControlController {
         request_id: Uuid,
         issued_at_ns: i64,
         fixed_active_range: Option<FixedActiveRangePlacement>,
+        fixed_subscription_progress: Option<FixedSubscriptionProgressPlacement>,
     ) -> Result<(String, Value), ControlError> {
         match command {
             Command::CreateSpace { name } => {
@@ -1436,7 +1488,7 @@ impl ControlController {
                             "Subscription source Feed has no committed range placement".to_owned(),
                         )
                     })?;
-                let range = state
+                state
                     .range_assignments
                     .get(&range_id)
                     .filter(|assignment| assignment.feed_id == feed_id)
@@ -1445,12 +1497,16 @@ impl ControlController {
                             "Subscription source Feed placement is not applied".to_owned(),
                         )
                     })?;
-                let replicas = range.replicas.clone();
-                let owner_index =
-                    usize::from(subscription_id.as_bytes()[0]) % ACTIVE_RANGE_REPLICA_COUNT;
+                let fixed = fixed_subscription_progress.ok_or_else(|| {
+                    ControlError::InvalidOperation(
+                        "Subscription progress has no consensus-prepared placement".to_owned(),
+                    )
+                })?;
+                let replicas = ReplicaSet::try_new(fixed.replicas)
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
                 let placement = SubscriptionProgressAssignment::try_new(
                     subscription_id,
-                    replicas.as_array()[owner_index].clone(),
+                    fixed.owner,
                     replicas,
                     1,
                 )
@@ -3834,6 +3890,7 @@ mod tests {
                 name: "orders".to_owned(),
             },
             fixed_active_range: None,
+            fixed_subscription_progress: None,
         };
         let left_result = left.apply_replicated(request.clone()).await;
         let right_result = right.apply_replicated(request.clone()).await;
@@ -3936,6 +3993,37 @@ mod tests {
                 .source,
             StateStoreSource::Manual,
         );
+    }
+
+    #[test]
+    fn subscription_progress_selection_is_deterministic_for_candidate_order() {
+        let first_dir = TempDir::new().unwrap();
+        let second_dir = TempDir::new().unwrap();
+        let nodes = (0..12)
+            .map(|index| StorageNodeId::try_new(format!("storage-{index:02}")).unwrap())
+            .collect::<Vec<_>>();
+        let make = |directory: &TempDir, candidates: Vec<StorageNodeId>| {
+            let store: Arc<dyn LogStore> =
+                Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store,
+                candidates,
+            )
+            .unwrap()
+        };
+        let first = make(&first_dir, nodes.clone());
+        let second = make(&second_dir, nodes.iter().cloned().rev().collect());
+        let mut used = BTreeSet::new();
+        for index in 0..32 {
+            let id = Uuid::from_u128(6000 + index);
+            let left = first.select_fixed_subscription_progress(id).unwrap();
+            let right = second.select_fixed_subscription_progress(id).unwrap();
+            assert_eq!(left, right);
+            assert!(left.replicas.contains(&left.owner));
+            used.extend(left.replicas);
+        }
+        assert!(used.len() >= 8);
     }
 
     #[tokio::test]

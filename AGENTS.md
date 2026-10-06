@@ -8,7 +8,7 @@
 - Standard three-Node development uses the OpenRaft-backed Control Plane and reports `control_plane` authority only after majority commit. `local_prototype` is reserved for Nodes without Control Plane configuration.
 - Public terminology is Control Plane; Raft, voters, and majority quorum are internal correctness mechanisms rather than user-managed resources.
 - Feed names use lowercase dotted segments matching `^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*$` with a 512-byte maximum, while immutable FeedId values carry identity across renames.
-- Supported Fabrics require at least three Nodes and three active replicas, including the standard development topology.
+- Supported Fabrics require at least three Nodes and three active replicas per internal range or progress shard, including the standard development topology. A 12/24-Node candidate-pool placement test does not prove a live 12/24-Node Fabric or unlimited capacity: current executable configuration derives eligible storage Nodes from static Control Plane Nodes, and Feed creation initially takes the first three. Separate storage roles/voters and prove larger live Fabrics before scaling claims.
 - Treat Whitewater as both a distributed database and a streaming platform: Feeds provide immutable temporal history, while persisted replicated Indexes provide current and queryable state.
 - Record-attached arbitrary key/value bytes are called Metadata, never Headers; reserve header terminology for transport protocols such as HTTP.
 - Every record stores signed 64-bit Unix epoch nanoseconds in `event_time_ns` and `ingest_time_ns`; do not reduce record time to milliseconds. JSON represents these as decimal strings to avoid JavaScript precision loss.
