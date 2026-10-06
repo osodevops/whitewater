@@ -81,7 +81,7 @@ Content-Type: application/json
 ```json
 {
   "request_id": "018f5f65-5d87-7c2e-a9a3-3af92c48ed21",
-  "script": "CREATE SPACE orders; CREATE FEED orders.created; SHOW FEEDS;"
+  "script": "CREATE DOMAIN orders; CREATE FEED orders.created; SHOW FEEDS;"
 }
 ```
 
@@ -96,7 +96,7 @@ curl -X POST http://localhost:7071/v1/admin/wcl \
 
 `POST /v1/control/execute` remains an authenticated compatibility alias during the prototype and should not be used by new clients.
 
-`CREATE SUBSCRIPTION orders.billing FROM orders.created;` or the typed `create_subscription` command declares one logical Subscription in the same Space as its source Feed. `SHOW SUBSCRIPTIONS`, `DESCRIBE SUBSCRIPTION`, rename and safe drop operate on its metadata; the result has `stage=declared`. No member can join it yet, no shared Cursor or lease is persisted, and no internal/public Feed is created for offsets or transaction decisions. Continue using existing named Reader sessions for working consumption until Subscription delivery is implemented. Development-only `/internal/subscription-progress/prepare` and `/internal/subscription-progress/commit` accept bounded Node requests with the shared Control Plane credential, verify receiver/owner/epoch against private placement, and persist local Fjall state outside application Feeds. They are not application APIs, do not verify sender Node identity or provide production inter-Node encryption, and do not make Subscriptions joinable or progress RF3-recoverable.
+`CREATE SUBSCRIPTION orders.billing FROM orders.created;` or the typed `create_subscription` command declares one logical Subscription in the same Domain as its source Feed. `SHOW SUBSCRIPTIONS`, `DESCRIBE SUBSCRIPTION`, rename and safe drop operate on its metadata; the result has `stage=declared`. No member can join it yet, no shared Cursor or lease is persisted, and no internal/public Feed is created for offsets or transaction decisions. Continue using existing named Reader sessions for working consumption until Subscription delivery is implemented. Development-only `/internal/subscription-progress/prepare` and `/internal/subscription-progress/commit` accept bounded Node requests with the shared Control Plane credential, verify receiver/owner/epoch against private placement, and persist local Fjall state outside application Feeds. They are not application APIs, do not verify sender Node identity or provide production inter-Node encryption, and do not make Subscriptions joinable or progress RF3-recoverable.
 
 ## Execute typed commands
 
@@ -113,7 +113,7 @@ Content-Type: application/json
   "request_id": "018f5f65-5d87-7c2e-a9a3-3af92c48ed21",
   "commands": [
     {
-      "command": "create_space",
+      "command": "create_domain",
       "name": "orders"
     },
     {
@@ -137,12 +137,14 @@ Content-Type: application/json
 }
 ```
 
+`create_domain`, `domain`, and `domains` are the preferred typed names. Existing `create_space`, `space`, and `spaces` remain accepted for compatibility and refer to the same resource. Persisted definitions and current JSON responses retain the `space_id` field; it is the Domain's stable identity, not a separate namespace. Do not re-create a Domain or change request IDs to migrate its name.
+
 ## Typed command shapes
 
 ### Create
 
 ```json
-{ "command": "create_space", "name": "orders" }
+{ "command": "create_domain", "name": "orders" }
 ```
 
 ```json
@@ -168,7 +170,7 @@ Content-Type: application/json
 
 ### Declare StateStore (metadata only)
 
-The typed Admin API can commit an idempotent Space-scoped StateStore declaration with either an explicit same-Space source Feed or a manual source:
+The typed Admin API can commit an idempotent Domain-scoped StateStore declaration with either an explicit same-Domain source Feed or a manual source:
 
 ```json
 { "command": "define_state_store", "name": "accounts.users", "source": { "kind": "manual" } }
@@ -178,7 +180,7 @@ The typed Admin API can commit an idempotent Space-scoped StateStore declaration
 { "command": "define_state_store", "name": "accounts.profiles", "source": { "kind": "feed", "feed": "accounts.events" } }
 ```
 
-The response reports `stage: "declared"` and an immutable `store_id`. This is **not** `CREATE STATESTORE`: there is no StateStore write, lookup, RF3 replica, or Pipe execution API yet. The catalog rejects unknown source Feeds and Feeds outside the StateStore's Space. Retry a timed-out declaration with the same request ID; do not attempt to use a `declared` store as live state.
+The response reports `stage: "declared"` and an immutable `store_id`. This is **not** `CREATE STATESTORE`: there is no StateStore write, lookup, RF3 replica, or Pipe execution API yet. The catalog rejects unknown source Feeds and Feeds outside the StateStore's Domain. Retry a timed-out declaration with the same request ID; do not attempt to use a `declared` store as live state.
 
 Reader start variants:
 
@@ -203,7 +205,7 @@ Reader start variants:
 }
 ```
 
-Kinds are `space`, `feed`, `writer`, `reader`, and `role`.
+Kinds are `domain`, `feed`, `writer`, `reader`, `subscription`, and `role`.
 
 ### Drop
 
@@ -221,7 +223,7 @@ Kinds are `space`, `feed`, `writer`, `reader`, and `role`.
 { "command": "show", "kind": "feeds" }
 ```
 
-Kinds are `spaces`, `feeds`, `writers`, `readers`, `roles`, and `grants`.
+Kinds are `domains`, `feeds`, `writers`, `readers`, `subscriptions`, `roles`, and `grants`.
 
 ### Describe
 
@@ -427,7 +429,7 @@ let admin = AdminClient::new(
 
 let result = admin
     .execute_commands(vec![
-        Command::CreateSpace {
+        Command::CreateDomain {
             name: "orders".to_owned(),
         },
         Command::CreateFeed {
@@ -440,7 +442,7 @@ let result = admin
 Resource-oriented methods are available for applications that should not construct command enums:
 
 ```rust
-admin.create_space("orders").await?;
+admin.create_domain("orders").await?;
 admin.create_feed("orders.created").await?;
 admin
     .create_writer("checkout", "orders.created")
@@ -482,7 +484,7 @@ wwctl
 ```text
 Whitewater Control Language shell
 whitewater> SHOW FEEDS;
-whitewater> CREATE SPACE orders;
+whitewater> CREATE DOMAIN orders;
 whitewater> \\help
 ```
 
@@ -541,7 +543,7 @@ wcl-cli
 Without a configured key, `wcl-cli` prompts using secure input. One-shot mutation retries can reuse a request ID:
 
 ```powershell
-wcl-cli -Execute 'CREATE SPACE orders;' -RequestId '018f5f65-5d87-7c2e-a9a3-3af92c48ed21'
+wcl-cli -Execute 'CREATE DOMAIN orders;' -RequestId '018f5f65-5d87-7c2e-a9a3-3af92c48ed21'
 ```
 
 Override endpoints for one session with a quoted semicolon-separated list:

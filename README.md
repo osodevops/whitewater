@@ -1,6 +1,6 @@
 # Whitewater
 
-Whitewater is a clean-sheet distributed database and partitionless streaming platform built around `riverbed -> space -> feed -> key -> cursor -> subscription`. Applications do not create or manage partitions.
+Whitewater is a clean-sheet distributed database and partitionless streaming platform built around `riverbed -> domain -> feed -> key -> cursor -> subscription`. Applications do not create or manage partitions.
 
 Design documents:
 
@@ -40,7 +40,7 @@ This repository contains a replicated streaming correctness foundation, internal
 - Producer identity and sequence deduplication
 - Read-after-cursor HTTP API
 - DNS-seeded node discovery, heartbeats, expiry, and graceful leave
-- WCL v0 controller for Spaces, Feeds, Writers, Readers, declared-only Subscriptions, Roles, namespace grants, rename, seek, show, describe, explain, and safe drop; shared Subscription delivery is not implemented
+- WCL v0 controller for Domains, Feeds, Writers, Readers, declared-only Subscriptions, Roles, namespace grants, rename, seek, show, describe, explain, and safe drop; shared Subscription delivery is not implemented
 - Persistent OpenRaft Control Plane with three-voter majority commit, leader election, follower forwarding, and restart recovery
 - Persisted local prototype catalog fallback and `wwctl` command runner
 - Three-Node and arbitrary-scale Docker development environments
@@ -109,10 +109,12 @@ wcl-cli
 It reads `WHITEWATER_API_KEY` and `WHITEWATER_ENDPOINTS`, or securely prompts for a missing key. The Rust `wwctl` frontend remains available from Cargo and inside the Docker image.
 
 ```text
-whitewater> CREATE SPACE orders;
+whitewater> CREATE DOMAIN orders;
 whitewater> CREATE FEED orders.created;
 whitewater> SHOW FEEDS;
 ```
+
+`CREATE SPACE` and the other older Space WCL forms remain aliases for the same Domain. Existing `space_id` JSON fields and persisted identities are unchanged for compatibility.
 
 Write through a durable Writer session without managing sequence or topology internals:
 

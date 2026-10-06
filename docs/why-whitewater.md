@@ -9,7 +9,7 @@
 - **Company and package namespace:** FinnStream / `finnstream`
 - **Architecture source:** [Whitewater architecture](kafka-successor-architecture.md)
 - **Operational experience:** [Humane operations and day-two requirements](operational-experience.md)
-- **Public model:** `riverbed -> space -> feed -> key -> cursor -> subscription`
+- **Public model:** `riverbed -> domain -> feed -> key -> cursor -> subscription`
 - **Implementation:** Rust
 
 This document explains why Whitewater exists, how it differs from Kafka, and how familiar Kafka concepts translate into the Whitewater model. It distinguishes committed principles from areas that still require prototyping and benchmarking.
@@ -121,9 +121,9 @@ Whitewater separates Feed identity, key ordering, active-range ownership, immuta
 
 ### 8. Cleanup policy mixes event history with materialized state
 
-Kafka asks a topic to choose deletion, compaction, or both. Compaction can approximate latest-value state for a key, while Kafka Streams applications commonly maintain local state stores and changelog topics. Whitewater separates these responsibilities instead of offering compacted versus non-compacted *Spaces*.
+Kafka asks a topic to choose deletion, compaction, or both. Compaction can approximate latest-value state for a key, while Kafka Streams applications commonly maintain local state stores and changelog topics. Whitewater separates these responsibilities instead of offering compacted versus non-compacted *Domains*.
 
-**A Space is an ownership/policy namespace, not a cleanup-policy type.** There is one public **Feed** history model: committed events remain immutable until a History Policy expires or tiers them (the closest Kafka analogy is a delete-retained topic). A Space may contain many Feeds and Indexes and supply inherited quotas, access, retention, and accounting. Neither a Space nor a Feed changes into a compacted history when an Index is added. History Policy, tiering, and expiry are design requirements, not a completed retention implementation.
+**A Domain is an ownership/policy namespace, not a cleanup-policy type.** There is one public **Feed** history model: committed events remain immutable until a History Policy expires or tiers them (the closest Kafka analogy is a delete-retained topic). A Domain may contain many Feeds and Indexes and supply inherited quotas, access, retention, and accounting. Neither a Domain nor a Feed changes into a compacted history when an Index is added. History Policy, tiering, and expiry are design requirements, not a completed retention implementation.
 
 A **persisted Index layer is core Whitewater storage**, not a later performance trick. It holds current/queryable state derived from Feed history; applications do not have to operate separate compacted Feeds or changelog topics to make their state durable. An Index is a deliberate, named resource because each extra application-defined field/index costs write IO, replication bandwidth, disk, memory, and rebuild time. Not every Feed needs an Index, but the platform must support arbitrary declared secondary indexes as a first-class capability.
 
@@ -132,7 +132,7 @@ A **persisted Index layer is core Whitewater storage**, not a later performance 
 For example, one Feed can support several application-defined access paths without changing its immutable history:
 
 ```text
-Space:   commerce
+Domain:   commerce
 Feed:    commerce.orders.events        (committed append-only history)
 Primary: FeedId + order Key            (latest derived state for that Key)
 Index:   commerce.orders.bycustomer    (customer_id -> order Keys)
@@ -151,11 +151,11 @@ Kafka efficiently retrieves sequential records by partition offset and time inde
 
 Kafka Streams commonly uses a local store backed by a changelog topic, which applications and their framework must restore. Whitewater's intended recovery source is the **retained Feed history plus replicated Index checkpoints**, so applications do not create a second public changelog Feed to maintain the Index. An Index can catch up from its last applied Cursor; if its persisted derived state is discarded, a controlled rebuild reads the owning Feed(s) in a new Index generation and publishes the replacement only after it is verified and caught up.
 
-A Space-scoped `REBUILD INDEXES IN SPACE commerce` would select Indexes owned by that Space and replay their source Feeds; it would **not** erase the Space, clear Feed records, or mean that every Index is rebuildable from data that has already expired. If retained history and a usable checkpoint/backup are insufficient, the rebuild must refuse with an explanation rather than report success from incomplete state. Reset/empty operations require authorization, an explicit retained-history check, audit, and a shadow build instead of exposing an empty live Index.
+A Domain-scoped `REBUILD INDEXES IN DOMAIN commerce` would select Indexes owned by that Domain and replay their source Feeds; it would **not** erase the Domain, clear Feed records, or mean that every Index is rebuildable from data that has already expired. If retained history and a usable checkpoint/backup are insufficient, the rebuild must refuse with an explanation rather than report success from incomplete state. Reset/empty operations require authorization, an explicit retained-history check, audit, and a shadow build instead of exposing an empty live Index.
 
-A Space owns Feeds and StateStores; it has no single log of its own. A **Feed-derived** StateStore replays its explicitly named source Feed(s) with versioned deterministic extraction. A **manual** StateStore instead needs a Whitewater-managed replicated mutation journal and checkpoint: manual `PUT`/`DELETE` operations cannot be recreated from unrelated Feeds. The Control Plane can currently persist a `declared` manual or same-Space Feed-derived StateStore definition, but it cannot yet accept StateStore writes, replicate Fjall state, or serve lookups.
+A Domain owns Feeds and StateStores; it has no single log of its own. A **Feed-derived** StateStore replays its explicitly named source Feed(s) with versioned deterministic extraction. A **manual** StateStore instead needs a Whitewater-managed replicated mutation journal and checkpoint: manual `PUT`/`DELETE` operations cannot be recreated from unrelated Feeds. The Control Plane can currently persist a `declared` manual or same-Domain Feed-derived StateStore definition, but it cannot yet accept StateStore writes, replicate Fjall state, or serve lookups.
 
-Subscription progress and transaction/effect coordinator state are also **internal state, not application Feeds**. The public durable consumption identity should be a Space-scoped Subscription name; each connecting member gets an expiring, epoch-fenced session rather than a second user-defined group identity. Whitewater may store current progress, retry claims, leases, and coordinator decisions in shared internal Fjall keyspaces backed by RF3 mutation replication and verified checkpoints. A local Fjall write or WAL is not RF3 durability and cannot atomically commit the separate Feed log. The Control Plane can now declare a Subscription and resolve its owning Feed without creating a hidden/public Feed, but shared consumption, replicated progress, and transaction coordination are not implemented.
+Subscription progress and transaction/effect coordinator state are also **internal state, not application Feeds**. The public durable consumption identity should be a Domain-scoped Subscription name; each connecting member gets an expiring, epoch-fenced session rather than a second user-defined group identity. Whitewater may store current progress, retry claims, leases, and coordinator decisions in shared internal Fjall keyspaces backed by RF3 mutation replication and verified checkpoints. A local Fjall write or WAL is not RF3 durability and cannot atomically commit the separate Feed log. The Control Plane can now declare a Subscription and resolve its owning Feed without creating a hidden/public Feed, but shared consumption, replicated progress, and transaction coordination are not implemented.
 
 The intended enrichment experience is topology-free: a Reader obtains an event from `activity.events`, looks up `users[userId]` at a recorded state version through any Node, and writes to `activity.enriched` with an atomic input-progress/output effect. An internal owner may fetch state remotely or optimize placement; application code supplies no range, owner, partition count, or co-partitioning plan. An unavailable/lagging user store must not silently produce an unenriched output. This Pipe/runtime workflow and its cross-Node consistency tests remain planned, not implemented.
 
@@ -168,7 +168,7 @@ Whitewater's baseline is intentionally narrow:
 - All client and inter-Node traffic is encrypted in transit.
 - There is no plaintext production listener.
 - Client authentication uses scoped API keys over TLS.
-- API keys map to identities and capabilities at Space and Feed boundaries.
+- API keys map to identities and capabilities at Domain and Feed boundaries.
 - Keys are stored as one-way verifiers; plaintext credentials are not persisted.
 - Rotation and overlapping validity are standard operations.
 - Audit events are part of the control plane.
@@ -251,7 +251,7 @@ A Feed can accept arbitrary bytes or reference a Schema Policy. Schema enforceme
 
 ### 18. Multi-tenancy and isolation should not be retrofits
 
-Whitewater Spaces are policy and accounting boundaries from the beginning. CPU, memory, local IO, object-store IO, network bandwidth, connection count, Feed count, Index cost, and retained bytes must be attributable to a Space.
+Whitewater Domains are policy and accounting boundaries from the beginning. CPU, memory, local IO, object-store IO, network bandwidth, connection count, Feed count, Index cost, and retained bytes must be attributable to a Domain.
 
 Schedulers protect small workloads from noisy neighbours and prevent one hot Feed or key from consuming an entire Riverbed unnoticed.
 
@@ -282,9 +282,9 @@ A Riverbed is one cooperating Whitewater installation. It has a stable RiverbedI
 
 A Node is a replaceable process or container contributing storage, network, CPU, and optionally control-plane capacity. Applications do not address a specific Node for normal Feed operations.
 
-### Space
+### Domain
 
-A Space is a hierarchical administrative boundary for ownership, policy inheritance, quotas, authorization, schemas, encryption, and billing. Dotted Feed names naturally project into Space prefixes.
+A Domain is a hierarchical administrative boundary for ownership, policy inheritance, quotas, authorization, schemas, encryption, and billing. Dotted Feed names naturally project into Domain prefixes. Existing `SPACE` commands and the `space_id` wire/catalog field remain compatibility representations of that same identity; they do not define another public resource.
 
 ### Feed
 
@@ -320,7 +320,7 @@ An Index is a named, persisted, replicated projection over a Feed or Pipe output
 
 ### StateStore
 
-A StateStore is a named current-state resource owned by a Space, with an application primary Key and optional declared secondary Indexes. Its source is either specified Feed history (processed by a deterministic versioned projection) or manually submitted mutations recorded in a Whitewater-managed replicated journal. It is logically queryable from any Node without co-partitioning; ownership, placement, replay, and Index storage remain internal. The current Control Plane only persists `declared` definitions; it does not yet replicate or serve StateStore data.
+A StateStore is a named current-state resource owned by a Domain, with an application primary Key and optional declared secondary Indexes. Its source is either specified Feed history (processed by a deterministic versioned projection) or manually submitted mutations recorded in a Whitewater-managed replicated journal. It is logically queryable from any Node without co-partitioning; ownership, placement, replay, and Index storage remain internal. The current Control Plane only persists `declared` definitions; it does not yet replicate or serve StateStore data.
 
 ### History Policy
 
@@ -422,17 +422,17 @@ Developers should not choose a range count, assign a Reader to a range, handle p
 | Topic `cleanup.policy=compact` | Feed plus Key Index | Current state is a persisted replicated Index; history remains history |
 | Tombstone | Explicit Index deletion mutation | Deletes indexed state without redefining Feed storage semantics |
 | Log segment | Immutable segment | Internal storage chunk that may move to object storage |
-| Retention bytes/time | History Policy | Inherited through Spaces and coordinated with tiering and legal rules |
+| Retention bytes/time | History Policy | Inherited through Domains and coordinated with tiering and legal rules |
 | Kafka Streams state store | Index or Pipe state | Persisted and replicated first-class state, with memory as a cache |
 | Changelog topic | Index replication/checkpoint history | Recovery uses replicated checkpoints plus Feed tail rather than full replay by default |
 | KTable | Key Index | Direct latest-value view with known freshness Cursor |
 | Transactional producer | Atomic consume-and-append | Narrow, streaming-focused atomic primitive |
 | Kafka Connect | Adapter/Gateway | Integration runs outside the storage core through stable Feed APIs |
 | Schema Registry | Schema service | Integrated identity and policy model but optional for byte storage |
-| ACL | Space/Feed capability policy | Scoped API-key identity with inherited policy |
+| ACL | Domain/Feed capability policy | Scoped API-key identity with inherited policy |
 | SASL mechanisms | API-key authentication over TLS | One baseline client authentication model |
 | SSL/plaintext listeners | TLS-only listener | No production plaintext mode |
-| Quotas | Space resource policy | Accounts for CPU, IO, storage, object retrieval, Indexes, and network |
+| Quotas | Domain resource policy | Accounts for CPU, IO, storage, object retrieval, Indexes, and network |
 | Rack awareness | Failure-domain placement | Mandatory replica separation where infrastructure exposes domains |
 | Tiered storage | Transparent segment lifecycle | Clients keep Feed/Cursor semantics while storage location changes |
 | AdminClient | Control API and `wwctl` | Operates on logical resources, not partitions and broker assignments |
@@ -475,17 +475,17 @@ CREATE UNIQUE INDEX commerce.orders.byexternalid
   ON commerce.orders.events (external_id);
 INSPECT INDEX commerce.orders.bycustomer;
 REBUILD INDEX commerce.orders.bycustomer FROM FEED commerce.orders.events;
-REBUILD INDEXES IN SPACE commerce;
+REBUILD INDEXES IN DOMAIN commerce;
 ```
 
-An Index definition names the immutable FeedId, fields/extractor versions, types/collation, uniqueness, and build/consistency policy. A new Index starts in `building` with a pinned source Cursor and **shadow generation**, scans retained Feed history in bounded batches, catches up with live writes, verifies its primary/posting counts and unique claims on RF3, then switches the catalog's active generation through the Control Plane. Existing queries remain on the old generation until the new one is ready. Any proposed `RESET/EMPTY INDEX` must be implemented as an authorized rebuild that **never makes the live Index silently empty**. A failed build can be resumed or abandoned without changing Feed history; if the source's retained history is insufficient, require an appropriate checkpoint/backup or reject the rebuild. Operators should inspect applied Cursor, lag, build progress, cost, and reason for refusal by logical Space/Feed/Index.
+An Index definition names the immutable FeedId, fields/extractor versions, types/collation, uniqueness, and build/consistency policy. A new Index starts in `building` with a pinned source Cursor and **shadow generation**, scans retained Feed history in bounded batches, catches up with live writes, verifies its primary/posting counts and unique claims on RF3, then switches the catalog's active generation through the Control Plane. Existing queries remain on the old generation until the new one is ready. Any proposed `RESET/EMPTY INDEX` must be implemented as an authorized rebuild that **never makes the live Index silently empty**. A failed build can be resumed or abandoned without changing Feed history; if the source's retained history is insufficient, require an appropriate checkpoint/backup or reject the rebuild. Operators should inspect applied Cursor, lag, build progress, cost, and reason for refusal by logical Domain/Feed/Index.
 
 ### Proof required before claiming the feature
 
 - Validate per-Index definition/extractor compatibility and deterministic extraction without assuming payload bytes have a schema; compare Fjall against redb and RocksDB on sustained mixed append/read, many declared Indexes, compaction stalls, memory, replication, and recovery cost.
 - Prove transaction rollback after a crash at each primary/posting/unique/checkpoint boundary; stale postings never survive update/delete or an interrupted rebuild.
 - Prove concurrent unique conflicts, idempotent ambiguous retries, multiple nulls, duplicate nonunique values, composite/prefix/range ordering, and split/merge/move of the underlying Feed without changing logical references.
-- Prove RF3 Index catch-up, applied-Cursor fencing for strict reads, restart/checkpoint recovery, retention-blocked rebuilds, and bounded per-Space resource usage. Mark the runtime feature complete only after these tests and the public API pass.
+- Prove RF3 Index catch-up, applied-Cursor fencing for strict reads, restart/checkpoint recovery, retention-blocked rebuilds, and bounded per-Domain resource usage. Mark the runtime feature complete only after these tests and the public API pass.
 
 ## Index engine direction
 
@@ -540,7 +540,7 @@ The selection must still follow benchmarks and fault tests using Whitewater's re
 - Transparent object-store tiering
 - Predictive prefetch for historical reads
 - Content verification and repair
-- Per-Space storage accounting
+- Per-Domain storage accounting
 - Online disk replacement and cache rebalancing
 - Background maintenance that yields to foreground latency targets
 
@@ -573,7 +573,7 @@ The selection must still follow benchmarks and fault tests using Whitewater's re
 
 - TLS-only client and Node communication
 - Short, scoped, rotatable API credentials
-- Capability inheritance through Spaces
+- Capability inheritance through Domains
 - Customer-managed envelope-encryption keys
 - Feed- and Index-specific encryption boundaries
 - Full control-plane audit Feed
@@ -597,7 +597,7 @@ The selection must still follow benchmarks and fault tests using Whitewater's re
 ### Directional decisions
 
 - Product name is Whitewater.
-- Public resources are Riverbed, Space, Feed, Key, Cursor, Subscription, Pipe, Index, and Node.
+- Public resources are Riverbed, Domain, Feed, Key, Cursor, Subscription, Pipe, Index, and Node.
 - Feed identity is immutable and separate from mutable dotted naming.
 - Keys define ordering.
 - Partitions are not public.
@@ -632,7 +632,7 @@ Kafka made durable event history mainstream, but its partition abstraction coupl
 The intended developer experience is:
 
 ```text
-choose a Space
+choose a Domain
 name a Feed
 append by Key
 resume with a Cursor

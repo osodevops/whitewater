@@ -161,6 +161,14 @@ impl AdminClient {
         .await
     }
 
+    pub async fn create_domain(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::CreateDomain { name: name.into() })
+            .await
+    }
+
     pub async fn create_space(
         &self,
         name: impl Into<String>,

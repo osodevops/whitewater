@@ -44,7 +44,7 @@ If a proposal does not reduce a documented pain, justify why it belongs in White
 
 ## Non-negotiable experience principles
 
-- Preserve `riverbed -> space -> feed -> key -> cursor -> subscription`; never expose physical partitions.
+- Preserve `riverbed -> domain -> feed -> key -> cursor -> subscription`; never expose physical partitions.
 - Feed creation never asks for partition counts or physical placement.
 - Keys define ordering; physical ranges may split, merge, and move without changing the client contract.
 - Use opaque Cursors rather than public physical offsets.

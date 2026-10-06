@@ -12,11 +12,13 @@ def post(endpoint, path, body):
 
 def main():
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:6]}"
-    space, feed, writer, reader = f"m3{suffix}", f"m3{suffix}.events", f"writer{suffix}", f"reader{suffix}"
-    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SPACE {space}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer}; CREATE READER {reader} FROM {feed} START AT BEGINNING;"})
+    domain, feed, writer, reader = f"m3{suffix}", f"m3{suffix}.events", f"writer{suffix}", f"reader{suffix}"
+    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE DOMAIN {domain}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer}; CREATE READER {reader} FROM {feed} START AT BEGINNING;"})
     if status != 200: raise AssertionError(setup)
+    status, domains = post(ENDPOINTS[2], "/v1/admin/wcl", {"script": f"SHOW DOMAINS; DESCRIBE DOMAIN {domain};"})
+    if status != 200 or domains["results"][1]["data"]["space_id"] != setup["results"][0]["data"]["space_id"]: raise AssertionError(domains)
     writer_epoch = setup["results"][3]["data"]["session_epoch"]
-    subscription = f"{space}.billing"
+    subscription = f"{domain}.billing"
     status, before = post(ENDPOINTS[1], "/v1/admin/wcl", {"script": "SHOW FEEDS;"})
     if status != 200: raise AssertionError(before)
     status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {subscription} FROM {feed};"})

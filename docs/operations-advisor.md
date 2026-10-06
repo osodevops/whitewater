@@ -32,7 +32,7 @@ Node / Writer / Reader / Control Plane / Index / Subscription signals (as availa
 
 ## What it investigates
 
-Start with structured, bounded, timestamped observations keyed by Riverbed, Space, Feed, Node, and correlation/request ID. Potential signals include:
+Start with structured, bounded, timestamped observations keyed by Riverbed, Domain, Feed, Node, and correlation/request ID. Potential signals include:
 
 | Scope | Examples of useful evidence |
 |---|---|
@@ -59,11 +59,11 @@ The Advisor may learn *patterns*, not silently rewrite safety policy:
 4. Recommend or schedule *pre-approved* capacity/readiness checks ahead of predictable demand. A quiet schedule is never permission to remove a Node until ownership, replica durability, and drain gates are verified.
 5. Compare the observed outcome against the forecast and the proposed action; allow operators to label false positives, pin known maintenance effects, and disable/retrain a pattern. Learning must not create a self-reinforcing loop where the agent treats its own interventions as natural traffic.
 
-Aggregates should have retention and cardinality limits, per-Space access boundaries, and no default model training on event payloads or customer logs. An unavailable model or missing history falls back to ordinary deterministic alerts and reconciliation.
+Aggregates should have retention and cardinality limits, per-Domain access boundaries, and no default model training on event payloads or customer logs. An unavailable model or missing history falls back to ordinary deterministic alerts and reconciliation.
 
 ## Recommendation and action policy
 
-Use an explicit action ladder; deployment defaults to level 0. Policies are versioned, scoped to an identity and Riverbed/Space, and auditable.
+Use an explicit action ladder; deployment defaults to level 0. Policies are versioned, scoped to an identity and Riverbed/Domain, and auditable.
 
 | Level | Behavior | Examples |
 |---|---|---|
@@ -95,10 +95,10 @@ Kubernetes/network tools should expose only the namespaces, clusters, resource t
 
 ## Safety, security, and resource budgets
 
-- Separate recommendation identity from execution identity; use least privilege, per-Space isolation, explicit human confirmation, and an immutable audit trail for proposals, approvals, denials, tool calls, and outcomes. Present operational internal topology only to authorized operators, never in application Writer/Reader APIs.
+- Separate recommendation identity from execution identity; use least privilege, per-Domain isolation, explicit human confirmation, and an immutable audit trail for proposals, approvals, denials, tool calls, and outcomes. Present operational internal topology only to authorized operators, never in application Writer/Reader APIs.
 - Fail closed on stale snapshots, lost Control Plane quorum, inconsistent Node evidence, unknown TLS/peer identity, missing approval, or missing rollback preconditions. External service-mesh transport is acceptable only when identity, encryption, rotation, audit, and downgrade prevention meet Whitewater's security contract.
 - Limit model prompts, retrieved logs, tool calls, concurrent investigations, movement bandwidth, and spending. Foreground appends and Reader delivery take precedence; an analysis surge must not cause a cluster incident.
-- Support an immediate per-Riverbed/Space kill switch and audit-safe manual override. Restarting the Advisor must not replay non-idempotent actions; a durable action ledger and authoritative-state check are required before any mutation.
+- Support an immediate per-Riverbed/Domain kill switch and audit-safe manual override. Restarting the Advisor must not replay non-idempotent actions; a durable action ledger and authoritative-state check are required before any mutation.
 - Report costs and charge inference, storage, log retrieval, egress, and movement to logical owners where possible. The Advisor should be useful without sending customer data to an external model; deployment policy controls model location and data egress.
 
 ## Example investigations
@@ -107,7 +107,7 @@ Kubernetes/network tools should expose only the namespaces, clusters, resource t
 
 **Reader delay:** Delivered Cursor advances but acknowledged Cursor does not. The Advisor distinguishes application processing time from server credit exhaustion and network errors, gives a developer-facing retry/capacity recommendation, and leaves the Reader's progress untouched. Future Subscription lease diagnostics add scoped lease evidence without triggering a global rebalance.
 
-**Predictable busy window:** A Space's Feeds repeatedly spike during a business batch. The Advisor forecasts likely resource pressure, explains confidence and historical exceptions, suggests a bounded capacity plan before the window, and measures whether it helped. During the quieter period it recommends scale-in only after independent drain and durability checks.
+**Predictable busy window:** A Domain's Feeds repeatedly spike during a business batch. The Advisor forecasts likely resource pressure, explains confidence and historical exceptions, suggests a bounded capacity plan before the window, and measures whether it helped. During the quieter period it recommends scale-in only after independent drain and durability checks.
 
 ## Delivery sequence and acceptance evidence
 

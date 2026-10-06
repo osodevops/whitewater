@@ -6,7 +6,7 @@ Whitewater is both a distributed database and a partitionless streaming platform
 
 Every contributor should understand these project-wide rules:
 
-- Public applications use `riverbed -> space -> feed -> key -> cursor -> subscription`.
+- Public applications use `riverbed -> domain -> feed -> key -> cursor -> subscription`.
 - Physical partitions are never exposed.
 - Keys define ordering.
 - Readers and Subscriptions maintain independent Cursor positions; Readers cooperating in one Subscription share only that Subscription's durable progress.

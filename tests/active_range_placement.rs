@@ -54,6 +54,45 @@ async fn placement(controller: &ControlController) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn domain_typed_command_and_legacy_space_share_replicated_identity() {
+    let leader_dir = TempDir::new().unwrap();
+    let follower_dir = TempDir::new().unwrap();
+    let leader = controller(
+        &leader_dir,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    let follower = controller(
+        &follower_dir,
+        storage_nodes(&["storage-3", "storage-2", "storage-1"]),
+    );
+    let command = leader
+        .prepare_replicated(
+            Uuid::from_u128(777),
+            1_700_000_000,
+            Command::CreateDomain {
+                name: "orders".to_owned(),
+            },
+        )
+        .unwrap();
+    let left = leader.apply_replicated(command.clone()).await;
+    let right = follower.apply_replicated(command).await;
+    assert_eq!(left, right);
+    assert_eq!(left.result.as_ref().unwrap().statement, "CREATE DOMAIN");
+    let id = left.result.unwrap().data["space_id"].clone();
+    follower
+        .install_snapshot_bytes(&leader.snapshot_bytes().await.unwrap())
+        .await
+        .unwrap();
+    let described = follower
+        .execute("DESCRIBE DOMAIN orders; DESCRIBE SPACE orders; SHOW DOMAINS; SHOW SPACES;")
+        .await
+        .unwrap();
+    assert_eq!(described.results[0].data["space_id"], id);
+    assert_eq!(described.results[0].data, described.results[1].data);
+    assert_eq!(described.results[2].data, described.results[3].data);
+}
+
+#[tokio::test]
 async fn subscription_progress_uses_the_full_candidate_pool_without_changing_rf3() {
     for candidate_count in [3, 12, 24] {
         let directory = TempDir::new().unwrap();

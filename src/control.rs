@@ -348,6 +348,7 @@ impl Default for CatalogState {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceKind {
+    Domain,
     Space,
     Feed,
     Writer,
@@ -359,6 +360,7 @@ pub enum ResourceKind {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ShowKind {
+    Domains,
     Spaces,
     Feeds,
     Writers,
@@ -371,6 +373,9 @@ pub enum ShowKind {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Command {
+    CreateDomain {
+        name: String,
+    },
     CreateSpace {
         name: String,
     },
@@ -1235,7 +1240,7 @@ impl ControlController {
         fixed_subscription_progress: Option<FixedSubscriptionProgressPlacement>,
     ) -> Result<(String, Value), ControlError> {
         match command {
-            Command::CreateSpace { name } => {
+            Command::CreateDomain { name } | Command::CreateSpace { name } => {
                 validate_dotted_name(&name)?;
                 ensure_name_available(
                     state.spaces.values().map(|item| (&item.name, &item.status)),
@@ -1248,7 +1253,7 @@ impl ControlController {
                     created_at_ns: issued_at_ns,
                 };
                 state.spaces.insert(definition.space_id, definition.clone());
-                Ok((format!("created Space {name}"), json!(definition)))
+                Ok((format!("created Domain {name}"), json!(definition)))
             }
             Command::CreateFeed { name } => {
                 validate_dotted_name(&name)?;
@@ -1305,7 +1310,7 @@ impl ControlController {
                         let definition = active_feed(state, &feed)?;
                         if definition.space_id != space_id {
                             return Err(ControlError::InvalidOperation(
-                                "StateStore source Feed must belong to its Space".to_owned(),
+                                "StateStore source Feed must belong to its Domain".to_owned(),
                             ));
                         }
                         StateStoreSource::Feed {
@@ -1472,7 +1477,8 @@ impl ControlController {
                     let source = active_feed(state, &feed)?;
                     if source.space_id != space_id {
                         return Err(ControlError::InvalidOperation(
-                            "Subscription and source Feed must belong to the same Space".to_owned(),
+                            "Subscription and source Feed must belong to the same Domain"
+                                .to_owned(),
                         ));
                     }
                     source.feed_id
@@ -2540,7 +2546,7 @@ impl ControlController {
                     })
                 {
                     return Err(ControlError::InvalidOperation(
-                        "drop attached Subscriptions before moving a Feed to another Space"
+                        "drop attached Subscriptions before moving a Feed to another Domain"
                             .to_owned(),
                     ));
                 }
@@ -2552,13 +2558,13 @@ impl ControlController {
                     json!(item.clone()),
                 ))
             }
-            ResourceKind::Space => {
+            ResourceKind::Domain | ResourceKind::Space => {
                 if state.feeds.values().any(|feed| {
                     feed.status == ResourceStatus::Active
                         && is_within_namespace(&feed.name, current)
                 }) {
                     return Err(ControlError::InvalidOperation(
-                        "rename child Feeds before renaming a Space".to_owned(),
+                        "rename child Feeds before renaming a Domain".to_owned(),
                     ));
                 }
                 ensure_name_available(
@@ -2568,7 +2574,7 @@ impl ControlController {
                 let item = active_space_mut(state, current)?;
                 item.name = new.to_owned();
                 Ok((
-                    format!("renamed Space {current} to {new}"),
+                    format!("renamed Domain {current} to {new}"),
                     json!(item.clone()),
                 ))
             }
@@ -2583,7 +2589,7 @@ impl ControlController {
                     .space_id;
                 if owning_space(state, new)?.space_id != existing_space {
                     return Err(ControlError::InvalidOperation(
-                        "Subscription cannot be renamed across Spaces".to_owned(),
+                        "Subscription cannot be renamed across Domains".to_owned(),
                     ));
                 }
                 rename_named(&mut state.subscriptions, current, new, "Subscription")
@@ -2623,7 +2629,7 @@ impl ControlController {
                     json!(item.clone()),
                 ))
             }
-            ResourceKind::Space => {
+            ResourceKind::Domain | ResourceKind::Space => {
                 let space_id = active_space(state, name)?.space_id;
                 if state
                     .feeds
@@ -2634,12 +2640,12 @@ impl ControlController {
                     })
                 {
                     return Err(ControlError::InvalidOperation(
-                        "drop child Feeds and Subscriptions before dropping a Space".to_owned(),
+                        "drop child Feeds and Subscriptions before dropping a Domain".to_owned(),
                     ));
                 }
                 let item = state.spaces.get_mut(&space_id).expect("Space exists");
                 item.status = ResourceStatus::Dropped;
-                Ok((format!("dropped Space {name}"), json!(item.clone())))
+                Ok((format!("dropped Domain {name}"), json!(item.clone())))
             }
             ResourceKind::Writer => drop_named(&mut state.writers, name, "Writer"),
             ResourceKind::Reader => {
@@ -2759,6 +2765,9 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
     let keyword = |index: usize| tokens.get(index).map(|token| token.to_ascii_uppercase());
     match keyword(0).as_deref() {
         Some("CREATE") => match keyword(1).as_deref() {
+            Some("DOMAIN") => Ok(Command::CreateDomain {
+                name: token(&tokens, 2)?.to_owned(),
+            }),
             Some("SPACE") => Ok(Command::CreateSpace {
                 name: token(&tokens, 2)?.to_owned(),
             }),
@@ -2793,7 +2802,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 }
             }
             _ => Err(ControlError::Syntax(
-                "CREATE supports SPACE, FEED, WRITER, READER, SUBSCRIPTION, and ROLE".to_owned(),
+                "CREATE supports DOMAIN, FEED, WRITER, READER, SUBSCRIPTION, and ROLE (SPACE is a compatibility alias)".to_owned(),
             )),
         },
         Some("OPEN") => {
@@ -2948,6 +2957,7 @@ fn parse_reader_start(tokens: &[String], index: usize) -> Result<ReaderStart, Co
 
 fn parse_resource_kind(token: &str) -> Result<ResourceKind, ControlError> {
     match token.to_ascii_uppercase().as_str() {
+        "DOMAIN" => Ok(ResourceKind::Domain),
         "SPACE" => Ok(ResourceKind::Space),
         "FEED" => Ok(ResourceKind::Feed),
         "WRITER" => Ok(ResourceKind::Writer),
@@ -2962,6 +2972,7 @@ fn parse_resource_kind(token: &str) -> Result<ResourceKind, ControlError> {
 
 fn parse_show_kind(token: &str) -> Result<ShowKind, ControlError> {
     match token.to_ascii_uppercase().as_str() {
+        "DOMAINS" => Ok(ShowKind::Domains),
         "SPACES" => Ok(ShowKind::Spaces),
         "FEEDS" => Ok(ShowKind::Feeds),
         "WRITERS" => Ok(ShowKind::Writers),
@@ -3078,7 +3089,7 @@ fn owning_space<'a>(
             space.status == ResourceStatus::Active && feed.starts_with(&(space.name.clone() + "."))
         })
         .max_by_key(|space| space.name.len())
-        .ok_or_else(|| ControlError::NotFound(format!("owning Space for Feed {feed}")))
+        .ok_or_else(|| ControlError::NotFound(format!("owning Domain for Feed {feed}")))
 }
 
 fn active_space<'a>(
@@ -3089,7 +3100,7 @@ fn active_space<'a>(
         .spaces
         .values()
         .find(|item| item.name == name && item.status == ResourceStatus::Active)
-        .ok_or_else(|| ControlError::NotFound(format!("Space {name}")))
+        .ok_or_else(|| ControlError::NotFound(format!("Domain {name}")))
 }
 
 fn active_space_mut<'a>(
@@ -3100,7 +3111,7 @@ fn active_space_mut<'a>(
         .spaces
         .values_mut()
         .find(|item| item.name == name && item.status == ResourceStatus::Active)
-        .ok_or_else(|| ControlError::NotFound(format!("Space {name}")))
+        .ok_or_else(|| ControlError::NotFound(format!("Domain {name}")))
 }
 
 fn active_feed<'a>(
@@ -3265,7 +3276,7 @@ fn drop_named<T: Clone + Serialize + NamedResource>(
 
 fn show_resources(state: &CatalogState, kind: ShowKind) -> Value {
     match kind {
-        ShowKind::Spaces => json!(state
+        ShowKind::Domains | ShowKind::Spaces => json!(state
             .spaces
             .values()
             .filter(|item| item.status == ResourceStatus::Active)
@@ -3305,7 +3316,7 @@ fn describe_resource(
     name: &str,
 ) -> Result<Value, ControlError> {
     match kind {
-        ResourceKind::Space => Ok(json!(active_space(state, name)?)),
+        ResourceKind::Domain | ResourceKind::Space => Ok(json!(active_space(state, name)?)),
         ResourceKind::Feed => Ok(json!(active_feed(state, name)?)),
         ResourceKind::Writer => state
             .writers
@@ -3371,6 +3382,7 @@ fn unix_ns() -> i64 {
 
 fn command_label(command: &Command) -> String {
     match command {
+        Command::CreateDomain { .. } => "CREATE DOMAIN",
         Command::CreateSpace { .. } => "CREATE SPACE",
         Command::CreateFeed { .. } => "CREATE FEED",
         Command::DefineStateStore { .. } => "DEFINE STATE STORE",
@@ -3417,7 +3429,7 @@ fn command_label(command: &Command) -> String {
 
 fn resource_name(kind: &ResourceKind) -> &'static str {
     match kind {
-        ResourceKind::Space => "Space",
+        ResourceKind::Domain | ResourceKind::Space => "Domain",
         ResourceKind::Feed => "Feed",
         ResourceKind::Writer => "Writer",
         ResourceKind::Reader => "Reader",
@@ -3428,7 +3440,7 @@ fn resource_name(kind: &ResourceKind) -> &'static str {
 
 fn show_name(kind: &ShowKind) -> &'static str {
     match kind {
-        ShowKind::Spaces => "Spaces",
+        ShowKind::Domains | ShowKind::Spaces => "Domains",
         ShowKind::Feeds => "Feeds",
         ShowKind::Writers => "Writers",
         ShowKind::Readers => "Readers",
@@ -3482,6 +3494,94 @@ mod tests {
             Command::TransferActiveRangeOwnership { feed, owner }
                 if feed == "orders.created" && owner.as_str() == "storage-2"
         ));
+    }
+
+    #[test]
+    fn domain_wcl_is_accepted_alongside_legacy_space_syntax() {
+        let commands = parse_wcl(
+            "CREATE DOMAIN orders; SHOW DOMAINS; DESCRIBE DOMAIN orders; RENAME DOMAIN orders TO billing; DROP DOMAIN billing; CREATE SPACE legacy; SHOW SPACES;",
+        ).unwrap();
+        assert_eq!(commands.len(), 7, "Domain and Space syntax must both parse");
+        assert!(matches!(&commands[0], Command::CreateDomain { .. }));
+        assert!(matches!(
+            &commands[1],
+            Command::Show {
+                kind: ShowKind::Domains
+            }
+        ));
+        assert!(matches!(
+            &commands[2],
+            Command::Describe {
+                kind: ResourceKind::Domain,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &commands[3],
+            Command::Rename {
+                kind: ResourceKind::Domain,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &commands[4],
+            Command::Drop {
+                kind: ResourceKind::Domain,
+                ..
+            }
+        ));
+        assert!(matches!(&commands[5], Command::CreateSpace { .. }));
+        assert!(matches!(
+            &commands[6],
+            Command::Show {
+                kind: ShowKind::Spaces
+            }
+        ));
+        assert_eq!(
+            serde_json::to_value(&commands[0]).unwrap()["command"],
+            "create_domain"
+        );
+        assert_eq!(
+            serde_json::to_value(&commands[1]).unwrap()["kind"],
+            "domains"
+        );
+    }
+
+    #[tokio::test]
+    async fn domain_aliases_preserve_existing_catalog_identity_and_drop_guards() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        let created = controller
+            .execute("CREATE DOMAIN orders; CREATE SPACE legacy;")
+            .await
+            .unwrap();
+        assert_eq!(created.results[0].statement, "CREATE DOMAIN");
+        assert_eq!(created.results[0].message, "created Domain orders");
+        let domain_id = created.results[0].data["space_id"].clone();
+        let listed = controller
+            .execute("SHOW DOMAINS; SHOW SPACES; DESCRIBE DOMAIN orders; DESCRIBE SPACE orders;")
+            .await
+            .unwrap();
+        assert_eq!(listed.results[0].data, listed.results[1].data);
+        assert_eq!(listed.results[2].data, listed.results[3].data);
+        assert_eq!(listed.results[2].data["space_id"], domain_id);
+        controller
+            .execute("CREATE FEED orders.created;")
+            .await
+            .unwrap();
+        assert!(controller.execute("DROP DOMAIN orders;").await.is_err());
+        drop(controller);
+        let reopened = new_controller(&directory);
+        let described = reopened.execute("DESCRIBE DOMAIN orders;").await.unwrap();
+        assert_eq!(described.results[0].data["space_id"], domain_id);
+        reopened
+            .execute(
+                "DROP FEED orders.created; RENAME DOMAIN orders TO billing; DROP DOMAIN billing;",
+            )
+            .await
+            .unwrap();
+        assert!(reopened.execute("DESCRIBE DOMAIN billing;").await.is_err());
+        assert!(reopened.execute("DESCRIBE DOMAIN legacy;").await.is_ok());
     }
 
     #[tokio::test]

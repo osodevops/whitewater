@@ -32,7 +32,7 @@ The current delivery track is multiple internal Active Ranges. In parallel, [Mil
 ## F0 — Product and architecture
 
 - [x] Name the product Whitewater under FinnStream.
-- [x] Define the public model: `riverbed -> space -> feed -> key -> cursor -> subscription`.
+- [x] Define the public model: `riverbed -> domain -> feed -> key -> cursor -> subscription`.
 - [x] Replace Topic with Feed, Headers with Metadata, and Offset with opaque Cursor terminology.
 - [x] Define immutable FeedId and mutable dotted FeedName.
 - [x] Define lowercase dotted names and 512-byte maximum.
@@ -89,7 +89,7 @@ Evidence:
 ## F3 — Administration
 
 - [x] Implement WCL v0 parser and typed command model.
-- [x] Implement Spaces, Feeds, Writers, Readers, Roles, and namespace grants.
+- [x] Implement Domains, Feeds, Writers, Readers, Roles, and namespace grants.
 - [x] Implement immutable IDs and rename without physical storage rename.
 - [x] Implement `SHOW`, `DESCRIBE`, `EXPLAIN ACCESS`, `SEEK`, and safe logical `DROP`.
 - [x] Expose authenticated WCL and typed JSON Admin API routes.
@@ -716,7 +716,7 @@ Definition of Done:
 
 - [x] Define an internal IndexId, stable logical primary reference, shared secondary/unique-claim key encoding, composite/prefix/range access, and an update/delete mutation planner with focused unit tests (`src/index.rs`).
 - [x] Prototype a locally durable Fjall-backed Index with a fixed three-keyspace layout, serializable primary/posting/checkpoint upserts and deletes, bounded exact secondary lookups, local uniqueness checks, and restart/concurrent-conflict tests (`src/index.rs`). This does not implement distributed uniqueness or Feed-to-Index atomicity.
-- [x] Persist idempotent Space-scoped StateStore declarations with manual or same-Space Feed source in Control Plane catalogs and snapshots; their `declared` stage explicitly cannot serve data (`src/control.rs`).
+- [x] Persist idempotent Domain-scoped StateStore declarations with manual or same-Domain Feed source in Control Plane catalogs and snapshots; their `declared` stage explicitly cannot serve data (`src/control.rs`).
 - [ ] Define and persist versioned application-owned secondary Index definitions with typed fields/extractors, collation, consistency, scope, and build state through the Control Plane.
 - [ ] Replicate manual StateStore mutations and their idempotency identities on RF3 with a Whitewater-managed durable journal; never claim a manually populated store can be recreated from unrelated Feed history.
 - [ ] Replay Feed-derived StateStores from verified source FeedId/Cursor and bounded checkpoints, refusing rebuild if required history is gone.
@@ -728,7 +728,7 @@ Definition of Done:
 - [ ] Implement global uniqueness across Active Ranges with a replicated conditional claim protocol; reject UNIQUE definitions until it is proven.
 - [ ] Implement Index applied-Cursor freshness and strict reads that wait or explicitly report `index_behind`.
 - [ ] Implement three-replica Index durability, verified checkpoints, bounded catch-up, and transfer.
-- [ ] Implement controlled shadow-generation rebuild from retained Feed history, including `REBUILD INDEX` and `REBUILD INDEXES IN SPACE`, refusal when history/checkpoints are insufficient, and atomic activation.
+- [ ] Implement controlled shadow-generation rebuild from retained Feed history, including `REBUILD INDEX` and `REBUILD INDEXES IN DOMAIN`, refusal when history/checkpoints are insufficient, and atomic activation.
 - [ ] Implement automatic logical query routing and expose `CREATE INDEX`, `GET`, exact/prefix/range queries, and Index inspection through typed Admin API and WCL.
 
 Definition of Done:
@@ -739,7 +739,7 @@ Definition of Done:
 
 ## Milestone 7 — Subscriptions, Pipes, and atomic effects
 
-- [x] Declare Space-scoped Subscriptions by logical name and source Feed through typed Control Plane commands and WCL, idempotently across snapshots; `stage=declared` does not allow clients to join or acknowledge. Tests prove a declaration creates no internal/public Feed and refuses cross-Space sources or unsafe Feed drop.
+- [x] Declare Domain-scoped Subscriptions by logical name and source Feed through typed Control Plane commands and WCL, idempotently across snapshots; `stage=declared` does not allow clients to join or acknowledge. Tests prove a declaration creates no internal/public Feed and refuses cross-Domain sources or unsafe Feed drop.
 - [~] Implement durable Subscription progress in hidden, ReaderId/SubscriptionId-sharded RF3 internal state and mutation journals, not Kafka-style internal Feeds. A local Fjall `subscription_progress` replica prototype now durably prepares one bounded, epoch-fenced mutation per SubscriptionId and keeps it invisible until a separate commit step with two distinct matching prepare votes; deterministic unit and restart integration tests reject conflicting retries, stale epochs and one-copy evidence. An in-process coordinator now checks a supplied three-replica assignment, requires the owner plus another matching durable prepare and commit result, and returns ambiguous failure if only one commit succeeds; deterministic integration tests cover one unavailable replica, contradictory votes, and retry after a partial commit. New declarations now persist a private initial owner, three replicas, and ownership epoch in Control Plane state, leader-selected over all configured eligible storage Nodes using SubscriptionId-scoped rendezvous scoring and replicated as fixed command placement; public Subscription definitions expose none of that topology. Snapshot/restart tests preserve this placement despite different local Node candidates, and older declarations without it fail closed. Deterministic tests with 3, 12, and 24 eligible candidates verify each Subscription still has RF3 while different Subscriptions spread across the configured pool; this is placement logic only, not a live 12/24-Node Riverbed or an unbounded capacity claim. Each Control Plane Node now opens a private durable `subscription-progress` Fjall directory and exposes bounded internal prepare/commit endpoints protected by the development Control Plane key; receiver/owner/epoch and vote membership are checked against current private placement before blocking Fjall writes run off Tokio. An async HTTP transport targets assigned Node endpoints, and unit/router tests cover credential rejection, placement fencing, local persistence and request delivery. This is **not** production RF3: the shared development key does not verify sender Node identity or encrypt traffic, replica votes are not authenticated, the HTTP transport is not wired to a public consume path, and placement movement/drain and quorum-backed read/recovery remain absent. Member joins stay disabled. Persist separate expiring member leases, retry identities, and acknowledged frontiers without per-fetch Control Plane writes before enabling joins.
 - [ ] Implement transaction/effect coordinator state in separately bounded and RF3-replicated internal storage, not an application-visible Feed; do not claim atomic consume-and-append from local Fjall transactions.
 - [~] Implement epoch-fenced small-work leases: `SubscriptionLeaseTracker` now locally proves member-session fencing, bounded claims, non-overlapping grants, idempotent claim, expiry, stale-ack rejection, renewal and checked-clock behavior. It is an isolated state-machine prototype; RF3 journal/placement, verified time source, failover recovery, authenticated transport and public member joins remain.
@@ -750,7 +750,7 @@ Definition of Done:
 - [ ] Implement deterministic retry after ambiguous result.
 - [ ] Add built-in per-Key rolling-window count/sum/average as managed Pipe/StateStore views: declare the business duration, Key, and aggregation, while Whitewater chooses pane/slide/checkpoint/lease layout; do not require a fourth Node or client-side Fjall.
 - [ ] Define event-time default from `event_time_ns`, optional ingest-time policy, exact rolling boundaries, bounded watermark/grace, idle expiry, late-event revisions or explicit quarantine, versioned results, and retention/rebuild headroom.
-- [ ] Attribute per-Space window state/CPU/backfill cost, enforce active-Key and byte limits, and schedule epoch-fenced compute leases on the supported three-Node baseline with optional role-aware scale-out.
+- [ ] Attribute per-Domain window state/CPU/backfill cost, enforce active-Key and byte limits, and schedule epoch-fenced compute leases on the supported three-Node baseline with optional role-aware scale-out.
 - [ ] Prove window boundary/overflow, duplicate and out-of-order input, late events, crash/restart, owner change, compute-lease migration, no-input expiry, bounded memory, and a three-to-four-Node run without changing the SDK contract.
 - [ ] Implement a topology-free point-lookup enrichment Pipe: read a Feed, extract userId, fetch a versioned user StateStore row regardless of storage range, write an output Feed, and atomically record input progress plus output identity. Missing user or lagging state follows an explicit retry/quarantine policy.
 - [ ] Run a live three-Node acceptance with User Writer updates, Reader redelivery, Node restart/owner change, userId enrichment, and same-request retries; prove exactly one committed output effect and no acknowledged input loss without co-partition configuration.
@@ -812,7 +812,7 @@ Design: [Whitewater Operations Advisor](operations-advisor.md). This is **not im
 
 - [ ] Define versioned, correlated diagnostic schemas for Nodes, Control Plane, storage, Writers, Readers, and later Subscriptions/Indexes/Pipes, including cause, risk, automatic action, and next safe step.
 - [ ] Define a correlated health-explanation API spanning Writer, quorum, storage, Index, Subscription, and Reader stages.
-- [ ] Add bounded, redacted, authorized metrics/log/trace retrieval by Riverbed, Space, Feed, Node, and time window; treat returned content as untrusted.
+- [ ] Add bounded, redacted, authorized metrics/log/trace retrieval by Riverbed, Domain, Feed, Node, and time window; treat returned content as untrusted.
 - [ ] Expose read-only Whitewater health/explanation/recommendation tools via MCP, backed by the authenticated Admin API rather than a separate catalog.
 - [ ] Correlate scoped Kubernetes and network evidence through a least-privilege external integration without mounting infrastructure credentials in data Nodes.
 - [ ] Detect recurring busy/quiet schedules and incidents using bounded aggregates, confidence, drift detection, separate thresholds, hysteresis, and human feedback.

@@ -33,7 +33,7 @@ curl -X POST http://localhost:7071/v1/admin/wcl \
   -H 'authorization: Bearer whitewater-local-development-admin-key' \
   -H 'content-type: application/json' \
   -d '{
-    "script": "CREATE SPACE orders; SHOW SPACES;"
+    "script": "CREATE DOMAIN orders; SHOW DOMAINS;"
   }'
 ```
 
@@ -46,15 +46,15 @@ wwctl
 ```
 
 ```text
-whitewater> SHOW SPACES;
-whitewater> CREATE SPACE orders;
+whitewater> SHOW DOMAINS;
+whitewater> CREATE DOMAIN orders;
 whitewater> \\help
 ```
 
 One-shot and file execution:
 
 ```bash
-wwctl --execute "SHOW SPACES;"
+wwctl --execute "SHOW DOMAINS;"
 wwctl --file setup.wcl
 
 wwctl --endpoint http://localhost:7072 \
@@ -74,7 +74,7 @@ docker exec <node-container> \
 
 ## Names
 
-Spaces, Feeds, Writers, Readers, and Roles use lowercase dotted names:
+Domains, Feeds, Writers, Readers, and Roles use lowercase dotted names:
 
 ```regex
 ^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*$
@@ -82,11 +82,11 @@ Spaces, Feeds, Writers, Readers, and Roles use lowercase dotted names:
 
 Maximum encoded length is 512 bytes.
 
-A Feed must belong to an existing Space. The longest matching Space prefix owns the Feed.
+A Feed must belong to an existing Domain. The longest matching Domain prefix owns the Feed.
 
 ```sql
-CREATE SPACE commerce;
-CREATE SPACE commerce.orders;
+CREATE DOMAIN commerce;
+CREATE DOMAIN commerce.orders;
 CREATE FEED commerce.orders.created;
 ```
 
@@ -94,11 +94,13 @@ CREATE FEED commerce.orders.created;
 
 ## Create resources
 
-### Space
+### Domain
 
 ```sql
-CREATE SPACE orders;
+CREATE DOMAIN orders;
 ```
+
+`CREATE SPACE`, `SHOW SPACES`, `DESCRIBE SPACE`, `RENAME SPACE`, and `DROP SPACE` remain compatibility aliases for the same Domain. They do not create a second namespace or change existing Feed IDs, request IDs, or stored Cursors. New scripts should use `DOMAIN`/`DOMAINS`.
 
 ### Feed
 
@@ -151,7 +153,7 @@ CREATE SUBSCRIPTION orders.billing
   START AT BEGINNING;
 ```
 
-A Subscription belongs to the same Space as its Feed. It currently remains `declared`: it does not create an internal Feed, permit joining members, or establish shared Cursor progress yet. Existing named Readers remain independent and are not silently converted into shared Subscriptions.
+A Subscription belongs to the same Domain as its Feed. It currently remains `declared`: it does not create an internal Feed, permit joining members, or establish shared Cursor progress yet. Existing named Readers remain independent and are not silently converted into shared Subscriptions.
 
 ### Role
 
@@ -163,7 +165,7 @@ CREATE ROLE orderanalytics;
 
 ```sql
 GRANT READ
-  ON NAMESPACE orders.*
+  ON NAMEDOMAIN orders.*
   TO ROLE orderanalytics;
 ```
 
@@ -171,7 +173,7 @@ Multiple actions:
 
 ```sql
 GRANT READ, WRITE
-  ON NAMESPACE orders.*
+  ON NAMEDOMAIN orders.*
   TO ROLE orderapplication;
 ```
 
@@ -214,7 +216,7 @@ This currently explains catalog grants; it does not authenticate the caller.
 ## Show resources
 
 ```sql
-SHOW SPACES;
+SHOW DOMAINS;
 SHOW FEEDS;
 SHOW WRITERS;
 SHOW READERS;
@@ -228,7 +230,7 @@ Dropped resources are excluded from `SHOW` results.
 ## Describe resources
 
 ```sql
-DESCRIBE SPACE orders;
+DESCRIBE DOMAIN orders;
 DESCRIBE FEED orders.created;
 DESCRIBE WRITER checkout;
 DESCRIBE READER audit;
@@ -264,7 +266,7 @@ RENAME SUBSCRIPTION orders.billing TO orders.billingapi;
 RENAME ROLE orderanalytics TO businessanalytics;
 ```
 
-A Space containing active Feeds cannot currently be renamed. Rename or move its Feeds first.
+A Domain containing active Feeds cannot currently be renamed. Rename or move its Feeds first.
 
 ## Writer sessions
 
@@ -295,14 +297,14 @@ DROP SUBSCRIPTION orders.billing;
 DROP WRITER checkout;
 DROP FEED orders.created;
 DROP ROLE orderanalytics;
-DROP SPACE orders;
+DROP DOMAIN orders;
 ```
 
 Safety behavior:
 
 - A Feed with active Writers or Readers cannot be dropped.
 - Dropping a Feed does not purge physical history.
-- A Space with active Feeds cannot be dropped.
+- A Domain with active Feeds cannot be dropped.
 - Dropping a Role also removes its grants.
 - Dropped names remain reserved in v0.
 
@@ -311,7 +313,7 @@ Permanent purge syntax is deliberately absent.
 ## Complete setup example
 
 ```sql
-CREATE SPACE orders;
+CREATE DOMAIN orders;
 
 CREATE FEED orders.created;
 
@@ -329,7 +331,7 @@ CREATE READER analytics
 CREATE ROLE orderapplication;
 
 GRANT READ, WRITE
-  ON NAMESPACE orders.*
+  ON NAMEDOMAIN orders.*
   TO ROLE orderapplication;
 
 SHOW FEEDS;

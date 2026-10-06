@@ -32,7 +32,7 @@ def main():
                     split_started = True
                     break
                 if status != 503:
-                    raise AssertionError(result)
+                    raise AssertionError(f"append HTTP {status} at index {value} via {ENDPOINTS[value % 3]}: {result}")
                 time.sleep(0.1)
             else:
                 raise AssertionError(f"stable Writer request did not resolve after retry: {result}")

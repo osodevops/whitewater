@@ -33,7 +33,7 @@ This coupling is the source of much of Kafka's operational and application compl
 Whitewater separates those responsibilities. Its public abstraction becomes:
 
 ```text
-riverbed -> space -> feed -> key -> cursor -> subscription
+riverbed -> domain -> feed -> key -> cursor -> subscription
 ```
 
 A Feed has an immutable FeedId and a mutable dotted FeedName. The physical layout, replication strategy, work assignment, and degree of parallelism remain internal implementation details that can change dynamically. For the distinction between Kafka's public partitions and Whitewater's internal Active Ranges, including implementation limits, see [Kafka partitions versus Whitewater Active Ranges](why-whitewater.md#kafka-partitions-versus-whitewater-active-ranges).
@@ -294,7 +294,7 @@ or:
 commerce.orders.{region}
 ```
 
-Spaces and namespace prefixes inherit policy where useful, including history, authorization, quotas, encryption, and schema metadata, while allowing specific overrides.
+Domains and namespace prefixes inherit policy where useful, including history, authorization, quotas, encryption, and schema metadata, while allowing specific overrides.
 
 The implementation must avoid turning each dotted prefix into an expensive independently coordinated object.
 
@@ -408,7 +408,7 @@ Hysteresis, minimum and maximum cluster sizes, disruption budgets, and explicit 
 The application developer should think in these terms:
 
 ```text
-riverbed -> space -> feed -> key -> cursor -> subscription
+riverbed -> domain -> feed -> key -> cursor -> subscription
 
 feed
   -> immutable identity with a mutable dotted name

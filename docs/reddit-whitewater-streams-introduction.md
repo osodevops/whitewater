@@ -42,7 +42,7 @@ The goal is not to reproduce the Kafka API in Rust. The goal is to remove the ar
 The public model starts at the Riverbed boundary:
 
 ```text
-riverbed -> space -> feed -> key -> cursor -> subscription
+riverbed -> domain -> feed -> key -> cursor -> subscription
 ```
 
 Applications should not know which server owns their data, how many physical ranges exist, where replicas live, or how work moved after capacity changed.
@@ -241,7 +241,7 @@ Whitewater's target baseline is narrow:
 - TLS for all client and inter-Node traffic
 - No plaintext production listener
 - Scoped, rotatable API-key identities
-- Predictable inherited capability policy through Spaces
+- Predictable inherited capability policy through Domains
 - Audit events for administrative mutations
 - Secret-free logs, metrics, and support bundles
 
@@ -293,7 +293,7 @@ Those are architectural advantages, not benchmark results. Whitewater still has 
 The intended developer experience is:
 
 ```text
-choose a Space
+choose a Domain
 name a Feed
 append by Key
 resume with a Cursor
@@ -433,7 +433,7 @@ Current Docker membership demonstrates discovery and control-loop behavior, not 
 ### Phase 5 — production platform
 
 - Mandatory TLS and scoped API keys
-- Space isolation and quotas
+- Domain isolation and quotas
 - Object-storage tiering
 - Rolling upgrades
 - Disaster recovery
@@ -453,7 +453,7 @@ Kafka:
 cluster -> broker -> topic -> partition -> offset -> consumer group
 
 Whitewater:
-riverbed -> space -> feed -> key -> cursor -> subscription
+riverbed -> domain -> feed -> key -> cursor -> subscription
 ```
 
 That is a larger and riskier project than implementing a faster broker. It may also create room for substantially simpler applications and operations.

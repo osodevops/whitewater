@@ -6,7 +6,7 @@ Each Whitewater Riverbed has one **Control Plane**. Internally, three control vo
 
 The Control Plane owns logical metadata and administrative ordering:
 
-- Spaces
+- Domains
 - Feed identities and names
 - Writers and Readers
 - Reader Cursors

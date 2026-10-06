@@ -148,7 +148,7 @@ Whitewater promise:
 
 - Authenticated encryption is mandatory for client and inter-Node traffic. Native TLS/mTLS is the default; a trusted service mesh or equivalent orchestrator-provided transport may satisfy the inter-Node guarantee when peer identity, rotation, audit, and downgrade prevention are verified.
 - API keys are scoped identities, stored only as verifiers, and designed for rotation.
-- Space and Feed capabilities inherit predictably.
+- Domain and Feed capabilities inherit predictably.
 - Deny and allow decisions are explainable through an authorization trace.
 - Every administrative mutation produces an audit event.
 - Authentication secrets and data-encryption keys are separate.
@@ -188,7 +188,7 @@ The capacity owner wants cost to follow useful work. They should not need to acc
 
 Whitewater promise:
 
-- Cost is attributed to Space, Feed, Subscription, Pipe, and Index.
+- Cost is attributed to Domain, Feed, Subscription, Pipe, and Index.
 - Capacity recommendations explain which resource caused the recommendation.
 - Autoscaling is slow, hysteretic, and bounded.
 - Background movement has bandwidth and cost budgets.
@@ -270,7 +270,7 @@ Whitewater response:
 Acceptance criteria:
 
 - No acknowledged write fails solely because an expected background task consumed reserved headroom.
-- Operators receive time-to-exhaustion and the responsible Spaces/Feeds.
+- Operators receive time-to-exhaustion and the responsible Domains/Feeds.
 - Automatic action begins before the emergency threshold.
 - Recovery does not require deleting unknown business data by hand.
 
@@ -435,7 +435,7 @@ Kafka operations often combine JMX metrics, exporter mappings, consumer-lag tool
 
 Whitewater response:
 
-- Metrics, traces, logs, events, and control-plane decisions share Riverbed, Space, FeedId, SubscriptionId, PipeId, IndexId, and NodeId dimensions.
+- Metrics, traces, logs, events, and control-plane decisions share Riverbed, Domain, FeedId, SubscriptionId, PipeId, IndexId, and NodeId dimensions.
 - High-cardinality key diagnostics are sampled and bounded.
 - Every automatic action records its inputs, policy, decision, and result.
 - A built-in health explanation API answers “why is this delayed?”
@@ -540,8 +540,8 @@ Whitewater is not operationally better merely because its diagrams are cleaner. 
 
 ### Cost and isolation
 
-- Attribute hot, warm, remote, replicated, and indexed bytes per Space.
-- Enforce one Space's quotas without stalling another.
+- Attribute hot, warm, remote, replicated, and indexed bytes per Domain.
+- Enforce one Domain's quotas without stalling another.
 - Throttle background maintenance before foreground traffic.
 - Show the cost estimate and actual cost of an Index.
 
@@ -599,4 +599,4 @@ The simplest test of every proposed feature is:
 
 > Does this remove a class of decisions and incidents for users, or merely move the same complexity behind a new name?
 
-Whitewater succeeds only when safe operation is measurably calmer, recovery is bounded and explainable, and developers can work in terms of Spaces, Feeds, Keys, Cursors, and Subscriptions without inheriting the physical topology.
+Whitewater succeeds only when safe operation is measurably calmer, recovery is bounded and explainable, and developers can work in terms of Domains, Feeds, Keys, Cursors, and Subscriptions without inheriting the physical topology.
