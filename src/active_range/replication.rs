@@ -383,6 +383,20 @@ impl ReplicaAppendService {
             .map_err(map_store_error)
     }
 
+    pub async fn read_assignment_committed_bounded(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        after: Option<RangePosition>,
+        limit: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<super::StoredRangeFrame>, ReplicaAppendError> {
+        self.store_for(assignment)
+            .await?
+            .read_committed_bounded(after, limit, max_bytes)
+            .await
+            .map_err(map_store_error)
+    }
+
     pub async fn export_committed(
         &self,
         feed_id: Uuid,

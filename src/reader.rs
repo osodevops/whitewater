@@ -1330,6 +1330,79 @@ impl SubscriptionProgressCoordinator {
         Ok(observed.flatten())
     }
 
+    pub async fn reconcile_retry(
+        &self,
+        mutation: SubscriptionProgressMutation,
+    ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
+        if mutation.subscription_id != self.assignment.subscription_id
+            || mutation.ownership_epoch != self.assignment.ownership_epoch
+        {
+            return Err(SubscriptionProgressError::InvalidAssignment);
+        }
+        let mut reachable = 0;
+        let mut owner_seen = false;
+        let mut owner_committed = false;
+        let mut matching = 0;
+        for node in self.assignment.replicas.iter() {
+            match self
+                .transport
+                .committed(node, mutation.subscription_id, mutation.ownership_epoch)
+                .await
+            {
+                Ok(reply) => {
+                    if reply.replica != *node
+                        || reply.subscription_id != mutation.subscription_id
+                        || reply.ownership_epoch != mutation.ownership_epoch
+                    {
+                        return Err(SubscriptionProgressError::InvalidAssignment);
+                    }
+                    reachable += 1;
+                    if node == &self.assignment.owner {
+                        owner_seen = true;
+                    }
+                    match reply.result {
+                        Some(current) if current == mutation => {
+                            matching += 1;
+                            if node == &self.assignment.owner {
+                                owner_committed = true;
+                            }
+                        }
+                        Some(current)
+                            if current.subscription_id == mutation.subscription_id
+                                && current.feed_id == mutation.feed_id
+                                && current.ownership_epoch == mutation.ownership_epoch
+                                && current.sequence.checked_add(1) == Some(mutation.sequence)
+                                && mutation.expected_cursor.as_deref()
+                                    == Some(current.cursor.as_str()) => {}
+                        None if mutation.sequence == 1 && mutation.expected_cursor.is_none() => {}
+                        _ => return Err(SubscriptionProgressError::Conflict),
+                    }
+                }
+                Err(SubscriptionProgressError::Unavailable) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if reachable < 2 || !owner_seen {
+            return Err(SubscriptionProgressError::NoQuorum);
+        }
+        if owner_committed && matching >= 2 {
+            match self.read_committed().await {
+                Ok(Some(committed)) if committed == mutation => return Ok(mutation),
+                Err(SubscriptionProgressError::Conflict) => {}
+                Err(error) => return Err(error),
+                _ => return Err(SubscriptionProgressError::AmbiguousCommit),
+            }
+        }
+        self.apply(mutation.clone()).await?;
+        match self.read_committed().await {
+            Ok(Some(committed)) if committed == mutation => Ok(mutation),
+            Err(SubscriptionProgressError::Conflict) | Ok(_) => {
+                Err(SubscriptionProgressError::AmbiguousCommit)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn apply(
         &self,
         mutation: SubscriptionProgressMutation,

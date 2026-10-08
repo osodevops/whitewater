@@ -349,6 +349,101 @@ async fn quorum_subscription_read_fails_closed_on_loss_disagreement_and_ambiguou
 }
 
 #[tokio::test]
+async fn ambiguous_subscription_retry_reconciles_after_restart_without_guessing() {
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = progress_nodes();
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let subscription_id = Uuid::from_u128(1201);
+    let assignment = SubscriptionProgressAssignment::try_new(
+        subscription_id,
+        nodes[0].clone(),
+        ReplicaSet::try_new(nodes.clone()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let coordinator = SubscriptionProgressCoordinator::new(assignment.clone(), transport.clone());
+    let first = SubscriptionProgressMutation {
+        subscription_id,
+        feed_id: Uuid::from_u128(1202),
+        ownership_epoch: 1,
+        sequence: 1,
+        request_id: Uuid::from_u128(1203),
+        expected_cursor: None,
+        cursor: "cursor-1".to_owned(),
+        positions: BTreeMap::from([(
+            RangeId::from_uuid(Uuid::from_u128(1204)),
+            "cursor-1".to_owned(),
+        )]),
+    };
+    coordinator.apply(first.clone()).await.unwrap();
+    let mut next = first.clone();
+    next.sequence = 2;
+    next.request_id = Uuid::from_u128(1205);
+    next.expected_cursor = Some(first.cursor);
+    next.cursor = "cursor-2".to_owned();
+    transport
+        .commit_down
+        .lock()
+        .unwrap()
+        .extend([nodes[1].clone(), nodes[2].clone()]);
+    assert!(matches!(
+        coordinator.apply(next.clone()).await,
+        Err(SubscriptionProgressError::AmbiguousCommit)
+    ));
+    drop(coordinator);
+    drop(transport);
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::new(assignment, transport.clone());
+    transport.read_down.lock().unwrap().insert(nodes[0].clone());
+    assert!(matches!(
+        coordinator.reconcile_retry(next.clone()).await,
+        Err(SubscriptionProgressError::NoQuorum)
+    ));
+    transport.read_down.lock().unwrap().clear();
+    let mut conflicting = next.clone();
+    conflicting.cursor = "other-cursor".to_owned();
+    transport
+        .read_override
+        .lock()
+        .unwrap()
+        .insert(nodes[2].clone(), Some(conflicting));
+    assert!(matches!(
+        coordinator.reconcile_retry(next.clone()).await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+    transport.read_override.lock().unwrap().clear();
+    transport
+        .commit_down
+        .lock()
+        .unwrap()
+        .insert(nodes[2].clone());
+    assert!(matches!(
+        coordinator.reconcile_retry(next.clone()).await,
+        Err(SubscriptionProgressError::AmbiguousCommit)
+    ));
+    transport.commit_down.lock().unwrap().clear();
+    assert_eq!(
+        coordinator.reconcile_retry(next.clone()).await.unwrap(),
+        next
+    );
+    assert_eq!(
+        coordinator.read_committed().await.unwrap(),
+        Some(next.clone())
+    );
+    let mut wrong_id = next.clone();
+    wrong_id.request_id = Uuid::from_u128(1206);
+    assert!(matches!(
+        coordinator.reconcile_retry(wrong_id).await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+    assert_eq!(coordinator.read_committed().await.unwrap(), Some(next));
+}
+
+#[tokio::test]
 async fn progress_coordinator_refuses_replies_claiming_another_replica() {
     let dirs = [
         TempDir::new().unwrap(),

@@ -382,11 +382,6 @@ impl OwnerMoveExecutor {
         plan: &RangeOwnerMovePlan,
         frozen_commit: CommitPosition,
     ) -> Result<OwnerMoveEvidence, OwnerMoveError> {
-        if frozen_commit.value() > 10_000 {
-            return Err(OwnerMoveError::Target(
-                "range exceeds the 10,000-record prototype verification bound".to_owned(),
-            ));
-        }
         let assignment = &plan.source_assignment;
         let target_status = self
             .target
@@ -400,40 +395,8 @@ impl OwnerMoveExecutor {
             .truncate_uncommitted_for_assignment(assignment)
             .await
             .map_err(|error| OwnerMoveError::Target(error.to_string()))?;
-        let mut after = None;
-        let mut checksum = blake3::Hasher::new();
-        while after.map_or(0, RangePosition::value) < frozen_commit.value() {
-            let source = self
-                .source
-                .export_assignment_committed(assignment, after, 1)
-                .await
-                .map_err(|error| OwnerMoveError::Freeze(error.to_string()))?;
-            if source.is_empty() {
-                return Err(OwnerMoveError::VerificationFailed);
-            }
-            let target = self
-                .target
-                .read_staged_committed(assignment, after, source.len())
-                .await
-                .map_err(|error| OwnerMoveError::Target(error.to_string()))?;
-            if source.len() != target.len() {
-                return Err(OwnerMoveError::VerificationFailed);
-            }
-            for (source, target) in source.into_iter().zip(target) {
-                if source.position != target.position
-                    || source.identity != target.identity
-                    || source.cursor != target.cursor
-                    || source.frame != target.frame
-                    || source.position.value() > frozen_commit.value()
-                {
-                    return Err(OwnerMoveError::VerificationFailed);
-                }
-                let digest = blake3::hash(&source.frame);
-                checksum.update(&source.position.value().to_be_bytes());
-                checksum.update(digest.as_bytes());
-                after = Some(source.position);
-            }
-        }
+        let checksum =
+            verify_owner_move_prefix(&self.source, &self.target, assignment, frozen_commit).await?;
         let source_commit = self
             .source
             .recovery_status_for_assignment(assignment)
@@ -452,7 +415,7 @@ impl OwnerMoveExecutor {
         Ok(OwnerMoveEvidence {
             source_commit,
             target_commit,
-            checksum: *checksum.finalize().as_bytes(),
+            checksum,
             ready: true,
         })
     }
@@ -471,6 +434,61 @@ impl OwnerMoveExecutor {
             )
             .await;
     }
+}
+
+async fn verify_owner_move_prefix(
+    source: &ReplicaAppendService,
+    target: &ReplicaAppendService,
+    assignment: &ActiveRangeAssignment,
+    frozen_commit: CommitPosition,
+) -> Result<[u8; 32], OwnerMoveError> {
+    let mut after = None;
+    let mut checksum = blake3::Hasher::new();
+    while after.map_or(0, RangePosition::value) < frozen_commit.value() {
+        let page = source
+            .read_assignment_committed_bounded(
+                assignment,
+                after,
+                128,
+                crate::codec::MAX_FRAME_BYTES,
+            )
+            .await
+            .map_err(|error| OwnerMoveError::Freeze(error.to_string()))?;
+        if page.is_empty() {
+            return Err(OwnerMoveError::VerificationFailed);
+        }
+        let candidate = target
+            .read_assignment_committed_bounded(
+                assignment,
+                after,
+                page.len(),
+                crate::codec::MAX_FRAME_BYTES,
+            )
+            .await
+            .map_err(|error| OwnerMoveError::Target(error.to_string()))?;
+        if page.len() != candidate.len() {
+            return Err(OwnerMoveError::VerificationFailed);
+        }
+        for (item, candidate) in page.into_iter().zip(candidate) {
+            let expected = after.map_or(Some(1), |position: RangePosition| {
+                position.value().checked_add(1)
+            });
+            if Some(item.position.value()) != expected
+                || item.position != candidate.position
+                || item.identity != candidate.identity
+                || item.cursor != candidate.cursor
+                || item.frame != candidate.frame
+                || item.position.value() > frozen_commit.value()
+            {
+                return Err(OwnerMoveError::VerificationFailed);
+            }
+            let digest = blake3::hash(&item.frame);
+            checksum.update(&item.position.value().to_be_bytes());
+            checksum.update(digest.as_bytes());
+            after = Some(item.position);
+        }
+    }
+    Ok(*checksum.finalize().as_bytes())
 }
 
 pub async fn copy_follower_move(
@@ -874,5 +892,80 @@ impl LocalRepairSupervisor {
             .json()
             .await
             .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        active_range::{store::seed_committed_history, ActiveRangeDescriptor},
+        storage::{FileLogStore, LogStore},
+    };
+
+    #[tokio::test]
+    async fn owner_move_checks_full_history_beyond_ten_thousand_and_refuses_short_target() {
+        let root = tempfile::TempDir::new().unwrap();
+        let nodes = ["storage-1", "storage-2", "storage-3"]
+            .map(|node| StorageNodeId::try_new(node).unwrap());
+        let legacy: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(root.path().join("legacy")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                root.path().join("catalog.json"),
+                legacy,
+                nodes.to_vec(),
+            )
+            .unwrap(),
+        );
+        let created = control
+            .execute_commands(vec![
+                Command::CreateSpace {
+                    name: "orders".to_owned(),
+                },
+                Command::CreateFeed {
+                    name: "orders.events".to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+        let feed_id: Uuid =
+            serde_json::from_value(created.results[1].data["feed_id"].clone()).unwrap();
+        let assignment = control.active_range_assignment(feed_id).await.unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        let source_root = root.path().join("owner");
+        let target_root = root.path().join("target");
+        let short_root = root.path().join("short-target");
+        seed_committed_history(&source_root, &descriptor, 10_001);
+        seed_committed_history(&target_root, &descriptor, 10_001);
+        seed_committed_history(&short_root, &descriptor, 10_000);
+        let source = ReplicaAppendService::new(&source_root, nodes[0].clone(), control.clone());
+        let target = ReplicaAppendService::new(&target_root, nodes[1].clone(), control.clone());
+        let short = ReplicaAppendService::new(&short_root, nodes[2].clone(), control.clone());
+        let boundary = CommitPosition::new(10_001);
+        let checksum = verify_owner_move_prefix(&source, &target, &assignment, boundary)
+            .await
+            .unwrap();
+        assert_ne!(checksum, [0; 32]);
+        assert!(matches!(
+            verify_owner_move_prefix(&source, &short, &assignment, boundary).await,
+            Err(OwnerMoveError::VerificationFailed)
+        ));
+        drop(source);
+        drop(target);
+        let restarted_source =
+            ReplicaAppendService::new(&source_root, nodes[0].clone(), control.clone());
+        let restarted_target = ReplicaAppendService::new(&target_root, nodes[1].clone(), control);
+        assert_eq!(
+            verify_owner_move_prefix(&restarted_source, &restarted_target, &assignment, boundary)
+                .await
+                .unwrap(),
+            checksum
+        );
     }
 }
