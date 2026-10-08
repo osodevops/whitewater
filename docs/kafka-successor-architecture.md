@@ -294,6 +294,8 @@ or:
 commerce.orders.{region}
 ```
 
+A first-class Domain-wide Subscription selects all active Feeds in one Domain, including Feeds created after the Subscription; its progress tracks immutable FeedIds, not mutable names or a global cross-Feed position. Discovery and removal are incremental: newly created Feeds begin without missing retained records, while a removed Feed's outstanding work is drained or explicitly disposed before its history disappears. A Feed rename retains identity/progress, and a new Feed reusing a removed name starts with new progress. These changes do not pause other Feeds or claim total order across them. Every Feed- or Domain-consumer delivery passes server-owned source Metadata identifying both the last Feed-name segment and full Domain-qualified Feed name; that delivery context is distinct from Writer-provided record Metadata and must remain stable on an exact retry.
+
 Domains and namespace prefixes inherit policy where useful, including history, authorization, quotas, encryption, and schema metadata, while allowing specific overrides.
 
 The implementation must avoid turning each dotted prefix into an expensive independently coordinated object.
