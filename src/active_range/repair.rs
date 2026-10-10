@@ -173,11 +173,20 @@ impl FollowerMoveExecutor {
         plan: &RangeMovePlan,
         batch_size: usize,
     ) -> Result<FollowerMoveCopyResult, FollowerMoveError> {
+        // Phase 1 stages the committed prefix while appends keep flowing:
+        // staged frames are immutable committed records on the candidate
+        // store, so a failure here leaves the source unfrozen and writable.
+        copy_follower_move(plan, &self.source, &self.replacement, batch_size)
+            .await
+            .map_err(FollowerMoveError::Copy)?;
         let frozen_commit = self
             .coordinator
             .freeze_for_follower_move(&plan.source_assignment)
             .await
             .map_err(|error| FollowerMoveError::Freeze(error.to_string()))?;
+        // Phase 2 resumes at the proven committed boundary and only
+        // transfers the tail appended during phase 1, so the write stall is
+        // bounded by the delta rather than the whole range.
         let copied =
             match copy_follower_move(plan, &self.source, &self.replacement, batch_size).await {
                 Ok(copied) => copied,

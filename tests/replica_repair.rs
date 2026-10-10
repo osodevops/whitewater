@@ -826,3 +826,138 @@ async fn follower_move_copy_resumes_staged_prefix_after_target_restart() {
     assert_eq!(copied.transferred_records, 1);
     assert_eq!(copied.target_commit, CommitPosition::new(3));
 }
+#[tokio::test]
+async fn follower_move_stages_the_prefix_before_freezing_the_tail() {
+    let directory = TempDir::new().unwrap();
+    let legacy: Arc<dyn LogStore> =
+        Arc::new(FileLogStore::open(directory.path().join("legacy")).unwrap());
+    let control = Arc::new(
+        ControlController::open_with_storage_nodes(
+            directory.path().join("catalog.json"),
+            legacy,
+            ["storage-1", "storage-2", "storage-3", "storage-4"]
+                .into_iter()
+                .map(node)
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let created = control
+        .execute_commands(vec![
+            Command::CreateSpace {
+                name: "orders".to_owned(),
+            },
+            Command::CreateFeed {
+                name: "orders.events".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+    let feed_id = serde_json::from_value(created.results[1].data["feed_id"].clone()).unwrap();
+    let original = control.active_range_assignment(feed_id).await.unwrap();
+    let services = ["storage-1", "storage-2", "storage-3", "storage-4"]
+        .into_iter()
+        .map(|value| {
+            (
+                node(value),
+                Arc::new(ReplicaAppendService::new(
+                    directory.path().join(value),
+                    node(value),
+                    control.clone(),
+                )),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let source = services[&original.owner].clone();
+    for sequence in 1..=3_u64 {
+        let record = StoredRecord {
+            message_id: Uuid::from_u128(1_200 + sequence as u128),
+            producer_id: Uuid::from_u128(1_200),
+            producer_sequence: sequence,
+            event_time_ns: sequence as i64,
+            ingest_time_ns: sequence as i64,
+            key: b"order-1".to_vec(),
+            payload: format!("event-{sequence}").into_bytes(),
+            metadata: BTreeMap::new(),
+        };
+        let request = ReplicaAppendRequest {
+            feed_id,
+            range_id: original.range_id,
+            generation: original.generation,
+            ownership_epoch: original.ownership_epoch,
+            append_owner: original.owner.clone(),
+            expected_position: RangePosition::new(sequence),
+            identity: AppendIdentity {
+                writer_session_id: record.producer_id,
+                writer_epoch: 1,
+                sequence,
+            },
+            cursor: format!("cursor-{sequence}"),
+            frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+        };
+        for replica in original.replicas.iter() {
+            let accepted = services[replica].append(request.clone()).await.unwrap();
+            services[replica]
+                .commit(ReplicaCommitRequest {
+                    feed_id,
+                    range_id: original.range_id,
+                    generation: original.generation,
+                    ownership_epoch: original.ownership_epoch,
+                    append_owner: original.owner.clone(),
+                    commit_position: CommitPosition::new(sequence),
+                    frame_digest: accepted.frame_digest,
+                })
+                .await
+                .unwrap();
+        }
+    }
+    let removed = original
+        .replicas
+        .iter()
+        .find(|node| **node != original.owner)
+        .unwrap()
+        .clone();
+    let replacement = services
+        .keys()
+        .find(|node| !original.replicas.contains(node))
+        .unwrap()
+        .clone();
+    let prepared = control
+        .execute_commands(vec![Command::PrepareFollowerMove {
+            feed: "orders.events".to_owned(),
+            range_id: original.range_id,
+            removed_replica: removed.clone(),
+            replacement_replica: replacement.clone(),
+        }])
+        .await
+        .unwrap();
+    let plan: RangeMovePlan = serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+
+    let coordinator = Arc::new(MajorityAppendCoordinator::new(
+        source.clone(),
+        control.clone(),
+        Arc::new(UnusedTransport),
+    ));
+    let copied = FollowerMoveExecutor::new(
+        control.clone(),
+        coordinator,
+        source.clone(),
+        services[&replacement].clone(),
+    )
+    .finalize(
+        &LocalMoveControl(control.clone()),
+        "orders.events",
+        &plan,
+        2,
+    )
+    .await
+    .unwrap();
+    // Phase 1 staged the whole committed prefix while the source was still
+    // writable, so the frozen phase only resumed and found nothing to copy.
+    assert!(copied.ready);
+    assert_eq!(copied.skipped_records, 3);
+    assert_eq!(copied.transferred_records, 0);
+    let current = control.active_range_assignment(feed_id).await.unwrap();
+    assert!(current.replicas.contains(&replacement));
+    assert!(!current.replicas.contains(&removed));
+}
