@@ -6,15 +6,15 @@ use std::{
 
 use finnstream::{
     active_range::{KeyToken, RangeId, RangePosition, ReplicaSet, StorageNodeId},
-    control::ControlController,
+    control::{Command, ControlController},
     reader::{
         translate_merge_reader_frontier, translate_split_reader_frontier, FjallReaderProgressStore,
         FjallSubscriptionProgressReplica, ReaderDeliveryMutation, ReaderDeliveryReceipt,
         ReaderFrontierTranslationError, ReaderLineageEntry, ReaderPacingController,
         ReaderPressureSample, ReaderProgressEngine, ReaderProgressError,
         SubscriptionCommitEvidence, SubscriptionPrepareVote, SubscriptionProgressAssignment,
-        SubscriptionProgressCoordinator, SubscriptionProgressError, SubscriptionProgressMutation,
-        SubscriptionProgressTransport, SubscriptionReplicaReply,
+        SubscriptionProgressCoordinator, SubscriptionProgressError, SubscriptionProgressInspection,
+        SubscriptionProgressMutation, SubscriptionProgressTransport, SubscriptionReplicaReply,
     },
     storage::{FileLogStore, LogStore},
 };
@@ -186,6 +186,9 @@ struct TestProgressTransport {
     prepare_down: Mutex<BTreeSet<StorageNodeId>>,
     commit_down: Mutex<BTreeSet<StorageNodeId>>,
     read_down: Mutex<BTreeSet<StorageNodeId>>,
+    inspect_down: Mutex<BTreeSet<StorageNodeId>>,
+    adopt_down: Mutex<BTreeSet<StorageNodeId>>,
+    feed_ids: Mutex<BTreeMap<Uuid, Uuid>>,
     read_override: Mutex<BTreeMap<StorageNodeId, Option<SubscriptionProgressMutation>>>,
     wrong_prepare_node: Mutex<Option<StorageNodeId>>,
     wrong_commit_node: Mutex<Option<StorageNodeId>>,
@@ -206,6 +209,9 @@ impl TestProgressTransport {
             prepare_down: Mutex::new(BTreeSet::new()),
             commit_down: Mutex::new(BTreeSet::new()),
             read_down: Mutex::new(BTreeSet::new()),
+            inspect_down: Mutex::new(BTreeSet::new()),
+            adopt_down: Mutex::new(BTreeSet::new()),
+            feed_ids: Mutex::new(BTreeMap::new()),
             read_override: Mutex::new(BTreeMap::new()),
             wrong_prepare_node: Mutex::new(None),
             wrong_commit_node: Mutex::new(None),
@@ -243,6 +249,10 @@ impl SubscriptionProgressTransport for TestProgressTransport {
             .ok_or(SubscriptionProgressError::InvalidAssignment)?;
         let subscription_id = mutation.subscription_id;
         let ownership_epoch = mutation.ownership_epoch;
+        self.feed_ids
+            .lock()
+            .unwrap()
+            .insert(subscription_id, mutation.feed_id);
         let mut vote = tokio::task::spawn_blocking(move || store.prepare(mutation))
             .await
             .map_err(|_| SubscriptionProgressError::Unavailable)??;
@@ -309,6 +319,69 @@ impl SubscriptionProgressTransport for TestProgressTransport {
         };
         Ok(SubscriptionReplicaReply {
             replica: Self::claimed_node(&self.wrong_read_node, node),
+            subscription_id,
+            ownership_epoch,
+            result,
+        })
+    }
+
+    async fn inspect(
+        &self,
+        node: &StorageNodeId,
+        subscription_id: Uuid,
+        ownership_epoch: u64,
+    ) -> Result<SubscriptionReplicaReply<SubscriptionProgressInspection>, SubscriptionProgressError>
+    {
+        if self.inspect_down.lock().unwrap().contains(node) {
+            return Err(SubscriptionProgressError::Unavailable);
+        }
+        let store = self
+            .stores
+            .get(node)
+            .cloned()
+            .ok_or(SubscriptionProgressError::InvalidAssignment)?;
+        let result = tokio::task::spawn_blocking(move || store.local_state(subscription_id))
+            .await
+            .map_err(|_| SubscriptionProgressError::Unavailable)??;
+        Ok(SubscriptionReplicaReply {
+            replica: node.clone(),
+            subscription_id,
+            ownership_epoch,
+            result,
+        })
+    }
+
+    async fn adopt(
+        &self,
+        node: &StorageNodeId,
+        _owner: &StorageNodeId,
+        subscription_id: Uuid,
+        ownership_epoch: u64,
+        committed: Option<SubscriptionProgressMutation>,
+    ) -> Result<
+        SubscriptionReplicaReply<Option<SubscriptionProgressMutation>>,
+        SubscriptionProgressError,
+    > {
+        if self.adopt_down.lock().unwrap().contains(node) {
+            return Err(SubscriptionProgressError::Unavailable);
+        }
+        let feed_id = committed
+            .as_ref()
+            .map(|mutation| mutation.feed_id)
+            .or_else(|| self.feed_ids.lock().unwrap().get(&subscription_id).copied())
+            .ok_or(SubscriptionProgressError::InvalidAssignment)?;
+        let store = self
+            .stores
+            .get(node)
+            .cloned()
+            .ok_or(SubscriptionProgressError::InvalidAssignment)?;
+        let result = tokio::task::spawn_blocking(move || {
+            store.adopt_recovered(subscription_id, feed_id, ownership_epoch, committed)
+        })
+        .await
+        .map_err(|_| SubscriptionProgressError::Unavailable)??;
+        Ok(SubscriptionReplicaReply {
+            replica: node.clone(),
             subscription_id,
             ownership_epoch,
             result,
@@ -1090,4 +1163,318 @@ fn bounded_progress_and_pacing_do_not_advance_on_exhaustion() {
         .unwrap()
         .acknowledged
         .is_empty());
+}
+
+fn progress_mutation(
+    subscription_id: Uuid,
+    feed_id: Uuid,
+    epoch: u64,
+    sequence: u64,
+) -> SubscriptionProgressMutation {
+    SubscriptionProgressMutation {
+        subscription_id,
+        feed_id,
+        ownership_epoch: epoch,
+        sequence,
+        request_id: Uuid::from_u128(5_000 + sequence as u128),
+        expected_cursor: (sequence > 1).then(|| format!("rf1_{}", sequence - 1)),
+        cursor: format!("rf1_{sequence}"),
+        positions: BTreeMap::from([(
+            RangeId::from_uuid(Uuid::from_u128(6_000 + sequence as u128)),
+            format!("position-{sequence}"),
+        )]),
+    }
+}
+
+fn plant_committed(
+    transport: &TestProgressTransport,
+    node: &StorageNodeId,
+    mutation: &SubscriptionProgressMutation,
+) {
+    let store = &transport.stores[node];
+    let vote = store.prepare(mutation.clone()).unwrap();
+    store
+        .commit_with_quorum(
+            SubscriptionCommitEvidence::new(
+                mutation.subscription_id,
+                mutation.request_id,
+                [
+                    (StorageNodeId::try_new("witness-a").unwrap(), vote.digest),
+                    (StorageNodeId::try_new("witness-b").unwrap(), vote.digest),
+                ],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+}
+
+fn progress_controller(directory: &TempDir, nodes: &[StorageNodeId]) -> ControlController {
+    let store: Arc<dyn LogStore> =
+        Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+    ControlController::open_with_storage_nodes(
+        directory.path().join("catalog.json"),
+        store,
+        nodes.to_vec(),
+    )
+    .unwrap()
+}
+
+#[tokio::test]
+async fn subscription_progress_recovery_moves_owner_preserves_committed_and_fences_stale_epoch() {
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let owner = coordinator.assignment().owner.clone();
+    let first = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    coordinator.apply(first.clone()).await.unwrap();
+
+    for set in [
+        &transport.prepare_down,
+        &transport.commit_down,
+        &transport.read_down,
+        &transport.inspect_down,
+        &transport.adopt_down,
+    ] {
+        set.lock().unwrap().insert(owner.clone());
+    }
+
+    let outcome = coordinator.recover_lost_owner(&controller).await.unwrap();
+    assert_eq!(outcome.assignment.ownership_epoch, 2);
+    assert_ne!(outcome.assignment.owner, owner);
+    assert_eq!(outcome.adopted.len(), 2);
+    assert!(outcome.adopted.contains(&outcome.assignment.owner));
+    let recovered_committed = outcome.committed.clone().unwrap();
+    assert_eq!(recovered_committed.ownership_epoch, 2);
+    assert_eq!(recovered_committed.cursor, first.cursor);
+    assert_eq!(recovered_committed.request_id, first.request_id);
+
+    let recovered = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.assignment(), &outcome.assignment);
+
+    let mut stale_write =
+        progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 2);
+    stale_write.request_id = Uuid::from_u128(5_500);
+    assert!(matches!(
+        coordinator.apply(stale_write).await,
+        Err(SubscriptionProgressError::StaleEpoch)
+            | Err(SubscriptionProgressError::InvalidAssignment)
+    ));
+    assert!(matches!(
+        coordinator.read_committed().await,
+        Err(SubscriptionProgressError::StaleEpoch)
+            | Err(SubscriptionProgressError::InvalidAssignment)
+            | Err(SubscriptionProgressError::NoQuorum)
+    ));
+
+    let next = progress_mutation(subscription.subscription_id, subscription.feed_id, 2, 2);
+    recovered.apply(next.clone()).await.unwrap();
+    assert_eq!(recovered.read_committed().await.unwrap(), Some(next));
+
+    for set in [
+        &transport.prepare_down,
+        &transport.commit_down,
+        &transport.read_down,
+        &transport.inspect_down,
+        &transport.adopt_down,
+    ] {
+        set.lock().unwrap().clear();
+    }
+    let healed = recovered.synchronize_placement().await.unwrap();
+    assert_eq!(healed.adopted.len(), 3);
+    let owner_state = transport.stores[&owner]
+        .local_state(subscription.subscription_id)
+        .unwrap();
+    assert_eq!(owner_state.committed, healed.committed);
+    assert_eq!(owner_state.committed.unwrap().ownership_epoch, 2);
+
+    let third = progress_mutation(subscription.subscription_id, subscription.feed_id, 2, 3);
+    recovered.apply(third.clone()).await.unwrap();
+    assert_eq!(recovered.read_committed().await.unwrap(), Some(third));
+}
+
+#[tokio::test]
+async fn subscription_progress_recovery_fails_closed_on_insufficient_or_contradictory_evidence() {
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    transport
+        .feed_ids
+        .lock()
+        .unwrap()
+        .insert(subscription.subscription_id, subscription.feed_id);
+    let assignment = SubscriptionProgressAssignment::try_new(
+        subscription.subscription_id,
+        nodes[2].clone(),
+        ReplicaSet::try_new(nodes.clone()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let coordinator = SubscriptionProgressCoordinator::new(assignment, transport.clone());
+    transport
+        .inspect_down
+        .lock()
+        .unwrap()
+        .insert(nodes[2].clone());
+    transport
+        .adopt_down
+        .lock()
+        .unwrap()
+        .insert(nodes[2].clone());
+
+    let empty = coordinator.recover_lost_owner(&controller).await.unwrap();
+    assert_eq!(empty.assignment.ownership_epoch, 2);
+    assert!(empty.committed.is_none());
+    assert_eq!(empty.adopted.len(), 2);
+
+    let mut fork_left = progress_mutation(subscription.subscription_id, subscription.feed_id, 2, 1);
+    fork_left.cursor = "rf1_left".to_owned();
+    let mut fork_right = fork_left.clone();
+    fork_right.request_id = Uuid::from_u128(5_999);
+    fork_right.cursor = "rf1_right".to_owned();
+    plant_committed(&transport, &nodes[0], &fork_left);
+    plant_committed(&transport, &nodes[1], &fork_right);
+    assert!(matches!(
+        coordinator.recover_lost_owner(&controller).await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+    let current = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(current.assignment().ownership_epoch, 2);
+
+    transport
+        .inspect_down
+        .lock()
+        .unwrap()
+        .insert(nodes[0].clone());
+    assert!(matches!(
+        coordinator.recover_lost_owner(&controller).await,
+        Err(SubscriptionProgressError::NoQuorum)
+    ));
+}
+
+#[tokio::test]
+async fn subscription_progress_recovery_adopts_latest_committed_under_raced_move() {
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    transport
+        .feed_ids
+        .lock()
+        .unwrap()
+        .insert(subscription.subscription_id, subscription.feed_id);
+    let assignment = SubscriptionProgressAssignment::try_new(
+        subscription.subscription_id,
+        nodes[2].clone(),
+        ReplicaSet::try_new(nodes.clone()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let coordinator = SubscriptionProgressCoordinator::new(assignment, transport.clone());
+
+    for sequence in 1..=5 {
+        plant_committed(
+            &transport,
+            &nodes[0],
+            &progress_mutation(
+                subscription.subscription_id,
+                subscription.feed_id,
+                1,
+                sequence,
+            ),
+        );
+    }
+    for sequence in 1..=3 {
+        plant_committed(
+            &transport,
+            &nodes[1],
+            &progress_mutation(
+                subscription.subscription_id,
+                subscription.feed_id,
+                1,
+                sequence,
+            ),
+        );
+    }
+    transport
+        .inspect_down
+        .lock()
+        .unwrap()
+        .insert(nodes[2].clone());
+    transport
+        .adopt_down
+        .lock()
+        .unwrap()
+        .insert(nodes[2].clone());
+
+    controller
+        .execute_commands(vec![Command::RecoverSubscriptionProgressOwner {
+            subscription_id: subscription.subscription_id,
+            expected_ownership_epoch: 1,
+            new_owner: nodes[1].clone(),
+        }])
+        .await
+        .unwrap();
+
+    let outcome = coordinator.recover_lost_owner(&controller).await.unwrap();
+    assert_eq!(outcome.assignment.ownership_epoch, 2);
+    assert_eq!(outcome.assignment.owner, nodes[1]);
+    let committed = outcome.committed.unwrap();
+    assert_eq!(committed.sequence, 5);
+    assert_eq!(committed.ownership_epoch, 2);
+    assert_eq!(outcome.adopted.len(), 2);
+    let behind = transport.stores[&nodes[1]]
+        .local_state(subscription.subscription_id)
+        .unwrap();
+    assert_eq!(behind.committed, Some(committed));
 }

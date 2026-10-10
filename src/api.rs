@@ -254,6 +254,18 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             authorize_replica_append,
         ));
+    let subscription_inspect_route = post(subscription_inspect_local)
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
+    let subscription_adopt_route = post(subscription_adopt_local)
+        .layer(DefaultBodyLimit::max(512 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
     let owner_append_route = post(owner_append).layer(middleware::from_fn_with_state(
         state.clone(),
         authorize_replica_append,
@@ -471,6 +483,14 @@ pub fn router(state: AppState) -> Router {
             .route(
                 "/internal/subscription-progress/committed",
                 subscription_committed_route,
+            )
+            .route(
+                "/internal/subscription-progress/inspect",
+                subscription_inspect_route,
+            )
+            .route(
+                "/internal/subscription-progress/adopt",
+                subscription_adopt_route,
             );
     }
     app.with_state(state)
@@ -489,6 +509,14 @@ pub fn subscription_mtls_router(state: AppState) -> Router {
         .route(
             "/internal/subscription-progress/committed",
             post(subscription_committed_local).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/internal/subscription-progress/inspect",
+            post(subscription_inspect_local).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
+        .route(
+            "/internal/subscription-progress/adopt",
+            post(subscription_adopt_local).layer(DefaultBodyLimit::max(512 * 1024)),
         )
         .with_state(state)
 }
@@ -849,6 +877,52 @@ async fn subscription_committed_local(
     Ok(Json(
         service
             .committed(request)
+            .await
+            .map_err(subscription_progress_api_error)?,
+    ))
+}
+
+async fn subscription_inspect_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::reader::SubscriptionCommittedReadRequest>,
+) -> Result<
+    Json<crate::reader::SubscriptionReplicaReply<crate::reader::SubscriptionProgressInspection>>,
+    ApiError,
+> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0), &request.owner)?;
+    let service = state
+        .subscription_progress
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Subscription progress replica is not configured"))?;
+    Ok(Json(
+        service
+            .inspect(request)
+            .await
+            .map_err(subscription_progress_api_error)?,
+    ))
+}
+
+async fn subscription_adopt_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::reader::SubscriptionProgressAdoptRequest>,
+) -> Result<
+    Json<
+        crate::reader::SubscriptionReplicaReply<
+            Option<crate::reader::SubscriptionProgressMutation>,
+        >,
+    >,
+    ApiError,
+> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0), &request.owner)?;
+    let service = state
+        .subscription_progress
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Subscription progress replica is not configured"))?;
+    Ok(Json(
+        service
+            .adopt(request)
             .await
             .map_err(subscription_progress_api_error)?,
     ))

@@ -592,6 +592,11 @@ pub enum Command {
         feed: String,
         plan_id: Uuid,
     },
+    RecoverSubscriptionProgressOwner {
+        subscription_id: Uuid,
+        expected_ownership_epoch: u64,
+        new_owner: StorageNodeId,
+    },
 }
 
 impl Command {
@@ -621,6 +626,7 @@ impl Command {
                 | Self::RecordOwnerMoveCatchUp { .. }
                 | Self::ActivateOwnerMove { .. }
                 | Self::AbortOwnerMove { .. }
+                | Self::RecoverSubscriptionProgressOwner { .. }
         )
     }
 }
@@ -1894,6 +1900,58 @@ impl ControlController {
                 Ok((
                     format!("recovered Active Range ownership for Feed {feed}"),
                     json!(updated),
+                ))
+            }
+            Command::RecoverSubscriptionProgressOwner {
+                subscription_id,
+                expected_ownership_epoch,
+                new_owner,
+            } => {
+                let current = state
+                    .subscription_progress_assignments
+                    .get(&subscription_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "Subscription progress placement for {subscription_id}"
+                        ))
+                    })?;
+                if current.ownership_epoch != expected_ownership_epoch {
+                    return Err(ControlError::InvalidOperation(
+                        "Subscription progress ownership changed while recovery was being planned"
+                            .to_owned(),
+                    ));
+                }
+                if !current.replicas.contains(&new_owner) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "replacement owner {new_owner} is not a member of the Subscription progress replica set"
+                    )));
+                }
+                if !self.eligible_storage_nodes.contains(&new_owner) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "replacement owner {new_owner} is not eligible for storage"
+                    )));
+                }
+                let next_epoch = expected_ownership_epoch.checked_add(1).ok_or_else(|| {
+                    ControlError::InvalidOperation(
+                        "Subscription progress ownership epoch overflowed".to_owned(),
+                    )
+                })?;
+                let next = SubscriptionProgressAssignment::try_new(
+                    subscription_id,
+                    new_owner,
+                    current.replicas.clone(),
+                    next_epoch,
+                )
+                .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                state
+                    .subscription_progress_assignments
+                    .insert(subscription_id, next.clone());
+                Ok((
+                    format!(
+                        "recovered Subscription progress ownership for {subscription_id} at epoch {next_epoch}"
+                    ),
+                    json!(next),
                 ))
             }
             Command::PrepareActiveRangeSplit { feed, split_at } => {
@@ -3594,6 +3652,7 @@ fn command_label(command: &Command) -> String {
         Command::RecordOwnerMoveCatchUp { .. } => "RECORD OWNER MOVE CATCH UP",
         Command::ActivateOwnerMove { .. } => "ACTIVATE OWNER MOVE",
         Command::AbortOwnerMove { .. } => "ABORT OWNER MOVE",
+        Command::RecoverSubscriptionProgressOwner { .. } => "RECOVER SUBSCRIPTION PROGRESS OWNER",
     }
     .to_owned()
 }
@@ -4426,6 +4485,86 @@ mod tests {
             .active_subscription_progress_assignment_by_id(definition.subscription_id)
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn subscription_progress_owner_recovery_requires_current_epoch_and_replica_member() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+        let subscription = controller
+            .active_subscription_by_name("orders.billing")
+            .await
+            .unwrap();
+        let assignment = controller
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        let survivor = assignment
+            .replicas
+            .iter()
+            .find(|node| *node != &assignment.owner)
+            .cloned()
+            .unwrap();
+        let outsider = StorageNodeId::try_new("storage-x").unwrap();
+
+        assert!(controller
+            .execute_commands(vec![Command::RecoverSubscriptionProgressOwner {
+                subscription_id: subscription.subscription_id,
+                expected_ownership_epoch: 1,
+                new_owner: outsider,
+            }])
+            .await
+            .is_err());
+        assert!(controller
+            .execute_commands(vec![Command::RecoverSubscriptionProgressOwner {
+                subscription_id: subscription.subscription_id,
+                expected_ownership_epoch: 9,
+                new_owner: survivor.clone(),
+            }])
+            .await
+            .is_err());
+        assert!(controller
+            .execute_commands(vec![Command::RecoverSubscriptionProgressOwner {
+                subscription_id: Uuid::from_u128(9_999),
+                expected_ownership_epoch: 1,
+                new_owner: survivor.clone(),
+            }])
+            .await
+            .is_err());
+
+        controller
+            .execute_commands(vec![Command::RecoverSubscriptionProgressOwner {
+                subscription_id: subscription.subscription_id,
+                expected_ownership_epoch: 1,
+                new_owner: survivor.clone(),
+            }])
+            .await
+            .unwrap();
+        let moved = controller
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        assert_eq!(moved.owner, survivor);
+        assert_eq!(moved.ownership_epoch, 2);
+        assert_eq!(moved.replicas, assignment.replicas);
+        assert!(controller
+            .execute_commands(vec![Command::RecoverSubscriptionProgressOwner {
+                subscription_id: subscription.subscription_id,
+                expected_ownership_epoch: 1,
+                new_owner: survivor,
+            }])
+            .await
+            .is_err());
+
+        drop(controller);
+        let reopened = new_controller(&directory);
+        let persisted = reopened
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        assert_eq!(persisted.owner, moved.owner);
+        assert_eq!(persisted.ownership_epoch, 2);
     }
 
     #[tokio::test]
