@@ -722,12 +722,55 @@ fn authorize_internal<'a>(
     Ok(control_plane)
 }
 
+/// Shared-key authentication for internal data-plane routes. Unlike
+/// `authorize_internal`, a Control Plane is not required: non-voter
+/// storage Nodes serve replica/progress routes with only the configured
+/// internal credential.
+fn authorize_internal_key(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let supplied = headers
+        .get("x-whitewater-control-key")
+        .and_then(|value| value.to_str().ok());
+    match &state.control_plane {
+        Some(control_plane) => {
+            if control_plane.authorize_internal(supplied) {
+                Ok(())
+            } else {
+                Err(ApiError {
+                    status: StatusCode::UNAUTHORIZED,
+                    message: "invalid Control Plane credential".to_owned(),
+                    code: None,
+                })
+            }
+        }
+        None => match state.internal_key.as_deref() {
+            Some(key)
+                if supplied.is_some_and(|supplied| {
+                    crate::control_plane::constant_time_equal(key.as_bytes(), supplied.as_bytes())
+                }) =>
+            {
+                Ok(())
+            }
+            Some(_) => Err(ApiError {
+                status: StatusCode::UNAUTHORIZED,
+                message: "invalid Control Plane credential".to_owned(),
+                code: None,
+            }),
+            None => Err(ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "internal Control Plane credential is not configured on this Node"
+                    .to_owned(),
+                code: None,
+            }),
+        },
+    }
+}
+
 async fn authorize_replica_append(
     State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, ApiError> {
-    authorize_internal(&state, request.headers())?;
+    authorize_internal_key(&state, request.headers())?;
     Ok(next.run(request).await)
 }
 
@@ -7886,6 +7929,67 @@ mod tests {
             .is_err());
         shutdown_tx.send(true).unwrap();
         tls_task.await.unwrap().unwrap();
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_voter_internal_routes_authenticate_by_shared_key_without_a_control_plane() {
+        let directory = TempDir::new().unwrap();
+        let (mut state, control_plane, _control, _replica) =
+            internal_replica_test_state(&directory).await;
+        // A registered storage-only Node runs no Raft: its internal plane
+        // still authenticates the shared credential without a voter.
+        state.control_plane = None;
+        let app = router(state);
+        let request = |credential: Option<&str>| {
+            let mut request = Request::builder()
+                .method("GET")
+                .uri("/internal/active-range/pressure");
+            if let Some(credential) = credential {
+                request = request.header("x-whitewater-control-key", credential);
+            }
+            request.body(Body::empty()).unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request(None)).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Some("wrong-key")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = app
+            .clone()
+            .oneshot(request(Some("this-is-a-long-control-plane-key")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        // Raft RPC routes still require an actual Control Plane.
+        let vote = serde_json::to_vec(&VoteRequest::<ControlNodeId> {
+            vote: openraft::Vote::new(1, 1),
+            last_log_id: None,
+        })
+        .unwrap();
+        let raft = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/control-plane/raft/vote")
+                    .header(
+                        "x-whitewater-control-key",
+                        "this-is-a-long-control-plane-key",
+                    )
+                    .header("content-type", "application/json")
+                    .body(Body::from(vote))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raft.status(), StatusCode::SERVICE_UNAVAILABLE);
         control_plane.raft().shutdown().await.unwrap();
     }
 
