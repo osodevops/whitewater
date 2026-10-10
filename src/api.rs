@@ -48,7 +48,8 @@ use crate::{
     config::SubscriptionMtlsConfig,
     control::{
         ControlController, ControlError, RangeMergePlan, RangeMovePlan, RangeMoveStage,
-        RangeOwnerMovePlan, RangeSplitPlan, ReplicatedCommand,
+        RangeOwnerMovePlan, RangeSplitPlan, ReaderCutoverSnapshot, ReaderFrontierTranslation,
+        ReplicatedCommand,
     },
     control_plane::{
         ControlNodeId, ControlPlane, ControlPlaneError, ControlTypeConfig, FullSnapshotRequest,
@@ -58,6 +59,7 @@ use crate::{
     domain::{AppendInput, CursorRecord, StorageStats, StoredRecord},
     membership::{JoinResponse, MemberAnnouncement, MemberView, MembershipService},
     reader::{
+        translate_merge_reader_frontier, translate_split_reader_frontier, ReaderLineageEntry,
         SubscriptionCommitRequest, SubscriptionCommittedReadRequest, SubscriptionPrepareRequest,
         SubscriptionProgressError, SubscriptionProgressReplicaService,
     },
@@ -1601,6 +1603,228 @@ fn split_freeze_order(assignment: &ActiveRangeAssignment) -> Vec<StorageNodeId> 
     nodes
 }
 
+async fn read_cutover_lineage(
+    state: &AppState,
+    assignment: &ActiveRangeAssignment,
+    boundary: CommitPosition,
+) -> Result<Vec<ReaderLineageEntry>, ApiError> {
+    if boundary.value() > MAX_LOGICAL_READ_FRAMES as u64 {
+        return Err(ApiError::unavailable(
+            "Reader transition exceeds the bounded source history",
+        ));
+    }
+    let mut entries = Vec::new();
+    let mut after = None;
+    let mut bytes = 0_usize;
+    while after.map_or(0, RangePosition::value) < boundary.value() {
+        let page = fetch_range_page(
+            state,
+            ReadRangePageRequest {
+                assignment: assignment.clone(),
+                after,
+                expected_commit: after.map(|_| boundary),
+                after_cursor: None,
+                tail_count: None,
+                single_range: true,
+                page_limit: Some(32),
+            },
+        )
+        .await?;
+        if page.committed != boundary || page.frames.is_empty() {
+            return Err(ApiError::unavailable(
+                "Reader transition source boundary is incomplete",
+            ));
+        }
+        for frame in page.frames {
+            let expected = after.map_or(Some(1), |position: RangePosition| {
+                position.value().checked_add(1)
+            });
+            if Some(frame.position.value()) != expected
+                || frame.position.value() > boundary.value()
+                || frame.cursor.is_empty()
+                || frame.cursor.len() > 256
+            {
+                return Err(ApiError::unavailable(
+                    "Reader transition source has a position gap",
+                ));
+            }
+            let decoded = STANDARD
+                .decode(&frame.frame_base64)
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            bytes = bytes
+                .checked_add(decoded.len() + frame.cursor.len())
+                .ok_or_else(|| ApiError::unavailable("Reader transition size overflow"))?;
+            if bytes > MAX_LOGICAL_READ_BYTES {
+                return Err(ApiError::unavailable(
+                    "Reader transition exceeds its read byte budget",
+                ));
+            }
+            let record = decode_record(&decoded)
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            entries.push(ReaderLineageEntry {
+                range_id: assignment.range_id,
+                position: frame.position,
+                cursor: frame.cursor,
+                key_token: KeyToken::from_key(&record.key),
+                ingest_time_ns: record.ingest_time_ns,
+                message_id: record.message_id,
+            });
+            after = Some(frame.position);
+        }
+    }
+    Ok(entries)
+}
+
+fn prior_reader_positions(
+    snapshot: &ReaderCutoverSnapshot,
+    assignments: &[ActiveRangeAssignment],
+) -> Result<BTreeMap<RangeId, String>, ApiError> {
+    let mut positions = assignments
+        .iter()
+        .map(|assignment| (assignment.range_id, String::new()))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(frontier) = &snapshot.frontier {
+        if !frontier.acknowledged.is_empty()
+            && (frontier.acknowledged.len() != positions.len()
+                || frontier
+                    .acknowledged
+                    .keys()
+                    .any(|range| !positions.contains_key(range)))
+        {
+            return Err(ApiError::unavailable(
+                "Reader acknowledged frontier references stale ranges",
+            ));
+        }
+        positions.extend(frontier.acknowledged.clone());
+        if frontier.acknowledged.is_empty() {
+            if let Some(cursor) = &snapshot.reader.acknowledged_cursor {
+                if assignments.len() != 1 || cursor.starts_with("rf1_") {
+                    return Err(ApiError::unavailable(
+                        "Reader acknowledged progress has no source frontier",
+                    ));
+                }
+                positions.insert(assignments[0].range_id, cursor.clone());
+            }
+        }
+    } else if let Some(cursor) = &snapshot.reader.acknowledged_cursor {
+        if assignments.len() != 1 {
+            return Err(ApiError::unavailable(
+                "Reader record Cursor has no unambiguous source range",
+            ));
+        }
+        positions.insert(assignments[0].range_id, cursor.clone());
+    }
+    Ok(positions)
+}
+
+fn reader_frontier_translation(
+    snapshot: &ReaderCutoverSnapshot,
+    acknowledged: BTreeMap<RangeId, String>,
+) -> ReaderFrontierTranslation {
+    ReaderFrontierTranslation {
+        reader_id: snapshot.reader.reader_id,
+        expected_session_epoch: snapshot.reader.session_epoch,
+        expected_acknowledged_cursor: snapshot.reader.acknowledged_cursor.clone(),
+        expected_delivered_cursor: snapshot.reader.delivered_cursor.clone(),
+        expected_acknowledged: snapshot
+            .frontier
+            .as_ref()
+            .map(|value| value.acknowledged.clone())
+            .unwrap_or_default(),
+        expected_delivered: snapshot
+            .frontier
+            .as_ref()
+            .map(|value| value.delivered.clone())
+            .unwrap_or_default(),
+        expected_has_frontier: snapshot.frontier.is_some(),
+        acknowledged,
+    }
+}
+
+fn bounded_reader_translations(
+    translations: Vec<ReaderFrontierTranslation>,
+) -> Result<Vec<ReaderFrontierTranslation>, ApiError> {
+    if serde_json::to_vec(&translations)
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .len()
+        > 512 * 1024
+    {
+        return Err(ApiError::unavailable(
+            "Reader frontier cutover exceeds the bounded evidence budget",
+        ));
+    }
+    Ok(translations)
+}
+
+fn split_reader_translations(
+    snapshots: &[ReaderCutoverSnapshot],
+    assignments: &[ActiveRangeAssignment],
+    plan: &RangeSplitPlan,
+    entries: &[ReaderLineageEntry],
+) -> Result<Vec<ReaderFrontierTranslation>, ApiError> {
+    if snapshots.len() > 1024 {
+        return Err(ApiError::unavailable(
+            "Reader transition exceeds its Reader budget",
+        ));
+    }
+    let mut translations = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        let mut positions = prior_reader_positions(snapshot, assignments)?;
+        let source_cursor = positions
+            .get(&plan.source_range_id)
+            .ok_or_else(|| ApiError::unavailable("Reader split source position is unavailable"))?;
+        let child = translate_split_reader_frontier(
+            entries,
+            plan.source_range_id,
+            plan.source_range_id,
+            plan.right_assignment.range_id,
+            plan.split_at,
+            source_cursor,
+        )
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        positions.extend(child);
+        translations.push(reader_frontier_translation(snapshot, positions));
+    }
+    bounded_reader_translations(translations)
+}
+
+fn merge_reader_translations(
+    snapshots: &[ReaderCutoverSnapshot],
+    assignments: &[ActiveRangeAssignment],
+    plan: &RangeMergePlan,
+    left: &[ReaderLineageEntry],
+    right: &[ReaderLineageEntry],
+) -> Result<Vec<ReaderFrontierTranslation>, ApiError> {
+    if snapshots.len() > 1024 {
+        return Err(ApiError::unavailable(
+            "Reader transition exceeds its Reader budget",
+        ));
+    }
+    let mut translations = Vec::with_capacity(snapshots.len());
+    for snapshot in snapshots {
+        let mut positions = prior_reader_positions(snapshot, assignments)?;
+        let left_cursor = positions
+            .get(&plan.left_range_id)
+            .ok_or_else(|| ApiError::unavailable("Reader merge left position is unavailable"))?;
+        let right_cursor = positions
+            .get(&plan.right_range_id)
+            .ok_or_else(|| ApiError::unavailable("Reader merge right position is unavailable"))?;
+        let cursor = translate_merge_reader_frontier(
+            left,
+            right,
+            plan.left_range_id,
+            plan.right_range_id,
+            left_cursor,
+            right_cursor,
+        )
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        positions.remove(&plan.right_range_id);
+        positions.insert(plan.left_range_id, cursor);
+        translations.push(reader_frontier_translation(snapshot, positions));
+    }
+    bounded_reader_translations(translations)
+}
+
 async fn admin_split_range(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1722,6 +1946,30 @@ async fn admin_split_range(
             "RF3 split staging evidence does not match",
         ));
     }
+    let snapshots = state
+        .control
+        .active_reader_cutover_snapshots(plan.feed_id)
+        .await;
+    let reader_translations = if snapshots.is_empty() {
+        Vec::new()
+    } else {
+        let calculated = async {
+            let source = read_cutover_lineage(&state, &source_assignment, source_commit).await?;
+            let assignments = state
+                .control
+                .active_range_assignments_for_feed(plan.feed_id)
+                .await;
+            split_reader_translations(&snapshots, &assignments, &plan, &source)
+        }
+        .await;
+        match calculated {
+            Ok(translations) => translations,
+            Err(error) => {
+                unfreeze_split_nodes(&state, &plan, &source_assignment, key).await;
+                return Err(error);
+            }
+        }
+    };
     if let Err(error) = control_plane
         .execute_commands(vec![
             crate::control::Command::RecordActiveRangeSplitCatchUp {
@@ -1744,6 +1992,7 @@ async fn admin_split_range(
             plan_id: plan.plan_id,
             left_writer_sequences: evidence.left.writer_sequences.clone(),
             right_writer_sequences: evidence.right.writer_sequences.clone(),
+            reader_translations,
         }])
         .await
     {
@@ -1881,34 +2130,44 @@ async fn admin_merge_ranges(
         .ok_or_else(|| ApiError::unavailable("internal credential unavailable"))?;
     let mut evidence = Vec::new();
     for node in plan.merged_assignment.replicas.iter() {
-        let endpoint = state.control_endpoints.get(node).ok_or_else(|| {
-            ApiError::unavailable(format!("merge replica {node} endpoint unavailable"))
-        })?;
-        let response: LocalMergeStageResponse = state
-            .internal_http
-            .post(format!(
-                "{}/internal/active-range/merge/stage-local",
-                endpoint.trim_end_matches('/')
-            ))
-            .header("x-whitewater-control-key", key)
-            .json(&LocalMergeStageRequest {
-                plan: plan.clone(),
-                left_assignment: left.clone(),
-                right_assignment: right.clone(),
+        let staged = async {
+            let endpoint = state.control_endpoints.get(node).ok_or_else(|| {
+                ApiError::unavailable(format!("merge replica {node} endpoint unavailable"))
+            })?;
+            let response: LocalMergeStageResponse = state
+                .internal_http
+                .post(format!(
+                    "{}/internal/active-range/merge/stage-local",
+                    endpoint.trim_end_matches('/')
+                ))
+                .header("x-whitewater-control-key", key)
+                .json(&LocalMergeStageRequest {
+                    plan: plan.clone(),
+                    left_assignment: left.clone(),
+                    right_assignment: right.clone(),
+                })
+                .send()
+                .await
+                .map_err(|error| ApiError::unavailable(error.to_string()))?
+                .json()
+                .await
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            response.result.ok_or_else(|| {
+                ApiError::unavailable(
+                    response
+                        .error
+                        .unwrap_or_else(|| "merge staging failed".to_owned()),
+                )
             })
-            .send()
-            .await
-            .map_err(|error| ApiError::unavailable(error.to_string()))?
-            .json()
-            .await
-            .map_err(|error| ApiError::unavailable(error.to_string()))?;
-        evidence.push(response.result.ok_or_else(|| {
-            ApiError::unavailable(
-                response
-                    .error
-                    .unwrap_or_else(|| "merge staging failed".to_owned()),
-            )
-        })?);
+        }
+        .await;
+        match staged {
+            Ok(result) => evidence.push(result),
+            Err(error) => {
+                unfreeze_merge_nodes(&state, &plan, &left, &right, key).await;
+                return Err(error);
+            }
+        }
     }
     let staged = evidence
         .first()
@@ -1926,6 +2185,31 @@ async fn admin_merge_ranges(
             "RF3 merge staging evidence does not match",
         ));
     }
+    let snapshots = state
+        .control
+        .active_reader_cutover_snapshots(plan.feed_id)
+        .await;
+    let reader_translations = if snapshots.is_empty() {
+        Vec::new()
+    } else {
+        let calculated = async {
+            let left_rows = read_cutover_lineage(&state, &left, staged.left_commit).await?;
+            let right_rows = read_cutover_lineage(&state, &right, staged.right_commit).await?;
+            let assignments = state
+                .control
+                .active_range_assignments_for_feed(plan.feed_id)
+                .await;
+            merge_reader_translations(&snapshots, &assignments, &plan, &left_rows, &right_rows)
+        }
+        .await;
+        match calculated {
+            Ok(translations) => translations,
+            Err(error) => {
+                unfreeze_merge_nodes(&state, &plan, &left, &right, key).await;
+                return Err(error);
+            }
+        }
+    };
     control_plane
         .execute_commands(vec![
             crate::control::Command::RecordActiveRangeMergeStaging {
@@ -1944,6 +2228,7 @@ async fn admin_merge_ranges(
             feed: request.feed,
             plan_id: plan.plan_id,
             writer_sequences: staged.writer_sequences.clone(),
+            reader_translations,
         }])
         .await
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
@@ -3732,11 +4017,27 @@ async fn fetch_range_page(
             "Cursor is unknown, uncommitted, or belongs to another Feed",
         ));
     }
-    response
+    let mut response = response
         .error_for_status()
-        .map_err(|error| ApiError::unavailable(error.to_string()))?
-        .json::<ReadRangePageResponse>()
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+    {
+        if bytes
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|size| size > MAX_LOGICAL_READ_BYTES * 2)
+        {
+            return Err(ApiError::unavailable(
+                "owner range page exceeds the bounded response budget",
+            ));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice::<ReadRangePageResponse>(&bytes)
         .map_err(|error| ApiError::unavailable(error.to_string()))
 }
 

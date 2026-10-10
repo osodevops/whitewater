@@ -152,6 +152,25 @@ pub(crate) struct ReaderFrontier {
     pub last_fetch_request_id: Option<Uuid>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct ReaderCutoverSnapshot {
+    pub reader: ReaderDefinition,
+    pub frontier: Option<ReaderFrontier>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReaderFrontierTranslation {
+    pub reader_id: Uuid,
+    pub expected_session_epoch: u64,
+    pub expected_acknowledged_cursor: Option<String>,
+    pub expected_delivered_cursor: Option<String>,
+    pub expected_acknowledged: BTreeMap<RangeId, String>,
+    pub expected_delivered: BTreeMap<RangeId, String>,
+    pub expected_has_frontier: bool,
+    pub acknowledged: BTreeMap<RangeId, String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoleDefinition {
     pub role_id: Uuid,
@@ -509,6 +528,8 @@ pub enum Command {
         plan_id: Uuid,
         left_writer_sequences: Vec<StagedWriterSequence>,
         right_writer_sequences: Vec<StagedWriterSequence>,
+        #[serde(default)]
+        reader_translations: Vec<ReaderFrontierTranslation>,
     },
     PrepareActiveRangeMerge {
         feed: String,
@@ -527,6 +548,8 @@ pub enum Command {
         feed: String,
         plan_id: Uuid,
         writer_sequences: Vec<StagedWriterSequence>,
+        #[serde(default)]
+        reader_translations: Vec<ReaderFrontierTranslation>,
     },
     PrepareFollowerMove {
         feed: String,
@@ -1033,6 +1056,22 @@ impl ControlController {
             .get(&reader_id)
             .filter(|reader| reader.status == ResourceStatus::Active)?;
         state.reader_frontiers.get(&reader_id).cloned()
+    }
+
+    pub(crate) async fn active_reader_cutover_snapshots(
+        &self,
+        feed_id: Uuid,
+    ) -> Vec<ReaderCutoverSnapshot> {
+        let state = self.state.lock().await;
+        state
+            .readers
+            .values()
+            .filter(|reader| reader.feed_id == feed_id && reader.status == ResourceStatus::Active)
+            .map(|reader| ReaderCutoverSnapshot {
+                reader: reader.clone(),
+                frontier: state.reader_frontiers.get(&reader.reader_id).cloned(),
+            })
+            .collect()
     }
 
     pub async fn active_writer_by_name(&self, name: &str) -> Option<WriterDefinition> {
@@ -1990,6 +2029,7 @@ impl ControlController {
                 plan_id,
                 left_writer_sequences,
                 right_writer_sequences,
+                reader_translations,
             } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
                 let plan = state
@@ -2009,6 +2049,12 @@ impl ControlController {
                         "split plan has no staged left assignment".to_owned(),
                     )
                 })?;
+                validate_reader_translations(
+                    state,
+                    feed_id,
+                    &plan.candidate_map,
+                    &reader_translations,
+                )?;
                 for (range_id, progress) in [
                     (left_assignment.range_id, left_writer_sequences),
                     (plan.right_assignment.range_id, right_writer_sequences),
@@ -2041,6 +2087,7 @@ impl ControlController {
                     plan.right_assignment.clone(),
                 );
                 state.active_ranges.insert(feed_id, left_assignment);
+                install_reader_translations(state, reader_translations);
                 state.range_split_plans.remove(&feed_id);
                 Ok((
                     format!("activated Active Range split for Feed {feed}"),
@@ -2150,6 +2197,7 @@ impl ControlController {
                 feed,
                 plan_id,
                 writer_sequences,
+                reader_translations,
             } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
                 let plan = state
@@ -2164,6 +2212,12 @@ impl ControlController {
                         "merge plan is stale or not ready for activation".to_owned(),
                     ));
                 }
+                validate_reader_translations(
+                    state,
+                    feed_id,
+                    &plan.candidate_map,
+                    &reader_translations,
+                )?;
                 for progress in writer_sequences {
                     if let Some(writer) = state.writers.get_mut(&progress.writer_session_id) {
                         if writer.session_epoch == progress.writer_epoch {
@@ -2188,6 +2242,7 @@ impl ControlController {
                 state
                     .active_ranges
                     .insert(feed_id, plan.merged_assignment.clone());
+                install_reader_translations(state, reader_translations);
                 state.range_merge_plans.remove(&feed_id);
                 Ok((
                     format!("activated Active Range merge for Feed {feed}"),
@@ -3075,6 +3130,109 @@ fn ensure_name_available<'a>(
         Err(ControlError::AlreadyExists(name.to_owned()))
     } else {
         Ok(())
+    }
+}
+
+fn validate_reader_translations(
+    state: &CatalogState,
+    feed_id: Uuid,
+    candidate: &RangeMap,
+    translations: &[ReaderFrontierTranslation],
+) -> Result<(), ControlError> {
+    let readers = state
+        .readers
+        .values()
+        .filter(|reader| reader.feed_id == feed_id && reader.status == ResourceStatus::Active)
+        .count();
+    if readers > 1024
+        || translations.len() != readers
+        || candidate.routes().len() > 128
+        || translations.iter().any(|item| {
+            item.expected_acknowledged.len() > 128
+                || item.expected_delivered.len() > 128
+                || item
+                    .expected_acknowledged
+                    .values()
+                    .any(|cursor| cursor.len() > 256)
+                || item
+                    .expected_delivered
+                    .values()
+                    .any(|cursor| cursor.len() > 256)
+                || item
+                    .expected_acknowledged_cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.len() > 256)
+                || item
+                    .expected_delivered_cursor
+                    .as_ref()
+                    .is_some_and(|cursor| cursor.len() > 256)
+        })
+        || serde_json::to_vec(translations)?.len() > 512 * 1024
+    {
+        return Err(ControlError::InvalidOperation(
+            "Reader frontier cutover is incomplete or exceeds its bounded budget".to_owned(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for translation in translations {
+        let reader = state.readers.get(&translation.reader_id).ok_or_else(|| {
+            ControlError::InvalidOperation("Reader cutover references an unknown Reader".to_owned())
+        })?;
+        let prior = state.reader_frontiers.get(&reader.reader_id);
+        let previous = prior.cloned().unwrap_or_default();
+        if !seen.insert(reader.reader_id)
+            || reader.feed_id != feed_id
+            || reader.status != ResourceStatus::Active
+            || reader.session_epoch != translation.expected_session_epoch
+            || reader.session_epoch.checked_add(1).is_none()
+            || reader.acknowledged_cursor != translation.expected_acknowledged_cursor
+            || reader.delivered_cursor != translation.expected_delivered_cursor
+            || prior.is_some() != translation.expected_has_frontier
+            || previous.acknowledged != translation.expected_acknowledged
+            || previous.delivered != translation.expected_delivered
+            || translation.acknowledged.len() != candidate.routes().len()
+            || candidate
+                .routes()
+                .iter()
+                .any(|route| !translation.acknowledged.contains_key(&route.range_id))
+            || translation
+                .acknowledged
+                .values()
+                .any(|cursor| cursor.len() > 256)
+        {
+            return Err(ControlError::InvalidOperation(
+                "Reader frontier changed or translation does not match candidate ranges".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn install_reader_translations(
+    state: &mut CatalogState,
+    translations: Vec<ReaderFrontierTranslation>,
+) {
+    for translation in translations {
+        if let Some(reader) = state.readers.get_mut(&translation.reader_id) {
+            let preserve_unstarted = !translation.expected_has_frontier
+                && reader.acknowledged_cursor.is_none()
+                && reader.delivered_cursor.is_none()
+                && !matches!(reader.start, ReaderStart::Beginning);
+            reader.session_epoch = reader.session_epoch.saturating_add(1);
+            reader.session_active = false;
+            reader.session_capacity = 0;
+            reader.delivered_cursor = reader.acknowledged_cursor.clone();
+            if !preserve_unstarted {
+                state.reader_frontiers.insert(
+                    reader.reader_id,
+                    ReaderFrontier {
+                        acknowledged: translation.acknowledged.clone(),
+                        delivered: translation.acknowledged,
+                        last_fetch_request_id: None,
+                    },
+                );
+            }
+        }
     }
 }
 

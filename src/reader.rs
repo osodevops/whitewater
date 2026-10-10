@@ -1,11 +1,127 @@
-use std::{collections::BTreeMap, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+    time::Duration,
+};
 
 use fjall::Readable;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::active_range::RangeId;
+use crate::active_range::{KeyToken, RangeId, RangePosition};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReaderLineageEntry {
+    pub range_id: RangeId,
+    pub position: RangePosition,
+    pub cursor: String,
+    pub key_token: KeyToken,
+    pub ingest_time_ns: i64,
+    pub message_id: Uuid,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ReaderFrontierTranslationError {
+    #[error("Reader frontier source history is incomplete, duplicated, or exceeds the 10,000-record transition budget")]
+    InvalidHistory,
+    #[error("Reader acknowledged Cursor is missing from the frozen committed source history")]
+    MissingCursor,
+    #[error("Reader split or merge source ranges are invalid")]
+    InvalidSources,
+}
+
+fn acknowledged_source_position(
+    entries: &[ReaderLineageEntry],
+    range_id: RangeId,
+    cursor: &str,
+) -> Result<u64, ReaderFrontierTranslationError> {
+    if entries.len() > 10_000 {
+        return Err(ReaderFrontierTranslationError::InvalidHistory);
+    }
+    let mut seen = BTreeSet::new();
+    let mut acknowledged = (!cursor.is_empty()).then_some(None);
+    for (index, item) in entries.iter().enumerate() {
+        if item.range_id != range_id
+            || item.position.value() != index as u64 + 1
+            || item.cursor.is_empty()
+            || item.cursor.len() > 256
+            || !seen.insert(item.cursor.as_str())
+        {
+            return Err(ReaderFrontierTranslationError::InvalidHistory);
+        }
+        if item.cursor == cursor {
+            acknowledged = Some(Some(item.position.value()));
+        }
+    }
+    match acknowledged {
+        None => Ok(0),
+        Some(Some(position)) => Ok(position),
+        Some(None) => Err(ReaderFrontierTranslationError::MissingCursor),
+    }
+}
+
+pub fn translate_split_reader_frontier(
+    entries: &[ReaderLineageEntry],
+    source: RangeId,
+    left: RangeId,
+    right: RangeId,
+    split_at: KeyToken,
+    acknowledged_cursor: &str,
+) -> Result<BTreeMap<RangeId, String>, ReaderFrontierTranslationError> {
+    if source != left || left == right {
+        return Err(ReaderFrontierTranslationError::InvalidSources);
+    }
+    let position = acknowledged_source_position(entries, source, acknowledged_cursor)?;
+    let mut translated = BTreeMap::from([(left, String::new()), (right, String::new())]);
+    for entry in entries.iter().take(position as usize) {
+        let range = if entry.key_token < split_at {
+            left
+        } else {
+            right
+        };
+        translated.insert(range, entry.cursor.clone());
+    }
+    Ok(translated)
+}
+
+pub fn translate_merge_reader_frontier(
+    left_entries: &[ReaderLineageEntry],
+    right_entries: &[ReaderLineageEntry],
+    left: RangeId,
+    right: RangeId,
+    left_cursor: &str,
+    right_cursor: &str,
+) -> Result<String, ReaderFrontierTranslationError> {
+    if left == right {
+        return Err(ReaderFrontierTranslationError::InvalidSources);
+    }
+    let left_position = acknowledged_source_position(left_entries, left, left_cursor)?;
+    let right_position = acknowledged_source_position(right_entries, right, right_cursor)?;
+    let mut merged = left_entries.iter().chain(right_entries).collect::<Vec<_>>();
+    let mut cursors = BTreeSet::new();
+    if merged
+        .iter()
+        .any(|entry| !cursors.insert(entry.cursor.as_str()))
+    {
+        return Err(ReaderFrontierTranslationError::InvalidHistory);
+    }
+    merged.sort_by_key(|entry| (entry.ingest_time_ns, entry.message_id));
+    let mut translated = String::new();
+    for entry in merged {
+        let boundary = if entry.range_id == left {
+            left_position
+        } else {
+            right_position
+        };
+        if entry.position.value() > boundary {
+            break;
+        }
+        translated = entry.cursor.clone();
+    }
+    Ok(translated)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReaderRetryPolicy {

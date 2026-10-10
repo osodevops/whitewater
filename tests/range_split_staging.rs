@@ -11,7 +11,9 @@ use finnstream::{
         StorageNodeId,
     },
     codec::encode_record,
-    control::{Command, ControlController, RangeMergePlan, RangeSplitPlan},
+    control::{
+        Command, ControlController, RangeMergePlan, RangeSplitPlan, ReaderFrontierTranslation,
+    },
     domain::StoredRecord,
     storage::{FileLogStore, LogStore},
 };
@@ -24,6 +26,7 @@ fn node(value: &str) -> StorageNodeId {
 
 struct LocalSplitControl {
     control: Arc<ControlController>,
+    reader_translations: Vec<ReaderFrontierTranslation>,
 }
 
 #[async_trait]
@@ -54,12 +57,46 @@ impl SplitCutoverControl for LocalSplitControl {
         plan: &RangeSplitPlan,
         boundary: &FrozenSplitBoundary,
     ) -> Result<(), String> {
+        if !self.reader_translations.is_empty()
+            && self
+                .control
+                .execute_commands(vec![Command::ActivateActiveRangeSplit {
+                    feed: feed.to_owned(),
+                    plan_id: plan.plan_id,
+                    left_writer_sequences: boundary.staging.left.writer_sequences.clone(),
+                    right_writer_sequences: boundary.staging.right.writer_sequences.clone(),
+                    reader_translations: Vec::new(),
+                }])
+                .await
+                .is_ok()
+        {
+            return Err("cutover ignored the Reader translation requirement".to_owned());
+        }
+        if let Some(first) = self.reader_translations.first() {
+            let mut stale = first.clone();
+            stale.expected_delivered_cursor = Some("changed-during-staging".to_owned());
+            if self
+                .control
+                .execute_commands(vec![Command::ActivateActiveRangeSplit {
+                    feed: feed.to_owned(),
+                    plan_id: plan.plan_id,
+                    left_writer_sequences: boundary.staging.left.writer_sequences.clone(),
+                    right_writer_sequences: boundary.staging.right.writer_sequences.clone(),
+                    reader_translations: vec![stale],
+                }])
+                .await
+                .is_ok()
+            {
+                return Err("cutover accepted stale Reader frontier evidence".to_owned());
+            }
+        }
         self.control
             .execute_commands(vec![Command::ActivateActiveRangeSplit {
                 feed: feed.to_owned(),
                 plan_id: plan.plan_id,
                 left_writer_sequences: boundary.staging.left.writer_sequences.clone(),
                 right_writer_sequences: boundary.staging.right.writer_sequences.clone(),
+                reader_translations: self.reader_translations.clone(),
             }])
             .await
             .map(|_| ())
@@ -168,6 +205,52 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             .await
             .unwrap();
     }
+    control
+        .execute("CREATE READER audit FROM orders.events START AT BEGINNING;")
+        .await
+        .unwrap();
+    let reader = control.active_reader_by_name("audit").await.unwrap();
+    control
+        .execute_commands(vec![Command::OpenReaderSession {
+            reader: "audit".to_owned(),
+            capacity: 4,
+        }])
+        .await
+        .unwrap();
+    let acknowledged = BTreeMap::from([(source_assignment.range_id, "cursor-2".to_owned())]);
+    let delivered = BTreeMap::from([(source_assignment.range_id, "cursor-4".to_owned())]);
+    control
+        .execute_commands(vec![Command::RecordReaderFrontier {
+            reader: "audit".to_owned(),
+            session_epoch: 1,
+            cursor: "ack-token".to_owned(),
+            positions: acknowledged.clone(),
+            expected_cursor: None,
+            fence_delivery: true,
+            fetch_request_id: Some(Uuid::from_u128(8001)),
+        }])
+        .await
+        .unwrap();
+    control
+        .execute_commands(vec![Command::AcknowledgeReader {
+            reader: "audit".to_owned(),
+            session_epoch: 1,
+            cursor: "ack-token".to_owned(),
+        }])
+        .await
+        .unwrap();
+    control
+        .execute_commands(vec![Command::RecordReaderFrontier {
+            reader: "audit".to_owned(),
+            session_epoch: 1,
+            cursor: "unack-token".to_owned(),
+            positions: delivered.clone(),
+            expected_cursor: Some("ack-token".to_owned()),
+            fence_delivery: true,
+            fetch_request_id: Some(Uuid::from_u128(8002)),
+        }])
+        .await
+        .unwrap();
     let prepared = control
         .execute_commands(vec![Command::PrepareActiveRangeSplit {
             feed: "orders.events".to_owned(),
@@ -287,6 +370,19 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
     );
     let cutover_control = LocalSplitControl {
         control: control.clone(),
+        reader_translations: vec![ReaderFrontierTranslation {
+            reader_id: reader.reader_id,
+            expected_session_epoch: 1,
+            expected_acknowledged_cursor: Some("ack-token".to_owned()),
+            expected_delivered_cursor: Some("unack-token".to_owned()),
+            expected_acknowledged: acknowledged,
+            expected_delivered: delivered,
+            expected_has_frontier: true,
+            acknowledged: BTreeMap::from([
+                (source_assignment.range_id, "cursor-1".to_owned()),
+                (plan.right_assignment.range_id, "cursor-2".to_owned()),
+            ]),
+        }],
     };
     let final_boundary = orchestrate_split_cutover(
         &cutover_control,
@@ -300,6 +396,33 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
     .await
     .unwrap();
     assert_eq!(final_boundary.final_commit, CommitPosition::new(4));
+    let after_split = control.active_reader_by_name("audit").await.unwrap();
+    assert_eq!(after_split.session_epoch, 2);
+    assert!(!after_split.session_active);
+    assert!(control
+        .execute_commands(vec![Command::AcknowledgeReader {
+            reader: "audit".to_owned(),
+            session_epoch: 1,
+            cursor: "unack-token".to_owned(),
+        }])
+        .await
+        .is_err());
+    let after_split_state: serde_json::Value =
+        serde_json::from_slice(&control.snapshot_bytes().await.unwrap()).unwrap();
+    let split_progress =
+        &after_split_state["reader_frontiers"][reader.reader_id.to_string()]["acknowledged"];
+    assert_eq!(
+        split_progress[source_assignment.range_id.to_string()],
+        "cursor-1"
+    );
+    assert_eq!(
+        split_progress[plan.right_assignment.range_id.to_string()],
+        "cursor-2"
+    );
+    assert_eq!(
+        after_split_state["reader_frontiers"][reader.reader_id.to_string()]["delivered"],
+        *split_progress
+    );
     assert_eq!(
         control
             .active_range_map(feed_id)
@@ -359,6 +482,22 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             feed: "orders.events".to_owned(),
             plan_id: merge_plan.plan_id,
             writer_sequences: merge_staged.writer_sequences.clone(),
+            reader_translations: vec![ReaderFrontierTranslation {
+                reader_id: reader.reader_id,
+                expected_session_epoch: 2,
+                expected_acknowledged_cursor: Some("ack-token".to_owned()),
+                expected_delivered_cursor: Some("ack-token".to_owned()),
+                expected_acknowledged: BTreeMap::from([
+                    (source_assignment.range_id, "cursor-1".to_owned()),
+                    (plan.right_assignment.range_id, "cursor-2".to_owned()),
+                ]),
+                expected_delivered: BTreeMap::from([
+                    (source_assignment.range_id, "cursor-1".to_owned()),
+                    (plan.right_assignment.range_id, "cursor-2".to_owned()),
+                ]),
+                expected_has_frontier: true,
+                acknowledged: BTreeMap::from([(merge_plan.left_range_id, "cursor-2".to_owned())]),
+            }],
         }])
         .await
         .unwrap();
@@ -372,6 +511,49 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
         1
     );
     let merged_assignment = control.active_range_assignment(feed_id).await.unwrap();
+    let restored_store: Arc<dyn LogStore> =
+        Arc::new(FileLogStore::open(directory.path().join("reopened-legacy")).unwrap());
+    let restored = ControlController::open_with_storage_nodes(
+        directory.path().join("restored-catalog.json"),
+        restored_store,
+        vec![node("storage-1"), node("storage-2"), node("storage-3")],
+    )
+    .unwrap();
+    restored
+        .install_snapshot_bytes(&control.snapshot_bytes().await.unwrap())
+        .await
+        .unwrap();
+    let restored_reader = restored.active_reader_by_name("audit").await.unwrap();
+    assert_eq!(restored_reader.session_epoch, 3);
+    let restored_state: serde_json::Value =
+        serde_json::from_slice(&restored.snapshot_bytes().await.unwrap()).unwrap();
+    let merged_progress =
+        &restored_state["reader_frontiers"][reader.reader_id.to_string()]["acknowledged"];
+    assert_eq!(
+        merged_progress[merged_assignment.range_id.to_string()],
+        "cursor-2"
+    );
+    assert_eq!(merged_progress.as_object().unwrap().len(), 1);
+    let reopened = restored
+        .execute_commands(vec![Command::OpenReaderSession {
+            reader: "audit".to_owned(),
+            capacity: 4,
+        }])
+        .await
+        .unwrap();
+    assert_eq!(reopened.results[0].data["session_epoch"], 4);
+    restored
+        .execute_commands(vec![Command::RecordReaderFrontier {
+            reader: "audit".to_owned(),
+            session_epoch: 4,
+            cursor: "after-merge".to_owned(),
+            positions: BTreeMap::from([(merged_assignment.range_id, "cursor-4".to_owned())]),
+            expected_cursor: Some("ack-token".to_owned()),
+            fence_delivery: true,
+            fetch_request_id: Some(Uuid::from_u128(8003)),
+        }])
+        .await
+        .unwrap();
     let final_records = services[&merged_assignment.owner]
         .read_committed(feed_id, None, 10)
         .await

@@ -1,9 +1,10 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use finnstream::{
     active_range::{CommitPosition, KeyToken, StorageNodeId},
     control::{
-        Command, ControlController, ControlError, RangeSplitPlan, RangeSplitStage, ReaderStart,
+        Command, ControlController, ControlError, RangeMergePlan, RangeSplitPlan, RangeSplitStage,
+        ReaderFrontierTranslation, ReaderStart,
     },
     storage::{FileLogStore, LogStore},
 };
@@ -892,6 +893,7 @@ async fn split_plan_is_consensus_persisted_but_cannot_change_authoritative_routi
             plan_id: plan.plan_id,
             left_writer_sequences: Vec::new(),
             right_writer_sequences: Vec::new(),
+            reader_translations: Vec::new(),
         }])
         .await
         .unwrap();
@@ -953,4 +955,290 @@ async fn split_plan_is_consensus_persisted_but_cannot_change_authoritative_routi
             .len(),
         2
     );
+}
+
+#[tokio::test]
+async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    create_feed(&control, Uuid::from_u128(90_001)).await;
+    control
+        .execute(
+            "CREATE READER audit FROM orders.created START AT BEGINNING; \
+             CREATE READER metrics FROM orders.created START AT NOW;",
+        )
+        .await
+        .unwrap();
+    let audit = control.active_reader_by_name("audit").await.unwrap();
+    let metrics = control.active_reader_by_name("metrics").await.unwrap();
+    let feed_id = audit.feed_id;
+    let source_range = control.active_range_map(feed_id).await.unwrap().routes()[0].range_id;
+    control
+        .execute_commands(vec![Command::OpenReaderSession {
+            reader: "audit".to_owned(),
+            capacity: 8,
+        }])
+        .await
+        .unwrap();
+    let acknowledged = BTreeMap::from([(source_range, "ack-cursor-1".to_owned())]);
+    control
+        .execute_commands(vec![Command::RecordReaderFrontier {
+            reader: "audit".to_owned(),
+            session_epoch: 1,
+            cursor: "ack-token-1".to_owned(),
+            positions: acknowledged.clone(),
+            expected_cursor: None,
+            fence_delivery: true,
+            fetch_request_id: Some(Uuid::from_u128(90_002)),
+        }])
+        .await
+        .unwrap();
+    control
+        .execute_commands(vec![Command::AcknowledgeReader {
+            reader: "audit".to_owned(),
+            session_epoch: 1,
+            cursor: "ack-token-1".to_owned(),
+        }])
+        .await
+        .unwrap();
+    let delivered = BTreeMap::from([(source_range, "delivered-cursor-2".to_owned())]);
+    control
+        .execute_commands(vec![Command::RecordReaderFrontier {
+            reader: "audit".to_owned(),
+            session_epoch: 1,
+            cursor: "del-token-2".to_owned(),
+            positions: delivered.clone(),
+            expected_cursor: Some("ack-token-1".to_owned()),
+            fence_delivery: true,
+            fetch_request_id: Some(Uuid::from_u128(90_003)),
+        }])
+        .await
+        .unwrap();
+
+    let prepared = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            split_at: KeyToken::from_bytes([0x80; 16]),
+        }])
+        .await
+        .unwrap();
+    let plan: RangeSplitPlan = serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+    let (left_range, right_range) = (
+        plan.candidate_map.routes()[0].range_id,
+        plan.candidate_map.routes()[1].range_id,
+    );
+    for (scanned, right_commit, stage) in [(9_u64, 4_u64, "catching_up"), (10, 5, "ready")] {
+        let result = control
+            .execute_commands(vec![Command::RecordActiveRangeSplitCatchUp {
+                feed: "orders.created".to_owned(),
+                plan_id: plan.plan_id,
+                source_commit: CommitPosition::new(10),
+                source_scanned_through: CommitPosition::new(scanned),
+                right_commit: CommitPosition::new(right_commit),
+                checksum_verified: true,
+            }])
+            .await
+            .unwrap();
+        assert_eq!(result.results[0].data["stage"], stage);
+    }
+
+    let audit_translation = ReaderFrontierTranslation {
+        reader_id: audit.reader_id,
+        expected_session_epoch: 1,
+        expected_acknowledged_cursor: Some("ack-token-1".to_owned()),
+        expected_delivered_cursor: Some("del-token-2".to_owned()),
+        expected_acknowledged: acknowledged.clone(),
+        expected_delivered: delivered.clone(),
+        expected_has_frontier: true,
+        acknowledged: BTreeMap::from([
+            (left_range, "ack-cursor-1".to_owned()),
+            (right_range, String::new()),
+        ]),
+    };
+    let metrics_translation = ReaderFrontierTranslation {
+        reader_id: metrics.reader_id,
+        expected_session_epoch: 0,
+        expected_acknowledged_cursor: None,
+        expected_delivered_cursor: None,
+        expected_acknowledged: BTreeMap::new(),
+        expected_delivered: BTreeMap::new(),
+        expected_has_frontier: false,
+        acknowledged: BTreeMap::from([(left_range, String::new()), (right_range, String::new())]),
+    };
+
+    // An incomplete cutover cannot activate: every active Reader needs a translation.
+    assert!(control
+        .execute_commands(vec![Command::ActivateActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            plan_id: plan.plan_id,
+            left_writer_sequences: Vec::new(),
+            right_writer_sequences: Vec::new(),
+            reader_translations: vec![audit_translation.clone()],
+        }])
+        .await
+        .is_err());
+    // Stale Reader evidence must refuse rather than guess a frontier.
+    let mut stale = audit_translation.clone();
+    stale.expected_delivered_cursor = Some("other-token".to_owned());
+    assert!(control
+        .execute_commands(vec![Command::ActivateActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            plan_id: plan.plan_id,
+            left_writer_sequences: Vec::new(),
+            right_writer_sequences: Vec::new(),
+            reader_translations: vec![stale, metrics_translation.clone()],
+        }])
+        .await
+        .is_err());
+    // A translation that does not cover every candidate route is rejected.
+    let mut uncovered = audit_translation.clone();
+    uncovered.acknowledged.remove(&right_range);
+    assert!(control
+        .execute_commands(vec![Command::ActivateActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            plan_id: plan.plan_id,
+            left_writer_sequences: Vec::new(),
+            right_writer_sequences: Vec::new(),
+            reader_translations: vec![uncovered, metrics_translation.clone()],
+        }])
+        .await
+        .is_err());
+    assert_eq!(
+        control
+            .active_range_map(feed_id)
+            .await
+            .unwrap()
+            .routes()
+            .len(),
+        1
+    );
+
+    let activated = control
+        .execute_commands(vec![Command::ActivateActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            plan_id: plan.plan_id,
+            left_writer_sequences: Vec::new(),
+            right_writer_sequences: Vec::new(),
+            reader_translations: vec![audit_translation, metrics_translation],
+        }])
+        .await
+        .unwrap();
+    assert_eq!(
+        activated.results[0].data["range_map"]["routes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    let audit_after = control.active_reader_by_name("audit").await.unwrap();
+    assert_eq!(audit_after.session_epoch, 2);
+    assert!(!audit_after.session_active);
+    assert_eq!(audit_after.delivered_cursor.as_deref(), Some("ack-token-1"));
+    assert!(control
+        .execute_commands(vec![Command::RecordReaderFrontier {
+            reader: "audit".to_owned(),
+            session_epoch: 1,
+            cursor: "stale-delivery".to_owned(),
+            positions: BTreeMap::from(
+                [(left_range, "x".to_owned()), (right_range, String::new()),]
+            ),
+            expected_cursor: Some("ack-token-1".to_owned()),
+            fence_delivery: true,
+            fetch_request_id: Some(Uuid::from_u128(90_004)),
+        }])
+        .await
+        .is_err());
+    let metrics_after = control.active_reader_by_name("metrics").await.unwrap();
+    assert_eq!(metrics_after.session_epoch, 1);
+    assert_eq!(metrics_after.acknowledged_cursor, None);
+    assert_eq!(metrics_after.delivered_cursor, None);
+
+    let merged = control
+        .execute_commands(vec![Command::PrepareActiveRangeMerge {
+            feed: "orders.created".to_owned(),
+            left_range_id: left_range,
+            right_range_id: right_range,
+        }])
+        .await
+        .unwrap();
+    let merge_plan: RangeMergePlan =
+        serde_json::from_value(merged.results[0].data.clone()).unwrap();
+    let merged_range = merge_plan.candidate_map.routes()[0].range_id;
+    control
+        .execute_commands(vec![Command::RecordActiveRangeMergeStaging {
+            feed: "orders.created".to_owned(),
+            plan_id: merge_plan.plan_id,
+            left_commit: CommitPosition::new(2),
+            right_commit: CommitPosition::new(2),
+            merged_commit: CommitPosition::new(4),
+            checksum_verified: true,
+        }])
+        .await
+        .unwrap();
+    let split_acknowledged = BTreeMap::from([
+        (left_range, "ack-cursor-1".to_owned()),
+        (right_range, String::new()),
+    ]);
+    let audit_merge = ReaderFrontierTranslation {
+        reader_id: audit.reader_id,
+        expected_session_epoch: 2,
+        expected_acknowledged_cursor: Some("ack-token-1".to_owned()),
+        expected_delivered_cursor: Some("ack-token-1".to_owned()),
+        expected_acknowledged: split_acknowledged.clone(),
+        expected_delivered: split_acknowledged,
+        expected_has_frontier: true,
+        acknowledged: BTreeMap::from([(merged_range, "ack-cursor-1".to_owned())]),
+    };
+    let metrics_merge = ReaderFrontierTranslation {
+        reader_id: metrics.reader_id,
+        expected_session_epoch: 1,
+        expected_acknowledged_cursor: None,
+        expected_delivered_cursor: None,
+        expected_acknowledged: BTreeMap::new(),
+        expected_delivered: BTreeMap::new(),
+        expected_has_frontier: false,
+        acknowledged: BTreeMap::from([(merged_range, String::new())]),
+    };
+    let merge_activated = control
+        .execute_commands(vec![Command::ActivateActiveRangeMerge {
+            feed: "orders.created".to_owned(),
+            plan_id: merge_plan.plan_id,
+            writer_sequences: Vec::new(),
+            reader_translations: vec![audit_merge, metrics_merge],
+        }])
+        .await
+        .unwrap();
+    assert_eq!(
+        merge_activated.results[0].data["range_map"]["routes"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    let audit_merged = control.active_reader_by_name("audit").await.unwrap();
+    assert_eq!(audit_merged.session_epoch, 3);
+    assert!(control
+        .execute_commands(vec![Command::RecordReaderFrontier {
+            reader: "audit".to_owned(),
+            session_epoch: 2,
+            cursor: "stale".to_owned(),
+            positions: BTreeMap::from([(merged_range, "x".to_owned())]),
+            expected_cursor: Some("ack-token-1".to_owned()),
+            fence_delivery: true,
+            fetch_request_id: Some(Uuid::from_u128(90_005)),
+        }])
+        .await
+        .is_err());
+    let reopened = control
+        .execute_commands(vec![Command::OpenReaderSession {
+            reader: "audit".to_owned(),
+            capacity: 4,
+        }])
+        .await
+        .unwrap();
+    assert_eq!(reopened.results[0].data["session_epoch"], 4);
+    assert_eq!(reopened.results[0].data["delivered_cursor"], "ack-token-1");
 }

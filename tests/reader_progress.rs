@@ -5,19 +5,181 @@ use std::{
 };
 
 use finnstream::{
-    active_range::{RangeId, ReplicaSet, StorageNodeId},
+    active_range::{KeyToken, RangeId, RangePosition, ReplicaSet, StorageNodeId},
     control::ControlController,
     reader::{
-        FjallReaderProgressStore, FjallSubscriptionProgressReplica, ReaderDeliveryMutation,
-        ReaderDeliveryReceipt, ReaderPacingController, ReaderPressureSample, ReaderProgressEngine,
-        ReaderProgressError, SubscriptionCommitEvidence, SubscriptionPrepareVote,
-        SubscriptionProgressAssignment, SubscriptionProgressCoordinator, SubscriptionProgressError,
-        SubscriptionProgressMutation, SubscriptionProgressTransport, SubscriptionReplicaReply,
+        translate_merge_reader_frontier, translate_split_reader_frontier, FjallReaderProgressStore,
+        FjallSubscriptionProgressReplica, ReaderDeliveryMutation, ReaderDeliveryReceipt,
+        ReaderFrontierTranslationError, ReaderLineageEntry, ReaderPacingController,
+        ReaderPressureSample, ReaderProgressEngine, ReaderProgressError,
+        SubscriptionCommitEvidence, SubscriptionPrepareVote, SubscriptionProgressAssignment,
+        SubscriptionProgressCoordinator, SubscriptionProgressError, SubscriptionProgressMutation,
+        SubscriptionProgressTransport, SubscriptionReplicaReply,
     },
     storage::{FileLogStore, LogStore},
 };
 use tempfile::TempDir;
 use uuid::Uuid;
+
+#[test]
+fn split_and_merge_frontiers_keep_acknowledged_history_without_skipping() {
+    let left = RangeId::from_uuid(Uuid::from_u128(401));
+    let right = RangeId::from_uuid(Uuid::from_u128(402));
+    let split_at = KeyToken::from_bytes([0x80; 16]);
+    let rows = (1..=4)
+        .map(|position| ReaderLineageEntry {
+            range_id: left,
+            position: RangePosition::new(position),
+            cursor: format!("cursor-{position}"),
+            key_token: KeyToken::from_bytes([if position % 2 == 0 { 0xf0 } else { 0x10 }; 16]),
+            ingest_time_ns: position as i64,
+            message_id: Uuid::from_u128(position as u128),
+        })
+        .collect::<Vec<_>>();
+    let split =
+        translate_split_reader_frontier(&rows, left, left, right, split_at, "cursor-2").unwrap();
+    assert_eq!(split[&left], "cursor-1");
+    assert_eq!(split[&right], "cursor-2");
+    let left_rows = rows
+        .iter()
+        .filter(|row| row.position.value() % 2 == 1)
+        .enumerate()
+        .map(|(index, row)| ReaderLineageEntry {
+            range_id: left,
+            position: RangePosition::new(index as u64 + 1),
+            ..row.clone()
+        })
+        .collect::<Vec<_>>();
+    let right_rows = rows
+        .iter()
+        .filter(|row| row.position.value() % 2 == 0)
+        .enumerate()
+        .map(|(index, row)| ReaderLineageEntry {
+            range_id: right,
+            position: RangePosition::new(index as u64 + 1),
+            ..row.clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        translate_merge_reader_frontier(&left_rows, &right_rows, left, right, "cursor-3", "")
+            .unwrap(),
+        "cursor-1"
+    );
+    assert_eq!(
+        translate_merge_reader_frontier(
+            &left_rows,
+            &right_rows,
+            left,
+            right,
+            "cursor-3",
+            "cursor-2"
+        )
+        .unwrap(),
+        "cursor-3"
+    );
+    assert!(matches!(
+        translate_split_reader_frontier(&rows, left, left, right, split_at, "unknown"),
+        Err(ReaderFrontierTranslationError::MissingCursor)
+    ));
+    let mut missing = rows.clone();
+    missing.remove(1);
+    assert!(matches!(
+        translate_split_reader_frontier(&missing, left, left, right, split_at, "cursor-3"),
+        Err(ReaderFrontierTranslationError::InvalidHistory)
+    ));
+}
+
+#[test]
+fn frontier_translation_rejects_ambiguous_and_oversized_source_history() {
+    let left = RangeId::from_uuid(Uuid::from_u128(501));
+    let right = RangeId::from_uuid(Uuid::from_u128(502));
+    let split_at = KeyToken::from_bytes([0x80; 16]);
+    let rows = (1..=2)
+        .map(|position| ReaderLineageEntry {
+            range_id: left,
+            position: RangePosition::new(position),
+            cursor: format!("source-{position}"),
+            key_token: KeyToken::from_bytes([position as u8; 16]),
+            ingest_time_ns: position as i64,
+            message_id: Uuid::from_u128(position as u128),
+        })
+        .collect::<Vec<_>>();
+    let empty = translate_split_reader_frontier(&rows, left, left, right, split_at, "").unwrap();
+    assert!(empty.values().all(String::is_empty));
+    let left_rows = rows
+        .iter()
+        .map(|row| ReaderLineageEntry {
+            range_id: left,
+            ..row.clone()
+        })
+        .collect::<Vec<_>>();
+    let right_rows = rows
+        .iter()
+        .map(|row| ReaderLineageEntry {
+            range_id: right,
+            cursor: format!("other-{}", row.position.value()),
+            ingest_time_ns: row.ingest_time_ns + 10,
+            ..row.clone()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        translate_merge_reader_frontier(&left_rows, &right_rows, left, right, "", "").unwrap(),
+        ""
+    );
+
+    let mut duplicated = rows.clone();
+    duplicated[1].cursor = duplicated[0].cursor.clone();
+    assert!(matches!(
+        translate_split_reader_frontier(&duplicated, left, left, right, split_at, ""),
+        Err(ReaderFrontierTranslationError::InvalidHistory)
+    ));
+    let mut gap = rows.clone();
+    gap[1].position = RangePosition::new(3);
+    assert!(matches!(
+        translate_split_reader_frontier(&gap, left, left, right, split_at, ""),
+        Err(ReaderFrontierTranslationError::InvalidHistory)
+    ));
+    let mut wrong_range = rows.clone();
+    wrong_range[0].range_id = right;
+    assert!(matches!(
+        translate_split_reader_frontier(&wrong_range, left, left, right, split_at, ""),
+        Err(ReaderFrontierTranslationError::InvalidHistory)
+    ));
+    let mut oversized_cursor = rows.clone();
+    oversized_cursor[0].cursor = "x".repeat(257);
+    assert!(matches!(
+        translate_split_reader_frontier(&oversized_cursor, left, left, right, split_at, ""),
+        Err(ReaderFrontierTranslationError::InvalidHistory)
+    ));
+    let oversized_history = (1..=10_001_u64)
+        .map(|position| ReaderLineageEntry {
+            range_id: left,
+            position: RangePosition::new(position),
+            cursor: format!("large-{position}"),
+            key_token: KeyToken::from_bytes([0x10; 16]),
+            ingest_time_ns: position as i64,
+            message_id: Uuid::from_u128(position as u128),
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        translate_split_reader_frontier(&oversized_history, left, left, right, split_at, ""),
+        Err(ReaderFrontierTranslationError::InvalidHistory)
+    ));
+    assert!(matches!(
+        translate_split_reader_frontier(&rows, left, left, left, split_at, ""),
+        Err(ReaderFrontierTranslationError::InvalidSources)
+    ));
+    assert!(matches!(
+        translate_merge_reader_frontier(&left_rows, &right_rows, left, left, "", ""),
+        Err(ReaderFrontierTranslationError::InvalidSources)
+    ));
+    let mut conflicting_right = right_rows.clone();
+    conflicting_right[0].cursor = left_rows[0].cursor.clone();
+    assert!(matches!(
+        translate_merge_reader_frontier(&left_rows, &conflicting_right, left, right, "", ""),
+        Err(ReaderFrontierTranslationError::InvalidHistory)
+    ));
+}
 
 struct TestProgressTransport {
     stores: BTreeMap<StorageNodeId, Arc<FjallSubscriptionProgressReplica>>,
