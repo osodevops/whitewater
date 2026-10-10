@@ -865,6 +865,14 @@ impl ControlController {
         self.state.lock().await.draining_storage_nodes.clone()
     }
 
+    /// In-flight Active Range movement plans (follower replacements and owner
+    /// transfers) that have been prepared but not yet activated. Drain
+    /// scheduling treats this count as the movement disruption budget.
+    pub async fn pending_move_plan_count(&self) -> usize {
+        let state = self.state.lock().await;
+        state.range_move_plans.len() + state.owner_move_plans.len()
+    }
+
     fn select_fixed_active_range(
         &self,
         state: &CatalogState,

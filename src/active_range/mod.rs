@@ -11,7 +11,8 @@ pub mod store;
 
 pub use drain::{
     DrainCommandAuthority, DrainMoveDriver, LocalDrainDriver, StorageDrainError,
-    StorageDrainExecutor, StorageDrainOutcome, StorageDrainReport, StorageDrainSupervisor,
+    StorageDrainExecutor, StorageDrainOutcome, StorageDrainReport, StorageDrainStatus,
+    StorageDrainSupervisor,
 };
 pub use majority::{
     HttpReplicaTransport, MajorityAppendCoordinator, MajorityAppendError, MajorityAppendErrorCode,

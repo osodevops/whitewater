@@ -5,7 +5,7 @@ use finnstream::{
     active_range::{
         cold_adjacent_pairs, ColdRangeTracker, HttpRecoveryTransport, HttpReplicaTransport,
         LocalRepairSupervisor, MajorityAppendCoordinator, RecoverySupervisor, ReplicaAppendService,
-        SplitPressureTracker, StorageDrainSupervisor, StorageNodeId,
+        SplitPressureTracker, StorageDrainStatus, StorageDrainSupervisor, StorageNodeId,
     },
     admin::AdminAuthenticator,
     api::{router, subscription_mtls_router, AdminDrainDriver, AppState, SubscriptionTlsServer},
@@ -245,7 +245,12 @@ async fn main() -> Result<()> {
                 control_plane.clone(),
                 Duration::from_secs(60),
             )?;
-            let supervisor = StorageDrainSupervisor::new(control.clone(), Arc::new(driver));
+            let move_budget = std::env::var("WHITEWATER_DRAIN_MOVE_BUDGET")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(2);
+            let supervisor = StorageDrainSupervisor::new(control.clone(), Arc::new(driver))
+                .with_move_budget(move_budget);
             let mut shutdown = shutdown_tx.subscribe();
             Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(5));
@@ -256,14 +261,17 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                             for outcome in supervisor.tick().await {
-                                match outcome.result {
-                                    Ok(report) if report.ready_to_retire => {
+                                match outcome.status {
+                                    StorageDrainStatus::Drained(report) if report.ready_to_retire => {
                                         tracing::info!(node = %report.node, completed_moves = report.completed_moves, "storage Node drain completed; Node reports safe-to-remove")
                                     }
-                                    Ok(report) => {
+                                    StorageDrainStatus::Drained(report) => {
                                         tracing::warn!(node = %report.node, unplannable = ?report.unplannable, "storage Node drain blocked")
                                     }
-                                    Err(error) => {
+                                    StorageDrainStatus::Throttled { pending_plans } => {
+                                        tracing::info!(node = %outcome.node, pending_plans, "storage Node drain deferred by movement budget")
+                                    }
+                                    StorageDrainStatus::Failed(error) => {
                                         tracing::warn!(node = %outcome.node, %error, "storage Node drain step failed")
                                     }
                                 }

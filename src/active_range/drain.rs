@@ -38,11 +38,22 @@ pub struct StorageDrainReport {
     pub ready_to_retire: bool,
 }
 
-/// Outcome of one supervisor drain pass over a single storage Node.
+/// Result of one supervisor drain pass over a single storage Node.
 #[derive(Clone, Debug)]
 pub struct StorageDrainOutcome {
     pub node: StorageNodeId,
-    pub result: Result<StorageDrainReport, String>,
+    pub status: StorageDrainStatus,
+}
+
+#[derive(Clone, Debug)]
+pub enum StorageDrainStatus {
+    /// The plan is exhausted; `ready_to_retire` says whether RETIRE is safe.
+    Drained(StorageDrainReport),
+    /// The Node still has planned moves but the cluster-wide movement
+    /// disruption budget is exhausted; the next tick retries.
+    Throttled { pending_plans: usize },
+    /// A plan step failed; the Node keeps its draining flag and retries.
+    Failed(String),
 }
 
 #[derive(Debug, Error)]
@@ -65,6 +76,10 @@ pub enum StorageDrainError {
 
 const MAX_DRAIN_STEPS: usize = 64;
 const DEFAULT_DRAIN_BATCH: usize = 32;
+/// Concurrent in-flight Active Range movement plans a supervised drain may
+/// contribute to; pending plans from crashed or abandoned moves count toward
+/// the budget so drained Nodes cannot pile freezes onto unresolved movement.
+const DEFAULT_MOVE_BUDGET: usize = 2;
 
 /// Executes `INSPECT DRAIN` plans one move at a time, re-planning after every
 /// committed step so each command is applied against the newest placement.
@@ -261,6 +276,7 @@ pub struct StorageDrainSupervisor {
     control: Arc<ControlController>,
     driver: Arc<dyn DrainMoveDriver>,
     max_steps_per_node: usize,
+    move_budget: usize,
 }
 
 impl StorageDrainSupervisor {
@@ -269,11 +285,17 @@ impl StorageDrainSupervisor {
             control,
             driver,
             max_steps_per_node: MAX_DRAIN_STEPS,
+            move_budget: DEFAULT_MOVE_BUDGET,
         }
     }
 
     pub fn with_max_steps_per_node(mut self, max_steps_per_node: usize) -> Self {
         self.max_steps_per_node = max_steps_per_node.max(1);
+        self
+    }
+
+    pub fn with_move_budget(mut self, move_budget: usize) -> Self {
+        self.move_budget = move_budget.max(1);
         self
     }
 
@@ -285,28 +307,21 @@ impl StorageDrainSupervisor {
         for node in self.control.draining_storage_nodes().await {
             outcomes.push(StorageDrainOutcome {
                 node: node.clone(),
-                result: self
-                    .drain_node(&node)
-                    .await
-                    .map_err(|error| error.to_string()),
+                status: self.drain_node(&node).await,
             });
         }
         outcomes
     }
 
-    async fn drain_node(
-        &self,
-        node: &StorageNodeId,
-    ) -> Result<StorageDrainReport, StorageDrainError> {
+    async fn drain_node(&self, node: &StorageNodeId) -> StorageDrainStatus {
         let mut completed_moves = 0_usize;
         loop {
-            let plan = self
-                .control
-                .storage_drain_plan(node)
-                .await
-                .map_err(|error| StorageDrainError::Plan(error.to_string()))?;
+            let plan = match self.control.storage_drain_plan(node).await {
+                Ok(plan) => plan,
+                Err(error) => return StorageDrainStatus::Failed(error.to_string()),
+            };
             if plan.moves.is_empty() {
-                return Ok(StorageDrainReport {
+                return StorageDrainStatus::Drained(StorageDrainReport {
                     node: node.clone(),
                     completed_moves,
                     unplannable: plan.unplannable,
@@ -314,12 +329,22 @@ impl StorageDrainSupervisor {
                 });
             }
             if completed_moves >= self.max_steps_per_node {
-                return Err(StorageDrainError::Stalled);
+                return StorageDrainStatus::Failed(StorageDrainError::Stalled.to_string());
             }
-            self.driver
-                .apply(plan.moves[0].clone())
-                .await
-                .map_err(StorageDrainError::Command)?;
+            if matches!(
+                plan.moves[0],
+                Command::PrepareFollowerMove { .. } | Command::PrepareOwnerMove { .. }
+            ) {
+                let pending = self.control.pending_move_plan_count().await;
+                if pending >= self.move_budget {
+                    return StorageDrainStatus::Throttled {
+                        pending_plans: pending,
+                    };
+                }
+            }
+            if let Err(error) = self.driver.apply(plan.moves[0].clone()).await {
+                return StorageDrainStatus::Failed(error);
+            }
             completed_moves += 1;
         }
     }
