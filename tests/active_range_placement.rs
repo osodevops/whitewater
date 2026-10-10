@@ -1779,3 +1779,209 @@ async fn drain_plan_explains_ordered_moves_and_unplannable_references() {
     .unwrap();
     assert!(!plan.unplannable.is_empty());
 }
+
+fn pin(seed: u8) -> String {
+    format!("{:064x}", seed)
+}
+
+fn pin_bytes(hex: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    for (index, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        out[index] = u8::from_str_radix(std::str::from_utf8(chunk).unwrap(), 16).unwrap();
+    }
+    out
+}
+
+#[tokio::test]
+async fn registered_storage_node_certificate_pins_validate_and_resolve() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+
+    // Malformed pins are refused before the record persists.
+    assert!(control
+        .execute("REGISTER STORAGE NODE storage-4 AT https://storage-4:7271 WITH CERT PIN xyz;")
+        .await
+        .is_err());
+    assert!(control
+        .execute("REGISTER STORAGE NODE storage-4 AT https://storage-4:7271 WITH CERT PIN abcd;")
+        .await
+        .is_err());
+
+    // Multiple pins register together for certificate rotation overlap and
+    // resolve back to the owning Node in normalized lowercase hex.
+    let pins = format!("{}|{}", pin(0xAB), pin(0xCD).to_ascii_uppercase());
+    control
+        .execute(&format!(
+            "REGISTER STORAGE NODE storage-4 AT https://storage-4:7271 WITH CERT PIN {pins};"
+        ))
+        .await
+        .unwrap();
+    let record = control
+        .storage_node_by_cert_pin(blake3::hash(b"").as_bytes())
+        .await;
+    assert_eq!(record, None);
+    let first = pin_bytes(&pin(0xAB));
+    let second = pin_bytes(&pin(0xCD));
+    assert_eq!(
+        control.storage_node_by_cert_pin(&first).await,
+        Some(StorageNodeId::try_new("storage-4").unwrap())
+    );
+    assert_eq!(
+        control.storage_node_by_cert_pin(&second).await,
+        Some(StorageNodeId::try_new("storage-4").unwrap())
+    );
+
+    let shown = control
+        .execute("SHOW STORAGE NODES;")
+        .await
+        .unwrap()
+        .results
+        .remove(0)
+        .data;
+    let storage4 = shown
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["node"] == "storage-4")
+        .unwrap();
+    assert_eq!(
+        storage4["cert_pins"],
+        serde_json::json!([pin(0xAB), pin(0xCD)])
+    );
+}
+
+#[tokio::test]
+async fn registered_storage_node_certificate_pins_are_unique_across_nodes() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    control
+        .execute(&format!(
+            "REGISTER STORAGE NODE storage-4 AT https://storage-4:7271 WITH CERT PIN {};",
+            pin(1)
+        ))
+        .await
+        .unwrap();
+    // A second Node cannot claim a pin already registered elsewhere; the
+    // accept loop must never resolve one certificate to two identities.
+    assert!(control
+        .execute(&format!(
+            "REGISTER STORAGE NODE storage-5 AT https://storage-5:7271 WITH CERT PIN {};",
+            pin(1)
+        ))
+        .await
+        .is_err());
+    // ...including via a pin-set update on an already registered Node.
+    control
+        .execute(&format!(
+            "REGISTER STORAGE NODE storage-5 AT https://storage-5:7271 WITH CERT PIN {};",
+            pin(2)
+        ))
+        .await
+        .unwrap();
+    assert!(control
+        .execute(&format!(
+            "REGISTER STORAGE NODE storage-5 AT https://storage-5:7271 WITH CERT PIN {}|{};",
+            pin(2),
+            pin(1)
+        ))
+        .await
+        .is_err());
+    assert_eq!(
+        control.storage_node_by_cert_pin(&pin_bytes(&pin(1))).await,
+        Some(StorageNodeId::try_new("storage-4").unwrap())
+    );
+}
+
+#[tokio::test]
+async fn registered_storage_node_certificate_pins_rotate_via_reregister() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    control
+        .execute(&format!(
+            "REGISTER STORAGE NODE storage-4 AT https://storage-4:7271 WITH CERT PIN {};",
+            pin(3)
+        ))
+        .await
+        .unwrap();
+    // Rotation overlap: re-register with old and new pins; both authenticate.
+    control
+        .execute(&format!(
+            "REGISTER STORAGE NODE storage-4 AT https://storage-4:7271 WITH CERT PIN {}|{};",
+            pin(3),
+            pin(4)
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        control.storage_node_by_cert_pin(&pin_bytes(&pin(4))).await,
+        Some(StorageNodeId::try_new("storage-4").unwrap())
+    );
+    // Completing rotation drops the retired pin.
+    control
+        .execute(&format!(
+            "REGISTER STORAGE NODE storage-4 AT https://storage-4:7271 WITH CERT PIN {};",
+            pin(4)
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        control.storage_node_by_cert_pin(&pin_bytes(&pin(3))).await,
+        None
+    );
+    assert_eq!(
+        control.storage_node_by_cert_pin(&pin_bytes(&pin(4))).await,
+        Some(StorageNodeId::try_new("storage-4").unwrap())
+    );
+    // Endpoint still cannot change without retire.
+    assert!(control
+        .execute(&format!(
+            "REGISTER STORAGE NODE storage-4 AT https://storage-4:9999 WITH CERT PIN {};",
+            pin(4)
+        ))
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn registered_storage_node_endpoints_resolve_through_the_catalog() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    control
+        .execute("REGISTER STORAGE NODE storage-4 AT https://storage-4:7271;")
+        .await
+        .unwrap();
+    control
+        .execute("REGISTER STORAGE NODE storage-5 AT https://storage-5:7271;")
+        .await
+        .unwrap();
+    assert_eq!(
+        control
+            .storage_node_endpoint(&StorageNodeId::try_new("storage-4").unwrap())
+            .await
+            .as_deref(),
+        Some("https://storage-4:7271")
+    );
+    assert_eq!(
+        control
+            .storage_node_endpoint(&StorageNodeId::try_new("missing").unwrap())
+            .await,
+        None
+    );
+    let registered = control.registered_storage_node_endpoints().await;
+    assert_eq!(
+        registered.keys().cloned().collect::<Vec<_>>(),
+        storage_nodes(&["storage-4", "storage-5"])
+    );
+}

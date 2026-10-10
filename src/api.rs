@@ -85,7 +85,7 @@ pub struct AppState {
     pub subscription_mtls_enabled: bool,
     pub majority_append: Option<Arc<MajorityAppendCoordinator>>,
     pub storage_node_id: Option<StorageNodeId>,
-    pub control_endpoints: Arc<BTreeMap<StorageNodeId, String>>,
+    pub control_endpoints: Arc<crate::internal_plane::InternalEndpoints>,
     pub internal_key: Option<String>,
     pub internal_http: reqwest::Client,
     pub internal_mtls: Option<Arc<InternalMtlsMaterial>>,
@@ -95,6 +95,9 @@ pub struct AppState {
 pub struct SubscriptionTlsServer {
     acceptor: tokio_rustls::TlsAcceptor,
     peer_pins: Arc<BTreeMap<StorageNodeId, std::collections::BTreeSet<[u8; 32]>>>,
+    /// Catalog lookup for certificate pins carried by independently
+    /// registered storage Nodes rather than static peer configuration.
+    control: Option<Arc<ControlController>>,
 }
 
 /// Certificate material one Node presents to its peers for internal
@@ -189,7 +192,16 @@ impl SubscriptionTlsServer {
         Ok(Self {
             acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(server_config)),
             peer_pins: Arc::new(config.peer_pins.clone()),
+            control: None,
         })
+    }
+
+    /// Registered storage Nodes distribute their certificate pins through
+    /// the replicated catalog; supply the controller so pinned identities
+    /// include registered Nodes, not only statically configured peers.
+    pub fn with_control(mut self, control: Arc<ControlController>) -> Self {
+        self.control = Some(control);
+        self
     }
 
     pub async fn serve(
@@ -219,6 +231,7 @@ impl SubscriptionTlsServer {
             };
             let acceptor = self.acceptor.clone();
             let pins = self.peer_pins.clone();
+            let control = self.control.clone();
             let app = app.clone();
             tokio::spawn(async move {
                 let _permit = permit;
@@ -246,9 +259,21 @@ impl SubscriptionTlsServer {
                     return;
                 };
                 let fingerprint = blake3::hash(leaf.as_ref());
-                let Some(node) = pins.iter().find_map(|(node, pin)| {
+                let configured = pins.iter().find_map(|(node, pin)| {
                     pin.contains(fingerprint.as_bytes()).then(|| node.clone())
-                }) else {
+                });
+                let node = match configured {
+                    Some(node) => Some(node),
+                    None => match &control {
+                        Some(control) => {
+                            control
+                                .storage_node_by_cert_pin(fingerprint.as_bytes())
+                                .await
+                        }
+                        None => None,
+                    },
+                };
+                let Some(node) = node else {
                     tracing::warn!("Subscription mTLS peer certificate is not pinned to a Node");
                     return;
                 };
@@ -2524,7 +2549,7 @@ async fn unfreeze_split_nodes(
     key: &str,
 ) {
     for node in plan.right_assignment.replicas.iter() {
-        if let Some(endpoint) = state.control_endpoints.get(node) {
+        if let Some(endpoint) = state.control_endpoints.resolve(node).await {
             let _ = state
                 .internal_http
                 .post(format!(
@@ -2808,9 +2833,13 @@ async fn admin_split_range(
         .ok_or_else(|| ApiError::unavailable("internal credential is unavailable"))?;
     let mut source_commit = CommitPosition::new(0);
     for node in split_freeze_order(&source_assignment) {
-        let endpoint = state.control_endpoints.get(&node).ok_or_else(|| {
-            ApiError::unavailable(format!("source replica {node} endpoint is unavailable"))
-        })?;
+        let endpoint = state
+            .control_endpoints
+            .resolve(&node)
+            .await
+            .ok_or_else(|| {
+                ApiError::unavailable(format!("source replica {node} endpoint is unavailable"))
+            })?;
         let progress: ReplicaProgressResponse = state
             .internal_http
             .post(format!(
@@ -2835,11 +2864,11 @@ async fn admin_split_range(
     }
     let mut staged = Vec::new();
     for node in plan.right_assignment.replicas.iter() {
-        let attempt = match state.control_endpoints.get(node) {
+        let attempt = match state.control_endpoints.resolve(node).await {
             Some(endpoint) => {
                 match reconcile_split_node(
                     &state,
-                    endpoint,
+                    &endpoint,
                     key,
                     &ReplicaReconcileRequest {
                         feed_id: plan.feed_id,
@@ -2851,7 +2880,7 @@ async fn admin_split_range(
                     Ok(()) => {
                         stage_split_node(
                             &state,
-                            endpoint,
+                            &endpoint,
                             key,
                             &LocalSplitStageRequest {
                                 plan: plan.clone(),
@@ -3022,7 +3051,7 @@ async fn unfreeze_merge_nodes(
     key: &str,
 ) {
     for node in plan.merged_assignment.replicas.iter() {
-        if let Some(endpoint) = state.control_endpoints.get(node) {
+        if let Some(endpoint) = state.control_endpoints.resolve(node).await {
             for assignment in [left, right] {
                 let _ = state
                     .internal_http
@@ -3081,7 +3110,7 @@ async fn admin_merge_ranges(
     let mut evidence = Vec::new();
     for node in plan.merged_assignment.replicas.iter() {
         let staged = async {
-            let endpoint = state.control_endpoints.get(node).ok_or_else(|| {
+            let endpoint = state.control_endpoints.resolve(node).await.ok_or_else(|| {
                 ApiError::unavailable(format!("merge replica {node} endpoint unavailable"))
             })?;
             let response: LocalMergeStageResponse = state
@@ -3346,7 +3375,8 @@ async fn move_stage_local(
     }
     let endpoint = state
         .control_endpoints
-        .get(&plan.source_assignment.owner)
+        .resolve(&plan.source_assignment.owner)
+        .await
         .ok_or_else(|| ApiError::unavailable("source owner endpoint unavailable"))?;
     let key = state
         .internal_key
@@ -3363,7 +3393,7 @@ async fn move_stage_local(
     let resume = (prior_commit.value() > 0).then(|| RangePosition::new(prior_commit.value()));
     let first = fetch_move_export(
         &state,
-        endpoint,
+        &endpoint,
         key,
         MoveExportRequest {
             plan_id: plan.plan_id,
@@ -3451,7 +3481,7 @@ async fn move_stage_local(
         if after.map_or(0, RangePosition::value) < captured.value() {
             next = fetch_move_export(
                 &state,
-                endpoint,
+                &endpoint,
                 key,
                 MoveExportRequest {
                     plan_id: plan.plan_id,
@@ -3465,7 +3495,7 @@ async fn move_stage_local(
     }
     let latest = fetch_move_export(
         &state,
-        endpoint,
+        &endpoint,
         key,
         MoveExportRequest {
             plan_id: plan.plan_id,
@@ -3654,11 +3684,13 @@ async fn admin_move_follower(
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     let source_endpoint = state
         .control_endpoints
-        .get(&plan.source_assignment.owner)
+        .resolve(&plan.source_assignment.owner)
+        .await
         .ok_or_else(|| ApiError::unavailable("source endpoint unavailable"))?;
     let target_endpoint = state
         .control_endpoints
-        .get(&plan.replacement_replica)
+        .resolve(&plan.replacement_replica)
+        .await
         .ok_or_else(|| ApiError::unavailable("replacement endpoint unavailable"))?;
     let key = state
         .internal_key
@@ -3674,14 +3706,14 @@ async fn admin_move_follower(
         .await
         == Some(plan.candidate_assignment.clone())
     {
-        unfreeze_move(&state, source_endpoint, key, &plan_request).await?;
+        unfreeze_move(&state, &source_endpoint, key, &plan_request).await?;
         return Ok(Json(
             json!({ "status": "activated", "assignment": plan.candidate_assignment }),
         ));
     }
     post_move_request(
         &state,
-        target_endpoint,
+        &target_endpoint,
         key,
         "/internal/active-range/move/stage",
         &MoveStageRequest {
@@ -3693,7 +3725,7 @@ async fn admin_move_follower(
     .await?;
     let frozen = post_move_request(
         &state,
-        source_endpoint,
+        &source_endpoint,
         key,
         "/internal/active-range/move/freeze",
         &plan_request,
@@ -3702,13 +3734,13 @@ async fn admin_move_follower(
     let boundary: CommitPosition = match serde_json::from_value(frozen["source_commit"].clone()) {
         Ok(commit) => commit,
         Err(error) => {
-            unfreeze_move(&state, source_endpoint, key, &plan_request).await?;
+            unfreeze_move(&state, &source_endpoint, key, &plan_request).await?;
             return Err(ApiError::unavailable(error.to_string()));
         }
     };
     let final_copy = post_move_request(
         &state,
-        target_endpoint,
+        &target_endpoint,
         key,
         "/internal/active-range/move/stage",
         &MoveStageRequest {
@@ -3722,17 +3754,17 @@ async fn admin_move_follower(
         Ok(data) => match serde_json::from_value(data) {
             Ok(copied) => copied,
             Err(error) => {
-                unfreeze_move(&state, source_endpoint, key, &plan_request).await?;
+                unfreeze_move(&state, &source_endpoint, key, &plan_request).await?;
                 return Err(ApiError::unavailable(error.to_string()));
             }
         },
         Err(error) => {
-            unfreeze_move(&state, source_endpoint, key, &plan_request).await?;
+            unfreeze_move(&state, &source_endpoint, key, &plan_request).await?;
             return Err(error);
         }
     };
     if !copied.ready || copied.source_commit != boundary || copied.target_commit != boundary {
-        unfreeze_move(&state, source_endpoint, key, &plan_request).await?;
+        unfreeze_move(&state, &source_endpoint, key, &plan_request).await?;
         return Err(ApiError::unavailable(
             "replacement did not commit the frozen source prefix",
         ));
@@ -3746,7 +3778,7 @@ async fn admin_move_follower(
         .activate(&request.feed, &plan)
         .await
         .map_err(ApiError::unavailable)?;
-    unfreeze_move(&state, source_endpoint, key, &plan_request).await?;
+    unfreeze_move(&state, &source_endpoint, key, &plan_request).await?;
     Ok(Json(
         json!({ "status": "activated", "assignment": plan.candidate_assignment,
         "committed_position": copied.target_commit, "transferred_records": copied.transferred_records,
@@ -3929,7 +3961,8 @@ async fn owner_move_verify(
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     let endpoint = state
         .control_endpoints
-        .get(&plan.source_assignment.owner)
+        .resolve(&plan.source_assignment.owner)
+        .await
         .ok_or_else(|| ApiError::unavailable("current owner endpoint unavailable"))?;
     let key = state
         .internal_key
@@ -3940,7 +3973,7 @@ async fn owner_move_verify(
     while after.map_or(0, RangePosition::value) < request.expected_commit.value() {
         let exported = fetch_owner_move_export(
             &state,
-            endpoint,
+            &endpoint,
             key,
             MoveExportRequest {
                 plan_id: plan.plan_id,
@@ -3993,7 +4026,7 @@ async fn owner_move_verify(
     }
     let latest = fetch_owner_move_export(
         &state,
-        endpoint,
+        &endpoint,
         key,
         MoveExportRequest {
             plan_id: plan.plan_id,
@@ -4219,11 +4252,13 @@ async fn admin_move_owner(
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     let source_endpoint = state
         .control_endpoints
-        .get(&plan.source_assignment.owner)
+        .resolve(&plan.source_assignment.owner)
+        .await
         .ok_or_else(|| ApiError::unavailable("source owner endpoint unavailable"))?;
     let target_endpoint = state
         .control_endpoints
-        .get(&plan.candidate_assignment.owner)
+        .resolve(&plan.candidate_assignment.owner)
+        .await
         .ok_or_else(|| ApiError::unavailable("candidate owner endpoint unavailable"))?;
     let key = state
         .internal_key
@@ -4239,15 +4274,15 @@ async fn admin_move_owner(
         .await
         == Some(plan.candidate_assignment.clone())
     {
-        unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
-        unfreeze_owner_move(&state, target_endpoint, key, &plan_request).await?;
+        unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
+        unfreeze_owner_move(&state, &target_endpoint, key, &plan_request).await?;
         return Ok(Json(
             json!({ "status": "activated", "assignment": plan.candidate_assignment }),
         ));
     }
     let frozen = match post_move_request(
         &state,
-        source_endpoint,
+        &source_endpoint,
         key,
         "/internal/active-range/owner-move/freeze",
         &plan_request,
@@ -4256,20 +4291,20 @@ async fn admin_move_owner(
     {
         Ok(frozen) => frozen,
         Err(error) => {
-            unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
+            unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
             return Err(error);
         }
     };
     let boundary: CommitPosition = match serde_json::from_value(frozen["source_commit"].clone()) {
         Ok(commit) => commit,
         Err(error) => {
-            unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
+            unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
             return Err(ApiError::unavailable(error.to_string()));
         }
     };
     let evidence = post_move_request(
         &state,
-        target_endpoint,
+        &target_endpoint,
         key,
         "/internal/active-range/owner-move/verify",
         &OwnerMoveVerifyRequest {
@@ -4283,20 +4318,20 @@ async fn admin_move_owner(
         Ok(data) => match serde_json::from_value(data) {
             Ok(evidence) => evidence,
             Err(error) => {
-                unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
-                unfreeze_owner_move(&state, target_endpoint, key, &plan_request).await?;
+                unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
+                unfreeze_owner_move(&state, &target_endpoint, key, &plan_request).await?;
                 return Err(ApiError::unavailable(error.to_string()));
             }
         },
         Err(error) => {
-            unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
-            unfreeze_owner_move(&state, target_endpoint, key, &plan_request).await?;
+            unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
+            unfreeze_owner_move(&state, &target_endpoint, key, &plan_request).await?;
             return Err(error);
         }
     };
     if !evidence.ready || evidence.source_commit != boundary || evidence.target_commit != boundary {
-        unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
-        unfreeze_owner_move(&state, target_endpoint, key, &plan_request).await?;
+        unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
+        unfreeze_owner_move(&state, &target_endpoint, key, &plan_request).await?;
         return Err(ApiError::unavailable(
             "candidate owner is not verified through frozen source boundary",
         ));
@@ -4318,8 +4353,8 @@ async fn admin_move_owner(
         }])
         .await
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
-    unfreeze_owner_move(&state, source_endpoint, key, &plan_request).await?;
-    unfreeze_owner_move(&state, target_endpoint, key, &plan_request).await?;
+    unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
+    unfreeze_owner_move(&state, &target_endpoint, key, &plan_request).await?;
     Ok(Json(
         json!({ "status": "activated", "assignment": plan.candidate_assignment,
         "committed_position": evidence.target_commit }),
@@ -4551,7 +4586,8 @@ async fn client_append(
     }
     let endpoint = state
         .control_endpoints
-        .get(&assignment.owner)
+        .resolve(&assignment.owner)
+        .await
         .ok_or_else(|| {
             ApiError::unavailable(format!(
                 "current Append Owner {} has no endpoint",
@@ -4879,7 +4915,7 @@ async fn verify_read_quorum(
             .iter()
             .filter(|node| **node != assignment.owner)
             .map(|node| async {
-                let endpoint = state.control_endpoints.get(node)?;
+                let endpoint = state.control_endpoints.resolve(node).await?;
                 let response = state
                     .internal_http
                     .post(format!(
@@ -5055,7 +5091,8 @@ async fn fetch_range_page(
     }
     let endpoint = state
         .control_endpoints
-        .get(&request.assignment.owner)
+        .resolve(&request.assignment.owner)
+        .await
         .ok_or_else(|| ApiError::unavailable("current owner endpoint is unavailable"))?;
     let key = state
         .internal_key
@@ -6609,7 +6646,7 @@ mod tests {
             subscription_progress: None,
             subscription_mtls_enabled: false,
             storage_node_id: Some(assignment.owner),
-            control_endpoints: Arc::new(BTreeMap::new()),
+            control_endpoints: Arc::new(BTreeMap::new().into()),
             internal_key: None,
             internal_http: reqwest::Client::new(),
             internal_mtls: None,
@@ -6707,7 +6744,7 @@ mod tests {
             subscription_progress: None,
             subscription_mtls_enabled: false,
             storage_node_id: None,
-            control_endpoints: Arc::new(BTreeMap::new()),
+            control_endpoints: Arc::new(BTreeMap::new().into()),
             internal_key: None,
             internal_http: reqwest::Client::new(),
             internal_mtls: None,
@@ -6798,7 +6835,7 @@ mod tests {
                 storage_node_id: Some(
                     crate::active_range::StorageNodeId::try_new("control-1").unwrap(),
                 ),
-                control_endpoints: Arc::new(BTreeMap::new()),
+                control_endpoints: Arc::new(BTreeMap::new().into()),
                 internal_key: Some("this-is-a-long-control-plane-key".to_owned()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,
@@ -7683,6 +7720,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn internal_mtls_plane_accepts_catalog_registered_certificate_pins() {
+        let directory = TempDir::new().unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params =
+            rcgen::CertificateParams::new(vec!["riverbed-test-ca".to_owned()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let issue = |name: &str| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec![name.to_owned()]).unwrap();
+            params.extended_key_usages = vec![
+                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            ];
+            let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
+            (cert, key)
+        };
+        let nodes = ["control-1", "control-2", "control-3"]
+            .map(|name| StorageNodeId::try_new(name).unwrap());
+        let mut pins = BTreeMap::new();
+        let (server_cert, server_key) = issue(nodes[0].as_str());
+        pins.insert(
+            nodes[0].clone(),
+            std::collections::BTreeSet::from(
+                [*blake3::hash(server_cert.der().as_ref()).as_bytes()],
+            ),
+        );
+        // Static pins cover the configured voters only.
+        for node in &nodes[1..] {
+            let (cert, _) = issue(node.as_str());
+            pins.insert(
+                node.clone(),
+                std::collections::BTreeSet::from([*blake3::hash(cert.der().as_ref()).as_bytes()]),
+            );
+        }
+        tokio::fs::write(directory.path().join("node.pem"), server_cert.pem())
+            .await
+            .unwrap();
+        tokio::fs::write(
+            directory.path().join("node.key"),
+            server_key.serialize_pem(),
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(directory.path().join("ca.pem"), ca.pem())
+            .await
+            .unwrap();
+        let config = SubscriptionMtlsConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            cert_path: directory.path().join("node.pem"),
+            key_path: directory.path().join("node.key"),
+            ca_path: directory.path().join("ca.pem"),
+            peer_pins: pins,
+            peer_endpoints: BTreeMap::new(),
+        };
+        let server = SubscriptionTlsServer::from_config(&config, &nodes[0])
+            .await
+            .unwrap();
+        let (mut state, control_plane, control, _replica) =
+            internal_replica_test_state(&directory).await;
+        state.subscription_mtls_enabled = true;
+        // A registered storage Node's certificate pin arrives through the
+        // replicated catalog rather than the static peer-pin configuration.
+        let (registered_cert, registered_key) = issue("storage-9");
+        let registered_identity = format!(
+            "{}{}",
+            registered_cert.pem(),
+            registered_key.serialize_pem()
+        );
+        let registered_pin = blake3::hash(registered_cert.der().as_ref())
+            .to_hex()
+            .to_string();
+        control
+            .execute_commands(vec![crate::control::Command::RegisterStorageNode {
+                node: StorageNodeId::try_new("storage-9").unwrap(),
+                endpoint: "https://storage-9:7271".to_owned(),
+                cert_pins: std::collections::BTreeSet::from([registered_pin]),
+            }])
+            .await
+            .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let tls_task = tokio::spawn(server.with_control(control.clone()).serve(
+            listener,
+            internal_mtls_router(state.clone()),
+            shutdown_rx,
+        ));
+        let make_client = |identity: &str| {
+            reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(reqwest::Certificate::from_pem(ca.pem().as_bytes()).unwrap())
+                .identity(reqwest::Identity::from_pem(identity.as_bytes()).unwrap())
+                .resolve("control-1", address)
+                .build()
+                .unwrap()
+        };
+        let endpoint = format!("https://control-1:{}", address.port());
+        let samples: Vec<crate::demand::RangePressureSample> = make_client(&registered_identity)
+            .get(format!("{endpoint}/internal/active-range/pressure"))
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key",
+            )
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(samples.is_empty());
+        // A valid CA-signed certificate with no registered or configured pin
+        // is still refused.
+        let (rogue_cert, rogue_key) = issue("storage-8");
+        let rogue_identity = format!("{}{}", rogue_cert.pem(), rogue_key.serialize_pem());
+        assert!(make_client(&rogue_identity)
+            .get(format!("{endpoint}/internal/active-range/pressure"))
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key",
+            )
+            .send()
+            .await
+            .is_err());
+        shutdown_tx.send(true).unwrap();
+        tls_task.await.unwrap().unwrap();
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn internal_range_transport_authenticates_before_decoding_requests() {
         let directory = TempDir::new().unwrap();
         let (app, control_plane, _, _) = internal_replica_test_router(&directory).await;
@@ -8185,7 +8355,7 @@ mod tests {
                 subscription_progress: None,
                 subscription_mtls_enabled: false,
                 storage_node_id: Some(node.clone()),
-                control_endpoints: endpoints.clone(),
+                control_endpoints: Arc::new(endpoints.clone().into()),
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,
@@ -8435,7 +8605,7 @@ mod tests {
                 )),
                 subscription_mtls_enabled: false,
                 storage_node_id: Some(node.clone()),
-                control_endpoints: endpoints.clone(),
+                control_endpoints: Arc::new(endpoints.clone().into()),
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,

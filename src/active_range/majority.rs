@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -352,14 +352,14 @@ impl MajorityAppendCoordinator {
 
 #[derive(Clone)]
 pub struct HttpReplicaTransport {
-    endpoints: Arc<BTreeMap<StorageNodeId, String>>,
+    endpoints: Arc<crate::internal_plane::InternalEndpoints>,
     key: String,
     http: reqwest::Client,
 }
 
 impl HttpReplicaTransport {
     pub fn new(
-        endpoints: BTreeMap<StorageNodeId, String>,
+        endpoints: impl Into<crate::internal_plane::InternalEndpoints>,
         key: String,
         timeout: Duration,
     ) -> Result<Self, ReplicaTransportError> {
@@ -374,12 +374,12 @@ impl HttpReplicaTransport {
     }
 
     pub fn with_client(
-        endpoints: BTreeMap<StorageNodeId, String>,
+        endpoints: impl Into<crate::internal_plane::InternalEndpoints>,
         key: String,
         http: reqwest::Client,
     ) -> Result<Self, ReplicaTransportError> {
         Ok(Self {
-            endpoints: Arc::new(endpoints),
+            endpoints: Arc::new(endpoints.into()),
             key,
             http,
         })
@@ -395,13 +395,14 @@ impl HttpReplicaTransport {
         Request: Serialize + Sync,
         Response: for<'de> Deserialize<'de>,
     {
-        let endpoint = self
-            .endpoints
-            .get(replica)
-            .ok_or_else(|| ReplicaTransportError {
-                message: format!("replica {replica} has no configured endpoint"),
-                retryable: false,
-            })?;
+        let endpoint =
+            self.endpoints
+                .resolve(replica)
+                .await
+                .ok_or_else(|| ReplicaTransportError {
+                    message: format!("replica {replica} has no configured endpoint"),
+                    retryable: false,
+                })?;
         let response = self
             .http
             .post(format!("{}{}", endpoint.trim_end_matches('/'), path))

@@ -1725,7 +1725,7 @@ pub trait SubscriptionProgressTransport: Send + Sync {
 
 pub struct HttpSubscriptionProgressTransport {
     assignment: SubscriptionProgressAssignment,
-    endpoints: BTreeMap<crate::active_range::StorageNodeId, String>,
+    endpoints: crate::internal_plane::InternalEndpoints,
     key: Option<String>,
     client: reqwest::Client,
 }
@@ -1733,13 +1733,13 @@ pub struct HttpSubscriptionProgressTransport {
 impl HttpSubscriptionProgressTransport {
     pub fn new(
         assignment: SubscriptionProgressAssignment,
-        endpoints: BTreeMap<crate::active_range::StorageNodeId, String>,
+        endpoints: impl Into<crate::internal_plane::InternalEndpoints>,
         key: String,
         timeout: Duration,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
             assignment,
-            endpoints,
+            endpoints: endpoints.into(),
             key: Some(key),
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(1))
@@ -1750,12 +1750,13 @@ impl HttpSubscriptionProgressTransport {
 
     pub fn new_mtls(
         assignment: SubscriptionProgressAssignment,
-        endpoints: BTreeMap<crate::active_range::StorageNodeId, String>,
+        endpoints: impl Into<crate::internal_plane::InternalEndpoints>,
         ca_pem: &[u8],
         identity_pem: &[u8],
         timeout: Duration,
     ) -> Result<Self, SubscriptionProgressError> {
-        for (node, endpoint) in &endpoints {
+        let endpoints = endpoints.into();
+        for (node, endpoint) in endpoints.configured() {
             let url = reqwest::Url::parse(endpoint)
                 .map_err(|_| SubscriptionProgressError::InvalidAssignment)?;
             if url.scheme() != "https" || url.host_str() != Some(node.as_str()) {
@@ -1794,7 +1795,8 @@ impl HttpSubscriptionProgressTransport {
         }
         let endpoint = self
             .endpoints
-            .get(node)
+            .resolve(node)
+            .await
             .ok_or(SubscriptionProgressError::Unavailable)?;
         let mut request = self
             .client

@@ -6,3 +6,5 @@
 .DS_Store
 Thumbs.db
 /.mtls-certs/
+/C:/
+/.cargo-home/

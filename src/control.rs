@@ -287,6 +287,10 @@ pub struct StorageNodeRecord {
     pub node: StorageNodeId,
     pub endpoint: String,
     pub registered_at_ns: i64,
+    /// blake3-256 certificate fingerprints (hex) this Node may present on
+    /// the internal mTLS plane; empty means no certificate is registered.
+    #[serde(default)]
+    pub cert_pins: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -623,6 +627,8 @@ pub enum Command {
     RegisterStorageNode {
         node: StorageNodeId,
         endpoint: String,
+        #[serde(default)]
+        cert_pins: BTreeSet<String>,
     },
     RetireStorageNode {
         node: StorageNodeId,
@@ -863,6 +869,40 @@ impl ControlController {
 
     pub async fn draining_storage_nodes(&self) -> BTreeSet<StorageNodeId> {
         self.state.lock().await.draining_storage_nodes.clone()
+    }
+
+    /// Endpoints of every independently registered storage Node.
+    pub async fn registered_storage_node_endpoints(&self) -> BTreeMap<StorageNodeId, String> {
+        self.state
+            .lock()
+            .await
+            .storage_nodes
+            .iter()
+            .map(|(node, record)| (node.clone(), record.endpoint.clone()))
+            .collect()
+    }
+
+    /// Internal endpoint for an independently registered storage Node.
+    /// Configured voter endpoints are resolved separately and take priority.
+    pub async fn storage_node_endpoint(&self, node: &StorageNodeId) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .storage_nodes
+            .get(node)
+            .map(|record| record.endpoint.clone())
+    }
+
+    /// Registered storage Node allowed to present the given certificate
+    /// fingerprint on the internal mTLS plane.
+    pub async fn storage_node_by_cert_pin(&self, fingerprint: &[u8; 32]) -> Option<StorageNodeId> {
+        let hex = blake3::Hash::from(*fingerprint).to_hex().to_string();
+        self.state
+            .lock()
+            .await
+            .storage_nodes
+            .values()
+            .find_map(|record| record.cert_pins.contains(&hex).then(|| record.node.clone()))
     }
 
     /// In-flight Active Range movement plans (follower replacements and owner
@@ -2138,18 +2178,48 @@ impl ControlController {
                     json!(next),
                 ))
             }
-            Command::RegisterStorageNode { node, endpoint } => {
+            Command::RegisterStorageNode {
+                node,
+                endpoint,
+                cert_pins,
+            } => {
+                let mut normalized_pins = BTreeSet::new();
+                for pin in &cert_pins {
+                    let lower = pin.to_ascii_lowercase();
+                    if lower.len() != 64 || !lower.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(ControlError::InvalidOperation(format!(
+                            "storage Node {node} certificate pin must be a 64-digit hex fingerprint"
+                        )));
+                    }
+                    normalized_pins.insert(lower);
+                }
+                // A certificate pin may belong to exactly one storage Node;
+                // without uniqueness the pinned-peer lookup could map one
+                // certificate to two identities.
+                for (other, record) in &state.storage_nodes {
+                    if *other == node {
+                        continue;
+                    }
+                    if let Some(pin) = record.cert_pins.intersection(&normalized_pins).next() {
+                        return Err(ControlError::InvalidOperation(format!(
+                            "storage Node {node} certificate pin {pin} is already registered to storage Node {other}"
+                        )));
+                    }
+                }
                 if let Some(existing) = state.storage_nodes.get(&node) {
                     if existing.endpoint != endpoint {
                         return Err(ControlError::InvalidOperation(format!(
                             "storage Node {node} is already registered with a different endpoint; retire it before re-registering"
                         )));
                     }
-                    let record = existing.clone();
-                    return Ok((
-                        format!("storage Node {node} is already registered"),
-                        json!(record),
-                    ));
+                    // Re-registration replaces the certificate pin set so a
+                    // Node can rotate certificates: register old and new pins
+                    // while the new certificate rolls out, then drop the old
+                    // pin once rotation completes.
+                    let mut record = existing.clone();
+                    record.cert_pins = normalized_pins;
+                    state.storage_nodes.insert(node.clone(), record.clone());
+                    return Ok((format!("re-registered storage Node {node}"), json!(record)));
                 }
                 if endpoint.trim().is_empty()
                     || !matches!(
@@ -2165,6 +2235,7 @@ impl ControlController {
                     node: node.clone(),
                     endpoint,
                     registered_at_ns: issued_at_ns,
+                    cert_pins: normalized_pins,
                 };
                 state.retired_storage_nodes.remove(&node);
                 state.storage_nodes.insert(node.clone(), record.clone());
@@ -3264,10 +3335,20 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             expect_keyword(&tokens, 1, "STORAGE")?;
             expect_keyword(&tokens, 2, "NODE")?;
             expect_keyword(&tokens, 4, "AT")?;
+            let mut cert_pins = BTreeSet::new();
+            if tokens.len() > 6 {
+                expect_keyword(&tokens, 6, "WITH")?;
+                expect_keyword(&tokens, 7, "CERT")?;
+                expect_keyword(&tokens, 8, "PIN")?;
+                for pin in token(&tokens, 9)?.split('|') {
+                    cert_pins.insert(pin.to_owned());
+                }
+            }
             Ok(Command::RegisterStorageNode {
                 node: StorageNodeId::try_new(token(&tokens, 3)?.to_owned())
                     .map_err(|error| ControlError::Syntax(error.to_string()))?,
                 endpoint: token(&tokens, 5)?.to_owned(),
+                cert_pins,
             })
         }
         Some("RETIRE") => {
@@ -3878,6 +3959,11 @@ fn show_resources(
                             .storage_nodes
                             .get(node)
                             .map(|record| record.endpoint.as_str()),
+                        "cert_pins": state
+                            .storage_nodes
+                            .get(node)
+                            .map(|record| record.cert_pins.iter().collect::<Vec<_>>())
+                            .unwrap_or_default(),
                         "source": if registered.contains(node) {
                             "registered"
                         } else {

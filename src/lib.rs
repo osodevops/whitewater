@@ -10,6 +10,7 @@ pub mod cursor;
 pub mod demand;
 pub mod domain;
 pub mod index;
+pub mod internal_plane;
 pub mod membership;
 pub mod reader;
 pub mod storage;

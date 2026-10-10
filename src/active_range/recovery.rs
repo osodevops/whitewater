@@ -327,14 +327,14 @@ impl RecoverySupervisor {
 
 #[derive(Clone)]
 pub struct HttpRecoveryTransport {
-    endpoints: Arc<BTreeMap<StorageNodeId, String>>,
+    endpoints: Arc<crate::internal_plane::InternalEndpoints>,
     key: String,
     http: reqwest::Client,
 }
 
 impl HttpRecoveryTransport {
     pub fn new(
-        endpoints: BTreeMap<StorageNodeId, String>,
+        endpoints: impl Into<crate::internal_plane::InternalEndpoints>,
         key: String,
         timeout: Duration,
     ) -> Result<Self, reqwest::Error> {
@@ -346,12 +346,12 @@ impl HttpRecoveryTransport {
     }
 
     pub fn with_client(
-        endpoints: BTreeMap<StorageNodeId, String>,
+        endpoints: impl Into<crate::internal_plane::InternalEndpoints>,
         key: String,
         http: reqwest::Client,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            endpoints: Arc::new(endpoints),
+            endpoints: Arc::new(endpoints.into()),
             key,
             http,
         })
@@ -369,7 +369,8 @@ impl HttpRecoveryTransport {
     {
         let endpoint = self
             .endpoints
-            .get(node)
+            .resolve(node)
+            .await
             .ok_or_else(|| format!("Node {node} has no endpoint"))?;
         self.http
             .post(format!("{}{}", endpoint.trim_end_matches('/'), path))

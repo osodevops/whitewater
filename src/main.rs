@@ -17,6 +17,7 @@ use finnstream::{
     control::ControlController,
     control_plane::ControlPlane,
     demand::DemandMetrics,
+    internal_plane::InternalEndpoints,
     membership::{MemberAnnouncement, MembershipService},
     reader::{
         FjallSubscriptionProgressReplica, SubscriptionPlacementAuthority,
@@ -71,7 +72,7 @@ async fn main() -> Result<()> {
             None => reqwest::Client::builder().timeout(timeout).build(),
         }
     };
-    let control_endpoints: BTreeMap<StorageNodeId, String> = match &config.subscription_mtls {
+    let configured_endpoints: BTreeMap<StorageNodeId, String> = match &config.subscription_mtls {
         Some(tls) => tls.peer_endpoints.clone(),
         None => config
             .control_nodes
@@ -82,6 +83,9 @@ async fn main() -> Result<()> {
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?,
     };
+    // Configured voter endpoints take priority; independently registered
+    // storage Nodes resolve through their replicated catalog record.
+    let control_endpoints = InternalEndpoints::new(configured_endpoints.clone(), control.clone());
     let control_plane = match (config.control_node_id, config.control_plane_key.clone()) {
         (Some(node_id), Some(key)) => {
             let peers = config
@@ -398,7 +402,7 @@ async fn main() -> Result<()> {
                         }
                         if control_plane.status().await.state == "leader" {
                             let mut totals = BTreeMap::new();
-                            for peer in peer_endpoints.values() {
+                            for peer in peer_endpoints.all().await.values() {
                                 let response = peer_client
                                     .get(format!("{}/internal/active-range/pressure", peer.trim_end_matches('/')))
                                     .header("x-whitewater-control-key", &internal_key)
@@ -460,9 +464,11 @@ async fn main() -> Result<()> {
         }))
     });
     let subscription_tls = match (&config.subscription_mtls, &replica_append) {
-        (Some(tls), Some(local)) => {
-            Some(SubscriptionTlsServer::from_config(tls, local.local_node()).await?)
-        }
+        (Some(tls), Some(local)) => Some(
+            SubscriptionTlsServer::from_config(tls, local.local_node())
+                .await?
+                .with_control(control.clone()),
+        ),
         (Some(_), None) => anyhow::bail!("Subscription mTLS requires a storage replica"),
         _ => None,
     };
@@ -485,7 +491,7 @@ async fn main() -> Result<()> {
         subscription_progress,
         subscription_mtls_enabled: config.subscription_mtls.is_some(),
         majority_append,
-        control_endpoints: Arc::new(control_endpoints),
+        control_endpoints: Arc::new(control_endpoints.clone()),
         internal_key: config.control_plane_key.clone(),
         internal_http: build_internal_client(Duration::from_secs(5))?,
         internal_mtls: internal_mtls.clone(),

@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -713,7 +713,7 @@ pub struct LocalRepairSupervisor {
     local_node: StorageNodeId,
     local: Arc<ReplicaAppendService>,
     control: Arc<ControlController>,
-    endpoints: Arc<BTreeMap<StorageNodeId, String>>,
+    endpoints: Arc<crate::internal_plane::InternalEndpoints>,
     key: String,
     http: reqwest::Client,
     batch_size: usize,
@@ -724,7 +724,7 @@ impl LocalRepairSupervisor {
         local_node: StorageNodeId,
         local: Arc<ReplicaAppendService>,
         control: Arc<ControlController>,
-        endpoints: BTreeMap<StorageNodeId, String>,
+        endpoints: impl Into<crate::internal_plane::InternalEndpoints>,
         key: String,
         timeout: Duration,
         batch_size: usize,
@@ -744,7 +744,7 @@ impl LocalRepairSupervisor {
         local_node: StorageNodeId,
         local: Arc<ReplicaAppendService>,
         control: Arc<ControlController>,
-        endpoints: BTreeMap<StorageNodeId, String>,
+        endpoints: impl Into<crate::internal_plane::InternalEndpoints>,
         key: String,
         http: reqwest::Client,
         batch_size: usize,
@@ -753,7 +753,7 @@ impl LocalRepairSupervisor {
             local_node,
             local,
             control,
-            endpoints: Arc::new(endpoints),
+            endpoints: Arc::new(endpoints.into()),
             key,
             http,
             batch_size: batch_size.clamp(1, 10_000),
@@ -919,7 +919,8 @@ impl LocalRepairSupervisor {
     {
         let endpoint = self
             .endpoints
-            .get(node)
+            .resolve(node)
+            .await
             .ok_or_else(|| format!("Node {node} has no endpoint"))?;
         self.http
             .post(format!("{}{}", endpoint.trim_end_matches('/'), path))
