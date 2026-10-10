@@ -375,6 +375,30 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/readers/ack", post(reader_ack))
         .route("/v1/readers/close", post(reader_close))
         .route("/v1/readers/temporary/fetch", post(temporary_reader_fetch))
+        .route(
+            "/v1/subscriptions/members/join",
+            post(subscription_member_join),
+        )
+        .route(
+            "/v1/subscriptions/members/claim",
+            post(subscription_member_claim),
+        )
+        .route(
+            "/v1/subscriptions/members/renew",
+            post(subscription_member_renew),
+        )
+        .route(
+            "/v1/subscriptions/members/release",
+            post(subscription_member_release),
+        )
+        .route(
+            "/v1/subscriptions/members/ack",
+            post(subscription_member_ack),
+        )
+        .route(
+            "/v1/subscriptions/members/state",
+            get(subscription_member_state),
+        )
         .route("/v1/feeds/records", get(read_feed_records))
         .route("/v1/admin/wcl", post(execute_admin_wcl))
         .route("/v1/admin/commands", post(execute_admin_commands))
@@ -799,6 +823,483 @@ fn check_subscription_peer(
         });
     }
     Ok(())
+}
+
+pub const SUBSCRIPTION_MEMBER_DEFAULT_LEASE_TICKS: u64 = 30;
+pub const SUBSCRIPTION_MEMBER_MAX_LEASE_TICKS: u64 = 600;
+
+#[derive(Deserialize)]
+struct SubscriptionMemberJoinRequest {
+    subscription: String,
+    request_id: Uuid,
+    member_id: Uuid,
+}
+
+#[derive(Deserialize)]
+struct SubscriptionMemberLeaseRequest {
+    subscription: String,
+    request_id: Uuid,
+    member_id: Uuid,
+    member_epoch: u64,
+    work_id: Uuid,
+    lease_ticks: Option<u64>,
+    lease_epoch: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct SubscriptionMemberReleaseRequest {
+    subscription: String,
+    request_id: Uuid,
+    member_id: Uuid,
+    member_epoch: u64,
+    work_id: Uuid,
+    lease_epoch: u64,
+}
+
+#[derive(Deserialize)]
+struct SubscriptionMemberAckRequest {
+    subscription: String,
+    request_id: Uuid,
+    member_id: Uuid,
+    member_epoch: u64,
+    work_id: Uuid,
+    lease_epoch: u64,
+    cursor: Option<String>,
+    positions: Option<BTreeMap<RangeId, String>>,
+}
+
+#[derive(Deserialize)]
+struct SubscriptionMemberStateQuery {
+    subscription: String,
+}
+
+#[derive(Serialize)]
+struct SubscriptionMemberResponse {
+    subscription: String,
+    member_epoch: Option<u64>,
+    tick: u64,
+    ownership_epoch: u64,
+    lease: Option<crate::reader::SubscriptionWorkLease>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    member_epochs: BTreeMap<Uuid, u64>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    leases: BTreeMap<Uuid, crate::reader::SubscriptionWorkLease>,
+}
+
+async fn member_coordinator(
+    state: &AppState,
+    subscription: &str,
+) -> Result<
+    (
+        crate::reader::SubscriptionProgressCoordinator,
+        crate::reader::SubscriptionProgressAssignment,
+        crate::control::SubscriptionDefinition,
+    ),
+    ApiError,
+> {
+    let definition = state
+        .control
+        .active_subscription_by_name(subscription)
+        .await
+        .ok_or_else(|| ApiError::bad_request("Subscription does not exist or is not active"))?;
+    let assignment = state
+        .control
+        .active_subscription_progress_assignment_by_id(definition.subscription_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Subscription progress placement is unavailable"))?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("internal credential is not configured"))?;
+    let transport = crate::reader::HttpSubscriptionProgressTransport::new(
+        assignment.clone(),
+        state.control_endpoints.as_ref().clone(),
+        key.clone(),
+        Duration::from_secs(5),
+    )
+    .map_err(|_| ApiError::unavailable("Subscription progress transport failed to build"))?;
+    Ok((
+        crate::reader::SubscriptionProgressCoordinator::new(
+            assignment.clone(),
+            std::sync::Arc::new(transport),
+        ),
+        assignment,
+        definition,
+    ))
+}
+
+fn member_lease_ticks(requested: Option<u64>) -> Result<u64, ApiError> {
+    let ticks = requested.unwrap_or(SUBSCRIPTION_MEMBER_DEFAULT_LEASE_TICKS);
+    if ticks == 0 || ticks > SUBSCRIPTION_MEMBER_MAX_LEASE_TICKS {
+        return Err(ApiError::bad_request(
+            "lease_ticks exceeds the bounded Subscription member lease duration",
+        ));
+    }
+    Ok(ticks)
+}
+
+fn member_response(
+    subscription: String,
+    ownership_epoch: u64,
+    member_state: crate::reader::SubscriptionMemberState,
+) -> SubscriptionMemberResponse {
+    SubscriptionMemberResponse {
+        subscription,
+        member_epoch: None,
+        tick: member_state.last_tick,
+        ownership_epoch,
+        lease: None,
+        member_epochs: member_state.member_epochs,
+        leases: member_state.leases,
+    }
+}
+
+async fn read_member_state(
+    coordinator: &crate::reader::SubscriptionProgressCoordinator,
+) -> Result<crate::reader::SubscriptionMemberState, ApiError> {
+    coordinator
+        .member_state()
+        .await
+        .map_err(subscription_progress_api_error)
+}
+
+/// Committed request replay: returns the recorded member state when the latest
+/// mutation already carries `request_id` and `lease_ops` match; conflicts when
+/// the request identity was reused with different operations.
+async fn member_replayed(
+    coordinator: &crate::reader::SubscriptionProgressCoordinator,
+    request_id: Uuid,
+    lease_ops: &[crate::reader::SubscriptionLeaseOp],
+) -> Result<Option<crate::reader::SubscriptionMemberState>, ApiError> {
+    let Some(latest) = coordinator
+        .read_committed()
+        .await
+        .map_err(subscription_progress_api_error)?
+    else {
+        return Ok(None);
+    };
+    if latest.request_id != request_id {
+        return Ok(None);
+    }
+    if latest.lease_ops != lease_ops {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: "request_id was already used with different Subscription member operations"
+                .to_string(),
+        });
+    }
+    Ok(Some(read_member_state(coordinator).await?))
+}
+
+/// Applies member ops with request-identity dedup: a retry of a committed
+/// request returns the recorded outcome rather than a second mutation.
+async fn member_apply(
+    coordinator: &crate::reader::SubscriptionProgressCoordinator,
+    request_id: Uuid,
+    lease_ops: Vec<crate::reader::SubscriptionLeaseOp>,
+) -> Result<crate::reader::SubscriptionMemberState, ApiError> {
+    if let Some(state) = member_replayed(coordinator, request_id, &lease_ops).await? {
+        return Ok(state);
+    }
+    let tick = read_member_state(coordinator)
+        .await?
+        .last_tick
+        .saturating_add(1);
+    coordinator
+        .apply_member_ops(request_id, tick, lease_ops)
+        .await
+        .map_err(subscription_progress_api_error)?;
+    read_member_state(coordinator).await
+}
+
+async fn subscription_member_join(
+    State(state): State<AppState>,
+    Json(request): Json<SubscriptionMemberJoinRequest>,
+) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
+    let (coordinator, assignment, definition) =
+        member_coordinator(&state, &request.subscription).await?;
+    let replayed = coordinator
+        .read_committed()
+        .await
+        .map_err(subscription_progress_api_error)?
+        .filter(|latest| latest.request_id == request.request_id);
+    let member_state = if let Some(latest) = replayed {
+        let joined = latest.lease_ops.iter().any(|op| {
+            matches!(
+                op,
+                crate::reader::SubscriptionLeaseOp::Join { member_id, .. }
+                    if *member_id == request.member_id
+            )
+        });
+        if !joined {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message:
+                    "request_id was already used with different Subscription member operations"
+                        .to_string(),
+            });
+        }
+        read_member_state(&coordinator).await?
+    } else if coordinator
+        .read_committed()
+        .await
+        .map_err(subscription_progress_api_error)?
+        .is_some()
+    {
+        // An established frontier already exists: the Join rides the next
+        // sequence under the current cursor boundary.
+        let prior = read_member_state(&coordinator).await?;
+        let member_epoch = prior
+            .member_epochs
+            .get(&request.member_id)
+            .copied()
+            .map_or(1, |epoch| epoch.saturating_add(1));
+        coordinator
+            .apply_member_ops(
+                request.request_id,
+                prior.last_tick.saturating_add(1),
+                vec![crate::reader::SubscriptionLeaseOp::Join {
+                    member_id: request.member_id,
+                    member_epoch,
+                }],
+            )
+            .await
+            .map_err(subscription_progress_api_error)?;
+        read_member_state(&coordinator).await?
+    } else {
+        // First member: establish the declared-start frontier and the Join
+        // lease transition in one atomic sequence-1 quorum mutation.
+        if !matches!(definition.start, crate::control::ReaderStart::Beginning) {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "Subscription member sessions currently bootstrap a beginning frontier only; explicit-Cursor, now, and timestamp starts need fetch-time position resolution"
+                    .to_owned(),
+            });
+        }
+        let positions: BTreeMap<RangeId, String> = state
+            .control
+            .active_range_assignments_for_feed(definition.feed_id)
+            .await
+            .iter()
+            .map(|assignment| (assignment.range_id, String::new()))
+            .collect();
+        if positions.is_empty() {
+            return Err(ApiError::unavailable(
+                "Subscription source Feed has no Active Range placement",
+            ));
+        }
+        coordinator
+            .apply(crate::reader::SubscriptionProgressMutation {
+                subscription_id: assignment.subscription_id,
+                feed_id: definition.feed_id,
+                ownership_epoch: assignment.ownership_epoch,
+                sequence: 1,
+                request_id: request.request_id,
+                expected_cursor: None,
+                cursor: "beginning".to_owned(),
+                positions,
+                tick: 1,
+                lease_ops: vec![crate::reader::SubscriptionLeaseOp::Join {
+                    member_id: request.member_id,
+                    member_epoch: 1,
+                }],
+            })
+            .await
+            .map_err(subscription_progress_api_error)?;
+        read_member_state(&coordinator).await?
+    };
+    let mut response = member_response(
+        request.subscription,
+        assignment.ownership_epoch,
+        member_state,
+    );
+    response.member_epoch = response.member_epochs.get(&request.member_id).copied();
+    Ok(Json(response))
+}
+
+async fn subscription_member_claim(
+    State(state): State<AppState>,
+    Json(request): Json<SubscriptionMemberLeaseRequest>,
+) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
+    let lease_ticks = member_lease_ticks(request.lease_ticks)?;
+    let (coordinator, assignment, _definition) =
+        member_coordinator(&state, &request.subscription).await?;
+    let member_state = member_apply(
+        &coordinator,
+        request.request_id,
+        vec![crate::reader::SubscriptionLeaseOp::Claim {
+            work_id: request.work_id,
+            member_id: request.member_id,
+            member_epoch: request.member_epoch,
+            lease_ticks,
+        }],
+    )
+    .await?;
+    let mut response = member_response(
+        request.subscription,
+        assignment.ownership_epoch,
+        member_state,
+    );
+    response.member_epoch = Some(request.member_epoch);
+    response.lease = response.leases.get(&request.work_id).cloned();
+    Ok(Json(response))
+}
+
+async fn subscription_member_renew(
+    State(state): State<AppState>,
+    Json(request): Json<SubscriptionMemberLeaseRequest>,
+) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
+    let lease_ticks = member_lease_ticks(request.lease_ticks)?;
+    let lease_epoch = request.lease_epoch.ok_or_else(|| {
+        ApiError::bad_request("lease_epoch is required to renew a Subscription member lease")
+    })?;
+    let (coordinator, assignment, _definition) =
+        member_coordinator(&state, &request.subscription).await?;
+    let member_state = member_apply(
+        &coordinator,
+        request.request_id,
+        vec![crate::reader::SubscriptionLeaseOp::Renew {
+            work_id: request.work_id,
+            member_id: request.member_id,
+            member_epoch: request.member_epoch,
+            lease_epoch,
+            lease_ticks,
+        }],
+    )
+    .await?;
+    let mut response = member_response(
+        request.subscription,
+        assignment.ownership_epoch,
+        member_state,
+    );
+    response.member_epoch = Some(request.member_epoch);
+    response.lease = response.leases.get(&request.work_id).cloned();
+    Ok(Json(response))
+}
+
+async fn subscription_member_release(
+    State(state): State<AppState>,
+    Json(request): Json<SubscriptionMemberReleaseRequest>,
+) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
+    let (coordinator, assignment, _definition) =
+        member_coordinator(&state, &request.subscription).await?;
+    let member_state = member_apply(
+        &coordinator,
+        request.request_id,
+        vec![crate::reader::SubscriptionLeaseOp::Release {
+            work_id: request.work_id,
+            member_id: request.member_id,
+            member_epoch: request.member_epoch,
+            lease_epoch: request.lease_epoch,
+        }],
+    )
+    .await?;
+    let mut response = member_response(
+        request.subscription,
+        assignment.ownership_epoch,
+        member_state,
+    );
+    response.member_epoch = Some(request.member_epoch);
+    Ok(Json(response))
+}
+
+async fn subscription_member_ack(
+    State(state): State<AppState>,
+    Json(request): Json<SubscriptionMemberAckRequest>,
+) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
+    let (coordinator, assignment, _definition) =
+        member_coordinator(&state, &request.subscription).await?;
+    match (request.cursor, request.positions) {
+        (Some(cursor), Some(positions)) => {
+            if cursor.is_empty() || positions.is_empty() {
+                return Err(ApiError::bad_request(
+                    "Subscription acknowledgement requires a non-empty Cursor and progress positions",
+                ));
+            }
+            if let Some(latest) = coordinator
+                .read_committed()
+                .await
+                .map_err(subscription_progress_api_error)?
+                .filter(|latest| latest.request_id == request.request_id)
+            {
+                if latest.cursor != cursor || latest.positions != positions {
+                    return Err(ApiError {
+                        status: StatusCode::CONFLICT,
+                        message: "request_id was already used with a different Subscription acknowledgement"
+                            .to_string(),
+                    });
+                }
+                let member_state = read_member_state(&coordinator).await?;
+                let mut response = member_response(
+                    request.subscription,
+                    assignment.ownership_epoch,
+                    member_state,
+                );
+                response.member_epoch = Some(request.member_epoch);
+                return Ok(Json(response));
+            }
+            let grant = crate::reader::SubscriptionWorkLease {
+                work_id: request.work_id,
+                member_id: request.member_id,
+                member_epoch: request.member_epoch,
+                lease_epoch: request.lease_epoch,
+                expires_at_tick: 0,
+            };
+            let tick = read_member_state(&coordinator)
+                .await?
+                .last_tick
+                .saturating_add(1);
+            coordinator
+                .acknowledge(&grant, tick, request.request_id, cursor, positions)
+                .await
+                .map_err(subscription_progress_api_error)?;
+            let member_state = read_member_state(&coordinator).await?;
+            let mut response = member_response(
+                request.subscription,
+                assignment.ownership_epoch,
+                member_state,
+            );
+            response.member_epoch = Some(request.member_epoch);
+            Ok(Json(response))
+        }
+        (None, None) => {
+            let member_state = member_apply(
+                &coordinator,
+                request.request_id,
+                vec![crate::reader::SubscriptionLeaseOp::Release {
+                    work_id: request.work_id,
+                    member_id: request.member_id,
+                    member_epoch: request.member_epoch,
+                    lease_epoch: request.lease_epoch,
+                }],
+            )
+            .await?;
+            let mut response = member_response(
+                request.subscription,
+                assignment.ownership_epoch,
+                member_state,
+            );
+            response.member_epoch = Some(request.member_epoch);
+            Ok(Json(response))
+        }
+        _ => Err(ApiError::bad_request(
+            "cursor and positions must be supplied together for a Subscription acknowledgement",
+        )),
+    }
+}
+
+async fn subscription_member_state(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<SubscriptionMemberStateQuery>,
+) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
+    let (coordinator, assignment, _definition) =
+        member_coordinator(&state, &query.subscription).await?;
+    let member_state = read_member_state(&coordinator).await?;
+    Ok(Json(member_response(
+        query.subscription,
+        assignment.ownership_epoch,
+        member_state,
+    )))
 }
 
 fn subscription_progress_api_error(error: SubscriptionProgressError) -> ApiError {
@@ -7126,6 +7627,436 @@ mod tests {
         let (status, body) = read_feed("orders.blobs", Some("cursor-2"), 10).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(cursors_of(&body), vec!["cursor-3", "cursor-4"]);
+
+        for handle in handles {
+            handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn subscription_member_endpoints_fence_and_apply_through_quorum() {
+        let directory = TempDir::new().unwrap();
+        let log_store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                log_store.clone(),
+                ["storage-1", "storage-2", "storage-3"]
+                    .into_iter()
+                    .map(|node| StorageNodeId::try_new(node).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        control
+            .execute_commands(vec![
+                Command::CreateSpace {
+                    name: "orders".to_owned(),
+                },
+                Command::CreateFeed {
+                    name: "orders.events".to_owned(),
+                },
+                Command::CreateSubscription {
+                    name: "orders.billing".to_owned(),
+                    feed: "orders.events".to_owned(),
+                    start: crate::control::ReaderStart::Beginning,
+                },
+                Command::CreateSubscription {
+                    name: "orders.fresh".to_owned(),
+                    feed: "orders.events".to_owned(),
+                    start: crate::control::ReaderStart::Beginning,
+                },
+            ])
+            .await
+            .unwrap();
+        let definition = control
+            .active_subscription_by_name("orders.billing")
+            .await
+            .unwrap();
+        let assignment = control
+            .active_subscription_progress_assignment_by_id(definition.subscription_id)
+            .await
+            .unwrap();
+        let nodes: Vec<StorageNodeId> = ["storage-1", "storage-2", "storage-3"]
+            .into_iter()
+            .map(|node| StorageNodeId::try_new(node).unwrap())
+            .collect();
+        let control_key = "this-is-a-long-control-plane-key".to_owned();
+        let peers: BTreeMap<u64, BasicNode> = [1_u64, 2, 3]
+            .into_iter()
+            .map(|node| (node, BasicNode::new(format!("127.0.0.1:{}", 9_800 + node))))
+            .collect();
+        let mut listeners = Vec::new();
+        let mut endpoints = BTreeMap::new();
+        for node in &nodes {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            endpoints.insert(
+                node.clone(),
+                format!("http://{}", listener.local_addr().unwrap()),
+            );
+            listeners.push(listener);
+        }
+        let endpoints = Arc::new(endpoints);
+        let mut handles = Vec::new();
+        let mut listeners = listeners.into_iter();
+        for (index, node) in nodes.iter().enumerate() {
+            let listener = listeners.next().unwrap();
+            let replica = Arc::new(
+                crate::reader::FjallSubscriptionProgressReplica::open(
+                    directory.path().join(format!("progress-{index}")),
+                )
+                .unwrap(),
+            );
+            let plane = Arc::new(
+                ControlPlane::start(
+                    index as u64 + 1,
+                    peers.clone(),
+                    control_key.clone(),
+                    directory.path().join(format!("raft-member-{index}.json")),
+                    control.clone(),
+                )
+                .await
+                .unwrap(),
+            );
+            let membership = Arc::new(MembershipService::new(
+                MemberAnnouncement {
+                    node_id: format!("test-node-{index}"),
+                    api_url: "http://test-node:7070".to_owned(),
+                    capacity: 100,
+                },
+                vec![],
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            ));
+            let state = AppState {
+                store: log_store.clone(),
+                membership,
+                demand: DemandMetrics::default(),
+                autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                replica_append: None,
+                control: control.clone(),
+                control_plane: Some(plane),
+                majority_append: None,
+                subscription_progress: Some(Arc::new(
+                    crate::reader::SubscriptionProgressReplicaService::new(
+                        node.clone(),
+                        control.clone(),
+                        replica,
+                    ),
+                )),
+                subscription_mtls_enabled: false,
+                storage_node_id: Some(node.clone()),
+                control_endpoints: endpoints.clone(),
+                internal_key: Some(control_key.clone()),
+                internal_http: reqwest::Client::new(),
+                admin_auth: AdminAuthenticator::new(Some(
+                    "this-is-a-long-development-api-key".to_owned(),
+                ))
+                .unwrap(),
+            };
+            handles.push(tokio::spawn(async move {
+                axum::serve(listener, router(state)).await.unwrap();
+            }));
+        }
+
+        // Seed the committed frontier through the same quorum path the
+        // member endpoints rely on.
+        let seed_transport = crate::reader::HttpSubscriptionProgressTransport::new(
+            assignment.clone(),
+            endpoints.as_ref().clone(),
+            control_key.clone(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let coordinator = crate::reader::SubscriptionProgressCoordinator::new(
+            assignment.clone(),
+            Arc::new(seed_transport),
+        );
+        let progress_range = RangeId::from_uuid(Uuid::from_u128(0xbeef));
+        coordinator
+            .apply(crate::reader::SubscriptionProgressMutation {
+                subscription_id: assignment.subscription_id,
+                feed_id: definition.feed_id,
+                ownership_epoch: assignment.ownership_epoch,
+                sequence: 1,
+                request_id: Uuid::from_u128(0x9001),
+                expected_cursor: None,
+                cursor: "cursor-0".to_owned(),
+                positions: BTreeMap::from([(progress_range, "position-0".to_owned())]),
+                tick: 0,
+                lease_ops: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let client = reqwest::Client::new();
+        let base = format!("{}/v1/subscriptions/members", endpoints[&nodes[0]]);
+        let post = |path: &str, body: Value| {
+            let client = client.clone();
+            let url = format!("{base}/{path}");
+            async move {
+                let response = client.post(url).json(&body).send().await.unwrap();
+                let status = response.status();
+                let body: Value = response.json().await.unwrap_or_default();
+                (status, body)
+            }
+        };
+        let member = Uuid::from_u128(0x1111);
+        let work = Uuid::from_u128(0x2222);
+
+        // Unknown Subscription is rejected before placement work begins.
+        let (status, _) = post(
+            "join",
+            json!({"subscription": "orders.missing", "request_id": Uuid::from_u128(1),
+                "member_id": member}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Join assigns the first member epoch through the committed quorum.
+        let (status, body) = post(
+            "join",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(2),
+                "member_id": member}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["member_epoch"], json!(1));
+        let join_replay = post(
+            "join",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(2),
+                "member_id": member}),
+        )
+        .await;
+        assert_eq!(join_replay.0, StatusCode::OK);
+        assert_eq!(join_replay.1["member_epoch"], json!(1));
+
+        // A fresh join request fences the earlier epoch.
+        let (status, body) = post(
+            "join",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(3),
+                "member_id": member}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["member_epoch"], json!(2));
+
+        // Reusing a request identity for a different operation conflicts.
+        let (status, _) = post(
+            "claim",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(3),
+                "member_id": member, "member_epoch": 2, "work_id": work}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // The fenced member epoch cannot claim work.
+        let (status, _) = post(
+            "claim",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(4),
+                "member_id": member, "member_epoch": 1, "work_id": work}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // Out-of-bounds lease durations are rejected at the edge.
+        let (status, _) = post(
+            "claim",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(5),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_ticks": SUBSCRIPTION_MEMBER_MAX_LEASE_TICKS + 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // The live member claims bounded work.
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(5),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_ticks": 60}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let lease = body["lease"].clone();
+        assert_eq!(lease["work_id"], json!(work));
+        assert_eq!(lease["member_epoch"], json!(2));
+        assert_eq!(lease["lease_epoch"], json!(1));
+        assert_eq!(
+            lease["expires_at_tick"].as_u64().unwrap(),
+            body["tick"].as_u64().unwrap() + 60
+        );
+        let claim_replay = post(
+            "claim",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(5),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_ticks": 60}),
+        )
+        .await;
+        assert_eq!(claim_replay.0, StatusCode::OK);
+        assert_eq!(claim_replay.1["lease"], lease);
+
+        // Renew advances the expiry and bumps the lease epoch.
+        let (status, body) = post(
+            "renew",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(6),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_epoch": 1, "lease_ticks": 90}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let renewed = body["lease"].clone();
+        assert_eq!(renewed["lease_epoch"], json!(1));
+        assert!(
+            renewed["expires_at_tick"].as_u64().unwrap()
+                > lease["expires_at_tick"].as_u64().unwrap()
+        );
+
+        // A stale lease epoch cannot renew or acknowledge.
+        let (status, _) = post(
+            "renew",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(7),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_epoch": 7, "lease_ticks": 30}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = post(
+            "ack",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(8),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_epoch": 7, "cursor": "cursor-9",
+                "positions": {progress_range.to_string(): "position-9"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // cursor and positions must travel together.
+        let (status, _) = post(
+            "ack",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(9),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_epoch": 1, "cursor": "cursor-9"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A valid grant acknowledges progress and releases the lease atomically.
+        let (status, body) = post(
+            "ack",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(9),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_epoch": 1, "cursor": "cursor-9",
+                "positions": {progress_range.to_string(): "position-9"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["leases"]
+            .as_object()
+            .is_none_or(|leases| leases.is_empty()));
+        assert_eq!(
+            coordinator.read_committed().await.unwrap().unwrap().cursor,
+            "cursor-9"
+        );
+        // The committed acknowledgement replays its recorded outcome.
+        let (status, body) = post(
+            "ack",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(9),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_epoch": 1, "cursor": "cursor-9",
+                "positions": {progress_range.to_string(): "position-9"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body["leases"]
+            .as_object()
+            .is_none_or(|leases| leases.is_empty()));
+        // Reusing the acknowledgement identity with a different Cursor conflicts.
+        let (status, _) = post(
+            "ack",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(9),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_epoch": 1, "cursor": "cursor-10",
+                "positions": {progress_range.to_string(): "position-9"}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        // Member state reflects the fenced epochs and empty lease set.
+        let response = client
+            .get(format!("{base}/state"))
+            .query(&[("subscription", "orders.billing")])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["member_epochs"][member.to_string()], json!(2));
+        assert!(body["leases"]
+            .as_object()
+            .is_none_or(|leases| leases.is_empty()));
+
+        // A new claim after the release is issued a fresh lease epoch.
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(10),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_ticks": 30}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["lease"]["lease_epoch"], json!(1));
+
+        // A Subscription with no committed frontier bootstraps its declared
+        // start atomically with the first member join.
+        let (status, body) = post(
+            "join",
+            json!({"subscription": "orders.fresh", "request_id": Uuid::from_u128(20),
+                "member_id": member}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["member_epoch"], json!(1));
+        let fresh_assignment = control
+            .active_subscription_progress_assignment_by_id(
+                control
+                    .active_subscription_by_name("orders.fresh")
+                    .await
+                    .unwrap()
+                    .subscription_id,
+            )
+            .await
+            .unwrap();
+        let fresh_transport = crate::reader::HttpSubscriptionProgressTransport::new(
+            fresh_assignment.clone(),
+            endpoints.as_ref().clone(),
+            control_key.clone(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let fresh_coordinator = crate::reader::SubscriptionProgressCoordinator::new(
+            fresh_assignment,
+            Arc::new(fresh_transport),
+        );
+        let frontier = fresh_coordinator.read_committed().await.unwrap().unwrap();
+        assert_eq!(frontier.sequence, 1);
+        assert_eq!(frontier.cursor, "beginning");
+        assert!(!frontier.positions.is_empty());
+        assert!(frontier.positions.values().all(|value| value.is_empty()));
+        assert!(frontier.lease_ops.iter().any(|op| matches!(
+            op,
+            crate::reader::SubscriptionLeaseOp::Join { member_id, member_epoch }
+                if *member_id == member && *member_epoch == 1
+        )));
+        // Members can claim work on the bootstrapped frontier.
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.fresh", "request_id": Uuid::from_u128(21),
+                "member_id": member, "member_epoch": 1, "work_id": work}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
 
         for handle in handles {
             handle.abort();
