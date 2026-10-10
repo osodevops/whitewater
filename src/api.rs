@@ -78,6 +78,7 @@ pub struct AppState {
     pub autoscaler: Arc<Mutex<AutoscaleController>>,
     pub control: Arc<ControlController>,
     pub control_plane: Option<Arc<ControlPlane>>,
+    pub progress_authority: Arc<dyn crate::reader::SubscriptionPlacementAuthority>,
     pub replica_append: Option<Arc<ReplicaAppendService>>,
     pub subscription_progress: Option<Arc<SubscriptionProgressReplicaService>>,
     pub subscription_mtls_enabled: bool,
@@ -640,6 +641,8 @@ fn require_control_plane(state: &AppState) -> Result<&Arc<ControlPlane>, ApiErro
     state.control_plane.as_ref().ok_or_else(|| ApiError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         message: "Control Plane is not configured on this Node".to_owned(),
+
+        code: None,
     })
 }
 
@@ -655,6 +658,8 @@ fn authorize_internal<'a>(
         return Err(ApiError {
             status: StatusCode::UNAUTHORIZED,
             message: "invalid Control Plane credential".to_owned(),
+
+            code: None,
         });
     }
     Ok(control_plane)
@@ -782,6 +787,8 @@ async fn replica_append(
     let service = state.replica_append.as_ref().ok_or_else(|| ApiError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         message: "Active Range replica storage is not configured on this Node".to_owned(),
+
+        code: None,
     })?;
     Ok(Json(match service.append(request).await {
         Ok(result) => ReplicaAppendResponse {
@@ -802,6 +809,8 @@ async fn replica_commit(
     let service = state.replica_append.as_ref().ok_or_else(|| ApiError {
         status: StatusCode::SERVICE_UNAVAILABLE,
         message: "Active Range replica storage is not configured on this Node".to_owned(),
+
+        code: None,
     })?;
     Ok(Json(match service.commit(request).await {
         Ok(result) => ReplicaCommitResponse {
@@ -824,6 +833,8 @@ fn check_subscription_peer(
         return Err(ApiError {
             status: StatusCode::UNAUTHORIZED,
             message: "Subscription progress requires the assigned owner's mTLS identity".to_owned(),
+
+            code: None,
         });
     }
     Ok(())
@@ -911,6 +922,20 @@ async fn member_coordinator(
         .active_subscription_progress_assignment_by_id(definition.subscription_id)
         .await
         .ok_or_else(|| ApiError::unavailable("Subscription progress placement is unavailable"))?;
+    let (coordinator, assignment) = member_assignment_coordinator(state, assignment)?;
+    Ok((coordinator, assignment, definition))
+}
+
+fn member_assignment_coordinator(
+    state: &AppState,
+    assignment: crate::reader::SubscriptionProgressAssignment,
+) -> Result<
+    (
+        crate::reader::SubscriptionProgressCoordinator,
+        crate::reader::SubscriptionProgressAssignment,
+    ),
+    ApiError,
+> {
     let key = state
         .internal_key
         .as_ref()
@@ -928,7 +953,6 @@ async fn member_coordinator(
             std::sync::Arc::new(transport),
         ),
         assignment,
-        definition,
     ))
 }
 
@@ -944,14 +968,79 @@ async fn member_coordinator_recovering(
     ApiError,
 > {
     let (coordinator, assignment, definition) = member_coordinator(state, subscription).await?;
-    if coordinator.owner_available().await {
-        return Ok((coordinator, assignment, definition));
+    let evidence = match coordinator.inspect_evidence().await {
+        Ok(evidence) => evidence,
+        Err(SubscriptionProgressError::NoQuorum) => {
+            return member_coordinator_recovered(state, &coordinator, definition).await;
+        }
+        Err(error) => return Err(subscription_progress_api_error(error)),
+    };
+    if !evidence.iter().any(|(node, _)| node == &assignment.owner)
+        || subscription_placement_diverged(&evidence)
+    {
+        // The owner is unreachable, or reachable replicas hold divergent
+        // committed/member state. Recovery advances the ownership epoch
+        // (possibly keeping the same owner) and adopts the recovered
+        // frontier under the new epoch, which heals lagging replicas.
+        return member_coordinator_recovered(state, &coordinator, definition).await;
     }
-    coordinator
-        .recover_lost_owner(state.control.as_ref())
-        .await
-        .map_err(subscription_progress_api_error)?;
-    member_coordinator(state, subscription).await
+    Ok((coordinator, assignment, definition))
+}
+
+/// True when reachable replicas hold divergent committed progress or member
+/// state: recovery must advance the ownership epoch and adopt the recovered
+/// frontier so lagging replicas heal before further mutations.
+fn subscription_placement_diverged(
+    evidence: &[(
+        crate::active_range::StorageNodeId,
+        crate::reader::SubscriptionProgressInspection,
+    )],
+) -> bool {
+    let mut states = evidence
+        .iter()
+        .map(|(_, inspection)| (&inspection.committed, &inspection.members));
+    match states.next() {
+        None => false,
+        Some(first) => states.any(|state| state != first),
+    }
+}
+
+async fn member_coordinator_recovered(
+    state: &AppState,
+    coordinator: &crate::reader::SubscriptionProgressCoordinator,
+    definition: crate::control::SubscriptionDefinition,
+) -> Result<
+    (
+        crate::reader::SubscriptionProgressCoordinator,
+        crate::reader::SubscriptionProgressAssignment,
+        crate::control::SubscriptionDefinition,
+    ),
+    ApiError,
+> {
+    // The ownership CAS must replicate through the placement authority (the
+    // Control Plane when configured); a local-catalog write would strand the
+    // new epoch on the serving Node only. While a killed voter leaves the
+    // Control Plane briefly leaderless the authority reports Unavailable:
+    // retrying is safe because every attempt re-inspects replica evidence
+    // and re-derives the CAS expected epoch, so a CAS that already landed
+    // converges through adoption instead of guessing.
+    let mut result = Err(SubscriptionProgressError::Unavailable);
+    for attempt in 0..6 {
+        result = coordinator
+            .recover_lost_owner(state.progress_authority.as_ref())
+            .await;
+        let retryable = matches!(
+            result,
+            Err(SubscriptionProgressError::Unavailable) | Err(SubscriptionProgressError::NoQuorum)
+        );
+        if !retryable || attempt == 5 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    }
+    let outcome = result.map_err(subscription_progress_api_error)?;
+    let (coordinator, assignment) = member_assignment_coordinator(state, outcome.assignment)?;
+    Ok((coordinator, assignment, definition))
 }
 
 fn member_lease_ticks(requested: Option<u64>) -> Result<u64, ApiError> {
@@ -1012,6 +1101,8 @@ async fn member_replayed(
             status: StatusCode::CONFLICT,
             message: "request_id was already used with different Subscription member operations"
                 .to_string(),
+
+            code: None,
         });
     }
     Ok(Some(read_member_state(coordinator).await?))
@@ -1063,6 +1154,8 @@ async fn subscription_member_join(
                 message:
                     "request_id was already used with different Subscription member operations"
                         .to_string(),
+
+                code: None,
             });
         }
         read_member_state(&coordinator).await?
@@ -1163,7 +1256,9 @@ async fn subscription_member_join(
                     status: StatusCode::CONFLICT,
                     message: "Subscription member sessions support beginning and now starts; explicit-Cursor and timestamp starts need merged-order position resolution"
                         .to_owned(),
-                })
+
+                    code: None,
+})
             }
         };
         coordinator
@@ -1305,7 +1400,9 @@ async fn subscription_member_ack(
                         status: StatusCode::CONFLICT,
                         message: "request_id was already used with a different Subscription acknowledgement"
                             .to_string(),
-                    });
+
+                        code: None,
+});
                 }
                 let member_state = read_member_state(&coordinator).await?;
                 let mut response = member_response(
@@ -1419,6 +1516,8 @@ async fn subscription_member_fetch(
         return Err(ApiError {
             status: StatusCode::CONFLICT,
             message: "Subscription work lease is stale, expired, or fenced".to_owned(),
+
+            code: None,
         });
     }
     let frontier = coordinator
@@ -1440,7 +1539,9 @@ async fn subscription_member_fetch(
                 message:
                     "Subscription frontier does not cover a current Active Range; reconcile progress"
                         .to_owned(),
-            });
+
+                code: None,
+});
         };
         let mut stream = RangeFrameStream::new(&state, range_assignment);
         if !position.is_empty() {
@@ -1453,6 +1554,8 @@ async fn subscription_member_fetch(
             status: StatusCode::CONFLICT,
             message: "Subscription frontier predates an Active Range change; reconcile progress"
                 .to_owned(),
+
+            code: None,
         });
     }
 
@@ -1533,6 +1636,7 @@ async fn subscription_member_state(
 }
 
 fn subscription_progress_api_error(error: SubscriptionProgressError) -> ApiError {
+    let code = error.code();
     let status = match error {
         SubscriptionProgressError::Unavailable
         | SubscriptionProgressError::AmbiguousCommit
@@ -1543,6 +1647,7 @@ fn subscription_progress_api_error(error: SubscriptionProgressError) -> ApiError
     ApiError {
         status,
         message: error.to_string(),
+        code: Some(code),
     }
 }
 
@@ -4346,6 +4451,8 @@ async fn client_append(
         message: response
             .error
             .unwrap_or_else(|| "Append Owner returned no result".to_owned()),
+
+        code: None,
     })
 }
 
@@ -4518,6 +4625,7 @@ fn majority_api_error(error: MajorityAppendError) -> ApiError {
             StatusCode::CONFLICT
         },
         message: error.to_string(),
+        code: None,
     }
 }
 
@@ -4712,6 +4820,8 @@ async fn read_owned_range_page(
             StatusCode::BAD_REQUEST
         },
         message: error.message,
+
+        code: None,
     })?;
     if frames
         .iter()
@@ -5792,6 +5902,7 @@ fn unix_ns() -> i64 {
 struct ApiError {
     status: StatusCode,
     message: String,
+    code: Option<&'static str>,
 }
 
 impl ApiError {
@@ -5799,6 +5910,7 @@ impl ApiError {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
+            code: None,
         }
     }
 
@@ -5806,6 +5918,7 @@ impl ApiError {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: message.into(),
+            code: None,
         }
     }
 }
@@ -5828,6 +5941,7 @@ impl From<StorageError> for ApiError {
         Self {
             status,
             message: error.to_string(),
+            code: None,
         }
     }
 }
@@ -5842,6 +5956,7 @@ impl From<AdminAuthError> for ApiError {
                 AdminAuthError::Missing | AdminAuthError::Invalid => StatusCode::UNAUTHORIZED,
             },
             message: error.to_string(),
+            code: None,
         }
     }
 }
@@ -5861,6 +5976,7 @@ impl From<ControlPlaneError> for ApiError {
                 ControlPlaneError::Control(_) => StatusCode::INTERNAL_SERVER_ERROR,
             },
             message: error.to_string(),
+            code: None,
         }
     }
 }
@@ -5874,13 +5990,18 @@ impl From<ControlError> for ApiError {
                 StatusCode::INTERNAL_SERVER_ERROR
             },
             message: error.to_string(),
+            code: None,
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(json!({ "error": self.message }))).into_response()
+        let mut body = json!({ "error": self.message });
+        if let Some(code) = self.code {
+            body["code"] = json!(code);
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -6340,8 +6461,9 @@ mod tests {
                 assignment.owner.clone(),
                 control.clone(),
             ))),
-            control,
+            control: control.clone(),
             control_plane: None,
+            progress_authority: control.clone(),
             majority_append: None,
             subscription_progress: None,
             subscription_mtls_enabled: false,
@@ -6435,8 +6557,9 @@ mod tests {
             membership,
             demand: DemandMetrics::default(),
             autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
-            control,
+            control: control.clone(),
             control_plane: None,
+            progress_authority: control.clone(),
             replica_append: None,
             majority_append: None,
             subscription_progress: None,
@@ -6523,6 +6646,7 @@ mod tests {
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
                 control: control.clone(),
                 control_plane: Some(control_plane.clone()),
+                progress_authority: control.clone(),
                 replica_append: Some(replica_append),
                 majority_append: None,
                 subscription_progress: Some(subscription_progress),
@@ -7770,6 +7894,7 @@ mod tests {
                 replica_append: Some(services[node].clone()),
                 control: control.clone(),
                 control_plane: plane,
+                progress_authority: control.clone(),
                 majority_append: None,
                 subscription_progress: None,
                 subscription_mtls_enabled: false,
@@ -8011,6 +8136,7 @@ mod tests {
                 replica_append: Some(services[node].clone()),
                 control: control.clone(),
                 control_plane: Some(plane),
+                progress_authority: control.clone(),
                 majority_append: None,
                 subscription_progress: Some(Arc::new(
                     crate::reader::SubscriptionProgressReplicaService::new(
@@ -8529,5 +8655,60 @@ mod tests {
         for handle in handles {
             handle.abort();
         }
+    }
+
+    #[test]
+    fn subscription_placement_divergence_detects_mixed_replica_state() {
+        let node = |name: &str| crate::active_range::StorageNodeId::try_new(name).unwrap();
+        let mutation =
+            |sequence: u64, ownership_epoch: u64| crate::reader::SubscriptionProgressMutation {
+                subscription_id: Uuid::from_u128(9_100),
+                feed_id: Uuid::from_u128(9_101),
+                ownership_epoch,
+                sequence,
+                request_id: Uuid::from_u128(9_102),
+                expected_cursor: None,
+                cursor: format!("rf1_{sequence}"),
+                positions: BTreeMap::from([(
+                    RangeId::from_uuid(Uuid::from_u128(9_103)),
+                    "position".to_owned(),
+                )]),
+                tick: 0,
+                lease_ops: Vec::new(),
+            };
+        let inspection = |committed| crate::reader::SubscriptionProgressInspection {
+            committed,
+            prepared: None,
+            members: crate::reader::SubscriptionMemberState::default(),
+        };
+        let aligned: Vec<_> = [node("storage-a"), node("storage-b"), node("storage-c")]
+            .into_iter()
+            .map(|node| (node, inspection(Some(mutation(8, 2)))))
+            .collect();
+        assert!(!subscription_placement_diverged(&aligned));
+
+        // A replica an ownership epoch behind the others diverges.
+        let mut lagging = aligned.clone();
+        lagging[0].1 = inspection(Some(mutation(8, 1)));
+        assert!(subscription_placement_diverged(&lagging));
+
+        // A replica missing committed progress diverges.
+        let mut missing = aligned.clone();
+        missing[0].1 = inspection(None);
+        assert!(subscription_placement_diverged(&missing));
+
+        // A replica a sequence behind diverges.
+        let mut behind = aligned.clone();
+        behind[1].1 = inspection(Some(mutation(7, 2)));
+        assert!(subscription_placement_diverged(&behind));
+
+        // Divergent member state alone also triggers healing.
+        let mut members = aligned.clone();
+        members[2]
+            .1
+            .members
+            .member_epochs
+            .insert(Uuid::from_u128(9_104), 1);
+        assert!(subscription_placement_diverged(&members));
     }
 }

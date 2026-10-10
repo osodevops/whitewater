@@ -15,7 +15,10 @@ use finnstream::{
     control_plane::ControlPlane,
     demand::DemandMetrics,
     membership::{MemberAnnouncement, MembershipService},
-    reader::{FjallSubscriptionProgressReplica, SubscriptionProgressReplicaService},
+    reader::{
+        FjallSubscriptionProgressReplica, SubscriptionPlacementAuthority,
+        SubscriptionProgressReplicaService,
+    },
     storage::{FileLogStore, LogStore},
 };
 use openraft::BasicNode;
@@ -378,6 +381,10 @@ async fn main() -> Result<()> {
         (Some(_), None) => anyhow::bail!("Subscription mTLS requires a storage replica"),
         _ => None,
     };
+    let progress_authority: Arc<dyn SubscriptionPlacementAuthority> = match &control_plane {
+        Some(plane) => plane.clone(),
+        None => control.clone(),
+    };
     let app_state = AppState {
         store,
         membership,
@@ -385,6 +392,7 @@ async fn main() -> Result<()> {
         autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
         control,
         control_plane: control_plane.clone(),
+        progress_authority,
         storage_node_id: replica_append
             .as_ref()
             .map(|service| service.local_node().clone()),

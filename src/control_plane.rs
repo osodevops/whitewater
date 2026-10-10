@@ -566,6 +566,13 @@ pub struct ControlPlane {
 }
 
 impl ControlPlane {
+    /// The replicated catalog controller this plane applies committed
+    /// commands into. Read-only accessor for callers that need
+    /// placement-authority reads alongside raft-backed writes.
+    pub fn controller(&self) -> &std::sync::Arc<crate::control::ControlController> {
+        &self.controller
+    }
+
     pub async fn start(
         node_id: ControlNodeId,
         peers: BTreeMap<ControlNodeId, BasicNode>,

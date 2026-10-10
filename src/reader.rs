@@ -852,6 +852,29 @@ pub struct SubscriptionProgressMutation {
     pub lease_ops: Vec<SubscriptionLeaseOp>,
 }
 
+/// A replica answering with one of these errors is behind the current
+/// placement (still applying a committed catalog change or holding an older
+/// row) rather than contradicting quorum state. Such replies are treated as
+/// lagging witnesses and skipped so a single stale replica cannot wedge
+/// otherwise healthy progress.
+fn lagging_witness(error: &SubscriptionProgressError) -> bool {
+    matches!(
+        error,
+        SubscriptionProgressError::Unavailable
+            | SubscriptionProgressError::StaleEpoch
+            | SubscriptionProgressError::InvalidAssignment
+            | SubscriptionProgressError::Sequence
+    )
+}
+
+/// Prepare-stage refusals that identify a lagging replica. `Lease`
+/// rejections are included because a replica whose member state is behind
+/// validates against stale leases; current replicas fence identically, so
+/// skipping the stale vote cannot admit a mutation that quorum would reject.
+fn lagging_prepare(error: &SubscriptionProgressError) -> bool {
+    lagging_witness(error) || matches!(error, SubscriptionProgressError::Lease(_))
+}
+
 fn same_progress_identity(
     left: &SubscriptionProgressMutation,
     right: &SubscriptionProgressMutation,
@@ -902,6 +925,63 @@ pub enum SubscriptionProgressError {
     Unavailable,
     #[error("Subscription progress commit result is ambiguous; retry the same request identity")]
     AmbiguousCommit,
+}
+
+impl SubscriptionProgressError {
+    /// Wire-stable identifier carried by internal replica responses so a
+    /// calling coordinator can distinguish lagging replicas from genuine
+    /// progress conflicts instead of collapsing every failure into one
+    /// variant.
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Engine(_) => "engine",
+            Self::Serialization(_) => "serialization",
+            Self::Conflict => "conflict",
+            Self::StaleEpoch => "stale_epoch",
+            Self::Sequence => "sequence",
+            Self::TooLarge => "too_large",
+            Self::NoQuorum => "no_quorum",
+            Self::Lease(inner) => inner.code(),
+            Self::InvalidAssignment => "invalid_assignment",
+            Self::Unavailable => "unavailable",
+            Self::AmbiguousCommit => "ambiguous_commit",
+        }
+    }
+
+    pub(crate) fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "conflict" => Self::Conflict,
+            "stale_epoch" => Self::StaleEpoch,
+            "sequence" => Self::Sequence,
+            "too_large" => Self::TooLarge,
+            "no_quorum" => Self::NoQuorum,
+            "invalid_assignment" => Self::InvalidAssignment,
+            "unavailable" => Self::Unavailable,
+            "ambiguous_commit" => Self::AmbiguousCommit,
+            other => Self::Lease(SubscriptionLeaseError::from_code(other)?),
+        })
+    }
+}
+
+impl SubscriptionLeaseError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Busy => "lease.busy",
+            Self::StaleLease => "lease.stale_lease",
+            Self::Capacity => "lease.capacity",
+            Self::InvalidClock => "lease.invalid_clock",
+        }
+    }
+
+    fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "lease.busy" => Self::Busy,
+            "lease.stale_lease" => Self::StaleLease,
+            "lease.capacity" => Self::Capacity,
+            "lease.invalid_clock" => Self::InvalidClock,
+            _ => return None,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1182,11 +1262,16 @@ impl FjallSubscriptionProgressReplica {
             }
         }
         if let Some(prepared) = &row.prepared {
-            return if prepared == &mutation {
-                Ok(vote)
-            } else {
-                Err(SubscriptionProgressError::Conflict)
-            };
+            if prepared == &mutation {
+                return Ok(vote);
+            }
+            if prepared.request_id == mutation.request_id {
+                return Err(SubscriptionProgressError::Conflict);
+            }
+            // A residue from an abandoned vote: this replica is behind the
+            // quorum's committed trail, so it answers as a lagging witness
+            // rather than contradicting the mutation.
+            return Err(SubscriptionProgressError::Sequence);
         }
         let prior_sequence = row.committed.as_ref().map_or(0, |prior| prior.sequence);
         if prior_sequence.checked_add(1) != Some(mutation.sequence) {
@@ -1656,7 +1741,10 @@ impl HttpSubscriptionProgressTransport {
             assignment,
             endpoints,
             key: Some(key),
-            client: reqwest::Client::builder().timeout(timeout).build()?,
+            client: reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(1))
+                .timeout(timeout)
+                .build()?,
         })
     }
 
@@ -1679,6 +1767,7 @@ impl HttpSubscriptionProgressTransport {
         let identity = reqwest::Identity::from_pem(identity_pem)
             .map_err(|_| SubscriptionProgressError::InvalidAssignment)?;
         let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(1))
             .timeout(timeout)
             .https_only(true)
             .tls_built_in_root_certs(false)
@@ -1719,7 +1808,24 @@ impl HttpSubscriptionProgressTransport {
             .await
             .map_err(|_| SubscriptionProgressError::Unavailable)?;
         if !response.status().is_success() {
-            return Err(if response.status() == reqwest::StatusCode::CONFLICT {
+            let status = response.status();
+            let body = response.bytes().await.unwrap_or_default();
+            let code = body
+                .get(..4096)
+                .and_then(|head| serde_json::from_slice::<serde_json::Value>(head).ok())
+                .and_then(|value| {
+                    value
+                        .get("code")
+                        .and_then(|code| code.as_str())
+                        .map(str::to_owned)
+                });
+            if let Some(error) = code
+                .as_deref()
+                .and_then(SubscriptionProgressError::from_code)
+            {
+                return Err(error);
+            }
+            return Err(if status == reqwest::StatusCode::CONFLICT {
                 SubscriptionProgressError::Conflict
             } else {
                 SubscriptionProgressError::Unavailable
@@ -1879,6 +1985,68 @@ impl SubscriptionProgressTransport for HttpSubscriptionProgressTransport {
     }
 }
 
+/// Executes Subscription progress placement commands through the
+/// configured placement authority: the replicated Control Plane when one is
+/// configured, or the local catalog for `local_prototype` Nodes. Recovery and
+/// replica movement must mutate placement through this authority so the new
+/// ownership epoch is replicated to every Node's catalog instead of landing
+/// only on the Node that happened to serve the request.
+#[async_trait::async_trait]
+pub trait SubscriptionPlacementAuthority: Send + Sync {
+    async fn execute_placement_commands(
+        &self,
+        commands: Vec<crate::control::Command>,
+    ) -> Result<(), SubscriptionProgressError>;
+
+    async fn progress_assignment(
+        &self,
+        subscription_id: Uuid,
+    ) -> Option<SubscriptionProgressAssignment>;
+}
+
+#[async_trait::async_trait]
+impl SubscriptionPlacementAuthority for crate::control::ControlController {
+    async fn execute_placement_commands(
+        &self,
+        commands: Vec<crate::control::Command>,
+    ) -> Result<(), SubscriptionProgressError> {
+        self.execute_commands(commands)
+            .await
+            .map(|_| ())
+            .map_err(|_| SubscriptionProgressError::Unavailable)
+    }
+
+    async fn progress_assignment(
+        &self,
+        subscription_id: Uuid,
+    ) -> Option<SubscriptionProgressAssignment> {
+        self.active_subscription_progress_assignment_by_id(subscription_id)
+            .await
+    }
+}
+
+#[async_trait::async_trait]
+impl SubscriptionPlacementAuthority for crate::control_plane::ControlPlane {
+    async fn execute_placement_commands(
+        &self,
+        commands: Vec<crate::control::Command>,
+    ) -> Result<(), SubscriptionProgressError> {
+        self.execute_commands(commands)
+            .await
+            .map(|_| ())
+            .map_err(|_| SubscriptionProgressError::Unavailable)
+    }
+
+    async fn progress_assignment(
+        &self,
+        subscription_id: Uuid,
+    ) -> Option<SubscriptionProgressAssignment> {
+        self.controller()
+            .active_subscription_progress_assignment_by_id(subscription_id)
+            .await
+    }
+}
+
 pub struct SubscriptionProgressCoordinator {
     assignment: SubscriptionProgressAssignment,
     transport: std::sync::Arc<dyn SubscriptionProgressTransport>,
@@ -1910,18 +2078,19 @@ impl SubscriptionProgressCoordinator {
     pub async fn read_committed(
         &self,
     ) -> Result<Option<SubscriptionProgressMutation>, SubscriptionProgressError> {
-        let mut observed: Option<Option<SubscriptionProgressMutation>> = None;
+        let mut observed: Option<SubscriptionProgressMutation> = None;
         let mut votes = 0;
-        for node in self.assignment.replicas.iter() {
-            match self
-                .transport
-                .committed(
-                    node,
-                    self.assignment.subscription_id,
-                    self.assignment.ownership_epoch,
-                )
-                .await
-            {
+        let mut lagged = false;
+        let replies = futures_util::future::join_all(self.assignment.replicas.iter().map(|node| {
+            self.transport.committed(
+                node,
+                self.assignment.subscription_id,
+                self.assignment.ownership_epoch,
+            )
+        }))
+        .await;
+        for (node, reply) in self.assignment.replicas.iter().zip(replies) {
+            match reply {
                 Ok(reply) => {
                     if reply.replica != *node
                         || reply.subscription_id != self.assignment.subscription_id
@@ -1935,25 +2104,42 @@ impl SubscriptionProgressCoordinator {
                             return Err(SubscriptionProgressError::Conflict);
                         }
                         if mutation.ownership_epoch != self.assignment.ownership_epoch {
-                            return Err(SubscriptionProgressError::StaleEpoch);
+                            if mutation.ownership_epoch > self.assignment.ownership_epoch {
+                                // The replica knows a newer placement; this
+                                // coordinator's assignment is stale.
+                                return Err(SubscriptionProgressError::StaleEpoch);
+                            }
+                            // The replica still carries the prior epoch's row;
+                            // it is a lagging witness, not a contradiction.
+                            lagged = true;
+                            continue;
                         }
                     }
-                    if observed.as_ref().is_some_and(|prior| prior != &progress) {
-                        return Err(SubscriptionProgressError::Conflict);
-                    }
-                    if observed.is_none() {
-                        observed = Some(progress);
-                    }
                     votes += 1;
+                    if let Some(candidate) = progress {
+                        match &observed {
+                            Some(current) if !same_progress_identity(current, &candidate) => {
+                                match candidate.sequence.cmp(&current.sequence) {
+                                    std::cmp::Ordering::Greater => observed = Some(candidate),
+                                    std::cmp::Ordering::Equal => {
+                                        return Err(SubscriptionProgressError::Conflict)
+                                    }
+                                    std::cmp::Ordering::Less => {}
+                                }
+                            }
+                            Some(_) => {}
+                            None => observed = Some(candidate),
+                        }
+                    }
                 }
-                Err(SubscriptionProgressError::Unavailable) => {}
+                Err(error) if lagging_witness(&error) => lagged = true,
                 Err(error) => return Err(error),
             }
         }
-        if votes < 2 || (votes < 3 && observed.as_ref() == Some(&None)) {
+        if votes < 2 || (observed.is_none() && (votes < 3 || lagged)) {
             return Err(SubscriptionProgressError::NoQuorum);
         }
-        Ok(observed.flatten())
+        Ok(observed)
     }
 
     pub async fn reconcile_retry(
@@ -1969,12 +2155,13 @@ impl SubscriptionProgressCoordinator {
         let mut owner_seen = false;
         let mut owner_committed = false;
         let mut matching = 0;
-        for node in self.assignment.replicas.iter() {
-            match self
-                .transport
+        let replies = futures_util::future::join_all(self.assignment.replicas.iter().map(|node| {
+            self.transport
                 .committed(node, mutation.subscription_id, mutation.ownership_epoch)
-                .await
-            {
+        }))
+        .await;
+        for (node, reply) in self.assignment.replicas.iter().zip(replies) {
+            match reply {
                 Ok(reply) => {
                     if reply.replica != *node
                         || reply.subscription_id != mutation.subscription_id
@@ -1993,18 +2180,15 @@ impl SubscriptionProgressCoordinator {
                                 owner_committed = true;
                             }
                         }
-                        Some(current)
-                            if current.subscription_id == mutation.subscription_id
-                                && current.feed_id == mutation.feed_id
-                                && current.ownership_epoch == mutation.ownership_epoch
-                                && current.sequence.checked_add(1) == Some(mutation.sequence)
-                                && mutation.expected_cursor.as_deref()
-                                    == Some(current.cursor.as_str()) => {}
-                        None if mutation.sequence == 1 && mutation.expected_cursor.is_none() => {}
+                        // A replica holding an older sequence or no committed
+                        // row is a lagging witness; quorum evidence decides,
+                        // and adoption brings the replica forward.
+                        Some(current) if current.sequence < mutation.sequence => {}
+                        None => {}
                         _ => return Err(SubscriptionProgressError::Conflict),
                     }
                 }
-                Err(SubscriptionProgressError::Unavailable) => {}
+                Err(error) if lagging_witness(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -2040,8 +2224,16 @@ impl SubscriptionProgressCoordinator {
         }
         let digest = *blake3::hash(&serde_json::to_vec(&mutation)?).as_bytes();
         let mut prepared = Vec::with_capacity(3);
-        for node in self.assignment.replicas.iter() {
-            match self.transport.prepare(node, mutation.clone()).await {
+        let mut first_refusal: Option<SubscriptionProgressError> = None;
+        let replies = futures_util::future::join_all(
+            self.assignment
+                .replicas
+                .iter()
+                .map(|node| self.transport.prepare(node, mutation.clone())),
+        )
+        .await;
+        for (node, reply) in self.assignment.replicas.iter().zip(replies) {
+            match reply {
                 Ok(reply) => {
                     if reply.replica != *node
                         || reply.subscription_id != self.assignment.subscription_id
@@ -2058,7 +2250,13 @@ impl SubscriptionProgressCoordinator {
                     }
                     prepared.push((node.clone(), vote.digest));
                 }
-                Err(SubscriptionProgressError::Unavailable) => {}
+                Err(error) if lagging_prepare(&error) => {
+                    if !matches!(error, SubscriptionProgressError::Unavailable)
+                        && first_refusal.is_none()
+                    {
+                        first_refusal = Some(error);
+                    }
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -2067,7 +2265,10 @@ impl SubscriptionProgressCoordinator {
                 .iter()
                 .any(|(node, _)| node == &self.assignment.owner)
         {
-            return Err(SubscriptionProgressError::NoQuorum);
+            // Quorum failed: surface the most informative replica refusal
+            // (a lease fence or stale epoch) when one exists rather than a
+            // bare quorum shortage.
+            return Err(first_refusal.unwrap_or(SubscriptionProgressError::NoQuorum));
         }
         let other = prepared
             .iter()
@@ -2082,18 +2283,24 @@ impl SubscriptionProgressCoordinator {
             ],
         };
         let mut committed = Vec::with_capacity(3);
-        for (node, _) in prepared {
-            match self.transport.commit(&node, evidence.clone()).await {
+        let replies = futures_util::future::join_all(
+            prepared
+                .iter()
+                .map(|(node, _)| self.transport.commit(node, evidence.clone())),
+        )
+        .await;
+        for ((node, _), reply) in prepared.iter().zip(replies) {
+            match reply {
                 Ok(reply)
-                    if reply.replica != node
+                    if reply.replica != *node
                         || reply.subscription_id != self.assignment.subscription_id
                         || reply.ownership_epoch != self.assignment.ownership_epoch =>
                 {
                     return Err(SubscriptionProgressError::InvalidAssignment);
                 }
-                Ok(reply) if reply.result == mutation => committed.push(node),
+                Ok(reply) if reply.result == mutation => committed.push(node.clone()),
                 Ok(_) => return Err(SubscriptionProgressError::Conflict),
-                Err(SubscriptionProgressError::Unavailable) => {}
+                Err(error) if lagging_witness(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -2107,7 +2314,7 @@ impl SubscriptionProgressCoordinator {
         &self.assignment
     }
 
-    async fn inspect_evidence(
+    pub(crate) async fn inspect_evidence(
         &self,
     ) -> Result<
         Vec<(
@@ -2117,16 +2324,16 @@ impl SubscriptionProgressCoordinator {
         SubscriptionProgressError,
     > {
         let mut evidence = Vec::with_capacity(3);
-        for node in self.assignment.replicas.iter() {
-            match self
-                .transport
-                .inspect(
-                    node,
-                    self.assignment.subscription_id,
-                    self.assignment.ownership_epoch,
-                )
-                .await
-            {
+        let replies = futures_util::future::join_all(self.assignment.replicas.iter().map(|node| {
+            self.transport.inspect(
+                node,
+                self.assignment.subscription_id,
+                self.assignment.ownership_epoch,
+            )
+        }))
+        .await;
+        for (node, reply) in self.assignment.replicas.iter().zip(replies) {
+            match reply {
                 Ok(reply) => {
                     if reply.replica != *node
                         || reply.subscription_id != self.assignment.subscription_id
@@ -2147,7 +2354,7 @@ impl SubscriptionProgressCoordinator {
                     }
                     evidence.push((node.clone(), reply.result));
                 }
-                Err(SubscriptionProgressError::Unavailable) => {}
+                Err(error) if lagging_witness(&error) => {}
                 Err(error) => return Err(error),
             }
         }
@@ -2238,34 +2445,56 @@ impl SubscriptionProgressCoordinator {
         committed: Option<SubscriptionProgressMutation>,
         member_state: &SubscriptionMemberState,
     ) -> Result<Vec<crate::active_range::StorageNodeId>, SubscriptionProgressError> {
-        let mut adopted = Vec::with_capacity(3);
-        for node in members {
-            match self
-                .transport
-                .adopt(
-                    node,
-                    owner,
-                    self.assignment.subscription_id,
-                    ownership_epoch,
-                    committed.clone(),
-                    member_state.clone(),
-                )
-                .await
-            {
-                Ok(reply) => {
-                    if reply.replica != *node
-                        || reply.subscription_id != self.assignment.subscription_id
-                        || reply.ownership_epoch != ownership_epoch
-                    {
-                        return Err(SubscriptionProgressError::InvalidAssignment);
+        // A replica whose catalog has not yet applied a just-committed
+        // placement change rejects the new epoch; give the replicated catalog
+        // a bounded window to converge before counting the replica as
+        // unavailable. Members are adopted in parallel.
+        let results = futures_util::future::join_all(members.iter().map(|node| async {
+            let mut attempts = 0u8;
+            loop {
+                match self
+                    .transport
+                    .adopt(
+                        node,
+                        owner,
+                        self.assignment.subscription_id,
+                        ownership_epoch,
+                        committed.clone(),
+                        member_state.clone(),
+                    )
+                    .await
+                {
+                    Ok(reply) => {
+                        if reply.replica != *node
+                            || reply.subscription_id != self.assignment.subscription_id
+                            || reply.ownership_epoch != ownership_epoch
+                        {
+                            break Some(Err(SubscriptionProgressError::InvalidAssignment));
+                        }
+                        if reply.result != committed {
+                            break Some(Err(SubscriptionProgressError::Conflict));
+                        }
+                        break Some(Ok(()));
                     }
-                    if reply.result != committed {
-                        return Err(SubscriptionProgressError::Conflict);
+                    Err(SubscriptionProgressError::Unavailable) => break None,
+                    Err(error) if lagging_witness(&error) => {
+                        attempts += 1;
+                        if attempts >= 5 {
+                            break None;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     }
-                    adopted.push(node.clone());
+                    Err(error) => break Some(Err(error)),
                 }
-                Err(SubscriptionProgressError::Unavailable) => {}
-                Err(error) => return Err(error),
+            }
+        }))
+        .await;
+        let mut adopted = Vec::with_capacity(3);
+        for (node, result) in members.iter().zip(results) {
+            match result {
+                Some(Ok(())) => adopted.push(node.clone()),
+                Some(Err(error)) => return Err(error),
+                None => {}
             }
         }
         if adopted.len() < 2 || !adopted.contains(owner) {
@@ -2285,9 +2514,9 @@ impl SubscriptionProgressCoordinator {
             .is_ok()
     }
 
-    pub async fn recover_lost_owner(
+    pub async fn recover_lost_owner<A: SubscriptionPlacementAuthority + ?Sized>(
         &self,
-        control: &crate::control::ControlController,
+        control: &A,
     ) -> Result<SubscriptionRecoveryOutcome, SubscriptionProgressError> {
         let next_epoch = self
             .assignment
@@ -2298,7 +2527,7 @@ impl SubscriptionProgressCoordinator {
         let (recovered, member_state) = Self::recovered_committed(&evidence)?;
         let proposed_owner = self.recovery_owner(&evidence, recovered.as_ref())?;
         let (owner, ownership_epoch) = match control
-            .execute_commands(vec![
+            .execute_placement_commands(vec![
                 crate::control::Command::RecoverSubscriptionProgressOwner {
                     subscription_id: self.assignment.subscription_id,
                     expected_ownership_epoch: self.assignment.ownership_epoch,
@@ -2310,7 +2539,7 @@ impl SubscriptionProgressCoordinator {
             Ok(_) => (proposed_owner, next_epoch),
             Err(_) => {
                 let current = control
-                    .active_subscription_progress_assignment_by_id(self.assignment.subscription_id)
+                    .progress_assignment(self.assignment.subscription_id)
                     .await
                     .ok_or(SubscriptionProgressError::InvalidAssignment)?;
                 if current.ownership_epoch <= self.assignment.ownership_epoch {
@@ -2345,9 +2574,9 @@ impl SubscriptionProgressCoordinator {
         })
     }
 
-    pub async fn move_replica(
+    pub async fn move_replica<A: SubscriptionPlacementAuthority + ?Sized>(
         &self,
-        control: &crate::control::ControlController,
+        control: &A,
         replaced: &crate::active_range::StorageNodeId,
         replacement: &crate::active_range::StorageNodeId,
     ) -> Result<SubscriptionRecoveryOutcome, SubscriptionProgressError> {
@@ -2373,7 +2602,7 @@ impl SubscriptionProgressCoordinator {
         let evidence = self.inspect_evidence().await?;
         let (recovered, member_state) = Self::recovered_committed(&evidence)?;
         let (replicas, owner, ownership_epoch) = match control
-            .execute_commands(vec![
+            .execute_placement_commands(vec![
                 crate::control::Command::MoveSubscriptionProgressReplica {
                     subscription_id: self.assignment.subscription_id,
                     expected_ownership_epoch: self.assignment.ownership_epoch,
@@ -2386,7 +2615,7 @@ impl SubscriptionProgressCoordinator {
             Ok(_) => (new_replicas, self.assignment.owner.clone(), next_epoch),
             Err(_) => {
                 let current = control
-                    .active_subscription_progress_assignment_by_id(self.assignment.subscription_id)
+                    .progress_assignment(self.assignment.subscription_id)
                     .await
                     .ok_or(SubscriptionProgressError::InvalidAssignment)?;
                 if current.ownership_epoch <= self.assignment.ownership_epoch {
@@ -2768,6 +2997,12 @@ mod tests {
         conflicting.request_id = Uuid::from_u128(6);
         assert!(matches!(
             reopened.prepare(conflicting),
+            Err(SubscriptionProgressError::Sequence)
+        ));
+        let mut conflicting_request = next.clone();
+        conflicting_request.cursor = "rf1_fork".to_owned();
+        assert!(matches!(
+            reopened.prepare(conflicting_request),
             Err(SubscriptionProgressError::Conflict)
         ));
         let mut future_epoch = next;

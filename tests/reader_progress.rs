@@ -544,15 +544,17 @@ async fn quorum_subscription_read_fails_closed_on_loss_disagreement_and_ambiguou
         Err(SubscriptionProgressError::NoQuorum)
     ));
     transport.read_down.lock().unwrap().clear();
+    // A replica holding no committed row is a lagging witness rather than a
+    // contradiction; the two agreeing committed votes still decide.
     transport
         .read_override
         .lock()
         .unwrap()
         .insert(nodes[2].clone(), None);
-    assert!(matches!(
-        coordinator.read_committed().await,
-        Err(SubscriptionProgressError::Conflict)
-    ));
+    assert_eq!(
+        coordinator.read_committed().await.unwrap(),
+        Some(mutation.clone())
+    );
     transport.read_override.lock().unwrap().clear();
     let mut stale = mutation.clone();
     stale.ownership_epoch = 2;
@@ -588,10 +590,12 @@ async fn quorum_subscription_read_fails_closed_on_loss_disagreement_and_ambiguou
         coordinator.apply(next.clone()).await,
         Err(SubscriptionProgressError::AmbiguousCommit)
     ));
-    assert!(matches!(
-        coordinator.read_committed().await,
-        Err(SubscriptionProgressError::Conflict)
-    ));
+    // The quorum-evidenced commit reached one replica: that higher committed
+    // sequence is the live frontier while the two lagging replicas converge.
+    assert_eq!(
+        coordinator.read_committed().await.unwrap(),
+        Some(next.clone())
+    );
     transport.commit_down.lock().unwrap().clear();
     coordinator.apply(next.clone()).await.unwrap();
     assert_eq!(coordinator.read_committed().await.unwrap(), Some(next));
@@ -673,10 +677,12 @@ async fn ambiguous_subscription_retry_reconciles_after_restart_without_guessing(
         .lock()
         .unwrap()
         .insert(nodes[2].clone());
-    assert!(matches!(
-        coordinator.reconcile_retry(next.clone()).await,
-        Err(SubscriptionProgressError::AmbiguousCommit)
-    ));
+    // The mutation quorum-commits on the two reachable replicas; the third
+    // is a lagging witness, so reconciliation confirms the committed value.
+    assert_eq!(
+        coordinator.reconcile_retry(next.clone()).await.unwrap(),
+        next
+    );
     transport.commit_down.lock().unwrap().clear();
     assert_eq!(
         coordinator.reconcile_retry(next.clone()).await.unwrap(),
@@ -744,10 +750,12 @@ async fn progress_coordinator_refuses_replies_claiming_another_replica() {
         coordinator.apply(mutation.clone()).await,
         Err(SubscriptionProgressError::InvalidAssignment)
     ));
-    assert!(matches!(
-        coordinator.read_committed().await,
-        Err(SubscriptionProgressError::Conflict)
-    ));
+    // Replicas that only prepared (or stayed empty) are lagging witnesses;
+    // the one committed vote is the live frontier.
+    assert_eq!(
+        coordinator.read_committed().await.unwrap(),
+        Some(mutation.clone())
+    );
     *transport.wrong_commit_node.lock().unwrap() = None;
     coordinator.apply(mutation.clone()).await.unwrap();
     *transport.wrong_read_node.lock().unwrap() = Some(nodes[1].clone());
@@ -2165,4 +2173,174 @@ async fn owner_available_reports_progress_owner_liveness() {
         .unwrap()
         .insert(coordinator.assignment().owner.clone());
     assert!(!coordinator.owner_available().await);
+}
+
+#[tokio::test]
+async fn epoch_stale_replica_rows_are_lagging_witnesses_for_reads_and_writes() {
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    for sequence in 1..=2 {
+        let mutation = progress_mutation(
+            subscription.subscription_id,
+            subscription.feed_id,
+            1,
+            sequence,
+        );
+        for node in &nodes {
+            plant_committed(&transport, node, &mutation);
+        }
+    }
+    // Recovery advances the catalog to epoch 2 and adopts the recovered
+    // frontier at the new epoch. Leave one replica un-adopted so its row
+    // stays fenced at ownership epoch 1. The recovery owner is the first
+    // replica holding the recovered frontier, so lag the last member.
+    let lagging = coordinator
+        .assignment()
+        .replicas
+        .as_array()
+        .last()
+        .unwrap()
+        .clone();
+    transport.adopt_down.lock().unwrap().insert(lagging.clone());
+    let outcome = coordinator.recover_lost_owner(&controller).await.unwrap();
+    assert_eq!(outcome.assignment.ownership_epoch, 2);
+    let recovered = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.assignment().ownership_epoch, 2);
+
+    // The epoch-stale row is a lagging witness, not a contradiction: reads
+    // return the current frontier and member mutations still commit through
+    // the current replicas.
+    let committed = recovered.read_committed().await.unwrap().unwrap();
+    assert_eq!(committed.sequence, 2);
+    assert_eq!(committed.ownership_epoch, 2);
+    recovered.member_state().await.unwrap();
+    let applied = recovered
+        .apply_member_ops(
+            Uuid::from_u128(9_001),
+            1,
+            vec![finnstream::reader::SubscriptionLeaseOp::Join {
+                member_id: Uuid::from_u128(9_002),
+                member_epoch: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.sequence, 3);
+
+    // Retry reconciliation likewise treats the stale row as behind rather
+    // than as a conflicting fork.
+    let mut retry = applied.clone();
+    retry.sequence = applied.sequence.checked_add(1).unwrap();
+    retry.request_id = Uuid::from_u128(9_003);
+    retry.expected_cursor = Some(applied.cursor.clone());
+    retry.cursor = "rf1_4".to_owned();
+    retry.lease_ops = vec![finnstream::reader::SubscriptionLeaseOp::Claim {
+        work_id: Uuid::from_u128(9_004),
+        member_id: Uuid::from_u128(9_002),
+        member_epoch: 1,
+        lease_ticks: 10,
+    }];
+    recovered.reconcile_retry(retry).await.unwrap();
+
+    // The lagging replica was never admitted into the epoch-2 mutations and
+    // remains fenced at epoch 1 until a future adoption heals it.
+    let stale = transport.stores[&lagging]
+        .local_committed(subscription.subscription_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(stale.sequence, 2);
+    assert_eq!(stale.ownership_epoch, 1);
+}
+
+#[tokio::test]
+async fn recovery_then_member_ops_when_a_survivor_lags_one_sequence() {
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let owner = coordinator.assignment().owner.clone();
+    let survivors: Vec<StorageNodeId> = nodes
+        .iter()
+        .filter(|node| **node != owner)
+        .cloned()
+        .collect();
+    // One survivor lags exactly one committed sequence behind the other.
+    let first = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    let second = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 2);
+    plant_committed(&transport, &survivors[0], &first);
+    plant_committed(&transport, &survivors[1], &first);
+    plant_committed(&transport, &survivors[1], &second);
+    for set in [
+        &transport.prepare_down,
+        &transport.commit_down,
+        &transport.read_down,
+        &transport.inspect_down,
+        &transport.adopt_down,
+    ] {
+        set.lock().unwrap().insert(owner.clone());
+    }
+
+    let outcome = coordinator.recover_lost_owner(&controller).await.unwrap();
+    assert_eq!(outcome.committed.as_ref().unwrap().sequence, 2);
+    let recovered = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let applied = recovered
+        .apply_member_ops(
+            Uuid::from_u128(7_777),
+            1,
+            vec![finnstream::reader::SubscriptionLeaseOp::Join {
+                member_id: Uuid::from_u128(8_888),
+                member_epoch: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(applied.sequence, 3);
 }

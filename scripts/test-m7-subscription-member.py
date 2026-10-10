@@ -1,4 +1,4 @@
-import json, os, sys, time, urllib.error, urllib.request, uuid
+import json, os, subprocess, sys, time, urllib.error, urllib.request, uuid
 
 BASE_PORT = int(os.environ.get("WHITEWATER_TEST_BASE_PORT", "7071"))
 ENDPOINTS = [f"http://localhost:{BASE_PORT + offset}" for offset in range(3)]
@@ -100,6 +100,40 @@ def main():
     # Member state reports the fenced epoch and no live leases after acks.
     status, state = get(ENDPOINTS[1], f"{members}/state?subscription={subscription}")
     if status != 200 or state["member_epochs"][member] != 2: raise AssertionError(state)
+
+    # Killing Nodes one at a time: a replica loss never fails member calls,
+    # and the owner kill is detected by the ownership_epoch bump the
+    # endpoint's transparent recovery performs before serving the mutation.
+    epoch = state["ownership_epoch"]
+    recovered = False
+    for index in range(3):
+        service = f"node{index + 1}"
+        subprocess.run(["docker", "compose", "stop", service], check=True)
+        survivor = ENDPOINTS[(index + 1) % 3]
+        try:
+            status, join = post(survivor, f"{members}/join", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": str(uuid.uuid4())})
+            if status != 200:
+                for probe in ENDPOINTS:
+                    try:
+                        ps, pbody = get(probe, f"{members}/state?subscription={subscription}")
+                        print(f"PROBE {probe}: {ps} {pbody}")
+                    except Exception as error:
+                        print(f"PROBE {probe}: unreachable {error}")
+                raise AssertionError(f"member op failed with {service} down: {join}")
+            status, after = get(survivor, f"{members}/state?subscription={subscription}")
+            if status != 200: raise AssertionError(after)
+            if after["ownership_epoch"] > epoch:
+                epoch, recovered = after["ownership_epoch"], True
+        finally:
+            subprocess.run(["docker", "compose", "start", service], check=True)
+            for _ in range(60):
+                try:
+                    status, _ = post(ENDPOINTS[index], "/v1/admin/wcl", {"script": "SHOW DOMAINS;"})
+                    if status == 200: break
+                except (urllib.error.URLError, TimeoutError): pass
+                time.sleep(1)
+            else: raise AssertionError(f"{service} did not come back after restart")
+    if not recovered: raise AssertionError("member mutations never recovered a lost progress owner")
 
     print(json.dumps({"status": "ok", "subscription": subscription, "member_epoch": 2, "first_page": 3, "resumed_page": 2, "final_fetch": len(tail["records"])}, indent=2))
 
