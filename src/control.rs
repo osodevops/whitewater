@@ -330,6 +330,8 @@ struct CatalogState {
     #[serde(default)]
     retired_storage_nodes: BTreeSet<StorageNodeId>,
     #[serde(default)]
+    draining_storage_nodes: BTreeSet<StorageNodeId>,
+    #[serde(default)]
     applied_requests: BTreeMap<Uuid, ReplicatedCommandResult>,
 }
 
@@ -366,6 +368,7 @@ impl Default for CatalogState {
             range_assignments: BTreeMap::new(),
             storage_nodes: BTreeMap::new(),
             retired_storage_nodes: BTreeSet::new(),
+            draining_storage_nodes: BTreeSet::new(),
             range_split_plans: BTreeMap::new(),
             range_merge_plans: BTreeMap::new(),
             range_move_plans: BTreeMap::new(),
@@ -624,6 +627,15 @@ pub enum Command {
     RetireStorageNode {
         node: StorageNodeId,
     },
+    DrainStorageNode {
+        node: StorageNodeId,
+    },
+    UndrainStorageNode {
+        node: StorageNodeId,
+    },
+    InspectStorageDrain {
+        node: StorageNodeId,
+    },
 }
 
 impl Command {
@@ -634,6 +646,7 @@ impl Command {
                 | Self::Describe { .. }
                 | Self::ExplainAccess { .. }
                 | Self::InspectPlacement { .. }
+                | Self::InspectStorageDrain { .. }
         )
     }
 
@@ -824,6 +837,7 @@ impl ControlController {
             .iter()
             .chain(state.storage_nodes.keys())
             .filter(|node| !state.retired_storage_nodes.contains(*node))
+            .filter(|node| !state.draining_storage_nodes.contains(*node))
             .cloned()
             .collect()
     }
@@ -831,6 +845,20 @@ impl ControlController {
     fn storage_eligible(&self, state: &CatalogState, node: &StorageNodeId) -> bool {
         (self.eligible_storage_nodes.contains(node) || state.storage_nodes.contains_key(node))
             && !state.retired_storage_nodes.contains(node)
+            && !state.draining_storage_nodes.contains(node)
+    }
+
+    pub async fn storage_drain_plan(
+        &self,
+        node: &StorageNodeId,
+    ) -> Result<StorageDrainPlan, ControlError> {
+        let state = self.state.lock().await;
+        let known =
+            state.storage_nodes.contains_key(node) || self.eligible_storage_nodes.contains(node);
+        if !known {
+            return Err(ControlError::NotFound(format!("storage Node {node}")));
+        }
+        Ok(storage_drain_plan(&state, self, node))
     }
 
     fn select_fixed_active_range(
@@ -1093,7 +1121,7 @@ impl ControlController {
             .cloned()
     }
 
-    pub(crate) async fn active_subscription_progress_assignment_by_id(
+    pub async fn active_subscription_progress_assignment_by_id(
         &self,
         subscription_id: Uuid,
     ) -> Option<SubscriptionProgressAssignment> {
@@ -2142,10 +2170,51 @@ impl ControlController {
                     )));
                 }
                 state.storage_nodes.remove(&node);
+                state.draining_storage_nodes.remove(&node);
                 state.retired_storage_nodes.insert(node.clone());
                 Ok((
                     format!("retired storage Node {node}"),
                     json!({ "node": node, "retired": true }),
+                ))
+            }
+            Command::DrainStorageNode { node } => {
+                let known = state.storage_nodes.contains_key(&node)
+                    || self.eligible_storage_nodes.contains(&node);
+                if !known || state.retired_storage_nodes.contains(&node) {
+                    return Err(ControlError::NotFound(format!("storage Node {node}")));
+                }
+                if !state.draining_storage_nodes.insert(node.clone()) {
+                    return Ok((
+                        format!("storage Node {node} is already draining"),
+                        json!({ "node": node, "draining": true }),
+                    ));
+                }
+                Ok((
+                    format!("draining storage Node {node}"),
+                    json!({ "node": node, "draining": true }),
+                ))
+            }
+            Command::UndrainStorageNode { node } => {
+                if !state.draining_storage_nodes.remove(&node) {
+                    return Err(ControlError::NotFound(format!(
+                        "draining storage Node {node}"
+                    )));
+                }
+                Ok((
+                    format!("restored storage Node {node} eligibility"),
+                    json!({ "node": node, "draining": false }),
+                ))
+            }
+            Command::InspectStorageDrain { node } => {
+                let known = state.storage_nodes.contains_key(&node)
+                    || self.eligible_storage_nodes.contains(&node);
+                if !known {
+                    return Err(ControlError::NotFound(format!("storage Node {node}")));
+                }
+                let plan = storage_drain_plan(state, self, &node);
+                Ok((
+                    format!("inspected drain for storage Node {node}"),
+                    json!(plan),
                 ))
             }
             Command::PrepareActiveRangeSplit { feed, split_at } => {
@@ -3197,6 +3266,22 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                     .map_err(|error| ControlError::Syntax(error.to_string()))?,
             })
         }
+        Some("DRAIN") => {
+            expect_keyword(&tokens, 1, "STORAGE")?;
+            expect_keyword(&tokens, 2, "NODE")?;
+            Ok(Command::DrainStorageNode {
+                node: StorageNodeId::try_new(token(&tokens, 3)?.to_owned())
+                    .map_err(|error| ControlError::Syntax(error.to_string()))?,
+            })
+        }
+        Some("UNDRAIN") => {
+            expect_keyword(&tokens, 1, "STORAGE")?;
+            expect_keyword(&tokens, 2, "NODE")?;
+            Ok(Command::UndrainStorageNode {
+                node: StorageNodeId::try_new(token(&tokens, 3)?.to_owned())
+                    .map_err(|error| ControlError::Syntax(error.to_string()))?,
+            })
+        }
         Some("DESCRIBE") => Ok(Command::Describe {
             kind: parse_resource_kind(token(&tokens, 1)?)?,
             name: token(&tokens, 2)?.to_owned(),
@@ -3204,6 +3289,15 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
         Some("GRANT") => parse_grant(&tokens),
         Some("EXPLAIN") => parse_explain(&tokens),
         Some("INSPECT") => {
+            if token(&tokens, 1)?.eq_ignore_ascii_case("DRAIN") {
+                expect_keyword(&tokens, 2, "FOR")?;
+                expect_keyword(&tokens, 3, "STORAGE")?;
+                expect_keyword(&tokens, 4, "NODE")?;
+                return Ok(Command::InspectStorageDrain {
+                    node: StorageNodeId::try_new(token(&tokens, 5)?.to_owned())
+                        .map_err(|error| ControlError::Syntax(error.to_string()))?,
+                });
+            }
             expect_keyword(&tokens, 1, "PLACEMENT")?;
             expect_keyword(&tokens, 2, "FOR")?;
             expect_keyword(&tokens, 3, "FEED")?;
@@ -3777,7 +3871,9 @@ fn show_resources(
                         } else {
                             "configured"
                         },
-                        "eligible": !state.retired_storage_nodes.contains(node),
+                        "eligible": !state.retired_storage_nodes.contains(node)
+                            && !state.draining_storage_nodes.contains(node),
+                        "draining": state.draining_storage_nodes.contains(node),
                     })
                 })
                 .collect::<Vec<_>>())
@@ -3860,6 +3956,137 @@ fn storage_node_in_use(state: &CatalogState, node: &StorageNodeId) -> Option<&'s
         return Some("a Subscription progress assignment");
     }
     None
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageDrainPlan {
+    pub node: StorageNodeId,
+    pub draining: bool,
+    pub moves: Vec<Command>,
+    pub unplannable: Vec<String>,
+    pub ready_to_retire: bool,
+}
+
+fn drain_replacement(
+    state: &CatalogState,
+    controller: &ControlController,
+    excluded: &BTreeSet<StorageNodeId>,
+    seed: &Uuid,
+) -> Option<StorageNodeId> {
+    let mut ranked = controller
+        .storage_pool(state)
+        .into_iter()
+        .filter(|node| !excluded.contains(node))
+        .map(|node| {
+            let mut hash = blake3::Hasher::new();
+            hash.update(b"whitewater-storage-drain-v1");
+            hash.update(seed.as_bytes());
+            hash.update(node.as_str().as_bytes());
+            (*hash.finalize().as_bytes(), node)
+        })
+        .collect::<Vec<_>>();
+    ranked.sort_unstable_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+    ranked.into_iter().next().map(|(_, node)| node)
+}
+
+fn storage_drain_plan(
+    state: &CatalogState,
+    controller: &ControlController,
+    node: &StorageNodeId,
+) -> StorageDrainPlan {
+    let mut moves = Vec::new();
+    let mut unplannable = Vec::new();
+    for (range_id, assignment) in state.range_assignments.iter() {
+        if !assignment.replicas.contains(node) {
+            continue;
+        }
+        let feed = state
+            .feeds
+            .values()
+            .find(|feed| feed.feed_id == assignment.feed_id)
+            .map(|feed| feed.name.clone())
+            .unwrap_or_else(|| assignment.feed_id.to_string());
+        if assignment.owner == *node {
+            let new_owner = assignment
+                .replicas
+                .iter()
+                .find(|replica| **replica != *node)
+                .cloned();
+            match new_owner {
+                Some(new_owner) => moves.push(Command::PrepareOwnerMove {
+                    feed: feed.clone(),
+                    range_id: *range_id,
+                    new_owner,
+                }),
+                None => {
+                    unplannable.push(format!(
+                        "Active Range {range_id} has no other replica to own it"
+                    ));
+                    continue;
+                }
+            }
+        }
+        let excluded: BTreeSet<StorageNodeId> = assignment.replicas.iter().cloned().collect();
+        match drain_replacement(state, controller, &excluded, &range_id.as_uuid()) {
+            Some(replacement) => moves.push(Command::PrepareFollowerMove {
+                feed,
+                range_id: *range_id,
+                removed_replica: node.clone(),
+                replacement_replica: replacement,
+            }),
+            None => unplannable.push(format!(
+                "Active Range {range_id} has no eligible replacement Node for {node}"
+            )),
+        }
+    }
+    for (subscription_id, assignment) in state.subscription_progress_assignments.iter() {
+        if !assignment.replicas.contains(node) {
+            continue;
+        }
+        let mut epoch = assignment.ownership_epoch;
+        if assignment.owner == *node {
+            let new_owner = assignment
+                .replicas
+                .iter()
+                .find(|replica| **replica != *node)
+                .cloned();
+            match new_owner {
+                Some(new_owner) => {
+                    moves.push(Command::RecoverSubscriptionProgressOwner {
+                        subscription_id: *subscription_id,
+                        expected_ownership_epoch: epoch,
+                        new_owner,
+                    });
+                    epoch += 1;
+                }
+                None => {
+                    unplannable.push(format!(
+                        "Subscription progress {subscription_id} has no other replica to own it"
+                    ));
+                    continue;
+                }
+            }
+        }
+        let excluded: BTreeSet<StorageNodeId> = assignment.replicas.iter().cloned().collect();
+        match drain_replacement(state, controller, &excluded, subscription_id) {
+            Some(replacement) => moves.push(Command::MoveSubscriptionProgressReplica {
+                subscription_id: *subscription_id,
+                expected_ownership_epoch: epoch,
+                replaced: node.clone(),
+                replacement,
+            }),
+            None => unplannable.push(format!(
+                "Subscription progress {subscription_id} has no eligible replacement Node for {node}"
+            )),
+        }
+    }
+    StorageDrainPlan {
+        node: node.clone(),
+        draining: state.draining_storage_nodes.contains(node),
+        moves,
+        unplannable,
+        ready_to_retire: storage_node_in_use(state, node).is_none(),
+    }
 }
 
 fn persist_state(path: &Path, state: &CatalogState) -> Result<(), ControlError> {
@@ -3949,6 +4176,9 @@ fn command_label(command: &Command) -> String {
         Command::MoveSubscriptionProgressReplica { .. } => "MOVE SUBSCRIPTION PROGRESS REPLICA",
         Command::RegisterStorageNode { .. } => "REGISTER STORAGE NODE",
         Command::RetireStorageNode { .. } => "RETIRE STORAGE NODE",
+        Command::DrainStorageNode { .. } => "DRAIN STORAGE NODE",
+        Command::UndrainStorageNode { .. } => "UNDRAIN STORAGE NODE",
+        Command::InspectStorageDrain { .. } => "INSPECT DRAIN",
     }
     .to_owned()
 }

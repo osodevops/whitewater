@@ -264,6 +264,20 @@ Configured Control Plane Nodes seed the eligible storage pool, but the pool is n
 
 `RETIRE STORAGE NODE` removes an unreferenced Node's eligibility and persists across restart. Retirement is refused while the Node still holds an Active Range assignment; move or drain every placement off the Node first, so scale-in never reduces durability.
 
+### Draining a Node before removal
+
+```sql
+DRAIN STORAGE NODE storage-4;
+INSPECT DRAIN FOR STORAGE NODE storage-4;
+UNDRAIN STORAGE NODE storage-4;
+```
+
+`DRAIN STORAGE NODE` persists a draining flag: the Node keeps serving its existing replicas but is immediately excluded from every new placement and from move/replacement targeting. `SHOW STORAGE NODES` reports the `draining` flag alongside `eligible`.
+
+`INSPECT DRAIN FOR STORAGE NODE` is a read-only dry run returning the ordered move list required to vacate the Node — `PREPARE OWNER MOVE` before `PREPARE FOLLOWER MOVE` for owned ranges, `RECOVER SUBSCRIPTION PROGRESS OWNER` before `MOVE SUBSCRIPTION PROGRESS REPLICA` for owned progress shards — plus an `unplannable` list when no eligible replacement exists and a `ready_to_retire` flag once nothing references the Node.
+
+`UNDRAIN STORAGE NODE` clears the flag and restores eligibility. `RETIRE` clears it too, so a fully drained Node can be removed in the same session.
+
 ## Rename resources
 
 ```sql

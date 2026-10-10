@@ -551,7 +551,7 @@ Autoscaling must never apply one generic removal procedure to all three cases.
 - [ ] Add placement eligibility and exclusion reasons.
 - [ ] Add capability-specific pressure metrics.
 - [ ] Add minimum baseline policy.
-- [ ] Add storage drain state machine.
+- [~] Add storage drain state machine: `DRAIN STORAGE NODE` persists a catalog flag that immediately excludes the Node from all new placements and move-targeting while it keeps serving existing replicas; `UNDRAIN STORAGE NODE` restores eligibility and `RETIRE` clears the flag on removal. `INSPECT DRAIN FOR STORAGE NODE` is a read-only dry run returning the ordered vacate plan — owner move then follower move per range, progress-owner recovery then replica move per progress shard — plus `unplannable` entries when no eligible replacement exists and a `ready_to_retire` flag. Automatic plan execution (leader-driven drain supervisor) and live multi-Node evidence remain.
 - [ ] Add compute/gateway graceful drain.
 - [ ] Add Control voter learner and replacement flow.
 - [ ] Add SLO-aware movement budgets.

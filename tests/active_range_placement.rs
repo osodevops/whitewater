@@ -1481,3 +1481,301 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
     assert_eq!(reopened.results[0].data["session_epoch"], 4);
     assert_eq!(reopened.results[0].data["delivered_cursor"], "ack-token-1");
 }
+
+#[tokio::test]
+async fn draining_a_storage_node_excludes_new_placement_and_survives_restart() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    control
+        .execute(
+            "REGISTER STORAGE NODE storage-4 AT http://storage-4:7070;              REGISTER STORAGE NODE storage-5 AT http://storage-5:7070;",
+        )
+        .await
+        .unwrap();
+    control
+        .execute("DRAIN STORAGE NODE storage-4;")
+        .await
+        .unwrap();
+    // A second drain reports the existing state rather than failing.
+    control
+        .execute("DRAIN STORAGE NODE storage-4;")
+        .await
+        .unwrap();
+    // Draining an unknown Node is refused.
+    assert!(control
+        .execute("DRAIN STORAGE NODE storage-9;")
+        .await
+        .is_err());
+    // Draining a retired Node is refused.
+    control
+        .execute("RETIRE STORAGE NODE storage-5;")
+        .await
+        .unwrap();
+    assert!(control
+        .execute("DRAIN STORAGE NODE storage-5;")
+        .await
+        .is_err());
+
+    let shown = control
+        .execute("SHOW STORAGE NODES;")
+        .await
+        .unwrap()
+        .results
+        .remove(0)
+        .data;
+    let storage4 = shown
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["node"] == "storage-4")
+        .unwrap();
+    assert_eq!(storage4["draining"], true);
+    assert_eq!(storage4["eligible"], false);
+
+    // Draining Nodes never receive new placements.
+    create_feed(&control, Uuid::from_u128(800)).await;
+    for index in 0..6 {
+        control
+            .execute_commands(vec![
+                Command::CreateSpace {
+                    name: format!("space{index}"),
+                },
+                Command::CreateFeed {
+                    name: format!("space{index}.events"),
+                },
+            ])
+            .await
+            .unwrap();
+        let feed = control
+            .active_feed_by_name(&format!("space{index}.events"))
+            .await
+            .unwrap();
+        let assignment = control.active_range_assignment(feed.feed_id).await.unwrap();
+        assert!(!assignment
+            .replicas
+            .as_array()
+            .iter()
+            .any(|node| node.as_str() == "storage-4"));
+        assert_ne!(assignment.owner.as_str(), "storage-4");
+    }
+    assert!(!placed_replicas(&placement(&control).await)
+        .iter()
+        .any(|node| node.as_str() == "storage-4"));
+
+    // Draining survives catalog restart so a restarted broker does not
+    // accidentally schedule new work onto a Node being decommissioned.
+    drop(control);
+    let reopened = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    let shown = reopened
+        .execute("SHOW STORAGE NODES;")
+        .await
+        .unwrap()
+        .results
+        .remove(0)
+        .data;
+    let storage4 = shown
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["node"] == "storage-4")
+        .unwrap();
+    assert_eq!(storage4["draining"], true);
+    assert_eq!(storage4["eligible"], false);
+
+    // UNDRAIN restores eligibility; a second undrain is refused.
+    reopened
+        .execute("UNDRAIN STORAGE NODE storage-4;")
+        .await
+        .unwrap();
+    assert!(reopened
+        .execute("UNDRAIN STORAGE NODE storage-4;")
+        .await
+        .is_err());
+    let shown = reopened
+        .execute("SHOW STORAGE NODES;")
+        .await
+        .unwrap()
+        .results
+        .remove(0)
+        .data;
+    let storage4 = shown
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["node"] == "storage-4")
+        .unwrap();
+    assert_eq!(storage4["draining"], false);
+    assert_eq!(storage4["eligible"], true);
+}
+
+#[tokio::test]
+async fn drain_plan_explains_ordered_moves_and_unplannable_references() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    control
+        .execute("REGISTER STORAGE NODE storage-4 AT http://storage-4:7070;")
+        .await
+        .unwrap();
+    create_feed(&control, Uuid::from_u128(810)).await;
+    control
+        .execute_commands(vec![Command::CreateSubscription {
+            name: "orders.billing".to_owned(),
+            feed: "orders.created".to_owned(),
+            start: ReaderStart::Beginning,
+        }])
+        .await
+        .unwrap();
+    let plc = placement(&control).await;
+    let held = placed_replicas(&plc)[0].clone();
+    let owner = placed_owner(&plc);
+
+    // INSPECT DRAIN explains the required moves without changing state.
+    let plan: finnstream::control::StorageDrainPlan = serde_json::from_value(
+        control
+            .execute(&format!("INSPECT DRAIN FOR STORAGE NODE {held};"))
+            .await
+            .unwrap()
+            .results
+            .remove(0)
+            .data,
+    )
+    .unwrap();
+    assert!(!plan.draining);
+    assert!(!plan.ready_to_retire);
+    let owner_pos = plan
+        .moves
+        .iter()
+        .position(|command| matches!(command, Command::PrepareOwnerMove { .. }));
+    let follower_move = plan
+        .moves
+        .iter()
+        .find_map(|command| match command {
+            Command::PrepareFollowerMove {
+                removed_replica,
+                replacement_replica,
+                ..
+            } => Some((removed_replica, replacement_replica)),
+            _ => None,
+        })
+        .expect("a follower move off the drained Node");
+    assert_eq!(*follower_move.0, held);
+    let expected_replacement = storage_nodes(&["storage-1", "storage-2", "storage-3", "storage-4"])
+        .into_iter()
+        .find(|node| !placed_replicas(&plc).contains(node))
+        .unwrap();
+    assert_eq!(*follower_move.1, expected_replacement);
+    if held == owner {
+        let owner_index = owner_pos.expect("an owner move away from the drained Node");
+        let follower_index = plan
+            .moves
+            .iter()
+            .position(|command| matches!(command, Command::PrepareFollowerMove { .. }))
+            .unwrap();
+        assert!(owner_index < follower_index);
+    }
+    // Draining a Subscription progress replica emits the matching move commands.
+    let subscription = control
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let progress_assignment = control
+        .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+        .await
+        .unwrap();
+    let progress_held = progress_assignment.replicas.iter().next().unwrap().clone();
+    let progress_plan: finnstream::control::StorageDrainPlan = serde_json::from_value(
+        control
+            .execute(&format!("INSPECT DRAIN FOR STORAGE NODE {progress_held};"))
+            .await
+            .unwrap()
+            .results
+            .remove(0)
+            .data,
+    )
+    .unwrap();
+    let progress_moves: Vec<&Command> = progress_plan
+        .moves
+        .iter()
+        .filter(|command| {
+            matches!(
+                command,
+                Command::MoveSubscriptionProgressReplica { .. }
+                    | Command::RecoverSubscriptionProgressOwner { .. }
+            )
+        })
+        .collect();
+    assert!(!progress_moves.is_empty());
+    let replica_move = progress_moves
+        .iter()
+        .find_map(|command| match command {
+            Command::MoveSubscriptionProgressReplica {
+                replaced,
+                replacement,
+                ..
+            } => Some((replaced, replacement)),
+            _ => None,
+        })
+        .expect("a Subscription progress replica move off the drained Node");
+    assert_eq!(*replica_move.0, progress_held);
+    if progress_assignment.owner == progress_held {
+        assert!(progress_moves
+            .iter()
+            .any(|command| matches!(command, Command::RecoverSubscriptionProgressOwner { .. })));
+    }
+
+    // INSPECT DRAIN on an unknown Node is refused.
+    assert!(control
+        .execute("INSPECT DRAIN FOR STORAGE NODE storage-9;")
+        .await
+        .is_err());
+
+    // DRAIN marks intent; the plan reports it and RETIRE still waits for moves.
+    control
+        .execute(&format!("DRAIN STORAGE NODE {held};"))
+        .await
+        .unwrap();
+    let plan: finnstream::control::StorageDrainPlan = serde_json::from_value(
+        control
+            .execute(&format!("INSPECT DRAIN FOR STORAGE NODE {held};"))
+            .await
+            .unwrap()
+            .results
+            .remove(0)
+            .data,
+    )
+    .unwrap();
+    assert!(plan.draining);
+    assert!(control
+        .execute(&format!("RETIRE STORAGE NODE {held};"))
+        .await
+        .is_err());
+
+    // With no spare eligible Node, moves are unplannable but still explained.
+    let tight_dir = TempDir::new().unwrap();
+    let tight = controller(
+        &tight_dir,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    create_feed(&tight, Uuid::from_u128(820)).await;
+    let tight_held = placed_replicas(&placement(&tight).await)[0].clone();
+    let plan: finnstream::control::StorageDrainPlan = serde_json::from_value(
+        tight
+            .execute(&format!("INSPECT DRAIN FOR STORAGE NODE {tight_held};"))
+            .await
+            .unwrap()
+            .results
+            .remove(0)
+            .data,
+    )
+    .unwrap();
+    assert!(!plan.unplannable.is_empty());
+}
