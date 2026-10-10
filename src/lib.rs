@@ -9,6 +9,7 @@ pub mod control_plane;
 pub mod cursor;
 pub mod demand;
 pub mod domain;
+pub mod effect;
 pub mod index;
 pub mod internal_plane;
 pub mod membership;
