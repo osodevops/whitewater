@@ -54,6 +54,30 @@ async fn placement(controller: &ControlController) -> serde_json::Value {
         .data
 }
 
+fn placed_owner(placement: &serde_json::Value) -> StorageNodeId {
+    serde_json::from_value(placement["owner"].clone()).unwrap()
+}
+
+fn placed_replicas(placement: &serde_json::Value) -> Vec<StorageNodeId> {
+    serde_json::from_value(placement["replicas"].clone()).unwrap()
+}
+
+fn non_owner_replica(placement: &serde_json::Value) -> StorageNodeId {
+    let owner = placed_owner(placement);
+    placed_replicas(placement)
+        .into_iter()
+        .find(|node| *node != owner)
+        .unwrap()
+}
+
+fn non_member(pool: &[StorageNodeId], placement: &serde_json::Value) -> StorageNodeId {
+    let members = placed_replicas(placement);
+    pool.iter()
+        .find(|node| !members.contains(node))
+        .cloned()
+        .unwrap()
+}
+
 #[tokio::test]
 async fn domain_typed_command_and_legacy_space_share_replicated_identity() {
     let leader_dir = TempDir::new().unwrap();
@@ -74,6 +98,7 @@ async fn domain_typed_command_and_legacy_space_share_replicated_identity() {
                 name: "orders".to_owned(),
             },
         )
+        .await
         .unwrap();
     let left = leader.apply_replicated(command.clone()).await;
     let right = follower.apply_replicated(command).await;
@@ -178,6 +203,7 @@ async fn follower_uses_leader_subscription_placement_not_local_candidates() {
                 start: ReaderStart::Beginning,
             },
         )
+        .await
         .unwrap();
     let fixed = command.fixed_subscription_progress.as_ref().unwrap();
     assert!(fixed
@@ -286,11 +312,12 @@ async fn replicated_feed_creation_produces_one_identical_rf3_assignment_on_every
     let expected = placement(&controllers[0]).await;
     assert_eq!(expected["generation"], 1);
     assert_eq!(expected["ownership_epoch"], 1);
-    assert_eq!(expected["owner"], "storage-1");
-    assert_eq!(
-        expected["replicas"],
-        serde_json::json!(["storage-1", "storage-2", "storage-3"])
-    );
+    let expected_replicas = placed_replicas(&expected);
+    assert_eq!(expected_replicas.len(), 3);
+    assert!(expected_replicas.contains(&placed_owner(&expected)));
+    for node in &expected_replicas {
+        assert!(nodes.contains(node));
+    }
     for controller in &controllers[1..] {
         assert_eq!(placement(controller).await, expected);
     }
@@ -322,6 +349,7 @@ async fn followers_apply_the_leaders_embedded_placement_not_their_local_candidat
                 name: "orders".to_owned(),
             },
         )
+        .await
         .unwrap();
     let create_feed = leader
         .prepare_replicated(
@@ -331,6 +359,7 @@ async fn followers_apply_the_leaders_embedded_placement_not_their_local_candidat
                 name: "orders.created".to_owned(),
             },
         )
+        .await
         .unwrap();
 
     for target in [&leader, &follower] {
@@ -346,7 +375,8 @@ async fn followers_apply_the_leaders_embedded_placement_not_their_local_candidat
             .is_none());
     }
     assert_eq!(placement(&follower).await, placement(&leader).await);
-    assert_eq!(placement(&follower).await["owner"], "storage-1");
+    let owner = placed_owner(&placement(&follower).await);
+    assert!(storage_nodes(&["storage-1", "storage-2", "storage-3"]).contains(&owner));
 }
 
 #[tokio::test]
@@ -391,10 +421,11 @@ async fn owner_move_requires_a_verified_caught_up_target_and_atomic_placement_ch
     let original = placement(&leader).await;
     let range_id = serde_json::from_value(original["range_id"].clone()).unwrap();
     let request_id = Uuid::from_u128(191);
+    let new_owner = non_owner_replica(&original);
     let command = Command::PrepareOwnerMove {
         feed: "orders.created".to_owned(),
         range_id,
-        new_owner: StorageNodeId::try_new("storage-2").unwrap(),
+        new_owner: new_owner.clone(),
     };
     let prepared = leader
         .execute_commands_with_request_id(vec![command.clone()], request_id)
@@ -448,7 +479,7 @@ async fn owner_move_requires_a_verified_caught_up_target_and_atomic_placement_ch
         .results
         .remove(0)
         .data;
-    assert_eq!(moved["owner"], "storage-2");
+    assert_eq!(placed_owner(&moved), new_owner);
     assert_eq!(moved["ownership_epoch"], 2);
     assert_eq!(moved["replicas"], original["replicas"]);
     assert!(placement(&leader).await["owner_move_plans"]
@@ -467,11 +498,12 @@ async fn owner_move_plan_cannot_overwrite_newer_recovery_placement() {
     create_feed(&control, Uuid::from_u128(202)).await;
     let original = placement(&control).await;
     let range_id = serde_json::from_value(original["range_id"].clone()).unwrap();
+    let pool = storage_nodes(&["storage-1", "storage-2", "storage-3", "storage-4"]);
     let prepared = control
         .execute_commands(vec![Command::PrepareOwnerMove {
             feed: "orders.created".to_owned(),
             range_id,
-            new_owner: StorageNodeId::try_new("storage-2").unwrap(),
+            new_owner: non_owner_replica(&original),
         }])
         .await
         .unwrap();
@@ -480,8 +512,8 @@ async fn owner_move_plan_cannot_overwrite_newer_recovery_placement() {
         .execute_commands(vec![Command::PrepareFollowerMove {
             feed: "orders.created".to_owned(),
             range_id,
-            removed_replica: StorageNodeId::try_new("storage-3").unwrap(),
-            replacement_replica: StorageNodeId::try_new("storage-4").unwrap(),
+            removed_replica: non_owner_replica(&original),
+            replacement_replica: non_member(&pool, &original),
         }])
         .await
         .is_err());
@@ -495,12 +527,13 @@ async fn owner_move_plan_cannot_overwrite_newer_recovery_placement() {
         }])
         .await
         .unwrap();
+    let recovered_owner = non_owner_replica(&original);
     control
         .execute_commands(vec![Command::RecoverActiveRangeOwnership {
             feed: "orders.created".to_owned(),
-            expected_owner: StorageNodeId::try_new("storage-1").unwrap(),
+            expected_owner: placed_owner(&original),
             expected_epoch: finnstream::active_range::OwnershipEpoch::new(1),
-            new_owner: StorageNodeId::try_new("storage-3").unwrap(),
+            new_owner: recovered_owner.clone(),
         }])
         .await
         .unwrap();
@@ -511,7 +544,7 @@ async fn owner_move_plan_cannot_overwrite_newer_recovery_placement() {
         }])
         .await
         .is_err());
-    assert_eq!(placement(&control).await["owner"], "storage-3");
+    assert_eq!(placed_owner(&placement(&control).await), recovered_owner);
     control
         .execute_commands(vec![Command::AbortOwnerMove {
             feed: "orders.created".to_owned(),
@@ -537,7 +570,7 @@ async fn direct_owner_transfer_is_refused_without_verified_catch_up() {
     let result = controller
         .execute_commands(vec![Command::TransferActiveRangeOwnership {
             feed: "orders.created".to_owned(),
-            owner: StorageNodeId::try_new("storage-2").unwrap(),
+            owner: non_owner_replica(&original),
         }])
         .await;
     assert!(
@@ -564,7 +597,7 @@ async fn follower_move_keeps_rf3_until_verified_replacement_and_survives_snapsho
     let leader_dir = TempDir::new().unwrap();
     let follower_dir = TempDir::new().unwrap();
     let four_nodes = storage_nodes(&["storage-1", "storage-2", "storage-3", "storage-4"]);
-    let leader = controller(&leader_dir, four_nodes);
+    let leader = controller(&leader_dir, four_nodes.clone());
     let follower = controller(
         &follower_dir,
         storage_nodes(&["storage-1", "storage-2", "storage-3"]),
@@ -572,11 +605,13 @@ async fn follower_move_keeps_rf3_until_verified_replacement_and_survives_snapsho
     create_feed(&leader, Uuid::from_u128(500)).await;
     let original = placement(&leader).await;
     let range_id = serde_json::from_value(original["range_id"].clone()).unwrap();
+    let removed = non_owner_replica(&original);
+    let replacement = non_member(&four_nodes, &original);
     let move_command = Command::PrepareFollowerMove {
         feed: "orders.created".to_owned(),
         range_id,
-        removed_replica: storage_nodes(&["storage-3"]).remove(0),
-        replacement_replica: storage_nodes(&["storage-4"]).remove(0),
+        removed_replica: removed.clone(),
+        replacement_replica: replacement.clone(),
     };
     let request_id = Uuid::from_u128(501);
     let first = leader
@@ -661,10 +696,20 @@ async fn follower_move_keeps_rf3_until_verified_replacement_and_survives_snapsho
     assert_eq!(new_assignment["owner"], original["owner"]);
     assert_eq!(new_assignment["generation"], original["generation"]);
     assert_eq!(new_assignment["ownership_epoch"], 2);
-    assert_eq!(
-        new_assignment["replicas"],
-        serde_json::json!(["storage-1", "storage-2", "storage-4"])
-    );
+    let mut expected_replicas: Vec<StorageNodeId> = placed_replicas(&original)
+        .into_iter()
+        .map(|node| {
+            if node == removed {
+                replacement.clone()
+            } else {
+                node
+            }
+        })
+        .collect();
+    expected_replicas.sort();
+    let mut actual_replicas = placed_replicas(&new_assignment);
+    actual_replicas.sort();
+    assert_eq!(actual_replicas, expected_replicas);
     assert!(placement(&follower).await["range_move_plans"]
         .as_array()
         .unwrap()
@@ -703,17 +748,20 @@ async fn follower_move_rejects_owner_replacement_ineligible_node_and_conflicting
     create_feed(&control, Uuid::from_u128(510)).await;
     let current = placement(&control).await;
     let range_id = serde_json::from_value(current["range_id"].clone()).unwrap();
+    let pool = storage_nodes(&["storage-1", "storage-2", "storage-3", "storage-4"]);
+    let members = placed_replicas(&current);
+    let ineligible = StorageNodeId::try_new("storage-5").unwrap();
     for (removed, replacement) in [
-        ("storage-1", "storage-4"),
-        ("storage-3", "storage-2"),
-        ("storage-3", "storage-5"),
+        (placed_owner(&current), members[1].clone()),
+        (members[0].clone(), members[1].clone()),
+        (members[0].clone(), ineligible.clone()),
     ] {
         assert!(control
             .execute_commands(vec![Command::PrepareFollowerMove {
                 feed: "orders.created".to_owned(),
                 range_id,
-                removed_replica: storage_nodes(&[removed]).remove(0),
-                replacement_replica: storage_nodes(&[replacement]).remove(0),
+                removed_replica: removed,
+                replacement_replica: replacement,
             }])
             .await
             .is_err());
@@ -722,8 +770,8 @@ async fn follower_move_rejects_owner_replacement_ineligible_node_and_conflicting
         .execute_commands(vec![Command::PrepareFollowerMove {
             feed: "orders.created".to_owned(),
             range_id,
-            removed_replica: storage_nodes(&["storage-3"]).remove(0),
-            replacement_replica: storage_nodes(&["storage-4"]).remove(0),
+            removed_replica: non_owner_replica(&current),
+            replacement_replica: non_member(&pool, &current),
         }])
         .await
         .unwrap();
@@ -732,8 +780,8 @@ async fn follower_move_rejects_owner_replacement_ineligible_node_and_conflicting
         .execute_commands(vec![Command::PrepareFollowerMove {
             feed: "orders.created".to_owned(),
             range_id,
-            removed_replica: storage_nodes(&["storage-2"]).remove(0),
-            replacement_replica: storage_nodes(&["storage-4"]).remove(0),
+            removed_replica: non_owner_replica(&current),
+            replacement_replica: non_member(&pool, &current),
         }])
         .await
         .is_err());
@@ -757,12 +805,13 @@ async fn follower_move_cannot_overwrite_newer_ownership() {
     create_feed(&control, Uuid::from_u128(520)).await;
     let original = placement(&control).await;
     let range_id = serde_json::from_value(original["range_id"].clone()).unwrap();
+    let pool = storage_nodes(&["storage-1", "storage-2", "storage-3", "storage-4"]);
     let prepared = control
         .execute_commands(vec![Command::PrepareFollowerMove {
             feed: "orders.created".to_owned(),
             range_id,
-            removed_replica: storage_nodes(&["storage-3"]).remove(0),
-            replacement_replica: storage_nodes(&["storage-4"]).remove(0),
+            removed_replica: non_owner_replica(&original),
+            replacement_replica: non_member(&pool, &original),
         }])
         .await
         .unwrap();
@@ -777,12 +826,13 @@ async fn follower_move_cannot_overwrite_newer_ownership() {
         }])
         .await
         .unwrap();
+    let recovered_owner = non_owner_replica(&original);
     control
         .execute_commands(vec![Command::RecoverActiveRangeOwnership {
             feed: "orders.created".to_owned(),
-            expected_owner: storage_nodes(&["storage-1"]).remove(0),
+            expected_owner: placed_owner(&original),
             expected_epoch: finnstream::active_range::OwnershipEpoch::new(1),
-            new_owner: storage_nodes(&["storage-2"]).remove(0),
+            new_owner: recovered_owner.clone(),
         }])
         .await
         .unwrap();
@@ -793,8 +843,197 @@ async fn follower_move_cannot_overwrite_newer_ownership() {
         }])
         .await
         .is_err());
-    assert_eq!(placement(&control).await["owner"], "storage-2");
+    assert_eq!(placed_owner(&placement(&control).await), recovered_owner);
     assert_eq!(placement(&control).await["replicas"], original["replicas"]);
+}
+
+#[tokio::test]
+async fn registered_storage_nodes_join_the_eligible_pool_and_survive_restart() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    let shown = control
+        .execute("SHOW STORAGE NODES;")
+        .await
+        .unwrap()
+        .results
+        .remove(0)
+        .data;
+    assert_eq!(shown.as_array().unwrap().len(), 3);
+    assert!(shown
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["source"] == "configured" && entry["eligible"] == true));
+
+    control
+        .execute("REGISTER STORAGE NODE storage-4 AT http://storage-4:7070;")
+        .await
+        .unwrap();
+    // Re-registering the same endpoint is idempotent; a different endpoint is refused.
+    control
+        .execute("REGISTER STORAGE NODE storage-4 AT http://storage-4:7070;")
+        .await
+        .unwrap();
+    assert!(control
+        .execute("REGISTER STORAGE NODE storage-4 AT http://storage-4:9090;")
+        .await
+        .is_err());
+    assert!(control
+        .execute("REGISTER STORAGE NODE storage-5 AT not-a-url;")
+        .await
+        .is_err());
+
+    let shown = control
+        .execute("SHOW STORAGE NODES;")
+        .await
+        .unwrap()
+        .results
+        .remove(0)
+        .data;
+    let entries = shown.as_array().unwrap();
+    assert_eq!(entries.len(), 4);
+    let storage4 = entries
+        .iter()
+        .find(|entry| entry["node"] == "storage-4")
+        .unwrap();
+    assert_eq!(storage4["source"], "registered");
+    assert_eq!(storage4["endpoint"], "http://storage-4:7070");
+    assert_eq!(storage4["eligible"], true);
+
+    // Retiring a registered Node that holds no placements removes it from
+    // the pool immediately; a second retire is refused as unknown.
+    control
+        .execute("REGISTER STORAGE NODE storage-5 AT http://storage-5:7070;")
+        .await
+        .unwrap();
+    control
+        .execute("RETIRE STORAGE NODE storage-5;")
+        .await
+        .unwrap();
+    assert!(control
+        .execute("RETIRE STORAGE NODE storage-5;")
+        .await
+        .is_err());
+    let shown = control
+        .execute("SHOW STORAGE NODES;")
+        .await
+        .unwrap()
+        .results
+        .remove(0)
+        .data;
+    let storage5 = shown
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["node"] == "storage-5")
+        .unwrap();
+    assert_eq!(storage5["eligible"], false);
+
+    // Registered Nodes widen Feed placement beyond the configured pool.
+    create_feed(&control, Uuid::from_u128(700)).await;
+    for index in 0..8 {
+        control
+            .execute_commands(vec![
+                Command::CreateSpace {
+                    name: format!("space{index}"),
+                },
+                Command::CreateFeed {
+                    name: format!("space{index}.events"),
+                },
+            ])
+            .await
+            .unwrap();
+    }
+    let placement = placement(&control).await;
+    let replicas = placed_replicas(&placement);
+    assert_eq!(replicas.len(), 3);
+    for node in &replicas {
+        assert!(
+            storage_nodes(&["storage-1", "storage-2", "storage-3", "storage-4"]).contains(node)
+        );
+    }
+
+    // A Node that still holds placements cannot be retired: it must be
+    // drained by moves first, so scale-in cannot strand replicas.
+    let held = replicas[0].clone();
+    let refused = control
+        .execute(&format!("RETIRE STORAGE NODE {held};"))
+        .await;
+    assert!(refused.is_err());
+
+    // The pool survives catalog restart.
+    drop(control);
+    let reopened = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    let shown = reopened
+        .execute("SHOW STORAGE NODES;")
+        .await
+        .unwrap()
+        .results
+        .remove(0)
+        .data;
+    let storage5 = shown
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["node"] == "storage-5")
+        .unwrap();
+    assert_eq!(storage5["eligible"], false);
+    let storage4 = shown
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["node"] == "storage-4")
+        .unwrap();
+    assert_eq!(storage4["eligible"], true);
+}
+
+#[tokio::test]
+async fn feed_creation_spreads_replicas_across_a_widened_eligible_pool() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    control
+        .execute(
+            "REGISTER STORAGE NODE storage-4 AT http://storage-4:7070;              REGISTER STORAGE NODE storage-5 AT http://storage-5:7070;",
+        )
+        .await
+        .unwrap();
+    let mut used = std::collections::BTreeSet::new();
+    let mut sets = std::collections::BTreeSet::new();
+    for index in 0..10 {
+        control
+            .execute_commands(vec![
+                Command::CreateSpace {
+                    name: format!("space{index}"),
+                },
+                Command::CreateFeed {
+                    name: format!("space{index}.events"),
+                },
+            ])
+            .await
+            .unwrap();
+        let feed = control
+            .active_feed_by_name(&format!("space{index}.events"))
+            .await
+            .unwrap();
+        let assignment = control.active_range_assignment(feed.feed_id).await.unwrap();
+        for node in assignment.replicas.as_array() {
+            used.insert(node.clone());
+        }
+        let mut set = assignment.replicas.as_array().to_vec();
+        set.sort();
+        sets.insert(set);
+    }
+    assert!(used.len() >= 4);
+    assert!(sets.len() >= 2);
 }
 
 #[tokio::test]

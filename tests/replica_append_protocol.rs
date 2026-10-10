@@ -20,6 +20,8 @@ struct Fixture {
     controller: Arc<ControlController>,
     feed_id: Uuid,
     range_id: RangeId,
+    owner: StorageNodeId,
+    replicas: Vec<StorageNodeId>,
 }
 
 impl Fixture {
@@ -58,6 +60,8 @@ impl Fixture {
             controller,
             feed_id,
             range_id: placement.range_id,
+            owner: placement.owner.clone(),
+            replicas: placement.replicas.iter().cloned().collect(),
         }
     }
 
@@ -86,7 +90,7 @@ impl Fixture {
             range_id: self.range_id,
             generation: RangeGeneration::new(1),
             ownership_epoch: finnstream::active_range::OwnershipEpoch::new(1),
-            append_owner: StorageNodeId::try_new("storage-1").unwrap(),
+            append_owner: self.owner.clone(),
             expected_position: RangePosition::new(position),
             identity: AppendIdentity {
                 writer_session_id,
@@ -125,9 +129,9 @@ async fn all_assigned_replicas_persist_identical_checksummed_bytes() {
     let expected_digest =
         *blake3::hash(&STANDARD.decode(&request.frame_base64).unwrap()).as_bytes();
 
-    for replica in ["storage-1", "storage-2", "storage-3"] {
+    for replica in fixture.replicas.clone() {
         let accepted = fixture
-            .service(replica)
+            .service(replica.as_str())
             .append(request.clone())
             .await
             .unwrap();
@@ -234,7 +238,12 @@ async fn replica_rejects_wrong_range_generation_epoch_owner_and_receiver() {
     );
 
     let mut wrong_owner = fixture.request(1, 1, b"one");
-    wrong_owner.append_owner = StorageNodeId::try_new("storage-2").unwrap();
+    wrong_owner.append_owner = fixture
+        .replicas
+        .iter()
+        .find(|replica| **replica != fixture.owner)
+        .unwrap()
+        .clone();
     assert_eq!(
         service.append(wrong_owner).await.unwrap_err().code,
         ReplicaAppendErrorCode::NotCurrentOwner

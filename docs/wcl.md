@@ -248,6 +248,22 @@ INSPECT PLACEMENT FOR FEED orders.created;
 
 The standard three-Node Riverbed creates one RF3 Active Range at Feed creation. The legacy `TRANSFER ACTIVE RANGE OWNERSHIP` syntax is still recognized but deliberately rejected: metadata-only transfer could promote a follower without verified committed history. Local owner-movement verification exists, but an authenticated live operator cutover is not yet available.
 
+## Storage capacity Nodes
+
+Storage Node registration and retirement are authenticated operator controls. Application Writers and Readers do not receive physical topology.
+
+```sql
+REGISTER STORAGE NODE storage-4 AT http://storage-4:7070;
+SHOW STORAGE NODES;
+RETIRE STORAGE NODE storage-4;
+```
+
+Configured Control Plane Nodes seed the eligible storage pool, but the pool is no longer limited to voters. `REGISTER STORAGE NODE` persists a storage-capable Node in the catalog without making it a Control Plane voter. Re-registering the same Node and endpoint is idempotent; registering an existing Node with a different endpoint is rejected so a typo cannot silently redirect placement traffic.
+
+`SHOW STORAGE NODES` reports each Node's identity, `source` (`configured` or `registered`), endpoint, and current `eligible` flag. Registered eligible Nodes participate in RF3 Active Range placement, which spreads each new Feed's replicas and Append Owner across the widened pool rather than always taking the first three Nodes.
+
+`RETIRE STORAGE NODE` removes an unreferenced Node's eligibility and persists across restart. Retirement is refused while the Node still holds an Active Range assignment; move or drain every placement off the Node first, so scale-in never reduces durability.
+
 ## Rename resources
 
 ```sql

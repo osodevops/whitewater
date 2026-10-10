@@ -151,6 +151,7 @@ struct Fixture {
     control: Arc<ControlController>,
     services: BTreeMap<StorageNodeId, Arc<ReplicaAppendService>>,
     request: ReplicaAppendRequest,
+    owner: StorageNodeId,
 }
 
 impl Fixture {
@@ -170,19 +171,22 @@ impl Fixture {
             .unwrap(),
         );
         let execution = control
-            .execute_commands(vec![
-                Command::CreateSpace {
-                    name: "orders".to_owned(),
-                },
-                Command::CreateFeed {
-                    name: "orders.events".to_owned(),
-                },
-            ])
+            .execute_commands_with_request_id(
+                vec![
+                    Command::CreateSpace {
+                        name: "orders".to_owned(),
+                    },
+                    Command::CreateFeed {
+                        name: "orders.events".to_owned(),
+                    },
+                ],
+                Uuid::from_u128(600),
+            )
             .await
             .unwrap();
         let feed_id = serde_json::from_value(execution.results[1].data["feed_id"].clone()).unwrap();
         let assignment = control.active_range_assignment(feed_id).await.unwrap();
-        let owner = nodes[0].clone();
+        let owner = assignment.owner.clone();
         let services = nodes
             .into_iter()
             .map(|node| {
@@ -210,7 +214,7 @@ impl Fixture {
             range_id: assignment.range_id,
             generation: RangeGeneration::new(1),
             ownership_epoch: OwnershipEpoch::new(1),
-            append_owner: owner,
+            append_owner: owner.clone(),
             expected_position: RangePosition::new(1),
             identity: AppendIdentity {
                 writer_session_id: writer,
@@ -226,7 +230,23 @@ impl Fixture {
             control,
             services,
             request,
+            owner,
         }
+    }
+
+    fn non_owner_nodes(&self) -> Vec<StorageNodeId> {
+        self.services
+            .keys()
+            .filter(|node| **node != self.owner)
+            .cloned()
+            .collect()
+    }
+
+    fn non_owner_names(&self) -> Vec<String> {
+        self.non_owner_nodes()
+            .iter()
+            .map(|node| node.as_str().to_owned())
+            .collect()
     }
 
     fn coordinator(
@@ -263,7 +283,7 @@ impl Fixture {
             commit_pause,
         };
         MajorityAppendCoordinator::new(
-            self.services[&StorageNodeId::try_new("storage-1").unwrap()].clone(),
+            self.services[&self.owner].clone(),
             self.control.clone(),
             Arc::new(transport),
         )
@@ -284,10 +304,11 @@ async fn three_healthy_replicas_commit_with_three_matching_evidence_records() {
 
 #[tokio::test]
 async fn either_follower_can_form_a_two_of_three_majority_with_the_owner() {
-    for unavailable in ["storage-2", "storage-3"] {
+    let probe = Fixture::new().await;
+    for unavailable in probe.non_owner_names() {
         let fixture = Fixture::new().await;
         let result = fixture
-            .coordinator(&[unavailable], &[], None)
+            .coordinator(&[&unavailable], &[], None)
             .append(fixture.request.clone())
             .await
             .unwrap();
@@ -295,7 +316,7 @@ async fn either_follower_can_form_a_two_of_three_majority_with_the_owner() {
         assert_eq!(result.commit_evidence.len(), 2);
         assert!(!result
             .durable_replicas
-            .contains(&StorageNodeId::try_new(unavailable).unwrap()));
+            .contains(&StorageNodeId::try_new(unavailable.as_str()).unwrap()));
     }
 }
 
@@ -334,7 +355,7 @@ async fn split_freeze_waits_for_in_flight_majority_commit_before_truncating_owne
         .await
         .unwrap();
     let pause = CommitPause {
-        node: StorageNodeId::try_new("storage-2").unwrap(),
+        node: fixture.non_owner_nodes().remove(0),
         entered: Arc::new(tokio::sync::Notify::new()),
         release: Arc::new(tokio::sync::Notify::new()),
     };
@@ -379,7 +400,8 @@ async fn split_freeze_waits_for_in_flight_majority_commit_before_truncating_owne
 #[tokio::test]
 async fn follower_move_freeze_discards_only_the_uncommitted_owner_tail() {
     let fixture = Fixture::new().await;
-    let owner = fixture.coordinator(&["storage-2", "storage-3"], &[], None);
+    let down: Vec<String> = fixture.non_owner_names();
+    let owner = fixture.coordinator(&[down[0].as_str(), down[1].as_str()], &[], None);
     assert_eq!(
         owner
             .append(fixture.request.clone())
@@ -431,8 +453,9 @@ async fn owner_move_fences_old_owner_only_after_verified_catch_up() {
         .await
         .unwrap();
     let source = fixture.services[&original.owner].clone();
-    let target = fixture.services[&StorageNodeId::try_new("storage-2").unwrap()].clone();
-    let owner = Arc::new(fixture.coordinator(&[], &["storage-2"], None));
+    let target_name = fixture.non_owner_names().remove(0);
+    let target = fixture.services[&StorageNodeId::try_new(target_name.as_str()).unwrap()].clone();
+    let owner = Arc::new(fixture.coordinator(&[], &[target_name.as_str()], None));
     owner.append(fixture.request.clone()).await.unwrap();
     let prepared = fixture
         .control
@@ -617,7 +640,8 @@ async fn owner_move_rejects_a_caught_up_follower_with_different_bytes() {
         .await
         .unwrap();
     let source = fixture.services[&original.owner].clone();
-    let target = fixture.services[&StorageNodeId::try_new("storage-2").unwrap()].clone();
+    let target_name = fixture.non_owner_names().remove(0);
+    let target = fixture.services[&StorageNodeId::try_new(target_name.as_str()).unwrap()].clone();
     let owner = Arc::new(fixture.coordinator(&[], &[], None));
     owner.append(fixture.request.clone()).await.unwrap();
     target
@@ -724,7 +748,9 @@ async fn committed_range_pages_require_the_current_owner_and_preserve_the_bounda
         .await
         .unwrap();
     let owner = fixture.services[&assignment.owner].clone();
-    let follower = fixture.services[&StorageNodeId::try_new("storage-2").unwrap()].clone();
+    let follower_name = fixture.non_owner_names().remove(0);
+    let follower =
+        fixture.services[&StorageNodeId::try_new(follower_name.as_str()).unwrap()].clone();
     let (empty_boundary, empty) = owner
         .read_owned_range_page(&assignment, None, None, 32)
         .await
@@ -846,7 +872,9 @@ async fn read_evidence_exposes_owner_data_loss_instead_of_claiming_empty_history
         .await
         .unwrap();
     let owner = fixture.services[&assignment.owner].clone();
-    let follower = fixture.services[&StorageNodeId::try_new("storage-2").unwrap()].clone();
+    let follower_name = fixture.non_owner_names().remove(0);
+    let follower =
+        fixture.services[&StorageNodeId::try_new(follower_name.as_str()).unwrap()].clone();
     let boundary = CommitPosition::new(1);
     let original = owner
         .read_replica_evidence(&assignment, boundary)
@@ -944,7 +972,14 @@ async fn cursor_pages_continue_after_a_bounded_batch_without_rescanning_the_pref
 async fn one_healthy_replica_never_returns_success() {
     let fixture = Fixture::new().await;
     let error = fixture
-        .coordinator(&["storage-2", "storage-3"], &[], None)
+        .coordinator(
+            &[
+                fixture.non_owner_names()[0].as_str(),
+                fixture.non_owner_names()[1].as_str(),
+            ],
+            &[],
+            None,
+        )
         .append(fixture.request.clone())
         .await
         .unwrap_err();
@@ -956,7 +991,14 @@ async fn one_healthy_replica_never_returns_success() {
 async fn frame_majority_without_commit_majority_returns_retryable_ambiguous_failure() {
     let fixture = Fixture::new().await;
     let error = fixture
-        .coordinator(&[], &["storage-2", "storage-3"], None)
+        .coordinator(
+            &[],
+            &[
+                fixture.non_owner_names()[0].as_str(),
+                fixture.non_owner_names()[1].as_str(),
+            ],
+            None,
+        )
         .append(fixture.request.clone())
         .await
         .unwrap_err();
@@ -969,7 +1011,7 @@ async fn frame_majority_without_commit_majority_returns_retryable_ambiguous_fail
 async fn conflicting_follower_digest_is_rejected() {
     let fixture = Fixture::new().await;
     let error = fixture
-        .coordinator(&[], &[], Some("storage-2"))
+        .coordinator(&[], &[], Some(fixture.non_owner_names()[0].as_str()))
         .append(fixture.request.clone())
         .await
         .unwrap_err();

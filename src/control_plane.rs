@@ -703,11 +703,10 @@ impl ControlPlane {
             let response = match self.controller.applied_result(command_request_id).await {
                 Some(response) => response,
                 None => {
-                    let replicated = self.controller.prepare_replicated(
-                        command_request_id,
-                        issued_at_ns,
-                        command,
-                    )?;
+                    let replicated = self
+                        .controller
+                        .prepare_replicated(command_request_id, issued_at_ns, command)
+                        .await?;
                     self.submit(replicated).await?
                 }
             };

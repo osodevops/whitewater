@@ -282,6 +282,13 @@ pub struct RangeOwnerMovePlan {
     pub checksum_verified: bool,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageNodeRecord {
+    pub node: StorageNodeId,
+    pub endpoint: String,
+    pub registered_at_ns: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CatalogState {
     schema_version: u32,
@@ -319,6 +326,10 @@ struct CatalogState {
     #[serde(default)]
     completed_owner_move_plans: BTreeMap<RangeId, RangeOwnerMovePlan>,
     #[serde(default)]
+    storage_nodes: BTreeMap<StorageNodeId, StorageNodeRecord>,
+    #[serde(default)]
+    retired_storage_nodes: BTreeSet<StorageNodeId>,
+    #[serde(default)]
     applied_requests: BTreeMap<Uuid, ReplicatedCommandResult>,
 }
 
@@ -353,6 +364,8 @@ impl Default for CatalogState {
             active_ranges: BTreeMap::new(),
             range_maps: BTreeMap::new(),
             range_assignments: BTreeMap::new(),
+            storage_nodes: BTreeMap::new(),
+            retired_storage_nodes: BTreeSet::new(),
             range_split_plans: BTreeMap::new(),
             range_merge_plans: BTreeMap::new(),
             range_move_plans: BTreeMap::new(),
@@ -387,6 +400,7 @@ pub enum ShowKind {
     Subscriptions,
     Roles,
     Grants,
+    StorageNodes,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -603,6 +617,13 @@ pub enum Command {
         replaced: StorageNodeId,
         replacement: StorageNodeId,
     },
+    RegisterStorageNode {
+        node: StorageNodeId,
+        endpoint: String,
+    },
+    RetireStorageNode {
+        node: StorageNodeId,
+    },
 }
 
 impl Command {
@@ -748,18 +769,19 @@ impl ControlController {
         })
     }
 
-    pub fn prepare_replicated(
+    pub async fn prepare_replicated(
         &self,
         request_id: Uuid,
         issued_at_ns: i64,
         command: Command,
     ) -> Result<ReplicatedCommand, ControlError> {
+        let state = self.state.lock().await;
         if let Command::PrepareFollowerMove {
             replacement_replica,
             ..
         } = &command
         {
-            if !self.eligible_storage_nodes.contains(replacement_replica) {
+            if !self.storage_eligible(&state, replacement_replica) {
                 return Err(ControlError::InvalidOperation(format!(
                     "replacement Node {replacement_replica} is not eligible for storage"
                 )));
@@ -769,16 +791,25 @@ impl ControlController {
             &command,
             Command::CreateFeed { .. } | Command::PrepareActiveRangeSplit { .. }
         )
-        .then(|| self.select_fixed_active_range())
+        .then(|| {
+            let seed = match &command {
+                Command::PrepareActiveRangeSplit { .. } => {
+                    derived_resource_id(request_id, "active-range-split-right")
+                }
+                _ => derived_resource_id(request_id, "active-range"),
+            };
+            self.select_fixed_active_range(&state, &seed)
+        })
         .transpose()?;
         let fixed_subscription_progress = matches!(&command, Command::CreateSubscription { .. })
             .then(|| {
-                self.select_fixed_subscription_progress(derived_resource_id(
-                    request_id,
-                    "subscription",
-                ))
+                self.select_fixed_subscription_progress(
+                    &state,
+                    derived_resource_id(request_id, "subscription"),
+                )
             })
             .transpose()?;
+        drop(state);
         Ok(ReplicatedCommand {
             request_id,
             issued_at_ns,
@@ -788,12 +819,43 @@ impl ControlController {
         })
     }
 
-    fn select_fixed_active_range(&self) -> Result<FixedActiveRangePlacement, ControlError> {
-        let replicas = self
-            .eligible_storage_nodes
+    fn storage_pool(&self, state: &CatalogState) -> BTreeSet<StorageNodeId> {
+        self.eligible_storage_nodes
             .iter()
-            .take(ACTIVE_RANGE_REPLICA_COUNT)
+            .chain(state.storage_nodes.keys())
+            .filter(|node| !state.retired_storage_nodes.contains(*node))
             .cloned()
+            .collect()
+    }
+
+    fn storage_eligible(&self, state: &CatalogState, node: &StorageNodeId) -> bool {
+        (self.eligible_storage_nodes.contains(node) || state.storage_nodes.contains_key(node))
+            && !state.retired_storage_nodes.contains(node)
+    }
+
+    fn select_fixed_active_range(
+        &self,
+        state: &CatalogState,
+        seed: &Uuid,
+    ) -> Result<FixedActiveRangePlacement, ControlError> {
+        let mut ranked = self
+            .storage_pool(state)
+            .into_iter()
+            .map(|node| {
+                let mut hash = blake3::Hasher::new();
+                hash.update(b"whitewater-active-range-v1");
+                hash.update(seed.as_bytes());
+                hash.update(node.as_str().as_bytes());
+                (*hash.finalize().as_bytes(), node)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_unstable_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
+        });
+        let replicas = ranked
+            .into_iter()
+            .take(ACTIVE_RANGE_REPLICA_COUNT)
+            .map(|(_, node)| node)
             .collect::<Vec<_>>();
         let replicas: [StorageNodeId; ACTIVE_RANGE_REPLICA_COUNT] = replicas.try_into().map_err(
             |replicas: Vec<StorageNodeId>| {
@@ -811,17 +873,18 @@ impl ControlController {
 
     fn select_fixed_subscription_progress(
         &self,
+        state: &CatalogState,
         subscription_id: Uuid,
     ) -> Result<FixedSubscriptionProgressPlacement, ControlError> {
         let mut ranked = self
-            .eligible_storage_nodes
-            .iter()
+            .storage_pool(state)
+            .into_iter()
             .map(|node| {
                 let mut hash = blake3::Hasher::new();
                 hash.update(b"whitewater-subscription-progress-v1");
                 hash.update(subscription_id.as_bytes());
                 hash.update(node.as_str().as_bytes());
-                (*hash.finalize().as_bytes(), node.clone())
+                (*hash.finalize().as_bytes(), node)
             })
             .collect::<Vec<_>>();
         ranked.sort_unstable_by(|left, right| {
@@ -881,11 +944,13 @@ impl ControlController {
                 revision = self.revision().await;
                 continue;
             }
-            let replicated = self.prepare_replicated(
-                derive_command_request_id(request_id, index),
-                issued_at_ns,
-                command,
-            )?;
+            let replicated = self
+                .prepare_replicated(
+                    derive_command_request_id(request_id, index),
+                    issued_at_ns,
+                    command,
+                )
+                .await?;
             let response = self.apply_replicated(replicated).await;
             revision = response.revision;
             match (response.result, response.error) {
@@ -1746,7 +1811,7 @@ impl ControlController {
             Command::Drop { kind, name } => self.drop_resource(state, kind, &name),
             Command::Show { kind } => Ok((
                 format!("showing {}", show_name(&kind)),
-                show_resources(state, kind),
+                show_resources(state, kind, &self.eligible_storage_nodes),
             )),
             Command::Describe { kind, name } => Ok((
                 format!("described {} {name}", resource_name(&kind)),
@@ -1934,7 +1999,7 @@ impl ControlController {
                         "replacement owner {new_owner} is not a member of the Subscription progress replica set"
                     )));
                 }
-                if !self.eligible_storage_nodes.contains(&new_owner) {
+                if !self.storage_eligible(state, &new_owner) {
                     return Err(ControlError::InvalidOperation(format!(
                         "replacement owner {new_owner} is not eligible for storage"
                     )));
@@ -1998,7 +2063,7 @@ impl ControlController {
                         "replacement Node {replacement} is already a Subscription progress replica"
                     )));
                 }
-                if !self.eligible_storage_nodes.contains(&replacement) {
+                if !self.storage_eligible(state, &replacement) {
                     return Err(ControlError::InvalidOperation(format!(
                         "replacement Node {replacement} is not eligible for storage"
                     )));
@@ -2031,6 +2096,56 @@ impl ControlController {
                         "moved Subscription progress replica {replaced} to {replacement} at epoch {next_epoch}"
                     ),
                     json!(next),
+                ))
+            }
+            Command::RegisterStorageNode { node, endpoint } => {
+                if let Some(existing) = state.storage_nodes.get(&node) {
+                    if existing.endpoint != endpoint {
+                        return Err(ControlError::InvalidOperation(format!(
+                            "storage Node {node} is already registered with a different endpoint; retire it before re-registering"
+                        )));
+                    }
+                    let record = existing.clone();
+                    return Ok((
+                        format!("storage Node {node} is already registered"),
+                        json!(record),
+                    ));
+                }
+                if endpoint.trim().is_empty()
+                    || !matches!(
+                        endpoint.split_once("://").map(|(scheme, _)| scheme),
+                        Some("http" | "https")
+                    )
+                {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "storage Node {node} endpoint must be an http or https URL"
+                    )));
+                }
+                let record = StorageNodeRecord {
+                    node: node.clone(),
+                    endpoint,
+                    registered_at_ns: issued_at_ns,
+                };
+                state.retired_storage_nodes.remove(&node);
+                state.storage_nodes.insert(node.clone(), record.clone());
+                Ok((format!("registered storage Node {node}"), json!(record)))
+            }
+            Command::RetireStorageNode { node } => {
+                let known = state.storage_nodes.contains_key(&node)
+                    || self.eligible_storage_nodes.contains(&node);
+                if !known || state.retired_storage_nodes.contains(&node) {
+                    return Err(ControlError::NotFound(format!("storage Node {node}")));
+                }
+                if let Some(holder) = storage_node_in_use(state, &node) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "storage Node {node} still holds {holder}; move every placement off it before retiring"
+                    )));
+                }
+                state.storage_nodes.remove(&node);
+                state.retired_storage_nodes.insert(node.clone());
+                Ok((
+                    format!("retired storage Node {node}"),
+                    json!({ "node": node, "retired": true }),
                 ))
             }
             Command::PrepareActiveRangeSplit { feed, split_at } => {
@@ -3057,8 +3172,31 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             name: token(&tokens, 2)?.to_owned(),
         }),
         Some("SHOW") => Ok(Command::Show {
-            kind: parse_show_kind(token(&tokens, 1)?)?,
+            kind: if token(&tokens, 1)?.eq_ignore_ascii_case("STORAGE") {
+                expect_keyword(&tokens, 2, "NODES")?;
+                ShowKind::StorageNodes
+            } else {
+                parse_show_kind(token(&tokens, 1)?)?
+            },
         }),
+        Some("REGISTER") => {
+            expect_keyword(&tokens, 1, "STORAGE")?;
+            expect_keyword(&tokens, 2, "NODE")?;
+            expect_keyword(&tokens, 4, "AT")?;
+            Ok(Command::RegisterStorageNode {
+                node: StorageNodeId::try_new(token(&tokens, 3)?.to_owned())
+                    .map_err(|error| ControlError::Syntax(error.to_string()))?,
+                endpoint: token(&tokens, 5)?.to_owned(),
+            })
+        }
+        Some("RETIRE") => {
+            expect_keyword(&tokens, 1, "STORAGE")?;
+            expect_keyword(&tokens, 2, "NODE")?;
+            Ok(Command::RetireStorageNode {
+                node: StorageNodeId::try_new(token(&tokens, 3)?.to_owned())
+                    .map_err(|error| ControlError::Syntax(error.to_string()))?,
+            })
+        }
         Some("DESCRIBE") => Ok(Command::Describe {
             kind: parse_resource_kind(token(&tokens, 1)?)?,
             name: token(&tokens, 2)?.to_owned(),
@@ -3582,7 +3720,11 @@ fn drop_named<T: Clone + Serialize + NamedResource>(
     ))
 }
 
-fn show_resources(state: &CatalogState, kind: ShowKind) -> Value {
+fn show_resources(
+    state: &CatalogState,
+    kind: ShowKind,
+    configured: &BTreeSet<StorageNodeId>,
+) -> Value {
     match kind {
         ShowKind::Domains | ShowKind::Spaces => json!(state
             .spaces
@@ -3615,6 +3757,31 @@ fn show_resources(state: &CatalogState, kind: ShowKind) -> Value {
             .filter(|item| item.status == ResourceStatus::Active)
             .collect::<Vec<_>>()),
         ShowKind::Grants => json!(state.grants.values().collect::<Vec<_>>()),
+        ShowKind::StorageNodes => {
+            let registered: BTreeSet<&StorageNodeId> = state.storage_nodes.keys().collect();
+            json!(configured
+                .iter()
+                .chain(state.storage_nodes.keys())
+                .chain(state.retired_storage_nodes.iter())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|node| {
+                    json!({
+                        "node": node.as_str(),
+                        "endpoint": state
+                            .storage_nodes
+                            .get(node)
+                            .map(|record| record.endpoint.as_str()),
+                        "source": if registered.contains(node) {
+                            "registered"
+                        } else {
+                            "configured"
+                        },
+                        "eligible": !state.retired_storage_nodes.contains(node),
+                    })
+                })
+                .collect::<Vec<_>>())
+        }
     }
 }
 
@@ -3646,6 +3813,53 @@ fn describe_resource(
             .ok_or_else(|| ControlError::NotFound(format!("Subscription {name}"))),
         ResourceKind::Role => Ok(json!(active_role(state, name)?)),
     }
+}
+
+/// Returns which live or in-flight placement still references a storage Node,
+/// or None when retiring it cannot strand replicas or owners.
+fn storage_node_in_use(state: &CatalogState, node: &StorageNodeId) -> Option<&'static str> {
+    fn touches(assignment: &ActiveRangeAssignment, node: &StorageNodeId) -> bool {
+        assignment.owner == *node || assignment.replicas.contains(node)
+    }
+    if state.range_assignments.values().any(|a| touches(a, node)) {
+        return Some("an Active Range assignment");
+    }
+    if state.range_split_plans.values().any(|plan| {
+        plan.left_assignment
+            .as_ref()
+            .is_some_and(|a| touches(a, node))
+            || touches(&plan.right_assignment, node)
+    }) {
+        return Some("a pending Active Range split");
+    }
+    if state
+        .range_merge_plans
+        .values()
+        .any(|plan| touches(&plan.merged_assignment, node))
+    {
+        return Some("a pending Active Range merge");
+    }
+    if state.range_move_plans.values().any(|plan| {
+        touches(&plan.source_assignment, node)
+            || touches(&plan.candidate_assignment, node)
+            || plan.removed_replica == *node
+            || plan.replacement_replica == *node
+    }) {
+        return Some("a pending follower move");
+    }
+    if state.owner_move_plans.values().any(|plan| {
+        touches(&plan.source_assignment, node) || touches(&plan.candidate_assignment, node)
+    }) {
+        return Some("a pending owner move");
+    }
+    if state
+        .subscription_progress_assignments
+        .values()
+        .any(|assignment| assignment.owner == *node || assignment.replicas.contains(node))
+    {
+        return Some("a Subscription progress assignment");
+    }
+    None
 }
 
 fn persist_state(path: &Path, state: &CatalogState) -> Result<(), ControlError> {
@@ -3733,6 +3947,8 @@ fn command_label(command: &Command) -> String {
         Command::AbortOwnerMove { .. } => "ABORT OWNER MOVE",
         Command::RecoverSubscriptionProgressOwner { .. } => "RECOVER SUBSCRIPTION PROGRESS OWNER",
         Command::MoveSubscriptionProgressReplica { .. } => "MOVE SUBSCRIPTION PROGRESS REPLICA",
+        Command::RegisterStorageNode { .. } => "REGISTER STORAGE NODE",
+        Command::RetireStorageNode { .. } => "RETIRE STORAGE NODE",
     }
     .to_owned()
 }
@@ -3757,6 +3973,7 @@ fn show_name(kind: &ShowKind) -> &'static str {
         ShowKind::Subscriptions => "Subscriptions",
         ShowKind::Roles => "Roles",
         ShowKind::Grants => "Grants",
+        ShowKind::StorageNodes => "Storage Nodes",
     }
 }
 
@@ -4405,8 +4622,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn subscription_progress_selection_is_deterministic_for_candidate_order() {
+    #[tokio::test]
+    async fn subscription_progress_selection_is_deterministic_for_candidate_order() {
         let first_dir = TempDir::new().unwrap();
         let second_dir = TempDir::new().unwrap();
         let nodes = (0..12)
@@ -4427,8 +4644,16 @@ mod tests {
         let mut used = BTreeSet::new();
         for index in 0..32 {
             let id = Uuid::from_u128(6000 + index);
-            let left = first.select_fixed_subscription_progress(id).unwrap();
-            let right = second.select_fixed_subscription_progress(id).unwrap();
+            let left_state = first.state.lock().await;
+            let left = first
+                .select_fixed_subscription_progress(&left_state, id)
+                .unwrap();
+            drop(left_state);
+            let right_state = second.state.lock().await;
+            let right = second
+                .select_fixed_subscription_progress(&right_state, id)
+                .unwrap();
+            drop(right_state);
             assert_eq!(left, right);
             assert!(left.replicas.contains(&left.owner));
             used.extend(left.replicas);

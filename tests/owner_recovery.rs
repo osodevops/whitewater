@@ -3,9 +3,9 @@ use std::{collections::BTreeMap, sync::Arc};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use finnstream::{
     active_range::{
-        plan_owner_recovery, AppendIdentity, CommitPosition, OwnerRecoveryError, OwnershipEpoch,
-        RangeGeneration, RangePosition, ReplicaAppendRequest, ReplicaAppendService,
-        ReplicaCommitRequest, ReplicaRecoveryStatus, StorageNodeId,
+        plan_owner_recovery, AppendIdentity, CommitPosition, OwnerRecoveryError, RangeGeneration,
+        RangePosition, ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitRequest,
+        ReplicaRecoveryStatus, StorageNodeId,
     },
     codec::encode_record,
     control::{Command, ControlController, ControlError},
@@ -44,23 +44,32 @@ async fn fixture() -> (
 #[tokio::test]
 async fn failed_owner_recovery_selects_a_caught_up_replica_and_higher_epoch() {
     let (_directory, _controller, assignment) = fixture().await;
+    let owner = assignment.owner.clone();
+    let followers = assignment
+        .replicas
+        .iter()
+        .filter(|node| **node != owner)
+        .cloned()
+        .collect::<Vec<_>>();
+    let caught_up = followers[0].clone();
+    let lagging = followers[1].clone();
     let plan = plan_owner_recovery(
         &assignment,
         &[
             ReplicaRecoveryStatus {
-                node: node("storage-1"),
+                node: owner.clone(),
                 healthy: false,
                 appended: RangePosition::new(5),
                 committed: CommitPosition::new(4),
             },
             ReplicaRecoveryStatus {
-                node: node("storage-2"),
+                node: caught_up.clone(),
                 healthy: true,
                 appended: RangePosition::new(5),
                 committed: CommitPosition::new(4),
             },
             ReplicaRecoveryStatus {
-                node: node("storage-3"),
+                node: lagging,
                 healthy: true,
                 appended: RangePosition::new(4),
                 committed: CommitPosition::new(4),
@@ -68,9 +77,12 @@ async fn failed_owner_recovery_selects_a_caught_up_replica_and_higher_epoch() {
         ],
     )
     .unwrap();
-    assert_eq!(plan.previous_owner, node("storage-1"));
-    assert_eq!(plan.new_owner, node("storage-2"));
-    assert_eq!(plan.new_epoch.value(), 2);
+    assert_eq!(plan.previous_owner, owner);
+    assert_eq!(plan.new_owner, caught_up);
+    assert_eq!(
+        plan.new_epoch.value(),
+        assignment.ownership_epoch.value() + 1
+    );
     assert_eq!(plan.committed_prefix.value(), 4);
 }
 
@@ -78,7 +90,7 @@ async fn failed_owner_recovery_selects_a_caught_up_replica_and_higher_epoch() {
 async fn recovery_refuses_a_healthy_owner_or_loss_of_replica_majority() {
     let (_directory, _controller, assignment) = fixture().await;
     let healthy_owner = ReplicaRecoveryStatus {
-        node: node("storage-1"),
+        node: assignment.owner.clone(),
         healthy: true,
         appended: RangePosition::new(1),
         committed: CommitPosition::new(1),
@@ -97,7 +109,12 @@ async fn recovery_refuses_a_healthy_owner_or_loss_of_replica_majority() {
             &[
                 failed_owner,
                 ReplicaRecoveryStatus {
-                    node: node("storage-2"),
+                    node: assignment
+                        .replicas
+                        .iter()
+                        .find(|node| **node != assignment.owner)
+                        .unwrap()
+                        .clone(),
                     healthy: true,
                     appended: RangePosition::new(1),
                     committed: CommitPosition::new(1),
@@ -116,7 +133,12 @@ async fn consensus_recovery_command_is_compare_and_set_and_fences_old_owner() {
             feed: "orders.events".to_owned(),
             expected_owner: assignment.owner.clone(),
             expected_epoch: assignment.ownership_epoch,
-            new_owner: node("storage-2"),
+            new_owner: assignment
+                .replicas
+                .iter()
+                .find(|node| **node != assignment.owner)
+                .unwrap()
+                .clone(),
         }])
         .await
         .unwrap();
@@ -124,7 +146,14 @@ async fn consensus_recovery_command_is_compare_and_set_and_fences_old_owner() {
         .active_range_assignment(assignment.feed_id)
         .await
         .unwrap();
-    assert_eq!(recovered.owner, node("storage-2"));
+    assert_eq!(
+        recovered.owner,
+        *assignment
+            .replicas
+            .iter()
+            .find(|node| **node != assignment.owner)
+            .unwrap()
+    );
     assert_eq!(recovered.ownership_epoch.value(), 2);
     assert!(recovered
         .validate_request(
@@ -138,7 +167,7 @@ async fn consensus_recovery_command_is_compare_and_set_and_fences_old_owner() {
             feed: "orders.events".to_owned(),
             expected_owner: assignment.owner,
             expected_epoch: assignment.ownership_epoch,
-            new_owner: node("storage-3"),
+            new_owner: node("storage-4"),
         }])
         .await;
     assert!(matches!(stale, Err(ControlError::InvalidOperation(_))));
@@ -176,8 +205,8 @@ async fn recovered_replicas_advance_epoch_preserve_commit_and_truncate_tail() {
             feed_id: assignment.feed_id,
             range_id: assignment.range_id,
             generation: RangeGeneration::new(1),
-            ownership_epoch: OwnershipEpoch::new(1),
-            append_owner: node("storage-1"),
+            ownership_epoch: assignment.ownership_epoch,
+            append_owner: assignment.owner.clone(),
             expected_position: RangePosition::new(position),
             identity: AppendIdentity {
                 writer_session_id: writer,
@@ -193,9 +222,15 @@ async fn recovered_replicas_advance_epoch_preserve_commit_and_truncate_tail() {
     for service in services.values() {
         digest = service.append(first.clone()).await.unwrap().frame_digest;
     }
+    let followers = assignment
+        .replicas
+        .iter()
+        .filter(|node| **node != assignment.owner)
+        .cloned()
+        .collect::<Vec<_>>();
     for service in [
-        services[&node("storage-2")].clone(),
-        services[&node("storage-3")].clone(),
+        services[&followers[0]].clone(),
+        services[&followers[1]].clone(),
     ] {
         service
             .commit(ReplicaCommitRequest {
@@ -214,15 +249,15 @@ async fn recovered_replicas_advance_epoch_preserve_commit_and_truncate_tail() {
     controller
         .execute_commands(vec![Command::RecoverActiveRangeOwnership {
             feed: "orders.events".to_owned(),
-            expected_owner: node("storage-1"),
-            expected_epoch: OwnershipEpoch::new(1),
-            new_owner: node("storage-2"),
+            expected_owner: assignment.owner.clone(),
+            expected_epoch: assignment.ownership_epoch,
+            new_owner: followers[0].clone(),
         }])
         .await
         .unwrap();
     for service in [
-        services[&node("storage-2")].clone(),
-        services[&node("storage-3")].clone(),
+        services[&followers[0]].clone(),
+        services[&followers[1]].clone(),
     ] {
         assert_eq!(
             service
@@ -235,8 +270,5 @@ async fn recovered_replicas_advance_epoch_preserve_commit_and_truncate_tail() {
         assert_eq!(status.appended, RangePosition::new(1));
         assert_eq!(status.committed, CommitPosition::new(1));
     }
-    assert!(services[&node("storage-2")]
-        .append(request(2, 2))
-        .await
-        .is_err());
+    assert!(services[&followers[0]].append(request(2, 2)).await.is_err());
 }

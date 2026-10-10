@@ -416,17 +416,28 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
                 .unwrap();
         }
     }
+    let removed = original
+        .replicas
+        .iter()
+        .find(|node| **node != original.owner)
+        .unwrap()
+        .clone();
+    let replacement = services
+        .keys()
+        .find(|node| !original.replicas.contains(node))
+        .unwrap()
+        .clone();
     let prepared = control
         .execute_commands(vec![Command::PrepareFollowerMove {
             feed: "orders.events".to_owned(),
             range_id: original.range_id,
-            removed_replica: node("storage-3"),
-            replacement_replica: node("storage-4"),
+            removed_replica: removed.clone(),
+            replacement_replica: replacement.clone(),
         }])
         .await
         .unwrap();
     let plan: RangeMovePlan = serde_json::from_value(prepared.results[0].data.clone()).unwrap();
-    let target = services[&node("storage-4")].clone();
+    let target = services[&replacement].clone();
     let copied = copy_follower_move(&plan, &source, &target, 1)
         .await
         .unwrap();
@@ -493,7 +504,7 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
         control.clone(),
         coordinator.clone(),
         source.clone(),
-        services[&node("storage-2")].clone(),
+        services[&removed].clone(),
     );
     assert!(failed_executor
         .finalize(
@@ -570,8 +581,8 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
             .await
     );
     let current = control.active_range_assignment(feed_id).await.unwrap();
-    assert!(!current.replicas.contains(&node("storage-3")));
-    assert!(current.replicas.contains(&node("storage-4")));
+    assert!(!current.replicas.contains(&removed));
+    assert!(current.replicas.contains(&replacement));
     let next_record = StoredRecord {
         message_id: Uuid::from_u128(905),
         producer_id: Uuid::from_u128(900),
@@ -597,7 +608,7 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
         cursor: "cursor-5".to_owned(),
         frame_base64: STANDARD.encode(encode_record(&next_record).unwrap()),
     };
-    assert!(services[&node("storage-3")]
+    assert!(services[&removed]
         .append(next_request.clone())
         .await
         .is_err());
@@ -653,8 +664,8 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
         source.read_committed(feed_id, None, 10).await.unwrap()[2].frame
     );
     let restarted = ReplicaAppendService::new(
-        directory.path().join("storage-4"),
-        node("storage-4"),
+        directory.path().join(replacement.as_str()),
+        replacement.clone(),
         control,
     );
     let (frames, status) = tokio::join!(
