@@ -511,6 +511,7 @@ impl ReplicaAppendService {
         assignment: &ActiveRangeAssignment,
         after: Option<RangePosition>,
         expected_commit: Option<CommitPosition>,
+        page_limit: usize,
     ) -> Result<(CommitPosition, Vec<super::StoredRangeFrame>), ReplicaAppendError> {
         if self.local_node != assignment.owner
             || self
@@ -531,17 +532,15 @@ impl ReplicaAppendService {
             .map_err(map_store_error)?
             .progress
             .commit_position();
-        if committed.value() > 10_000
-            || expected_commit.is_some_and(|expected| expected > committed)
-        {
+        if expected_commit.is_some_and(|expected| expected > committed) {
             return Err(ReplicaAppendError::temporary(
                 ReplicaAppendErrorCode::StorageFailure,
-                "range exceeds the bounded 10,000-record read or lost its committed prefix",
+                "previously committed history is unavailable on the current owner",
             ));
         }
         let boundary = expected_commit.unwrap_or(committed);
         let frames = store
-            .read_committed(after, 1)
+            .read_committed_bounded(after, page_limit.clamp(1, 128), MAX_COMMITTED_READ_BYTES)
             .await
             .map_err(map_store_error)?
             .into_iter()

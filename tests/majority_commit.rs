@@ -696,6 +696,25 @@ async fn owner_move_rejects_a_caught_up_follower_with_different_bytes() {
     );
 }
 
+fn paged_request(fixture: &Fixture, sequence: u64) -> ReplicaAppendRequest {
+    let mut request = fixture.request.clone();
+    let record = StoredRecord {
+        message_id: Uuid::from_u128(700 + sequence as u128),
+        producer_id: request.identity.writer_session_id,
+        producer_sequence: sequence,
+        event_time_ns: sequence as i64,
+        ingest_time_ns: sequence as i64 + 1,
+        key: b"customer-1".to_vec(),
+        payload: format!("value-{sequence}").into_bytes(),
+        metadata: BTreeMap::new(),
+    };
+    request.expected_position = RangePosition::new(sequence);
+    request.identity.sequence = sequence;
+    request.cursor = format!("cursor-{sequence}");
+    request.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+    request
+}
+
 #[tokio::test]
 async fn committed_range_pages_require_the_current_owner_and_preserve_the_boundary() {
     let fixture = Fixture::new().await;
@@ -707,7 +726,7 @@ async fn committed_range_pages_require_the_current_owner_and_preserve_the_bounda
     let owner = fixture.services[&assignment.owner].clone();
     let follower = fixture.services[&StorageNodeId::try_new("storage-2").unwrap()].clone();
     let (empty_boundary, empty) = owner
-        .read_owned_range_page(&assignment, None, None)
+        .read_owned_range_page(&assignment, None, None, 32)
         .await
         .unwrap();
     assert_eq!(empty_boundary, CommitPosition::new(0));
@@ -718,14 +737,14 @@ async fn committed_range_pages_require_the_current_owner_and_preserve_the_bounda
         .await
         .unwrap();
     let (boundary, page) = owner
-        .read_owned_range_page(&assignment, None, None)
+        .read_owned_range_page(&assignment, None, None, 32)
         .await
         .unwrap();
     assert_eq!(boundary, CommitPosition::new(1));
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].cursor, fixture.request.cursor);
     let (_, exhausted) = owner
-        .read_owned_range_page(&assignment, Some(RangePosition::new(1)), Some(boundary))
+        .read_owned_range_page(&assignment, Some(RangePosition::new(1)), Some(boundary), 32)
         .await
         .unwrap();
     assert!(exhausted.is_empty());
@@ -756,9 +775,56 @@ async fn committed_range_pages_require_the_current_owner_and_preserve_the_bounda
             .code,
         ReplicaAppendErrorCode::PositionConflict
     );
+    for sequence in 2..=5_u64 {
+        fixture
+            .coordinator(&[], &[], None)
+            .append(paged_request(&fixture, sequence))
+            .await
+            .unwrap();
+    }
+    let (boundary, page) = owner
+        .read_owned_range_page(&assignment, None, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(boundary, CommitPosition::new(5));
+    assert_eq!(
+        page.iter()
+            .map(|frame| frame.cursor.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cursor-1", "cursor-2"]
+    );
+    let (boundary, page) = owner
+        .read_owned_range_page(&assignment, Some(RangePosition::new(2)), Some(boundary), 2)
+        .await
+        .unwrap();
+    assert_eq!(boundary, CommitPosition::new(5));
+    assert_eq!(
+        page.iter()
+            .map(|frame| frame.cursor.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cursor-3", "cursor-4"]
+    );
+    let (_, page) = owner
+        .read_owned_range_page(&assignment, Some(RangePosition::new(4)), Some(boundary), 2)
+        .await
+        .unwrap();
+    assert_eq!(
+        page.iter()
+            .map(|frame| frame.cursor.as_str())
+            .collect::<Vec<_>>(),
+        vec!["cursor-5"]
+    );
+    assert_eq!(
+        owner
+            .read_owned_range_page(&assignment, None, Some(CommitPosition::new(6)), 2)
+            .await
+            .unwrap_err()
+            .code,
+        ReplicaAppendErrorCode::StorageFailure
+    );
     assert_eq!(
         follower
-            .read_owned_range_page(&assignment, None, None)
+            .read_owned_range_page(&assignment, None, None, 32)
             .await
             .unwrap_err()
             .code,

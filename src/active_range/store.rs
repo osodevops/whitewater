@@ -1384,6 +1384,26 @@ impl<'a> ByteReader<'a> {
 
 #[cfg(test)]
 pub(crate) fn seed_committed_history(root: &Path, descriptor: &ActiveRangeDescriptor, count: u64) {
+    seed_committed_history_shaped(
+        root,
+        descriptor,
+        count,
+        &|_| b"key".to_vec(),
+        &|sequence| sequence as i64,
+        0,
+    );
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn seed_committed_history_shaped(
+    root: &Path,
+    descriptor: &ActiveRangeDescriptor,
+    count: u64,
+    key_for: &dyn Fn(u64) -> Vec<u8>,
+    ingest_for: &dyn Fn(u64) -> i64,
+    payload_len: usize,
+) {
     drop(FileActiveRangeStore::open(root, descriptor.clone()).unwrap());
     let directory = range_directory(root, descriptor);
     let writer_session_id = Uuid::from_u128(3);
@@ -1394,9 +1414,9 @@ pub(crate) fn seed_committed_history(root: &Path, descriptor: &ActiveRangeDescri
             producer_id: writer_session_id,
             producer_sequence: sequence,
             event_time_ns: sequence as i64,
-            ingest_time_ns: sequence as i64,
-            key: b"key".to_vec(),
-            payload: Vec::new(),
+            ingest_time_ns: ingest_for(sequence),
+            key: key_for(sequence),
+            payload: vec![0xAB; payload_len],
             metadata: std::collections::BTreeMap::new(),
         };
         let frame = crate::codec::encode_record(&record).unwrap();

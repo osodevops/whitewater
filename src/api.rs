@@ -3965,7 +3965,12 @@ async fn read_owned_range_page(
         ));
     } else {
         service
-            .read_owned_range_page(&request.assignment, request.after, expected_commit)
+            .read_owned_range_page(
+                &request.assignment,
+                request.after,
+                expected_commit,
+                request.page_limit.unwrap_or(32),
+            )
             .await
             .map(|(commit, frames)| (commit, request.after, frames))
     }
@@ -4419,6 +4424,190 @@ async fn read_reader_frontier(
     Ok((records, progress))
 }
 
+struct RangeFrameStream<'a> {
+    state: &'a AppState,
+    assignment: &'a ActiveRangeAssignment,
+    boundary: Option<CommitPosition>,
+    after: Option<RangePosition>,
+    pending: std::collections::VecDeque<StoredRangeFrame>,
+    exhausted: bool,
+}
+
+impl RangeFrameStream<'_> {
+    fn new<'a>(state: &'a AppState, assignment: &'a ActiveRangeAssignment) -> RangeFrameStream<'a> {
+        RangeFrameStream {
+            state,
+            assignment,
+            boundary: None,
+            after: None,
+            pending: std::collections::VecDeque::new(),
+            exhausted: false,
+        }
+    }
+
+    async fn next_frame(&mut self) -> Result<Option<StoredRangeFrame>, ApiError> {
+        loop {
+            if let Some(frame) = self.pending.pop_front() {
+                return Ok(Some(frame));
+            }
+            if self.exhausted {
+                return Ok(None);
+            }
+            let page = fetch_range_page(
+                self.state,
+                ReadRangePageRequest {
+                    assignment: self.assignment.clone(),
+                    after: self.after,
+                    expected_commit: self.boundary,
+                    after_cursor: None,
+                    tail_count: None,
+                    single_range: false,
+                    page_limit: Some(128),
+                },
+            )
+            .await?;
+            if self
+                .boundary
+                .is_some_and(|expected| expected != page.committed)
+            {
+                return Err(ApiError::unavailable(
+                    "committed range boundary changed during read; retry with the same Cursor",
+                ));
+            }
+            self.boundary = Some(page.committed);
+            let mut expected = self.after.map_or(1, |position: RangePosition| {
+                position.value().saturating_add(1)
+            });
+            for frame in page.frames {
+                if frame.position.value() != expected
+                    || frame.position.value() > page.committed.value()
+                {
+                    return Err(ApiError::unavailable(
+                        "current owner returned a gapped committed range",
+                    ));
+                }
+                let decoded = STANDARD
+                    .decode(frame.frame_base64.as_bytes())
+                    .map_err(|_| {
+                        ApiError::unavailable("current owner returned an invalid frame encoding")
+                    })?;
+                if decoded.len() > MAX_LOGICAL_READ_BYTES {
+                    return Err(ApiError::unavailable(
+                        "record exceeds the bounded Feed read byte budget",
+                    ));
+                }
+                self.pending.push_back(StoredRangeFrame {
+                    position: frame.position,
+                    identity: frame.identity,
+                    cursor: frame.cursor,
+                    frame: decoded,
+                });
+                self.after = Some(frame.position);
+                expected = expected.saturating_add(1);
+            }
+            if self.after.map_or(0, RangePosition::value) >= page.committed.value() {
+                self.exhausted = true;
+            } else if self.pending.is_empty() {
+                return Err(ApiError::unavailable(
+                    "current owner omitted committed range frames",
+                ));
+            }
+        }
+    }
+}
+
+async fn read_paginated_feed(
+    state: &AppState,
+    feed_id: Uuid,
+    feed_name: &str,
+    after: Option<&str>,
+    limit: usize,
+) -> Result<Vec<StoredRangeFrame>, ApiError> {
+    let assignments = read_placement(state, feed_id, feed_name).await?;
+    if assignments.len() == 1 {
+        return read_single_range(
+            state,
+            feed_id,
+            feed_name,
+            &assignments[0],
+            after,
+            limit,
+            SingleRangeReadMode {
+                tail: false,
+                require_complete: false,
+            },
+        )
+        .await;
+    }
+    let limit = limit.min(MAX_LOGICAL_READ_FRAMES);
+    let mut streams: Vec<RangeFrameStream> = assignments
+        .iter()
+        .map(|assignment| RangeFrameStream::new(state, assignment))
+        .collect();
+    let mut heads: Vec<Option<((i64, Uuid), StoredRangeFrame)>> =
+        (0..streams.len()).map(|_| None).collect();
+    let mut emitted: Vec<StoredRangeFrame> = Vec::new();
+    let mut bytes = 0_usize;
+    let mut found_after = after.is_none();
+    loop {
+        for index in 0..streams.len() {
+            if heads[index].is_none() {
+                heads[index] = match streams[index].next_frame().await? {
+                    Some(frame) => {
+                        let record = decode_record(&frame.frame)
+                            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                        Some(((record.ingest_time_ns, record.message_id), frame))
+                    }
+                    None => None,
+                };
+            }
+        }
+        let Some(index) = heads
+            .iter()
+            .enumerate()
+            .filter_map(|(index, head)| head.as_ref().map(|(key, _)| (index, *key)))
+            .min_by_key(|(index, key)| (*key, *index))
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let Some((_, frame)) = heads[index].take() else {
+            continue;
+        };
+        if !found_after {
+            if after == Some(frame.cursor.as_str()) {
+                found_after = true;
+            }
+            continue;
+        }
+        if emitted.len() >= limit {
+            break;
+        }
+        let frame_bytes = frame.frame.len() + frame.cursor.len();
+        if bytes.saturating_add(frame_bytes) > MAX_LOGICAL_READ_BYTES {
+            if emitted.is_empty() {
+                return Err(ApiError::unavailable(
+                    "record exceeds the bounded Feed read byte budget",
+                ));
+            }
+            break;
+        }
+        bytes = bytes.saturating_add(frame_bytes);
+        emitted.push(frame);
+    }
+    if !found_after {
+        return Err(ApiError::bad_request(
+            "Cursor is unknown, uncommitted, or belongs to another Feed",
+        ));
+    }
+    if read_placement(state, feed_id, feed_name).await? != assignments {
+        return Err(ApiError::unavailable(
+            "Feed placement changed during read; retry with the same Cursor",
+        ));
+    }
+    Ok(emitted)
+}
+
 async fn read_complete_feed(
     state: &AppState,
     feed_id: Uuid,
@@ -4444,6 +4633,9 @@ async fn read_complete_feed(
         )
         .await;
     }
+    if !tail && !require_complete {
+        return read_paginated_feed(state, feed_id, feed_name, after, limit).await;
+    }
     let mut merged = Vec::new();
     let mut bytes = 0_usize;
     for assignment in &assignments {
@@ -4457,7 +4649,7 @@ async fn read_complete_feed(
                 after_cursor: None,
                 tail_count: None,
                 single_range: false,
-                page_limit: None,
+                page_limit: Some(128),
             };
             let page = fetch_range_page(state, request).await?;
             if boundary.is_some_and(|expected| expected != page.committed)
@@ -4471,36 +4663,38 @@ async fn read_complete_feed(
             if after_position.map_or(0, RangePosition::value) >= page.committed.value() {
                 break;
             }
-            let frame = page.frames.into_iter().next().ok_or_else(|| {
-                ApiError::unavailable("current owner omitted a committed range frame")
-            })?;
-            let next = after_position.map_or(1, |position: RangePosition| {
+            let mut expected = after_position.map_or(1, |position: RangePosition| {
                 position.value().saturating_add(1)
             });
-            if frame.position.value() != next || frame.position.value() > page.committed.value() {
-                return Err(ApiError::unavailable(
-                    "current owner returned a gapped committed range",
-                ));
+            for frame in page.frames {
+                if frame.position.value() != expected
+                    || frame.position.value() > page.committed.value()
+                {
+                    return Err(ApiError::unavailable(
+                        "current owner returned a gapped committed range",
+                    ));
+                }
+                let decoded = STANDARD
+                    .decode(frame.frame_base64.as_bytes())
+                    .map_err(|_| {
+                        ApiError::unavailable("current owner returned an invalid frame encoding")
+                    })?;
+                bytes = bytes.saturating_add(decoded.len() + frame.cursor.len());
+                if decoded.len() > MAX_LOGICAL_READ_BYTES
+                    || bytes > MAX_LOGICAL_READ_BYTES
+                    || merged.len() >= MAX_LOGICAL_READ_FRAMES
+                {
+                    return Err(ApiError::unavailable("Feed history exceeds the bounded read budget; scalable continuation is not available"));
+                }
+                merged.push(StoredRangeFrame {
+                    position: frame.position,
+                    identity: frame.identity,
+                    cursor: frame.cursor,
+                    frame: decoded,
+                });
+                after_position = Some(frame.position);
+                expected = expected.saturating_add(1);
             }
-            let decoded = STANDARD
-                .decode(frame.frame_base64.as_bytes())
-                .map_err(|_| {
-                    ApiError::unavailable("current owner returned an invalid frame encoding")
-                })?;
-            bytes = bytes.saturating_add(decoded.len() + frame.cursor.len());
-            if decoded.len() > MAX_LOGICAL_READ_BYTES
-                || bytes > MAX_LOGICAL_READ_BYTES
-                || merged.len() >= MAX_LOGICAL_READ_FRAMES
-            {
-                return Err(ApiError::unavailable("Feed history exceeds the bounded read budget; scalable continuation is not available"));
-            }
-            merged.push(StoredRangeFrame {
-                position: frame.position,
-                identity: frame.identity,
-                cursor: frame.cursor,
-                frame: decoded,
-            });
-            after_position = Some(frame.position);
         }
     }
     if read_placement(state, feed_id, feed_name).await? != assignments {
@@ -4966,8 +5160,10 @@ mod tests {
     use super::*;
     use crate::{
         active_range::{
-            store::seed_committed_history, ActiveRangeDescriptor, OwnershipEpoch, RangeGeneration,
-            ReplicaSet,
+            orchestrate_split_cutover,
+            store::{seed_committed_history, seed_committed_history_shaped},
+            ActiveRangeDescriptor, FrozenSplitBoundary, OwnershipEpoch, RangeGeneration,
+            ReplicaSet, SplitCutoverControl,
         },
         control::Command,
         membership::MemberAnnouncement,
@@ -6593,5 +6789,346 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    struct FeedPaginationCutover {
+        control: Arc<ControlController>,
+    }
+
+    #[async_trait::async_trait]
+    impl SplitCutoverControl for FeedPaginationCutover {
+        async fn mark_ready(
+            &self,
+            feed: &str,
+            plan: &RangeSplitPlan,
+            boundary: &FrozenSplitBoundary,
+        ) -> Result<(), String> {
+            self.control
+                .execute_commands(vec![Command::RecordActiveRangeSplitCatchUp {
+                    feed: feed.to_owned(),
+                    plan_id: plan.plan_id,
+                    source_commit: boundary.final_commit,
+                    source_scanned_through: boundary.staging.source_commit,
+                    right_commit: boundary.staging.right.target_commit,
+                    checksum_verified: true,
+                }])
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+
+        async fn activate(
+            &self,
+            feed: &str,
+            plan: &RangeSplitPlan,
+            boundary: &FrozenSplitBoundary,
+        ) -> Result<(), String> {
+            self.control
+                .execute_commands(vec![Command::ActivateActiveRangeSplit {
+                    feed: feed.to_owned(),
+                    plan_id: plan.plan_id,
+                    left_writer_sequences: boundary.staging.left.writer_sequences.clone(),
+                    right_writer_sequences: boundary.staging.right.writer_sequences.clone(),
+                    reader_translations: Vec::new(),
+                }])
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_split_feed(
+        directory: &TempDir,
+        control: &Arc<ControlController>,
+        services: &BTreeMap<StorageNodeId, Arc<ReplicaAppendService>>,
+        feed: &str,
+        records: u64,
+        key_for: &dyn Fn(u64) -> Vec<u8>,
+        ingest_for: &dyn Fn(u64) -> i64,
+        payload_len: usize,
+        split_at: KeyToken,
+    ) -> Uuid {
+        let created = control
+            .execute_commands(vec![Command::CreateFeed {
+                name: feed.to_owned(),
+            }])
+            .await
+            .unwrap();
+        let feed_id: Uuid =
+            serde_json::from_value(created.results[0].data["feed_id"].clone()).unwrap();
+        let parent = control.active_range_assignment(feed_id).await.unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id,
+            range_id: parent.range_id,
+            generation: parent.generation,
+            ownership_epoch: parent.ownership_epoch,
+        };
+        for node in parent.replicas.iter() {
+            let index = ["storage-1", "storage-2", "storage-3"]
+                .iter()
+                .position(|candidate| candidate == &node.as_str())
+                .unwrap();
+            seed_committed_history_shaped(
+                &directory.path().join(format!("node-{index}")),
+                &descriptor,
+                records,
+                key_for,
+                ingest_for,
+                payload_len,
+            );
+        }
+        let prepared = control
+            .execute_commands(vec![Command::PrepareActiveRangeSplit {
+                feed: feed.to_owned(),
+                split_at,
+            }])
+            .await
+            .unwrap();
+        let plan: RangeSplitPlan =
+            serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+        orchestrate_split_cutover(
+            &FeedPaginationCutover {
+                control: control.clone(),
+            },
+            feed,
+            &plan,
+            &parent,
+            services[&parent.owner].clone(),
+            services,
+            64,
+        )
+        .await
+        .unwrap();
+        feed_id
+    }
+
+    fn routed_key(side: u8, split_at: KeyToken) -> Vec<u8> {
+        for probe in 0..u16::MAX {
+            let key = format!("route-{side}-{probe}").into_bytes();
+            let is_left = KeyToken::from_key(&key).as_bytes() < split_at.as_bytes();
+            if (side == 0) == is_left {
+                return key;
+            }
+        }
+        panic!("no {side} key found");
+    }
+
+    #[tokio::test]
+    async fn multi_range_feed_reads_merge_pages_across_owner_nodes() {
+        let directory = TempDir::new().unwrap();
+        let log_store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                log_store.clone(),
+                ["storage-1", "storage-2", "storage-3"]
+                    .into_iter()
+                    .map(|node| StorageNodeId::try_new(node).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        control
+            .execute_commands(vec![Command::CreateSpace {
+                name: "orders".to_owned(),
+            }])
+            .await
+            .unwrap();
+        let nodes: Vec<StorageNodeId> = ["storage-1", "storage-2", "storage-3"]
+            .into_iter()
+            .map(|node| StorageNodeId::try_new(node).unwrap())
+            .collect();
+        let mut services = BTreeMap::new();
+        for (index, node) in nodes.iter().enumerate() {
+            services.insert(
+                node.clone(),
+                Arc::new(ReplicaAppendService::new(
+                    directory.path().join(format!("node-{index}")),
+                    node.clone(),
+                    control.clone(),
+                )),
+            );
+        }
+        let split_at = KeyToken::from_bytes([0x80; 16]);
+        let left_key = routed_key(0, split_at);
+        let right_key = routed_key(1, split_at);
+        let key_for = move |sequence: u64| {
+            if sequence.is_multiple_of(2) {
+                left_key.clone()
+            } else {
+                right_key.clone()
+            }
+        };
+        for (feed, records, payload_len) in [
+            ("orders.events", 12_u64, 0_usize),
+            ("orders.deep", 10_005_u64, 0_usize),
+            ("orders.blobs", 4_u64, 6 * 1024 * 1024),
+        ] {
+            seed_split_feed(
+                &directory,
+                &control,
+                &services,
+                feed,
+                records,
+                &key_for,
+                &|sequence| sequence as i64,
+                payload_len,
+                split_at,
+            )
+            .await;
+        }
+
+        let control_key = "this-is-a-long-control-plane-key".to_owned();
+        let peers: BTreeMap<u64, BasicNode> = [1_u64, 2, 3]
+            .into_iter()
+            .map(|node| (node, BasicNode::new(format!("127.0.0.1:{}", 9_700 + node))))
+            .collect();
+        let mut listeners = Vec::new();
+        let mut endpoints = BTreeMap::new();
+        for node in &nodes {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            endpoints.insert(
+                node.clone(),
+                format!("http://{}", listener.local_addr().unwrap()),
+            );
+            listeners.push(listener);
+        }
+        let endpoints = Arc::new(endpoints);
+        let mut handles = Vec::new();
+        let mut listeners = listeners.into_iter();
+        for (index, node) in nodes.iter().enumerate() {
+            let listener = listeners.next().unwrap();
+            let plane = if index == 0 {
+                None
+            } else {
+                Some(Arc::new(
+                    ControlPlane::start(
+                        index as u64 + 1,
+                        peers.clone(),
+                        control_key.clone(),
+                        directory.path().join(format!("raft-{index}.json")),
+                        control.clone(),
+                    )
+                    .await
+                    .unwrap(),
+                ))
+            };
+            let membership = Arc::new(MembershipService::new(
+                MemberAnnouncement {
+                    node_id: format!("test-node-{index}"),
+                    api_url: "http://test-node:7070".to_owned(),
+                    capacity: 100,
+                },
+                vec![],
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            ));
+            let state = AppState {
+                store: log_store.clone(),
+                membership,
+                demand: DemandMetrics::default(),
+                autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                replica_append: Some(services[node].clone()),
+                control: control.clone(),
+                control_plane: plane,
+                majority_append: None,
+                subscription_progress: None,
+                subscription_mtls_enabled: false,
+                storage_node_id: Some(node.clone()),
+                control_endpoints: endpoints.clone(),
+                internal_key: Some(control_key.clone()),
+                internal_http: reqwest::Client::new(),
+                admin_auth: AdminAuthenticator::new(Some(
+                    "this-is-a-long-development-api-key".to_owned(),
+                ))
+                .unwrap(),
+            };
+            handles.push(tokio::spawn(async move {
+                axum::serve(listener, router(state)).await.unwrap();
+            }));
+        }
+        let client = reqwest::Client::new();
+        let base = format!("{}/v1/feeds/records", endpoints[&nodes[0]]);
+        let read_feed = |feed: &str, after: Option<&str>, limit: usize| {
+            let client = client.clone();
+            let mut url = reqwest::Url::parse(&base).unwrap();
+            url.query_pairs_mut()
+                .append_pair("feed", feed)
+                .append_pair("limit", &limit.to_string());
+            if let Some(after) = after {
+                url.query_pairs_mut().append_pair("after", after);
+            }
+            async move {
+                let response = client
+                    .get(url)
+                    .bearer_auth("this-is-a-long-development-api-key")
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body: Value = response.json().await.unwrap();
+                (status, body)
+            }
+        };
+        let cursors_of = |body: &Value| -> Vec<String> {
+            body.as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["cursor"].as_str().unwrap().to_owned())
+                .collect()
+        };
+
+        let (status, body) = read_feed("orders.events", None, 5).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            cursors_of(&body),
+            vec!["cursor-1", "cursor-2", "cursor-3", "cursor-4", "cursor-5"]
+        );
+        let (status, body) = read_feed("orders.events", Some("cursor-5"), 5).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            cursors_of(&body),
+            vec!["cursor-6", "cursor-7", "cursor-8", "cursor-9", "cursor-10"]
+        );
+        let (status, body) = read_feed("orders.events", Some("cursor-10"), 5).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cursors_of(&body), vec!["cursor-11", "cursor-12"]);
+        let (status, body) = read_feed("orders.events", Some("cursor-12"), 5).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.as_array().unwrap().is_empty());
+        let (status, _) = read_feed("orders.events", Some("cursor-404"), 5).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, body) = read_feed("orders.deep", None, 12_000).await;
+        assert_eq!(status, StatusCode::OK);
+        let expected: Vec<String> = (1..=10_000_u64)
+            .map(|sequence| format!("cursor-{sequence}"))
+            .collect();
+        assert_eq!(cursors_of(&body), expected);
+        let (status, body) = read_feed("orders.deep", Some("cursor-10000"), 10).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            cursors_of(&body),
+            vec![
+                "cursor-10001",
+                "cursor-10002",
+                "cursor-10003",
+                "cursor-10004",
+                "cursor-10005"
+            ]
+        );
+
+        let (status, body) = read_feed("orders.blobs", None, 10).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cursors_of(&body), vec!["cursor-1", "cursor-2"]);
+        let (status, body) = read_feed("orders.blobs", Some("cursor-2"), 10).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cursors_of(&body), vec!["cursor-3", "cursor-4"]);
+
+        for handle in handles {
+            handle.abort();
+        }
     }
 }
