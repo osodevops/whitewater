@@ -3,13 +3,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use finnstream::active_range::{RangeId, StorageNodeId};
+use finnstream::active_range::{RangeId, ReplicaSet, StorageNodeId};
 use finnstream::effect::{
-    EffectCommitEvidence, EffectConsume, EffectCoordinator, EffectJournalAssignment,
-    EffectJournalError, EffectJournalInspection, EffectJournalTransport, EffectMutation,
-    EffectOutput, EffectPrepareVote, EffectReplicaReply, EffectTransition,
-    FjallEffectJournalReplica,
+    EffectCommitEvidence, EffectConsume, EffectCoordinator, EffectJournalError,
+    EffectJournalInspection, EffectJournalTransport, EffectMutation, EffectOutput,
+    EffectPrepareVote, EffectReplicaReply, EffectTransition, FjallEffectJournalReplica,
 };
+use finnstream::reader::SubscriptionProgressAssignment;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -28,15 +28,19 @@ fn output(sequence: u64) -> EffectOutput {
     }
 }
 
+fn scope() -> Uuid {
+    Uuid::from_u128(777)
+}
+
 fn declare(effect_id: Uuid, sequence: u64, epoch: u64) -> EffectMutation {
     EffectMutation {
         effect_id,
+        subscription_id: scope(),
         ownership_epoch: epoch,
         sequence,
         request_id: Uuid::new_v4(),
         transition: EffectTransition::Declare {
             consume: Some(EffectConsume {
-                subscription_id: Uuid::new_v4(),
                 feed_id: Uuid::new_v4(),
                 expected_cursor: None,
                 cursor: "cursor-1".to_owned(),
@@ -196,7 +200,7 @@ impl EffectJournalTransport for TestEffectTransport {
             .cloned()
             .ok_or(EffectJournalError::InvalidAssignment)?;
         let result = tokio::task::spawn_blocking(move || {
-            store.adopt_recovered(effect_id, ownership_epoch, committed)
+            store.adopt_recovered(effect_id, scope(), ownership_epoch, committed)
         })
         .await
         .map_err(|_| EffectJournalError::Unavailable)??;
@@ -212,15 +216,15 @@ impl EffectJournalTransport for TestEffectTransport {
 fn effect_coordinator(
     transport: Arc<TestEffectTransport>,
     nodes: &[StorageNodeId; 3],
-    effect_id: Uuid,
 ) -> EffectCoordinator {
     EffectCoordinator::new(
-        EffectJournalAssignment {
-            effect_id,
-            owner: nodes[0].clone(),
-            replicas: nodes.to_vec(),
-            ownership_epoch: 1,
-        },
+        SubscriptionProgressAssignment::try_new(
+            scope(),
+            nodes[0].clone(),
+            ReplicaSet::try_new(nodes.clone()).unwrap(),
+            1,
+        )
+        .unwrap(),
         transport,
     )
 }
@@ -235,10 +239,16 @@ async fn effect_declare_commits_across_a_three_replica_quorum() {
     let nodes = nodes();
     let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
     let mutation = declare(Uuid::new_v4(), 1, 1);
-    let coordinator = effect_coordinator(transport, &nodes, mutation.effect_id);
+    let coordinator = effect_coordinator(transport, &nodes);
     let committed = coordinator.apply(mutation.clone()).await.unwrap();
     assert_eq!(committed, mutation);
-    assert_eq!(coordinator.read_committed().await.unwrap(), Some(mutation));
+    assert_eq!(
+        coordinator
+            .read_committed(mutation.effect_id)
+            .await
+            .unwrap(),
+        Some(mutation)
+    );
 }
 
 #[tokio::test]
@@ -256,7 +266,7 @@ async fn declare_survives_one_unavailable_replica_but_needs_the_owner() {
         .lock()
         .unwrap()
         .insert(nodes[2].clone());
-    let coordinator = effect_coordinator(transport.clone(), &nodes, mutation.effect_id);
+    let coordinator = effect_coordinator(transport.clone(), &nodes);
     coordinator.apply(mutation.clone()).await.unwrap();
 
     // The owner itself going down denies quorum even when members are up.
@@ -267,7 +277,7 @@ async fn declare_survives_one_unavailable_replica_but_needs_the_owner() {
         .unwrap()
         .insert(nodes[0].clone());
     let fresh = declare(Uuid::new_v4(), 1, 1);
-    let coordinator_b = effect_coordinator(transport.clone(), &nodes, fresh.effect_id);
+    let coordinator_b = effect_coordinator(transport.clone(), &nodes);
     assert!(matches!(
         coordinator_b.apply(fresh).await,
         Err(EffectJournalError::NoQuorum) | Err(EffectJournalError::AmbiguousCommit)
@@ -291,7 +301,7 @@ async fn reconcile_retry_completes_a_partially_committed_declare() {
         .lock()
         .unwrap()
         .insert(nodes[0].clone());
-    let coordinator = effect_coordinator(transport.clone(), &nodes, mutation.effect_id);
+    let coordinator = effect_coordinator(transport.clone(), &nodes);
     assert!(matches!(
         coordinator.apply(mutation.clone()).await,
         Err(EffectJournalError::AmbiguousCommit) | Err(EffectJournalError::NoQuorum)
@@ -299,7 +309,13 @@ async fn reconcile_retry_completes_a_partially_committed_declare() {
     transport.commit_down.lock().unwrap().clear();
     let reconciled = coordinator.reconcile_retry(mutation.clone()).await.unwrap();
     assert_eq!(reconciled, mutation);
-    assert_eq!(coordinator.read_committed().await.unwrap(), Some(mutation));
+    assert_eq!(
+        coordinator
+            .read_committed(mutation.effect_id)
+            .await
+            .unwrap(),
+        Some(mutation)
+    );
 }
 
 #[tokio::test]
@@ -313,7 +329,7 @@ async fn wrong_replica_identities_and_conflicting_reads_are_refused() {
     let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
     let mutation = declare(Uuid::new_v4(), 1, 1);
     *transport.wrong_node.lock().unwrap() = Some(nodes[1].clone());
-    let coordinator = effect_coordinator(transport.clone(), &nodes, mutation.effect_id);
+    let coordinator = effect_coordinator(transport.clone(), &nodes);
     assert!(matches!(
         coordinator.apply(mutation.clone()).await,
         Err(EffectJournalError::InvalidAssignment)
@@ -332,11 +348,12 @@ async fn applied_transition_commits_as_a_second_sequenced_mutation() {
     let nodes = nodes();
     let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
     let mutation = declare(Uuid::new_v4(), 1, 1);
-    let coordinator = effect_coordinator(transport, &nodes, mutation.effect_id);
+    let coordinator = effect_coordinator(transport, &nodes);
     coordinator.apply(mutation.clone()).await.unwrap();
 
     let applied = EffectMutation {
         effect_id: mutation.effect_id,
+        subscription_id: scope(),
         ownership_epoch: 1,
         sequence: 2,
         request_id: Uuid::new_v4(),
@@ -345,5 +362,11 @@ async fn applied_transition_commits_as_a_second_sequenced_mutation() {
         },
     };
     coordinator.apply(applied.clone()).await.unwrap();
-    assert_eq!(coordinator.read_committed().await.unwrap(), Some(applied));
+    assert_eq!(
+        coordinator
+            .read_committed(mutation.effect_id)
+            .await
+            .unwrap(),
+        Some(applied)
+    );
 }

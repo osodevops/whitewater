@@ -50,7 +50,6 @@ pub struct EffectOutput {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EffectConsume {
-    pub subscription_id: Uuid,
     pub feed_id: Uuid,
     pub expected_cursor: Option<String>,
     pub cursor: String,
@@ -79,6 +78,9 @@ pub enum EffectTransition {
 #[serde(deny_unknown_fields)]
 pub struct EffectMutation {
     pub effect_id: Uuid,
+    /// The Subscription whose progress assignment owns this journal row:
+    /// the same RF3 replica set and ownership epoch fence the decision.
+    pub subscription_id: Uuid,
     pub ownership_epoch: u64,
     pub sequence: u64,
     pub request_id: Uuid,
@@ -116,6 +118,46 @@ impl EffectCommitEvidence {
             votes: [(owner, owner_digest), (member, member_digest)],
         }
     }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectPrepareRequest {
+    pub owner: crate::active_range::StorageNodeId,
+    pub receiver: crate::active_range::StorageNodeId,
+    pub mutation: EffectMutation,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectCommitRequest {
+    pub owner: crate::active_range::StorageNodeId,
+    pub receiver: crate::active_range::StorageNodeId,
+    pub subscription_id: Uuid,
+    pub effect_id: Uuid,
+    pub ownership_epoch: u64,
+    pub evidence: EffectCommitEvidence,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectReadRequest {
+    pub owner: crate::active_range::StorageNodeId,
+    pub receiver: crate::active_range::StorageNodeId,
+    pub subscription_id: Uuid,
+    pub effect_id: Uuid,
+    pub ownership_epoch: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectAdoptRequest {
+    pub owner: crate::active_range::StorageNodeId,
+    pub receiver: crate::active_range::StorageNodeId,
+    pub subscription_id: Uuid,
+    pub effect_id: Uuid,
+    pub ownership_epoch: u64,
+    pub committed: Option<EffectMutation>,
 }
 
 /// A replica reply carrying the responder's claimed identity so the
@@ -157,6 +199,37 @@ pub enum EffectJournalError {
     Unavailable,
     #[error("effect journal commit result is ambiguous; retry the same request identity")]
     AmbiguousCommit,
+}
+
+impl EffectJournalError {
+    pub(crate) fn code(&self) -> &'static str {
+        match self {
+            Self::Conflict => "conflict",
+            Self::StaleEpoch => "stale_epoch",
+            Self::Sequence => "sequence",
+            Self::TooLarge => "too_large",
+            Self::NoQuorum => "no_quorum",
+            Self::InvalidAssignment => "invalid_assignment",
+            Self::Unavailable => "unavailable",
+            Self::AmbiguousCommit => "ambiguous_commit",
+            Self::Engine(_) => "engine",
+            Self::Serialization(_) => "serialization",
+        }
+    }
+
+    pub(crate) fn from_code(code: &str) -> Option<Self> {
+        Some(match code {
+            "conflict" => Self::Conflict,
+            "stale_epoch" => Self::StaleEpoch,
+            "sequence" => Self::Sequence,
+            "too_large" => Self::TooLarge,
+            "no_quorum" => Self::NoQuorum,
+            "invalid_assignment" => Self::InvalidAssignment,
+            "unavailable" => Self::Unavailable,
+            "ambiguous_commit" => Self::AmbiguousCommit,
+            _ => return None,
+        })
+    }
 }
 
 /// Replies that mean a replica is behind the current placement rather than
@@ -254,6 +327,7 @@ impl FjallEffectJournalReplica {
     pub fn adopt_recovered(
         &self,
         effect_id: Uuid,
+        subscription_id: Uuid,
         ownership_epoch: u64,
         committed: Option<EffectMutation>,
     ) -> Result<Option<EffectMutation>, EffectJournalError> {
@@ -261,7 +335,9 @@ impl FjallEffectJournalReplica {
             return Err(EffectJournalError::StaleEpoch);
         }
         if committed.as_ref().is_some_and(|mutation| {
-            mutation.effect_id != effect_id || mutation.ownership_epoch > ownership_epoch
+            mutation.effect_id != effect_id
+                || mutation.subscription_id != subscription_id
+                || mutation.ownership_epoch > ownership_epoch
         }) {
             return Err(EffectJournalError::Conflict);
         }
@@ -556,26 +632,19 @@ pub trait EffectJournalTransport: Send + Sync {
     ) -> Result<EffectReplicaReply<Option<EffectMutation>>, EffectJournalError>;
 }
 
-/// The placement one effect journal row is pinned to.
-#[derive(Clone, Debug)]
-pub struct EffectJournalAssignment {
-    pub effect_id: Uuid,
-    pub owner: crate::active_range::StorageNodeId,
-    pub replicas: Vec<crate::active_range::StorageNodeId>,
-    pub ownership_epoch: u64,
-}
-
-/// Drives a mutation through the replicated prepare/commit protocol over an
-/// injected transport, refusing decisions that lack owner-plus-member quorum
-/// evidence and reconciling ambiguous outcomes by request identity.
+/// Drives mutations through the replicated prepare/commit protocol over an
+/// injected transport. The coordinator is bound to one Subscription's
+/// progress assignment: every effect in the scope shares that RF3 replica
+/// set and ownership epoch, so draining or moving the Subscription's
+/// progress placement moves the journal with it.
 pub struct EffectCoordinator {
-    assignment: EffectJournalAssignment,
+    assignment: crate::reader::SubscriptionProgressAssignment,
     transport: std::sync::Arc<dyn EffectJournalTransport>,
 }
 
 impl EffectCoordinator {
     pub fn new(
-        assignment: EffectJournalAssignment,
+        assignment: crate::reader::SubscriptionProgressAssignment,
         transport: std::sync::Arc<dyn EffectJournalTransport>,
     ) -> Self {
         Self {
@@ -584,31 +653,45 @@ impl EffectCoordinator {
         }
     }
 
-    /// The quorum-corroborated committed mutation for this effect, if any.
-    pub async fn read_committed(&self) -> Result<Option<EffectMutation>, EffectJournalError> {
+    /// Resolve the coordinator for a Subscription's current progress
+    /// placement through the catalog.
+    pub async fn for_subscription(
+        control: &crate::control::ControlController,
+        subscription_id: Uuid,
+        transport: std::sync::Arc<dyn EffectJournalTransport>,
+    ) -> Result<Self, EffectJournalError> {
+        let assignment = control
+            .active_subscription_progress_assignment_by_id(subscription_id)
+            .await
+            .ok_or(EffectJournalError::InvalidAssignment)?;
+        Ok(Self::new(assignment, transport))
+    }
+
+    /// The quorum-corroborated committed mutation for one effect, if any.
+    pub async fn read_committed(
+        &self,
+        effect_id: Uuid,
+    ) -> Result<Option<EffectMutation>, EffectJournalError> {
         let mut observed: Option<EffectMutation> = None;
         let mut votes = 0;
         let mut lagged = false;
         let replies = futures_util::future::join_all(self.assignment.replicas.iter().map(|node| {
-            self.transport.committed(
-                node,
-                self.assignment.effect_id,
-                self.assignment.ownership_epoch,
-            )
+            self.transport
+                .committed(node, effect_id, self.assignment.ownership_epoch)
         }))
         .await;
         for (node, reply) in self.assignment.replicas.iter().zip(replies) {
             match reply {
                 Ok(reply) => {
                     if reply.replica != *node
-                        || reply.effect_id != self.assignment.effect_id
+                        || reply.effect_id != effect_id
                         || reply.ownership_epoch != self.assignment.ownership_epoch
                     {
                         return Err(EffectJournalError::InvalidAssignment);
                     }
                     let mutation = reply.result;
                     if let Some(candidate) = mutation.as_ref() {
-                        if candidate.effect_id != self.assignment.effect_id {
+                        if candidate.effect_id != effect_id {
                             return Err(EffectJournalError::Conflict);
                         }
                         if candidate.ownership_epoch != self.assignment.ownership_epoch {
@@ -654,7 +737,7 @@ impl EffectCoordinator {
         &self,
         mutation: EffectMutation,
     ) -> Result<EffectMutation, EffectJournalError> {
-        if mutation.effect_id != self.assignment.effect_id
+        if mutation.subscription_id != self.assignment.subscription_id
             || mutation.ownership_epoch != self.assignment.ownership_epoch
         {
             return Err(EffectJournalError::InvalidAssignment);
@@ -671,7 +754,7 @@ impl EffectCoordinator {
             match reply {
                 Ok(reply)
                     if reply.replica != *node
-                        || reply.effect_id != self.assignment.effect_id
+                        || reply.effect_id != mutation.effect_id
                         || reply.ownership_epoch != self.assignment.ownership_epoch =>
                 {
                     return Err(EffectJournalError::InvalidAssignment)
@@ -702,7 +785,7 @@ impl EffectCoordinator {
             .map(|(node, _)| node.clone())
             .ok_or(EffectJournalError::NoQuorum)?;
         let evidence = EffectCommitEvidence {
-            effect_id: self.assignment.effect_id,
+            effect_id: mutation.effect_id,
             request_id: mutation.request_id,
             votes: [(self.assignment.owner.clone(), digest), (other, digest)],
         };
@@ -717,7 +800,7 @@ impl EffectCoordinator {
             match reply {
                 Ok(reply)
                     if reply.replica != *node
-                        || reply.effect_id != self.assignment.effect_id
+                        || reply.effect_id != mutation.effect_id
                         || reply.ownership_epoch != self.assignment.ownership_epoch =>
                 {
                     return Err(EffectJournalError::InvalidAssignment)
@@ -744,7 +827,7 @@ impl EffectCoordinator {
         &self,
         mutation: EffectMutation,
     ) -> Result<EffectMutation, EffectJournalError> {
-        if mutation.effect_id != self.assignment.effect_id
+        if mutation.subscription_id != self.assignment.subscription_id
             || mutation.ownership_epoch != self.assignment.ownership_epoch
         {
             return Err(EffectJournalError::InvalidAssignment);
@@ -791,7 +874,7 @@ impl EffectCoordinator {
             return Err(EffectJournalError::NoQuorum);
         }
         if owner_committed && matching >= 2 {
-            match self.read_committed().await {
+            match self.read_committed(mutation.effect_id).await {
                 Ok(Some(committed)) if committed == mutation => return Ok(mutation),
                 Err(EffectJournalError::Conflict) => {}
                 Err(error) => return Err(error),
@@ -802,6 +885,450 @@ impl EffectCoordinator {
             Ok(committed) => Ok(committed),
             Err(error) => Err(error),
         }
+    }
+}
+
+/// One Node's placement-fenced effect journal endpoint surface: every
+/// request is checked against the Subscription progress assignment that owns
+/// the journal scope before the durable replica is touched.
+pub struct EffectJournalService {
+    local_node: crate::active_range::StorageNodeId,
+    control: std::sync::Arc<crate::control::ControlController>,
+    replica: std::sync::Arc<FjallEffectJournalReplica>,
+}
+
+impl EffectJournalService {
+    pub fn new(
+        local_node: crate::active_range::StorageNodeId,
+        control: std::sync::Arc<crate::control::ControlController>,
+        replica: std::sync::Arc<FjallEffectJournalReplica>,
+    ) -> Self {
+        Self {
+            local_node,
+            control,
+            replica,
+        }
+    }
+
+    async fn check_placement(
+        &self,
+        subscription_id: Uuid,
+        owner: &crate::active_range::StorageNodeId,
+        receiver: &crate::active_range::StorageNodeId,
+        epoch: u64,
+    ) -> Result<crate::reader::SubscriptionProgressAssignment, EffectJournalError> {
+        let assignment = self
+            .control
+            .active_subscription_progress_assignment_by_id(subscription_id)
+            .await
+            .ok_or(EffectJournalError::InvalidAssignment)?;
+        if assignment.owner != *owner
+            || epoch != assignment.ownership_epoch
+            || *receiver != self.local_node
+            || !assignment.replicas.iter().any(|node| node == receiver)
+        {
+            return Err(EffectJournalError::InvalidAssignment);
+        }
+        Ok(assignment)
+    }
+
+    pub async fn prepare(
+        &self,
+        request: EffectPrepareRequest,
+    ) -> Result<EffectReplicaReply<EffectPrepareVote>, EffectJournalError> {
+        let assignment = self
+            .check_placement(
+                request.mutation.subscription_id,
+                &request.owner,
+                &request.receiver,
+                request.mutation.ownership_epoch,
+            )
+            .await?;
+        let replica = self.replica.clone();
+        let mutation = request.mutation;
+        let effect_id = mutation.effect_id;
+        let result = tokio::task::spawn_blocking(move || replica.prepare(mutation))
+            .await
+            .map_err(|_| EffectJournalError::Unavailable)??;
+        Ok(EffectReplicaReply {
+            replica: self.local_node.clone(),
+            effect_id,
+            ownership_epoch: assignment.ownership_epoch,
+            result,
+        })
+    }
+
+    pub async fn commit(
+        &self,
+        request: EffectCommitRequest,
+    ) -> Result<EffectReplicaReply<EffectMutation>, EffectJournalError> {
+        let assignment = self
+            .check_placement(
+                request.subscription_id,
+                &request.owner,
+                &request.receiver,
+                request.ownership_epoch,
+            )
+            .await?;
+        if request.evidence.effect_id != request.effect_id
+            || request
+                .evidence
+                .votes
+                .iter()
+                .any(|(node, _)| !assignment.replicas.iter().any(|member| member == node))
+            || !request
+                .evidence
+                .votes
+                .iter()
+                .any(|(node, _)| node == &assignment.owner)
+        {
+            return Err(EffectJournalError::InvalidAssignment);
+        }
+        let replica = self.replica.clone();
+        let result =
+            tokio::task::spawn_blocking(move || replica.commit_with_quorum(request.evidence))
+                .await
+                .map_err(|_| EffectJournalError::Unavailable)??;
+        Ok(EffectReplicaReply {
+            replica: self.local_node.clone(),
+            effect_id: result.effect_id,
+            ownership_epoch: result.ownership_epoch,
+            result,
+        })
+    }
+
+    pub async fn committed(
+        &self,
+        request: EffectReadRequest,
+    ) -> Result<EffectReplicaReply<Option<EffectMutation>>, EffectJournalError> {
+        let assignment = self
+            .check_placement(
+                request.subscription_id,
+                &request.owner,
+                &request.receiver,
+                request.ownership_epoch,
+            )
+            .await?;
+        let replica = self.replica.clone();
+        let effect_id = request.effect_id;
+        let committed = tokio::task::spawn_blocking(move || replica.local_committed(effect_id))
+            .await
+            .map_err(|_| EffectJournalError::Unavailable)??;
+        if let Some(mutation) = &committed {
+            if mutation.effect_id != effect_id
+                || mutation.subscription_id != request.subscription_id
+            {
+                return Err(EffectJournalError::Conflict);
+            }
+            if mutation.ownership_epoch != request.ownership_epoch {
+                return Err(EffectJournalError::StaleEpoch);
+            }
+        }
+        Ok(EffectReplicaReply {
+            replica: self.local_node.clone(),
+            effect_id,
+            ownership_epoch: assignment.ownership_epoch,
+            result: committed,
+        })
+    }
+
+    pub async fn inspect(
+        &self,
+        request: EffectReadRequest,
+    ) -> Result<EffectReplicaReply<EffectJournalInspection>, EffectJournalError> {
+        let assignment = self
+            .check_placement(
+                request.subscription_id,
+                &request.owner,
+                &request.receiver,
+                request.ownership_epoch,
+            )
+            .await?;
+        let replica = self.replica.clone();
+        let effect_id = request.effect_id;
+        let inspection = tokio::task::spawn_blocking(move || replica.local_state(effect_id))
+            .await
+            .map_err(|_| EffectJournalError::Unavailable)??;
+        Ok(EffectReplicaReply {
+            replica: self.local_node.clone(),
+            effect_id,
+            ownership_epoch: assignment.ownership_epoch,
+            result: inspection,
+        })
+    }
+
+    pub async fn adopt(
+        &self,
+        request: EffectAdoptRequest,
+    ) -> Result<EffectReplicaReply<Option<EffectMutation>>, EffectJournalError> {
+        let assignment = self
+            .check_placement(
+                request.subscription_id,
+                &request.owner,
+                &request.receiver,
+                request.ownership_epoch,
+            )
+            .await?;
+        let replica = self.replica.clone();
+        let effect_id = request.effect_id;
+        let subscription_id = request.subscription_id;
+        let ownership_epoch = request.ownership_epoch;
+        let result = tokio::task::spawn_blocking(move || {
+            replica.adopt_recovered(
+                effect_id,
+                subscription_id,
+                ownership_epoch,
+                request.committed,
+            )
+        })
+        .await
+        .map_err(|_| EffectJournalError::Unavailable)??;
+        Ok(EffectReplicaReply {
+            replica: self.local_node.clone(),
+            effect_id,
+            ownership_epoch: assignment.ownership_epoch,
+            result,
+        })
+    }
+}
+
+/// HTTP transport targeting the assigned journal replicas over the internal
+/// plane; the mTLS variant presents the Node certificate so the receiving
+/// listener authenticates the caller by its pinned identity.
+pub struct HttpEffectJournalTransport {
+    assignment: crate::reader::SubscriptionProgressAssignment,
+    endpoints: crate::internal_plane::InternalEndpoints,
+    key: Option<String>,
+    client: reqwest::Client,
+}
+
+impl HttpEffectJournalTransport {
+    pub fn new(
+        assignment: crate::reader::SubscriptionProgressAssignment,
+        endpoints: impl Into<crate::internal_plane::InternalEndpoints>,
+        key: String,
+        timeout: std::time::Duration,
+    ) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            assignment,
+            endpoints: endpoints.into(),
+            key: Some(key),
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(1))
+                .timeout(timeout)
+                .build()?,
+        })
+    }
+
+    pub fn new_mtls(
+        assignment: crate::reader::SubscriptionProgressAssignment,
+        endpoints: impl Into<crate::internal_plane::InternalEndpoints>,
+        ca_pem: &[u8],
+        identity_pem: &[u8],
+        timeout: std::time::Duration,
+    ) -> Result<Self, EffectJournalError> {
+        let endpoints = endpoints.into();
+        for (node, endpoint) in endpoints.configured() {
+            let url =
+                reqwest::Url::parse(endpoint).map_err(|_| EffectJournalError::InvalidAssignment)?;
+            if url.scheme() != "https" || url.host_str() != Some(node.as_str()) {
+                return Err(EffectJournalError::InvalidAssignment);
+            }
+        }
+        let ca = reqwest::Certificate::from_pem(ca_pem)
+            .map_err(|_| EffectJournalError::InvalidAssignment)?;
+        let identity = reqwest::Identity::from_pem(identity_pem)
+            .map_err(|_| EffectJournalError::InvalidAssignment)?;
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(1))
+            .timeout(timeout)
+            .https_only(true)
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(ca)
+            .identity(identity)
+            .build()
+            .map_err(|_| EffectJournalError::InvalidAssignment)?;
+        Ok(Self {
+            assignment,
+            endpoints,
+            key: None,
+            client,
+        })
+    }
+
+    async fn send<R: Serialize, T: serde::de::DeserializeOwned>(
+        &self,
+        node: &crate::active_range::StorageNodeId,
+        path: &str,
+        body: &R,
+    ) -> Result<T, EffectJournalError> {
+        if !self.assignment.replicas.iter().any(|member| member == node) {
+            return Err(EffectJournalError::InvalidAssignment);
+        }
+        let endpoint = self
+            .endpoints
+            .resolve(node)
+            .await
+            .ok_or(EffectJournalError::Unavailable)?;
+        let mut request = self
+            .client
+            .post(format!("{}{path}", endpoint.trim_end_matches('/')))
+            .json(body);
+        if let Some(key) = &self.key {
+            request = request.header("x-whitewater-control-key", key);
+        }
+        let response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(node = %node, path, %error, "effect journal request failed");
+                return Err(EffectJournalError::Unavailable);
+            }
+        };
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.bytes().await.unwrap_or_default();
+            tracing::warn!(node = %node, path, %status, "effect journal replica refused");
+            let code = body
+                .get(..4096)
+                .and_then(|head| serde_json::from_slice::<serde_json::Value>(head).ok())
+                .and_then(|value| {
+                    value
+                        .get("code")
+                        .and_then(|code| code.as_str())
+                        .map(str::to_owned)
+                });
+            if let Some(error) = code.as_deref().and_then(EffectJournalError::from_code) {
+                return Err(error);
+            }
+            return Err(if status == reqwest::StatusCode::CONFLICT {
+                EffectJournalError::Conflict
+            } else {
+                EffectJournalError::Unavailable
+            });
+        }
+        serde_json::from_slice(
+            &response
+                .bytes()
+                .await
+                .map_err(|_| EffectJournalError::Unavailable)?,
+        )
+        .map_err(|_| EffectJournalError::Unavailable)
+    }
+}
+
+#[async_trait::async_trait]
+impl EffectJournalTransport for HttpEffectJournalTransport {
+    async fn prepare(
+        &self,
+        replica: &crate::active_range::StorageNodeId,
+        mutation: EffectMutation,
+    ) -> Result<EffectReplicaReply<EffectPrepareVote>, EffectJournalError> {
+        if mutation.subscription_id != self.assignment.subscription_id
+            || mutation.ownership_epoch != self.assignment.ownership_epoch
+        {
+            return Err(EffectJournalError::InvalidAssignment);
+        }
+        self.send(
+            replica,
+            "/internal/effect-journal/prepare",
+            &EffectPrepareRequest {
+                owner: self.assignment.owner.clone(),
+                receiver: replica.clone(),
+                mutation,
+            },
+        )
+        .await
+    }
+
+    async fn commit(
+        &self,
+        replica: &crate::active_range::StorageNodeId,
+        evidence: EffectCommitEvidence,
+    ) -> Result<EffectReplicaReply<EffectMutation>, EffectJournalError> {
+        self.send(
+            replica,
+            "/internal/effect-journal/commit",
+            &EffectCommitRequest {
+                owner: self.assignment.owner.clone(),
+                receiver: replica.clone(),
+                subscription_id: self.assignment.subscription_id,
+                effect_id: evidence.effect_id,
+                ownership_epoch: self.assignment.ownership_epoch,
+                evidence,
+            },
+        )
+        .await
+    }
+
+    async fn committed(
+        &self,
+        replica: &crate::active_range::StorageNodeId,
+        effect_id: Uuid,
+        ownership_epoch: u64,
+    ) -> Result<EffectReplicaReply<Option<EffectMutation>>, EffectJournalError> {
+        if ownership_epoch != self.assignment.ownership_epoch {
+            return Err(EffectJournalError::StaleEpoch);
+        }
+        self.send(
+            replica,
+            "/internal/effect-journal/committed",
+            &EffectReadRequest {
+                owner: self.assignment.owner.clone(),
+                receiver: replica.clone(),
+                subscription_id: self.assignment.subscription_id,
+                effect_id,
+                ownership_epoch,
+            },
+        )
+        .await
+    }
+
+    async fn inspect(
+        &self,
+        replica: &crate::active_range::StorageNodeId,
+        effect_id: Uuid,
+        ownership_epoch: u64,
+    ) -> Result<EffectReplicaReply<EffectJournalInspection>, EffectJournalError> {
+        if ownership_epoch != self.assignment.ownership_epoch {
+            return Err(EffectJournalError::StaleEpoch);
+        }
+        self.send(
+            replica,
+            "/internal/effect-journal/inspect",
+            &EffectReadRequest {
+                owner: self.assignment.owner.clone(),
+                receiver: replica.clone(),
+                subscription_id: self.assignment.subscription_id,
+                effect_id,
+                ownership_epoch,
+            },
+        )
+        .await
+    }
+
+    async fn adopt(
+        &self,
+        replica: &crate::active_range::StorageNodeId,
+        effect_id: Uuid,
+        ownership_epoch: u64,
+        committed: Option<EffectMutation>,
+    ) -> Result<EffectReplicaReply<Option<EffectMutation>>, EffectJournalError> {
+        if ownership_epoch < self.assignment.ownership_epoch {
+            return Err(EffectJournalError::StaleEpoch);
+        }
+        self.send(
+            replica,
+            "/internal/effect-journal/adopt",
+            &EffectAdoptRequest {
+                owner: self.assignment.owner.clone(),
+                receiver: replica.clone(),
+                subscription_id: self.assignment.subscription_id,
+                effect_id,
+                ownership_epoch,
+                committed,
+            },
+        )
+        .await
     }
 }
 
@@ -824,7 +1351,6 @@ mod tests {
 
     fn consume() -> EffectConsume {
         EffectConsume {
-            subscription_id: Uuid::new_v4(),
             feed_id: Uuid::new_v4(),
             expected_cursor: None,
             cursor: "cursor-1".to_owned(),
@@ -835,6 +1361,7 @@ mod tests {
     fn declare(sequence: u64) -> EffectMutation {
         EffectMutation {
             effect_id: Uuid::new_v4(),
+            subscription_id: Uuid::new_v4(),
             ownership_epoch: 1,
             sequence,
             request_id: Uuid::new_v4(),
@@ -1040,25 +1567,35 @@ mod tests {
             ))
             .unwrap();
         assert!(matches!(
-            replica.adopt_recovered(mutation.effect_id, 2, None),
+            replica.adopt_recovered(mutation.effect_id, mutation.subscription_id, 2, None),
             Err(EffectJournalError::Conflict)
         ));
         let mut fork = mutation.clone();
         fork.request_id = Uuid::new_v4();
         assert!(matches!(
-            replica.adopt_recovered(mutation.effect_id, 2, Some(fork)),
+            replica.adopt_recovered(mutation.effect_id, mutation.subscription_id, 2, Some(fork)),
             Err(EffectJournalError::Conflict)
         ));
         assert_eq!(
             replica
-                .adopt_recovered(mutation.effect_id, 2, Some(mutation.clone()))
+                .adopt_recovered(
+                    mutation.effect_id,
+                    mutation.subscription_id,
+                    2,
+                    Some(mutation.clone())
+                )
                 .unwrap(),
             Some(mutation.clone())
         );
         let state = replica.local_state(mutation.effect_id).unwrap();
-        assert_eq!(state.committed, Some(mutation));
+        assert_eq!(state.committed, Some(mutation.clone()));
         assert!(matches!(
-            replica.adopt_recovered(state.committed.clone().unwrap().effect_id, 1, None),
+            replica.adopt_recovered(
+                state.committed.clone().unwrap().effect_id,
+                mutation.subscription_id,
+                1,
+                None
+            ),
             Err(EffectJournalError::StaleEpoch) | Err(EffectJournalError::Conflict)
         ));
     }
@@ -1070,7 +1607,12 @@ mod tests {
         let mutation = declare(1);
         assert_eq!(
             replica
-                .adopt_recovered(mutation.effect_id, 1, Some(mutation.clone()))
+                .adopt_recovered(
+                    mutation.effect_id,
+                    mutation.subscription_id,
+                    1,
+                    Some(mutation.clone())
+                )
                 .unwrap(),
             Some(mutation.clone())
         );

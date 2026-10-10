@@ -82,6 +82,7 @@ pub struct AppState {
     pub progress_authority: Arc<dyn crate::reader::SubscriptionPlacementAuthority>,
     pub replica_append: Option<Arc<ReplicaAppendService>>,
     pub subscription_progress: Option<Arc<SubscriptionProgressReplicaService>>,
+    pub effect_journal: Option<Arc<crate::effect::EffectJournalService>>,
     pub subscription_mtls_enabled: bool,
     pub majority_append: Option<Arc<MajorityAppendCoordinator>>,
     pub storage_node_id: Option<StorageNodeId>,
@@ -535,6 +536,36 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
         .route(
             "/internal/subscription-progress/adopt",
             subscription_adopt_route,
+        )
+        .route(
+            "/internal/effect-journal/prepare",
+            subscription_key_layer(
+                post(effect_journal_prepare_local).layer(DefaultBodyLimit::max(512 * 1024)),
+            ),
+        )
+        .route(
+            "/internal/effect-journal/commit",
+            subscription_key_layer(
+                post(effect_journal_commit_local).layer(DefaultBodyLimit::max(512 * 1024)),
+            ),
+        )
+        .route(
+            "/internal/effect-journal/committed",
+            subscription_key_layer(
+                post(effect_journal_committed_local).layer(DefaultBodyLimit::max(64 * 1024)),
+            ),
+        )
+        .route(
+            "/internal/effect-journal/inspect",
+            subscription_key_layer(
+                post(effect_journal_inspect_local).layer(DefaultBodyLimit::max(64 * 1024)),
+            ),
+        )
+        .route(
+            "/internal/effect-journal/adopt",
+            subscription_key_layer(
+                post(effect_journal_adopt_local).layer(DefaultBodyLimit::max(512 * 1024)),
+            ),
         )
 }
 
@@ -1794,6 +1825,115 @@ fn subscription_progress_api_error(error: SubscriptionProgressError) -> ApiError
         message: error.to_string(),
         code: Some(code),
     }
+}
+
+fn effect_journal_api_error(error: crate::effect::EffectJournalError) -> ApiError {
+    let code = error.code();
+    let status = match error {
+        crate::effect::EffectJournalError::Unavailable
+        | crate::effect::EffectJournalError::AmbiguousCommit
+        | crate::effect::EffectJournalError::Engine(_)
+        | crate::effect::EffectJournalError::Serialization(_) => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::CONFLICT,
+    };
+    ApiError {
+        status,
+        message: error.to_string(),
+        code: Some(code),
+    }
+}
+
+async fn effect_journal_prepare_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::effect::EffectPrepareRequest>,
+) -> Result<Json<crate::effect::EffectReplicaReply<crate::effect::EffectPrepareVote>>, ApiError> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let service = state
+        .effect_journal
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("effect journal replica is not configured"))?;
+    Ok(Json(
+        service
+            .prepare(request)
+            .await
+            .map_err(effect_journal_api_error)?,
+    ))
+}
+
+async fn effect_journal_commit_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::effect::EffectCommitRequest>,
+) -> Result<Json<crate::effect::EffectReplicaReply<crate::effect::EffectMutation>>, ApiError> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let service = state
+        .effect_journal
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("effect journal replica is not configured"))?;
+    Ok(Json(
+        service
+            .commit(request)
+            .await
+            .map_err(effect_journal_api_error)?,
+    ))
+}
+
+async fn effect_journal_committed_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::effect::EffectReadRequest>,
+) -> Result<Json<crate::effect::EffectReplicaReply<Option<crate::effect::EffectMutation>>>, ApiError>
+{
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let service = state
+        .effect_journal
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("effect journal replica is not configured"))?;
+    Ok(Json(
+        service
+            .committed(request)
+            .await
+            .map_err(effect_journal_api_error)?,
+    ))
+}
+
+async fn effect_journal_inspect_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::effect::EffectReadRequest>,
+) -> Result<Json<crate::effect::EffectReplicaReply<crate::effect::EffectJournalInspection>>, ApiError>
+{
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let service = state
+        .effect_journal
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("effect journal replica is not configured"))?;
+    Ok(Json(
+        service
+            .inspect(request)
+            .await
+            .map_err(effect_journal_api_error)?,
+    ))
+}
+
+async fn effect_journal_adopt_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::effect::EffectAdoptRequest>,
+) -> Result<Json<crate::effect::EffectReplicaReply<Option<crate::effect::EffectMutation>>>, ApiError>
+{
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let service = state
+        .effect_journal
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("effect journal replica is not configured"))?;
+    Ok(Json(
+        service
+            .adopt(request)
+            .await
+            .map_err(effect_journal_api_error)?,
+    ))
 }
 
 async fn subscription_prepare_local(
@@ -6724,6 +6864,7 @@ mod tests {
             progress_authority: control.clone(),
             majority_append: None,
             subscription_progress: None,
+            effect_journal: None,
             subscription_mtls_enabled: false,
             storage_node_id: Some(assignment.owner),
             control_endpoints: Arc::new(BTreeMap::new().into()),
@@ -6822,6 +6963,7 @@ mod tests {
             replica_append: None,
             majority_append: None,
             subscription_progress: None,
+            effect_journal: None,
             subscription_mtls_enabled: false,
             storage_node_id: None,
             control_endpoints: Arc::new(BTreeMap::new().into()),
@@ -6911,6 +7053,16 @@ mod tests {
                 replica_append: Some(replica_append),
                 majority_append: None,
                 subscription_progress: Some(subscription_progress),
+                effect_journal: Some(Arc::new(crate::effect::EffectJournalService::new(
+                    crate::active_range::StorageNodeId::try_new("control-1").unwrap(),
+                    control.clone(),
+                    Arc::new(
+                        crate::effect::FjallEffectJournalReplica::open(
+                            directory.path().join("effect-journal"),
+                        )
+                        .unwrap(),
+                    ),
+                ))),
                 subscription_mtls_enabled: false,
                 storage_node_id: Some(
                     crate::active_range::StorageNodeId::try_new("control-1").unwrap(),
@@ -7933,6 +8085,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn effect_journal_internal_routes_authenticate_and_fence_placement() {
+        let directory = TempDir::new().unwrap();
+        let (app, control_plane, control, _replica) =
+            internal_replica_test_router(&directory).await;
+        let subscription = control
+            .active_subscription_by_name("orders.billing")
+            .await
+            .unwrap();
+        let assignment = control
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        let local = crate::active_range::StorageNodeId::try_new("control-1").unwrap();
+        let effect_id = Uuid::from_u128(941);
+        let mutation = crate::effect::EffectMutation {
+            effect_id,
+            subscription_id: subscription.subscription_id,
+            ownership_epoch: assignment.ownership_epoch,
+            sequence: 1,
+            request_id: Uuid::from_u128(942),
+            transition: crate::effect::EffectTransition::Declare {
+                consume: Some(crate::effect::EffectConsume {
+                    feed_id: subscription.feed_id,
+                    expected_cursor: None,
+                    cursor: "effect-1".to_owned(),
+                    positions: BTreeMap::from([(
+                        RangeId::from_uuid(Uuid::from_u128(943)),
+                        "position-1".to_owned(),
+                    )]),
+                }),
+                outputs: vec![crate::effect::EffectOutput {
+                    feed_id: Uuid::from_u128(944),
+                    key_base64: "a2V5".to_owned(),
+                    payload_base64: "cGF5bG9hZA==".to_owned(),
+                    event_time_ns: 1,
+                    writer_session_id: Uuid::from_u128(945),
+                    sequence: 1,
+                }],
+            },
+        };
+        let prepare = crate::effect::EffectPrepareRequest {
+            owner: assignment.owner.clone(),
+            receiver: local.clone(),
+            mutation: mutation.clone(),
+        };
+        let request = |path: &str, body: serde_json::Value, key: Option<&str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                builder = builder.header("x-whitewater-control-key", key);
+            }
+            builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let path = "/internal/effect-journal/prepare";
+        let missing = app
+            .clone()
+            .oneshot(request(path, json!(prepare), None))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        let mut wrong = prepare.clone();
+        wrong.receiver = assignment
+            .replicas
+            .iter()
+            .find(|node| *node != &local)
+            .unwrap()
+            .clone();
+        let rejected = app
+            .clone()
+            .oneshot(request(
+                path,
+                json!(wrong),
+                Some("this-is-a-long-control-plane-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let accepted = app
+            .clone()
+            .oneshot(request(
+                path,
+                json!(prepare),
+                Some("this-is-a-long-control-plane-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(accepted.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(accepted.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let reply: crate::effect::EffectReplicaReply<crate::effect::EffectPrepareVote> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reply.replica, local);
+        assert_eq!(reply.effect_id, effect_id);
+        // The prepared mutation is invisible to committed reads until the
+        // quorum commit lands.
+        let read = crate::effect::EffectReadRequest {
+            owner: assignment.owner.clone(),
+            receiver: local.clone(),
+            subscription_id: subscription.subscription_id,
+            effect_id,
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                "/internal/effect-journal/committed",
+                json!(read),
+                Some("this-is-a-long-control-plane-key"),
+            ))
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let reply: crate::effect::EffectReplicaReply<Option<crate::effect::EffectMutation>> =
+            serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reply.result, None);
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn non_voter_internal_routes_authenticate_by_shared_key_without_a_control_plane() {
         let directory = TempDir::new().unwrap();
         let (mut state, control_plane, _control, _replica) =
@@ -8551,6 +8829,7 @@ mod tests {
                 progress_authority: control.clone(),
                 majority_append: None,
                 subscription_progress: None,
+                effect_journal: None,
                 subscription_mtls_enabled: false,
                 storage_node_id: Some(node.clone()),
                 control_endpoints: Arc::new(endpoints.clone().into()),
@@ -8801,6 +9080,16 @@ mod tests {
                         replica,
                     ),
                 )),
+                effect_journal: Some(Arc::new(crate::effect::EffectJournalService::new(
+                    node.clone(),
+                    control.clone(),
+                    Arc::new(
+                        crate::effect::FjallEffectJournalReplica::open(
+                            directory.path().join(format!("effect-journal-{index}")),
+                        )
+                        .unwrap(),
+                    ),
+                ))),
                 subscription_mtls_enabled: false,
                 storage_node_id: Some(node.clone()),
                 control_endpoints: Arc::new(endpoints.clone().into()),

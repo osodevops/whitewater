@@ -145,6 +145,20 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let effect_journal = if let Some(local) = &replica_append {
+        let path = config.data_dir.join("effect-journal");
+        let replica = tokio::task::spawn_blocking(move || {
+            finnstream::effect::FjallEffectJournalReplica::open(path)
+        })
+        .await??;
+        Some(Arc::new(finnstream::effect::EffectJournalService::new(
+            local.local_node().clone(),
+            control.clone(),
+            Arc::new(replica),
+        )))
+    } else {
+        None
+    };
 
     let majority_append = match (
         replica_append.clone(),
@@ -513,6 +527,7 @@ async fn main() -> Result<()> {
             .map(|service| service.local_node().clone()),
         replica_append,
         subscription_progress,
+        effect_journal,
         subscription_mtls_enabled: config.subscription_mtls.is_some(),
         majority_append,
         control_endpoints: Arc::new(control_endpoints.clone()),
