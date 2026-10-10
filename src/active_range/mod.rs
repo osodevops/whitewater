@@ -1,3 +1,4 @@
+pub mod drain;
 pub mod majority;
 pub mod merge;
 pub mod model;
@@ -8,6 +9,9 @@ pub mod routing;
 pub mod split;
 pub mod store;
 
+pub use drain::{
+    DrainCommandAuthority, StorageDrainError, StorageDrainExecutor, StorageDrainReport,
+};
 pub use majority::{
     HttpReplicaTransport, MajorityAppendCoordinator, MajorityAppendError, MajorityAppendErrorCode,
     MajorityAppendResult, ReplicaTransport, ReplicaTransportError,

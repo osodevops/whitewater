@@ -278,6 +278,8 @@ UNDRAIN STORAGE NODE storage-4;
 
 `UNDRAIN STORAGE NODE` clears the flag and restores eligibility. `RETIRE` clears it too, so a fully drained Node can be removed in the same session.
 
+`StorageDrainExecutor` (library) executes the inspected plan one move at a time through the same verified owner/follower and progress-replica machinery used by operator movement — never metadata-only swaps. It re-plans after every committed step, reports completed moves, `unplannable` references, and `ready_to_retire`, so automation can run a bounded drain loop rather than a blind multi-step script.
+
 ## Rename resources
 
 ```sql
