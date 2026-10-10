@@ -3313,6 +3313,15 @@ async fn move_stage_local(
         .internal_key
         .as_ref()
         .ok_or_else(|| ApiError::unavailable("internal credential unavailable"))?;
+    let prior_commit = service
+        .recovery_status_for_assignment(&plan.candidate_assignment)
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .committed;
+    // Every position at or below prior_commit was staged with its digest
+    // verified against this source before commit advanced, so an interrupted
+    // or retried stage resumes at the proven boundary instead of restarting.
+    let resume = (prior_commit.value() > 0).then(|| RangePosition::new(prior_commit.value()));
     let first = fetch_move_export(
         &state,
         endpoint,
@@ -3320,7 +3329,7 @@ async fn move_stage_local(
         MoveExportRequest {
             plan_id: plan.plan_id,
             range_id: request.range_id,
-            after: None,
+            after: resume,
             expected_commit: request.expected_commit,
         },
     )
@@ -3331,17 +3340,13 @@ async fn move_stage_local(
             "range exceeds the 10,000-record prototype transfer bound; keep the old RF3 assignment until checkpointed streaming movement is available",
         ));
     }
-    let prior_commit = service
-        .recovery_status_for_assignment(&plan.candidate_assignment)
-        .await
-        .map_err(|error| ApiError::unavailable(error.to_string()))?
-        .committed;
     if prior_commit > captured {
         return Err(ApiError::unavailable(
             "replacement replica is ahead of source CommitPosition",
         ));
     }
-    let mut after = None;
+    let mut after = resume;
+    let skipped_records = prior_commit.value();
     let mut checksum = blake3::Hasher::new();
     let mut transferred_records = 0_u64;
     let mut transferred_bytes = 0_u64;
@@ -3442,6 +3447,7 @@ async fn move_stage_local(
         target_commit,
         transferred_records,
         transferred_bytes,
+        skipped_records,
         checksum: *checksum.finalize().as_bytes(),
         ready: latest == captured && target_commit == captured,
     }))

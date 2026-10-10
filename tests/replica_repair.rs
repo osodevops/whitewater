@@ -444,13 +444,11 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
     assert!(copied.ready);
     assert_eq!(copied.transferred_records, 3);
     assert_eq!(copied.target_commit, CommitPosition::new(3));
-    assert_eq!(
-        copy_follower_move(&plan, &source, &target, 2)
-            .await
-            .unwrap()
-            .transferred_records,
-        0
-    );
+    let repeated = copy_follower_move(&plan, &source, &target, 2)
+        .await
+        .unwrap();
+    assert_eq!(repeated.transferred_records, 0);
+    assert_eq!(repeated.skipped_records, 3);
     assert_eq!(
         control.active_range_assignment(feed_id).await.unwrap(),
         original
@@ -574,6 +572,7 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
         .unwrap();
     assert!(final_copy.ready);
     assert_eq!(final_copy.transferred_records, 0);
+    assert_eq!(final_copy.skipped_records, 4);
     assert_eq!(final_copy.target_commit, CommitPosition::new(4));
     assert!(
         !source
@@ -674,4 +673,156 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
     );
     assert_eq!(frames.unwrap().len(), 11);
     assert_eq!(status.unwrap().committed, CommitPosition::new(11));
+}
+
+#[tokio::test]
+async fn follower_move_copy_resumes_staged_prefix_after_target_restart() {
+    let directory = TempDir::new().unwrap();
+    let legacy: Arc<dyn LogStore> =
+        Arc::new(FileLogStore::open(directory.path().join("legacy")).unwrap());
+    let control = Arc::new(
+        ControlController::open_with_storage_nodes(
+            directory.path().join("catalog.json"),
+            legacy,
+            ["storage-1", "storage-2", "storage-3", "storage-4"]
+                .into_iter()
+                .map(node)
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let created = control
+        .execute_commands(vec![
+            Command::CreateSpace {
+                name: "orders".to_owned(),
+            },
+            Command::CreateFeed {
+                name: "orders.events".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+    let feed_id = serde_json::from_value(created.results[1].data["feed_id"].clone()).unwrap();
+    let original = control.active_range_assignment(feed_id).await.unwrap();
+    let services = ["storage-1", "storage-2", "storage-3", "storage-4"]
+        .into_iter()
+        .map(|value| {
+            (
+                node(value),
+                Arc::new(ReplicaAppendService::new(
+                    directory.path().join(value),
+                    node(value),
+                    control.clone(),
+                )),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let source = services[&original.owner].clone();
+    for sequence in 1..=3_u64 {
+        let record = StoredRecord {
+            message_id: Uuid::from_u128(1_100 + sequence as u128),
+            producer_id: Uuid::from_u128(1_100),
+            producer_sequence: sequence,
+            event_time_ns: sequence as i64,
+            ingest_time_ns: sequence as i64,
+            key: b"order-1".to_vec(),
+            payload: format!("event-{sequence}").into_bytes(),
+            metadata: BTreeMap::new(),
+        };
+        let request = ReplicaAppendRequest {
+            feed_id,
+            range_id: original.range_id,
+            generation: original.generation,
+            ownership_epoch: original.ownership_epoch,
+            append_owner: original.owner.clone(),
+            expected_position: RangePosition::new(sequence),
+            identity: AppendIdentity {
+                writer_session_id: record.producer_id,
+                writer_epoch: 1,
+                sequence,
+            },
+            cursor: format!("cursor-{sequence}"),
+            frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+        };
+        for replica in original.replicas.iter() {
+            let accepted = services[replica].append(request.clone()).await.unwrap();
+            services[replica]
+                .commit(ReplicaCommitRequest {
+                    feed_id,
+                    range_id: original.range_id,
+                    generation: original.generation,
+                    ownership_epoch: original.ownership_epoch,
+                    append_owner: original.owner.clone(),
+                    commit_position: CommitPosition::new(sequence),
+                    frame_digest: accepted.frame_digest,
+                })
+                .await
+                .unwrap();
+        }
+    }
+    let removed = original
+        .replicas
+        .iter()
+        .find(|node| **node != original.owner)
+        .unwrap()
+        .clone();
+    let replacement = services
+        .keys()
+        .find(|node| !original.replicas.contains(node))
+        .unwrap()
+        .clone();
+    let prepared = control
+        .execute_commands(vec![Command::PrepareFollowerMove {
+            feed: "orders.events".to_owned(),
+            range_id: original.range_id,
+            removed_replica: removed.clone(),
+            replacement_replica: replacement.clone(),
+        }])
+        .await
+        .unwrap();
+    let plan: RangeMovePlan = serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+
+    // An earlier interrupted attempt staged and committed the first two
+    // positions on the replacement; its process then restarted.
+    let target_root = directory.path().join(replacement.as_str());
+    let target = Arc::new(ReplicaAppendService::new(
+        &target_root,
+        replacement.clone(),
+        control.clone(),
+    ));
+    let exported = source
+        .export_assignment_committed(&plan.source_assignment, None, 2)
+        .await
+        .unwrap();
+    assert_eq!(exported.len(), 2);
+    for frame in exported {
+        target
+            .stage_split_frame(
+                &plan.candidate_assignment,
+                frame.position,
+                frame.identity,
+                frame.cursor,
+                frame.frame,
+            )
+            .await
+            .unwrap();
+    }
+    target
+        .commit_staged_split(&plan.candidate_assignment, CommitPosition::new(2))
+        .await
+        .unwrap();
+    drop(target);
+    let target = Arc::new(ReplicaAppendService::new(
+        &target_root,
+        replacement.clone(),
+        control,
+    ));
+
+    let copied = copy_follower_move(&plan, &source, &target, 2)
+        .await
+        .unwrap();
+    assert!(copied.ready);
+    assert_eq!(copied.skipped_records, 2);
+    assert_eq!(copied.transferred_records, 1);
+    assert_eq!(copied.target_commit, CommitPosition::new(3));
 }

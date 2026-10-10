@@ -67,6 +67,11 @@ pub struct FollowerMoveCopyResult {
     pub target_commit: CommitPosition,
     pub transferred_records: u64,
     pub transferred_bytes: u64,
+    /// Positions already verified and committed on the replacement by an
+    /// earlier attempt; they are trusted rather than restaged, so a retry or
+    /// restarted driver resumes the copy instead of restarting it.
+    #[serde(default)]
+    pub skipped_records: u64,
     pub checksum: [u8; 32],
     pub ready: bool,
 }
@@ -521,7 +526,11 @@ pub async fn copy_follower_move(
     let mut checksum = blake3::Hasher::new();
     let mut transferred_records = 0_u64;
     let mut transferred_bytes = 0_u64;
-    let mut after = None;
+    // Every position at or below target_commit was staged with its digest
+    // verified against this source before commit advanced, so it is already a
+    // proven copy of the immutable source prefix and does not need restaging.
+    let skipped_records = target_commit.value();
+    let mut after = (target_commit.value() > 0).then(|| RangePosition::new(target_commit.value()));
     while after.map_or(0, RangePosition::value) < source_commit.value() {
         let frames = source
             .export_assignment_committed(&plan.source_assignment, after, batch_size.clamp(1, 256))
@@ -584,6 +593,7 @@ pub async fn copy_follower_move(
         target_commit: latest_target,
         transferred_records,
         transferred_bytes,
+        skipped_records,
         checksum: *checksum.finalize().as_bytes(),
         ready: latest_source == source_commit && latest_target == source_commit,
     })
