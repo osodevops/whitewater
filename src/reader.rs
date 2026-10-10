@@ -2020,12 +2020,13 @@ impl SubscriptionProgressCoordinator {
 
     async fn adopt_all(
         &self,
+        members: &[crate::active_range::StorageNodeId],
         owner: &crate::active_range::StorageNodeId,
         ownership_epoch: u64,
         committed: Option<SubscriptionProgressMutation>,
     ) -> Result<Vec<crate::active_range::StorageNodeId>, SubscriptionProgressError> {
         let mut adopted = Vec::with_capacity(3);
-        for node in self.assignment.replicas.iter() {
+        for node in members {
             match self
                 .transport
                 .adopt(
@@ -2098,13 +2099,96 @@ impl SubscriptionProgressCoordinator {
             mutation
         });
         let adopted = self
-            .adopt_all(&owner, ownership_epoch, committed.clone())
+            .adopt_all(
+                self.assignment.replicas.as_array(),
+                &owner,
+                ownership_epoch,
+                committed.clone(),
+            )
             .await?;
         Ok(SubscriptionRecoveryOutcome {
             assignment: SubscriptionProgressAssignment {
                 subscription_id: self.assignment.subscription_id,
                 owner,
                 replicas: self.assignment.replicas.clone(),
+                ownership_epoch,
+            },
+            committed,
+            adopted,
+        })
+    }
+
+    pub async fn move_replica(
+        &self,
+        control: &crate::control::ControlController,
+        replaced: &crate::active_range::StorageNodeId,
+        replacement: &crate::active_range::StorageNodeId,
+    ) -> Result<SubscriptionRecoveryOutcome, SubscriptionProgressError> {
+        if !self.assignment.replicas.contains(replaced)
+            || self.assignment.replicas.contains(replacement)
+            || *replaced == self.assignment.owner
+        {
+            return Err(SubscriptionProgressError::InvalidAssignment);
+        }
+        let next_epoch = self
+            .assignment
+            .ownership_epoch
+            .checked_add(1)
+            .ok_or(SubscriptionProgressError::Sequence)?;
+        let mut swapped = self.assignment.replicas.as_array().clone();
+        for slot in swapped.iter_mut() {
+            if *slot == *replaced {
+                *slot = replacement.clone();
+            }
+        }
+        let new_replicas = crate::active_range::ReplicaSet::try_new(swapped)
+            .map_err(|_| SubscriptionProgressError::InvalidAssignment)?;
+        let evidence = self.inspect_evidence().await?;
+        let recovered = Self::recovered_committed(&evidence)?;
+        let (replicas, owner, ownership_epoch) = match control
+            .execute_commands(vec![
+                crate::control::Command::MoveSubscriptionProgressReplica {
+                    subscription_id: self.assignment.subscription_id,
+                    expected_ownership_epoch: self.assignment.ownership_epoch,
+                    replaced: replaced.clone(),
+                    replacement: replacement.clone(),
+                },
+            ])
+            .await
+        {
+            Ok(_) => (new_replicas, self.assignment.owner.clone(), next_epoch),
+            Err(_) => {
+                let current = control
+                    .active_subscription_progress_assignment_by_id(self.assignment.subscription_id)
+                    .await
+                    .ok_or(SubscriptionProgressError::InvalidAssignment)?;
+                if current.ownership_epoch <= self.assignment.ownership_epoch {
+                    return Err(SubscriptionProgressError::Unavailable);
+                }
+                (
+                    current.replicas.clone(),
+                    current.owner,
+                    current.ownership_epoch,
+                )
+            }
+        };
+        let committed = recovered.map(|mut mutation| {
+            mutation.ownership_epoch = ownership_epoch;
+            mutation
+        });
+        let adopted = self
+            .adopt_all(
+                replicas.as_array(),
+                &owner,
+                ownership_epoch,
+                committed.clone(),
+            )
+            .await?;
+        Ok(SubscriptionRecoveryOutcome {
+            assignment: SubscriptionProgressAssignment {
+                subscription_id: self.assignment.subscription_id,
+                owner,
+                replicas,
                 ownership_epoch,
             },
             committed,
@@ -2123,6 +2207,7 @@ impl SubscriptionProgressCoordinator {
         });
         let adopted = self
             .adopt_all(
+                self.assignment.replicas.as_array(),
                 &self.assignment.owner.clone(),
                 self.assignment.ownership_epoch,
                 committed.clone(),

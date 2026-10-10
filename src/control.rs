@@ -597,6 +597,12 @@ pub enum Command {
         expected_ownership_epoch: u64,
         new_owner: StorageNodeId,
     },
+    MoveSubscriptionProgressReplica {
+        subscription_id: Uuid,
+        expected_ownership_epoch: u64,
+        replaced: StorageNodeId,
+        replacement: StorageNodeId,
+    },
 }
 
 impl Command {
@@ -627,6 +633,7 @@ impl Command {
                 | Self::ActivateOwnerMove { .. }
                 | Self::AbortOwnerMove { .. }
                 | Self::RecoverSubscriptionProgressOwner { .. }
+                | Self::MoveSubscriptionProgressReplica { .. }
         )
     }
 }
@@ -1950,6 +1957,78 @@ impl ControlController {
                 Ok((
                     format!(
                         "recovered Subscription progress ownership for {subscription_id} at epoch {next_epoch}"
+                    ),
+                    json!(next),
+                ))
+            }
+            Command::MoveSubscriptionProgressReplica {
+                subscription_id,
+                expected_ownership_epoch,
+                replaced,
+                replacement,
+            } => {
+                let current = state
+                    .subscription_progress_assignments
+                    .get(&subscription_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "Subscription progress placement for {subscription_id}"
+                        ))
+                    })?;
+                if current.ownership_epoch != expected_ownership_epoch {
+                    return Err(ControlError::InvalidOperation(
+                        "Subscription progress ownership changed while the move was being planned"
+                            .to_owned(),
+                    ));
+                }
+                if !current.replicas.contains(&replaced) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "replaced Node {replaced} is not a member of the Subscription progress replica set"
+                    )));
+                }
+                if current.owner == replaced {
+                    return Err(ControlError::InvalidOperation(
+                        "the Subscription progress owner cannot be replaced; recover ownership to a surviving replica first"
+                            .to_owned(),
+                    ));
+                }
+                if current.replicas.contains(&replacement) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "replacement Node {replacement} is already a Subscription progress replica"
+                    )));
+                }
+                if !self.eligible_storage_nodes.contains(&replacement) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "replacement Node {replacement} is not eligible for storage"
+                    )));
+                }
+                let mut swapped = current.replicas.as_array().clone();
+                for slot in swapped.iter_mut() {
+                    if *slot == replaced {
+                        *slot = replacement.clone();
+                    }
+                }
+                let replicas = ReplicaSet::try_new(swapped)
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let next_epoch = expected_ownership_epoch.checked_add(1).ok_or_else(|| {
+                    ControlError::InvalidOperation(
+                        "Subscription progress ownership epoch overflowed".to_owned(),
+                    )
+                })?;
+                let next = SubscriptionProgressAssignment::try_new(
+                    subscription_id,
+                    current.owner,
+                    replicas,
+                    next_epoch,
+                )
+                .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                state
+                    .subscription_progress_assignments
+                    .insert(subscription_id, next.clone());
+                Ok((
+                    format!(
+                        "moved Subscription progress replica {replaced} to {replacement} at epoch {next_epoch}"
                     ),
                     json!(next),
                 ))
@@ -3653,6 +3732,7 @@ fn command_label(command: &Command) -> String {
         Command::ActivateOwnerMove { .. } => "ACTIVATE OWNER MOVE",
         Command::AbortOwnerMove { .. } => "ABORT OWNER MOVE",
         Command::RecoverSubscriptionProgressOwner { .. } => "RECOVER SUBSCRIPTION PROGRESS OWNER",
+        Command::MoveSubscriptionProgressReplica { .. } => "MOVE SUBSCRIPTION PROGRESS REPLICA",
     }
     .to_owned()
 }
@@ -4565,6 +4645,146 @@ mod tests {
             .unwrap();
         assert_eq!(persisted.owner, moved.owner);
         assert_eq!(persisted.ownership_epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn subscription_progress_replica_move_swaps_membership_under_epoch_cas() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let nodes: Vec<StorageNodeId> = ["storage-1", "storage-2", "storage-3", "storage-4"]
+            .into_iter()
+            .map(|node| StorageNodeId::try_new(node).unwrap())
+            .collect();
+        let controller = ControlController::open_with_storage_nodes(
+            directory.path().join("catalog.json"),
+            store,
+            nodes.clone(),
+        )
+        .unwrap();
+        controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+        let subscription = controller
+            .active_subscription_by_name("orders.billing")
+            .await
+            .unwrap();
+        let assignment = controller
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        let replaced = assignment
+            .replicas
+            .iter()
+            .find(|node| *node != &assignment.owner)
+            .cloned()
+            .unwrap();
+        let spare = nodes
+            .iter()
+            .find(|node| !assignment.replicas.contains(node))
+            .cloned()
+            .unwrap();
+        let member = assignment
+            .replicas
+            .iter()
+            .find(|node| *node != &replaced)
+            .cloned()
+            .unwrap();
+        let outsider = StorageNodeId::try_new("storage-x").unwrap();
+
+        // owner cannot be removed through replica move; recover ownership first.
+        assert!(controller
+            .execute_commands(vec![Command::MoveSubscriptionProgressReplica {
+                subscription_id: subscription.subscription_id,
+                expected_ownership_epoch: 1,
+                replaced: assignment.owner.clone(),
+                replacement: spare.clone(),
+            }])
+            .await
+            .is_err());
+        // stale epoch must be refused.
+        assert!(controller
+            .execute_commands(vec![Command::MoveSubscriptionProgressReplica {
+                subscription_id: subscription.subscription_id,
+                expected_ownership_epoch: 7,
+                replaced: replaced.clone(),
+                replacement: spare.clone(),
+            }])
+            .await
+            .is_err());
+        // replaced node must be a member.
+        assert!(controller
+            .execute_commands(vec![Command::MoveSubscriptionProgressReplica {
+                subscription_id: subscription.subscription_id,
+                expected_ownership_epoch: 1,
+                replaced: spare.clone(),
+                replacement: member.clone(),
+            }])
+            .await
+            .is_err());
+        // replacement must not already be a member.
+        assert!(controller
+            .execute_commands(vec![Command::MoveSubscriptionProgressReplica {
+                subscription_id: subscription.subscription_id,
+                expected_ownership_epoch: 1,
+                replaced: replaced.clone(),
+                replacement: member.clone(),
+            }])
+            .await
+            .is_err());
+        // replacement must be an eligible storage Node.
+        assert!(controller
+            .execute_commands(vec![Command::MoveSubscriptionProgressReplica {
+                subscription_id: subscription.subscription_id,
+                expected_ownership_epoch: 1,
+                replaced: replaced.clone(),
+                replacement: outsider,
+            }])
+            .await
+            .is_err());
+
+        controller
+            .execute_commands(vec![Command::MoveSubscriptionProgressReplica {
+                subscription_id: subscription.subscription_id,
+                expected_ownership_epoch: 1,
+                replaced: replaced.clone(),
+                replacement: spare.clone(),
+            }])
+            .await
+            .unwrap();
+        let moved = controller
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        assert_eq!(moved.owner, assignment.owner);
+        assert_eq!(moved.ownership_epoch, 2);
+        assert!(moved.replicas.contains(&spare));
+        assert!(!moved.replicas.contains(&replaced));
+        // the previous epoch is fenced.
+        assert!(controller
+            .execute_commands(vec![Command::MoveSubscriptionProgressReplica {
+                subscription_id: subscription.subscription_id,
+                expected_ownership_epoch: 1,
+                replaced: member.clone(),
+                replacement: replaced.clone(),
+            }])
+            .await
+            .is_err());
+
+        drop(controller);
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let reopened = ControlController::open_with_storage_nodes(
+            directory.path().join("catalog.json"),
+            store,
+            nodes,
+        )
+        .unwrap();
+        let persisted = reopened
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        assert_eq!(persisted.owner, moved.owner);
+        assert_eq!(persisted.ownership_epoch, 2);
+        assert!(persisted.replicas.contains(&spare));
     }
 
     #[tokio::test]

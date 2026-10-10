@@ -1478,3 +1478,221 @@ async fn subscription_progress_recovery_adopts_latest_committed_under_raced_move
         .unwrap();
     assert_eq!(behind.committed, Some(committed));
 }
+
+#[tokio::test]
+async fn subscription_progress_replica_move_seeds_replacement_and_fences_stale_epoch() {
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let extra = StorageNodeId::try_new("storage-d").unwrap();
+    let mut all_nodes = nodes.to_vec();
+    all_nodes.push(extra.clone());
+    let controller = progress_controller(&directory, &all_nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let extra_dir = TempDir::new().unwrap();
+    let mut transport = TestProgressTransport::new(&dirs, &nodes);
+    transport.stores.insert(
+        extra.clone(),
+        Arc::new(FjallSubscriptionProgressReplica::open(extra_dir.path()).unwrap()),
+    );
+    let transport = Arc::new(transport);
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let owner = coordinator.assignment().owner.clone();
+    let replaced = coordinator
+        .assignment()
+        .replicas
+        .iter()
+        .find(|node| *node != &owner)
+        .cloned()
+        .unwrap();
+    let spare = all_nodes
+        .iter()
+        .find(|node| !coordinator.assignment().replicas.contains(node))
+        .cloned()
+        .unwrap();
+    let first = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    coordinator.apply(first.clone()).await.unwrap();
+
+    // the owner slot cannot be drained through a replica move.
+    assert!(matches!(
+        coordinator.move_replica(&controller, &owner, &spare).await,
+        Err(SubscriptionProgressError::InvalidAssignment)
+    ));
+    // a member cannot be swapped for an existing member.
+    assert!(matches!(
+        coordinator
+            .move_replica(&controller, &replaced, &owner)
+            .await,
+        Err(SubscriptionProgressError::InvalidAssignment)
+    ));
+
+    let outcome = coordinator
+        .move_replica(&controller, &replaced, &spare)
+        .await
+        .unwrap();
+    assert_eq!(outcome.assignment.ownership_epoch, 2);
+    assert_eq!(outcome.assignment.owner, owner);
+    assert!(outcome.assignment.replicas.contains(&spare));
+    assert!(!outcome.assignment.replicas.contains(&replaced));
+    assert_eq!(outcome.adopted.len(), 3);
+    let recovered = outcome.committed.clone().unwrap();
+    assert_eq!(recovered.ownership_epoch, 2);
+    assert_eq!(recovered.cursor, first.cursor);
+    assert_eq!(recovered.request_id, first.request_id);
+
+    // the replacement was seeded with the recovered committed value.
+    let spare_state = transport.stores[&spare]
+        .local_state(subscription.subscription_id)
+        .unwrap();
+    assert_eq!(spare_state.committed, Some(recovered.clone()));
+    // the drained member kept its old-epoch row and received no writes.
+    let drained_state = transport.stores[&replaced]
+        .local_state(subscription.subscription_id)
+        .unwrap();
+    let drained_committed = drained_state.committed.unwrap();
+    assert_eq!(drained_committed.ownership_epoch, 1);
+    assert_eq!(drained_committed.cursor, first.cursor);
+
+    // the drained member can no longer serve the subscription: a fresh
+    // coordinator binds the moved placement and continues progress.
+    let moved = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(moved.assignment(), &outcome.assignment);
+    let next = progress_mutation(subscription.subscription_id, subscription.feed_id, 2, 2);
+    moved.apply(next.clone()).await.unwrap();
+    assert_eq!(moved.read_committed().await.unwrap(), Some(next.clone()));
+    assert_eq!(
+        transport.stores[&spare]
+            .local_state(subscription.subscription_id)
+            .unwrap()
+            .committed,
+        Some(next)
+    );
+
+    // the old coordinator is fenced by the higher ownership epoch.
+    let stale = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 2);
+    assert!(matches!(
+        coordinator.apply(stale).await,
+        Err(SubscriptionProgressError::StaleEpoch)
+            | Err(SubscriptionProgressError::InvalidAssignment)
+            | Err(SubscriptionProgressError::NoQuorum)
+    ));
+
+    // the seeded value survives a replacement-Node restart.
+    drop(moved);
+    drop(coordinator);
+    drop(transport);
+    let spare_dir = if spare == extra {
+        &extra_dir
+    } else {
+        &dirs[all_nodes.iter().position(|node| *node == spare).unwrap()]
+    };
+    let reopened = FjallSubscriptionProgressReplica::open(spare_dir.path()).unwrap();
+    assert_eq!(
+        reopened
+            .local_state(subscription.subscription_id)
+            .unwrap()
+            .committed
+            .unwrap()
+            .sequence,
+        2
+    );
+}
+
+#[tokio::test]
+async fn subscription_progress_replica_move_drains_unavailable_member() {
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let extra = StorageNodeId::try_new("storage-d").unwrap();
+    let mut all_nodes = nodes.to_vec();
+    all_nodes.push(extra.clone());
+    let controller = progress_controller(&directory, &all_nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let extra_dir = TempDir::new().unwrap();
+    let mut transport = TestProgressTransport::new(&dirs, &nodes);
+    transport.stores.insert(
+        extra.clone(),
+        Arc::new(FjallSubscriptionProgressReplica::open(extra_dir.path()).unwrap()),
+    );
+    let transport = Arc::new(transport);
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let owner = coordinator.assignment().owner.clone();
+    let replaced = coordinator
+        .assignment()
+        .replicas
+        .iter()
+        .find(|node| *node != &owner)
+        .cloned()
+        .unwrap();
+    let spare = all_nodes
+        .iter()
+        .find(|node| !coordinator.assignment().replicas.contains(node))
+        .cloned()
+        .unwrap();
+    let first = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    coordinator.apply(first.clone()).await.unwrap();
+
+    // the member being drained is completely unreachable; quorum evidence
+    // from the two survivors still authorizes the move.
+    for set in [
+        &transport.prepare_down,
+        &transport.commit_down,
+        &transport.read_down,
+        &transport.inspect_down,
+        &transport.adopt_down,
+    ] {
+        set.lock().unwrap().insert(replaced.clone());
+    }
+
+    let outcome = coordinator
+        .move_replica(&controller, &replaced, &spare)
+        .await
+        .unwrap();
+    assert_eq!(outcome.assignment.ownership_epoch, 2);
+    assert!(outcome.assignment.replicas.contains(&spare));
+    assert!(!outcome.assignment.replicas.contains(&replaced));
+    assert_eq!(outcome.adopted.len(), 3);
+    assert!(!outcome.adopted.contains(&replaced));
+    let committed = outcome.committed.unwrap();
+    assert_eq!(committed.cursor, first.cursor);
+    assert_eq!(committed.ownership_epoch, 2);
+
+    let spare_state = transport.stores[&spare]
+        .local_state(subscription.subscription_id)
+        .unwrap();
+    assert_eq!(spare_state.committed, Some(committed));
+}
