@@ -852,12 +852,15 @@ async fn replica_commit(
 fn check_subscription_peer(
     state: &AppState,
     peer: Option<&AuthenticatedSubscriptionPeer>,
-    owner: &StorageNodeId,
 ) -> Result<(), ApiError> {
-    if state.subscription_mtls_enabled && peer.is_none_or(|peer| &peer.0 != owner) {
+    // Member requests land on any Node, so the coordinator driving progress
+    // mutations is not necessarily the assigned owner. The pinned peer
+    // certificate proves the caller is a cluster Node; ownership_epoch
+    // fencing and quorum evidence reject a stale coordinator's writes.
+    if state.subscription_mtls_enabled && peer.is_none() {
         return Err(ApiError {
             status: StatusCode::UNAUTHORIZED,
-            message: "Subscription progress requires the assigned owner's mTLS identity".to_owned(),
+            message: "Subscription progress requires a pinned Node mTLS identity".to_owned(),
 
             code: None,
         });
@@ -1696,7 +1699,7 @@ async fn subscription_prepare_local(
     Json<crate::reader::SubscriptionReplicaReply<crate::reader::SubscriptionPrepareVote>>,
     ApiError,
 > {
-    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0), &request.owner)?;
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
     let service = state
         .subscription_progress
         .as_ref()
@@ -1717,7 +1720,7 @@ async fn subscription_commit_local(
     Json<crate::reader::SubscriptionReplicaReply<crate::reader::SubscriptionProgressMutation>>,
     ApiError,
 > {
-    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0), &request.owner)?;
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
     let service = state
         .subscription_progress
         .as_ref()
@@ -1742,7 +1745,7 @@ async fn subscription_committed_local(
     >,
     ApiError,
 > {
-    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0), &request.owner)?;
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
     let service = state
         .subscription_progress
         .as_ref()
@@ -1763,7 +1766,7 @@ async fn subscription_inspect_local(
     Json<crate::reader::SubscriptionReplicaReply<crate::reader::SubscriptionProgressInspection>>,
     ApiError,
 > {
-    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0), &request.owner)?;
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
     let service = state
         .subscription_progress
         .as_ref()
@@ -1788,7 +1791,7 @@ async fn subscription_adopt_local(
     >,
     ApiError,
 > {
-    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0), &request.owner)?;
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
     let service = state
         .subscription_progress
         .as_ref()
@@ -7293,19 +7296,20 @@ mod tests {
             .find(|node| *node != &assignment.owner)
             .unwrap();
         let other_client = make_client(Some(&certificates[other]));
+        let owner_client = make_client(Some(&certificates[&assignment.owner]));
+        // A request claiming a different owner is rejected by placement checks
+        // even when the caller presents the real owner's certificate.
+        let mut claimed_other = request.clone();
+        claimed_other.owner = other.clone();
         assert_eq!(
-            other_client
+            owner_client
                 .post(format!("{endpoint}/prepare"))
-                .header(
-                    "x-whitewater-control-key",
-                    "this-is-a-long-control-plane-key"
-                )
-                .json(&request)
+                .json(&claimed_other)
                 .send()
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::UNAUTHORIZED
+            StatusCode::CONFLICT
         );
         let rogue_key = rcgen::KeyPair::generate().unwrap();
         let rogue_cert = rcgen::CertificateParams::new(vec!["rogue-node".to_owned()])
@@ -7319,20 +7323,9 @@ mod tests {
             .send()
             .await
             .is_err());
-        let owner_client = make_client(Some(&certificates[&assignment.owner]));
-        let mut claimed_other = request.clone();
-        claimed_other.owner = other.clone();
-        assert_eq!(
-            owner_client
-                .post(format!("{endpoint}/prepare"))
-                .json(&claimed_other)
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::UNAUTHORIZED
-        );
-        let accepted = owner_client
+        // Member requests are topology-free: any pinned Node may coordinate
+        // progress mutations on the assigned replicas.
+        let accepted = other_client
             .post(format!("{endpoint}/prepare"))
             .json(&request)
             .send()
@@ -7355,7 +7348,7 @@ mod tests {
         };
         let uncommitted: crate::reader::SubscriptionReplicaReply<
             Option<crate::reader::SubscriptionProgressMutation>,
-        > = owner_client
+        > = other_client
             .post(format!("{endpoint}/committed"))
             .json(&read)
             .send()
@@ -7365,16 +7358,6 @@ mod tests {
             .await
             .unwrap();
         assert!(uncommitted.result.is_none());
-        assert_eq!(
-            other_client
-                .post(format!("{endpoint}/committed"))
-                .json(&read)
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::UNAUTHORIZED
-        );
         let evidence = json!({
             "votes": [[assignment.owner, vote.result.digest], [other, vote.result.digest]],
             "subscription_id": subscription.subscription_id, "request_id": mutation.request_id,
@@ -7382,19 +7365,9 @@ mod tests {
         let commit = json!({"owner": assignment.owner, "receiver": nodes[0],
             "subscription_id": subscription.subscription_id,
             "ownership_epoch": assignment.ownership_epoch, "evidence": evidence});
-        assert_eq!(
-            other_client
-                .post(format!("{endpoint}/commit"))
-                .json(&commit)
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::UNAUTHORIZED
-        );
         let committed: crate::reader::SubscriptionReplicaReply<
             crate::reader::SubscriptionProgressMutation,
-        > = owner_client
+        > = other_client
             .post(format!("{endpoint}/commit"))
             .json(&commit)
             .send()

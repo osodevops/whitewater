@@ -1803,13 +1803,17 @@ impl HttpSubscriptionProgressTransport {
         if let Some(key) = &self.key {
             request = request.header("x-whitewater-control-key", key);
         }
-        let mut response = request
-            .send()
-            .await
-            .map_err(|_| SubscriptionProgressError::Unavailable)?;
+        let mut response = match request.send().await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(node = %node, path, %error, "Subscription progress request failed");
+                return Err(SubscriptionProgressError::Unavailable);
+            }
+        };
         if !response.status().is_success() {
             let status = response.status();
             let body = response.bytes().await.unwrap_or_default();
+            tracing::warn!(node = %node, path, %status, "Subscription progress replica refused");
             let code = body
                 .get(..4096)
                 .and_then(|head| serde_json::from_slice::<serde_json::Value>(head).ok())
