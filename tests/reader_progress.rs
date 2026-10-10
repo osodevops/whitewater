@@ -1948,3 +1948,178 @@ async fn subscription_member_leases_replicate_survive_restart_and_recover() {
         }
     }
 }
+
+#[tokio::test]
+async fn subscription_member_api_fences_acks_by_quorum_leases() {
+    use finnstream::reader::{SubscriptionLeaseOp, SubscriptionWorkLease};
+
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let member = Uuid::from_u128(21_001);
+    let work = Uuid::from_u128(21_002);
+
+    // member operations need an established committed frontier.
+    assert!(matches!(
+        coordinator
+            .apply_member_ops(
+                Uuid::from_u128(22_001),
+                1,
+                vec![SubscriptionLeaseOp::Join {
+                    member_id: member,
+                    member_epoch: 1,
+                }]
+            )
+            .await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+
+    let frontier = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    coordinator.apply(frontier.clone()).await.unwrap();
+
+    coordinator
+        .apply_member_ops(
+            Uuid::from_u128(22_002),
+            10,
+            vec![SubscriptionLeaseOp::Join {
+                member_id: member,
+                member_epoch: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    coordinator
+        .apply_member_ops(
+            Uuid::from_u128(22_003),
+            10,
+            vec![SubscriptionLeaseOp::Claim {
+                work_id: work,
+                member_id: member,
+                member_epoch: 1,
+                lease_ticks: 30,
+            }],
+        )
+        .await
+        .unwrap();
+    let members = coordinator.member_state().await.unwrap();
+    let lease = members.leases.get(&work).unwrap();
+    let grant = SubscriptionWorkLease {
+        work_id: work,
+        member_id: member,
+        member_epoch: 1,
+        lease_epoch: lease.lease_epoch,
+        expires_at_tick: lease.expires_at_tick,
+    };
+    assert_eq!(grant.expires_at_tick, 40);
+    assert!(coordinator.can_member_ack(&grant, 20).await.unwrap());
+
+    // a stale member epoch or stale lease epoch cannot acknowledge.
+    let wrong_member = SubscriptionWorkLease {
+        member_epoch: 2,
+        ..grant.clone()
+    };
+    assert!(!coordinator.can_member_ack(&wrong_member, 20).await.unwrap());
+    assert!(matches!(
+        coordinator
+            .acknowledge(
+                &wrong_member,
+                20,
+                Uuid::from_u128(22_004),
+                "rf1_acked".to_owned(),
+                frontier.positions.clone()
+            )
+            .await,
+        Err(SubscriptionProgressError::Lease(
+            finnstream::reader::SubscriptionLeaseError::StaleLease
+        ))
+    ));
+    let wrong_lease = SubscriptionWorkLease {
+        lease_epoch: grant.lease_epoch + 1,
+        ..grant.clone()
+    };
+    assert!(matches!(
+        coordinator
+            .acknowledge(
+                &wrong_lease,
+                20,
+                Uuid::from_u128(22_005),
+                "rf1_acked".to_owned(),
+                frontier.positions.clone()
+            )
+            .await,
+        Err(SubscriptionProgressError::Lease(
+            finnstream::reader::SubscriptionLeaseError::StaleLease
+        ))
+    ));
+
+    // a valid acknowledgement moves the frontier and releases the lease
+    // atomically on every replica.
+    let acked = coordinator
+        .acknowledge(
+            &grant,
+            20,
+            Uuid::from_u128(22_006),
+            "rf1_acked".to_owned(),
+            BTreeMap::from([(
+                RangeId::from_uuid(Uuid::from_u128(23_001)),
+                "ack-pos".to_owned(),
+            )]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(acked.cursor, "rf1_acked");
+    for node in &nodes {
+        let state = transport.stores[node]
+            .local_state(subscription.subscription_id)
+            .unwrap();
+        assert!(state.members.leases.is_empty());
+        assert_eq!(state.committed.as_ref().unwrap().cursor, "rf1_acked");
+    }
+    // after release the grant no longer authorizes anything.
+    assert!(!coordinator.can_member_ack(&grant, 21).await.unwrap());
+    // an expired lease can never acknowledge even if it still exists.
+    let reclaimed = coordinator
+        .apply_member_ops(
+            Uuid::from_u128(22_007),
+            30,
+            vec![SubscriptionLeaseOp::Claim {
+                work_id: work,
+                member_id: member,
+                member_epoch: 1,
+                lease_ticks: 5,
+            }],
+        )
+        .await
+        .unwrap();
+    assert_eq!(reclaimed.sequence, acked.sequence + 1);
+    let members = coordinator.member_state().await.unwrap();
+    let renewed_grant = SubscriptionWorkLease {
+        work_id: work,
+        member_id: member,
+        member_epoch: 1,
+        lease_epoch: members.leases[&work].lease_epoch,
+        expires_at_tick: members.leases[&work].expires_at_tick,
+    };
+    assert!(!coordinator
+        .can_member_ack(&renewed_grant, 36)
+        .await
+        .unwrap());
+}
