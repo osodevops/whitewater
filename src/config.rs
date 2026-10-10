@@ -17,6 +17,7 @@ pub struct SubscriptionMtlsConfig {
     pub key_path: PathBuf,
     pub ca_path: PathBuf,
     pub peer_pins: BTreeMap<StorageNodeId, BTreeSet<[u8; 32]>>,
+    pub peer_endpoints: BTreeMap<StorageNodeId, String>,
 }
 
 #[derive(Clone, Debug)]
@@ -84,24 +85,28 @@ impl NodeConfig {
             env::var("FINNSTREAM_SUBSCRIPTION_MTLS_KEY").ok(),
             env::var("FINNSTREAM_SUBSCRIPTION_MTLS_CA").ok(),
             env::var("FINNSTREAM_SUBSCRIPTION_MTLS_PEER_PINS").ok(),
+            env::var("FINNSTREAM_SUBSCRIPTION_MTLS_ENDPOINTS").ok(),
         ];
         if tls.iter().any(Option::is_some) && !tls.iter().all(Option::is_some) {
-            anyhow::bail!("Subscription mTLS bind, certificate, key, CA and peer pins must be configured together");
+            anyhow::bail!("Subscription mTLS bind, certificate, key, CA, peer pins and peer endpoints must be configured together");
         }
         let subscription_mtls = match tls {
-            [Some(bind), Some(cert), Some(key), Some(ca), Some(pins)] => {
+            [Some(bind), Some(cert), Some(key), Some(ca), Some(pins), Some(endpoints)] => {
                 let local_node = control_node_id.ok_or_else(|| {
                     anyhow::anyhow!("Subscription mTLS requires a configured Control Node ID")
                 })?;
                 let peer_pins = parse_peer_pins(&pins)?;
+                let peer_endpoints = parse_peer_endpoints(&endpoints)?;
                 let local_id = StorageNodeId::try_new(format!("control-{local_node}"))?;
                 if !peer_pins.contains_key(&local_id)
+                    || !peer_endpoints.contains_key(&local_id)
                     || control_nodes.iter().any(|(node, _)| {
-                        StorageNodeId::try_new(format!("control-{node}"))
-                            .map_or(true, |id| !peer_pins.contains_key(&id))
+                        StorageNodeId::try_new(format!("control-{node}")).map_or(true, |id| {
+                            !peer_pins.contains_key(&id) || !peer_endpoints.contains_key(&id)
+                        })
                     })
                 {
-                    anyhow::bail!("Subscription mTLS peer pins must include this Node and every configured Control Node");
+                    anyhow::bail!("Subscription mTLS peer pins and endpoints must include this Node and every configured Control Node");
                 }
                 Some(SubscriptionMtlsConfig {
                     bind_addr: bind
@@ -111,6 +116,7 @@ impl NodeConfig {
                     key_path: PathBuf::from(key),
                     ca_path: PathBuf::from(ca),
                     peer_pins,
+                    peer_endpoints,
                 })
             }
             _ => None,
@@ -173,6 +179,36 @@ fn parse_peer_pins(value: &str) -> Result<BTreeMap<StorageNodeId, BTreeSet<[u8; 
     Ok(pins)
 }
 
+fn parse_peer_endpoints(value: &str) -> Result<BTreeMap<StorageNodeId, String>> {
+    let mut endpoints = BTreeMap::new();
+    for entry in value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        let (node, endpoint) = entry
+            .split_once('@')
+            .with_context(|| format!("invalid Subscription mTLS endpoint entry: {entry}"))?;
+        let node = StorageNodeId::try_new(node)?;
+        let endpoint = endpoint.trim_end_matches('/').to_owned();
+        if endpoint.is_empty() {
+            anyhow::bail!("Subscription mTLS endpoint for {node} is empty");
+        }
+        let url = reqwest::Url::parse(&endpoint)
+            .with_context(|| format!("invalid Subscription mTLS endpoint for {node}"))?;
+        if url.scheme() != "https" || url.host_str() != Some(node.as_str()) {
+            anyhow::bail!("Subscription mTLS endpoint for {node} must be https://{node}:port");
+        }
+        if endpoints.insert(node.clone(), endpoint).is_some() {
+            anyhow::bail!("duplicate Subscription mTLS endpoint for {node}");
+        }
+    }
+    if endpoints.is_empty() {
+        anyhow::bail!("Subscription mTLS requires at least one peer endpoint");
+    }
+    Ok(endpoints)
+}
+
 fn parse_control_nodes(value: &str) -> Result<Vec<(u64, String)>> {
     value
         .split(',')
@@ -231,5 +267,27 @@ mod tests {
         assert!(parse_peer_pins(&format!("control-1@{first},control-2@{first}")).is_err());
         assert!(parse_peer_pins("control-1@bad").is_err());
         assert!(parse_peer_pins("").is_err());
+    }
+
+    #[test]
+    fn subscription_peer_endpoints_reject_duplicates_and_missing_values() {
+        let endpoints = parse_peer_endpoints(
+            "control-1@https://control-1:7271, control-2@https://control-2:7272",
+        )
+        .unwrap();
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(
+            endpoints[&StorageNodeId::try_new("control-1").unwrap()],
+            "https://control-1:7271"
+        );
+        assert!(parse_peer_endpoints(
+            "control-1@https://control-1:7271,control-1@https://control-1:7272"
+        )
+        .is_err());
+        assert!(parse_peer_endpoints("control-1@").is_err());
+        assert!(parse_peer_endpoints("missing-node").is_err());
+        assert!(parse_peer_endpoints("control-1@http://control-1:7271").is_err());
+        assert!(parse_peer_endpoints("control-1@https://control-2:7271").is_err());
+        assert!(parse_peer_endpoints("").is_err());
     }
 }

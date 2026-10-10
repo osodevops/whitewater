@@ -410,7 +410,11 @@ impl ControlNetwork {
         Response: DeserializeOwned,
         Error: std::error::Error + DeserializeOwned,
     {
-        let url = format!("http://{}{}", self.address, path);
+        let url = if self.address.contains("://") {
+            format!("{}{}", self.address, path)
+        } else {
+            format!("http://{}{}", self.address, path)
+        };
         let response = self
             .http
             .post(&url)
@@ -579,6 +583,7 @@ impl ControlPlane {
         key: String,
         storage_path: impl Into<PathBuf>,
         controller: Arc<ControlController>,
+        http: Option<reqwest::Client>,
     ) -> Result<Self, ControlPlaneError> {
         if peers.len() < 3 || !peers.contains_key(&node_id) {
             return Err(ControlPlaneError::Unavailable(
@@ -606,9 +611,10 @@ impl ControlPlane {
             .validate()
             .map_err(|error| ControlPlaneError::Unavailable(error.to_string()))?,
         );
+        let http = http.unwrap_or_default();
         let network = ControlNetworkFactory {
             key: key.clone(),
-            http: reqwest::Client::new(),
+            http: http.clone(),
         };
         let raft = Raft::new(node_id, config, network, log_store, state_machine)
             .await
@@ -619,7 +625,7 @@ impl ControlPlane {
             key,
             raft,
             controller,
-            http: reqwest::Client::new(),
+            http,
         })
     }
 

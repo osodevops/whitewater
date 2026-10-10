@@ -8,7 +8,10 @@ use finnstream::{
         SplitPressureTracker, StorageDrainStatus, StorageDrainSupervisor, StorageNodeId,
     },
     admin::AdminAuthenticator,
-    api::{router, subscription_mtls_router, AdminDrainDriver, AppState, SubscriptionTlsServer},
+    api::{
+        internal_mtls_router, router, AdminDrainDriver, AppState, InternalMtlsMaterial,
+        SubscriptionTlsServer,
+    },
     autoscale::AutoscaleController,
     config::NodeConfig,
     control::ControlController,
@@ -58,12 +61,44 @@ async fn main() -> Result<()> {
         store.clone(),
         eligible_storage_nodes,
     )?);
+    let internal_mtls = match &config.subscription_mtls {
+        Some(tls) => Some(Arc::new(InternalMtlsMaterial::from_config(tls).await?)),
+        None => None,
+    };
+    let build_internal_client = |timeout: Duration| -> Result<reqwest::Client, reqwest::Error> {
+        match &internal_mtls {
+            Some(material) => material.client(timeout),
+            None => reqwest::Client::builder().timeout(timeout).build(),
+        }
+    };
+    let control_endpoints: BTreeMap<StorageNodeId, String> = match &config.subscription_mtls {
+        Some(tls) => tls.peer_endpoints.clone(),
+        None => config
+            .control_nodes
+            .iter()
+            .map(|(node_id, address)| {
+                StorageNodeId::try_new(format!("control-{node_id}"))
+                    .map(|node| (node, format!("http://{address}")))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?,
+    };
     let control_plane = match (config.control_node_id, config.control_plane_key.clone()) {
         (Some(node_id), Some(key)) => {
             let peers = config
                 .control_nodes
                 .iter()
-                .map(|(id, address)| (*id, BasicNode::new(address)))
+                .map(|(id, address)| {
+                    let address = config
+                        .subscription_mtls
+                        .as_ref()
+                        .and_then(|tls| {
+                            StorageNodeId::try_new(format!("control-{id}"))
+                                .ok()
+                                .and_then(|node| tls.peer_endpoints.get(&node).cloned())
+                        })
+                        .unwrap_or_else(|| address.clone());
+                    (*id, BasicNode::new(address))
+                })
                 .collect::<BTreeMap<_, _>>();
             Some(Arc::new(
                 ControlPlane::start(
@@ -72,6 +107,7 @@ async fn main() -> Result<()> {
                     key,
                     config.data_dir.join("control-plane-raft.json"),
                     control.clone(),
+                    Some(build_internal_client(Duration::from_secs(30))?),
                 )
                 .await?,
             ))
@@ -103,24 +139,17 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let control_endpoints = config
-        .control_nodes
-        .iter()
-        .map(|(node_id, address)| {
-            StorageNodeId::try_new(format!("control-{node_id}"))
-                .map(|node| (node, format!("http://{address}")))
-        })
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+
     let majority_append = match (
         replica_append.clone(),
         config.control_plane_key.clone(),
         config.control_node_id,
     ) {
         (Some(local), Some(key), Some(_)) => {
-            let transport = Arc::new(HttpReplicaTransport::new(
+            let transport = Arc::new(HttpReplicaTransport::with_client(
                 control_endpoints.clone(),
                 key,
-                Duration::from_secs(2),
+                build_internal_client(Duration::from_secs(2))?,
             )?);
             Some(Arc::new(MajorityAppendCoordinator::new(
                 local,
@@ -132,10 +161,10 @@ async fn main() -> Result<()> {
     };
     let recovery_supervisor = match (control_plane.clone(), config.control_plane_key.clone()) {
         (Some(control_plane), Some(key)) => {
-            let transport = Arc::new(HttpRecoveryTransport::new(
+            let transport = Arc::new(HttpRecoveryTransport::with_client(
                 control_endpoints.clone(),
                 key,
-                Duration::from_secs(2),
+                build_internal_client(Duration::from_secs(2))?,
             )?);
             Some(RecoverySupervisor::new(
                 control.clone(),
@@ -151,13 +180,13 @@ async fn main() -> Result<()> {
         config.control_node_id,
         config.control_plane_key.clone(),
     ) {
-        (Some(local), Some(node_id), Some(key)) => Some(LocalRepairSupervisor::new(
+        (Some(local), Some(node_id), Some(key)) => Some(LocalRepairSupervisor::with_client(
             StorageNodeId::try_new(format!("control-{node_id}"))?,
             local,
             control.clone(),
             control_endpoints.clone(),
             key,
-            Duration::from_secs(5),
+            build_internal_client(Duration::from_secs(5))?,
             256,
         )?),
         _ => None,
@@ -319,6 +348,10 @@ async fn main() -> Result<()> {
             .unwrap_or(60);
         let internal_key = config.control_plane_key.clone()?;
         let peer_endpoints = control_endpoints.clone();
+        let peer_client = match build_internal_client(Duration::from_secs(5)) {
+            Ok(client) => client,
+            Err(_) => return None,
+        };
         let mut shutdown = shutdown_tx.subscribe();
         let demand = demand.clone();
         let control = control.clone();
@@ -366,7 +399,7 @@ async fn main() -> Result<()> {
                         if control_plane.status().await.state == "leader" {
                             let mut totals = BTreeMap::new();
                             for peer in peer_endpoints.values() {
-                                let response = client
+                                let response = peer_client
                                     .get(format!("{}/internal/active-range/pressure", peer.trim_end_matches('/')))
                                     .header("x-whitewater-control-key", &internal_key)
                                     .send()
@@ -454,15 +487,14 @@ async fn main() -> Result<()> {
         majority_append,
         control_endpoints: Arc::new(control_endpoints),
         internal_key: config.control_plane_key.clone(),
-        internal_http: reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()?,
+        internal_http: build_internal_client(Duration::from_secs(5))?,
+        internal_mtls: internal_mtls.clone(),
         admin_auth,
     };
     let tls_router = config
         .subscription_mtls
         .as_ref()
-        .map(|_| subscription_mtls_router(app_state.clone()));
+        .map(|_| internal_mtls_router(app_state.clone()));
     let app = router(app_state).layer(TraceLayer::new_for_http());
     let listener = TcpListener::bind(config.bind_addr).await?;
     let tls_task = match (subscription_tls, tls_router, &config.subscription_mtls) {

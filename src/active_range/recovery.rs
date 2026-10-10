@@ -338,10 +338,22 @@ impl HttpRecoveryTransport {
         key: String,
         timeout: Duration,
     ) -> Result<Self, reqwest::Error> {
+        Self::with_client(
+            endpoints,
+            key,
+            reqwest::Client::builder().timeout(timeout).build()?,
+        )
+    }
+
+    pub fn with_client(
+        endpoints: BTreeMap<StorageNodeId, String>,
+        key: String,
+        http: reqwest::Client,
+    ) -> Result<Self, reqwest::Error> {
         Ok(Self {
             endpoints: Arc::new(endpoints),
             key,
-            http: reqwest::Client::builder().timeout(timeout).build()?,
+            http,
         })
     }
 

@@ -370,6 +370,14 @@ impl HttpReplicaTransport {
                 message: error.to_string(),
                 retryable: true,
             })?;
+        Self::with_client(endpoints, key, http)
+    }
+
+    pub fn with_client(
+        endpoints: BTreeMap<StorageNodeId, String>,
+        key: String,
+        http: reqwest::Client,
+    ) -> Result<Self, ReplicaTransportError> {
         Ok(Self {
             endpoints: Arc::new(endpoints),
             key,

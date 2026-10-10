@@ -88,12 +88,56 @@ pub struct AppState {
     pub control_endpoints: Arc<BTreeMap<StorageNodeId, String>>,
     pub internal_key: Option<String>,
     pub internal_http: reqwest::Client,
+    pub internal_mtls: Option<Arc<InternalMtlsMaterial>>,
     pub admin_auth: AdminAuthenticator,
 }
 
 pub struct SubscriptionTlsServer {
     acceptor: tokio_rustls::TlsAcceptor,
     peer_pins: Arc<BTreeMap<StorageNodeId, std::collections::BTreeSet<[u8; 32]>>>,
+}
+
+/// Certificate material one Node presents to its peers for internal
+/// mTLS traffic: the Node's client identity plus the trust root used to
+/// verify pinned peers.
+#[derive(Clone)]
+pub struct InternalMtlsMaterial {
+    pub identity_pem: Vec<u8>,
+    pub ca_pem: Vec<u8>,
+}
+
+impl InternalMtlsMaterial {
+    pub async fn from_config(
+        config: &crate::config::SubscriptionMtlsConfig,
+    ) -> anyhow::Result<Self> {
+        let mut files = Vec::new();
+        for path in [&config.cert_path, &config.key_path, &config.ca_path] {
+            if tokio::fs::metadata(path).await?.len() > 1024 * 1024 {
+                anyhow::bail!("internal mTLS certificate material exceeds the 1 MiB limit");
+            }
+            files.push(tokio::fs::read(path).await?);
+        }
+        let mut identity_pem = files[0].clone();
+        identity_pem.extend_from_slice(&files[1]);
+        let material = Self {
+            identity_pem,
+            ca_pem: files[2].clone(),
+        };
+        material.client(Duration::from_secs(1))?;
+        Ok(material)
+    }
+
+    pub fn client(&self, timeout: Duration) -> Result<reqwest::Client, reqwest::Error> {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(1))
+            .timeout(timeout)
+            .https_only(true)
+            .tls_built_in_root_certs(false)
+            .add_root_certificate(reqwest::Certificate::from_pem(&self.ca_pem)?)
+            .identity(reqwest::Identity::from_pem(&self.identity_pem)?)
+            .no_proxy()
+            .build()
+    }
 }
 
 impl SubscriptionTlsServer {
@@ -225,7 +269,7 @@ impl SubscriptionTlsServer {
     }
 }
 
-pub fn router(state: AppState) -> Router {
+fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppState> {
     let replica_append_route = post(replica_append)
         .layer(DefaultBodyLimit::max(
             MAX_REPLICA_FRAME_BASE64_BYTES + 1024 * 1024,
@@ -238,36 +282,33 @@ pub fn router(state: AppState) -> Router {
         state.clone(),
         authorize_replica_append,
     ));
-    let subscription_prepare_route = post(subscription_prepare_local)
-        .layer(DefaultBodyLimit::max(512 * 1024))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            authorize_replica_append,
-        ));
-    let subscription_commit_route = post(subscription_commit_local)
-        .layer(DefaultBodyLimit::max(512 * 1024))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            authorize_replica_append,
-        ));
-    let subscription_committed_route = post(subscription_committed_local)
-        .layer(DefaultBodyLimit::max(64 * 1024))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            authorize_replica_append,
-        ));
-    let subscription_inspect_route = post(subscription_inspect_local)
-        .layer(DefaultBodyLimit::max(64 * 1024))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            authorize_replica_append,
-        ));
-    let subscription_adopt_route = post(subscription_adopt_local)
-        .layer(DefaultBodyLimit::max(512 * 1024))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            authorize_replica_append,
-        ));
+    // On the mTLS plane the pinned peer certificate is the credential; the
+    // shared Control Plane key stays required on the plain internal plane.
+    let subscription_key_layer = |route: axum::routing::MethodRouter<AppState>| {
+        if require_shared_key {
+            route.layer(middleware::from_fn_with_state(
+                state.clone(),
+                authorize_replica_append,
+            ))
+        } else {
+            route
+        }
+    };
+    let subscription_prepare_route = subscription_key_layer(
+        post(subscription_prepare_local).layer(DefaultBodyLimit::max(512 * 1024)),
+    );
+    let subscription_commit_route = subscription_key_layer(
+        post(subscription_commit_local).layer(DefaultBodyLimit::max(512 * 1024)),
+    );
+    let subscription_committed_route = subscription_key_layer(
+        post(subscription_committed_local).layer(DefaultBodyLimit::max(64 * 1024)),
+    );
+    let subscription_inspect_route = subscription_key_layer(
+        post(subscription_inspect_local).layer(DefaultBodyLimit::max(64 * 1024)),
+    );
+    let subscription_adopt_route = subscription_key_layer(
+        post(subscription_adopt_local).layer(DefaultBodyLimit::max(512 * 1024)),
+    );
     let owner_append_route = post(owner_append).layer(middleware::from_fn_with_state(
         state.clone(),
         authorize_replica_append,
@@ -364,56 +405,7 @@ pub fn router(state: AppState) -> Router {
             state.clone(),
             authorize_replica_append,
         ));
-    let mut app = Router::new()
-        .route("/health", get(health))
-        .route("/v1/streams", get(list_streams).post(create_stream))
-        .route("/v1/streams/describe", get(describe_stream))
-        .route("/v1/records", get(read_records).post(append_record))
-        .route("/v1/feeds/append", post(client_append))
-        .route("/v1/writers/append", post(writer_session_append))
-        .route("/v1/writers/append-batch", post(writer_batch_append))
-        .route("/v1/readers/open", post(reader_open))
-        .route("/v1/readers/fetch", post(reader_fetch))
-        .route("/v1/readers/ack", post(reader_ack))
-        .route("/v1/readers/close", post(reader_close))
-        .route("/v1/readers/temporary/fetch", post(temporary_reader_fetch))
-        .route(
-            "/v1/subscriptions/members/join",
-            post(subscription_member_join),
-        )
-        .route(
-            "/v1/subscriptions/members/claim",
-            post(subscription_member_claim),
-        )
-        .route(
-            "/v1/subscriptions/members/renew",
-            post(subscription_member_renew),
-        )
-        .route(
-            "/v1/subscriptions/members/release",
-            post(subscription_member_release),
-        )
-        .route(
-            "/v1/subscriptions/members/ack",
-            post(subscription_member_ack),
-        )
-        .route(
-            "/v1/subscriptions/members/fetch",
-            post(subscription_member_fetch),
-        )
-        .route(
-            "/v1/subscriptions/members/state",
-            get(subscription_member_state),
-        )
-        .route("/v1/feeds/records", get(read_feed_records))
-        .route("/v1/admin/wcl", post(execute_admin_wcl))
-        .route("/v1/admin/commands", post(execute_admin_commands))
-        .route("/v1/admin/ranges/split", post(admin_split_range))
-        .route("/v1/admin/ranges/merge", post(admin_merge_ranges))
-        .route("/v1/admin/ranges/move-follower", post(admin_move_follower))
-        .route("/v1/admin/ranges/move-owner", post(admin_move_owner))
-        .route("/v1/admin/control-plane", get(control_plane_status))
-        .route("/v1/control/execute", post(execute_admin_wcl))
+    Router::new()
         .route(
             "/internal/control-plane/raft/append",
             post(control_plane_append),
@@ -492,6 +484,79 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/internal/active-range/read/committed", read_range_route)
         .route("/internal/active-range/read/evidence", read_evidence_route)
+        .route(
+            "/internal/subscription-progress/prepare",
+            subscription_prepare_route,
+        )
+        .route(
+            "/internal/subscription-progress/commit",
+            subscription_commit_route,
+        )
+        .route(
+            "/internal/subscription-progress/committed",
+            subscription_committed_route,
+        )
+        .route(
+            "/internal/subscription-progress/inspect",
+            subscription_inspect_route,
+        )
+        .route(
+            "/internal/subscription-progress/adopt",
+            subscription_adopt_route,
+        )
+}
+
+pub fn router(state: AppState) -> Router {
+    let mut app = Router::new()
+        .route("/health", get(health))
+        .route("/v1/streams", get(list_streams).post(create_stream))
+        .route("/v1/streams/describe", get(describe_stream))
+        .route("/v1/records", get(read_records).post(append_record))
+        .route("/v1/feeds/append", post(client_append))
+        .route("/v1/writers/append", post(writer_session_append))
+        .route("/v1/writers/append-batch", post(writer_batch_append))
+        .route("/v1/readers/open", post(reader_open))
+        .route("/v1/readers/fetch", post(reader_fetch))
+        .route("/v1/readers/ack", post(reader_ack))
+        .route("/v1/readers/close", post(reader_close))
+        .route("/v1/readers/temporary/fetch", post(temporary_reader_fetch))
+        .route(
+            "/v1/subscriptions/members/join",
+            post(subscription_member_join),
+        )
+        .route(
+            "/v1/subscriptions/members/claim",
+            post(subscription_member_claim),
+        )
+        .route(
+            "/v1/subscriptions/members/renew",
+            post(subscription_member_renew),
+        )
+        .route(
+            "/v1/subscriptions/members/release",
+            post(subscription_member_release),
+        )
+        .route(
+            "/v1/subscriptions/members/ack",
+            post(subscription_member_ack),
+        )
+        .route(
+            "/v1/subscriptions/members/fetch",
+            post(subscription_member_fetch),
+        )
+        .route(
+            "/v1/subscriptions/members/state",
+            get(subscription_member_state),
+        )
+        .route("/v1/feeds/records", get(read_feed_records))
+        .route("/v1/admin/wcl", post(execute_admin_wcl))
+        .route("/v1/admin/commands", post(execute_admin_commands))
+        .route("/v1/admin/ranges/split", post(admin_split_range))
+        .route("/v1/admin/ranges/merge", post(admin_merge_ranges))
+        .route("/v1/admin/ranges/move-follower", post(admin_move_follower))
+        .route("/v1/admin/ranges/move-owner", post(admin_move_owner))
+        .route("/v1/admin/control-plane", get(control_plane_status))
+        .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
         .route(
@@ -501,54 +566,13 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/cluster/join", post(cluster_join))
         .route("/v1/cluster/leave", post(cluster_leave));
     if !state.subscription_mtls_enabled {
-        app = app
-            .route(
-                "/internal/subscription-progress/prepare",
-                subscription_prepare_route,
-            )
-            .route(
-                "/internal/subscription-progress/commit",
-                subscription_commit_route,
-            )
-            .route(
-                "/internal/subscription-progress/committed",
-                subscription_committed_route,
-            )
-            .route(
-                "/internal/subscription-progress/inspect",
-                subscription_inspect_route,
-            )
-            .route(
-                "/internal/subscription-progress/adopt",
-                subscription_adopt_route,
-            );
+        app = app.merge(internal_routes(&state, true));
     }
     app.with_state(state)
 }
 
-pub fn subscription_mtls_router(state: AppState) -> Router {
-    Router::new()
-        .route(
-            "/internal/subscription-progress/prepare",
-            post(subscription_prepare_local).layer(DefaultBodyLimit::max(512 * 1024)),
-        )
-        .route(
-            "/internal/subscription-progress/commit",
-            post(subscription_commit_local).layer(DefaultBodyLimit::max(512 * 1024)),
-        )
-        .route(
-            "/internal/subscription-progress/committed",
-            post(subscription_committed_local).layer(DefaultBodyLimit::max(64 * 1024)),
-        )
-        .route(
-            "/internal/subscription-progress/inspect",
-            post(subscription_inspect_local).layer(DefaultBodyLimit::max(64 * 1024)),
-        )
-        .route(
-            "/internal/subscription-progress/adopt",
-            post(subscription_adopt_local).layer(DefaultBodyLimit::max(512 * 1024)),
-        )
-        .with_state(state)
+pub fn internal_mtls_router(state: AppState) -> Router {
+    internal_routes(&state, false).with_state(state)
 }
 
 #[derive(Serialize)]
@@ -937,17 +961,29 @@ fn member_assignment_coordinator(
     ),
     ApiError,
 > {
-    let key = state
-        .internal_key
-        .as_ref()
-        .ok_or_else(|| ApiError::unavailable("internal credential is not configured"))?;
-    let transport = crate::reader::HttpSubscriptionProgressTransport::new(
-        assignment.clone(),
-        state.control_endpoints.as_ref().clone(),
-        key.clone(),
-        Duration::from_secs(5),
-    )
-    .map_err(|_| ApiError::unavailable("Subscription progress transport failed to build"))?;
+    let transport = match &state.internal_mtls {
+        Some(material) => crate::reader::HttpSubscriptionProgressTransport::new_mtls(
+            assignment.clone(),
+            state.control_endpoints.as_ref().clone(),
+            &material.ca_pem,
+            &material.identity_pem,
+            Duration::from_secs(5),
+        )
+        .map_err(|_| {
+            ApiError::unavailable("Subscription progress mTLS transport failed to build")
+        })?,
+        None => crate::reader::HttpSubscriptionProgressTransport::new(
+            assignment.clone(),
+            state.control_endpoints.as_ref().clone(),
+            state
+                .internal_key
+                .as_ref()
+                .ok_or_else(|| ApiError::unavailable("internal credential is not configured"))?
+                .clone(),
+            Duration::from_secs(5),
+        )
+        .map_err(|_| ApiError::unavailable("Subscription progress transport failed to build"))?,
+    };
     Ok((
         crate::reader::SubscriptionProgressCoordinator::new(
             assignment.clone(),
@@ -6573,6 +6609,7 @@ mod tests {
             control_endpoints: Arc::new(BTreeMap::new()),
             internal_key: None,
             internal_http: reqwest::Client::new(),
+            internal_mtls: None,
             admin_auth: AdminAuthenticator::new(Some(
                 "this-is-a-long-development-api-key".to_owned(),
             ))
@@ -6670,6 +6707,7 @@ mod tests {
             control_endpoints: Arc::new(BTreeMap::new()),
             internal_key: None,
             internal_http: reqwest::Client::new(),
+            internal_mtls: None,
             admin_auth: AdminAuthenticator::new(Some(
                 "this-is-a-long-development-api-key".to_owned(),
             ))
@@ -6716,6 +6754,7 @@ mod tests {
                 "this-is-a-long-control-plane-key".to_owned(),
                 directory.path().join("raft.json"),
                 control.clone(),
+                None,
             )
             .await
             .unwrap(),
@@ -6759,6 +6798,7 @@ mod tests {
                 control_endpoints: Arc::new(BTreeMap::new()),
                 internal_key: Some("this-is-a-long-control-plane-key".to_owned()),
                 internal_http: reqwest::Client::new(),
+                internal_mtls: None,
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))
@@ -7124,6 +7164,7 @@ mod tests {
             key_path: directory.path().join("node.key"),
             ca_path: directory.path().join("ca.pem"),
             peer_pins: pins,
+            peer_endpoints: BTreeMap::new(),
         };
         let mut wrong_config = config.clone();
         wrong_config.peer_pins.insert(
@@ -7159,11 +7200,8 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let tls_task = tokio::spawn(server.serve(
-            listener,
-            subscription_mtls_router(state.clone()),
-            shutdown_rx,
-        ));
+        let tls_task =
+            tokio::spawn(server.serve(listener, internal_mtls_router(state.clone()), shutdown_rx));
         let endpoint = format!(
             "https://control-1:{}/internal/subscription-progress",
             address.port()
@@ -7210,7 +7248,7 @@ mod tests {
             receiver: nodes[0].clone(),
             mutation: mutation.clone(),
         };
-        let no_peer = subscription_mtls_router(state.clone())
+        let no_peer = internal_mtls_router(state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -7429,7 +7467,7 @@ mod tests {
         let new_address = new_listener.local_addr().unwrap();
         let (stop_tx, stop_rx) = watch::channel(false);
         let new_task =
-            tokio::spawn(new_server.serve(new_listener, subscription_mtls_router(state), stop_rx));
+            tokio::spawn(new_server.serve(new_listener, internal_mtls_router(state), stop_rx));
         let rotation_client = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(3))
@@ -7497,6 +7535,178 @@ mod tests {
             Err(SubscriptionProgressError::TooLarge)
         ));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn internal_mtls_plane_serves_internal_endpoints_only_to_pinned_peers() {
+        let directory = TempDir::new().unwrap();
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca_params =
+            rcgen::CertificateParams::new(vec!["riverbed-test-ca".to_owned()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let nodes = ["control-1", "control-2", "control-3"]
+            .map(|name| StorageNodeId::try_new(name).unwrap());
+        let mut pins = BTreeMap::new();
+        let mut certificates = BTreeMap::new();
+        for node in &nodes {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let mut params = rcgen::CertificateParams::new(vec![node.as_str().to_owned()]).unwrap();
+            params.extended_key_usages = vec![
+                rcgen::ExtendedKeyUsagePurpose::ClientAuth,
+                rcgen::ExtendedKeyUsagePurpose::ServerAuth,
+            ];
+            let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
+            pins.insert(
+                node.clone(),
+                std::collections::BTreeSet::from([*blake3::hash(cert.der().as_ref()).as_bytes()]),
+            );
+            certificates.insert(
+                node.clone(),
+                format!("{}{}", cert.pem(), key.serialize_pem()),
+            );
+            if node == &nodes[0] {
+                tokio::fs::write(directory.path().join("node.pem"), cert.pem())
+                    .await
+                    .unwrap();
+                tokio::fs::write(directory.path().join("node.key"), key.serialize_pem())
+                    .await
+                    .unwrap();
+            }
+        }
+        tokio::fs::write(directory.path().join("ca.pem"), ca.pem())
+            .await
+            .unwrap();
+        let config = SubscriptionMtlsConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            cert_path: directory.path().join("node.pem"),
+            key_path: directory.path().join("node.key"),
+            ca_path: directory.path().join("ca.pem"),
+            peer_pins: pins,
+            peer_endpoints: BTreeMap::new(),
+        };
+        let server = SubscriptionTlsServer::from_config(&config, &nodes[0])
+            .await
+            .unwrap();
+        let (mut state, control_plane, control, _replica) =
+            internal_replica_test_state(&directory).await;
+        state.subscription_mtls_enabled = true;
+        let public = router(state.clone());
+        for path in [
+            "/internal/active-range/replica/append",
+            "/internal/active-range/recovery/progress",
+            "/internal/control-plane/raft/vote",
+        ] {
+            let response = public
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(
+                            "x-whitewater-control-key",
+                            "this-is-a-long-control-plane-key",
+                        )
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path} leaked");
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let tls_task =
+            tokio::spawn(server.serve(listener, internal_mtls_router(state.clone()), shutdown_rx));
+        let make_client = |identity: Option<&str>| {
+            let mut builder = reqwest::Client::builder()
+                .no_proxy()
+                .timeout(Duration::from_secs(3))
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(reqwest::Certificate::from_pem(ca.pem().as_bytes()).unwrap())
+                .resolve("control-1", address);
+            if let Some(identity) = identity {
+                builder =
+                    builder.identity(reqwest::Identity::from_pem(identity.as_bytes()).unwrap());
+            }
+            builder.build().unwrap()
+        };
+        let endpoint = format!("https://control-1:{}", address.port());
+        assert!(make_client(None)
+            .get(format!("{endpoint}/internal/active-range/pressure"))
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key"
+            )
+            .send()
+            .await
+            .is_err());
+        let rogue_key = rcgen::KeyPair::generate().unwrap();
+        let rogue_cert = rcgen::CertificateParams::new(vec!["rogue-node".to_owned()])
+            .unwrap()
+            .signed_by(&rogue_key, &ca, &ca_key)
+            .unwrap();
+        let rogue_identity = format!("{}{}", rogue_cert.pem(), rogue_key.serialize_pem());
+        assert!(make_client(Some(&rogue_identity))
+            .get(format!("{endpoint}/internal/active-range/pressure"))
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key"
+            )
+            .send()
+            .await
+            .is_err());
+        let peer_client = make_client(Some(&certificates[&nodes[1]]));
+        let samples: Vec<crate::demand::RangePressureSample> = peer_client
+            .get(format!("{endpoint}/internal/active-range/pressure"))
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key",
+            )
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(samples.is_empty());
+        let feed_id = control
+            .active_feed_by_name("orders.events")
+            .await
+            .unwrap()
+            .feed_id;
+        let progress: crate::active_range::ReplicaProgressResponse = peer_client
+            .post(format!(
+                "{endpoint}/internal/active-range/recovery/progress"
+            ))
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key",
+            )
+            .json(&serde_json::json!({ "feed_id": feed_id }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(progress.error.is_none());
+        assert!(progress.status.is_some());
+        assert_eq!(
+            peer_client
+                .get(format!("{endpoint}/internal/active-range/pressure"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        shutdown_tx.send(true).unwrap();
+        tls_task.await.unwrap().unwrap();
+        control_plane.raft().shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -7973,6 +8183,7 @@ mod tests {
                         control_key.clone(),
                         directory.path().join(format!("raft-{index}.json")),
                         control.clone(),
+                        None,
                     )
                     .await
                     .unwrap(),
@@ -8004,6 +8215,7 @@ mod tests {
                 control_endpoints: endpoints.clone(),
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
+                internal_mtls: None,
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))
@@ -8216,6 +8428,7 @@ mod tests {
                     control_key.clone(),
                     directory.path().join(format!("raft-member-{index}.json")),
                     control.clone(),
+                    None,
                 )
                 .await
                 .unwrap(),
@@ -8252,6 +8465,7 @@ mod tests {
                 control_endpoints: endpoints.clone(),
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
+                internal_mtls: None,
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))

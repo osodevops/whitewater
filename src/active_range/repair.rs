@@ -729,13 +729,33 @@ impl LocalRepairSupervisor {
         timeout: Duration,
         batch_size: usize,
     ) -> Result<Self, reqwest::Error> {
+        Self::with_client(
+            local_node,
+            local,
+            control,
+            endpoints,
+            key,
+            reqwest::Client::builder().timeout(timeout).build()?,
+            batch_size,
+        )
+    }
+
+    pub fn with_client(
+        local_node: StorageNodeId,
+        local: Arc<ReplicaAppendService>,
+        control: Arc<ControlController>,
+        endpoints: BTreeMap<StorageNodeId, String>,
+        key: String,
+        http: reqwest::Client,
+        batch_size: usize,
+    ) -> Result<Self, reqwest::Error> {
         Ok(Self {
             local_node,
             local,
             control,
             endpoints: Arc::new(endpoints),
             key,
-            http: reqwest::Client::builder().timeout(timeout).build()?,
+            http,
             batch_size: batch_size.clamp(1, 10_000),
         })
     }
