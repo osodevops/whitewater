@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+
 use crate::active_range::StorageNodeId;
 use crate::control::ControlController;
 
@@ -181,5 +183,182 @@ mod tests {
         assert_eq!(endpoints.resolve(&node("storage-9")).await, None);
         assert_eq!(endpoints.all().await.len(), 1);
         let _ = control;
+    }
+}
+
+/// Upper bound on a replicated catalog snapshot payload; larger responses
+/// are refused rather than streamed into memory.
+pub const MAX_CATALOG_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+
+/// A committed catalog snapshot offered by a peer for non-voter storage
+/// Nodes to install.
+#[derive(Clone, Debug)]
+pub struct CatalogSnapshot {
+    pub revision: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// Supplies the freshest committed catalog snapshot visible to this Node.
+/// Implemented by the authenticated internal HTTP transport in
+/// production and by in-memory fixtures in tests.
+#[async_trait::async_trait]
+pub trait CatalogSnapshotSource: Send + Sync {
+    /// Returns the newest reachable snapshot, or `None` when every
+    /// endpoint was unavailable or refused.
+    async fn latest_snapshot(&self) -> Option<CatalogSnapshot>;
+}
+
+/// Fetches committed catalog snapshots from every reachable internal
+/// endpoint and returns the highest revision observed.
+pub struct HttpCatalogSnapshotSource {
+    endpoints: InternalEndpoints,
+    key: Option<String>,
+    client: reqwest::Client,
+    max_bytes: usize,
+}
+
+#[derive(serde::Deserialize)]
+struct CatalogSnapshotResponse {
+    revision: u64,
+    snapshot_base64: String,
+}
+
+impl HttpCatalogSnapshotSource {
+    pub fn new(endpoints: InternalEndpoints, key: Option<String>, client: reqwest::Client) -> Self {
+        Self {
+            endpoints,
+            key,
+            client,
+            max_bytes: MAX_CATALOG_SNAPSHOT_BYTES,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CatalogSnapshotSource for HttpCatalogSnapshotSource {
+    async fn latest_snapshot(&self) -> Option<CatalogSnapshot> {
+        let mut best: Option<CatalogSnapshot> = None;
+        for (node, endpoint) in self.endpoints.all().await {
+            let mut request = self
+                .client
+                .post(format!(
+                    "{}/internal/catalog/snapshot",
+                    endpoint.trim_end_matches('/')
+                ))
+                .body(Vec::new());
+            if let Some(key) = &self.key {
+                request = request.header("x-whitewater-control-key", key);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    tracing::debug!(node = %node, %error, "catalog snapshot request failed");
+                    continue;
+                }
+            };
+            if !response.status().is_success() {
+                tracing::debug!(node = %node, status = %response.status(), "catalog snapshot refused");
+                continue;
+            }
+            let body = match response.bytes().await {
+                Ok(body) => body,
+                Err(_) => continue,
+            };
+            let parsed: CatalogSnapshotResponse = match serde_json::from_slice(&body) {
+                Ok(parsed) => parsed,
+                Err(_) => continue,
+            };
+            let bytes = match STANDARD.decode(&parsed.snapshot_base64) {
+                Ok(bytes) => bytes,
+                Err(_) => continue,
+            };
+            if bytes.len() > self.max_bytes {
+                tracing::warn!(node = %node, bytes = bytes.len(), "catalog snapshot exceeds the accepted bound");
+                continue;
+            }
+            if best
+                .as_ref()
+                .is_none_or(|current: &CatalogSnapshot| parsed.revision > current.revision)
+            {
+                best = Some(CatalogSnapshot {
+                    revision: parsed.revision,
+                    bytes,
+                });
+            }
+        }
+        best
+    }
+}
+
+/// Outcome of one catalog synchronization pass.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CatalogSyncOutcome {
+    /// A newer committed snapshot was installed.
+    Installed { revision: u64 },
+    /// The local catalog is already at or ahead of every reachable
+    /// snapshot; nothing was installed.
+    Current { revision: u64 },
+    /// No endpoint offered a snapshot this pass.
+    Unavailable,
+}
+
+/// Replicates committed Control Plane catalog state onto a Node that is
+/// not a Control Plane voter. Independently registered storage Nodes
+/// cannot receive Raft log replication, so they periodically install the
+/// newest committed snapshot offered by any reachable internal endpoint;
+/// installs are revision-gated so a lagging peer can never roll the
+/// catalog backwards.
+pub struct CatalogSyncSupervisor<S: CatalogSnapshotSource> {
+    control: Arc<ControlController>,
+    source: S,
+    interval: std::time::Duration,
+}
+
+impl<S: CatalogSnapshotSource> CatalogSyncSupervisor<S> {
+    pub fn new(control: Arc<ControlController>, source: S, interval: std::time::Duration) -> Self {
+        Self {
+            control,
+            source,
+            interval,
+        }
+    }
+
+    pub async fn sync_once(&self) -> CatalogSyncOutcome {
+        let local = self.control.revision().await;
+        let Some(snapshot) = self.source.latest_snapshot().await else {
+            return CatalogSyncOutcome::Unavailable;
+        };
+        if snapshot.revision <= local {
+            return CatalogSyncOutcome::Current { revision: local };
+        }
+        match self.control.install_snapshot_bytes(&snapshot.bytes).await {
+            Ok(()) => CatalogSyncOutcome::Installed {
+                revision: snapshot.revision,
+            },
+            Err(error) => {
+                tracing::warn!(%error, "catalog snapshot install failed");
+                CatalogSyncOutcome::Unavailable
+            }
+        }
+    }
+
+    pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let mut interval = tokio::time::interval(self.interval);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => match self.sync_once().await {
+                    CatalogSyncOutcome::Installed { revision } => {
+                        tracing::info!(revision, "installed committed catalog snapshot")
+                    }
+                    CatalogSyncOutcome::Unavailable => {
+                        tracing::debug!("no catalog snapshot source reachable")
+                    }
+                    CatalogSyncOutcome::Current { .. } => {}
+                },
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { break; }
+                }
+            }
+        }
     }
 }

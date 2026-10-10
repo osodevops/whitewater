@@ -762,6 +762,7 @@ pub struct ControlController {
     path: Arc<PathBuf>,
     state: Arc<Mutex<CatalogState>>,
     eligible_storage_nodes: Arc<BTreeSet<StorageNodeId>>,
+    synced_replica: bool,
 }
 
 impl ControlController {
@@ -785,7 +786,22 @@ impl ControlController {
             path: Arc::new(path),
             state: Arc::new(Mutex::new(state)),
             eligible_storage_nodes: Arc::new(eligible_storage_nodes.into_iter().collect()),
+            synced_replica: false,
         })
+    }
+
+    /// Marks this catalog as a synced replica: a Node without a Control
+    /// Plane voter role holds replicated state for fencing and lookup but
+    /// must never mutate it locally, since local writes would diverge
+    /// from majority-committed authority and be silently reverted by the
+    /// next snapshot sync.
+    pub fn into_synced_replica(mut self) -> Self {
+        self.synced_replica = true;
+        self
+    }
+
+    pub fn is_synced_replica(&self) -> bool {
+        self.synced_replica
     }
 
     pub async fn prepare_replicated(
@@ -1013,6 +1029,12 @@ impl ControlController {
         if commands.is_empty() {
             return Err(ControlError::Syntax(
                 "request contains no commands".to_owned(),
+            ));
+        }
+        if self.synced_replica && commands.iter().any(|command| !command.is_read_only()) {
+            return Err(ControlError::InvalidOperation(
+                "catalog is a synced replica; submit mutations through a Control Plane voter"
+                    .to_owned(),
             ));
         }
         let mut results = Vec::with_capacity(commands.len());

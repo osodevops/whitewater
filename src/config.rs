@@ -33,6 +33,11 @@ pub struct NodeConfig {
     pub control_node_id: Option<u64>,
     pub control_nodes: Vec<(u64, String)>,
     pub control_plane_key: Option<String>,
+    /// This Node's storage identity on the internal data plane. Voters
+    /// default to `control-N`; a Node without a Control Plane voter role
+    /// sets it explicitly to serve as an independently registered storage
+    /// Node.
+    pub storage_node_id: Option<StorageNodeId>,
     pub subscription_mtls: Option<SubscriptionMtlsConfig>,
 }
 
@@ -71,14 +76,15 @@ impl NodeConfig {
         let control_nodes =
             parse_control_nodes(&env::var("FINNSTREAM_CONTROL_NODES").unwrap_or_default())?;
         let control_plane_key = env::var("FINNSTREAM_CONTROL_PLANE_KEY").ok();
-        let control_values = [
-            control_node_id.is_some(),
-            !control_nodes.is_empty(),
-            control_plane_key.is_some(),
-        ];
-        if control_values.iter().any(|value| *value) && !control_values.iter().all(|value| *value) {
-            anyhow::bail!("FINNSTREAM_CONTROL_NODE_ID, FINNSTREAM_CONTROL_NODES, and FINNSTREAM_CONTROL_PLANE_KEY must be configured together");
-        }
+        validate_control_topology(
+            control_node_id,
+            &control_nodes,
+            control_plane_key.as_deref(),
+        )?;
+        let storage_node_id = resolve_storage_node_id(
+            env::var("FINNSTREAM_STORAGE_NODE_ID").ok().as_deref(),
+            control_node_id,
+        )?;
         let tls = [
             env::var("FINNSTREAM_SUBSCRIPTION_MTLS_BIND").ok(),
             env::var("FINNSTREAM_SUBSCRIPTION_MTLS_CERT").ok(),
@@ -92,12 +98,11 @@ impl NodeConfig {
         }
         let subscription_mtls = match tls {
             [Some(bind), Some(cert), Some(key), Some(ca), Some(pins), Some(endpoints)] => {
-                let local_node = control_node_id.ok_or_else(|| {
-                    anyhow::anyhow!("Subscription mTLS requires a configured Control Node ID")
+                let local_id = storage_node_id.clone().ok_or_else(|| {
+                    anyhow::anyhow!("Subscription mTLS requires a configured storage Node identity")
                 })?;
                 let peer_pins = parse_peer_pins(&pins)?;
                 let peer_endpoints = parse_peer_endpoints(&endpoints)?;
-                let local_id = StorageNodeId::try_new(format!("control-{local_node}"))?;
                 if !peer_pins.contains_key(&local_id)
                     || !peer_endpoints.contains_key(&local_id)
                     || control_nodes.iter().any(|(node, _)| {
@@ -108,6 +113,7 @@ impl NodeConfig {
                 {
                     anyhow::bail!("Subscription mTLS peer pins and endpoints must include this Node and every configured Control Node");
                 }
+
                 Some(SubscriptionMtlsConfig {
                     bind_addr: bind
                         .parse()
@@ -141,6 +147,7 @@ impl NodeConfig {
             control_node_id,
             control_nodes,
             control_plane_key,
+            storage_node_id,
             subscription_mtls,
         })
     }
@@ -209,6 +216,52 @@ fn parse_peer_endpoints(value: &str) -> Result<BTreeMap<StorageNodeId, String>> 
     Ok(endpoints)
 }
 
+fn validate_control_topology(
+    control_node_id: Option<u64>,
+    control_nodes: &[(u64, String)],
+    control_plane_key: Option<&str>,
+) -> Result<()> {
+    if control_node_id.is_some() && (control_nodes.is_empty() || control_plane_key.is_none()) {
+        anyhow::bail!(
+            "FINNSTREAM_CONTROL_NODE_ID requires FINNSTREAM_CONTROL_NODES and FINNSTREAM_CONTROL_PLANE_KEY"
+        );
+    }
+    if !control_nodes.is_empty() && control_plane_key.is_none() {
+        anyhow::bail!("FINNSTREAM_CONTROL_NODES requires FINNSTREAM_CONTROL_PLANE_KEY");
+    }
+    if control_node_id.is_some_and(|id| !control_nodes.iter().any(|(peer, _)| *peer == id)) {
+        anyhow::bail!("FINNSTREAM_CONTROL_NODE_ID must appear in FINNSTREAM_CONTROL_NODES");
+    }
+    Ok(())
+}
+
+/// Resolves this Node's storage identity on the internal data plane.
+/// Voters derive `control-N`; a Node without a voter role sets
+/// `FINNSTREAM_STORAGE_NODE_ID` explicitly to serve as an independently
+/// registered storage Node.
+fn resolve_storage_node_id(
+    explicit: Option<&str>,
+    control_node_id: Option<u64>,
+) -> Result<Option<StorageNodeId>> {
+    let derived = control_node_id.map(|node_id| {
+        StorageNodeId::try_new(format!("control-{node_id}"))
+            .expect("control-N storage Node IDs are valid")
+    });
+    match explicit {
+        Some(value) => {
+            let identity = StorageNodeId::try_new(value.trim().to_owned())
+                .context("FINNSTREAM_STORAGE_NODE_ID must be a valid storage Node ID")?;
+            if derived.is_some_and(|node| node != identity) {
+                anyhow::bail!(
+                    "FINNSTREAM_STORAGE_NODE_ID must match control-N on Control Plane voters"
+                );
+            }
+            Ok(Some(identity))
+        }
+        None => Ok(derived),
+    }
+}
+
 fn parse_control_nodes(value: &str) -> Result<Vec<(u64, String)>> {
     value
         .split(',')
@@ -253,6 +306,45 @@ fn discover_local_ip() -> IpAddr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_topology_requires_voter_self_membership_but_allows_non_voters() {
+        let voters = vec![
+            (1_u64, "control-1:7070".to_owned()),
+            (2_u64, "control-2:7070".to_owned()),
+            (3_u64, "control-3:7070".to_owned()),
+        ];
+        validate_control_topology(Some(1), &voters, Some("key")).unwrap();
+        // A storage-only Node knows the voters and the internal key but
+        // holds no voter id of its own.
+        validate_control_topology(None, &voters, Some("key")).unwrap();
+        validate_control_topology(Some(1), &voters, None).unwrap_err();
+        validate_control_topology(Some(9), &voters, Some("key")).unwrap_err();
+        validate_control_topology(Some(1), &[], Some("key")).unwrap_err();
+        validate_control_topology(None, &voters, None).unwrap_err();
+        validate_control_topology(None, &[], Some("key")).unwrap();
+        validate_control_topology(None, &[], None).unwrap();
+    }
+
+    #[test]
+    fn storage_node_identity_defaults_to_control_n_and_overrides_on_non_voters() {
+        assert_eq!(
+            resolve_storage_node_id(None, Some(2)).unwrap(),
+            Some(StorageNodeId::try_new("control-2").unwrap())
+        );
+        assert_eq!(resolve_storage_node_id(None, None).unwrap(), None);
+        assert_eq!(
+            resolve_storage_node_id(Some("storage-9"), None).unwrap(),
+            Some(StorageNodeId::try_new("storage-9").unwrap())
+        );
+        // Matching an explicit id on a voter is allowed; a conflicting one
+        // is refused so storage identity can never diverge from the voter.
+        assert!(resolve_storage_node_id(Some("control-2"), Some(2))
+            .unwrap()
+            .is_some());
+        assert!(resolve_storage_node_id(Some("storage-9"), Some(2)).is_err());
+        assert!(resolve_storage_node_id(Some("!!!"), None).is_err());
+    }
 
     #[test]
     fn subscription_peer_pins_reject_duplicate_identity_and_certificate() {

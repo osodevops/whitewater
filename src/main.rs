@@ -17,7 +17,7 @@ use finnstream::{
     control::ControlController,
     control_plane::ControlPlane,
     demand::DemandMetrics,
-    internal_plane::InternalEndpoints,
+    internal_plane::{CatalogSyncSupervisor, HttpCatalogSnapshotSource, InternalEndpoints},
     membership::{MemberAnnouncement, MembershipService},
     reader::{
         FjallSubscriptionProgressReplica, SubscriptionPlacementAuthority,
@@ -57,11 +57,18 @@ async fn main() -> Result<()> {
         .iter()
         .map(|(node_id, _)| StorageNodeId::try_new(format!("control-{node_id}")))
         .collect::<Result<Vec<_>, _>>()?;
-    let control = Arc::new(ControlController::open_with_storage_nodes(
+    let controller = ControlController::open_with_storage_nodes(
         config.data_dir.join(catalog_file),
         store.clone(),
         eligible_storage_nodes,
-    )?);
+    )?;
+    let control = Arc::new(
+        if config.control_node_id.is_none() && !config.control_nodes.is_empty() {
+            controller.into_synced_replica()
+        } else {
+            controller
+        },
+    );
     let internal_mtls = match &config.subscription_mtls {
         Some(tls) => Some(Arc::new(InternalMtlsMaterial::from_config(tls).await?)),
         None => None,
@@ -118,18 +125,13 @@ async fn main() -> Result<()> {
         }
         _ => None,
     };
-    let replica_append = config
-        .control_node_id
-        .map(|node_id| {
-            StorageNodeId::try_new(format!("control-{node_id}")).map(|local_node| {
-                Arc::new(ReplicaAppendService::new(
-                    config.data_dir.join("active-ranges"),
-                    local_node,
-                    control.clone(),
-                ))
-            })
-        })
-        .transpose()?;
+    let replica_append = config.storage_node_id.clone().map(|local_node| {
+        Arc::new(ReplicaAppendService::new(
+            config.data_dir.join("active-ranges"),
+            local_node,
+            control.clone(),
+        ))
+    });
     let subscription_progress = if let Some(local) = &replica_append {
         let path = config.data_dir.join("subscription-progress");
         let replica =
@@ -147,9 +149,9 @@ async fn main() -> Result<()> {
     let majority_append = match (
         replica_append.clone(),
         config.control_plane_key.clone(),
-        config.control_node_id,
+        config.storage_node_id.is_some(),
     ) {
-        (Some(local), Some(key), Some(_)) => {
+        (Some(local), Some(key), true) => {
             let transport = Arc::new(HttpReplicaTransport::with_client(
                 control_endpoints.clone(),
                 key,
@@ -181,11 +183,11 @@ async fn main() -> Result<()> {
     };
     let repair_supervisor = match (
         replica_append.clone(),
-        config.control_node_id,
+        config.storage_node_id.clone(),
         config.control_plane_key.clone(),
     ) {
         (Some(local), Some(node_id), Some(key)) => Some(LocalRepairSupervisor::with_client(
-            StorageNodeId::try_new(format!("control-{node_id}"))?,
+            node_id,
             local,
             control.clone(),
             control_endpoints.clone(),
@@ -267,6 +269,28 @@ async fn main() -> Result<()> {
             }
         })
     });
+    // Non-voter storage Nodes cannot receive Raft log replication; they
+    // install the newest committed catalog snapshot from any reachable
+    // internal endpoint so replica fencing uses real placement state.
+    let catalog_sync_task = if config.control_node_id.is_none() && !config.control_nodes.is_empty()
+    {
+        let interval_ms = std::env::var("WHITEWATER_CATALOG_SYNC_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1_000)
+            .max(100);
+        let source = HttpCatalogSnapshotSource::new(
+            control_endpoints.clone(),
+            config.control_plane_key.clone(),
+            build_internal_client(Duration::from_secs(5))?,
+        );
+        let supervisor =
+            CatalogSyncSupervisor::new(control.clone(), source, Duration::from_millis(interval_ms));
+        let shutdown = shutdown_tx.subscribe();
+        Some(tokio::spawn(supervisor.run(shutdown)))
+    } else {
+        None
+    };
     let drain_task = match (
         control_plane.clone(),
         std::env::var("FINNSTREAM_ADMIN_API_KEY").ok(),
@@ -550,6 +574,7 @@ async fn main() -> Result<()> {
         let _ = split_task.await;
     }
     if let Some(control_plane) = control_plane {
+        drop(catalog_sync_task);
         let _ = control_plane.raft().shutdown().await;
     }
     Ok(())

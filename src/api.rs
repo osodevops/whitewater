@@ -430,6 +430,12 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             state.clone(),
             authorize_replica_append,
         ));
+    let catalog_snapshot_route = post(catalog_snapshot)
+        .layer(DefaultBodyLimit::max(16 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
     Router::new()
         .route(
             "/internal/control-plane/raft/append",
@@ -447,6 +453,7 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             "/internal/control-plane/raft/snapshot",
             post(control_plane_full_snapshot),
         )
+        .route("/internal/catalog/snapshot", catalog_snapshot_route)
         .route("/internal/control-plane/write", post(control_plane_write))
         .route(
             "/internal/control-plane/commands",
@@ -722,6 +729,36 @@ async fn authorize_replica_append(
 ) -> Result<Response, ApiError> {
     authorize_internal(&state, request.headers())?;
     Ok(next.run(request).await)
+}
+
+#[derive(Serialize)]
+struct CatalogSnapshotResponse {
+    revision: u64,
+    snapshot_base64: String,
+}
+
+/// Serves the committed catalog snapshot to non-voter storage Nodes so
+/// they can fence replica requests against real placement state. The
+/// payload is bounded; a catalog exceeding the bound refuses rather than
+/// streaming unbounded state into an internal caller.
+async fn catalog_snapshot(
+    State(state): State<AppState>,
+) -> Result<Json<CatalogSnapshotResponse>, ApiError> {
+    let bytes = state
+        .control
+        .snapshot_bytes()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    if bytes.len() > crate::internal_plane::MAX_CATALOG_SNAPSHOT_BYTES {
+        return Err(ApiError::unavailable(
+            "catalog snapshot exceeds the internal transfer bound",
+        ));
+    }
+    let revision = state.control.revision().await;
+    Ok(Json(CatalogSnapshotResponse {
+        revision,
+        snapshot_base64: STANDARD.encode(bytes),
+    }))
 }
 
 async fn control_plane_append(
@@ -7849,6 +7886,63 @@ mod tests {
             .is_err());
         shutdown_tx.send(true).unwrap();
         tls_task.await.unwrap().unwrap();
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn catalog_snapshot_endpoint_serves_committed_state_to_internal_peers() {
+        let directory = TempDir::new().unwrap();
+        let (app, control_plane, control, _replica) =
+            internal_replica_test_router(&directory).await;
+        let request = |credential: Option<&str>| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/internal/catalog/snapshot");
+            if let Some(credential) = credential {
+                request = request.header("x-whitewater-control-key", credential);
+            }
+            request.body(Body::empty()).unwrap()
+        };
+        assert_eq!(
+            app.clone().oneshot(request(None)).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(request(Some("wrong-key")))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let response = app
+            .oneshot(request(Some("this-is-a-long-control-plane-key")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 40 * 1024 * 1024)
+            .await
+            .unwrap();
+        let payload: Value = serde_json::from_slice(&body).unwrap();
+        assert!(payload["revision"].as_u64().unwrap() > 0);
+        let bytes = STANDARD
+            .decode(payload["snapshot_base64"].as_str().unwrap())
+            .unwrap();
+        // The snapshot installs onto an empty non-voter catalog and
+        // materializes the committed placement state.
+        let storage_dir = TempDir::new().unwrap();
+        let storage = ControlController::open_with_storage_nodes(
+            storage_dir.path().join("catalog.json"),
+            Arc::new(FileLogStore::open(storage_dir.path().join("data")).unwrap()),
+            vec![],
+        )
+        .unwrap();
+        storage.install_snapshot_bytes(&bytes).await.unwrap();
+        assert!(storage.active_feed_by_name("orders.events").await.is_some());
+        assert_eq!(
+            control.revision().await,
+            payload["revision"].as_u64().unwrap()
+        );
         control_plane.raft().shutdown().await.unwrap();
     }
 
