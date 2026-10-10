@@ -5699,6 +5699,9 @@ mod tests {
                 RangeId::from_uuid(Uuid::from_u128(878)),
                 "event-1".to_owned(),
             )]),
+
+            tick: 0,
+            lease_ops: Vec::new(),
         };
         let prepare = SubscriptionPrepareRequest {
             owner: assignment.owner.clone(),
@@ -5826,6 +5829,9 @@ mod tests {
                 RangeId::from_uuid(Uuid::from_u128(901)),
                 "record".to_owned(),
             )]),
+
+            tick: 0,
+            lease_ops: Vec::new(),
         };
         let vote = crate::reader::SubscriptionProgressTransport::prepare(
             &transport,
@@ -6036,6 +6042,9 @@ mod tests {
                 RangeId::from_uuid(Uuid::from_u128(961)),
                 "record".to_owned(),
             )]),
+
+            tick: 0,
+            lease_ops: Vec::new(),
         };
         let request = SubscriptionPrepareRequest {
             owner: assignment.owner.clone(),

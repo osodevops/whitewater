@@ -249,6 +249,46 @@ pub struct SubscriptionWorkLease {
     pub expires_at_tick: u64,
 }
 
+pub const SUBSCRIPTION_LEASE_MAX_WORK: usize = 256;
+pub const SUBSCRIPTION_LEASE_MAX_MEMBER_WORK: usize = 32;
+pub const SUBSCRIPTION_LEASE_MAX_OPS: usize = 16;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionMemberState {
+    pub member_epochs: BTreeMap<Uuid, u64>,
+    pub leases: BTreeMap<Uuid, SubscriptionWorkLease>,
+    pub last_tick: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SubscriptionLeaseOp {
+    Join {
+        member_id: Uuid,
+        member_epoch: u64,
+    },
+    Claim {
+        work_id: Uuid,
+        member_id: Uuid,
+        member_epoch: u64,
+        lease_ticks: u64,
+    },
+    Renew {
+        work_id: Uuid,
+        member_id: Uuid,
+        member_epoch: u64,
+        lease_epoch: u64,
+        lease_ticks: u64,
+    },
+    Release {
+        work_id: Uuid,
+        member_id: Uuid,
+        member_epoch: u64,
+        lease_epoch: u64,
+    },
+}
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SubscriptionLeaseError {
     #[error("work is currently leased to another member")]
@@ -400,6 +440,95 @@ impl SubscriptionLeaseTracker {
                     && current.lease_epoch == grant.lease_epoch
                     && now_tick < current.expires_at_tick
             })
+    }
+
+    pub fn from_state(state: SubscriptionMemberState, max_work: usize) -> Self {
+        let mut tracker = Self::new(max_work);
+        tracker.leases = state.leases;
+        tracker.member_epochs = state.member_epochs;
+        tracker.last_tick = state.last_tick;
+        tracker
+    }
+
+    pub fn materialize(&self) -> SubscriptionMemberState {
+        SubscriptionMemberState {
+            member_epochs: self.member_epochs.clone(),
+            leases: self.leases.clone(),
+            last_tick: self.last_tick,
+        }
+    }
+
+    pub fn release(&mut self, grant: &SubscriptionWorkLease) -> Result<(), SubscriptionLeaseError> {
+        match self.leases.get(&grant.work_id) {
+            Some(current)
+                if current.member_id == grant.member_id
+                    && current.member_epoch == grant.member_epoch
+                    && current.lease_epoch == grant.lease_epoch =>
+            {
+                self.leases.remove(&grant.work_id);
+                Ok(())
+            }
+            _ => Err(SubscriptionLeaseError::StaleLease),
+        }
+    }
+
+    pub fn apply_op(
+        &mut self,
+        op: &SubscriptionLeaseOp,
+        now_tick: u64,
+    ) -> Result<(), SubscriptionLeaseError> {
+        match op {
+            SubscriptionLeaseOp::Join {
+                member_id,
+                member_epoch,
+            } => self.fence_member(*member_id, *member_epoch),
+            SubscriptionLeaseOp::Claim {
+                work_id,
+                member_id,
+                member_epoch,
+                lease_ticks,
+            } => self
+                .claim(
+                    *work_id,
+                    *member_id,
+                    *member_epoch,
+                    now_tick,
+                    *lease_ticks,
+                    SUBSCRIPTION_LEASE_MAX_MEMBER_WORK,
+                )
+                .map(|_| ()),
+            SubscriptionLeaseOp::Renew {
+                work_id,
+                member_id,
+                member_epoch,
+                lease_epoch,
+                lease_ticks,
+            } => self
+                .renew(
+                    &SubscriptionWorkLease {
+                        work_id: *work_id,
+                        member_id: *member_id,
+                        member_epoch: *member_epoch,
+                        lease_epoch: *lease_epoch,
+                        expires_at_tick: 0,
+                    },
+                    now_tick,
+                    *lease_ticks,
+                )
+                .map(|_| ()),
+            SubscriptionLeaseOp::Release {
+                work_id,
+                member_id,
+                member_epoch,
+                lease_epoch,
+            } => self.release(&SubscriptionWorkLease {
+                work_id: *work_id,
+                member_id: *member_id,
+                member_epoch: *member_epoch,
+                lease_epoch: *lease_epoch,
+                expires_at_tick: 0,
+            }),
+        }
     }
 
     fn check_tick(&self, now_tick: u64, lease_ticks: u64) -> Result<(), SubscriptionLeaseError> {
@@ -717,6 +846,10 @@ pub struct SubscriptionProgressMutation {
     pub expected_cursor: Option<String>,
     pub cursor: String,
     pub positions: BTreeMap<RangeId, String>,
+    #[serde(default)]
+    pub tick: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lease_ops: Vec<SubscriptionLeaseOp>,
 }
 
 fn same_progress_identity(
@@ -730,6 +863,8 @@ fn same_progress_identity(
         && left.expected_cursor == right.expected_cursor
         && left.cursor == right.cursor
         && left.positions == right.positions
+        && left.tick == right.tick
+        && left.lease_ops == right.lease_ops
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -739,6 +874,8 @@ struct SubscriptionProgressReplicaRow {
     ownership_epoch: u64,
     committed: Option<SubscriptionProgressMutation>,
     prepared: Option<SubscriptionProgressMutation>,
+    #[serde(default)]
+    members: SubscriptionMemberState,
 }
 
 #[derive(Debug, Error)]
@@ -757,6 +894,8 @@ pub enum SubscriptionProgressError {
     TooLarge,
     #[error("Subscription progress has no valid two-replica commit evidence")]
     NoQuorum,
+    #[error("Subscription member lease was rejected: {0}")]
+    Lease(#[from] SubscriptionLeaseError),
     #[error("Subscription progress replica placement or owner is invalid")]
     InvalidAssignment,
     #[error("Subscription progress replica is unavailable; retry the same request identity")]
@@ -876,10 +1015,12 @@ impl FjallSubscriptionProgressReplica {
             Some(row) => Ok(SubscriptionProgressInspection {
                 committed: row.committed,
                 prepared: row.prepared,
+                members: row.members,
             }),
             None => Ok(SubscriptionProgressInspection {
                 committed: None,
                 prepared: None,
+                members: SubscriptionMemberState::default(),
             }),
         }
     }
@@ -890,9 +1031,13 @@ impl FjallSubscriptionProgressReplica {
         feed_id: Uuid,
         ownership_epoch: u64,
         committed: Option<SubscriptionProgressMutation>,
+        members: SubscriptionMemberState,
     ) -> Result<Option<SubscriptionProgressMutation>, SubscriptionProgressError> {
         if ownership_epoch == 0 {
             return Err(SubscriptionProgressError::StaleEpoch);
+        }
+        if committed.is_none() && members != SubscriptionMemberState::default() {
+            return Err(SubscriptionProgressError::Conflict);
         }
         if let Some(mutation) = &committed {
             if mutation.subscription_id != subscription_id
@@ -908,8 +1053,11 @@ impl FjallSubscriptionProgressReplica {
                 || mutation.positions.len() > 128
                 || mutation.positions.values().any(|value| value.len() > 256)
                 || mutation.expected_cursor.as_ref().is_some_and(|expected| {
-                    expected.is_empty() || expected.len() > 256 || expected == &mutation.cursor
+                    expected.is_empty()
+                        || expected.len() > 256
+                        || (expected == &mutation.cursor && mutation.lease_ops.is_empty())
                 })
+                || mutation.lease_ops.len() > SUBSCRIPTION_LEASE_MAX_OPS
                 || serde_json::to_vec(mutation)?.len() > 256 * 1024
             {
                 return Err(SubscriptionProgressError::TooLarge);
@@ -929,6 +1077,7 @@ impl FjallSubscriptionProgressReplica {
             ownership_epoch: 0,
             committed: None,
             prepared: None,
+            members: SubscriptionMemberState::default(),
         });
         if row.subscription_id != subscription_id || row.feed_id != feed_id {
             return Err(SubscriptionProgressError::Conflict);
@@ -937,7 +1086,7 @@ impl FjallSubscriptionProgressReplica {
             return Err(SubscriptionProgressError::StaleEpoch);
         }
         if row.ownership_epoch == ownership_epoch {
-            return if row.committed == committed {
+            return if row.committed == committed && row.members == members {
                 Ok(row.committed)
             } else {
                 Err(SubscriptionProgressError::Conflict)
@@ -958,6 +1107,7 @@ impl FjallSubscriptionProgressReplica {
         }
         row.ownership_epoch = ownership_epoch;
         row.committed = committed;
+        row.members = members;
         row.prepared = None;
         let encoded = serde_json::to_vec(&row)?;
         if encoded.len() > 256 * 1024 {
@@ -979,6 +1129,12 @@ impl FjallSubscriptionProgressReplica {
             || mutation.positions.is_empty()
             || mutation.positions.len() > 128
             || mutation.positions.values().any(|value| value.len() > 256)
+            || mutation.lease_ops.len() > SUBSCRIPTION_LEASE_MAX_OPS
+            || mutation.expected_cursor.as_ref().is_some_and(|expected| {
+                expected.is_empty()
+                    || expected.len() > 256
+                    || (expected == &mutation.cursor && mutation.lease_ops.is_empty())
+            })
         {
             return Err(SubscriptionProgressError::TooLarge);
         }
@@ -1007,6 +1163,7 @@ impl FjallSubscriptionProgressReplica {
                 ownership_epoch: mutation.ownership_epoch,
                 committed: None,
                 prepared: None,
+                members: SubscriptionMemberState::default(),
             },
         };
         if row.subscription_id != mutation.subscription_id || row.feed_id != mutation.feed_id {
@@ -1039,6 +1196,17 @@ impl FjallSubscriptionProgressReplica {
             != mutation.expected_cursor.as_deref()
         {
             return Err(SubscriptionProgressError::Conflict);
+        }
+        if !mutation.lease_ops.is_empty() {
+            let mut tracker = SubscriptionLeaseTracker::from_state(
+                row.members.clone(),
+                SUBSCRIPTION_LEASE_MAX_WORK,
+            );
+            for op in &mutation.lease_ops {
+                tracker
+                    .apply_op(op, mutation.tick)
+                    .map_err(SubscriptionProgressError::Lease)?;
+            }
         }
         row.prepared = Some(mutation);
         let encoded = serde_json::to_vec(&row)?;
@@ -1093,6 +1261,18 @@ impl FjallSubscriptionProgressReplica {
             .prepared
             .take()
             .ok_or(SubscriptionProgressError::Conflict)?;
+        if !committed.lease_ops.is_empty() {
+            let mut tracker = SubscriptionLeaseTracker::from_state(
+                row.members.clone(),
+                SUBSCRIPTION_LEASE_MAX_WORK,
+            );
+            for op in &committed.lease_ops {
+                tracker
+                    .apply_op(op, committed.tick)
+                    .map_err(|_| SubscriptionProgressError::Conflict)?;
+            }
+            row.members = tracker.materialize();
+        }
         row.committed = Some(committed.clone());
         tx.insert(
             &self.progress,
@@ -1136,6 +1316,8 @@ pub struct SubscriptionCommittedReadRequest {
 pub struct SubscriptionProgressInspection {
     pub committed: Option<SubscriptionProgressMutation>,
     pub prepared: Option<SubscriptionProgressMutation>,
+    #[serde(default)]
+    pub members: SubscriptionMemberState,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1146,12 +1328,15 @@ pub struct SubscriptionProgressAdoptRequest {
     pub subscription_id: Uuid,
     pub ownership_epoch: u64,
     pub committed: Option<SubscriptionProgressMutation>,
+    #[serde(default)]
+    pub members: SubscriptionMemberState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubscriptionRecoveryOutcome {
     pub assignment: SubscriptionProgressAssignment,
     pub committed: Option<SubscriptionProgressMutation>,
+    pub members: SubscriptionMemberState,
     pub adopted: Vec<crate::active_range::StorageNodeId>,
 }
 
@@ -1360,8 +1545,15 @@ impl SubscriptionProgressReplicaService {
         let subscription_id = request.subscription_id;
         let ownership_epoch = request.ownership_epoch;
         let committed = request.committed;
+        let members = request.members;
         let result = tokio::task::spawn_blocking(move || {
-            replica.adopt_recovered(subscription_id, feed_id, ownership_epoch, committed)
+            replica.adopt_recovered(
+                subscription_id,
+                feed_id,
+                ownership_epoch,
+                committed,
+                members,
+            )
         })
         .await
         .map_err(|_| SubscriptionProgressError::Unavailable)??;
@@ -1439,6 +1631,7 @@ pub trait SubscriptionProgressTransport: Send + Sync {
         subscription_id: Uuid,
         ownership_epoch: u64,
         committed: Option<SubscriptionProgressMutation>,
+        members: SubscriptionMemberState,
     ) -> Result<
         SubscriptionReplicaReply<Option<SubscriptionProgressMutation>>,
         SubscriptionProgressError,
@@ -1657,6 +1850,7 @@ impl SubscriptionProgressTransport for HttpSubscriptionProgressTransport {
         subscription_id: Uuid,
         ownership_epoch: u64,
         committed: Option<SubscriptionProgressMutation>,
+        members: SubscriptionMemberState,
     ) -> Result<
         SubscriptionReplicaReply<Option<SubscriptionProgressMutation>>,
         SubscriptionProgressError,
@@ -1678,6 +1872,7 @@ impl SubscriptionProgressTransport for HttpSubscriptionProgressTransport {
                 subscription_id,
                 ownership_epoch,
                 committed,
+                members,
             },
         )
         .await
@@ -1967,23 +2162,40 @@ impl SubscriptionProgressCoordinator {
             crate::active_range::StorageNodeId,
             SubscriptionProgressInspection,
         )],
-    ) -> Result<Option<SubscriptionProgressMutation>, SubscriptionProgressError> {
-        let mut best: Option<&SubscriptionProgressMutation> = None;
+    ) -> Result<
+        (
+            Option<SubscriptionProgressMutation>,
+            SubscriptionMemberState,
+        ),
+        SubscriptionProgressError,
+    > {
+        let mut best: Option<(&SubscriptionProgressMutation, &SubscriptionMemberState)> = None;
         for (_, inspection) in evidence {
             let Some(candidate) = &inspection.committed else {
                 continue;
             };
             match best {
-                None => best = Some(candidate),
-                Some(current) if same_progress_identity(current, candidate) => {}
-                Some(current) => match candidate.sequence.cmp(&current.sequence) {
-                    std::cmp::Ordering::Greater => best = Some(candidate),
-                    std::cmp::Ordering::Equal => return Err(SubscriptionProgressError::Conflict),
+                None => best = Some((candidate, &inspection.members)),
+                Some((current, members)) if same_progress_identity(current, candidate) => {
+                    if *members != inspection.members {
+                        return Err(SubscriptionProgressError::Conflict);
+                    }
+                }
+                Some((current, _)) => match candidate.sequence.cmp(&current.sequence) {
+                    std::cmp::Ordering::Greater => {
+                        best = Some((candidate, &inspection.members));
+                    }
+                    std::cmp::Ordering::Equal => {
+                        return Err(SubscriptionProgressError::Conflict);
+                    }
                     std::cmp::Ordering::Less => {}
                 },
             }
         }
-        Ok(best.cloned())
+        Ok(best.map_or_else(
+            || (None, SubscriptionMemberState::default()),
+            |(mutation, members)| (Some(mutation.clone()), members.clone()),
+        ))
     }
 
     fn recovery_owner(
@@ -2024,6 +2236,7 @@ impl SubscriptionProgressCoordinator {
         owner: &crate::active_range::StorageNodeId,
         ownership_epoch: u64,
         committed: Option<SubscriptionProgressMutation>,
+        member_state: &SubscriptionMemberState,
     ) -> Result<Vec<crate::active_range::StorageNodeId>, SubscriptionProgressError> {
         let mut adopted = Vec::with_capacity(3);
         for node in members {
@@ -2035,6 +2248,7 @@ impl SubscriptionProgressCoordinator {
                     self.assignment.subscription_id,
                     ownership_epoch,
                     committed.clone(),
+                    member_state.clone(),
                 )
                 .await
             {
@@ -2070,7 +2284,7 @@ impl SubscriptionProgressCoordinator {
             .checked_add(1)
             .ok_or(SubscriptionProgressError::Sequence)?;
         let evidence = self.inspect_evidence().await?;
-        let recovered = Self::recovered_committed(&evidence)?;
+        let (recovered, member_state) = Self::recovered_committed(&evidence)?;
         let proposed_owner = self.recovery_owner(&evidence, recovered.as_ref())?;
         let (owner, ownership_epoch) = match control
             .execute_commands(vec![
@@ -2104,6 +2318,7 @@ impl SubscriptionProgressCoordinator {
                 &owner,
                 ownership_epoch,
                 committed.clone(),
+                &member_state,
             )
             .await?;
         Ok(SubscriptionRecoveryOutcome {
@@ -2114,6 +2329,7 @@ impl SubscriptionProgressCoordinator {
                 ownership_epoch,
             },
             committed,
+            members: member_state,
             adopted,
         })
     }
@@ -2144,7 +2360,7 @@ impl SubscriptionProgressCoordinator {
         let new_replicas = crate::active_range::ReplicaSet::try_new(swapped)
             .map_err(|_| SubscriptionProgressError::InvalidAssignment)?;
         let evidence = self.inspect_evidence().await?;
-        let recovered = Self::recovered_committed(&evidence)?;
+        let (recovered, member_state) = Self::recovered_committed(&evidence)?;
         let (replicas, owner, ownership_epoch) = match control
             .execute_commands(vec![
                 crate::control::Command::MoveSubscriptionProgressReplica {
@@ -2182,6 +2398,7 @@ impl SubscriptionProgressCoordinator {
                 &owner,
                 ownership_epoch,
                 committed.clone(),
+                &member_state,
             )
             .await?;
         Ok(SubscriptionRecoveryOutcome {
@@ -2192,6 +2409,7 @@ impl SubscriptionProgressCoordinator {
                 ownership_epoch,
             },
             committed,
+            members: member_state,
             adopted,
         })
     }
@@ -2200,7 +2418,7 @@ impl SubscriptionProgressCoordinator {
         &self,
     ) -> Result<SubscriptionRecoveryOutcome, SubscriptionProgressError> {
         let evidence = self.inspect_evidence().await?;
-        let recovered = Self::recovered_committed(&evidence)?;
+        let (recovered, member_state) = Self::recovered_committed(&evidence)?;
         let committed = recovered.map(|mut mutation| {
             mutation.ownership_epoch = self.assignment.ownership_epoch;
             mutation
@@ -2211,11 +2429,13 @@ impl SubscriptionProgressCoordinator {
                 &self.assignment.owner.clone(),
                 self.assignment.ownership_epoch,
                 committed.clone(),
+                &member_state,
             )
             .await?;
         Ok(SubscriptionRecoveryOutcome {
             assignment: self.assignment.clone(),
             committed,
+            members: member_state,
             adopted,
         })
     }
@@ -2280,6 +2500,9 @@ mod tests {
                 RangeId::from_uuid(Uuid::from_u128(701)),
                 "event".to_owned(),
             )]),
+
+            tick: 0,
+            lease_ops: Vec::new(),
         };
         let valid = SubscriptionPrepareRequest {
             owner: assignment.owner.clone(),
@@ -2394,6 +2617,9 @@ mod tests {
                 RangeId::from_uuid(Uuid::from_u128(4)),
                 "record-one".to_owned(),
             )]),
+
+            tick: 0,
+            lease_ops: Vec::new(),
         };
         let first_vote = first.prepare(mutation.clone()).unwrap();
         let second_vote = second.prepare(mutation.clone()).unwrap();
@@ -2728,7 +2954,312 @@ mod tests {
                 RangeId::from_uuid(Uuid::from_u128(7_000 + sequence as u128)),
                 format!("position-{sequence}"),
             )]),
+            tick: 0,
+            lease_ops: Vec::new(),
         }
+    }
+
+    #[test]
+    fn subscription_lease_ops_commit_atomically_and_fence_members() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let replica = FjallSubscriptionProgressReplica::open(directory.path()).unwrap();
+        let subscription_id = Uuid::from_u128(610);
+        let feed_id = Uuid::from_u128(611);
+        let member = Uuid::from_u128(612);
+        let other = Uuid::from_u128(613);
+        let work = Uuid::from_u128(614);
+
+        let mut join = subscription_progress_mutation(subscription_id, feed_id, 1, 1);
+        join.lease_ops = vec![SubscriptionLeaseOp::Join {
+            member_id: member,
+            member_epoch: 1,
+        }];
+        commit_direct(&replica, &join);
+        let state = replica.local_state(subscription_id).unwrap();
+        assert_eq!(state.members.member_epochs.get(&member), Some(&1));
+        assert!(state.members.leases.is_empty());
+
+        // a lease-only mutation leaves the frontier unchanged.
+        let mut claim = subscription_progress_mutation(subscription_id, feed_id, 1, 2);
+        claim.expected_cursor = Some(join.cursor.clone());
+        claim.cursor = join.cursor.clone();
+        claim.tick = 10;
+        claim.lease_ops = vec![SubscriptionLeaseOp::Claim {
+            work_id: work,
+            member_id: member,
+            member_epoch: 1,
+            lease_ticks: 30,
+        }];
+        commit_direct(&replica, &claim);
+        let state = replica.local_state(subscription_id).unwrap();
+        let granted = state.members.leases.get(&work).unwrap();
+        assert_eq!(
+            (granted.member_id, granted.member_epoch, granted.lease_epoch),
+            (member, 1, 1)
+        );
+        assert_eq!(granted.expires_at_tick, 40);
+        assert_eq!(state.members.last_tick, 10);
+        assert_eq!(state.committed.as_ref().unwrap().cursor, join.cursor);
+
+        // a member that never joined cannot claim.
+        let mut outsider = subscription_progress_mutation(subscription_id, feed_id, 1, 3);
+        outsider.expected_cursor = Some(join.cursor.clone());
+        outsider.cursor = join.cursor.clone();
+        outsider.tick = 20;
+        outsider.lease_ops = vec![SubscriptionLeaseOp::Claim {
+            work_id: Uuid::from_u128(615),
+            member_id: other,
+            member_epoch: 1,
+            lease_ticks: 10,
+        }];
+        assert!(matches!(
+            replica.prepare(outsider),
+            Err(SubscriptionProgressError::Lease(
+                SubscriptionLeaseError::StaleLease
+            ))
+        ));
+
+        // the live lease cannot be stolen before expiry.
+        let mut join_other = subscription_progress_mutation(subscription_id, feed_id, 1, 3);
+        join_other.expected_cursor = Some(join.cursor.clone());
+        join_other.cursor = join.cursor.clone();
+        join_other.tick = 20;
+        join_other.lease_ops = vec![
+            SubscriptionLeaseOp::Join {
+                member_id: other,
+                member_epoch: 1,
+            },
+            SubscriptionLeaseOp::Claim {
+                work_id: work,
+                member_id: other,
+                member_epoch: 1,
+                lease_ticks: 10,
+            },
+        ];
+        assert!(matches!(
+            replica.prepare(join_other.clone()),
+            Err(SubscriptionProgressError::Lease(
+                SubscriptionLeaseError::Busy
+            ))
+        ));
+
+        // after expiry the other member takes over at a higher lease epoch.
+        let mut takeover = join_other.clone();
+        takeover.tick = 45;
+        commit_direct(&replica, &takeover);
+        let state = replica.local_state(subscription_id).unwrap();
+        let held = state.members.leases.get(&work).unwrap();
+        assert_eq!(
+            (held.member_id, held.member_epoch, held.lease_epoch),
+            (other, 1, 2)
+        );
+        assert_eq!(held.expires_at_tick, 55);
+
+        // lease clocks never move backwards.
+        let mut rewind = subscription_progress_mutation(subscription_id, feed_id, 1, 4);
+        rewind.expected_cursor = Some(join.cursor.clone());
+        rewind.cursor = join.cursor.clone();
+        rewind.tick = 30;
+        rewind.lease_ops = vec![SubscriptionLeaseOp::Renew {
+            work_id: work,
+            member_id: other,
+            member_epoch: 1,
+            lease_epoch: 2,
+            lease_ticks: 10,
+        }];
+        assert!(matches!(
+            replica.prepare(rewind),
+            Err(SubscriptionProgressError::Lease(
+                SubscriptionLeaseError::InvalidClock
+            ))
+        ));
+
+        // renew requires the exact lease epoch.
+        let mut wrong_epoch = subscription_progress_mutation(subscription_id, feed_id, 1, 4);
+        wrong_epoch.expected_cursor = Some(join.cursor.clone());
+        wrong_epoch.cursor = join.cursor.clone();
+        wrong_epoch.tick = 50;
+        wrong_epoch.lease_ops = vec![SubscriptionLeaseOp::Renew {
+            work_id: work,
+            member_id: other,
+            member_epoch: 1,
+            lease_epoch: 1,
+            lease_ticks: 10,
+        }];
+        assert!(matches!(
+            replica.prepare(wrong_epoch),
+            Err(SubscriptionProgressError::Lease(
+                SubscriptionLeaseError::StaleLease
+            ))
+        ));
+
+        // release removes the lease at its exact epoch.
+        let mut release = subscription_progress_mutation(subscription_id, feed_id, 1, 4);
+        release.expected_cursor = Some(join.cursor.clone());
+        release.cursor = join.cursor.clone();
+        release.tick = 50;
+        release.lease_ops = vec![SubscriptionLeaseOp::Release {
+            work_id: work,
+            member_id: other,
+            member_epoch: 1,
+            lease_epoch: 2,
+        }];
+        commit_direct(&replica, &release);
+        assert!(replica
+            .local_state(subscription_id)
+            .unwrap()
+            .members
+            .leases
+            .is_empty());
+
+        // member fencing expires that member's remaining leases.
+        let mut reclaim = subscription_progress_mutation(subscription_id, feed_id, 1, 5);
+        reclaim.expected_cursor = Some(join.cursor.clone());
+        reclaim.cursor = join.cursor.clone();
+        reclaim.tick = 60;
+        reclaim.lease_ops = vec![
+            SubscriptionLeaseOp::Claim {
+                work_id: work,
+                member_id: member,
+                member_epoch: 1,
+                lease_ticks: 30,
+            },
+            SubscriptionLeaseOp::Join {
+                member_id: member,
+                member_epoch: 2,
+            },
+        ];
+        commit_direct(&replica, &reclaim);
+        let state = replica.local_state(subscription_id).unwrap();
+        assert_eq!(state.members.member_epochs.get(&member), Some(&2));
+        let expired = state.members.leases.get(&work).unwrap();
+        assert_eq!(expired.lease_epoch, 1);
+        assert!(expired.expires_at_tick <= state.members.last_tick);
+        let tracker = SubscriptionLeaseTracker::from_state(
+            state.members.clone(),
+            SUBSCRIPTION_LEASE_MAX_WORK,
+        );
+        assert!(!tracker.can_ack(expired, 61));
+
+        // member state survives a replica restart.
+        drop(replica);
+        let reopened = FjallSubscriptionProgressReplica::open(directory.path()).unwrap();
+        let state = reopened.local_state(subscription_id).unwrap();
+        assert_eq!(state.members.member_epochs.get(&member), Some(&2));
+        assert!(state.members.leases.contains_key(&work));
+
+        // an adopt under a higher epoch installs the member snapshot.
+        let adopted_dir = tempfile::TempDir::new().unwrap();
+        let adopted = FjallSubscriptionProgressReplica::open(adopted_dir.path()).unwrap();
+        let mut recovered_committed = state.committed.clone().unwrap();
+        recovered_committed.ownership_epoch = 2;
+        adopted
+            .adopt_recovered(
+                subscription_id,
+                feed_id,
+                2,
+                Some(recovered_committed),
+                state.members.clone(),
+            )
+            .unwrap();
+        let adopted_state = adopted.local_state(subscription_id).unwrap();
+        assert_eq!(adopted_state.members, state.members);
+        // the same committed value with a different member snapshot is a fork.
+        assert!(matches!(
+            adopted.adopt_recovered(
+                subscription_id,
+                feed_id,
+                2,
+                adopted_state.committed.clone(),
+                SubscriptionMemberState::default()
+            ),
+            Err(SubscriptionProgressError::Conflict)
+        ));
+    }
+
+    #[test]
+    fn subscription_lease_ops_stay_invisible_until_committed() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let replica = FjallSubscriptionProgressReplica::open(directory.path()).unwrap();
+        let subscription_id = Uuid::from_u128(620);
+        let feed_id = Uuid::from_u128(621);
+        let member = Uuid::from_u128(622);
+        let work = Uuid::from_u128(623);
+
+        let first = subscription_progress_mutation(subscription_id, feed_id, 1, 1);
+        commit_direct(&replica, &first);
+
+        let mut claim = subscription_progress_mutation(subscription_id, feed_id, 1, 2);
+        claim.expected_cursor = Some(first.cursor.clone());
+        claim.cursor = first.cursor.clone();
+        claim.tick = 5;
+        claim.lease_ops = vec![
+            SubscriptionLeaseOp::Join {
+                member_id: member,
+                member_epoch: 1,
+            },
+            SubscriptionLeaseOp::Claim {
+                work_id: work,
+                member_id: member,
+                member_epoch: 1,
+                lease_ticks: 20,
+            },
+        ];
+        replica.prepare(claim).unwrap();
+        let state = replica.local_state(subscription_id).unwrap();
+        assert!(state.prepared.is_some());
+        assert!(state.members.member_epochs.is_empty());
+        assert!(state.members.leases.is_empty());
+
+        drop(replica);
+        let reopened = FjallSubscriptionProgressReplica::open(directory.path()).unwrap();
+        let state = reopened.local_state(subscription_id).unwrap();
+        assert!(state.prepared.is_some());
+        assert!(state.members.member_epochs.is_empty());
+    }
+
+    #[test]
+    fn subscription_lease_ops_obey_capacity_and_bounded_fan_out() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let replica = FjallSubscriptionProgressReplica::open(directory.path()).unwrap();
+        let subscription_id = Uuid::from_u128(630);
+        let feed_id = Uuid::from_u128(631);
+        let member = Uuid::from_u128(632);
+
+        let mut fanout = subscription_progress_mutation(subscription_id, feed_id, 1, 1);
+        fanout.lease_ops = (0..SUBSCRIPTION_LEASE_MAX_OPS as u128 + 1)
+            .map(|index| SubscriptionLeaseOp::Join {
+                member_id: Uuid::from_u128(7_000 + index),
+                member_epoch: 1,
+            })
+            .collect();
+        assert!(matches!(
+            replica.prepare(fanout),
+            Err(SubscriptionProgressError::TooLarge)
+        ));
+
+        let mut join = subscription_progress_mutation(subscription_id, feed_id, 1, 1);
+        join.lease_ops = vec![SubscriptionLeaseOp::Join {
+            member_id: member,
+            member_epoch: 1,
+        }];
+        commit_direct(&replica, &join);
+
+        let mut exact = subscription_progress_mutation(subscription_id, feed_id, 1, 2);
+        exact.expected_cursor = Some(join.cursor.clone());
+        exact.cursor = join.cursor.clone();
+        exact.tick = 5;
+        exact.lease_ops = (0..SUBSCRIPTION_LEASE_MAX_OPS as u128)
+            .map(|index| SubscriptionLeaseOp::Claim {
+                work_id: Uuid::from_u128(10_000 + index),
+                member_id: member,
+                member_epoch: 1,
+                lease_ticks: 10,
+            })
+            .collect();
+        commit_direct(&replica, &exact);
+        let state = replica.local_state(subscription_id).unwrap();
+        assert_eq!(state.members.leases.len(), SUBSCRIPTION_LEASE_MAX_OPS);
     }
 
     fn commit_direct(
@@ -2768,57 +3299,111 @@ mod tests {
         commit_direct(&replica, &first);
 
         assert!(matches!(
-            replica.adopt_recovered(subscription_id, feed_id, 0, None),
+            replica.adopt_recovered(
+                subscription_id,
+                feed_id,
+                0,
+                None,
+                SubscriptionMemberState::default()
+            ),
             Err(SubscriptionProgressError::StaleEpoch)
         ));
         let mut adopted_first = first.clone();
         adopted_first.ownership_epoch = 2;
         assert_eq!(
             replica
-                .adopt_recovered(subscription_id, feed_id, 2, Some(adopted_first.clone()))
+                .adopt_recovered(
+                    subscription_id,
+                    feed_id,
+                    2,
+                    Some(adopted_first.clone()),
+                    SubscriptionMemberState::default()
+                )
                 .unwrap(),
             Some(adopted_first.clone())
         );
         assert_eq!(
             replica
-                .adopt_recovered(subscription_id, feed_id, 2, Some(adopted_first.clone()))
+                .adopt_recovered(
+                    subscription_id,
+                    feed_id,
+                    2,
+                    Some(adopted_first.clone()),
+                    SubscriptionMemberState::default()
+                )
                 .unwrap(),
             Some(adopted_first.clone())
         );
         assert!(matches!(
-            replica.adopt_recovered(subscription_id, feed_id, 2, None),
+            replica.adopt_recovered(
+                subscription_id,
+                feed_id,
+                2,
+                None,
+                SubscriptionMemberState::default()
+            ),
             Err(SubscriptionProgressError::Conflict)
         ));
         let mut divergent = subscription_progress_mutation(subscription_id, feed_id, 2, 2);
         divergent.request_id = Uuid::from_u128(6_666);
         assert!(matches!(
-            replica.adopt_recovered(subscription_id, feed_id, 2, Some(divergent)),
+            replica.adopt_recovered(
+                subscription_id,
+                feed_id,
+                2,
+                Some(divergent),
+                SubscriptionMemberState::default()
+            ),
             Err(SubscriptionProgressError::Conflict)
         ));
 
         let second = subscription_progress_mutation(subscription_id, feed_id, 3, 2);
         assert_eq!(
             replica
-                .adopt_recovered(subscription_id, feed_id, 3, Some(second.clone()))
+                .adopt_recovered(
+                    subscription_id,
+                    feed_id,
+                    3,
+                    Some(second.clone()),
+                    SubscriptionMemberState::default()
+                )
                 .unwrap(),
             Some(second.clone())
         );
         let mut regressed = subscription_progress_mutation(subscription_id, feed_id, 4, 1);
         regressed.ownership_epoch = 4;
         assert!(matches!(
-            replica.adopt_recovered(subscription_id, feed_id, 4, Some(regressed)),
+            replica.adopt_recovered(
+                subscription_id,
+                feed_id,
+                4,
+                Some(regressed),
+                SubscriptionMemberState::default()
+            ),
             Err(SubscriptionProgressError::Conflict)
         ));
         let mut forked = subscription_progress_mutation(subscription_id, feed_id, 4, 2);
         forked.request_id = Uuid::from_u128(6_667);
         assert!(matches!(
-            replica.adopt_recovered(subscription_id, feed_id, 4, Some(forked)),
+            replica.adopt_recovered(
+                subscription_id,
+                feed_id,
+                4,
+                Some(forked),
+                SubscriptionMemberState::default()
+            ),
             Err(SubscriptionProgressError::Conflict)
         ));
         let mut unchained = subscription_progress_mutation(subscription_id, feed_id, 4, 3);
         unchained.expected_cursor = Some("rf1_unknown".to_owned());
         assert!(matches!(
-            replica.adopt_recovered(subscription_id, feed_id, 4, Some(unchained)),
+            replica.adopt_recovered(
+                subscription_id,
+                feed_id,
+                4,
+                Some(unchained),
+                SubscriptionMemberState::default()
+            ),
             Err(SubscriptionProgressError::Conflict)
         ));
 
@@ -2827,7 +3412,13 @@ mod tests {
         let third = subscription_progress_mutation(subscription_id, feed_id, 5, 3);
         assert_eq!(
             replica
-                .adopt_recovered(subscription_id, feed_id, 5, Some(third.clone()))
+                .adopt_recovered(
+                    subscription_id,
+                    feed_id,
+                    5,
+                    Some(third.clone()),
+                    SubscriptionMemberState::default()
+                )
                 .unwrap(),
             Some(third.clone())
         );
@@ -2847,7 +3438,13 @@ mod tests {
         let empty_subscription = Uuid::from_u128(602);
         assert_eq!(
             replica
-                .adopt_recovered(empty_subscription, feed_id, 2, None)
+                .adopt_recovered(
+                    empty_subscription,
+                    feed_id,
+                    2,
+                    None,
+                    SubscriptionMemberState::default()
+                )
                 .unwrap(),
             None
         );
@@ -2860,11 +3457,23 @@ mod tests {
             ))
             .unwrap();
         assert!(matches!(
-            replica.adopt_recovered(subscription_id, Uuid::from_u128(999), 6, None),
+            replica.adopt_recovered(
+                subscription_id,
+                Uuid::from_u128(999),
+                6,
+                None,
+                SubscriptionMemberState::default()
+            ),
             Err(SubscriptionProgressError::Conflict)
         ));
         assert!(matches!(
-            replica.adopt_recovered(Uuid::from_u128(999), feed_id, 6, None),
+            replica.adopt_recovered(
+                Uuid::from_u128(999),
+                feed_id,
+                6,
+                None,
+                SubscriptionMemberState::default()
+            ),
             Ok(None)
         ));
 
@@ -2929,6 +3538,7 @@ mod tests {
             subscription_id: subscription.subscription_id,
             ownership_epoch: 2,
             committed: None,
+            members: SubscriptionMemberState::default(),
         };
         assert!(matches!(
             service.adopt(adopt.clone()).await,
@@ -2974,6 +3584,9 @@ mod tests {
                 RangeId::from_uuid(Uuid::from_u128(9_998)),
                 "position".to_owned(),
             )]),
+
+            tick: 0,
+            lease_ops: Vec::new(),
         };
         let adopt = SubscriptionProgressAdoptRequest {
             owner: survivor.clone(),
@@ -2981,6 +3594,7 @@ mod tests {
             subscription_id: subscription.subscription_id,
             ownership_epoch: 2,
             committed: Some(adopted_committed.clone()),
+            members: SubscriptionMemberState::default(),
         };
         assert_eq!(
             service.adopt(adopt).await.unwrap().result,
