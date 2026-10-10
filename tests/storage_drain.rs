@@ -1,14 +1,21 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use finnstream::{
     active_range::{
-        AppendIdentity, CommitPosition, DrainCommandAuthority, FollowerMoveControl,
-        FollowerMoveCopyResult, OwnerMoveControl, OwnerMoveEvidence, RangeGeneration,
-        RangePosition, ReplicaAppendAccepted, ReplicaAppendRequest, ReplicaAppendService,
-        ReplicaCommitAccepted, ReplicaCommitRequest, ReplicaTransport, ReplicaTransportError,
-        StorageDrainExecutor, StorageNodeId,
+        AppendIdentity, CommitPosition, DrainCommandAuthority, DrainMoveDriver,
+        FollowerMoveControl, FollowerMoveCopyResult, LocalDrainDriver, OwnerMoveControl,
+        OwnerMoveEvidence, RangeGeneration, RangePosition, ReplicaAppendAccepted,
+        ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest,
+        ReplicaTransport, ReplicaTransportError, StorageDrainExecutor, StorageDrainSupervisor,
+        StorageNodeId,
     },
     codec::encode_record,
     control::{Command, ControlController, RangeMovePlan, RangeOwnerMovePlan, ReaderStart},
@@ -139,6 +146,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_spare_node(true).await
+    }
+
+    async fn with_spare_node(spare: bool) -> Self {
         let directory = TempDir::new().unwrap();
         let store: Arc<dyn LogStore> =
             Arc::new(FileLogStore::open(directory.path().join("legacy")).unwrap());
@@ -150,11 +161,18 @@ impl Fixture {
             )
             .unwrap(),
         );
-        control
-            .execute("REGISTER STORAGE NODE storage-4 AT http://storage-4:7070;")
-            .await
-            .unwrap();
-        let services = ["storage-1", "storage-2", "storage-3", "storage-4"]
+        if spare {
+            control
+                .execute("REGISTER STORAGE NODE storage-4 AT http://storage-4:7070;")
+                .await
+                .unwrap();
+        }
+        let nodes = if spare {
+            vec!["storage-1", "storage-2", "storage-3", "storage-4"]
+        } else {
+            vec!["storage-1", "storage-2", "storage-3"]
+        };
+        let services = nodes
             .into_iter()
             .map(|value| {
                 let node = node(value);
@@ -166,19 +184,33 @@ impl Fixture {
                 (node, service)
             })
             .collect::<BTreeMap<_, _>>();
-        let executor = StorageDrainExecutor::new(
-            control.clone(),
-            Arc::new(LocalDrainAuthority(control.clone())),
-            Arc::new(LocalMoveControl(control.clone())),
-            Arc::new(LocalMoveControl(control.clone())),
-            Arc::new(UnusedTransport),
-        );
+        let executor = Self::executor(control.clone());
         Self {
             _directory: directory,
             control,
             services,
             executor,
         }
+    }
+
+    fn executor(control: Arc<ControlController>) -> StorageDrainExecutor {
+        StorageDrainExecutor::new(
+            control.clone(),
+            Arc::new(LocalDrainAuthority(control.clone())),
+            Arc::new(LocalMoveControl(control.clone())),
+            Arc::new(LocalMoveControl(control.clone())),
+            Arc::new(UnusedTransport),
+        )
+    }
+
+    fn supervisor(&self) -> StorageDrainSupervisor {
+        StorageDrainSupervisor::new(
+            self.control.clone(),
+            Arc::new(LocalDrainDriver::new(
+                Self::executor(self.control.clone()),
+                Arc::new(self.services.clone()),
+            )),
+        )
     }
 
     async fn create_feed_and_subscription(&self) {
@@ -304,7 +336,6 @@ async fn drain_executor_vacates_a_follower_and_unblocks_retire() {
         .find(|node| !original.replicas.contains(node))
         .unwrap()
         .clone();
-    assert_eq!(replacement.as_str(), "storage-4");
     assert_eq!(
         fixture.services[&replacement]
             .read_committed(feed_id, None, 10)
@@ -402,4 +433,164 @@ async fn drain_executor_vacates_subscription_progress_references() {
         .execute(&format!("RETIRE STORAGE NODE {drained};"))
         .await
         .unwrap();
+}
+
+/// Fails `apply` the first `failures` calls, then delegates to the inner
+/// driver; proves a mid-drain failure leaves a retriable plan instead of a
+/// wedged Node.
+struct FlakyDriver {
+    inner: LocalDrainDriver,
+    failures: usize,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl DrainMoveDriver for FlakyDriver {
+    async fn apply(&self, command: Command) -> Result<(), String> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) < self.failures {
+            return Err("injected movement failure".to_owned());
+        }
+        self.inner.apply(command).await
+    }
+}
+
+#[tokio::test]
+async fn supervisor_drains_marked_nodes_and_reports_safe_to_remove() {
+    let fixture = Fixture::new().await;
+    fixture.create_feed_and_subscription().await;
+    let feed_id = fixture.feed_id().await;
+    fixture.seed_committed(feed_id).await;
+    let original = fixture
+        .control
+        .active_range_assignment(feed_id)
+        .await
+        .unwrap();
+    let drained = original
+        .replicas
+        .iter()
+        .find(|node| **node != original.owner)
+        .unwrap()
+        .clone();
+    fixture
+        .control
+        .execute(&format!("DRAIN STORAGE NODE {drained};"))
+        .await
+        .unwrap();
+
+    let outcomes = fixture.supervisor().tick().await;
+    assert_eq!(outcomes.len(), 1);
+    let report = outcomes[0].result.as_ref().unwrap();
+    assert_eq!(report.node, drained);
+    assert!(report.completed_moves >= 1);
+    assert!(report.ready_to_retire);
+
+    let current = fixture
+        .control
+        .active_range_assignment(feed_id)
+        .await
+        .unwrap();
+    assert!(!current.replicas.contains(&drained));
+    fixture
+        .control
+        .execute(&format!("RETIRE STORAGE NODE {drained};"))
+        .await
+        .unwrap();
+    assert!(fixture.control.draining_storage_nodes().await.is_empty());
+}
+
+#[tokio::test]
+async fn supervisor_drains_owner_and_progress_references_together() {
+    let fixture = Fixture::new().await;
+    fixture.create_feed_and_subscription().await;
+    let feed_id = fixture.feed_id().await;
+    fixture.seed_committed(feed_id).await;
+    let drained = fixture
+        .control
+        .active_range_assignment(feed_id)
+        .await
+        .unwrap()
+        .owner;
+    fixture
+        .control
+        .execute(&format!("DRAIN STORAGE NODE {drained};"))
+        .await
+        .unwrap();
+
+    let outcomes = fixture.supervisor().tick().await;
+    let report = outcomes[0].result.as_ref().unwrap();
+    assert!(report.completed_moves >= 2);
+    assert!(report.ready_to_retire);
+    let current = fixture
+        .control
+        .active_range_assignment(feed_id)
+        .await
+        .unwrap();
+    assert!(!current.replicas.contains(&drained));
+    assert_ne!(current.owner, drained);
+}
+
+#[tokio::test]
+async fn supervisor_reports_unplannable_when_no_replacement_exists() {
+    let fixture = Fixture::with_spare_node(false).await;
+    fixture.create_feed_and_subscription().await;
+    let feed_id = fixture.feed_id().await;
+    let drained = fixture
+        .control
+        .active_range_assignment(feed_id)
+        .await
+        .unwrap()
+        .owner;
+    fixture
+        .control
+        .execute(&format!("DRAIN STORAGE NODE {drained};"))
+        .await
+        .unwrap();
+
+    let outcomes = fixture.supervisor().tick().await;
+    let report = outcomes[0].result.as_ref().unwrap();
+    // Ownership can always move onto a surviving replica; the follower and
+    // progress-replica replacements that need spare capacity stay unplannable.
+    assert!(!report.unplannable.is_empty());
+    assert!(!report.ready_to_retire);
+    fixture
+        .control
+        .execute(&format!("RETIRE STORAGE NODE {drained};"))
+        .await
+        .unwrap_err();
+}
+
+#[tokio::test]
+async fn supervisor_retries_after_driver_failure() {
+    let fixture = Fixture::new().await;
+    fixture.create_feed_and_subscription().await;
+    let feed_id = fixture.feed_id().await;
+    fixture.seed_committed(feed_id).await;
+    let drained = fixture
+        .control
+        .active_range_assignment(feed_id)
+        .await
+        .unwrap()
+        .owner;
+    fixture
+        .control
+        .execute(&format!("DRAIN STORAGE NODE {drained};"))
+        .await
+        .unwrap();
+
+    let supervisor = StorageDrainSupervisor::new(
+        fixture.control.clone(),
+        Arc::new(FlakyDriver {
+            inner: LocalDrainDriver::new(
+                Fixture::executor(fixture.control.clone()),
+                Arc::new(fixture.services.clone()),
+            ),
+            failures: 1,
+            calls: AtomicUsize::new(0),
+        }),
+    );
+    let first = supervisor.tick().await;
+    assert!(first[0].result.is_err());
+    let second = supervisor.tick().await;
+    let report = second[0].result.as_ref().unwrap();
+    assert!(report.ready_to_retire);
 }

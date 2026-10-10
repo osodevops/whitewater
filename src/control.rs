@@ -861,6 +861,10 @@ impl ControlController {
         Ok(storage_drain_plan(&state, self, node))
     }
 
+    pub async fn draining_storage_nodes(&self) -> BTreeSet<StorageNodeId> {
+        self.state.lock().await.draining_storage_nodes.clone()
+    }
+
     fn select_fixed_active_range(
         &self,
         state: &CatalogState,

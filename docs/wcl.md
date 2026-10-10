@@ -280,6 +280,8 @@ UNDRAIN STORAGE NODE storage-4;
 
 `StorageDrainExecutor` (library) executes the inspected plan one move at a time through the same verified owner/follower and progress-replica machinery used by operator movement — never metadata-only swaps. It re-plans after every committed step, reports completed moves, `unplannable` references, and `ready_to_retire`, so automation can run a bounded drain loop rather than a blind multi-step script.
 
+When the Control Plane is configured and `FINNSTREAM_ADMIN_API_KEY` is set, the leader runs `StorageDrainSupervisor` automatically: every few seconds it walks the marked Nodes and executes their plans through `AdminDrainDriver`, which invokes the same admin move endpoints an operator would call. The log reports each completed move, blocked `unplannable` references, and the `safe-to-remove` signal once a Node is fully drained; `RETIRE STORAGE NODE` then completes removal.
+
 ## Rename resources
 
 ```sql

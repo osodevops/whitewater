@@ -5,10 +5,10 @@ use finnstream::{
     active_range::{
         cold_adjacent_pairs, ColdRangeTracker, HttpRecoveryTransport, HttpReplicaTransport,
         LocalRepairSupervisor, MajorityAppendCoordinator, RecoverySupervisor, ReplicaAppendService,
-        SplitPressureTracker, StorageNodeId,
+        SplitPressureTracker, StorageDrainSupervisor, StorageNodeId,
     },
     admin::AdminAuthenticator,
-    api::{router, subscription_mtls_router, AppState, SubscriptionTlsServer},
+    api::{router, subscription_mtls_router, AdminDrainDriver, AppState, SubscriptionTlsServer},
     autoscale::AutoscaleController,
     config::NodeConfig,
     control::ControlController,
@@ -234,6 +234,50 @@ async fn main() -> Result<()> {
             }
         })
     });
+    let drain_task = match (
+        control_plane.clone(),
+        std::env::var("FINNSTREAM_ADMIN_API_KEY").ok(),
+    ) {
+        (Some(control_plane), Some(admin_key)) => {
+            let driver = AdminDrainDriver::new(
+                format!("http://127.0.0.1:{}", config.bind_addr.port()),
+                admin_key,
+                control_plane.clone(),
+                Duration::from_secs(60),
+            )?;
+            let supervisor = StorageDrainSupervisor::new(control.clone(), Arc::new(driver));
+            let mut shutdown = shutdown_tx.subscribe();
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            if control_plane.status().await.state != "leader" {
+                                continue;
+                            }
+                            for outcome in supervisor.tick().await {
+                                match outcome.result {
+                                    Ok(report) if report.ready_to_retire => {
+                                        tracing::info!(node = %report.node, completed_moves = report.completed_moves, "storage Node drain completed; Node reports safe-to-remove")
+                                    }
+                                    Ok(report) => {
+                                        tracing::warn!(node = %report.node, unplannable = ?report.unplannable, "storage Node drain blocked")
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(node = %outcome.node, %error, "storage Node drain step failed")
+                                    }
+                                }
+                            }
+                        }
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() { break; }
+                        }
+                    }
+                }
+            }))
+        }
+        _ => None,
+    };
     let split_task = control_plane.clone().and_then(|control_plane| {
         let admin_key = std::env::var("FINNSTREAM_ADMIN_API_KEY").ok()?;
         let interval_ms = std::env::var("WHITEWATER_AUTO_SPLIT_INTERVAL_MS")
@@ -452,6 +496,9 @@ async fn main() -> Result<()> {
     }
     if let Some(repair_task) = repair_task {
         let _ = repair_task.await;
+    }
+    if let Some(drain_task) = drain_task {
+        let _ = drain_task.await;
     }
     if let Some(split_task) = split_task {
         let _ = split_task.await;

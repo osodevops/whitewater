@@ -4,6 +4,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Query, State},
@@ -34,13 +35,13 @@ use crate::{
     active_range::{
         stage_candidate_ranges_local, stage_merged_range_local, ActiveRangeAssignment,
         AppendIdentity, CandidateSplitStagingResult, CommitPosition, ControlPlaneFollowerMove,
-        FollowerMoveControl, FollowerMoveCopyResult, KeyToken, MajorityAppendCoordinator,
-        MajorityAppendError, MergeStagingResult, OwnerMoveEvidence, RangeId, RangePosition,
-        ReadReplicaEvidence, RepairExportRequest, RepairExportResponse, RepairFrame,
-        ReplicaAppendRequest, ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitRequest,
-        ReplicaCommitResponse, ReplicaProgressRequest, ReplicaProgressResponse,
-        ReplicaReconcileRequest, ReplicaReconcileResponse, StorageNodeId, StoredRangeFrame,
-        MAX_COMMITTED_READ_BYTES, MAX_REPLICA_FRAME_BASE64_BYTES,
+        DrainMoveDriver, FollowerMoveControl, FollowerMoveCopyResult, KeyToken,
+        MajorityAppendCoordinator, MajorityAppendError, MergeStagingResult, OwnerMoveEvidence,
+        RangeId, RangePosition, ReadReplicaEvidence, RepairExportRequest, RepairExportResponse,
+        RepairFrame, ReplicaAppendRequest, ReplicaAppendResponse, ReplicaAppendService,
+        ReplicaCommitRequest, ReplicaCommitResponse, ReplicaProgressRequest,
+        ReplicaProgressResponse, ReplicaReconcileRequest, ReplicaReconcileResponse, StorageNodeId,
+        StoredRangeFrame, MAX_COMMITTED_READ_BYTES, MAX_REPLICA_FRAME_BASE64_BYTES,
     },
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
@@ -4051,6 +4052,101 @@ pub struct AdminMoveOwnerRequest {
     pub feed: String,
     pub range_id: RangeId,
     pub new_owner: StorageNodeId,
+}
+
+/// Drives `StorageDrainSupervisor` steps on a live multi-Node cluster: Active
+/// Range moves post to the local admin move endpoints (which run the verified
+/// copy/freeze/activate orchestration against internal Node endpoints), while
+/// Subscription progress moves are single catalog commands routed through the
+/// Control Plane.
+pub struct AdminDrainDriver {
+    endpoint: String,
+    admin_key: String,
+    control_plane: Arc<ControlPlane>,
+    http: reqwest::Client,
+}
+
+impl AdminDrainDriver {
+    pub fn new(
+        endpoint: String,
+        admin_key: String,
+        control_plane: Arc<ControlPlane>,
+        timeout: Duration,
+    ) -> Result<Self, reqwest::Error> {
+        Ok(Self {
+            endpoint: endpoint.trim_end_matches('/').to_owned(),
+            admin_key,
+            control_plane,
+            http: reqwest::Client::builder().timeout(timeout).build()?,
+        })
+    }
+
+    async fn post(&self, path: &str, request: &impl Serialize) -> Result<(), String> {
+        let response = self
+            .http
+            .post(format!("{}{path}", self.endpoint))
+            .bearer_auth(&self.admin_key)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let detail = response.text().await.unwrap_or_default();
+            return Err(format!("{path} failed with {status}: {detail}"));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DrainMoveDriver for AdminDrainDriver {
+    async fn apply(&self, command: crate::control::Command) -> Result<(), String> {
+        match command {
+            crate::control::Command::PrepareFollowerMove {
+                feed,
+                range_id,
+                removed_replica,
+                replacement_replica,
+            } => {
+                self.post(
+                    "/v1/admin/ranges/move-follower",
+                    &AdminMoveFollowerRequest {
+                        request_id: Uuid::new_v4(),
+                        feed,
+                        range_id,
+                        removed_replica,
+                        replacement_replica,
+                    },
+                )
+                .await
+            }
+            crate::control::Command::PrepareOwnerMove {
+                feed,
+                range_id,
+                new_owner,
+            } => {
+                self.post(
+                    "/v1/admin/ranges/move-owner",
+                    &AdminMoveOwnerRequest {
+                        request_id: Uuid::new_v4(),
+                        feed,
+                        range_id,
+                        new_owner,
+                    },
+                )
+                .await
+            }
+            command @ (crate::control::Command::MoveSubscriptionProgressReplica { .. }
+            | crate::control::Command::RecoverSubscriptionProgressOwner { .. }) => self
+                .control_plane
+                .execute_commands(vec![command])
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            _ => Err("drain plan emitted an unexpected command".to_owned()),
+        }
+    }
 }
 
 async fn admin_move_owner(
