@@ -2123,3 +2123,46 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
         .await
         .unwrap());
 }
+
+#[tokio::test]
+async fn owner_available_reports_progress_owner_liveness() {
+    let directory = TempDir::new().unwrap();
+    let store: Arc<dyn LogStore> =
+        Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+    let nodes = progress_nodes();
+    let controller = ControlController::open_with_storage_nodes(
+        directory.path().join("catalog.json"),
+        store,
+        nodes.to_vec(),
+    )
+    .unwrap();
+    controller
+        .execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;")
+        .await
+        .unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert!(coordinator.owner_available().await);
+    transport
+        .inspect_down
+        .lock()
+        .unwrap()
+        .insert(coordinator.assignment().owner.clone());
+    assert!(!coordinator.owner_available().await);
+}

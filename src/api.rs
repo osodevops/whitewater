@@ -932,6 +932,28 @@ async fn member_coordinator(
     ))
 }
 
+async fn member_coordinator_recovering(
+    state: &AppState,
+    subscription: &str,
+) -> Result<
+    (
+        crate::reader::SubscriptionProgressCoordinator,
+        crate::reader::SubscriptionProgressAssignment,
+        crate::control::SubscriptionDefinition,
+    ),
+    ApiError,
+> {
+    let (coordinator, assignment, definition) = member_coordinator(state, subscription).await?;
+    if coordinator.owner_available().await {
+        return Ok((coordinator, assignment, definition));
+    }
+    coordinator
+        .recover_lost_owner(state.control.as_ref())
+        .await
+        .map_err(subscription_progress_api_error)?;
+    member_coordinator(state, subscription).await
+}
+
 fn member_lease_ticks(requested: Option<u64>) -> Result<u64, ApiError> {
     let ticks = requested.unwrap_or(SUBSCRIPTION_MEMBER_DEFAULT_LEASE_TICKS);
     if ticks == 0 || ticks > SUBSCRIPTION_MEMBER_MAX_LEASE_TICKS {
@@ -1021,7 +1043,7 @@ async fn subscription_member_join(
     Json(request): Json<SubscriptionMemberJoinRequest>,
 ) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
     let (coordinator, assignment, definition) =
-        member_coordinator(&state, &request.subscription).await?;
+        member_coordinator_recovering(&state, &request.subscription).await?;
     let replayed = coordinator
         .read_committed()
         .await
@@ -1179,7 +1201,7 @@ async fn subscription_member_claim(
 ) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
     let lease_ticks = member_lease_ticks(request.lease_ticks)?;
     let (coordinator, assignment, _definition) =
-        member_coordinator(&state, &request.subscription).await?;
+        member_coordinator_recovering(&state, &request.subscription).await?;
     let member_state = member_apply(
         &coordinator,
         request.request_id,
@@ -1210,7 +1232,7 @@ async fn subscription_member_renew(
         ApiError::bad_request("lease_epoch is required to renew a Subscription member lease")
     })?;
     let (coordinator, assignment, _definition) =
-        member_coordinator(&state, &request.subscription).await?;
+        member_coordinator_recovering(&state, &request.subscription).await?;
     let member_state = member_apply(
         &coordinator,
         request.request_id,
@@ -1238,7 +1260,7 @@ async fn subscription_member_release(
     Json(request): Json<SubscriptionMemberReleaseRequest>,
 ) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
     let (coordinator, assignment, _definition) =
-        member_coordinator(&state, &request.subscription).await?;
+        member_coordinator_recovering(&state, &request.subscription).await?;
     let member_state = member_apply(
         &coordinator,
         request.request_id,
@@ -1264,7 +1286,7 @@ async fn subscription_member_ack(
     Json(request): Json<SubscriptionMemberAckRequest>,
 ) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
     let (coordinator, assignment, _definition) =
-        member_coordinator(&state, &request.subscription).await?;
+        member_coordinator_recovering(&state, &request.subscription).await?;
     match (request.cursor, request.positions) {
         (Some(cursor), Some(positions)) => {
             if cursor.is_empty() || positions.is_empty() {
@@ -8436,6 +8458,73 @@ mod tests {
             body["positions"][progress_range.to_string()],
             json!("cursor-12")
         );
+
+        // A lost progress owner leaves member reads on surviving quorum
+        // evidence while the next mutation transparently recovers placement
+        // onto an eligible replica.
+        let owner_index = nodes
+            .iter()
+            .position(|node| *node == assignment.owner)
+            .unwrap();
+        handles[owner_index].abort();
+        let survivor_index = nodes
+            .iter()
+            .position(|node| *node != assignment.owner)
+            .unwrap();
+        let response = client
+            .get(format!(
+                "{}/v1/subscriptions/members/state?subscription=orders.billing",
+                endpoints[&nodes[survivor_index]]
+            ))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let survivor_base = format!(
+            "{}/v1/subscriptions/members",
+            endpoints[&nodes[survivor_index]]
+        );
+        let post_survivor = |path: &str, body: Value| {
+            let client = client.clone();
+            let url = format!("{survivor_base}/{path}");
+            async move {
+                let response = client.post(url).json(&body).send().await.unwrap();
+                let status = response.status();
+                let body: Value = response.json().await.unwrap_or_default();
+                (status, body)
+            }
+        };
+        let recovered_member = Uuid::from_u128(0x3333);
+        let (status, body) = post_survivor(
+            "join",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(40),
+                "member_id": recovered_member}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["member_epoch"], json!(1));
+        let recovered_assignment = control
+            .active_subscription_progress_assignment_by_id(assignment.subscription_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            recovered_assignment.ownership_epoch,
+            assignment.ownership_epoch + 1
+        );
+        assert_ne!(recovered_assignment.owner, assignment.owner);
+
+        // Later mutations run straight through on the recovered owner.
+        let (status, body) = post_survivor(
+            "claim",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(41),
+                "member_id": recovered_member, "member_epoch": 1,
+                "work_id": Uuid::from_u128(0x4444)}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
 
         for handle in handles {
             handle.abort();

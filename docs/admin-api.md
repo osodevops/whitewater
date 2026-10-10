@@ -298,6 +298,14 @@ is fenced by the committed Cursor at `ack`, not by delivery, so failover is
 at-least-once until per-Key work windows arrive. Explicit-Cursor and timestamp
 Subscription starts and per-Key work subdivision are not yet implemented.
 
+All member mutations first probe the private progress owner: if it is lost,
+the endpoint runs the quorum-backed owner-recovery path — adopting the highest
+committed frontier onto surviving replicas under a bumped ownership epoch —
+then retries the operation once on the recovered placement, so member
+operations survive a single Node loss without client-visible topology. `state`
+and `fetch` are reads and continue on the surviving replica quorum without
+moving ownership.
+
 ### Writer sessions
 
 ```json

@@ -2274,6 +2274,17 @@ impl SubscriptionProgressCoordinator {
         Ok(adopted)
     }
 
+    pub async fn owner_available(&self) -> bool {
+        self.transport
+            .inspect(
+                &self.assignment.owner,
+                self.assignment.subscription_id,
+                self.assignment.ownership_epoch,
+            )
+            .await
+            .is_ok()
+    }
+
     pub async fn recover_lost_owner(
         &self,
         control: &crate::control::ControlController,
