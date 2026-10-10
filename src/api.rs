@@ -396,6 +396,10 @@ pub fn router(state: AppState) -> Router {
             post(subscription_member_ack),
         )
         .route(
+            "/v1/subscriptions/members/fetch",
+            post(subscription_member_fetch),
+        )
+        .route(
             "/v1/subscriptions/members/state",
             get(subscription_member_state),
         )
@@ -1286,6 +1290,158 @@ async fn subscription_member_ack(
             "cursor and positions must be supplied together for a Subscription acknowledgement",
         )),
     }
+}
+
+pub const SUBSCRIPTION_MEMBER_FETCH_MAX_LIMIT: usize = 256;
+
+#[derive(Deserialize)]
+struct SubscriptionMemberFetchRequest {
+    subscription: String,
+    request_id: Uuid,
+    member_id: Uuid,
+    member_epoch: u64,
+    work_id: Uuid,
+    lease_epoch: u64,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct SubscriptionMemberFetchResponse {
+    request_id: Uuid,
+    records: Vec<RecordResponse>,
+    cursor: Option<String>,
+    positions: BTreeMap<RangeId, String>,
+    ownership_epoch: u64,
+}
+
+/// Delivers the bounded page of records after the shared Subscription frontier
+/// to a member holding a live work lease. The returned per-range positions and
+/// Cursor are what the member supplies to `ack`; concurrent members may fetch
+/// overlapping windows because acknowledgement is fenced by the committed
+/// Cursor, not by delivery.
+async fn subscription_member_fetch(
+    State(state): State<AppState>,
+    Json(request): Json<SubscriptionMemberFetchRequest>,
+) -> Result<Json<SubscriptionMemberFetchResponse>, ApiError> {
+    let limit = request
+        .limit
+        .unwrap_or(64)
+        .clamp(1, SUBSCRIPTION_MEMBER_FETCH_MAX_LIMIT);
+    let (coordinator, progress_assignment, _definition) =
+        member_coordinator(&state, &request.subscription).await?;
+    let members = read_member_state(&coordinator).await?;
+    let grant = crate::reader::SubscriptionWorkLease {
+        work_id: request.work_id,
+        member_id: request.member_id,
+        member_epoch: request.member_epoch,
+        lease_epoch: request.lease_epoch,
+        expires_at_tick: 0,
+    };
+    let tracker = crate::reader::SubscriptionLeaseTracker::from_state(
+        members.clone(),
+        crate::reader::SUBSCRIPTION_LEASE_MAX_WORK,
+    );
+    if !tracker.can_ack(&grant, members.last_tick) {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Subscription work lease is stale, expired, or fenced".to_owned(),
+        });
+    }
+    let frontier = coordinator
+        .read_committed()
+        .await
+        .map_err(subscription_progress_api_error)?
+        .ok_or_else(|| {
+            ApiError::unavailable("Subscription progress frontier is not established")
+        })?;
+    let range_assignments = state
+        .control
+        .active_range_assignments_for_feed(frontier.feed_id)
+        .await;
+    let mut streams: Vec<(RangeId, RangeFrameStream)> = Vec::with_capacity(range_assignments.len());
+    for range_assignment in &range_assignments {
+        let Some(position) = frontier.positions.get(&range_assignment.range_id) else {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message:
+                    "Subscription frontier does not cover a current Active Range; reconcile progress"
+                        .to_owned(),
+            });
+        };
+        let mut stream = RangeFrameStream::new(&state, range_assignment);
+        if !position.is_empty() {
+            stream.after_cursor = Some(position.clone());
+        }
+        streams.push((range_assignment.range_id, stream));
+    }
+    if streams.len() != frontier.positions.len() {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Subscription frontier predates an Active Range change; reconcile progress"
+                .to_owned(),
+        });
+    }
+
+    let mut heads: Vec<Option<((i64, Uuid), StoredRangeFrame)>> =
+        (0..streams.len()).map(|_| None).collect();
+    let mut records: Vec<RecordResponse> = Vec::new();
+    let mut positions = frontier.positions.clone();
+    let mut cursor = None;
+    let mut bytes = 0_usize;
+    loop {
+        for index in 0..streams.len() {
+            if heads[index].is_none() {
+                heads[index] = match streams[index].1.next_frame().await? {
+                    Some(frame) => {
+                        let record = decode_record(&frame.frame)
+                            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                        Some(((record.ingest_time_ns, record.message_id), frame))
+                    }
+                    None => None,
+                };
+            }
+        }
+        let Some(index) = heads
+            .iter()
+            .enumerate()
+            .filter_map(|(index, head)| head.as_ref().map(|(key, _)| (index, *key)))
+            .min_by_key(|(index, key)| (*key, *index))
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let Some((_, frame)) = heads[index].take() else {
+            continue;
+        };
+        if records.len() >= limit {
+            break;
+        }
+        let frame_bytes = frame.frame.len() + frame.cursor.len();
+        if bytes.saturating_add(frame_bytes) > MAX_LOGICAL_READ_BYTES {
+            if records.is_empty() {
+                return Err(ApiError::unavailable(
+                    "record exceeds the bounded Subscription fetch byte budget",
+                ));
+            }
+            break;
+        }
+        bytes = bytes.saturating_add(frame_bytes);
+        let record = decode_record(&frame.frame)
+            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        positions.insert(streams[index].0, frame.cursor.clone());
+        cursor = Some(frame.cursor.clone());
+        records.push(record_response(crate::domain::CursorRecord {
+            cursor: frame.cursor,
+            record,
+        }));
+    }
+    Ok(Json(SubscriptionMemberFetchResponse {
+        request_id: request.request_id,
+        records,
+        cursor,
+        positions,
+        ownership_epoch: progress_assignment.ownership_epoch,
+    }))
 }
 
 async fn subscription_member_state(
@@ -4930,6 +5086,7 @@ struct RangeFrameStream<'a> {
     assignment: &'a ActiveRangeAssignment,
     boundary: Option<CommitPosition>,
     after: Option<RangePosition>,
+    after_cursor: Option<String>,
     pending: std::collections::VecDeque<StoredRangeFrame>,
     exhausted: bool,
 }
@@ -4941,6 +5098,7 @@ impl RangeFrameStream<'_> {
             assignment,
             boundary: None,
             after: None,
+            after_cursor: None,
             pending: std::collections::VecDeque::new(),
             exhausted: false,
         }
@@ -4954,15 +5112,16 @@ impl RangeFrameStream<'_> {
             if self.exhausted {
                 return Ok(None);
             }
+            let after_cursor = self.after_cursor.take();
             let page = fetch_range_page(
                 self.state,
                 ReadRangePageRequest {
                     assignment: self.assignment.clone(),
                     after: self.after,
                     expected_commit: self.boundary,
-                    after_cursor: None,
+                    single_range: after_cursor.is_some(),
+                    after_cursor,
                     tail_count: None,
-                    single_range: false,
                     page_limit: Some(128),
                 },
             )
@@ -4976,7 +5135,7 @@ impl RangeFrameStream<'_> {
                 ));
             }
             self.boundary = Some(page.committed);
-            let mut expected = self.after.map_or(1, |position: RangePosition| {
+            let mut expected = page.resolved_after.map_or(1, |position: RangePosition| {
                 position.value().saturating_add(1)
             });
             for frame in page.frames {
@@ -7682,6 +7841,39 @@ mod tests {
             .into_iter()
             .map(|node| StorageNodeId::try_new(node).unwrap())
             .collect();
+        // Seed committed Feed history on every assigned replica so member
+        // fetches read real frames across Node boundaries.
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        let parent = control.active_range_assignment(feed.feed_id).await.unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id: feed.feed_id,
+            range_id: parent.range_id,
+            generation: parent.generation,
+            ownership_epoch: parent.ownership_epoch,
+        };
+        let mut services = BTreeMap::new();
+        for (index, node) in nodes.iter().enumerate() {
+            services.insert(
+                node.clone(),
+                Arc::new(ReplicaAppendService::new(
+                    directory.path().join(format!("node-{index}")),
+                    node.clone(),
+                    control.clone(),
+                )),
+            );
+        }
+        for node in parent.replicas.iter() {
+            let index = nodes
+                .iter()
+                .position(|candidate| candidate == node)
+                .unwrap();
+            seed_committed_history(
+                &directory.path().join(format!("node-{index}")),
+                &descriptor,
+                12,
+            );
+        }
+        let progress_range = parent.range_id;
         let control_key = "this-is-a-long-control-plane-key".to_owned();
         let peers: BTreeMap<u64, BasicNode> = [1_u64, 2, 3]
             .into_iter()
@@ -7734,7 +7926,7 @@ mod tests {
                 membership,
                 demand: DemandMetrics::default(),
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
-                replica_append: None,
+                replica_append: Some(services[node].clone()),
                 control: control.clone(),
                 control_plane: Some(plane),
                 majority_append: None,
@@ -7773,7 +7965,6 @@ mod tests {
             assignment.clone(),
             Arc::new(seed_transport),
         );
-        let progress_range = RangeId::from_uuid(Uuid::from_u128(0xbeef));
         coordinator
             .apply(crate::reader::SubscriptionProgressMutation {
                 subscription_id: assignment.subscription_id,
@@ -7782,8 +7973,8 @@ mod tests {
                 sequence: 1,
                 request_id: Uuid::from_u128(0x9001),
                 expected_cursor: None,
-                cursor: "cursor-0".to_owned(),
-                positions: BTreeMap::from([(progress_range, "position-0".to_owned())]),
+                cursor: "cursor-2".to_owned(),
+                positions: BTreeMap::from([(progress_range, "cursor-2".to_owned())]),
                 tick: 0,
                 lease_ops: Vec::new(),
             })
@@ -7926,8 +8117,8 @@ mod tests {
             "ack",
             json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(8),
                 "member_id": member, "member_epoch": 2, "work_id": work,
-                "lease_epoch": 7, "cursor": "cursor-9",
-                "positions": {progress_range.to_string(): "position-9"}}),
+                "lease_epoch": 7, "cursor": "cursor-7",
+                "positions": {progress_range.to_string(): "cursor-7"}}),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
@@ -7937,7 +8128,7 @@ mod tests {
             "ack",
             json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(9),
                 "member_id": member, "member_epoch": 2, "work_id": work,
-                "lease_epoch": 1, "cursor": "cursor-9"}),
+                "lease_epoch": 1, "cursor": "cursor-7"}),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -7947,8 +8138,8 @@ mod tests {
             "ack",
             json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(9),
                 "member_id": member, "member_epoch": 2, "work_id": work,
-                "lease_epoch": 1, "cursor": "cursor-9",
-                "positions": {progress_range.to_string(): "position-9"}}),
+                "lease_epoch": 1, "cursor": "cursor-7",
+                "positions": {progress_range.to_string(): "cursor-7"}}),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -7957,15 +8148,15 @@ mod tests {
             .is_none_or(|leases| leases.is_empty()));
         assert_eq!(
             coordinator.read_committed().await.unwrap().unwrap().cursor,
-            "cursor-9"
+            "cursor-7"
         );
         // The committed acknowledgement replays its recorded outcome.
         let (status, body) = post(
             "ack",
             json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(9),
                 "member_id": member, "member_epoch": 2, "work_id": work,
-                "lease_epoch": 1, "cursor": "cursor-9",
-                "positions": {progress_range.to_string(): "position-9"}}),
+                "lease_epoch": 1, "cursor": "cursor-7",
+                "positions": {progress_range.to_string(): "cursor-7"}}),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -7978,7 +8169,7 @@ mod tests {
             json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(9),
                 "member_id": member, "member_epoch": 2, "work_id": work,
                 "lease_epoch": 1, "cursor": "cursor-10",
-                "positions": {progress_range.to_string(): "position-9"}}),
+                "positions": {progress_range.to_string(): "cursor-7"}}),
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
@@ -8007,6 +8198,84 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["lease"]["lease_epoch"], json!(1));
+
+        // Fetch delivers committed records after the shared frontier to a
+        // member holding a live work lease.
+        let (status, _) = post(
+            "fetch",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(11),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_epoch": 7}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(11),
+                "member_id": member, "member_epoch": 2, "work_id": work}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let claimed_epoch = body["lease"]["lease_epoch"].as_u64().unwrap();
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(12),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_epoch": claimed_epoch,
+                "limit": 3}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["cursor"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["cursor-8", "cursor-9", "cursor-10"]
+        );
+        assert_eq!(body["cursor"], json!("cursor-10"));
+        assert_eq!(
+            body["positions"][progress_range.to_string()],
+            json!("cursor-10")
+        );
+        // The member acknowledges the delivered page atomically.
+        let (status, body) = post(
+            "ack",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(13),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_epoch": claimed_epoch,
+                "cursor": body["cursor"], "positions": body["positions"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // A second fetch continues from the acknowledged frontier.
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(14),
+                "member_id": member, "member_epoch": 2, "work_id": work}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let reclaimed_epoch = body["lease"]["lease_epoch"].as_u64().unwrap();
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(15),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_epoch": reclaimed_epoch}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["cursor"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["cursor-11", "cursor-12"]
+        );
 
         // A Subscription with no committed frontier bootstraps its declared
         // start atomically with the first member join.
@@ -8057,6 +8326,25 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        let fresh_epoch = body["lease"]["lease_epoch"].as_u64().unwrap();
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.fresh", "request_id": Uuid::from_u128(22),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_epoch": fresh_epoch,
+                "limit": 4}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["cursor"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["cursor-1", "cursor-2", "cursor-3", "cursor-4"]
+        );
 
         for handle in handles {
             handle.abort();
