@@ -1,0 +1,80 @@
+name: whitewater-storage-join
+
+x-node: &node
+  build:
+    context: .
+  environment: &node-environment
+    FINNSTREAM_SEEDS: control-1:7070,control-2:7070,control-3:7070
+    FINNSTREAM_NODE_CAPACITY: 100
+    FINNSTREAM_ADMIN_API_KEY: ${FINNSTREAM_ADMIN_API_KEY:-whitewater-local-development-admin-key}
+    FINNSTREAM_CONTROL_NODES: 1@control-1:7070,2@control-2:7070,3@control-3:7070
+    FINNSTREAM_CONTROL_PLANE_KEY: ${FINNSTREAM_CONTROL_PLANE_KEY:-whitewater-local-development-control-key}
+    WHITEWATER_AUTO_SPLIT_APPEND_RATE: 1000000000
+    WHITEWATER_AUTO_MERGE_SUSTAINED_SAMPLES: 1000000000
+
+services:
+  control-1:
+    <<: *node
+    env_file: ./.mtls-join-certs/control-1.env
+    ports:
+      - "7171:7070"
+      - "7571:7271"
+    environment:
+      <<: *node-environment
+      FINNSTREAM_NODE_ID: whitewater-join-1
+      FINNSTREAM_CONTROL_NODE_ID: 1
+      FINNSTREAM_ADVERTISE_URL: http://control-1:7070
+    volumes:
+      - ./.mtls-join-certs:/certs:ro
+      - control-1-data:/var/lib/finnstream
+
+  control-2:
+    <<: *node
+    env_file: ./.mtls-join-certs/control-2.env
+    ports:
+      - "7172:7070"
+      - "7572:7271"
+    environment:
+      <<: *node-environment
+      FINNSTREAM_NODE_ID: whitewater-join-2
+      FINNSTREAM_CONTROL_NODE_ID: 2
+      FINNSTREAM_ADVERTISE_URL: http://control-2:7070
+    volumes:
+      - ./.mtls-join-certs:/certs:ro
+      - control-2-data:/var/lib/finnstream
+
+  control-3:
+    <<: *node
+    env_file: ./.mtls-join-certs/control-3.env
+    ports:
+      - "7173:7070"
+      - "7573:7271"
+    environment:
+      <<: *node-environment
+      FINNSTREAM_NODE_ID: whitewater-join-3
+      FINNSTREAM_CONTROL_NODE_ID: 3
+      FINNSTREAM_ADVERTISE_URL: http://control-3:7070
+    volumes:
+      - ./.mtls-join-certs:/certs:ro
+      - control-3-data:/var/lib/finnstream
+
+  storage-1:
+    <<: *node
+    env_file: ./.mtls-join-certs/storage-1.env
+    ports:
+      - "7175:7070"
+      - "7575:7271"
+    environment:
+      <<: *node-environment
+      FINNSTREAM_NODE_ID: whitewater-join-storage-1
+      FINNSTREAM_STORAGE_NODE_ID: storage-1
+      FINNSTREAM_ADVERTISE_URL: http://storage-1:7070
+    volumes:
+      - ./.mtls-join-certs:/certs:ro
+      - storage-1-data:/var/lib/finnstream
+
+volumes:
+  control-1-data:
+  control-2-data:
+  control-3-data:
+  storage-1-data:
