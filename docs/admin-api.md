@@ -288,14 +288,14 @@ POST /v1/subscriptions/members/ack
 GET /v1/subscriptions/members/state?subscription=orders.billing
 ```
 
-The first `join` on a Subscription declared `START AT BEGINNING` atomically
-establishes the shared frontier and member epoch 1; rejoining fences the prior
+The first `join` on a Subscription declared `START AT BEGINNING` or `START AT NOW`
+atomically establishes the shared frontier and member epoch 1; rejoining fences the prior
 epoch. `claim` grants a bounded expiring work lease, `fetch` returns a bounded
 page of records after the shared frontier plus the per-range `positions` and
 `cursor` to pass back to `ack`, and `ack` atomically advances the frontier and
 releases the lease. Concurrent members may fetch overlapping windows — progress
 is fenced by the committed Cursor at `ack`, not by delivery, so failover is
-at-least-once until per-Key work windows arrive. Cursor/now/timestamp
+at-least-once until per-Key work windows arrive. Explicit-Cursor and timestamp
 Subscription starts and per-Key work subdivision are not yet implemented.
 
 ### Writer sessions

@@ -81,6 +81,22 @@ def main():
     status, tail = post(ENDPOINTS[2], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": tailclaim["lease"]["work_id"], "lease_epoch": tailclaim["lease"]["lease_epoch"]})
     if status != 200 or tail["records"]: raise AssertionError(tail)
 
+    # A `now` Subscription pins the committed tail at first join: earlier
+    # records are skipped and only post-join appends are delivered.
+    now_sub = f"{domain}.realtime"
+    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {now_sub} FROM {feed} START AT NOW;"})
+    if status != 200: raise AssertionError(declared)
+    status, joined = post(ENDPOINTS[1], f"{members}/join", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member})
+    if status != 200 or joined["member_epoch"] != 1: raise AssertionError(joined)
+    status, claimed = post(ENDPOINTS[2], f"{members}/claim", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work})
+    if status != 200: raise AssertionError(claimed)
+    status, page = post(ENDPOINTS[0], f"{members}/fetch", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work, "lease_epoch": claimed["lease"]["lease_epoch"]})
+    if status != 200 or page["records"]: raise AssertionError(f"now Subscription delivered pre-join records: {page}")
+    status, appended = post(ENDPOINTS[1], "/v1/writers/append", {"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": writer_epoch, "event_time_ns": "6", "key_base64": "aw==", "payload_base64": "dg==", "metadata_base64": {}})
+    if status != 200: raise AssertionError(appended)
+    status, page = post(ENDPOINTS[2], f"{members}/fetch", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work, "lease_epoch": claimed["lease"]["lease_epoch"], "wait_ms": 2000})
+    if status != 200 or len(page["records"]) != 1: raise AssertionError(page)
+
     # Member state reports the fenced epoch and no live leases after acks.
     status, state = get(ENDPOINTS[1], f"{members}/state?subscription={subscription}")
     if status != 200 or state["member_epochs"][member] != 2: raise AssertionError(state)

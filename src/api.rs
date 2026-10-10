@@ -1073,25 +1073,77 @@ async fn subscription_member_join(
     } else {
         // First member: establish the declared-start frontier and the Join
         // lease transition in one atomic sequence-1 quorum mutation.
-        if !matches!(definition.start, crate::control::ReaderStart::Beginning) {
-            return Err(ApiError {
-                status: StatusCode::CONFLICT,
-                message: "Subscription member sessions currently bootstrap a beginning frontier only; explicit-Cursor, now, and timestamp starts need fetch-time position resolution"
-                    .to_owned(),
-            });
-        }
-        let positions: BTreeMap<RangeId, String> = state
+        let range_assignments = state
             .control
             .active_range_assignments_for_feed(definition.feed_id)
-            .await
-            .iter()
-            .map(|assignment| (assignment.range_id, String::new()))
-            .collect();
-        if positions.is_empty() {
+            .await;
+        if range_assignments.is_empty() {
             return Err(ApiError::unavailable(
                 "Subscription source Feed has no Active Range placement",
             ));
         }
+        let (start_cursor, positions) = match &definition.start {
+            crate::control::ReaderStart::Beginning => (
+                "beginning".to_owned(),
+                range_assignments
+                    .iter()
+                    .map(|assignment| (assignment.range_id, String::new()))
+                    .collect::<BTreeMap<_, _>>(),
+            ),
+            crate::control::ReaderStart::Now => {
+                // Pin each range's committed tail Cursor so only records
+                // appended after the first join are delivered.
+                let mut positions = BTreeMap::new();
+                let mut tail: Option<((i64, Uuid), String)> = None;
+                for range_assignment in &range_assignments {
+                    let page = fetch_range_page(
+                        &state,
+                        ReadRangePageRequest {
+                            assignment: range_assignment.clone(),
+                            after: None,
+                            expected_commit: None,
+                            after_cursor: None,
+                            tail_count: Some(1),
+                            single_range: true,
+                            page_limit: Some(1),
+                        },
+                    )
+                    .await?;
+                    let frame = page.frames.last();
+                    positions.insert(
+                        range_assignment.range_id,
+                        frame.map(|frame| frame.cursor.clone()).unwrap_or_default(),
+                    );
+                    if let Some(frame) = frame {
+                        let decoded = STANDARD
+                            .decode(frame.frame_base64.as_bytes())
+                            .map_err(|_| {
+                                ApiError::unavailable(
+                                    "current owner returned an invalid frame encoding",
+                                )
+                            })?;
+                        let record = decode_record(&decoded)
+                            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                        let key = (record.ingest_time_ns, record.message_id);
+                        if tail.as_ref().is_none_or(|(current, _)| key > *current) {
+                            tail = Some((key, frame.cursor.clone()));
+                        }
+                    }
+                }
+                (
+                    tail.map(|(_, cursor)| cursor)
+                        .unwrap_or_else(|| "now".to_owned()),
+                    positions,
+                )
+            }
+            crate::control::ReaderStart::Cursor(_) | crate::control::ReaderStart::Timestamp(_) => {
+                return Err(ApiError {
+                    status: StatusCode::CONFLICT,
+                    message: "Subscription member sessions support beginning and now starts; explicit-Cursor and timestamp starts need merged-order position resolution"
+                        .to_owned(),
+                })
+            }
+        };
         coordinator
             .apply(crate::reader::SubscriptionProgressMutation {
                 subscription_id: assignment.subscription_id,
@@ -1100,7 +1152,7 @@ async fn subscription_member_join(
                 sequence: 1,
                 request_id: request.request_id,
                 expected_cursor: None,
-                cursor: "beginning".to_owned(),
+                cursor: start_cursor,
                 positions,
                 tick: 1,
                 lease_ops: vec![crate::reader::SubscriptionLeaseOp::Join {
@@ -7829,6 +7881,11 @@ mod tests {
                     feed: "orders.events".to_owned(),
                     start: crate::control::ReaderStart::Beginning,
                 },
+                Command::CreateSubscription {
+                    name: "orders.now".to_owned(),
+                    feed: "orders.events".to_owned(),
+                    start: crate::control::ReaderStart::Now,
+                },
             ])
             .await
             .unwrap();
@@ -8347,6 +8404,37 @@ mod tests {
                 .map(|record| record["cursor"].as_str().unwrap().to_owned())
                 .collect::<Vec<_>>(),
             vec!["cursor-1", "cursor-2", "cursor-3", "cursor-4"]
+        );
+
+        // A `now` Subscription pins each range's committed tail at first join,
+        // so the first fetch is empty and its positions name the tail Cursors.
+        let (status, body) = post(
+            "join",
+            json!({"subscription": "orders.now", "request_id": Uuid::from_u128(30),
+                "member_id": member}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.now", "request_id": Uuid::from_u128(31),
+                "member_id": member, "member_epoch": 1, "work_id": work}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let now_epoch = body["lease"]["lease_epoch"].as_u64().unwrap();
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.now", "request_id": Uuid::from_u128(32),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_epoch": now_epoch}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["records"].as_array().unwrap().is_empty());
+        assert_eq!(
+            body["positions"][progress_range.to_string()],
+            json!("cursor-12")
         );
 
         for handle in handles {
