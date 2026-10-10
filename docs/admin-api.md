@@ -257,6 +257,47 @@ Delivered and acknowledged Cursors are separate. Fetch advances delivered progre
 
 Anonymous temporary Readers use `POST /v1/readers/temporary/fetch` with `feed`, optional `after`, signed nanosecond `after_event_time_ns`, `limit`, `tail`, `new_only`, and bounded `wait_ms`. They retain no server-side progress. `new_only` atomically returns the current end Cursor without historical records; the caller then waits after that Cursor.
 
+### Subscription member sessions
+
+Member sessions share a Subscription's durable acknowledged progress through
+epoch-fenced work leases. All calls are POSTs under `/v1/subscriptions/members/`
+and take `subscription`, `request_id`, `member_id`, and (except `join`) the
+member's current `member_epoch`:
+
+```json
+POST /v1/subscriptions/members/join
+{ "subscription": "orders.billing", "request_id": "...", "member_id": "..." }
+
+POST /v1/subscriptions/members/claim
+{ "subscription": "orders.billing", "request_id": "...", "member_id": "...",
+  "member_epoch": 2, "work_id": "...", "lease_ticks": 60 }
+
+POST /v1/subscriptions/members/renew
+{ "...": "...", "lease_epoch": 1, "lease_ticks": 90 }
+
+POST /v1/subscriptions/members/release
+{ "...": "...", "lease_epoch": 1 }
+
+POST /v1/subscriptions/members/fetch
+{ "...": "...", "work_id": "...", "lease_epoch": 1, "limit": 100 }
+
+POST /v1/subscriptions/members/ack
+{ "...": "...", "work_id": "...", "lease_epoch": 1,
+  "cursor": "...", "positions": { "<range-id>": "<position>" } }
+
+GET /v1/subscriptions/members/state?subscription=orders.billing
+```
+
+The first `join` on a Subscription declared `START AT BEGINNING` atomically
+establishes the shared frontier and member epoch 1; rejoining fences the prior
+epoch. `claim` grants a bounded expiring work lease, `fetch` returns a bounded
+page of records after the shared frontier plus the per-range `positions` and
+`cursor` to pass back to `ack`, and `ack` atomically advances the frontier and
+releases the lease. Concurrent members may fetch overlapping windows — progress
+is fenced by the committed Cursor at `ack`, not by delivery, so failover is
+at-least-once until per-Key work windows arrive. Cursor/now/timestamp
+Subscription starts and per-Key work subdivision are not yet implemented.
+
 ### Writer sessions
 
 ```json

@@ -5165,6 +5165,9 @@ impl RangeFrameStream<'_> {
                 self.after = Some(frame.position);
                 expected = expected.saturating_add(1);
             }
+            if self.after.is_none() {
+                self.after = page.resolved_after;
+            }
             if self.after.map_or(0, RangePosition::value) >= page.committed.value() {
                 self.exhausted = true;
             } else if self.pending.is_empty() {
