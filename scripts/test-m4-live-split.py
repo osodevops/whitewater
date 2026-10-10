@@ -66,24 +66,21 @@ def main():
     status, pending = post(ENDPOINTS[2], "/v1/readers/fetch", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": split_epoch, "limit": 4})
     if status != 200 or [row["cursor"] for row in pending["records"]] != cursors[8:12]: raise AssertionError(pending)
     status, merged = post(ENDPOINTS[1], "/v1/admin/ranges/merge", {"request_id": str(uuid.uuid4()), "feed": feed, "left_range_id": routes[0]["range_id"], "right_range_id": routes[1]["range_id"]})
-    if status == 200 and merged.get("status") == "activated":
-        status, stale = post(ENDPOINTS[0], "/v1/readers/ack", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": split_epoch, "cursor": pending["delivered_cursor"]})
-        if status == 200: raise AssertionError(f"merge accepted stale Reader acknowledgement: {stale}")
-        merge_status = "activated"
-    elif status in (409, 503) and "Writer sequence" in merged.get("error", ""):
-        status, unchanged = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"})
-        if status != 200 or len(unchanged["results"][0]["data"]["range_map"]["routes"]) != 2: raise AssertionError(f"failed merge changed placement: {unchanged}")
-        merge_status = "refused_overlapping_writer_sequences"
-    else:
-        raise AssertionError(merged)
+    if status != 200 or merged.get("status") != "activated": raise AssertionError(f"merge with branched Writer sequences was refused: {merged}")
+    merge_status = "activated"
+    status, stale = post(ENDPOINTS[0], "/v1/readers/ack", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": split_epoch, "cursor": pending["delivered_cursor"]})
+    if status == 200: raise AssertionError(f"merge accepted stale Reader acknowledgement: {stale}")
     status, reopened = post(ENDPOINTS[2], "/v1/readers/open", {"request_id": str(uuid.uuid4()), "reader": reader, "capacity": 16})
     if status != 200 or reopened["session_epoch"] <= split_epoch: raise AssertionError(reopened)
     status, after_merge = post(ENDPOINTS[1], "/v1/readers/fetch", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": reopened["session_epoch"], "limit": 16})
-    if status != 200 or [row["cursor"] for row in after_merge["records"]] != cursors[8:]: raise AssertionError(f"merge failure or cutover skipped unacknowledged Reader history: {after_merge}")
-    if merge_status != "activated":
-        status, restored_append = append(17, ENDPOINTS[2])
-        if status != 200: raise AssertionError(f"failed merge left a source generation frozen: {restored_append}")
-        cursors.append(restored_append["cursor"])
+    if status != 200 or [row["cursor"] for row in after_merge["records"]] != cursors[8:]: raise AssertionError(f"merge cutover skipped unacknowledged Reader history: {after_merge}")
+    status, second_merged = post(ENDPOINTS[0], "/v1/readers/open", {"request_id": str(uuid.uuid4()), "reader": second_reader, "capacity": 16})
+    if status != 200 or second_merged["session_epoch"] <= second_open["session_epoch"]: raise AssertionError(second_merged)
+    status, second_resumed = post(ENDPOINTS[2], "/v1/readers/fetch", {"request_id": str(uuid.uuid4()), "reader": second_reader, "session_epoch": second_merged["session_epoch"], "limit": 16})
+    if status != 200 or [row["cursor"] for row in second_resumed["records"]] != cursors[1:16]: raise AssertionError(f"merge lost independent Reader history: {second_resumed}")
+    status, restored_append = append(17, ENDPOINTS[2])
+    if status != 200: raise AssertionError(f"merged range rejected continued Writer history: {restored_append}")
+    cursors.append(restored_append["cursor"])
     encoded = urllib.parse.quote(feed, safe="")
     with urllib.request.urlopen(urllib.request.Request(f"{ENDPOINTS[0]}/v1/feeds/records?feed={encoded}&limit=100", headers={"authorization": f"Bearer {KEY}"}), timeout=30) as response:
         records = json.loads(response.read())

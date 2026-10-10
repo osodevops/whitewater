@@ -492,3 +492,102 @@ async fn commit_position_is_monotonic_and_cannot_cross_the_flushed_boundary() {
         Err(ActiveRangeStoreError::CommitMovedBackwards { .. })
     ));
 }
+
+fn staged(sequence: u64, payload: &[u8], cursor: &str, position: u64) -> ActiveRangeAppend {
+    let writer_session_id = Uuid::from_u128(3);
+    let record = StoredRecord {
+        message_id: Uuid::from_u128(200 + sequence as u128 + position as u128),
+        producer_id: writer_session_id,
+        producer_sequence: sequence,
+        event_time_ns: sequence as i64,
+        ingest_time_ns: sequence as i64 + 1,
+        key: format!("key-{cursor}").into_bytes(),
+        payload: payload.to_vec(),
+        metadata: BTreeMap::new(),
+    };
+    ActiveRangeAppend {
+        generation: RangeGeneration::new(1),
+        ownership_epoch: OwnershipEpoch::new(1),
+        expected_position: Some(RangePosition::new(position)),
+        identity: AppendIdentity {
+            writer_session_id,
+            writer_epoch: 1,
+            sequence,
+        },
+        cursor: cursor.to_owned(),
+        frame: encode_record(&record).unwrap(),
+    }
+}
+
+#[tokio::test]
+async fn imported_merge_branches_deduplicate_colliding_sequences_by_frame_digest() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    // Two merge branches carry the same writer sequences with different records.
+    let left_one = staged(1, b"left-1", "left-1", 1);
+    let right_one = staged(1, b"right-1", "right-1", 2);
+    let left_two = staged(2, b"left-2", "left-2", 3);
+    let right_two = staged(2, b"right-2", "right-2", 4);
+    for frame in [
+        left_one.clone(),
+        right_one.clone(),
+        left_two.clone(),
+        right_two.clone(),
+    ] {
+        store.import_split(frame).await.unwrap();
+    }
+    store
+        .commit(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            CommitPosition::new(4),
+        )
+        .await
+        .unwrap();
+    // Re-staging an identical frame is idempotent.
+    let replay = store.import_split(right_two.clone()).await.unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(replay.position, RangePosition::new(4));
+    assert_eq!(replay.cursor, "right-2");
+    // A staged retry without a position resolves by frame digest.
+    let mut position_free = right_one.clone();
+    position_free.expected_position = None;
+    let replay = store.import_split(position_free).await.unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(replay.position, RangePosition::new(2));
+    // Live appends continue at the merged writer maximum.
+    let third = store.append(append(3, b"merged-3")).await.unwrap();
+    assert_eq!(third.position, RangePosition::new(5));
+    // Retries of collided branch frames return their original results.
+    let mut live_retry = right_one.clone();
+    live_retry.expected_position = None;
+    let replay = store.append(live_retry).await.unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(replay.position, RangePosition::new(2));
+    assert_eq!(replay.cursor, "right-1");
+    let mut live_retry_left = left_one.clone();
+    live_retry_left.expected_position = None;
+    let replay = store.append(live_retry_left).await.unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(replay.position, RangePosition::new(1));
+    // Distinct payloads reusing a committed sequence still fail closed.
+    assert!(matches!(
+        store.append(append(3, b"different")).await,
+        Err(ActiveRangeStoreError::WriterSequenceConflict)
+    ));
+    assert!(matches!(
+        store.append(append(2, b"different")).await,
+        Err(ActiveRangeStoreError::StaleWriterSequence { .. })
+    ));
+    drop(store);
+    let reopened = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let mut retry = right_two.clone();
+    retry.expected_position = None;
+    let replay = reopened.append(retry).await.unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(replay.cursor, "right-2");
+    assert!(matches!(
+        reopened.append(append(3, b"another")).await,
+        Err(ActiveRangeStoreError::WriterSequenceConflict)
+    ));
+}

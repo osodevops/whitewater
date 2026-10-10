@@ -215,6 +215,7 @@ struct LoadedRange {
     active_file: File,
     entries: Vec<EntryIndex>,
     cursor_positions: HashMap<String, RangePosition>,
+    digest_positions: HashMap<[u8; 32], RangePosition>,
     deduplication: HashMap<WriterKey, DeduplicationState>,
 }
 
@@ -321,6 +322,15 @@ impl FileActiveRangeStore {
                 "duplicate Cursor identity".to_owned(),
             ));
         }
+        let digest_positions = entries
+            .iter()
+            .map(|entry| (entry.frame_digest, entry.position))
+            .collect::<HashMap<_, _>>();
+        if digest_positions.len() != entries.len() {
+            return Err(ActiveRangeStoreError::InvalidState(
+                "duplicate frame digest identity".to_owned(),
+            ));
+        }
         let recovered_position = entries.last().map_or(0, |entry| entry.position.value());
         if persisted.committed > recovered_position {
             return Err(ActiveRangeStoreError::InvalidState(format!(
@@ -342,6 +352,7 @@ impl FileActiveRangeStore {
                     active_file,
                     entries,
                     cursor_positions,
+                    digest_positions,
                     deduplication: recovered_deduplication,
                 }),
             }),
@@ -609,7 +620,7 @@ fn snapshot(loaded: &LoadedRange) -> Result<ActiveRangeSnapshot, ActiveRangeStor
 fn append(
     inner: &FileActiveRangeStoreInner,
     request: ActiveRangeAppend,
-    allow_writer_sequence_gap: bool,
+    import: bool,
 ) -> Result<ActiveRangeAppendResult, ActiveRangeStoreError> {
     if request.cursor.len() > MAX_CURSOR_BYTES {
         return Err(ActiveRangeStoreError::CursorTooLarge);
@@ -667,44 +678,61 @@ fn append(
             });
         }
     }
-    if let Some(previous) = loaded.deduplication.get(&writer_key) {
-        if request.identity.sequence == previous.sequence {
-            if frame_digest != previous.frame_digest {
-                let existing = loaded
-                    .entries
-                    .iter()
-                    .find(|entry| entry.position == previous.position)
-                    .ok_or(ActiveRangeStoreError::WriterSequenceConflict)?;
-                let existing_frame = read_indexed_frame(&inner.directory, existing)?;
-                let existing_record = decode_record(&existing_frame.frame)?;
-                if !same_logical_record(&existing_record, &record) {
-                    return Err(ActiveRangeStoreError::WriterSequenceConflict);
+    if let Some(position) = loaded.digest_positions.get(&frame_digest).copied() {
+        let existing = loaded
+            .entries
+            .iter()
+            .find(|entry| entry.position == position)
+            .ok_or(ActiveRangeStoreError::PositionConflict(position))?;
+        return Ok(ActiveRangeAppendResult {
+            position: existing.position,
+            message_id: existing.message_id,
+            cursor: existing.cursor.clone(),
+            frame_digest,
+            deduplicated: true,
+            committed: existing.position.value() <= loaded.persisted.committed,
+        });
+    }
+    if !import {
+        if let Some(previous) = loaded.deduplication.get(&writer_key) {
+            if request.identity.sequence == previous.sequence {
+                if frame_digest != previous.frame_digest {
+                    let existing = loaded
+                        .entries
+                        .iter()
+                        .find(|entry| entry.position == previous.position)
+                        .ok_or(ActiveRangeStoreError::WriterSequenceConflict)?;
+                    let existing_frame = read_indexed_frame(&inner.directory, existing)?;
+                    let existing_record = decode_record(&existing_frame.frame)?;
+                    if !same_logical_record(&existing_record, &record) {
+                        return Err(ActiveRangeStoreError::WriterSequenceConflict);
+                    }
                 }
+                return Ok(ActiveRangeAppendResult {
+                    position: previous.position,
+                    message_id: previous.message_id,
+                    cursor: previous.cursor.clone(),
+                    frame_digest: previous.frame_digest,
+                    deduplicated: true,
+                    committed: previous.position.value() <= loaded.persisted.committed,
+                });
             }
-            return Ok(ActiveRangeAppendResult {
-                position: previous.position,
-                message_id: previous.message_id,
-                cursor: previous.cursor.clone(),
-                frame_digest: previous.frame_digest,
-                deduplicated: true,
-                committed: previous.position.value() <= loaded.persisted.committed,
-            });
-        }
-        if request.identity.sequence < previous.sequence {
-            return Err(ActiveRangeStoreError::StaleWriterSequence {
-                actual: request.identity.sequence,
-                latest: previous.sequence,
-            });
-        }
-        let expected = previous
-            .sequence
-            .checked_add(1)
-            .ok_or(ActiveRangeStoreError::PositionOverflow)?;
-        if !allow_writer_sequence_gap && request.identity.sequence != expected {
-            return Err(ActiveRangeStoreError::WriterSequenceGap {
-                actual: request.identity.sequence,
-                expected,
-            });
+            if request.identity.sequence < previous.sequence {
+                return Err(ActiveRangeStoreError::StaleWriterSequence {
+                    actual: request.identity.sequence,
+                    latest: previous.sequence,
+                });
+            }
+            let expected = previous
+                .sequence
+                .checked_add(1)
+                .ok_or(ActiveRangeStoreError::PositionOverflow)?;
+            if request.identity.sequence != expected {
+                return Err(ActiveRangeStoreError::WriterSequenceGap {
+                    actual: request.identity.sequence,
+                    expected,
+                });
+            }
         }
     }
     if loaded.cursor_positions.contains_key(&request.cursor) {
@@ -760,8 +788,14 @@ fn append(
     loaded
         .cursor_positions
         .insert(index.cursor.clone(), position);
+    loaded.digest_positions.insert(frame_digest, position);
     loaded.entries.push(index);
-    loaded.deduplication.insert(writer_key, deduplication);
+    match loaded.deduplication.get_mut(&writer_key) {
+        Some(existing) if existing.sequence >= deduplication.sequence => {}
+        _ => {
+            loaded.deduplication.insert(writer_key, deduplication);
+        }
+    }
     let mut next = loaded.persisted.clone();
     next.appended = position.value();
     next.flushed = position.value();
@@ -904,6 +938,9 @@ fn truncate_uncommitted(
         .retain(|entry| entry.position.value() <= committed);
     loaded
         .cursor_positions
+        .retain(|_, position| position.value() <= committed);
+    loaded
+        .digest_positions
         .retain(|_, position| position.value() <= committed);
     loaded.deduplication = deduplication_from_entries(&loaded.entries);
     let mut next = loaded.persisted.clone();
