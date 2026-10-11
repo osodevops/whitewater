@@ -318,6 +318,43 @@ impl SubscriptionSource {
     }
 }
 
+/// Bound on member Feeds tracked per Domain-scoped Subscription;
+/// attaching past it refuses rather than silently dropping tracking.
+pub const MAX_SUBSCRIPTION_MEMBER_FEEDS: usize = 4096;
+
+/// Explainable lifecycle state of one member Feed under a Domain-scoped
+/// Subscription.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionFeedState {
+    /// Membership is attached; the initial frontier boundary is durable.
+    Active,
+    /// The Feed left the Domain or is being removed; pending work is
+    /// fenced and never silently acknowledged or discarded.
+    Draining,
+    /// Attach is deferred (for example bound or authorization pressure);
+    /// nothing is skipped and the detail explains why.
+    Blocked,
+}
+
+/// One member Feed under a Domain-scoped Subscription, keyed by the
+/// immutable FeedId so a rename retains progress and a same-name
+/// replacement gets fresh progress.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscriptionFeedMembership {
+    pub feed_id: Uuid,
+    pub state: SubscriptionFeedState,
+    /// Start policy this member honors. Existing Feeds honor the
+    /// Subscription's declared start; newly discovered Feeds always start
+    /// at `ReaderStart::Beginning` (their first retained record).
+    pub start: ReaderStart,
+    /// Catalog revision that durably attached the Feed: the discovery
+    /// boundary after which no write to the Feed can be skipped.
+    pub attached_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubscriptionDefinition {
     pub subscription_id: Uuid,
@@ -501,6 +538,8 @@ struct CatalogState {
     #[serde(default)]
     subscription_progress_assignments: BTreeMap<Uuid, SubscriptionProgressAssignment>,
     #[serde(default)]
+    subscription_feed_memberships: BTreeMap<Uuid, BTreeMap<Uuid, SubscriptionFeedMembership>>,
+    #[serde(default)]
     state_store_assignments: BTreeMap<Uuid, crate::state_store::StateStoreAssignment>,
     #[serde(default)]
     reader_frontiers: BTreeMap<Uuid, ReaderFrontier>,
@@ -561,6 +600,7 @@ impl Default for CatalogState {
             readers: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
             subscription_progress_assignments: BTreeMap::new(),
+            subscription_feed_memberships: BTreeMap::new(),
             state_store_assignments: BTreeMap::new(),
             reader_frontiers: BTreeMap::new(),
             roles: BTreeMap::new(),
@@ -1957,6 +1997,15 @@ impl ControlController {
                     .range_assignments
                     .insert(assignment.range_id, assignment.clone());
                 state.active_ranges.insert(feed_id, assignment);
+                // Domain-scoped Subscriptions covering this Domain attach
+                // the new Feed in the same catalog commit — the durable
+                // discovery boundary — so no write can slip through
+                // registration unseen.
+                attach_feed_to_domain_subscriptions(
+                    state,
+                    &definition,
+                    state.revision.saturating_add(1),
+                )?;
                 Ok((format!("created Feed {name}"), json!(definition)))
             }
             Command::DefineStateStore { name, source } => {
@@ -2423,6 +2472,17 @@ impl ControlController {
                 state
                     .subscriptions
                     .insert(subscription_id, definition.clone());
+                if definition.source.domain_id().is_some() {
+                    // Existing member Feeds attach honoring the declared
+                    // start policy, atomically with the declaration.
+                    attach_subscription_feed_members(
+                        state,
+                        subscription_id,
+                        space_id,
+                        &definition.start,
+                        state.revision.saturating_add(1),
+                    );
+                }
                 Ok((
                     format!("declared Subscription {name}; shared consumption is not active"),
                     json!(definition),
@@ -3694,7 +3754,7 @@ impl ControlController {
                     new,
                 )?;
                 let new_space_id = owning_space(state, new)?.space_id;
-                let existing = active_feed(state, current)?;
+                let existing = active_feed(state, current)?.clone();
                 if new_space_id != existing.space_id
                     && state.subscriptions.values().any(|subscription| {
                         subscription.status == ResourceStatus::Active
@@ -3709,10 +3769,46 @@ impl ControlController {
                 let item = active_feed_mut(state, current)?;
                 item.name = new.to_owned();
                 item.space_id = new_space_id;
-                Ok((
-                    format!("renamed Feed {current} to {new}"),
-                    json!(item.clone()),
-                ))
+                let moved = item.clone();
+                if new_space_id != existing.space_id {
+                    // Renaming within a Domain keeps the immutable FeedId,
+                    // so memberships retain progress untouched. A cross-
+                    // Domain move instead drains coverage in the old
+                    // Domain (fenced pending work, never silently
+                    // discarded) and attaches as a newly discovered Feed
+                    // under every covering Subscription in the new Domain.
+                    let covering: Vec<Uuid> = state
+                        .subscriptions
+                        .values()
+                        .filter(|item| {
+                            item.status == ResourceStatus::Active
+                                && item.source.domain_id() == Some(existing.space_id)
+                        })
+                        .map(|item| item.subscription_id)
+                        .collect();
+                    let revision = state.revision.saturating_add(1);
+                    for subscription_id in covering {
+                        let members = state
+                            .subscription_feed_memberships
+                            .entry(subscription_id)
+                            .or_default();
+                        let member = members.entry(moved.feed_id).or_insert_with(|| {
+                            SubscriptionFeedMembership {
+                                feed_id: moved.feed_id,
+                                state: SubscriptionFeedState::Active,
+                                start: ReaderStart::Beginning,
+                                attached_revision: revision,
+                                detail: None,
+                            }
+                        });
+                        member.state = SubscriptionFeedState::Draining;
+                        member.detail = Some(
+                            "Feed moved to another Domain; pending work stays fenced".to_owned(),
+                        );
+                    }
+                    attach_feed_to_domain_subscriptions(state, &moved, revision)?;
+                }
+                Ok((format!("renamed Feed {current} to {new}"), json!(moved)))
             }
             ResourceKind::Domain | ResourceKind::Space => {
                 if state.feeds.values().any(|feed| {
@@ -3810,9 +3906,15 @@ impl ControlController {
                 }
                 let item = state.feeds.get_mut(&feed_id).expect("Feed exists");
                 item.status = ResourceStatus::Dropped;
+                let dropped = item.clone();
+                // An explicit drop is the disposition that retires any
+                // fenced membership rows the Feed still holds.
+                for members in state.subscription_feed_memberships.values_mut() {
+                    members.remove(&feed_id);
+                }
                 Ok((
                     format!("dropped Feed {name} without purging stored history"),
-                    json!(item.clone()),
+                    json!(dropped),
                 ))
             }
             ResourceKind::Domain | ResourceKind::Space => {
@@ -3858,6 +3960,7 @@ impl ControlController {
                 state
                     .subscription_progress_assignments
                     .remove(&subscription_id);
+                state.subscription_feed_memberships.remove(&subscription_id);
                 Ok(result)
             }
             ResourceKind::Pipe => drop_named(&mut state.pipes, name, "Pipe"),
@@ -4946,6 +5049,89 @@ fn rename_named<T: Clone + Serialize + NamedResource>(
     ))
 }
 
+/// Attaches one Feed to every active Domain-scoped Subscription covering
+/// its Domain. A newly discovered Feed starts at `ReaderStart::Beginning`
+/// — its first retained record — regardless of each Subscription's
+/// declared start. Refuses when a Subscription is at its member bound
+/// rather than silently skipping the Feed.
+fn attach_feed_to_domain_subscriptions(
+    state: &mut CatalogState,
+    feed: &FeedDefinition,
+    revision: u64,
+) -> Result<(), ControlError> {
+    let covering: Vec<(Uuid, String)> = state
+        .subscriptions
+        .values()
+        .filter(|item| {
+            item.status == ResourceStatus::Active && item.source.domain_id() == Some(feed.space_id)
+        })
+        .map(|item| (item.subscription_id, item.name.clone()))
+        .collect();
+    for (subscription_id, subscription_name) in covering {
+        let members = state
+            .subscription_feed_memberships
+            .entry(subscription_id)
+            .or_default();
+        if let Some(existing) = members.get_mut(&feed.feed_id) {
+            // Reattaching a Feed that moved out and back keeps its member
+            // identity (immutable FeedId) and original start policy; the
+            // fresh revision is the discovery boundary for resumed coverage.
+            existing.state = SubscriptionFeedState::Active;
+            existing.attached_revision = revision;
+            existing.detail = None;
+            continue;
+        }
+        if members.len() >= MAX_SUBSCRIPTION_MEMBER_FEEDS {
+            return Err(ControlError::InvalidOperation(format!(
+                "Domain Subscription {subscription_name} reached its {MAX_SUBSCRIPTION_MEMBER_FEEDS} member-Feed bound; drop the Subscription or detach member Feeds first"
+            )));
+        }
+        members.insert(
+            feed.feed_id,
+            SubscriptionFeedMembership {
+                feed_id: feed.feed_id,
+                state: SubscriptionFeedState::Active,
+                start: ReaderStart::Beginning,
+                attached_revision: revision,
+                detail: None,
+            },
+        );
+    }
+    Ok(())
+}
+
+/// Attaches every active Feed in the Subscription's Domain, honoring the
+/// declared start policy, in the same commit that declares it.
+fn attach_subscription_feed_members(
+    state: &mut CatalogState,
+    subscription_id: Uuid,
+    space_id: Uuid,
+    declared_start: &ReaderStart,
+    revision: u64,
+) {
+    let feed_ids: Vec<Uuid> = state
+        .feeds
+        .values()
+        .filter(|item| item.status == ResourceStatus::Active && item.space_id == space_id)
+        .map(|item| item.feed_id)
+        .collect();
+    let members = state
+        .subscription_feed_memberships
+        .entry(subscription_id)
+        .or_default();
+    for feed_id in feed_ids {
+        members
+            .entry(feed_id)
+            .or_insert_with(|| SubscriptionFeedMembership {
+                feed_id,
+                state: SubscriptionFeedState::Active,
+                start: declared_start.clone(),
+                attached_revision: revision,
+                detail: None,
+            });
+    }
+}
+
 fn drop_named<T: Clone + Serialize + NamedResource>(
     items: &mut BTreeMap<Uuid, T>,
     name: &str,
@@ -5060,12 +5246,24 @@ fn describe_resource(
             .find(|item| item.name == name && item.status == ResourceStatus::Active)
             .map(|item| json!(item))
             .ok_or_else(|| ControlError::NotFound(format!("Reader {name}"))),
-        ResourceKind::Subscription => state
-            .subscriptions
-            .values()
-            .find(|item| item.name == name && item.status == ResourceStatus::Active)
-            .map(|item| json!(item))
-            .ok_or_else(|| ControlError::NotFound(format!("Subscription {name}"))),
+        ResourceKind::Subscription => {
+            let item = state
+                .subscriptions
+                .values()
+                .find(|item| item.name == name && item.status == ResourceStatus::Active)
+                .cloned()
+                .ok_or_else(|| ControlError::NotFound(format!("Subscription {name}")))?;
+            let mut value = json!(item);
+            if item.source.domain_id().is_some() {
+                let members: Vec<SubscriptionFeedMembership> = state
+                    .subscription_feed_memberships
+                    .get(&item.subscription_id)
+                    .map(|members| members.values().cloned().collect())
+                    .unwrap_or_default();
+                value["member_feeds"] = json!(members);
+            }
+            Ok(value)
+        }
         ResourceKind::Pipe => state
             .pipes
             .values()
@@ -7132,5 +7330,194 @@ mod tests {
             .execute("DROP FEED orders.events;")
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn domain_subscription_membership_tracks_feed_lifecycle_by_immutable_id() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SPACE other;")
+            .await
+            .unwrap();
+
+        // Declaration attaches every existing Feed in the Domain honoring
+        // the declared start, atomically with the commit.
+        controller
+            .execute("CREATE SUBSCRIPTION orders.cover FROM DOMAIN orders START AT NOW;")
+            .await
+            .unwrap();
+        let subscription = controller
+            .active_subscription_by_name("orders.cover")
+            .await
+            .unwrap();
+        let events_id = controller
+            .state
+            .lock()
+            .await
+            .feeds
+            .values()
+            .find(|feed| feed.name == "orders.events")
+            .unwrap()
+            .feed_id;
+        {
+            let state = controller.state.lock().await;
+            let members = &state.subscription_feed_memberships[&subscription.subscription_id];
+            let member = members.get(&events_id).unwrap();
+            assert_eq!(member.state, SubscriptionFeedState::Active);
+            assert_eq!(member.start, ReaderStart::Now);
+            assert!(member.attached_revision > 0);
+        }
+
+        // A new Feed attaches in the same commit that creates it — the
+        // durable discovery boundary — starting at first retained record
+        // (Beginning) regardless of the declared start.
+        controller.execute("CREATE FEED orders.new;").await.unwrap();
+        let new_id = {
+            let state = controller.state.lock().await;
+            let members = &state.subscription_feed_memberships[&subscription.subscription_id];
+            assert_eq!(members.len(), 2);
+            let member = members
+                .values()
+                .find(|member| member.feed_id != events_id)
+                .unwrap();
+            assert_eq!(member.state, SubscriptionFeedState::Active);
+            assert_eq!(member.start, ReaderStart::Beginning);
+            member.feed_id
+        };
+
+        // Renaming within the Domain retains membership (immutable FeedId).
+        controller
+            .execute("RENAME FEED orders.new TO orders.renamed;")
+            .await
+            .unwrap();
+        {
+            let state = controller.state.lock().await;
+            let member = state.subscription_feed_memberships[&subscription.subscription_id]
+                .get(&new_id)
+                .unwrap();
+            assert_eq!(member.state, SubscriptionFeedState::Active);
+        }
+
+        // Moving the Feed to another Domain drains its membership (fenced
+        // pending work, not silently discarded) and attaches it under any
+        // covering Subscription in the target Domain.
+        controller
+            .execute("CREATE SUBSCRIPTION other.cover FROM DOMAIN other;")
+            .await
+            .unwrap();
+        controller
+            .execute("RENAME FEED orders.renamed TO other.renamed;")
+            .await
+            .unwrap();
+        let other_id = {
+            let state = controller.state.lock().await;
+            let source_members =
+                &state.subscription_feed_memberships[&subscription.subscription_id];
+            let drained = source_members.get(&new_id).unwrap();
+            assert_eq!(drained.state, SubscriptionFeedState::Draining);
+            assert!(drained.detail.is_some());
+            let other_sub = state
+                .subscriptions
+                .values()
+                .find(|item| item.name == "other.cover")
+                .unwrap();
+            let member = state.subscription_feed_memberships[&other_sub.subscription_id]
+                .get(&new_id)
+                .unwrap();
+            assert_eq!(member.state, SubscriptionFeedState::Active);
+            assert_eq!(member.start, ReaderStart::Beginning);
+            other_sub.subscription_id
+        };
+
+        // Drop under coverage stays fenced; once the Feed lives in another
+        // Domain the operator's explicit drop retires the fenced row.
+        assert!(controller
+            .execute("DROP FEED other.renamed;")
+            .await
+            .is_err());
+        controller
+            .execute("DROP SUBSCRIPTION other.cover;")
+            .await
+            .unwrap();
+        {
+            let state = controller.state.lock().await;
+            assert!(!state.subscription_feed_memberships.contains_key(&other_id));
+        }
+        controller
+            .execute("DROP FEED other.renamed;")
+            .await
+            .unwrap();
+        {
+            let state = controller.state.lock().await;
+            assert!(
+                !state.subscription_feed_memberships[&subscription.subscription_id]
+                    .contains_key(&new_id)
+            );
+        }
+
+        // Membership survives a catalog snapshot + restart (the map rides
+        // CatalogState serde).
+        let reopened = new_controller(&directory);
+        let state = reopened.state.lock().await;
+        let member = state.subscription_feed_memberships[&subscription.subscription_id]
+            .get(&events_id)
+            .unwrap();
+        assert_eq!(member.state, SubscriptionFeedState::Active);
+        drop(state);
+
+        // DESCRIBE surfaces explainable member-Feed states.
+        let described = reopened
+            .execute("DESCRIBE SUBSCRIPTION orders.cover;")
+            .await
+            .unwrap();
+        let members = described.results[0]
+            .data
+            .get("member_feeds")
+            .unwrap()
+            .as_array()
+            .unwrap();
+        assert!(members.iter().any(|member| {
+            member["feed_id"].as_str().unwrap() == events_id.to_string()
+                && member["state"] == "active"
+        }));
+    }
+    #[tokio::test]
+    async fn domain_subscription_member_bound_refuses_attach_instead_of_skipping() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute("CREATE SPACE orders; CREATE SUBSCRIPTION orders.cover FROM DOMAIN orders;")
+            .await
+            .unwrap();
+        let subscription = controller
+            .active_subscription_by_name("orders.cover")
+            .await
+            .unwrap();
+        // Seed the map to the bound; a real attach then refuses loudly.
+        {
+            let mut state = controller.state.lock().await;
+            let members = state
+                .subscription_feed_memberships
+                .entry(subscription.subscription_id)
+                .or_default();
+            for index in 0..MAX_SUBSCRIPTION_MEMBER_FEEDS {
+                members.insert(
+                    Uuid::from_u128(0x1000 + index as u128),
+                    SubscriptionFeedMembership {
+                        feed_id: Uuid::from_u128(0x1000 + index as u128),
+                        state: SubscriptionFeedState::Active,
+                        start: ReaderStart::Beginning,
+                        attached_revision: 0,
+                        detail: None,
+                    },
+                );
+            }
+        }
+        let error = controller
+            .execute("CREATE FEED orders.overflow;")
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("member-Feed bound"));
     }
 }

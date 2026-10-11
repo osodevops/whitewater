@@ -316,7 +316,7 @@ CREATE SUBSCRIPTION orders.everything
   START AT BEGINNING;
 ```
 
-Either way the Subscription remains `declared` until member delivery lands: it does not create an internal Feed, permit joining members, or establish shared Cursor progress yet — member join on a Domain source is refused honestly until incremental Feed membership tracking ships. Existing named Readers remain independent and are not silently converted into shared Subscriptions.
+Either way the Subscription remains `declared` until member delivery lands: it does not create an internal Feed, permit joining members, or establish shared Cursor progress yet — member Feeds attach in the same catalog commit that creates them (existing Feeds honor the declared start, newly discovered Feeds start at their first retained record), a Feed moved to another Domain drains its fenced membership rather than silently discarding pending work, and `DESCRIBE SUBSCRIPTION` reports per-Feed `member_feeds` states; member join itself stays refused honestly until shared delivery lands. Existing named Readers remain independent and are not silently converted into shared Subscriptions.
 
 
 
