@@ -1450,7 +1450,7 @@ Definition of Done:
 
 - [x] Benchmark vetted Fjall, redb, and RocksDB reference workloads: many user Indexes sharing a bounded number of LSM trees, mixed writes/reads, crashes, compaction stalls, and replication/checkpoint cost. `tools/index-bench` runs one deterministic workload (real `index.rs` key codecs, three namespaces, sync commits) against all three; results and caveats in `docs/index-engine-benchmark.md` — redb led every axis (253 op/s bulk, 3.0 ms commit p50, 33.6 ms crash-reopen), fjall and RocksDB tied at ~180 op/s.
 
-- [ ] Select and integrate an Index Engine behind a narrow transactional interface; validate serializable read-modify-write, durable batch semantics, and memory/disk budgets.
+- [x] Select and integrate an Index Engine behind a narrow transactional interface; validate serializable read-modify-write, durable batch semantics, and memory/disk budgets. Fjall 3.1.10 selected (decision record in `docs/index-engine-benchmark.md`); `src/index.rs` defines `IndexStore` (upsert/delete/get/lookup_exact/last_applied) implemented by `FjallIndexStore` with bounded journal (64 MiB) and memtable (16 MiB) crash-replay caps. Tests cover multi-entry batch atomicity, row/cursor/query budgets, cursor replay semantics, and trait-object usage (15 index tests).
 
 - [ ] Co-design Feed commit and required synchronous primary/secondary Index mutations across the existing file log and replicated Index state; do not claim cross-engine atomicity from a local Fjall write batch.
 

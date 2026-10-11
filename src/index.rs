@@ -309,6 +309,55 @@ pub enum IndexStoreError {
     QueryTooLarge,
 }
 
+/// The narrow transactional contract every local Index replica engine must
+/// honour. `upsert`/`delete` are serializable read-modify-write batches:
+/// posting removals, unique-claim checks, the primary row, and applied-Cursor
+/// checkpoints commit atomically and are durable (fsync) before the call
+/// returns. Reads are snapshot-consistent and bounded by caller limits and
+/// fixed byte budgets. The interface is intentionally engine-agnostic so the
+/// selected engine remains an implementation detail of replica code.
+pub trait IndexStore: Send + Sync {
+    /// Apply one projected row mutation under `cursor`. Refuses a reused
+    /// `cursor` that would change an existing row, unowned unique claims,
+    /// oversized rows, and invalid cursors.
+    fn upsert(
+        &self,
+        reference: &PrimaryRef,
+        payload: &[u8],
+        entries: &[IndexEntry],
+        cursor: &str,
+    ) -> Result<(), IndexStoreError>;
+
+    /// Remove the row and all of its postings under `cursor`; `false` when no
+    /// row exists for `reference`.
+    fn delete(&self, reference: &PrimaryRef, cursor: &str) -> Result<bool, IndexStoreError>;
+
+    /// Fetch the current projected row for `reference`.
+    fn get(&self, reference: &PrimaryRef) -> Result<Option<IndexRow>, IndexStoreError>;
+
+    /// Resolve up to `limit` (1..=1_000) rows by exact typed Index values.
+    fn lookup_exact(
+        &self,
+        id: IndexId,
+        values: &[IndexValue],
+        limit: usize,
+    ) -> Result<Vec<IndexRow>, IndexStoreError>;
+
+    /// The last applied Cursor recorded for `id` by a committed batch.
+    fn last_applied(&self, id: IndexId) -> Result<Option<String>, IndexStoreError>;
+}
+
+/// Fjall crash-recovery replays the write journal, so its size bounds reopen
+/// time: the database rotates sealed journals once 64 MiB is outstanding and
+/// each keyspace flushes its memtable at 16 MiB, keeping the surviving replay
+/// tail small rather than proportional to total history.
+const JOURNAL_REPLAY_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+const MEMTABLE_FLUSH_BYTES: u64 = 16 * 1024 * 1024;
+
+fn bounded_keyspace() -> fjall::KeyspaceCreateOptions {
+    fjall::KeyspaceCreateOptions::default().max_memtable_size(MEMTABLE_FLUSH_BYTES)
+}
+
 pub struct FjallIndexStore {
     db: fjall::SingleWriterTxDatabase,
     primary: fjall::SingleWriterTxKeyspace,
@@ -318,11 +367,12 @@ pub struct FjallIndexStore {
 
 impl FjallIndexStore {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self, IndexStoreError> {
-        let db = fjall::SingleWriterTxDatabase::builder(path).open()?;
-        let primary = db.keyspace(PRIMARY_KEYSPACE, fjall::KeyspaceCreateOptions::default)?;
-        let entries = db.keyspace(ENTRIES_KEYSPACE, fjall::KeyspaceCreateOptions::default)?;
-        let checkpoints =
-            db.keyspace(CHECKPOINT_KEYSPACE, fjall::KeyspaceCreateOptions::default)?;
+        let db = fjall::SingleWriterTxDatabase::builder(path)
+            .max_journaling_size(JOURNAL_REPLAY_BUDGET_BYTES)
+            .open()?;
+        let primary = db.keyspace(PRIMARY_KEYSPACE, bounded_keyspace)?;
+        let entries = db.keyspace(ENTRIES_KEYSPACE, bounded_keyspace)?;
+        let checkpoints = db.keyspace(CHECKPOINT_KEYSPACE, bounded_keyspace)?;
         Ok(Self {
             db,
             primary,
@@ -334,8 +384,10 @@ impl FjallIndexStore {
     pub fn keyspace_count(&self) -> usize {
         self.db.keyspace_count()
     }
+}
 
-    pub fn upsert(
+impl IndexStore for FjallIndexStore {
+    fn upsert(
         &self,
         reference: &PrimaryRef,
         payload: &[u8],
@@ -401,7 +453,7 @@ impl FjallIndexStore {
         Ok(())
     }
 
-    pub fn delete(&self, reference: &PrimaryRef, cursor: &str) -> Result<bool, IndexStoreError> {
+    fn delete(&self, reference: &PrimaryRef, cursor: &str) -> Result<bool, IndexStoreError> {
         if cursor.is_empty() || cursor.len() > 512 {
             return Err(IndexStoreError::InvalidCursor);
         }
@@ -432,7 +484,7 @@ impl FjallIndexStore {
         Ok(true)
     }
 
-    pub fn get(&self, reference: &PrimaryRef) -> Result<Option<IndexRow>, IndexStoreError> {
+    fn get(&self, reference: &PrimaryRef) -> Result<Option<IndexRow>, IndexStoreError> {
         let key = primary_key(reference)?;
         let Some(bytes) = self.db.read_tx().get(&self.primary, key)? else {
             return Ok(None);
@@ -444,7 +496,7 @@ impl FjallIndexStore {
         Ok(Some(row))
     }
 
-    pub fn lookup_exact(
+    fn lookup_exact(
         &self,
         id: IndexId,
         values: &[IndexValue],
@@ -483,7 +535,7 @@ impl FjallIndexStore {
         Ok(rows)
     }
 
-    pub fn last_applied(&self, id: IndexId) -> Result<Option<String>, IndexStoreError> {
+    fn last_applied(&self, id: IndexId) -> Result<Option<String>, IndexStoreError> {
         self.db
             .read_tx()
             .get(&self.checkpoints, id.0.as_bytes())?
@@ -831,5 +883,139 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(store.get(&reference(b"alice")).unwrap().is_none());
+    }
+
+    #[test]
+    fn fjall_multi_entry_batch_commits_all_or_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+        let claimed = entry(IndexValue::Text("taken".to_owned()), true);
+        store
+            .upsert(
+                &reference(b"owner"),
+                b"holder",
+                std::slice::from_ref(&claimed),
+                "cursor-1",
+            )
+            .unwrap();
+        let city = IndexEntry {
+            id: IndexId(Uuid::from_u128(9)),
+            values: vec![IndexValue::Text("Lisbon".to_owned())],
+            unique: false,
+        };
+        // A conflicting unique claim must roll back the whole batch: the
+        // unrelated `city` posting, the primary row, and both Index
+        // checkpoints must all remain absent.
+        assert!(matches!(
+            store.upsert(
+                &reference(b"new"),
+                b"data",
+                &[city.clone(), claimed.clone()],
+                "cursor-2"
+            ),
+            Err(IndexStoreError::Key(IndexKeyError::UniqueConflict))
+        ));
+        assert!(store.get(&reference(b"new")).unwrap().is_none());
+        assert!(store
+            .lookup_exact(city.id, &city.values, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.last_applied(city.id).unwrap(), None);
+        assert_eq!(
+            store.last_applied(claimed.id).unwrap().as_deref(),
+            Some("cursor-1")
+        );
+    }
+
+    #[test]
+    fn fjall_enforces_row_cursor_and_query_budgets() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+        let row = entry(IndexValue::Text("v".to_owned()), false);
+        assert!(matches!(
+            store.upsert(
+                &reference(b"k"),
+                &[0u8; 4 * 1024 * 1024 + 1],
+                std::slice::from_ref(&row),
+                "c1"
+            ),
+            Err(IndexStoreError::RowTooLarge)
+        ));
+        assert!(matches!(
+            store.upsert(&reference(b"k"), b"payload", &vec![row.clone(); 65], "c1"),
+            Err(IndexStoreError::RowTooLarge)
+        ));
+        for cursor in ["", &"x".repeat(513)] {
+            assert!(matches!(
+                store.upsert(&reference(b"k"), b"p", std::slice::from_ref(&row), cursor),
+                Err(IndexStoreError::InvalidCursor)
+            ));
+            assert!(matches!(
+                store.delete(&reference(b"k"), cursor),
+                Err(IndexStoreError::InvalidCursor)
+            ));
+        }
+        for limit in [0, 1_001] {
+            assert!(matches!(
+                store.lookup_exact(row.id, &row.values, limit),
+                Err(IndexStoreError::InvalidLimit)
+            ));
+        }
+    }
+
+    #[test]
+    fn fjall_duplicate_cursor_is_idempotent_only_for_identical_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+        let row = entry(IndexValue::Text("v".to_owned()), false);
+        store
+            .upsert(
+                &reference(b"k"),
+                b"payload",
+                std::slice::from_ref(&row),
+                "cursor-9",
+            )
+            .unwrap();
+        // Replaying the same mutation is a harmless retry; reusing the Cursor
+        // for different bytes is a conflict.
+        store
+            .upsert(
+                &reference(b"k"),
+                b"payload",
+                std::slice::from_ref(&row),
+                "cursor-9",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.upsert(&reference(b"k"), b"other", &[row], "cursor-9"),
+            Err(IndexStoreError::CursorConflict)
+        ));
+    }
+
+    #[test]
+    fn store_contract_is_engine_agnostic_through_the_trait() {
+        let directory = tempfile::tempdir().unwrap();
+        let store: Box<dyn IndexStore> = Box::new(FjallIndexStore::open(directory.path()).unwrap());
+        let row = entry(IndexValue::Text("Porto".to_owned()), false);
+        store
+            .upsert(
+                &reference(b"ana"),
+                b"payload",
+                std::slice::from_ref(&row),
+                "cursor-1",
+            )
+            .unwrap();
+        assert_eq!(
+            store.lookup_exact(row.id, &row.values, 10).unwrap()[0]
+                .reference
+                .application_key,
+            b"ana"
+        );
+        assert_eq!(
+            store.last_applied(row.id).unwrap().as_deref(),
+            Some("cursor-1")
+        );
+        assert!(store.delete(&reference(b"ana"), "cursor-2").unwrap());
+        assert!(store.get(&reference(b"ana")).unwrap().is_none());
     }
 }

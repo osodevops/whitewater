@@ -8,10 +8,11 @@
 //! time and last-write survival after a hard kill, and tail latency while
 //! the engine absorbs a compaction-pressure burst.
 //!
-//!   cargo run --release --example index_bench --features index-bench
+//!   cargo run --release --manifest-path tools/index-bench/Cargo.toml
 //!
 //! Tuning: IB_ROWS (default 20000), IB_OPS (10000), IB_INDEXES (32),
-//! IB_PAYLOAD (256 bytes), IB_BURST (2x rows for the pressure phase).
+//! IB_PAYLOAD (256 bytes), IB_BURST (rows), IB_CHURN_ROUNDS (10),
+//! IB_CHURN_KEYS (2000).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -20,8 +21,8 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use finnstream::index::{
-    posting_key, posting_prefix, primary_key, unique_claim_key, IndexEntry, IndexId,
-    IndexValue, PrimaryRef,
+    posting_key, posting_prefix, primary_key, unique_claim_key, IndexEntry, IndexId, IndexValue,
+    PrimaryRef,
 };
 use fjall::Readable as _;
 use redb::ReadableTable as _;
@@ -111,8 +112,8 @@ impl Workload {
         let tenant = format!("tenant{:05}", row % 512);
         (0..4)
             .map(|slot| {
-                let idx = ((row + generation).wrapping_add(slot as u64)
-                    % self.indexes.len() as u64) as usize;
+                let idx = ((row + generation).wrapping_add(slot as u64) % self.indexes.len() as u64)
+                    as usize;
                 IndexEntry {
                     id: self.indexes[idx],
                     values: vec![
@@ -164,7 +165,10 @@ impl Workload {
                 Vec::new()
             },
             claim: self.claim_for(row),
-            cp_key: self.indexes[row as usize % self.indexes.len()].0.as_bytes().to_vec(),
+            cp_key: self.indexes[row as usize % self.indexes.len()]
+                .0
+                .as_bytes()
+                .to_vec(),
             cp_val: format!("cursor-{:016x}", row ^ g).into_bytes(),
         }
     }
@@ -173,7 +177,10 @@ impl Workload {
         Op::Delete {
             pk: primary_key(&self.reference(row)).unwrap(),
             old_postings: self.postings(row, g),
-            cp_key: self.indexes[row as usize % self.indexes.len()].0.as_bytes().to_vec(),
+            cp_key: self.indexes[row as usize % self.indexes.len()]
+                .0
+                .as_bytes()
+                .to_vec(),
             cp_val: format!("cursor-{:016x}", row).into_bytes(),
         }
     }
@@ -181,11 +188,7 @@ impl Workload {
         let idx = self.rng.below(self.indexes.len() as u64) as usize;
         let tenant = format!("tenant{:05}", self.rng.below(512));
         Op::Lookup {
-            prefix: posting_prefix(
-                self.indexes[idx],
-                &[IndexValue::Text(tenant)],
-            )
-            .unwrap(),
+            prefix: posting_prefix(self.indexes[idx], &[IndexValue::Text(tenant)]).unwrap(),
             limit: 8,
         }
     }
@@ -219,19 +222,18 @@ struct FjallBench {
 
 impl BenchEngine for FjallBench {
     fn open(dir: &Path) -> Result<Self, String> {
+        // Same bounds as FjallIndexStore::open: a 64 MiB journal rotation
+        // cap plus 16 MiB memtable flush keeps the crash-replay tail
+        // bounded rather than proportional to history.
         let db = fjall::SingleWriterTxDatabase::builder(dir)
+            .max_journaling_size(64 * 1024 * 1024)
             .open()
             .map_err(|e| e.to_string())?;
+        let opts = || fjall::KeyspaceCreateOptions::default().max_memtable_size(16 * 1024 * 1024);
         Ok(Self {
-            primary: db
-                .keyspace(PRIMARY, fjall::KeyspaceCreateOptions::default)
-                .map_err(|e| e.to_string())?,
-            entries: db
-                .keyspace(ENTRIES, fjall::KeyspaceCreateOptions::default)
-                .map_err(|e| e.to_string())?,
-            checkpoints: db
-                .keyspace(CHECKPOINTS, fjall::KeyspaceCreateOptions::default)
-                .map_err(|e| e.to_string())?,
+            primary: db.keyspace(PRIMARY, opts).map_err(|e| e.to_string())?,
+            entries: db.keyspace(ENTRIES, opts).map_err(|e| e.to_string())?,
+            checkpoints: db.keyspace(CHECKPOINTS, opts).map_err(|e| e.to_string())?,
             db,
         })
     }
@@ -364,8 +366,7 @@ impl BenchEngine for RedbBench {
         {
             let mut primary = tx.open_table(R_PRIMARY).map_err(|e| e.to_string())?;
             let mut entries = tx.open_table(R_ENTRIES).map_err(|e| e.to_string())?;
-            let mut checkpoints =
-                tx.open_table(R_CHECKPOINTS).map_err(|e| e.to_string())?;
+            let mut checkpoints = tx.open_table(R_CHECKPOINTS).map_err(|e| e.to_string())?;
             primary.get(pk.as_slice()).map_err(|e| e.to_string())?;
             for key in old_postings {
                 entries.remove(key.as_slice()).map_err(|e| e.to_string())?;
@@ -401,8 +402,7 @@ impl BenchEngine for RedbBench {
         {
             let mut primary = tx.open_table(R_PRIMARY).map_err(|e| e.to_string())?;
             let mut entries = tx.open_table(R_ENTRIES).map_err(|e| e.to_string())?;
-            let mut checkpoints =
-                tx.open_table(R_CHECKPOINTS).map_err(|e| e.to_string())?;
+            let mut checkpoints = tx.open_table(R_CHECKPOINTS).map_err(|e| e.to_string())?;
             for key in old_postings {
                 entries.remove(key.as_slice()).map_err(|e| e.to_string())?;
             }
@@ -456,19 +456,13 @@ impl BenchEngine for RocksBench {
         let mut options = Options::default();
         options.create_if_missing(true);
         options.create_missing_column_families(true);
-        let db = DB::open_cf(
-            &options,
-            dir,
-            [PRIMARY, ENTRIES, CHECKPOINTS],
-        )
-        .map_err(|e| e.to_string())?;
+        let db = DB::open_cf(&options, dir, [PRIMARY, ENTRIES, CHECKPOINTS])
+            .map_err(|e| e.to_string())?;
         Ok(Self { db })
     }
     fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
         let cf = self.db.cf_handle(PRIMARY).unwrap();
-        self.db
-            .get_cf(cf, key)
-            .map_err(|e| e.to_string())
+        self.db.get_cf(cf, key).map_err(|e| e.to_string())
     }
     fn upsert_sync(&mut self, op: &Op) -> Result<(), String> {
         let Op::Upsert {
@@ -588,6 +582,9 @@ struct EngineReport {
     delete_p50: Duration,
     tail_after_burst: Duration,
     reopen_ms: f64,
+    reopen_clean_ms: f64,
+    churn_p99: Duration,
+    db_bytes: u64,
     crash_survived: bool,
     resolved_rows: usize,
 }
@@ -600,7 +597,30 @@ fn dir(name: &str) -> PathBuf {
     dir
 }
 
-fn run_engine<E: BenchEngine>(engine_dir: &Path, rows: usize, ops: usize, burst: usize) -> Result<EngineReport, String> {
+fn dir_size(path: &Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        if let Ok(entries) = std::fs::read_dir(d) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if let Ok(m) = entry.metadata() {
+                    total += m.len();
+                }
+            }
+        }
+    }
+    total
+}
+
+fn run_engine<E: BenchEngine>(
+    engine_dir: &Path,
+    rows: usize,
+    ops: usize,
+    burst: usize,
+) -> Result<EngineReport, String> {
     let mut wl = Workload::new(env_usize("IB_INDEXES", 32), env_usize("IB_PAYLOAD", 256));
 
     // Phase 1: bulk upsert, all rows new.
@@ -662,9 +682,31 @@ fn run_engine<E: BenchEngine>(engine_dir: &Path, rows: usize, ops: usize, burst:
     engine.lookup(prefix, *limit)?;
     let tail_after_burst = t.elapsed();
 
-    drop(engine);
+    // Phase 4: churn — repeated in-place updates over a fixed key set.
+    // Each upsert bumps the row generation so old postings are removed
+    // and new ones written: the workload that exposes copy-on-write
+    // amplification (B-tree) vs compaction behaviour (LSM) under
+    // sustained index churn.
+    let mut churn = Stats::new();
+    for _ in 0..env_usize("IB_CHURN_ROUNDS", 10) {
+        for i in 0..env_usize("IB_CHURN_KEYS", 2_000) as u64 {
+            let op = wl.upsert(i);
+            let t = Instant::now();
+            engine.upsert_sync(&op)?;
+            churn.record(t.elapsed());
+        }
+    }
+    let db_bytes = dir_size(engine_dir);
 
-    // Phase 4: hard-kill durability — child writes then _exit()s without
+    // Phase 5: clean reopen — bounded replay expected even without a
+    // crash, since the journal/memtable bounds cap residual replay.
+    drop(engine);
+    let t = Instant::now();
+    let clean = E::open(engine_dir)?;
+    let reopen_clean_ms = t.elapsed().as_secs_f64() * 1000.0;
+    drop(clean);
+
+    // Phase 6: hard-kill durability — child writes then _exit()s without
     // destructors; parent reopens and checks the last committed row.
     let child_status = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -700,6 +742,9 @@ fn run_engine<E: BenchEngine>(engine_dir: &Path, rows: usize, ops: usize, burst:
         delete_p50: delete.percentile(0.50),
         tail_after_burst,
         reopen_ms,
+        reopen_clean_ms,
+        churn_p99: churn.percentile(0.99),
+        db_bytes,
         crash_survived,
         resolved_rows,
     })
@@ -770,23 +815,63 @@ fn main() -> ExitCode {
     }
 
     let mut out = String::new();
-    writeln!(out, "\n{:<9} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "engine", "bulk op/s", "bulk p50", "bulk p99", "mix op/s", "up p50", "up p99")
-        .unwrap();
+    writeln!(
+        out,
+        "\n{:<9} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "engine", "bulk op/s", "bulk p50", "bulk p99", "mix op/s", "up p50", "up p99"
+    )
+    .unwrap();
     for r in &reports {
-        writeln!(out, "{:<9} {:>10.0} {:>9?} {:>9?} {:>10.0} {:>9?} {:>9?}",
-            r.engine, r.bulk_ops_per_s, r.bulk_p50, r.bulk_p99,
-            r.mixed_ops_per_s, r.upsert_p50, r.upsert_p99)
-            .unwrap();
+        writeln!(
+            out,
+            "{:<9} {:>10.0} {:>9?} {:>9?} {:>10.0} {:>9?} {:>9?}",
+            r.engine,
+            r.bulk_ops_per_s,
+            r.bulk_p50,
+            r.bulk_p99,
+            r.mixed_ops_per_s,
+            r.upsert_p50,
+            r.upsert_p99
+        )
+        .unwrap();
     }
-    writeln!(out, "\n{:<9} {:>10} {:>10} {:>10} {:>14} {:>10} {:>10} {:>12}",
-        "engine", "lk p50", "lk p99", "del p50", "tail@burst", "reopen ms", "survived", "resolved")
-        .unwrap();
+    writeln!(
+        out,
+        "\n{:<9} {:>10} {:>10} {:>10} {:>14} {:>10} {:>12}",
+        "engine", "lk p50", "lk p99", "del p50", "tail@burst", "survived", "resolved"
+    )
+    .unwrap();
     for r in &reports {
-        writeln!(out, "{:<9} {:>9?} {:>9?} {:>9?} {:>13?} {:>10.1} {:>10} {:>12}",
-            r.engine, r.lookup_p50, r.lookup_p99, r.delete_p50,
-            r.tail_after_burst, r.reopen_ms, r.crash_survived, r.resolved_rows)
-            .unwrap();
+        writeln!(
+            out,
+            "{:<9} {:>9?} {:>9?} {:>9?} {:>13?} {:>10} {:>12}",
+            r.engine,
+            r.lookup_p50,
+            r.lookup_p99,
+            r.delete_p50,
+            r.tail_after_burst,
+            r.crash_survived,
+            r.resolved_rows
+        )
+        .unwrap();
+    }
+    writeln!(
+        out,
+        "\n{:<9} {:>11} {:>12} {:>10} {:>10}",
+        "engine", "reopen kill", "reopen clean", "churn p99", "db MB"
+    )
+    .unwrap();
+    for r in &reports {
+        writeln!(
+            out,
+            "{:<9} {:>11.1} {:>12.1} {:>9?} {:>10.1}",
+            r.engine,
+            r.reopen_ms,
+            r.reopen_clean_ms,
+            r.churn_p99,
+            r.db_bytes as f64 / (1024.0 * 1024.0)
+        )
+        .unwrap();
     }
     println!("{out}");
     ExitCode::SUCCESS

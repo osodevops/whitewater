@@ -439,7 +439,7 @@ Developers should not choose a range count, assign a Reader to a range, handle p
 
 ## Index storage contract and Fjall layout
 
-**Status:** This is the required storage architecture. `src/index.rs` now includes the versioned key encoding, mutation planner, and an isolated **local Fjall 3.1.10 storage prototype**: three shared keyspaces, serializable single-writer transactions for current-state rows and postings, exact secondary lookup, local uniqueness checks, durable commits, and restart tests. The production-path Active Range store is still a separate Rust file/segment log; there is no RF3-replicated Index, global uniqueness, public `CREATE INDEX`, or atomic Feed-to-Index commit. Engine selection and live integration still require workload and fault evidence before the public API claims those guarantees.
+**Status:** This is the required storage architecture. `src/index.rs` provides the versioned key encoding, mutation planner, and the selected engine — **Fjall 3.1.10 behind the narrow `IndexStore` trait**: three shared keyspaces, serializable single-writer transactions for current-state rows and postings, exact secondary lookup, local uniqueness checks, durable commits, bounded crash-replay configuration, and restart/atomicity/budget tests. The production-path Active Range store is still a separate Rust file/segment log; there is no RF3-replicated Index, global uniqueness, public `CREATE INDEX`, or atomic Feed-to-Index commit. Engine selection evidence is in `docs/index-engine-benchmark.md`; replicated-path integration still requires the RF3 milestone before the public API claims those guarantees.
 
 ### A small fixed set of engine keyspaces
 
