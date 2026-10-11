@@ -1,0 +1,71 @@
+{
+  "scenario": "feed-access",
+  "requires": ["admin.wcl", "admin.commands", "feed.append", "reader.temporary_fetch", "feed.records"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN sdk{{uniq}}; CREATE FEED sdk{{uniq}}.events;"
+      },
+      "bind": "setup",
+      "expect": {"authority": "control_plane"}
+    },
+    {
+      "op": "admin.commands",
+      "args": {
+        "commands": [{"command": "show", "kind": "feeds"}]
+      },
+      "bind": "listed",
+      "expect": {"authority": "control_plane", "results": "len>=1"}
+    },
+    {
+      "op": "feed.append",
+      "args": {
+        "request_id": "{{uuid:append1}}",
+        "feed": "sdk{{uniq}}.events",
+        "writer_session_id": "{{uuid:writer1}}",
+        "writer_epoch": 1,
+        "sequence": 1,
+        "key": {"utf8": "k1"},
+        "payload": {"utf8": "p1"},
+        "event_time_ns": "1700000000000000001",
+        "metadata": {"source": {"utf8": "conformance"}}
+      },
+      "bind": "appended",
+      "expect": {"cursor": "!=null", "message_id": "!=null", "deduplicated": false}
+    },
+    {
+      "op": "feed.append",
+      "args": {
+        "request_id": "{{uuid:append2}}",
+        "feed": "sdk{{uniq}}.events",
+        "writer_session_id": "{{uuid:writer1}}",
+        "writer_epoch": 1,
+        "sequence": 2,
+        "key": {"utf8": "k2"},
+        "payload": {"utf8": "p2"},
+        "event_time_ns": "1700000000000000002"
+      },
+      "bind": "appended2",
+      "expect": {"cursor": "!=null"}
+    },
+    {
+      "op": "reader.temporary_fetch",
+      "args": {"feed": "sdk{{uniq}}.events", "limit": 10},
+      "bind": "page",
+      "expect": {"records": "len>=2", "next_cursor": "!=null"}
+    },
+    {
+      "op": "reader.temporary_fetch",
+      "args": {"feed": "sdk{{uniq}}.events", "after": "{{page.records[0].cursor}}", "limit": 10},
+      "bind": "continued",
+      "expect": {"records": "len>=1", "next_cursor": "!=null"}
+    },
+    {
+      "op": "reader.temporary_fetch",
+      "args": {"feed": "sdk{{uniq}}.events", "new_only": true},
+      "bind": "end",
+      "expect": {"next_cursor": "!=null"}
+    }
+  ]
+}

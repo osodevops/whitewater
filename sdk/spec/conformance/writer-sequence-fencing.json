@@ -1,0 +1,85 @@
+{
+  "scenario": "writer-sequence-fencing",
+  "requires": ["admin.wcl", "feed.append"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN fence{{uniq}}; CREATE FEED fence{{uniq}}.events;"
+      },
+      "bind": "setup",
+      "expect": {"authority": "control_plane"}
+    },
+    {
+      "op": "feed.append",
+      "args": {
+        "request_id": "{{uuid:first}}",
+        "feed": "fence{{uniq}}.events",
+        "writer_session_id": "{{uuid:writer}}",
+        "writer_epoch": 1,
+        "sequence": 1,
+        "key": {"utf8": "k1"},
+        "payload": {"utf8": "p1"},
+        "event_time_ns": "1700000000000000001"
+      },
+      "bind": "first",
+      "expect": {"cursor": "!=null", "message_id": "!=null", "deduplicated": false}
+    },
+    {
+      "op": "feed.append",
+      "args": {
+        "request_id": "{{uuid:first}}",
+        "feed": "fence{{uniq}}.events",
+        "writer_session_id": "{{uuid:writer}}",
+        "writer_epoch": 1,
+        "sequence": 1,
+        "key": {"utf8": "k1"},
+        "payload": {"utf8": "p1"},
+        "event_time_ns": "1700000000000000001"
+      },
+      "expect": {"deduplicated": true, "message_id": "==first.message_id", "cursor": "==first.cursor"}
+    },
+    {
+      "op": "feed.append",
+      "args": {
+        "request_id": "{{uuid:usurper}}",
+        "feed": "fence{{uniq}}.events",
+        "writer_session_id": "{{uuid:writer}}",
+        "writer_epoch": 1,
+        "sequence": 1,
+        "key": {"utf8": "k1"},
+        "payload": {"utf8": "forged"},
+        "event_time_ns": "1700000000000000001"
+      },
+      "expect": {"error_status": 409}
+    },
+    {
+      "op": "feed.append",
+      "args": {
+        "request_id": "{{uuid:second}}",
+        "feed": "fence{{uniq}}.events",
+        "writer_session_id": "{{uuid:writer}}",
+        "writer_epoch": 1,
+        "sequence": 2,
+        "key": {"utf8": "k2"},
+        "payload": {"utf8": "p2"},
+        "event_time_ns": "1700000000000000002"
+      },
+      "expect": {"cursor": "!=null", "deduplicated": false}
+    },
+    {
+      "op": "feed.append",
+      "args": {
+        "request_id": "{{uuid:lateretry}}",
+        "feed": "fence{{uniq}}.events",
+        "writer_session_id": "{{uuid:writer}}",
+        "writer_epoch": 1,
+        "sequence": 1,
+        "key": {"utf8": "k1"},
+        "payload": {"utf8": "p1"},
+        "event_time_ns": "1700000000000000001"
+      },
+      "expect": {"error_code": "writer.stale_sequence"}
+    }
+  ]
+}

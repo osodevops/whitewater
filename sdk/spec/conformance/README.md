@@ -10,22 +10,29 @@ silently — the parity claim is only as strong as the weakest SDK.
 ```json
 {
   "scenario": "name",
+  "api_key": "optional scenario-level override of the admin key",
   "requires": ["ops", "the", "sdk", "must", "support"],
   "steps": [ ... ]
 }
 ```
+
+`api_key` replaces the environment key for every step in the scenario —
+use it to assert that a wrong key is refused rather than to authenticate
+successfully.
 
 ### Step kinds
 
 | `op` | Maps to | `args` |
 |---|---|---|
 | `wcl` | `admin.wcl` | `script` |
+| `admin.commands` | `admin.commands` | `commands` (typed command objects) |
 | `writer.append` | `writer.append` | `writer`, `session_epoch` (from a prior `bind`), `key`, `payload`, `request_id`, `event_time_ns` |
 | `writer.append_batch` | `writer.append_batch` | `records: [...]` same fields |
 | `reader.open` / `reader.fetch` / `reader.ack` / `reader.close` | reader ops | `reader`, `session_epoch`/`cursor`/`limit`/`capacity` |
 | `reader.temporary_fetch` | temporary fetch | `feed`, `after`, `limit`, `new_only`, `tail` |
 | `member.join` / `member.claim` / `member.renew` / `member.release` / `member.fetch` / `member.ack` | subscription member ops | `subscription`, `member_id`, `member_epoch`, `work_id`, `lease_epoch`, `limit`, `lease_ticks` |
-| `feed.records` | `feed.records` | `feed`, `limit` |
+| `feed.append` | `feed.append` | `feed`, `request_id`, `writer_session_id`, `writer_epoch`, `sequence`, `key`, `payload`, `event_time_ns` |
+| `feed.records` | `feed.records` | `feed`, `limit`, `after` |
 | `expect` | assertions | see below |
 
 ### Bindings and substitution
@@ -52,7 +59,12 @@ Each entry is `{ "path.to.field": expected }` over the named bound result
 - `"!=null"` — present and non-null
 - `"present"` / `"absent"`
 - `"len>=N"` — array/string length bound
-- `{ "error_code": "..." }` — the step must have failed with this code
+- `{ "error_code": "..." }` — the step must have failed with this wire
+  `code` (e.g. `writer.stale_sequence`, `lease.stale_lease`)
+- `{ "error_status": 401 }` — the step must have failed with this HTTP
+  status; use it for failures that carry no wire `code` (authentication
+  refusals, generic sequence conflicts). The two operators may be
+  combined when both are meaningful.
 
 Scenarios run against a fresh Riverbed with the development admin key from
 `FINNSTREAM_ADMIN_API_KEY` (default `whitewater-local-development-admin-key`).

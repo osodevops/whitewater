@@ -1,0 +1,19 @@
+{
+  "scenario": "auth-refused",
+  "api_key": "conformance-deliberately-invalid-admin-key",
+  "requires": ["wcl", "feed.records"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN auth{{uniq}};"
+      },
+      "expect": {"error_status": 401}
+    },
+    {
+      "op": "feed.records",
+      "args": {"feed": "auth{{uniq}}.events", "limit": 1},
+      "expect": {"error_status": 401}
+    }
+  ]
+}
