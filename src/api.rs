@@ -1894,25 +1894,63 @@ async fn pipe_drive_local(
             request.receiver
         )));
     }
-    let journal = effect_coordinator_for(&state, assignment.clone())?;
-    let (progress, _) = member_assignment_coordinator(&state, assignment.clone())?;
-    let (sink_progress, _) = member_assignment_coordinator(&state, assignment)?;
-    let sink = LiveEffectApply {
-        state: &state,
-        progress: sink_progress,
-        subscription_id: request.subscription_id,
-        ownership_epoch: request.ownership_epoch,
-    };
-    let driver = crate::pipe::PipeDriver::new(pipe.clone(), Arc::new(journal), Arc::new(progress));
     let limit = request
         .limit
         .unwrap_or(64)
         .clamp(1, SUBSCRIPTION_MEMBER_FETCH_MAX_LIMIT);
-    let applied = driver
+    let applied = drive_pipe(
+        &state,
+        &pipe,
+        request.subscription_id,
+        request.ownership_epoch,
+        limit,
+    )
+    .await?;
+    Ok(Json(PipeDriveResponse {
+        pipe_id: pipe.pipe_id,
+        applied,
+    }))
+}
+
+/// Drive one Pipe cycle on this Node over the live Subscription fetch core:
+/// coordinators bind to the Subscription's current placement and the sink
+/// writes through the same owner-routed append path as the apply endpoint.
+async fn drive_pipe(
+    state: &AppState,
+    pipe: &crate::control::PipeDefinition,
+    subscription_id: Uuid,
+    ownership_epoch: u64,
+    limit: usize,
+) -> Result<Option<crate::effect::EffectMutation>, ApiError> {
+    let assignment = state
+        .control
+        .active_subscription_progress_assignment_by_id(subscription_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Subscription progress placement is unavailable"))?;
+    if assignment.ownership_epoch != ownership_epoch {
+        return Err(ApiError::conflict(
+            "Pipe drive epoch does not match the current progress placement",
+        ));
+    }
+    let definition = state
+        .control
+        .active_subscription_by_id(subscription_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Subscription definition is unavailable"))?;
+    let journal = effect_coordinator_for(state, assignment.clone())?;
+    let (progress, _) = member_assignment_coordinator(state, assignment.clone())?;
+    let (sink_progress, _) = member_assignment_coordinator(state, assignment.clone())?;
+    let sink = LiveEffectApply {
+        state,
+        progress: sink_progress,
+        subscription_id,
+        ownership_epoch,
+    };
+    let driver = crate::pipe::PipeDriver::new(pipe.clone(), Arc::new(journal), Arc::new(progress));
+    driver
         .drive_once(
             limit,
             |frontier, limit| {
-                let state = &state;
                 let frontier = frontier.clone();
                 async move {
                     fetch_frontier_page(state, &frontier, limit)
@@ -1941,14 +1979,190 @@ async fn pipe_drive_local(
                         .map_err(|_| crate::effect::EffectJournalError::Unavailable)
                 }
             },
+            || async move {
+                bootstrap_pipe_frontier(state, &definition, &assignment)
+                    .await
+                    .map_err(pipe_bootstrap_error)
+            },
             &sink,
         )
         .await
-        .map_err(effect_journal_api_error)?;
-    Ok(Json(PipeDriveResponse {
-        pipe_id: pipe.pipe_id,
-        applied,
-    }))
+        .map_err(effect_journal_api_error)
+}
+
+/// Build the sequence-1 frontier mutation a Pipe driver commits when no
+/// member has ever joined the consumed Subscription: the Subscription's
+/// declared start decides `beginning` vs `now` exactly as first-member join
+/// does, and the request identity is deterministic so racing drivers replay
+/// instead of forking.
+async fn bootstrap_pipe_frontier(
+    state: &AppState,
+    definition: &crate::control::SubscriptionDefinition,
+    assignment: &crate::reader::SubscriptionProgressAssignment,
+) -> Result<crate::reader::SubscriptionProgressMutation, ApiError> {
+    let range_assignments = state
+        .control
+        .active_range_assignments_for_feed(definition.feed_id)
+        .await;
+    if range_assignments.is_empty() {
+        return Err(ApiError::unavailable(
+            "Subscription source Feed has no Active Range placement",
+        ));
+    }
+    let (start_cursor, positions) = match &definition.start {
+        crate::control::ReaderStart::Beginning => (
+            "beginning".to_owned(),
+            range_assignments
+                .iter()
+                .map(|assignment| (assignment.range_id, String::new()))
+                .collect::<BTreeMap<_, _>>(),
+        ),
+        crate::control::ReaderStart::Now => {
+            let mut positions = BTreeMap::new();
+            let mut tail: Option<((i64, Uuid), String)> = None;
+            for range_assignment in &range_assignments {
+                let page = fetch_range_page(
+                    state,
+                    ReadRangePageRequest {
+                        assignment: range_assignment.clone(),
+                        after: None,
+                        expected_commit: None,
+                        after_cursor: None,
+                        tail_count: Some(1),
+                        single_range: true,
+                        page_limit: Some(1),
+                    },
+                )
+                .await?;
+                let frame = page.frames.last();
+                positions.insert(
+                    range_assignment.range_id,
+                    frame.map(|frame| frame.cursor.clone()).unwrap_or_default(),
+                );
+                if let Some(frame) = frame {
+                    let decoded = STANDARD
+                        .decode(frame.frame_base64.as_bytes())
+                        .map_err(|_| {
+                            ApiError::unavailable(
+                                "current owner returned an invalid frame encoding",
+                            )
+                        })?;
+                    let record = decode_record(&decoded)
+                        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                    let key = (record.ingest_time_ns, record.message_id);
+                    if tail.as_ref().is_none_or(|(current, _)| key > *current) {
+                        tail = Some((key, frame.cursor.clone()));
+                    }
+                }
+            }
+            (
+                tail.map(|(_, cursor)| cursor)
+                    .unwrap_or_else(|| "now".to_owned()),
+                positions,
+            )
+        }
+        crate::control::ReaderStart::Cursor(_) | crate::control::ReaderStart::Timestamp(_) => {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "Pipe drives support beginning and now starts; explicit-Cursor and timestamp starts are not driveable yet".to_owned(),
+
+                code: None,
+            })
+        }
+    };
+    Ok(crate::reader::SubscriptionProgressMutation {
+        subscription_id: assignment.subscription_id,
+        feed_id: definition.feed_id,
+        ownership_epoch: assignment.ownership_epoch,
+        sequence: 1,
+        request_id: crate::pipe::pipe_frontier_request_id(
+            assignment.subscription_id,
+            definition.feed_id,
+        ),
+        expected_cursor: None,
+        cursor: start_cursor,
+        positions,
+        tick: 0,
+        lease_ops: Vec::new(),
+    })
+}
+
+fn pipe_bootstrap_error(error: ApiError) -> crate::effect::EffectJournalError {
+    if error.status.is_server_error() {
+        crate::effect::EffectJournalError::Unavailable
+    } else {
+        crate::effect::EffectJournalError::Conflict
+    }
+}
+
+/// One Pipe cycle result for the Node-local supervisor tick.
+#[derive(Debug)]
+pub enum PipeDriveOutcome {
+    /// This Node is not the Subscription's progress owner; the owner drives.
+    NotOwner,
+    /// The input was caught up; nothing applied.
+    Idle,
+    /// A cycle committed `Declare -> Applied` for this effect.
+    Applied { pipe_id: Uuid, effect_id: Uuid },
+    /// The cycle failed; deterministic identities make the next retry safe.
+    Failed { pipe_id: Uuid, message: String },
+}
+
+/// One supervisor tick: drive every active Pipe whose progress owner is this
+/// Node. Ownership lives in the Subscription's placement, so owner loss or
+/// movement simply changes which Node's tick drives the Pipe next; every
+/// cycle is fenced by the frontier CAS and deterministic identities, so a
+/// drive split across an ownership change never duplicates or loses work.
+pub async fn drive_local_pipes(state: &AppState, limit: usize) -> Vec<PipeDriveOutcome> {
+    let Some(local) = state.storage_node_id.clone() else {
+        return Vec::new();
+    };
+    let pipes = state.control.active_pipes().await;
+    let mut outcomes = Vec::with_capacity(pipes.len());
+    for pipe in pipes {
+        if pipe.operation != crate::control::PipeOperation::Forward {
+            outcomes.push(PipeDriveOutcome::Failed {
+                pipe_id: pipe.pipe_id,
+                message: "Pipe operation is not driveable yet".to_owned(),
+            });
+            continue;
+        }
+        let Some(assignment) = state
+            .control
+            .active_subscription_progress_assignment_by_id(pipe.subscription_id)
+            .await
+        else {
+            outcomes.push(PipeDriveOutcome::Failed {
+                pipe_id: pipe.pipe_id,
+                message: "Subscription progress placement is unavailable".to_owned(),
+            });
+            continue;
+        };
+        if assignment.owner != local {
+            outcomes.push(PipeDriveOutcome::NotOwner);
+            continue;
+        }
+        match drive_pipe(
+            state,
+            &pipe,
+            pipe.subscription_id,
+            assignment.ownership_epoch,
+            limit,
+        )
+        .await
+        {
+            Ok(Some(applied)) => outcomes.push(PipeDriveOutcome::Applied {
+                pipe_id: pipe.pipe_id,
+                effect_id: applied.effect_id,
+            }),
+            Ok(None) => outcomes.push(PipeDriveOutcome::Idle),
+            Err(error) => outcomes.push(PipeDriveOutcome::Failed {
+                pipe_id: pipe.pipe_id,
+                message: error.message,
+            }),
+        }
+    }
+    outcomes
 }
 
 async fn subscription_member_state(
@@ -8779,6 +8993,41 @@ mod tests {
                 .status(),
             StatusCode::CONFLICT
         );
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_local_pipes_drives_only_locally_owned_progress_assignments() {
+        let directory = TempDir::new().unwrap();
+        let (state, control_plane, control, _replica) =
+            internal_replica_test_state(&directory).await;
+        control
+            .execute("CREATE FEED orders.enriched; CREATE PIPE orders.forward FROM SUBSCRIPTION orders.billing TO FEED orders.enriched;")
+            .await
+            .unwrap();
+        let pipe = control.active_pipe_by_name("orders.forward").await.unwrap();
+        let assignment = control
+            .active_subscription_progress_assignment_by_id(pipe.subscription_id)
+            .await
+            .unwrap();
+        let local = crate::active_range::StorageNodeId::try_new("control-1").unwrap();
+        let outcomes = drive_local_pipes(&state, 4).await;
+        assert_eq!(outcomes.len(), 1);
+        if assignment.owner == local {
+            // Locally owned: the supervisor attempts the drive; with no
+            // reachable progress quorum it surfaces a failure rather than a
+            // silent skip.
+            assert!(matches!(
+                outcomes[0],
+                PipeDriveOutcome::Failed { pipe_id, .. } if pipe_id == pipe.pipe_id
+            ));
+        } else {
+            assert!(matches!(outcomes[0], PipeDriveOutcome::NotOwner));
+        }
+        // A Node with no storage identity drives nothing.
+        let mut stateless = state;
+        stateless.storage_node_id = None;
+        assert!(drive_local_pipes(&stateless, 4).await.is_empty());
         control_plane.raft().shutdown().await.unwrap();
     }
 

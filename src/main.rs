@@ -540,6 +540,47 @@ async fn main() -> Result<()> {
         .subscription_mtls
         .as_ref()
         .map(|_| internal_mtls_router(app_state.clone()));
+    let pipe_task = if app_state.storage_node_id.is_some() {
+        let state = app_state.clone();
+        let interval_ms = std::env::var("WHITEWATER_PIPE_DRIVE_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(1_000)
+            .max(100);
+        let mut shutdown = shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        for outcome in finnstream::api::drive_local_pipes(&state, 64).await {
+                            match outcome {
+                                finnstream::api::PipeDriveOutcome::Applied {
+                                    pipe_id,
+                                    effect_id,
+                                } => {
+                                    tracing::debug!(%pipe_id, %effect_id, "pipe cycle applied")
+                                }
+                                finnstream::api::PipeDriveOutcome::Failed {
+                                    pipe_id,
+                                    message,
+                                } => {
+                                    tracing::warn!(%pipe_id, %message, "pipe drive cycle failed")
+                                }
+                                finnstream::api::PipeDriveOutcome::Idle
+                                | finnstream::api::PipeDriveOutcome::NotOwner => {}
+                            }
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
     let app = router(app_state).layer(TraceLayer::new_for_http());
     let listener = TcpListener::bind(config.bind_addr).await?;
     let tls_task = match (subscription_tls, tls_router, &config.subscription_mtls) {
@@ -587,6 +628,9 @@ async fn main() -> Result<()> {
     }
     if let Some(split_task) = split_task {
         let _ = split_task.await;
+    }
+    if let Some(pipe_task) = pipe_task {
+        let _ = pipe_task.await;
     }
     if let Some(control_plane) = control_plane {
         drop(catalog_sync_task);

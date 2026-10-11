@@ -10,3 +10,4 @@ Thumbs.db
 /C:/
 /.cargo-home/
 /.cargo-cache/
+/.cargo-target/

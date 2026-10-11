@@ -69,12 +69,10 @@ fn pipe() -> PipeDefinition {
     }
 }
 
-/// Seed a committed frontier mutation (sequence 1, cursor `cursor`).
-async fn seed_frontier(
-    progress: &SubscriptionProgressCoordinator,
-    cursor: &str,
-) -> SubscriptionProgressMutation {
-    let mutation = SubscriptionProgressMutation {
+/// A sequence-1 frontier mutation like the one first-member join (or the
+/// Pipe bootstrap) commits.
+fn frontier_mutation(cursor: &str) -> SubscriptionProgressMutation {
+    SubscriptionProgressMutation {
         subscription_id: Uuid::from_u128(SUBSCRIPTION),
         feed_id: feed(),
         ownership_epoch: 7,
@@ -85,9 +83,22 @@ async fn seed_frontier(
         positions: BTreeMap::from([(range(), "root".to_owned())]),
         tick: 1,
         lease_ops: Vec::new(),
-    };
+    }
+}
+
+/// Seed a committed frontier mutation (sequence 1, cursor `cursor`).
+async fn seed_frontier(
+    progress: &SubscriptionProgressCoordinator,
+    cursor: &str,
+) -> SubscriptionProgressMutation {
+    let mutation = frontier_mutation(cursor);
     progress.apply(mutation.clone()).await.unwrap();
     mutation
+}
+
+/// A bootstrap result that would commit `cursor` if no frontier existed.
+fn bootstrap_with(cursor: &str) -> SubscriptionProgressMutation {
+    frontier_mutation(cursor)
 }
 
 struct PipeProgressTransport {
@@ -553,6 +564,7 @@ async fn pipe_driver_declares_applies_outputs_and_moves_the_frontier() {
                     Ok(page(vec![record(1), record(2), record(3)], "p1"))
                 }
             },
+            || async { Ok(bootstrap_with("p0")) },
             &harness.sink,
         )
         .await
@@ -612,6 +624,7 @@ async fn pipe_driver_returns_none_when_the_source_is_caught_up() {
         .drive_once(
             64,
             |_frontier, _limit| async { Ok(page(Vec::new(), "p0")) },
+            || async { Ok(bootstrap_with("p0")) },
             &harness.sink,
         )
         .await
@@ -647,6 +660,7 @@ async fn pipe_driver_replays_safely_after_an_ambiguous_declare_commit() {
         .drive_once(
             64,
             |_f, _l| async { Ok(page(vec![record(1)], "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
             &harness.sink,
         )
         .await
@@ -667,6 +681,7 @@ async fn pipe_driver_replays_safely_after_an_ambiguous_declare_commit() {
         .drive_once(
             64,
             |_f, _l| async { Ok(page(vec![record(1)], "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
             &harness.sink,
         )
         .await
@@ -696,6 +711,7 @@ async fn pipe_driver_replays_outputs_identically_when_applied_commit_is_ambiguou
         .drive_once(
             64,
             |_f, _l| async { Ok(page(vec![record(1), record(2)], "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
             &harness.sink,
         )
         .await
@@ -724,6 +740,7 @@ async fn pipe_driver_replays_outputs_identically_when_applied_commit_is_ambiguou
         .drive_once(
             64,
             |_f, _l| async { Ok(page(Vec::new(), "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
             &harness.sink,
         )
         .await
@@ -783,6 +800,7 @@ async fn pipe_driver_fences_a_frontier_that_moved_mid_apply() {
                     Ok(page(vec![record(1)], "p1"))
                 }
             },
+            || async { Ok(bootstrap_with("p0")) },
             &harness.sink,
         )
         .await
@@ -809,13 +827,52 @@ async fn pipe_driver_fences_a_frontier_that_moved_mid_apply() {
 }
 
 #[tokio::test]
-async fn pipe_driver_fails_when_no_frontier_is_established() {
+async fn pipe_driver_bootstraps_the_frontier_for_an_unjoined_subscription() {
+    let harness = harness();
+    // No member ever joined: the driver must establish the sequence-1
+    // frontier through the supplied bootstrap before fetching.
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |frontier, _limit| {
+                let frontier = frontier.clone();
+                async move {
+                    assert_eq!(frontier.sequence, 1);
+                    assert_eq!(frontier.cursor, "start");
+                    Ok(page(vec![record(7)], "p1"))
+                }
+            },
+            || async { Ok(bootstrap_with("start")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    assert!(matches!(
+        applied.transition,
+        EffectTransition::Applied { .. }
+    ));
+    let frontier = harness
+        .progress
+        .read_committed()
+        .await
+        .unwrap()
+        .expect("frontier");
+    assert_eq!(frontier.cursor, "p1");
+    assert_eq!(frontier.sequence, 2);
+    assert_eq!(harness.sink.appends.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn pipe_driver_surfaces_a_failing_bootstrap() {
     let harness = harness();
     let error = harness
         .driver
         .drive_once(
             64,
             |_f, _l| async { Ok(page(Vec::new(), "p0")) },
+            || async { Err(EffectJournalError::Unavailable) },
             &harness.sink,
         )
         .await

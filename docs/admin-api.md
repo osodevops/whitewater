@@ -180,7 +180,7 @@ The typed Admin API can commit an idempotent Domain-scoped StateStore declaratio
 { "command": "define_state_store", "name": "accounts.profiles", "source": { "kind": "feed", "feed": "accounts.events" } }
 ```
 
-The response reports `stage: "declared"` and an immutable `store_id`. This is **not** `CREATE STATESTORE`: there is no StateStore write, lookup, RF3 replica, or Pipe execution API yet. The catalog rejects unknown source Feeds and Feeds outside the StateStore's Domain. Retry a timed-out declaration with the same request ID; do not attempt to use a `declared` store as live state.
+The response reports `stage: "declared"` and an immutable `store_id`. This is **not** `CREATE STATESTORE`: there is no StateStore write, lookup, or RF3 replica API yet (Pipe execution exists, but StateStore effects remain planned). The catalog rejects unknown source Feeds and Feeds outside the StateStore's Domain. Retry a timed-out declaration with the same request ID; do not attempt to use a `declared` store as live state.
 
 Reader start variants:
 

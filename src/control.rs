@@ -1232,6 +1232,23 @@ impl ControlController {
             .cloned()
     }
 
+    /// The declared Subscription by immutable id.
+    pub async fn active_subscription_by_id(
+        &self,
+        subscription_id: Uuid,
+    ) -> Option<SubscriptionDefinition> {
+        self.state
+            .lock()
+            .await
+            .subscriptions
+            .values()
+            .find(|subscription| {
+                subscription.subscription_id == subscription_id
+                    && subscription.status == ResourceStatus::Active
+            })
+            .cloned()
+    }
+
     pub async fn active_subscription_by_name(&self, name: &str) -> Option<SubscriptionDefinition> {
         self.state
             .lock()
@@ -1394,6 +1411,18 @@ impl ControlController {
             .values()
             .find(|pipe| pipe.pipe_id == pipe_id && pipe.status == ResourceStatus::Active)
             .cloned()
+    }
+
+    /// Every active Pipe in the catalog.
+    pub async fn active_pipes(&self) -> Vec<PipeDefinition> {
+        self.state
+            .lock()
+            .await
+            .pipes
+            .values()
+            .filter(|pipe| pipe.status == ResourceStatus::Active)
+            .cloned()
+            .collect()
     }
 
     /// Every active Pipe consuming one Subscription's progress assignment;

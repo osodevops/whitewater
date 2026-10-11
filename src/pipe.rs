@@ -73,6 +73,19 @@ pub fn pipe_declare_request_id(effect_id: Uuid) -> Uuid {
     derived_uuid(b"pipe-declare", &[effect_id.as_bytes().as_slice()])
 }
 
+/// The frontier-bootstrap request identity for one Subscription: concurrent
+/// drivers (or a racing member join) produce the same mutation, so the
+/// sequence-1 frontier write replays idempotently instead of forking.
+pub fn pipe_frontier_request_id(subscription_id: Uuid, feed_id: Uuid) -> Uuid {
+    derived_uuid(
+        b"pipe-frontier",
+        &[
+            subscription_id.as_bytes().as_slice(),
+            feed_id.as_bytes().as_slice(),
+        ],
+    )
+}
+
 fn derived_uuid(tag: &[u8], parts: &[&[u8]]) -> Uuid {
     let mut material = tag.to_vec();
     for part in parts {
@@ -134,24 +147,58 @@ impl PipeDriver {
     /// retries: the second caller re-reads the moved frontier and either
     /// builds the next page or replays the identical journal mutation, while
     /// a stale `expected_cursor` fences a consumer that raced ahead.
-    pub async fn drive_once<F, Fut, A>(
+    pub async fn drive_once<F, Fut, B, BFut, A>(
         &self,
         limit: usize,
         fetch: F,
+        bootstrap: B,
         apply: &A,
     ) -> Result<Option<EffectMutation>, EffectJournalError>
     where
         F: FnOnce(&SubscriptionProgressMutation, usize) -> Fut,
         Fut: std::future::Future<Output = Result<FetchedPage, EffectJournalError>>,
+        B: FnOnce() -> BFut,
+        BFut:
+            std::future::Future<Output = Result<SubscriptionProgressMutation, EffectJournalError>>,
         A: crate::effect::EffectApply + ?Sized,
     {
-        let Some(frontier) = self
+        let frontier = match self
             .progress
             .read_committed()
             .await
             .map_err(progress_apply_error)?
-        else {
-            return Err(EffectJournalError::Unavailable);
+        {
+            Some(frontier) => frontier,
+            None => {
+                // A Pipe consumes without a member join, so the driver
+                // establishes the declared-start frontier itself. The caller
+                // supplies the sequence-1 mutation with deterministic request
+                // identity; a concurrent bootstrap or racing first join is a
+                // safe replay or a fenced conflict, never a fork.
+                let mutation = bootstrap().await?;
+                match self.progress.apply(mutation.clone()).await {
+                    Ok(_) => {}
+                    Err(
+                        crate::reader::SubscriptionProgressError::AmbiguousCommit
+                        | crate::reader::SubscriptionProgressError::NoQuorum,
+                    ) => {
+                        self.progress
+                            .reconcile_retry(mutation)
+                            .await
+                            .map_err(progress_apply_error)?;
+                    }
+                    // A conflicting bootstrap (different request shape, same
+                    // sequence) loses to whoever committed first; the
+                    // committed re-read below then proceeds with it.
+                    Err(crate::reader::SubscriptionProgressError::Conflict) => {}
+                    Err(error) => return Err(progress_apply_error(error)),
+                }
+                self.progress
+                    .read_committed()
+                    .await
+                    .map_err(progress_apply_error)?
+                    .ok_or(EffectJournalError::Unavailable)?
+            }
         };
         let limit = limit.clamp(1, crate::effect::EFFECT_MAX_OUTPUTS);
         let page = fetch(&frontier, limit).await?;

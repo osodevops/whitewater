@@ -330,7 +330,11 @@ CREATE PIPE orders.enrich
 
 A Pipe declares a managed consume-process-append binding: the named Subscription's durable frontier drives the input, and every delivered record flows through the declared operation into the output Feed. Today `forward` is the only operation; enrichment and rolling-window operations arrive with their runtimes. A Pipe belongs to the same Domain as its input Subscription and output Feed and may not write back to its own input Feed. The consumed Subscription and the output Feed cannot be dropped while the Pipe is active; drop the Pipe first.
 
-The internal `POST /internal/pipe/drive` route runs one bounded consume-declare-apply cycle on the Subscription's current progress owner: it fetches a page after the committed frontier, commits a `Declare` carrying the frontier evidence and per-record deterministic writer identities, appends outputs through the normal owner-routed append path, commits the consumed frontier, then marks the effect `Applied`. Drivers do not hold a member work lease; concurrent drives over the same frontier produce identical journal mutations, and a stale frontier loses the compare-and-set when committing progress. Until a supervisor loop is scheduled automatically, drives are triggered explicitly over the internal plane.
+Each Node runs a Pipe supervisor loop (`WHITEWATER_PIPE_DRIVE_INTERVAL_MS`, default 1000ms, minimum 100ms) that drives every active Pipe whose consumed Subscription's progress owner is that Node; ownership moves simply move the drive to the new owner. The internal `POST /internal/pipe/drive` route runs one bounded consume-declare-apply cycle on the progress owner for explicit drives and diagnostics.
+
+A cycle fetches a page after the committed frontier, commits a `Declare` carrying the frontier evidence and per-record deterministic writer identities, appends outputs through the normal owner-routed append path, commits the consumed frontier, then marks the effect `Applied`. Drivers do not hold a member work lease; concurrent drives over the same frontier produce identical journal mutations, and a stale frontier loses the compare-and-set when committing progress. When no member has ever joined the consumed Subscription, the driver bootstraps the declared-start frontier itself under a deterministic request identity.
+
+Two Pipes consuming the same Subscription share its frontier and split deliveries like cooperating members of one consumer group; declare one Subscription per Pipe for independent fan-out.
 
 
 
