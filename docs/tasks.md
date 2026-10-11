@@ -1440,9 +1440,9 @@ Definition of Done:
 
 - [x] Persist idempotent Domain-scoped StateStore declarations with manual or same-Domain Feed source in Control Plane catalogs and snapshots; their `declared` stage explicitly cannot serve data (`src/control.rs`).
 
-- [~] Define and persist versioned application-owned secondary Index definitions with typed fields/extractors, collation, consistency, scope, and build state through the Control Plane.
+- [x] Define and persist versioned application-owned secondary Index definitions with typed fields/extractors, collation, consistency, scope, and build state through the Control Plane. `StoredIndexDefinition` binds an Index to a space+feed with `IndexFieldSpec` extractor projections, `IndexCollation`, `IndexConsistency`, and `IndexBuildStage` (declared-only until the build pipeline lands); catalog `indexes` map persists via snapshot serde-default; WCL gains `SHOW INDEXES`/`DESCRIBE INDEX` plus rename/drop; snapshot round-trip + idempotent re-definition covered in `src/control.rs` tests.
 
-- [ ] Replicate manual StateStore mutations and their idempotency identities on RF3 with a Whitewater-managed durable journal; never claim a manually populated store can be recreated from unrelated Feed history.
+- [~] Replicate manual StateStore mutations and their idempotency identities on RF3 with a Whitewater-managed durable journal; never claim a manually populated store can be recreated from unrelated Feed history.
 
 - [ ] Replay Feed-derived StateStores from verified source FeedId/Cursor and bounded checkpoints, refusing rebuild if required history is gone.
 
