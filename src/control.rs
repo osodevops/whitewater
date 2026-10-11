@@ -1446,6 +1446,17 @@ impl ControlController {
         state.state_store_assignments.get(&store_id).cloned()
     }
 
+    /// Every persisted StateStore definition; placements resolve separately.
+    pub async fn state_store_definitions(&self) -> Vec<StateStoreDefinition> {
+        self.state
+            .lock()
+            .await
+            .state_stores
+            .values()
+            .cloned()
+            .collect()
+    }
+
     pub(crate) async fn active_subscription_feed_by_id(
         &self,
         subscription_id: Uuid,

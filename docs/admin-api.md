@@ -180,7 +180,14 @@ The typed Admin API can commit an idempotent Domain-scoped StateStore declaratio
 { "command": "define_state_store", "name": "accounts.profiles", "source": { "kind": "feed", "feed": "accounts.events" } }
 ```
 
-The response reports `stage: "declared"` and an immutable `store_id`. This is **not** `CREATE STATESTORE`: there is no StateStore write, lookup, or RF3 replica API yet (Pipe execution exists, but StateStore effects remain planned). The catalog rejects unknown source Feeds and Feeds outside the StateStore's Domain. Retry a timed-out declaration with the same request ID; do not attempt to use a `declared` store as live state.
+The response reports `stage: "declared"` and an immutable `store_id`. The catalog rejects unknown source Feeds and Feeds outside the StateStore's Domain. Retry a timed-out declaration with the same request ID.
+
+A declared store already has a working RF3 write path:
+
+- **Manual stores** accept `POST /v1/state-stores/mutate` (`{ "store": name, "mutation_id": uuid, "op": "put_row" | "delete_row" }`). `mutation_id` is the caller-owned idempotency identity: retries dedupe, changed contents conflict.
+- **Feed-derived stores** materialize committed source history: `POST /v1/state-stores/sync` resumes from the durable journaled frontier; `POST /v1/state-stores/rebuild` re-materializes under a caller `token` namespace. Both refuse with 409 when the source Feed or journaled frontier is gone rather than silently producing a partial store. Owning Nodes also drive bounded replay passes automatically.
+
+Lookup/query APIs remain planned: a populated store is durable state, not yet a queryable resource.
 
 Reader start variants:
 

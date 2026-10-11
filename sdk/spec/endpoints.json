@@ -458,6 +458,49 @@
         "unavailable(503) no quorum; retry identical mutation_id"
       ],
       "notes": "manual StateStores only; RF3 journal quorum commits before ack; sequence is owner-allocated"
+    },
+    {
+      "op": "state_store.sync",
+      "method": "POST",
+      "path": "/v1/state-stores/sync",
+      "auth": "admin",
+      "request": {
+        "store": "name"
+      },
+      "response": {
+        "store_id": "uuid",
+        "applied": "u64 (records committed this pass)",
+        "frontier": "string|null (source cursor)",
+        "complete": "bool (reached committed tip)"
+      },
+      "errors": [
+        "refused(400) manual StateStore / missing store",
+        "conflict(409) source Feed gone or frontier outside retained history; rebuild required",
+        "unavailable(503) no journal quorum / transient read failure"
+      ],
+      "notes": "resumes from the durable journaled frontier; records dedupe by deterministic replay identity"
+    },
+    {
+      "op": "state_store.rebuild",
+      "method": "POST",
+      "path": "/v1/state-stores/rebuild",
+      "auth": "admin",
+      "request": {
+        "store": "name",
+        "token": "uuid|null (caller retry identity for the pass)"
+      },
+      "response": {
+        "store_id": "uuid",
+        "applied": "u64",
+        "frontier": "string|null",
+        "complete": "bool"
+      },
+      "errors": [
+        "refused(400) manual StateStore / missing store",
+        "conflict(409) source Feed gone; required history cannot rematerialize",
+        "unavailable(503) no journal quorum"
+      ],
+      "notes": "re-materializes from retained source beginning; token namespaces replay identities so rows re-apply; same-token retries dedupe"
     }
   ]
 }

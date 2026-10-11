@@ -663,6 +663,44 @@ async fn main() -> Result<()> {
         .subscription_mtls
         .as_ref()
         .map(|_| internal_mtls_router(app_state.clone()));
+    let state_store_replay_task = if app_state.storage_node_id.is_some() {
+        let state = app_state.clone();
+        let interval_ms = std::env::var("WHITEWATER_STATE_STORE_REPLAY_INTERVAL_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(250)
+            .max(50);
+        let mut shutdown = shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        for outcome in finnstream::api::drive_local_state_stores(&state, 64).await {
+                            use finnstream::api::StateStoreDriveOutcome as Outcome;
+                            match outcome {
+                                Outcome::Synced { store_id, applied, complete } => {
+                                    tracing::debug!(%store_id, applied, complete, "state store replay pass committed")
+                                }
+                                Outcome::Refused { store_id, message } => {
+                                    tracing::warn!(%store_id, %message, "state store replay refused")
+                                }
+                                Outcome::Failed { store_id, message } => {
+                                    tracing::warn!(%store_id, %message, "state store replay pass failed")
+                                }
+                                Outcome::Idle | Outcome::NotOwner => {}
+                            }
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
     let pipe_task = if app_state.storage_node_id.is_some() {
         let state = app_state.clone();
         let interval_ms = std::env::var("WHITEWATER_PIPE_DRIVE_INTERVAL_MS")
@@ -754,6 +792,9 @@ async fn main() -> Result<()> {
     }
     if let Some(pipe_task) = pipe_task {
         let _ = pipe_task.await;
+    }
+    if let Some(task) = state_store_replay_task {
+        let _ = task.await;
     }
     if let Some(control_plane) = control_plane {
         drop(catalog_sync_task);

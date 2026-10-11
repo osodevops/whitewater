@@ -66,6 +66,14 @@ impl StateStoreMutationOp {
 /// `sequence` is the owner-allocated store-local total order; a request with
 /// `sequence == 0` asks the assigned owner to allocate the next position
 /// atomically inside its durable prepare.
+/// The position a replayed mutation occupied in its source Feed. Journaled
+/// on the mutation so the replay frontier survives restart on every replica.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaySource {
+    pub feed_id: Uuid,
+    pub cursor: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateStoreMutation {
@@ -76,6 +84,9 @@ pub struct StateStoreMutation {
     pub sequence: u64,
     pub op: StateStoreMutationOp,
     pub issued_at_ns: i64,
+    /// Set only on mutations a Feed-derived replay pass submitted.
+    #[serde(default)]
+    pub source: Option<ReplaySource>,
 }
 
 /// The RF3 placement of one StateStore's mutation journal: three eligible
@@ -869,6 +880,32 @@ impl StateStoreMutationCoordinator {
         Ok(observed)
     }
 
+    /// The owner's committed head mutation. For Feed-derived stores its
+    /// source cursor is the durable replay frontier.
+    pub async fn committed_head(
+        &self,
+    ) -> Result<StateStoreJournalInspection, StateStoreMutationError> {
+        let reply = self
+            .transport
+            .inspect(
+                &self.assignment.owner,
+                StateStoreInspectRequest {
+                    owner: self.assignment.owner.clone(),
+                    receiver: self.assignment.owner.clone(),
+                    store_id: self.assignment.store_id,
+                    ownership_epoch: self.assignment.ownership_epoch,
+                },
+            )
+            .await?;
+        if reply.replica != self.assignment.owner
+            || reply.store_id != self.assignment.store_id
+            || reply.ownership_epoch != self.assignment.ownership_epoch
+        {
+            return Err(StateStoreMutationError::InvalidAssignment);
+        }
+        Ok(reply.result)
+    }
+
     /// Prepare one mutation on the owner (which allocates the sequence when
     /// `sequence == 0`), forward the allocated mutation to the remaining
     /// replicas, then commit where matching digests prove durability.
@@ -1411,6 +1448,213 @@ impl StateStoreMutationService {
     }
 }
 
+/// One committed source-Feed record offered to StateStore replay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplaySourceRecord {
+    pub message_id: Uuid,
+    pub cursor: String,
+    pub key: Vec<u8>,
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Error)]
+pub enum StateStoreReplayError {
+    #[error("the declared source Feed no longer resolves; its history is gone")]
+    SourceUnavailable,
+    #[error(
+        "the replayed frontier no longer resolves in retained history; rebuild the StateStore"
+    )]
+    FrontierOutOfRange,
+    #[error("the source Feed could not be read: {0}")]
+    SourceRead(String),
+    #[error("StateStore has no Feed source to replay")]
+    ManualSource,
+    #[error(transparent)]
+    Mutation(#[from] StateStoreMutationError),
+}
+
+/// Bounded committed reads from a replay source Feed. The API layer
+/// implements this over the same bounded Feed read path Readers use.
+#[async_trait::async_trait]
+pub trait FeedReplaySource: Send + Sync {
+    /// Whether the declared source Feed still resolves to committed
+    /// history; replay refuses rather than silently materialize a store
+    /// whose source history is gone.
+    async fn source_exists(&self, feed_id: Uuid) -> bool;
+
+    /// Committed records strictly after `cursor` (None = the beginning),
+    /// bounded by `limit`. [`StateStoreReplayError::FrontierOutOfRange`]
+    /// when `cursor` no longer resolves in retained history.
+    async fn read_committed_records(
+        &self,
+        feed_id: Uuid,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ReplaySourceRecord>, StateStoreReplayError>;
+}
+
+/// The outcome of one bounded replay pass.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct StateStoreReplayOutcome {
+    pub store_id: Uuid,
+    pub applied: u64,
+    pub frontier: Option<String>,
+    /// True when the source Feed returned fewer records than the pass
+    /// budget, meaning replay has reached the committed tip.
+    pub complete: bool,
+}
+
+/// Deterministic idempotency identity for one replayed source record.
+/// Resuming a pass re-derives the same identity so re-reads dedupe; a
+/// rebuild pass namespaces identities by its token so its mutations commit
+/// as new sequence positions and re-apply their rows.
+pub fn replay_mutation_id(
+    store_id: Uuid,
+    feed_id: Uuid,
+    message_id: Uuid,
+    rebuild: Option<Uuid>,
+) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"whitewater-state-store-replay-v1");
+    hasher.update(store_id.as_bytes());
+    hasher.update(feed_id.as_bytes());
+    hasher.update(message_id.as_bytes());
+    if let Some(token) = rebuild {
+        hasher.update(token.as_bytes());
+    }
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+fn unix_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(i64::MAX)
+}
+
+/// Builds a quorum coordinator bound to one assignment's replicas over
+/// the caller's transport wiring.
+pub type StateStoreCoordinatorFactory = Arc<
+    dyn Fn(&StateStoreAssignment) -> Result<StateStoreMutationCoordinator, StateStoreMutationError>
+        + Send
+        + Sync,
+>;
+
+/// Drives a Feed-derived StateStore's replay against committed source
+/// history. Each committed record becomes one journaled quorum mutation
+/// carrying its source cursor, so retries, restarts, and rebuild passes all
+/// converge through mutation-identity deduplication.
+pub struct StateStoreReplayDriver {
+    control: Arc<crate::control::ControlController>,
+    source: Arc<dyn FeedReplaySource>,
+    coordinator_for: StateStoreCoordinatorFactory,
+}
+
+impl StateStoreReplayDriver {
+    pub fn new(
+        control: Arc<crate::control::ControlController>,
+        source: Arc<dyn FeedReplaySource>,
+        coordinator_for: StateStoreCoordinatorFactory,
+    ) -> Self {
+        Self {
+            control,
+            source,
+            coordinator_for,
+        }
+    }
+
+    /// The journaled replay frontier: the source cursor carried by the
+    /// newest committed mutation on the assigned owner.
+    pub async fn frontier(
+        &self,
+        store_id: Uuid,
+    ) -> Result<Option<String>, StateStoreMutationError> {
+        let assignment = self
+            .control
+            .active_state_store_assignment_by_id(store_id)
+            .await
+            .ok_or(StateStoreMutationError::InvalidAssignment)?;
+        let coordinator = (self.coordinator_for)(&assignment)?;
+        Ok(coordinator
+            .committed_head()
+            .await?
+            .committed
+            .and_then(|mutation| mutation.source.map(|source| source.cursor)))
+    }
+
+    /// One bounded replay pass over the source Feed. With `rebuild`, the
+    /// pass starts at the beginning and namespaces mutation identities by
+    /// its token so every retained record re-commits and re-applies.
+    pub async fn pass(
+        &self,
+        store: &crate::control::StateStoreDefinition,
+        rebuild: Option<Uuid>,
+        limit: usize,
+    ) -> Result<StateStoreReplayOutcome, StateStoreReplayError> {
+        let crate::control::StateStoreSource::Feed { feed_id } = store.source else {
+            return Err(StateStoreReplayError::ManualSource);
+        };
+        if !self.source.source_exists(feed_id).await {
+            return Err(StateStoreReplayError::SourceUnavailable);
+        }
+        let assignment = self
+            .control
+            .active_state_store_assignment_by_id(store.store_id)
+            .await
+            .ok_or(StateStoreMutationError::InvalidAssignment)?;
+        let coordinator = (self.coordinator_for)(&assignment)?;
+        let limit = limit.max(1);
+        let after = match rebuild {
+            Some(_) => None,
+            None => self.frontier(store.store_id).await?,
+        };
+        let records = self
+            .source
+            .read_committed_records(feed_id, after.as_deref(), limit)
+            .await?;
+        let complete = records.len() < limit;
+        let mut applied = 0_u64;
+        let mut frontier = after;
+        for record in records {
+            let mutation = StateStoreMutation {
+                store_id: store.store_id,
+                mutation_id: replay_mutation_id(
+                    store.store_id,
+                    feed_id,
+                    record.message_id,
+                    rebuild,
+                ),
+                request_id: Uuid::new_v4(),
+                ownership_epoch: assignment.ownership_epoch,
+                sequence: 0,
+                op: StateStoreMutationOp::PutRow {
+                    key: record.key.clone(),
+                    payload: record.payload.clone(),
+                },
+                issued_at_ns: unix_ns(),
+                source: Some(ReplaySource {
+                    feed_id,
+                    cursor: record.cursor.clone(),
+                }),
+            };
+            coordinator.mutate(mutation).await?;
+            applied += 1;
+            frontier = Some(record.cursor);
+        }
+        Ok(StateStoreReplayOutcome {
+            store_id: store.store_id,
+            applied,
+            frontier,
+            complete,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1445,6 +1689,7 @@ mod tests {
                 payload: b"payload".to_vec(),
             },
             issued_at_ns: 1,
+            source: None,
         }
     }
 
@@ -1751,5 +1996,288 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, StateStoreMutationError::NoQuorum));
+    }
+
+    struct StubFeedSource {
+        feed_id: Uuid,
+        exists: bool,
+        records: Vec<ReplaySourceRecord>,
+    }
+
+    #[async_trait::async_trait]
+    impl FeedReplaySource for StubFeedSource {
+        async fn source_exists(&self, feed_id: Uuid) -> bool {
+            self.exists && feed_id == self.feed_id
+        }
+
+        async fn read_committed_records(
+            &self,
+            feed_id: Uuid,
+            after: Option<&str>,
+            limit: usize,
+        ) -> Result<Vec<ReplaySourceRecord>, StateStoreReplayError> {
+            assert_eq!(feed_id, self.feed_id);
+            let start = match after {
+                None => 0,
+                Some(cursor) => self
+                    .records
+                    .iter()
+                    .position(|record| record.cursor == cursor)
+                    .map(|position| position + 1)
+                    .ok_or(StateStoreReplayError::FrontierOutOfRange)?,
+            };
+            Ok(self
+                .records
+                .iter()
+                .skip(start)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+    }
+
+    fn replay_record(sequence: u64, key: &str) -> ReplaySourceRecord {
+        ReplaySourceRecord {
+            message_id: Uuid::from_u128(0xF00D + sequence as u128),
+            cursor: format!("cursor-{sequence}"),
+            key: key.as_bytes().to_vec(),
+            payload: format!("payload-{sequence}").into_bytes(),
+        }
+    }
+
+    struct ReplayFixture {
+        store: crate::control::StateStoreDefinition,
+        feed_id: Uuid,
+        control: Arc<crate::control::ControlController>,
+        journals: Vec<Arc<FjallStateStoreMutationJournal>>,
+        _dirs: Vec<TempDir>,
+        _catalog_dir: TempDir,
+    }
+
+    impl ReplayFixture {
+        fn driver(&self, source: Arc<StubFeedSource>) -> StateStoreReplayDriver {
+            let transport: Arc<dyn StateStoreMutationTransport> =
+                Arc::new(InMemoryTransport::new(&[
+                    ("storage-1", self.journals[0].clone()),
+                    ("storage-2", self.journals[1].clone()),
+                    ("storage-3", self.journals[2].clone()),
+                ]));
+            StateStoreReplayDriver::new(
+                self.control.clone(),
+                source,
+                Arc::new(move |assignment| {
+                    Ok(StateStoreMutationCoordinator::new(
+                        assignment.clone(),
+                        transport.clone(),
+                    ))
+                }),
+            )
+        }
+    }
+
+    async fn replay_fixture() -> ReplayFixture {
+        let catalog_dir = TempDir::new().unwrap();
+        let store: Arc<dyn crate::storage::LogStore> =
+            Arc::new(crate::storage::FileLogStore::open(catalog_dir.path().join("data")).unwrap());
+        let control = Arc::new(
+            crate::control::ControlController::open_with_storage_nodes(
+                catalog_dir.path().join("catalog.json"),
+                store,
+                ["storage-1", "storage-2", "storage-3"]
+                    .into_iter()
+                    .map(|node| StorageNodeId::try_new(node).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        let created = control
+            .execute_commands(vec![
+                crate::control::Command::CreateSpace {
+                    name: "orders".to_owned(),
+                },
+                crate::control::Command::CreateFeed {
+                    name: "orders.events".to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+        let feed_id =
+            serde_json::from_value::<Uuid>(created.results[1].data["feed_id"].clone()).unwrap();
+        control
+            .execute_commands(vec![crate::control::Command::DefineStateStore {
+                name: "orders.profiles".to_owned(),
+                source: crate::control::StateStoreSourceRequest::Feed {
+                    feed: "orders.events".to_owned(),
+                },
+            }])
+            .await
+            .unwrap();
+        let definition = control
+            .declared_state_store_by_name("orders.profiles")
+            .await
+            .unwrap();
+        let dirs = vec![
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        ];
+        let journals: Vec<Arc<FjallStateStoreMutationJournal>> = dirs
+            .iter()
+            .map(|dir| Arc::new(FjallStateStoreMutationJournal::open(dir.path()).unwrap()))
+            .collect();
+        ReplayFixture {
+            store: definition,
+            feed_id,
+            control,
+            journals,
+            _dirs: dirs,
+            _catalog_dir: catalog_dir,
+        }
+    }
+
+    #[test]
+    fn replay_mutation_id_is_deterministic_and_namespaces_rebuilds() {
+        let store_id = Uuid::new_v4();
+        let feed_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        assert_eq!(
+            replay_mutation_id(store_id, feed_id, message_id, None),
+            replay_mutation_id(store_id, feed_id, message_id, None)
+        );
+        let token_a = Uuid::new_v4();
+        assert_eq!(
+            replay_mutation_id(store_id, feed_id, message_id, Some(token_a)),
+            replay_mutation_id(store_id, feed_id, message_id, Some(token_a))
+        );
+        assert_ne!(
+            replay_mutation_id(store_id, feed_id, message_id, None),
+            replay_mutation_id(store_id, feed_id, message_id, Some(token_a))
+        );
+        assert_ne!(
+            replay_mutation_id(store_id, feed_id, message_id, Some(token_a)),
+            replay_mutation_id(store_id, feed_id, message_id, Some(Uuid::new_v4()))
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_pass_commits_records_and_advances_the_durable_frontier() {
+        let records = vec![
+            replay_record(1, "user-1"),
+            replay_record(2, "user-2"),
+            replay_record(3, "user-1"),
+        ];
+        let fixture = replay_fixture().await;
+        let driver = fixture.driver(Arc::new(StubFeedSource {
+            feed_id: fixture.feed_id,
+            exists: true,
+            records,
+        }));
+        let outcome = driver.pass(&fixture.store, None, 8).await.unwrap();
+        assert_eq!(outcome.applied, 3);
+        assert!(outcome.complete);
+        assert_eq!(outcome.frontier.as_deref(), Some("cursor-3"));
+        for journal in &fixture.journals {
+            let inspection = journal.inspect(fixture.store.store_id).unwrap();
+            let committed = inspection.committed.unwrap();
+            assert_eq!(committed.sequence, 3);
+            assert_eq!(committed.source.as_ref().unwrap().cursor, "cursor-3");
+            assert_eq!(committed.source.unwrap().feed_id, fixture.feed_id);
+        }
+        // A resumed pass sees no new source records and applies nothing.
+        let second = driver.pass(&fixture.store, None, 8).await.unwrap();
+        assert_eq!(second.applied, 0);
+        assert!(second.complete);
+        assert_eq!(second.frontier.as_deref(), Some("cursor-3"));
+    }
+
+    #[tokio::test]
+    async fn replay_pass_resumes_mid_history_and_dedupes_overlap() {
+        let records = vec![replay_record(1, "a"), replay_record(2, "b")];
+        let fixture = replay_fixture().await;
+        let driver = fixture.driver(Arc::new(StubFeedSource {
+            feed_id: fixture.feed_id,
+            exists: true,
+            records,
+        }));
+        let first = driver.pass(&fixture.store, None, 1).await.unwrap();
+        assert_eq!(first.applied, 1);
+        assert!(!first.complete);
+        assert_eq!(first.frontier.as_deref(), Some("cursor-1"));
+        let second = driver.pass(&fixture.store, None, 8).await.unwrap();
+        assert_eq!(second.applied, 1);
+        assert!(second.complete);
+        assert_eq!(second.frontier.as_deref(), Some("cursor-2"));
+    }
+
+    #[tokio::test]
+    async fn replay_pass_refuses_when_source_is_gone() {
+        let fixture = replay_fixture().await;
+        let driver = fixture.driver(Arc::new(StubFeedSource {
+            feed_id: fixture.feed_id,
+            exists: false,
+            records: Vec::new(),
+        }));
+        let error = driver.pass(&fixture.store, None, 8).await.unwrap_err();
+        assert!(matches!(error, StateStoreReplayError::SourceUnavailable));
+        // Rebuild refuses too: a vanished source cannot rematerialize rows.
+        let rebuild = driver
+            .pass(&fixture.store, Some(Uuid::new_v4()), 8)
+            .await
+            .unwrap_err();
+        assert!(matches!(rebuild, StateStoreReplayError::SourceUnavailable));
+    }
+
+    #[tokio::test]
+    async fn replay_pass_reports_frontier_out_of_range() {
+        let records = vec![replay_record(1, "a"), replay_record(2, "b")];
+        let fixture = replay_fixture().await;
+        let driver = fixture.driver(Arc::new(StubFeedSource {
+            feed_id: fixture.feed_id,
+            exists: true,
+            records,
+        }));
+        driver.pass(&fixture.store, None, 8).await.unwrap();
+        // Rotate the source: the journaled frontier cursor-2 no longer
+        // resolves, so the pass refuses until an explicit rebuild.
+        let pruned = fixture.driver(Arc::new(StubFeedSource {
+            feed_id: fixture.feed_id,
+            exists: true,
+            records: vec![replay_record(5, "c")],
+        }));
+        let error = pruned.pass(&fixture.store, None, 8).await.unwrap_err();
+        assert!(matches!(error, StateStoreReplayError::FrontierOutOfRange));
+    }
+
+    #[tokio::test]
+    async fn rebuild_recommits_records_under_a_namespaced_identity() {
+        let records = vec![replay_record(1, "a"), replay_record(2, "b")];
+        let fixture = replay_fixture().await;
+        let driver = fixture.driver(Arc::new(StubFeedSource {
+            feed_id: fixture.feed_id,
+            exists: true,
+            records,
+        }));
+        driver.pass(&fixture.store, None, 8).await.unwrap();
+        let token = Uuid::new_v4();
+        let rebuilt = driver.pass(&fixture.store, Some(token), 8).await.unwrap();
+        // Rebuild re-commits every retained record at fresh sequence
+        // positions; rows converge by overwrite.
+        assert_eq!(rebuilt.applied, 2);
+        assert!(rebuilt.complete);
+        assert_eq!(rebuilt.frontier.as_deref(), Some("cursor-2"));
+        let inspection = fixture.journals[0].inspect(fixture.store.store_id).unwrap();
+        assert_eq!(inspection.committed.unwrap().sequence, 4);
+        // A retried rebuild with the same token dedupes.
+        let retried = driver.pass(&fixture.store, Some(token), 8).await.unwrap();
+        assert_eq!(retried.applied, 2);
+        assert_eq!(
+            fixture.journals[0]
+                .inspect(fixture.store.store_id)
+                .unwrap()
+                .committed
+                .unwrap()
+                .sequence,
+            4
+        );
     }
 }

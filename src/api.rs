@@ -612,6 +612,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/records", get(read_records).post(append_record))
         .route("/v1/feeds/append", post(client_append))
         .route("/v1/state-stores/mutate", post(state_store_mutate))
+        .route("/v1/state-stores/sync", post(state_store_sync))
+        .route("/v1/state-stores/rebuild", post(state_store_rebuild))
         .route("/v1/writers/append", post(writer_session_append))
         .route("/v1/writers/append-batch", post(writer_batch_append))
         .route("/v1/readers/open", post(reader_open))
@@ -2564,6 +2566,7 @@ async fn state_store_mutate(
         sequence: 0,
         op,
         issued_at_ns: unix_ns(),
+        source: None,
     };
     let coordinator = state_store_coordinator_for(&state, assignment)?;
     let result = coordinator
@@ -2576,6 +2579,268 @@ async fn state_store_mutate(
         sequence: result.sequence,
         deduplicated: result.deduplicated,
     }))
+}
+
+/// `FeedReplaySource` over the bounded committed Feed read path: replay
+/// consumes the same merged committed view Readers see, so a StateStore can
+/// never materialize uncommitted or skipped history.
+struct CommittedFeedReplaySource {
+    state: AppState,
+}
+
+#[async_trait]
+impl crate::state_store::FeedReplaySource for CommittedFeedReplaySource {
+    async fn source_exists(&self, feed_id: Uuid) -> bool {
+        self.state
+            .control
+            .active_feed_by_id(feed_id)
+            .await
+            .is_some()
+    }
+
+    async fn read_committed_records(
+        &self,
+        feed_id: Uuid,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<
+        Vec<crate::state_store::ReplaySourceRecord>,
+        crate::state_store::StateStoreReplayError,
+    > {
+        let feed = self
+            .state
+            .control
+            .active_feed_by_id(feed_id)
+            .await
+            .ok_or(crate::state_store::StateStoreReplayError::SourceUnavailable)?;
+        let frames =
+            read_complete_feed(&self.state, feed_id, &feed.name, after, limit, false, false)
+                .await
+                .map_err(|error| match error.status {
+                    StatusCode::BAD_REQUEST => {
+                        crate::state_store::StateStoreReplayError::FrontierOutOfRange
+                    }
+                    _ => crate::state_store::StateStoreReplayError::SourceRead(error.message),
+                })?;
+        frames
+            .iter()
+            .map(|frame| {
+                let record = decode_record(&frame.frame).map_err(|error| {
+                    crate::state_store::StateStoreReplayError::SourceRead(error.to_string())
+                })?;
+                Ok(crate::state_store::ReplaySourceRecord {
+                    message_id: record.message_id,
+                    cursor: frame.cursor.clone(),
+                    key: record.key,
+                    payload: record.payload,
+                })
+            })
+            .collect()
+    }
+}
+
+fn state_store_replay_driver(state: &AppState) -> crate::state_store::StateStoreReplayDriver {
+    let factory_state = state.clone();
+    crate::state_store::StateStoreReplayDriver::new(
+        state.control.clone(),
+        Arc::new(CommittedFeedReplaySource {
+            state: state.clone(),
+        }),
+        Arc::new(move |assignment| {
+            state_store_coordinator_for(&factory_state, assignment.clone())
+                .map_err(|_| crate::state_store::StateStoreMutationError::Unavailable)
+        }),
+    )
+}
+
+fn state_store_replay_api_error(error: crate::state_store::StateStoreReplayError) -> ApiError {
+    match error {
+        // A dropped source Feed or a frontier that outlived retention is a
+        // permanent condition: refuse rather than silently materialize an
+        // incomplete store. A rebuild (or re-declaration) is the recovery.
+        crate::state_store::StateStoreReplayError::SourceUnavailable
+        | crate::state_store::StateStoreReplayError::FrontierOutOfRange => {
+            ApiError::conflict(error.to_string())
+        }
+        crate::state_store::StateStoreReplayError::ManualSource => {
+            ApiError::bad_request(error.to_string())
+        }
+        crate::state_store::StateStoreReplayError::SourceRead(_) => {
+            ApiError::unavailable(error.to_string())
+        }
+        crate::state_store::StateStoreReplayError::Mutation(inner) => state_store_api_error(inner),
+    }
+}
+
+/// Records one bounded replay pass can commit per request.
+const STATE_STORE_REPLAY_PASS_LIMIT: usize = 64;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateStoreSyncRequest {
+    store: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateStoreRebuildRequest {
+    store: String,
+    /// Caller-owned identity for the rebuild pass; a retried rebuild with
+    /// the same token dedupes its already-committed replay mutations.
+    token: Option<Uuid>,
+}
+
+#[derive(Serialize)]
+struct StateStoreSyncResponse {
+    store_id: Uuid,
+    applied: u64,
+    frontier: Option<String>,
+    complete: bool,
+}
+
+async fn feed_derived_store(
+    state: &AppState,
+    name: &str,
+) -> Result<crate::control::StateStoreDefinition, ApiError> {
+    let store = state
+        .control
+        .declared_state_store_by_name(name)
+        .await
+        .ok_or_else(|| ApiError::bad_request(format!("StateStore does not exist: {name}")))?;
+    if !matches!(store.source, crate::control::StateStoreSource::Feed { .. }) {
+        return Err(ApiError::bad_request(
+            "replay applies only to Feed-derived StateStores; manual stores accept mutations",
+        ));
+    }
+    Ok(store)
+}
+
+/// `POST /v1/state-stores/sync` — resume a Feed-derived StateStore's replay
+/// from its durable frontier, committing up to the bounded pass limit as
+/// quorum-journaled mutations.
+async fn state_store_sync(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<StateStoreSyncRequest>,
+) -> Result<Json<StateStoreSyncResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let store = feed_derived_store(&state, &request.store).await?;
+    let outcome = state_store_replay_driver(&state)
+        .pass(&store, None, STATE_STORE_REPLAY_PASS_LIMIT)
+        .await
+        .map_err(state_store_replay_api_error)?;
+    Ok(Json(StateStoreSyncResponse {
+        store_id: outcome.store_id,
+        applied: outcome.applied,
+        frontier: outcome.frontier,
+        complete: outcome.complete,
+    }))
+}
+
+/// `POST /v1/state-stores/rebuild` — re-materialize a Feed-derived
+/// StateStore from the beginning of its retained source history. Refuses
+/// when the declared source Feed no longer resolves rather than producing
+/// a partial store.
+async fn state_store_rebuild(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<StateStoreRebuildRequest>,
+) -> Result<Json<StateStoreSyncResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let store = feed_derived_store(&state, &request.store).await?;
+    let outcome = state_store_replay_driver(&state)
+        .pass(
+            &store,
+            Some(request.token.unwrap_or_else(Uuid::new_v4)),
+            STATE_STORE_REPLAY_PASS_LIMIT,
+        )
+        .await
+        .map_err(state_store_replay_api_error)?;
+    Ok(Json(StateStoreSyncResponse {
+        store_id: outcome.store_id,
+        applied: outcome.applied,
+        frontier: outcome.frontier,
+        complete: outcome.complete,
+    }))
+}
+
+/// Per-store outcome of one background replay drive cycle.
+#[derive(Debug)]
+pub enum StateStoreDriveOutcome {
+    /// This Node is not the store's journal owner; the owner drives.
+    NotOwner,
+    /// The source had no uncommitted-to-store records this cycle.
+    Idle,
+    /// Records replayed this cycle.
+    Synced {
+        store_id: Uuid,
+        applied: u64,
+        complete: bool,
+    },
+    /// Replay refused: the source Feed or the retained frontier is gone.
+    Refused { store_id: Uuid, message: String },
+    /// The pass failed transiently; deterministic identities make the next
+    /// cycle a safe retry.
+    Failed { store_id: Uuid, message: String },
+}
+
+/// One supervisor tick: for every Feed-derived StateStore this Node owns,
+/// run one bounded replay pass. Ownership lives in the persisted placement,
+/// so owner loss or movement simply changes which Node's tick replays next;
+/// deterministic replay identities keep a drive split across an ownership
+/// change from duplicating or losing work.
+pub async fn drive_local_state_stores(
+    state: &AppState,
+    limit: usize,
+) -> Vec<StateStoreDriveOutcome> {
+    let Some(local) = state.storage_node_id.clone() else {
+        return Vec::new();
+    };
+    let stores = state.control.state_store_definitions().await;
+    let mut outcomes = Vec::new();
+    for store in stores {
+        let crate::control::StateStoreSource::Feed { .. } = store.source else {
+            continue;
+        };
+        let Some(assignment) = state
+            .control
+            .active_state_store_assignment_by_id(store.store_id)
+            .await
+        else {
+            outcomes.push(StateStoreDriveOutcome::Failed {
+                store_id: store.store_id,
+                message: "StateStore journal placement is unavailable".to_owned(),
+            });
+            continue;
+        };
+        if assignment.owner != local {
+            outcomes.push(StateStoreDriveOutcome::NotOwner);
+            continue;
+        }
+        match state_store_replay_driver(state)
+            .pass(&store, None, limit)
+            .await
+        {
+            Ok(outcome) if outcome.applied == 0 => outcomes.push(StateStoreDriveOutcome::Idle),
+            Ok(outcome) => outcomes.push(StateStoreDriveOutcome::Synced {
+                store_id: outcome.store_id,
+                applied: outcome.applied,
+                complete: outcome.complete,
+            }),
+            Err(
+                crate::state_store::StateStoreReplayError::SourceUnavailable
+                | crate::state_store::StateStoreReplayError::FrontierOutOfRange,
+            ) => outcomes.push(StateStoreDriveOutcome::Refused {
+                store_id: store.store_id,
+                message: "Feed-derived replay refused; rebuild or re-declare".to_owned(),
+            }),
+            Err(error) => outcomes.push(StateStoreDriveOutcome::Failed {
+                store_id: store.store_id,
+                message: error.to_string(),
+            }),
+        }
+    }
+    outcomes
 }
 
 /// Build the journal coordinator bound to a Subscription's progress
@@ -8071,6 +8336,235 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn feed_derived_state_store_replays_committed_history_and_resumes() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let nodes: Vec<crate::active_range::StorageNodeId> =
+            ["storage-1", "storage-2", "storage-3"]
+                .into_iter()
+                .map(|name| crate::active_range::StorageNodeId::try_new(name).unwrap())
+                .collect();
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store.clone(),
+                nodes.clone(),
+            )
+            .unwrap(),
+        );
+        control
+            .execute("CREATE SPACE orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        control
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "orders.profiles".to_owned(),
+                source: crate::control::StateStoreSourceRequest::Feed {
+                    feed: "orders.events".to_owned(),
+                },
+            }])
+            .await
+            .unwrap();
+        let definition = control
+            .declared_state_store_by_name("orders.profiles")
+            .await
+            .unwrap();
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        let range = control.active_range_assignment(feed.feed_id).await.unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id: feed.feed_id,
+            range_id: range.range_id,
+            generation: range.generation,
+            ownership_epoch: range.ownership_epoch,
+        };
+        // Commit-keyed history on every range replica so the owner serves it.
+        for replica in range.replicas.iter() {
+            let index = nodes.iter().position(|node| node == replica).unwrap();
+            crate::active_range::store::seed_committed_history_shaped(
+                &directory.path().join(format!("ranges-{index}")),
+                &descriptor,
+                4,
+                &|sequence| format!("user-{sequence}").into_bytes(),
+                &|sequence| sequence as i64,
+                8,
+            );
+        }
+
+        let control_key = "this-is-a-long-control-plane-key".to_owned();
+        let mut listeners = Vec::new();
+        let mut endpoints = BTreeMap::new();
+        for node in &nodes {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            endpoints.insert(
+                node.clone(),
+                format!("http://{}", listener.local_addr().unwrap()),
+            );
+            listeners.push(listener);
+        }
+        let mut indexes = Vec::new();
+        for (index, node) in nodes.iter().enumerate() {
+            let listener = listeners.remove(0);
+            listener.set_nonblocking(true).unwrap();
+            let journal = Arc::new(
+                crate::state_store::FjallStateStoreMutationJournal::open(
+                    directory.path().join(format!("journal-{index}")),
+                )
+                .unwrap(),
+            );
+            let index_store: Arc<dyn crate::index::IndexStore> = Arc::new(
+                crate::index::FjallIndexStore::open(
+                    directory.path().join(format!("index-{index}")),
+                )
+                .unwrap(),
+            );
+            indexes.push(index_store.clone());
+            let membership = Arc::new(MembershipService::new(
+                MemberAnnouncement {
+                    node_id: format!("test-node-{index}"),
+                    api_url: "http://test-node:7070".to_owned(),
+                    capacity: 100,
+                },
+                vec![],
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            ));
+            let state = AppState {
+                store: store.clone(),
+                membership,
+                demand: DemandMetrics::default(),
+                autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                control: control.clone(),
+                control_plane: None,
+                progress_authority: control.clone(),
+                replica_append: Some(Arc::new(ReplicaAppendService::new(
+                    directory.path().join(format!("ranges-{index}")),
+                    node.clone(),
+                    control.clone(),
+                ))),
+                majority_append: None,
+                subscription_progress: None,
+                effect_journal: None,
+                state_store_journal: Some(Arc::new(
+                    crate::state_store::StateStoreMutationService::new(
+                        node.clone(),
+                        control.clone(),
+                        journal,
+                        Arc::new(crate::state_store::IndexStoreStateApply::new(index_store)),
+                    ),
+                )),
+                subscription_mtls_enabled: false,
+                storage_node_id: Some(node.clone()),
+                control_endpoints: Arc::new(endpoints.clone().into()),
+                internal_key: Some(control_key.clone()),
+                internal_http: reqwest::Client::new(),
+                internal_mtls: None,
+                admin_auth: AdminAuthenticator::new(Some(
+                    "this-is-a-long-development-api-key".to_owned(),
+                ))
+                .unwrap(),
+            };
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, router(state)).await.unwrap();
+            });
+        }
+
+        let client = reqwest::Client::new();
+        let sync = |path: &str, body: serde_json::Value| {
+            let client = client.clone();
+            let url = format!("{}{path}", endpoints[&nodes[0]]);
+            async move {
+                let response = client
+                    .post(url)
+                    .bearer_auth("this-is-a-long-development-api-key")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                (response.status(), response.json::<Value>().await.unwrap())
+            }
+        };
+
+        // One sync pass materializes every committed source record.
+        let (status, body) = sync(
+            "/v1/state-stores/sync",
+            json!({ "store": "orders.profiles" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], 4);
+        assert_eq!(body["complete"], true);
+        assert_eq!(body["frontier"], "cursor-4");
+
+        // Every replica applied the materialized rows through the journal.
+        for index in &indexes {
+            let row = index
+                .get(&crate::index::PrimaryRef {
+                    feed_id: definition.store_id,
+                    application_key: b"user-3".to_vec(),
+                })
+                .unwrap()
+                .expect("replica applied the replayed row");
+            assert_eq!(row.payload, vec![0xAB; 8]);
+        }
+
+        // Resuming at the frontier applies nothing until new commits arrive.
+        let (status, body) = sync(
+            "/v1/state-stores/sync",
+            json!({ "store": "orders.profiles" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], 0);
+        assert_eq!(body["complete"], true);
+
+        // Rebuild recommits retained history under a namespaced identity;
+        // a retried rebuild with the same token dedupes.
+        let token = Uuid::new_v4();
+        let (status, body) = sync(
+            "/v1/state-stores/rebuild",
+            json!({ "store": "orders.profiles", "token": token }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], 4);
+        assert_eq!(body["complete"], true);
+        let (status, body) = sync(
+            "/v1/state-stores/rebuild",
+            json!({ "store": "orders.profiles", "token": token }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["applied"], 4);
+
+        // Manual mutation is refused on a Feed-derived store.
+        let (status, _body) = sync(
+            "/v1/state-stores/mutate",
+            json!({
+                "store": "orders.profiles",
+                "mutation_id": Uuid::new_v4(),
+                "op": { "kind": "put_row", "key_base64": STANDARD.encode(b"k"),
+                        "payload_base64": STANDARD.encode(b"v") },
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Sync on a manual store is refused.
+        control
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "orders.manual".to_owned(),
+                source: crate::control::StateStoreSourceRequest::Manual,
+            }])
+            .await
+            .unwrap();
+        let (status, _body) =
+            sync("/v1/state-stores/sync", json!({ "store": "orders.manual" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
