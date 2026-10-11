@@ -567,6 +567,12 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
                 post(effect_journal_adopt_local).layer(DefaultBodyLimit::max(512 * 1024)),
             ),
         )
+        .route(
+            "/internal/effect-journal/apply",
+            subscription_key_layer(
+                post(effect_journal_apply_local).layer(DefaultBodyLimit::max(64 * 1024)),
+            ),
+        )
 }
 
 pub fn router(state: AppState) -> Router {
@@ -1832,6 +1838,7 @@ fn effect_journal_api_error(error: crate::effect::EffectJournalError) -> ApiErro
     let status = match error {
         crate::effect::EffectJournalError::Unavailable
         | crate::effect::EffectJournalError::AmbiguousCommit
+        | crate::effect::EffectJournalError::NoQuorum
         | crate::effect::EffectJournalError::Engine(_)
         | crate::effect::EffectJournalError::Serialization(_) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::CONFLICT,
@@ -1934,6 +1941,186 @@ async fn effect_journal_adopt_local(
             .await
             .map_err(effect_journal_api_error)?,
     ))
+}
+
+/// Drives a committed `Declare` on one Subscription-scoped effect journal
+/// to its `Applied` marker. Runs on the progress owner so side effects and
+/// the terminal journal transition share the frontier authority's epoch
+/// fencing; output appends dedupe on deterministic writer identity and the
+/// frontier move replays by request identity, so repeating this call after
+/// an ambiguous result is safe.
+async fn effect_journal_apply_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::effect::EffectReadRequest>,
+) -> Result<Json<crate::effect::EffectMutation>, ApiError> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let assignment = state
+        .control
+        .active_subscription_progress_assignment_by_id(request.subscription_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Subscription progress placement is unavailable"))?;
+    if assignment.owner != request.receiver || assignment.owner != request.owner {
+        return Err(ApiError::conflict(
+            "effect apply must run on the current progress owner",
+        ));
+    }
+    if assignment.ownership_epoch != request.ownership_epoch {
+        return Err(ApiError::conflict(
+            "effect apply epoch does not match the current progress placement",
+        ));
+    }
+    if state.storage_node_id.as_ref() != Some(&request.receiver) {
+        return Err(ApiError::conflict(format!(
+            "Node {} is not the apply receiver {}",
+            state
+                .storage_node_id
+                .as_ref()
+                .map(|node| node.as_str())
+                .unwrap_or("unconfigured"),
+            request.receiver
+        )));
+    }
+    let effect_transport: Arc<dyn crate::effect::EffectJournalTransport> = match &state
+        .internal_mtls
+    {
+        Some(material) => Arc::new(
+            crate::effect::HttpEffectJournalTransport::new_mtls(
+                assignment.clone(),
+                state.control_endpoints.as_ref().clone(),
+                &material.ca_pem,
+                &material.identity_pem,
+                Duration::from_secs(5),
+            )
+            .map_err(effect_journal_api_error)?,
+        ),
+        None => Arc::new(
+            crate::effect::HttpEffectJournalTransport::new(
+                assignment.clone(),
+                state.control_endpoints.as_ref().clone(),
+                state
+                    .internal_key
+                    .as_ref()
+                    .ok_or_else(|| ApiError::unavailable("internal credential is not configured"))?
+                    .clone(),
+                Duration::from_secs(5),
+            )
+            .map_err(|error| ApiError::unavailable(error.to_string()))?,
+        ),
+    };
+    let journal = crate::effect::EffectCoordinator::new(assignment.clone(), effect_transport);
+    let (progress, _) = member_assignment_coordinator(&state, assignment)?;
+    let sink = LiveEffectApply {
+        state: &state,
+        progress,
+        subscription_id: request.subscription_id,
+        ownership_epoch: request.ownership_epoch,
+    };
+    journal
+        .apply_committed(request.effect_id, &sink)
+        .await
+        .map(Json)
+        .map_err(effect_journal_api_error)
+}
+
+/// Wires committed effect side effects to the real Feed append path and the
+/// Subscription progress journal.
+struct LiveEffectApply<'a> {
+    state: &'a AppState,
+    progress: crate::reader::SubscriptionProgressCoordinator,
+    subscription_id: Uuid,
+    ownership_epoch: u64,
+}
+
+fn progress_apply_error(
+    error: crate::reader::SubscriptionProgressError,
+) -> crate::effect::EffectJournalError {
+    match error {
+        crate::reader::SubscriptionProgressError::Unavailable
+        | crate::reader::SubscriptionProgressError::AmbiguousCommit
+        | crate::reader::SubscriptionProgressError::NoQuorum
+        | crate::reader::SubscriptionProgressError::Engine(_)
+        | crate::reader::SubscriptionProgressError::Serialization(_) => {
+            crate::effect::EffectJournalError::Unavailable
+        }
+        _ => crate::effect::EffectJournalError::Conflict,
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::effect::EffectApply for LiveEffectApply<'_> {
+    async fn append_output(
+        &self,
+        output: &crate::effect::EffectOutput,
+    ) -> Result<(), crate::effect::EffectJournalError> {
+        let feed = self
+            .state
+            .control
+            .active_feed_by_id(output.feed_id)
+            .await
+            .ok_or(crate::effect::EffectJournalError::Conflict)?;
+        let request = ClientAppendRequest {
+            request_id: crate::effect::effect_apply_request_id(output.writer_session_id, b"append"),
+            feed: feed.name,
+            writer_session_id: output.writer_session_id,
+            writer_epoch: output.writer_epoch,
+            sequence: output.sequence,
+            event_time_ns: Some(output.event_time_ns.to_string()),
+            key_base64: output.key_base64.clone(),
+            payload_base64: output.payload_base64.clone(),
+            metadata_base64: BTreeMap::new(),
+        };
+        route_append_to_owner(self.state, feed.feed_id, request)
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                if error.status.is_server_error() {
+                    crate::effect::EffectJournalError::Unavailable
+                } else {
+                    crate::effect::EffectJournalError::Conflict
+                }
+            })
+    }
+
+    async fn commit_frontier(
+        &self,
+        consume: &crate::effect::EffectConsume,
+        request_id: Uuid,
+    ) -> Result<(), crate::effect::EffectJournalError> {
+        let committed = self
+            .progress
+            .read_committed()
+            .await
+            .map_err(progress_apply_error)?;
+        if let Some(current) = &committed {
+            if current.cursor == consume.cursor {
+                return Ok(());
+            }
+        }
+        let mutation = crate::reader::SubscriptionProgressMutation {
+            subscription_id: self.subscription_id,
+            feed_id: consume.feed_id,
+            ownership_epoch: self.ownership_epoch,
+            sequence: committed.as_ref().map_or(1, |prior| prior.sequence + 1),
+            request_id,
+            expected_cursor: consume.expected_cursor.clone(),
+            cursor: consume.cursor.clone(),
+            positions: consume.positions.clone(),
+            tick: 0,
+            lease_ops: Vec::new(),
+        };
+        match self.progress.apply(mutation.clone()).await {
+            Ok(_) => Ok(()),
+            Err(crate::reader::SubscriptionProgressError::AmbiguousCommit)
+            | Err(crate::reader::SubscriptionProgressError::NoQuorum) => self
+                .progress
+                .reconcile_retry(mutation)
+                .await
+                .map(|_| ())
+                .map_err(progress_apply_error),
+            Err(error) => Err(progress_apply_error(error)),
+        }
+    }
 }
 
 async fn subscription_prepare_local(
@@ -4787,6 +4974,20 @@ async fn client_append(
         .active_feed_by_name(&request.feed)
         .await
         .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", request.feed)))?;
+    route_append_to_owner(&state, feed.feed_id, request)
+        .await
+        .map(Json)
+}
+
+/// Resolve the Active Range for one routing key and forward the append to its
+/// current Append Owner, locally or over the internal plane. Effect apply
+/// sinks share this path so declared outputs dedupe on the same writer
+/// identity rules as public appends.
+async fn route_append_to_owner(
+    state: &AppState,
+    feed_id: Uuid,
+    request: ClientAppendRequest,
+) -> Result<WriterAppendResponse, ApiError> {
     let routing_key = decode_base64("key_base64", &request.key_base64)?;
     if routing_key.is_empty() {
         return Err(ApiError::bad_request(
@@ -4795,14 +4996,14 @@ async fn client_append(
     }
     let (_, assignment) = state
         .control
-        .active_range_for_key(feed.feed_id, &routing_key)
+        .active_range_for_key(feed_id, &routing_key)
         .await
         .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
     let local = state.storage_node_id.as_ref().ok_or_else(|| {
         ApiError::unavailable("this Node is not configured for Active Range routing")
     })?;
     if &assignment.owner == local {
-        return owner_append_local(&state, request).await.map(Json);
+        return owner_append_local(state, request).await;
     }
     let endpoint = state
         .control_endpoints
@@ -4839,7 +5040,7 @@ async fn client_append(
         .json()
         .await
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
-    response.result.map(Json).ok_or_else(|| ApiError {
+    response.result.ok_or_else(|| ApiError {
         status: if response.retryable {
             StatusCode::SERVICE_UNAVAILABLE
         } else {
@@ -6315,6 +6516,14 @@ impl ApiError {
     fn unavailable(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
+            message: message.into(),
+            code: None,
+        }
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
             message: message.into(),
             code: None,
         }
@@ -8121,6 +8330,7 @@ mod tests {
                     payload_base64: "cGF5bG9hZA==".to_owned(),
                     event_time_ns: 1,
                     writer_session_id: Uuid::from_u128(945),
+                    writer_epoch: 1,
                     sequence: 1,
                 }],
             },
@@ -8207,6 +8417,99 @@ mod tests {
         let reply: crate::effect::EffectReplicaReply<Option<crate::effect::EffectMutation>> =
             serde_json::from_slice(&bytes).unwrap();
         assert_eq!(reply.result, None);
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn effect_journal_apply_requires_the_progress_owner_and_epoch() {
+        let directory = TempDir::new().unwrap();
+        let (app, control_plane, control, _replica) =
+            internal_replica_test_router(&directory).await;
+        let subscription = control
+            .active_subscription_by_name("orders.billing")
+            .await
+            .unwrap();
+        let assignment = control
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        let local = crate::active_range::StorageNodeId::try_new("control-1").unwrap();
+        let apply = crate::effect::EffectReadRequest {
+            owner: assignment.owner.clone(),
+            receiver: local.clone(),
+            subscription_id: subscription.subscription_id,
+            effect_id: Uuid::from_u128(951),
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        let request = |body: serde_json::Value, key: Option<&str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/internal/effect-journal/apply")
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                builder = builder.header("x-whitewater-control-key", key);
+            }
+            builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request(json!(apply), None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut wrong_receiver = apply.clone();
+        wrong_receiver.receiver = assignment
+            .replicas
+            .iter()
+            .find(|node| *node != &local)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    json!(wrong_receiver),
+                    Some("this-is-a-long-control-plane-key")
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let mut wrong_epoch = apply.clone();
+        wrong_epoch.ownership_epoch = assignment.ownership_epoch + 9;
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    json!(wrong_epoch),
+                    Some("this-is-a-long-control-plane-key")
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        // A well-formed apply is fenced unless it targets the local progress
+        // owner: when this fixture's placement elects control-1 the driver
+        // reaches the journal quorum and surfaces unreachable peers as
+        // retryable; otherwise the receiver check refuses the call.
+        let expected = if assignment.owner == local {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::CONFLICT
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                json!(apply),
+                Some("this-is-a-long-control-plane-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
         control_plane.raft().shutdown().await.unwrap();
     }
 

@@ -41,6 +41,7 @@ pub struct EffectOutput {
     pub payload_base64: String,
     pub event_time_ns: i64,
     pub writer_session_id: Uuid,
+    pub writer_epoch: u64,
     pub sequence: u64,
 }
 
@@ -886,6 +887,84 @@ impl EffectCoordinator {
             Err(error) => Err(error),
         }
     }
+
+    /// Drive a committed `Declare` to its terminal `Applied` marker: append
+    /// every declared output idempotently, commit the consumed frontier,
+    /// then commit `Applied` on the journal quorum. A crash anywhere replays
+    /// safely because output appends dedupe on deterministic writer identity,
+    /// the frontier move replays by request identity, and an already-terminal
+    /// journal row short-circuits the whole call.
+    pub async fn apply_committed<A: EffectApply + ?Sized>(
+        &self,
+        effect_id: Uuid,
+        apply: &A,
+    ) -> Result<EffectMutation, EffectJournalError> {
+        let committed = self
+            .read_committed(effect_id)
+            .await?
+            .ok_or(EffectJournalError::Conflict)?;
+        if committed.subscription_id != self.assignment.subscription_id {
+            return Err(EffectJournalError::InvalidAssignment);
+        }
+        let EffectTransition::Declare { consume, outputs } = &committed.transition else {
+            return Ok(committed);
+        };
+        for output in outputs {
+            apply.append_output(output).await?;
+        }
+        if let Some(consume) = consume {
+            apply
+                .commit_frontier(
+                    consume,
+                    effect_apply_request_id(committed.request_id, b"frontier"),
+                )
+                .await?;
+        }
+        let applied = EffectMutation {
+            effect_id,
+            subscription_id: committed.subscription_id,
+            ownership_epoch: committed.ownership_epoch,
+            sequence: committed.sequence + 1,
+            request_id: effect_apply_request_id(committed.request_id, b"applied"),
+            transition: EffectTransition::Applied {
+                declares: committed.request_id,
+            },
+        };
+        match self.apply(applied.clone()).await {
+            Ok(committed) => Ok(committed),
+            Err(EffectJournalError::AmbiguousCommit | EffectJournalError::NoQuorum) => {
+                self.reconcile_retry(applied).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Executes the side effects of a committed `Declare`: idempotent output
+/// appends, then the consumed frontier move. Implementations wire these to
+/// the real Feed append path and the Subscription progress journal.
+#[async_trait::async_trait]
+pub trait EffectApply: Send + Sync {
+    /// Idempotently append one declared output. A retry of the same writer
+    /// identity and sequence must dedupe rather than duplicate.
+    async fn append_output(&self, output: &EffectOutput) -> Result<(), EffectJournalError>;
+
+    /// Idempotently commit the declared frontier move on the consumed
+    /// Subscription's replicated progress journal.
+    async fn commit_frontier(
+        &self,
+        consume: &EffectConsume,
+        request_id: Uuid,
+    ) -> Result<(), EffectJournalError>;
+}
+
+/// A deterministic request identity derived from the committed Declare so a
+/// retried apply replays the identical journal mutation.
+pub fn effect_apply_request_id(declare_request_id: Uuid, tag: &[u8]) -> Uuid {
+    let mut material = declare_request_id.as_bytes().to_vec();
+    material.extend_from_slice(tag);
+    let digest = blake3::hash(&material);
+    Uuid::from_bytes(digest.as_bytes()[..16].try_into().expect("16-byte prefix"))
 }
 
 /// One Node's placement-fenced effect journal endpoint surface: every
@@ -1345,6 +1424,7 @@ mod tests {
             payload_base64: "cGF5bG9hZA==".to_owned(),
             event_time_ns: 1,
             writer_session_id: Uuid::new_v4(),
+            writer_epoch: 1,
             sequence,
         }
     }
@@ -1620,5 +1700,332 @@ mod tests {
             replica.local_committed(mutation.effect_id).unwrap(),
             Some(mutation)
         );
+    }
+
+    struct LoopbackTransport {
+        stores: std::collections::BTreeMap<StorageNodeId, FjallEffectJournalReplica>,
+        down: std::sync::Mutex<std::collections::BTreeSet<StorageNodeId>>,
+    }
+
+    impl LoopbackTransport {
+        fn new(
+            stores: std::collections::BTreeMap<StorageNodeId, FjallEffectJournalReplica>,
+        ) -> Self {
+            Self {
+                stores,
+                down: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EffectJournalTransport for LoopbackTransport {
+        async fn prepare(
+            &self,
+            node: &StorageNodeId,
+            mutation: EffectMutation,
+        ) -> Result<EffectReplicaReply<EffectPrepareVote>, EffectJournalError> {
+            if self.down.lock().unwrap().contains(node) {
+                return Err(EffectJournalError::Unavailable);
+            }
+            let store = self
+                .stores
+                .get(node)
+                .ok_or(EffectJournalError::InvalidAssignment)?;
+            let effect_id = mutation.effect_id;
+            let ownership_epoch = mutation.ownership_epoch;
+            Ok(EffectReplicaReply {
+                replica: node.clone(),
+                effect_id,
+                ownership_epoch,
+                result: store.prepare(mutation)?,
+            })
+        }
+
+        async fn commit(
+            &self,
+            node: &StorageNodeId,
+            evidence: EffectCommitEvidence,
+        ) -> Result<EffectReplicaReply<EffectMutation>, EffectJournalError> {
+            if self.down.lock().unwrap().contains(node) {
+                return Err(EffectJournalError::Unavailable);
+            }
+            let store = self
+                .stores
+                .get(node)
+                .ok_or(EffectJournalError::InvalidAssignment)?;
+            let result = store.commit_with_quorum(evidence)?;
+            Ok(EffectReplicaReply {
+                replica: node.clone(),
+                effect_id: result.effect_id,
+                ownership_epoch: result.ownership_epoch,
+                result,
+            })
+        }
+
+        async fn committed(
+            &self,
+            node: &StorageNodeId,
+            effect_id: Uuid,
+            ownership_epoch: u64,
+        ) -> Result<EffectReplicaReply<Option<EffectMutation>>, EffectJournalError> {
+            let store = self
+                .stores
+                .get(node)
+                .ok_or(EffectJournalError::InvalidAssignment)?;
+            Ok(EffectReplicaReply {
+                replica: node.clone(),
+                effect_id,
+                ownership_epoch,
+                result: store.local_committed(effect_id)?,
+            })
+        }
+
+        async fn inspect(
+            &self,
+            node: &StorageNodeId,
+            effect_id: Uuid,
+            ownership_epoch: u64,
+        ) -> Result<EffectReplicaReply<EffectJournalInspection>, EffectJournalError> {
+            let store = self
+                .stores
+                .get(node)
+                .ok_or(EffectJournalError::InvalidAssignment)?;
+            Ok(EffectReplicaReply {
+                replica: node.clone(),
+                effect_id,
+                ownership_epoch,
+                result: store.local_state(effect_id)?,
+            })
+        }
+
+        async fn adopt(
+            &self,
+            node: &StorageNodeId,
+            effect_id: Uuid,
+            ownership_epoch: u64,
+            committed: Option<EffectMutation>,
+        ) -> Result<EffectReplicaReply<Option<EffectMutation>>, EffectJournalError> {
+            let store = self
+                .stores
+                .get(node)
+                .ok_or(EffectJournalError::InvalidAssignment)?;
+            Ok(EffectReplicaReply {
+                replica: node.clone(),
+                effect_id,
+                ownership_epoch,
+                result: store.adopt_recovered(
+                    effect_id,
+                    Uuid::from_u128(0),
+                    ownership_epoch,
+                    committed,
+                )?,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingApply {
+        appended: std::sync::Mutex<Vec<EffectOutput>>,
+        frontier_requests: std::sync::Mutex<Vec<Uuid>>,
+        fail_outputs: std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EffectApply for RecordingApply {
+        async fn append_output(&self, output: &EffectOutput) -> Result<(), EffectJournalError> {
+            if self
+                .fail_outputs
+                .lock()
+                .unwrap()
+                .contains(&output.writer_session_id)
+            {
+                return Err(EffectJournalError::Unavailable);
+            }
+            let mut appended = self.appended.lock().unwrap();
+            if !appended
+                .iter()
+                .any(|seen| seen.writer_session_id == output.writer_session_id)
+            {
+                appended.push(output.clone());
+            }
+            Ok(())
+        }
+
+        async fn commit_frontier(
+            &self,
+            _consume: &EffectConsume,
+            request_id: Uuid,
+        ) -> Result<(), EffectJournalError> {
+            self.frontier_requests.lock().unwrap().push(request_id);
+            Ok(())
+        }
+    }
+
+    fn apply_fixture() -> (
+        Vec<TempDir>,
+        [StorageNodeId; 3],
+        std::sync::Arc<LoopbackTransport>,
+        EffectCoordinator,
+    ) {
+        let directories = vec![
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        ];
+        let nodes = [
+            StorageNodeId::try_new("apply-a").unwrap(),
+            StorageNodeId::try_new("apply-b").unwrap(),
+            StorageNodeId::try_new("apply-c").unwrap(),
+        ];
+        let stores = nodes
+            .iter()
+            .cloned()
+            .zip(
+                directories
+                    .iter()
+                    .map(|directory| FjallEffectJournalReplica::open(directory.path()).unwrap()),
+            )
+            .collect();
+        let transport = std::sync::Arc::new(LoopbackTransport::new(stores));
+        let coordinator = EffectCoordinator::new(
+            crate::reader::SubscriptionProgressAssignment::try_new(
+                Uuid::from_u128(0),
+                nodes[0].clone(),
+                crate::active_range::ReplicaSet::try_new(nodes.clone()).unwrap(),
+                1,
+            )
+            .unwrap(),
+            transport.clone(),
+        );
+        (directories, nodes, transport, coordinator)
+    }
+
+    fn scoped_declare(effect_id: Uuid) -> EffectMutation {
+        let mut mutation = declare(1);
+        mutation.effect_id = effect_id;
+        mutation.subscription_id = Uuid::from_u128(0);
+        mutation
+    }
+
+    #[tokio::test]
+    async fn apply_committed_runs_outputs_frontier_then_marks_applied() {
+        let (_directories, _nodes, _transport, coordinator) = apply_fixture();
+        let mutation = scoped_declare(Uuid::new_v4());
+        coordinator.apply(mutation.clone()).await.unwrap();
+        let sink = RecordingApply::default();
+        let applied = coordinator
+            .apply_committed(mutation.effect_id, &sink)
+            .await
+            .unwrap();
+        assert_eq!(
+            applied.transition,
+            EffectTransition::Applied {
+                declares: mutation.request_id
+            }
+        );
+        assert_eq!(applied.sequence, 2);
+        assert_eq!(
+            applied.request_id,
+            effect_apply_request_id(mutation.request_id, b"applied")
+        );
+        let appended = sink.appended.lock().unwrap();
+        assert_eq!(appended.len(), 1);
+        assert_eq!(appended[0].writer_epoch, 1);
+        drop(appended);
+        assert_eq!(
+            sink.frontier_requests.lock().unwrap().as_slice(),
+            &[effect_apply_request_id(mutation.request_id, b"frontier")]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_committed_replays_after_a_mid_apply_failure() {
+        let (_directories, _nodes, _transport, coordinator) = apply_fixture();
+        let mutation = scoped_declare(Uuid::new_v4());
+        coordinator.apply(mutation.clone()).await.unwrap();
+        let sink = RecordingApply::default();
+        let EffectTransition::Declare { outputs, .. } = &mutation.transition else {
+            panic!("expected declare")
+        };
+        sink.fail_outputs
+            .lock()
+            .unwrap()
+            .insert(outputs[0].writer_session_id);
+        assert!(matches!(
+            coordinator.apply_committed(mutation.effect_id, &sink).await,
+            Err(EffectJournalError::Unavailable)
+        ));
+        assert_eq!(sink.appended.lock().unwrap().len(), 0);
+        assert!(sink.frontier_requests.lock().unwrap().is_empty());
+
+        sink.fail_outputs.lock().unwrap().clear();
+        let applied = coordinator
+            .apply_committed(mutation.effect_id, &sink)
+            .await
+            .unwrap();
+        assert!(matches!(
+            applied.transition,
+            EffectTransition::Applied { .. }
+        ));
+        assert_eq!(sink.appended.lock().unwrap().len(), 1);
+        assert_eq!(sink.frontier_requests.lock().unwrap().len(), 1);
+
+        // A further call replays the sink work deterministically and sees the
+        // already-terminal row, so no additional journal transition commits.
+        let replayed = coordinator
+            .apply_committed(mutation.effect_id, &sink)
+            .await
+            .unwrap();
+        assert_eq!(replayed, applied);
+        assert_eq!(sink.appended.lock().unwrap().len(), 1);
+        assert_eq!(sink.frontier_requests.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_committed_survives_a_member_replica_loss() {
+        let (_directories, nodes, transport, coordinator) = apply_fixture();
+        let mutation = scoped_declare(Uuid::new_v4());
+        coordinator.apply(mutation.clone()).await.unwrap();
+        transport.down.lock().unwrap().insert(nodes[2].clone());
+        let sink = RecordingApply::default();
+        let applied = coordinator
+            .apply_committed(mutation.effect_id, &sink)
+            .await
+            .unwrap();
+        assert!(matches!(
+            applied.transition,
+            EffectTransition::Applied { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn apply_committed_rejects_a_row_from_another_scope() {
+        let (_directories, _nodes, transport, coordinator) = apply_fixture();
+        let mut foreign = declare(1);
+        foreign.subscription_id = Uuid::from_u128(9);
+        foreign.effect_id = Uuid::new_v4();
+        let other = EffectCoordinator::new(
+            crate::reader::SubscriptionProgressAssignment::try_new(
+                foreign.subscription_id,
+                StorageNodeId::try_new("apply-a").unwrap(),
+                crate::active_range::ReplicaSet::try_new(
+                    ["apply-a", "apply-b", "apply-c"]
+                        .map(|name| StorageNodeId::try_new(name).unwrap()),
+                )
+                .unwrap(),
+                1,
+            )
+            .unwrap(),
+            transport.clone(),
+        );
+        // Commit through the coordinator scoped to the foreign Subscription;
+        // then confirm the original coordinator refuses to apply it.
+        other.apply(foreign.clone()).await.unwrap();
+        let sink = RecordingApply::default();
+        assert!(matches!(
+            coordinator.apply_committed(foreign.effect_id, &sink).await,
+            Err(EffectJournalError::InvalidAssignment)
+        ));
     }
 }

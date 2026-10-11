@@ -5,9 +5,10 @@ use std::{
 
 use finnstream::active_range::{RangeId, ReplicaSet, StorageNodeId};
 use finnstream::effect::{
-    EffectCommitEvidence, EffectConsume, EffectCoordinator, EffectJournalError,
-    EffectJournalInspection, EffectJournalTransport, EffectMutation, EffectOutput,
-    EffectPrepareVote, EffectReplicaReply, EffectTransition, FjallEffectJournalReplica,
+    effect_apply_request_id, EffectApply, EffectCommitEvidence, EffectConsume, EffectCoordinator,
+    EffectJournalError, EffectJournalInspection, EffectJournalTransport, EffectMutation,
+    EffectOutput, EffectPrepareVote, EffectReplicaReply, EffectTransition,
+    FjallEffectJournalReplica,
 };
 use finnstream::reader::SubscriptionProgressAssignment;
 use tempfile::TempDir;
@@ -24,6 +25,7 @@ fn output(sequence: u64) -> EffectOutput {
         payload_base64: "cGF5bG9hZA==".to_owned(),
         event_time_ns: 1,
         writer_session_id: Uuid::new_v4(),
+        writer_epoch: 1,
         sequence,
     }
 }
@@ -362,6 +364,161 @@ async fn applied_transition_commits_as_a_second_sequenced_mutation() {
         },
     };
     coordinator.apply(applied.clone()).await.unwrap();
+    assert_eq!(
+        coordinator
+            .read_committed(mutation.effect_id)
+            .await
+            .unwrap(),
+        Some(applied)
+    );
+}
+
+#[derive(Default)]
+struct RecordingApply {
+    appended: Mutex<Vec<EffectOutput>>,
+    frontier_requests: Mutex<Vec<Uuid>>,
+    fail_once: Mutex<BTreeSet<Uuid>>,
+}
+
+#[async_trait::async_trait]
+impl EffectApply for RecordingApply {
+    async fn append_output(&self, output: &EffectOutput) -> Result<(), EffectJournalError> {
+        if self
+            .fail_once
+            .lock()
+            .unwrap()
+            .remove(&output.writer_session_id)
+        {
+            return Err(EffectJournalError::Unavailable);
+        }
+        let mut appended = self.appended.lock().unwrap();
+        if !appended
+            .iter()
+            .any(|seen| seen.writer_session_id == output.writer_session_id)
+        {
+            appended.push(output.clone());
+        }
+        Ok(())
+    }
+
+    async fn commit_frontier(
+        &self,
+        _consume: &EffectConsume,
+        request_id: Uuid,
+    ) -> Result<(), EffectJournalError> {
+        self.frontier_requests.lock().unwrap().push(request_id);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn apply_committed_replicates_the_applied_marker_on_the_journal_quorum() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare(Uuid::new_v4(), 1, 1);
+    let coordinator = effect_coordinator(transport.clone(), &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    let sink = RecordingApply::default();
+    let applied = coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    assert_eq!(
+        applied.transition,
+        EffectTransition::Applied {
+            declares: mutation.request_id
+        }
+    );
+    // The Applied marker is quorum-visible through the normal committed read.
+    assert_eq!(
+        coordinator
+            .read_committed(mutation.effect_id)
+            .await
+            .unwrap(),
+        Some(applied)
+    );
+    assert_eq!(sink.appended.lock().unwrap().len(), 1);
+    assert_eq!(
+        sink.frontier_requests.lock().unwrap().as_slice(),
+        &[effect_apply_request_id(mutation.request_id, b"frontier")]
+    );
+}
+
+#[tokio::test]
+async fn apply_committed_replays_deterministically_after_sink_failure() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare(Uuid::new_v4(), 1, 1);
+    let coordinator = effect_coordinator(transport.clone(), &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    let sink = RecordingApply::default();
+    let EffectTransition::Declare { outputs, .. } = &mutation.transition else {
+        panic!("expected declare")
+    };
+    sink.fail_once
+        .lock()
+        .unwrap()
+        .insert(outputs[0].writer_session_id);
+    assert!(matches!(
+        coordinator.apply_committed(mutation.effect_id, &sink).await,
+        Err(EffectJournalError::Unavailable)
+    ));
+    assert!(sink.frontier_requests.lock().unwrap().is_empty());
+
+    let applied = coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    assert!(matches!(
+        applied.transition,
+        EffectTransition::Applied { .. }
+    ));
+    // The retried apply appended each declared output exactly once because
+    // the sink dedupes on deterministic writer identity.
+    assert_eq!(sink.appended.lock().unwrap().len(), outputs.len());
+}
+
+#[tokio::test]
+async fn apply_committed_recovers_an_ambiguous_terminal_commit() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare(Uuid::new_v4(), 1, 1);
+    let coordinator = effect_coordinator(transport.clone(), &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    // The Applied transition commits on the owner but the member commit call
+    // fails: the outcome is ambiguous and reconcile_retry must settle it.
+    transport
+        .commit_down
+        .lock()
+        .unwrap()
+        .insert(nodes[2].clone());
+    let sink = RecordingApply::default();
+    let applied = coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    assert!(matches!(
+        applied.transition,
+        EffectTransition::Applied { .. }
+    ));
     assert_eq!(
         coordinator
             .read_committed(mutation.effect_id)

@@ -9,3 +9,4 @@ Thumbs.db
 /.mtls-join-certs/
 /C:/
 /.cargo-home/
+/.cargo-cache/
