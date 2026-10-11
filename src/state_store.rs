@@ -196,6 +196,33 @@ pub struct StateStoreLookupRequest {
     pub ownership_epoch: u64,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateStoreReadRequest {
+    pub owner: StorageNodeId,
+    pub receiver: StorageNodeId,
+    pub store_id: Uuid,
+    pub ownership_epoch: u64,
+    pub key: Vec<u8>,
+}
+
+/// One applied StateStore row returned by a replica read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateStoreRow {
+    pub payload: Vec<u8>,
+    /// The journal-sequence cursor this row last applied at.
+    pub applied_cursor: String,
+}
+
+/// A replica's row read plus the freshness evidence to interpret it:
+/// `applied_seq` behind `committed_seq` means the replica is lagging.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StateStoreReadOutcome {
+    pub row: Option<StateStoreRow>,
+    pub applied_seq: u64,
+    pub committed_seq: u64,
+}
+
 #[derive(Debug, Error)]
 pub enum StateStoreMutationError {
     #[error(transparent)]
@@ -701,6 +728,13 @@ impl FjallStateStoreMutationJournal {
 /// narrow seam so tests can capture applies without storage.
 pub trait StateStoreApply: Send + Sync {
     fn apply(&self, mutation: &StateStoreMutation) -> Result<(), StateStoreMutationError>;
+
+    /// Read the applied row for one primary key, if present.
+    fn get_row(
+        &self,
+        store_id: Uuid,
+        key: &[u8],
+    ) -> Result<Option<StateStoreRow>, StateStoreMutationError>;
 }
 
 /// Applies manual mutations as primary rows: the store id namespaces
@@ -739,6 +773,25 @@ impl StateStoreApply for IndexStoreStateApply {
         }
         Ok(())
     }
+
+    fn get_row(
+        &self,
+        store_id: Uuid,
+        key: &[u8],
+    ) -> Result<Option<StateStoreRow>, StateStoreMutationError> {
+        self.store
+            .get(&crate::index::PrimaryRef {
+                feed_id: store_id,
+                application_key: key.to_vec(),
+            })
+            .map(|row| {
+                row.map(|row| StateStoreRow {
+                    payload: row.payload,
+                    applied_cursor: row.applied_cursor,
+                })
+            })
+            .map_err(|_| StateStoreMutationError::ApplyFailed)
+    }
 }
 
 /// The wire surface one replica offers the coordinator. Injected so the
@@ -768,6 +821,13 @@ pub trait StateStoreMutationTransport: Send + Sync {
         replica: &StorageNodeId,
         request: StateStoreLookupRequest,
     ) -> Result<StateStoreReplicaReply<Option<StateStoreMutation>>, StateStoreMutationError>;
+
+    /// Read one applied row plus freshness evidence from a replica.
+    async fn read(
+        &self,
+        replica: &StorageNodeId,
+        request: StateStoreReadRequest,
+    ) -> Result<StateStoreReplicaReply<StateStoreReadOutcome>, StateStoreMutationError>;
 }
 
 /// Drives manual mutations through the replicated prepare/commit protocol
@@ -1240,6 +1300,18 @@ impl StateStoreMutationTransport for HttpStateStoreMutationTransport {
         self.send(replica, "/internal/state-store-journal/lookup", &request)
             .await
     }
+
+    async fn read(
+        &self,
+        replica: &StorageNodeId,
+        request: StateStoreReadRequest,
+    ) -> Result<StateStoreReplicaReply<StateStoreReadOutcome>, StateStoreMutationError> {
+        if request.ownership_epoch != self.assignment.ownership_epoch {
+            return Err(StateStoreMutationError::StaleEpoch);
+        }
+        self.send(replica, "/internal/state-store-journal/read", &request)
+            .await
+    }
 }
 
 /// Node-side service fencing journal RPCs against the catalog's current
@@ -1413,6 +1485,53 @@ impl StateStoreMutationService {
             store_id,
             ownership_epoch: assignment.ownership_epoch,
             result,
+        })
+    }
+
+    /// One replica's applied row plus freshness evidence. Placement and
+    /// ownership fencing match the journal mutation paths.
+    pub async fn read_row(
+        &self,
+        request: StateStoreReadRequest,
+    ) -> Result<StateStoreReplicaReply<StateStoreReadOutcome>, StateStoreMutationError> {
+        let assignment = self
+            .check_placement(
+                request.store_id,
+                &request.owner,
+                &request.receiver,
+                request.ownership_epoch,
+            )
+            .await?;
+        if request.key.is_empty() || request.key.len() > STATE_STORE_MAX_KEY_BYTES {
+            return Err(StateStoreMutationError::TooLarge);
+        }
+        let journal = self.journal.clone();
+        let apply = self.apply.clone();
+        let store_id = request.store_id;
+        let key = request.key;
+        let (row, applied_seq, committed_seq) = tokio::task::spawn_blocking(move || {
+            let inspection = journal.inspect(store_id)?;
+            let row = apply.get_row(store_id, &key)?;
+            Ok::<_, StateStoreMutationError>((
+                row,
+                inspection.applied_seq,
+                inspection
+                    .committed
+                    .map(|mutation| mutation.sequence)
+                    .unwrap_or(0),
+            ))
+        })
+        .await
+        .map_err(|_| StateStoreMutationError::Unavailable)??;
+        Ok(StateStoreReplicaReply {
+            replica: self.local_node.clone(),
+            store_id,
+            ownership_epoch: assignment.ownership_epoch,
+            result: StateStoreReadOutcome {
+                row,
+                applied_seq,
+                committed_seq,
+            },
         })
     }
 
@@ -1932,6 +2051,37 @@ mod tests {
                 result,
             })
         }
+
+        async fn read(
+            &self,
+            replica: &StorageNodeId,
+            request: StateStoreReadRequest,
+        ) -> Result<StateStoreReplicaReply<StateStoreReadOutcome>, StateStoreMutationError>
+        {
+            let journal = self
+                .replies
+                .lock()
+                .unwrap()
+                .get(replica.as_str())
+                .cloned()
+                .ok_or(StateStoreMutationError::Unavailable)?;
+            // In-memory transport has no applied index; report journal
+            // freshness so coordinator-level tests can assert on it.
+            let inspection = journal.inspect(request.store_id)?;
+            Ok(StateStoreReplicaReply {
+                replica: replica.clone(),
+                store_id: request.store_id,
+                ownership_epoch: request.ownership_epoch,
+                result: StateStoreReadOutcome {
+                    row: None,
+                    applied_seq: inspection.applied_seq,
+                    committed_seq: inspection
+                        .committed
+                        .map(|mutation| mutation.sequence)
+                        .unwrap_or(0),
+                },
+            })
+        }
     }
 
     #[tokio::test]
@@ -2246,6 +2396,95 @@ mod tests {
         }));
         let error = pruned.pass(&fixture.store, None, 8).await.unwrap_err();
         assert!(matches!(error, StateStoreReplayError::FrontierOutOfRange));
+    }
+
+    #[tokio::test]
+    async fn read_row_serves_applied_row_with_freshness_and_fencing() {
+        let fixture = replay_fixture().await;
+        let directory = TempDir::new().unwrap();
+        let index: Arc<dyn IndexStore> = Arc::new(FjallIndexStore::open(directory.path()).unwrap());
+        let journal = fixture.journals[0].clone();
+        let service = StateStoreMutationService::new(
+            node("storage-1"),
+            fixture.control.clone(),
+            journal.clone(),
+            Arc::new(IndexStoreStateApply::new(index.clone())),
+        );
+        let store_id = fixture.store.store_id;
+        let assignment = fixture
+            .control
+            .active_state_store_assignment_by_id(store_id)
+            .await
+            .unwrap();
+        let owner = assignment.owner.clone();
+        let epoch = assignment.ownership_epoch;
+        let read = |key: &[u8], epoch: u64| StateStoreReadRequest {
+            owner: owner.clone(),
+            receiver: node("storage-1"),
+            store_id,
+            ownership_epoch: epoch,
+            key: key.to_vec(),
+        };
+        // Empty journal: nothing committed or applied yet.
+        let empty = service.read_row(read(b"k", epoch)).await.unwrap();
+        assert!(empty.result.row.is_none());
+        assert_eq!(empty.result.applied_seq, 0);
+        assert_eq!(empty.result.committed_seq, 0);
+
+        // Commit + apply one mutation directly through the journal seam.
+        let mut mutation = mutation(store_id, 1, "user-7");
+        mutation.ownership_epoch = epoch;
+        journal.prepare(mutation.clone()).unwrap();
+        let votes = [
+            (owner.clone(), mutation_digest(&mutation).unwrap()),
+            (node("storage-2"), mutation_digest(&mutation).unwrap()),
+        ];
+        let committed = journal
+            .commit_with_quorum(
+                store_id,
+                epoch,
+                &StateStoreCommitEvidence {
+                    store_id,
+                    request_id: mutation.request_id,
+                    mutation_id: mutation.mutation_id,
+                    sequence: 1,
+                    votes,
+                },
+            )
+            .unwrap();
+        // Committed-but-unapplied: freshness evidence shows the lag before
+        // the row appears — callers see `applied_seq < committed_seq`.
+        let lagging = service.read_row(read(b"user-7", epoch)).await.unwrap();
+        assert!(lagging.result.row.is_none());
+        assert_eq!(lagging.result.applied_seq, 0);
+        assert_eq!(lagging.result.committed_seq, 1);
+        service.apply.apply(&committed).unwrap();
+        journal.mark_applied(store_id, 1).unwrap();
+
+        let reply = service.read_row(read(b"user-7", epoch)).await.unwrap();
+        assert_eq!(reply.replica, node("storage-1"));
+        let row = reply.result.row.unwrap();
+        assert_eq!(row.payload, b"payload");
+        assert_eq!(row.applied_cursor, "00000000000000000001");
+        assert_eq!(reply.result.applied_seq, 1);
+        assert_eq!(reply.result.committed_seq, 1);
+
+        // Missing key reads back absent without error.
+        let missing = service.read_row(read(b"none", epoch)).await.unwrap();
+        assert!(missing.result.row.is_none());
+
+        // Stale ownership epochs and oversized keys are fenced.
+        assert!(matches!(
+            service.read_row(read(b"k", 9)).await.unwrap_err(),
+            StateStoreMutationError::InvalidAssignment
+        ));
+        assert!(matches!(
+            service
+                .read_row(read(&vec![0_u8; STATE_STORE_MAX_KEY_BYTES + 1], 1))
+                .await
+                .unwrap_err(),
+            StateStoreMutationError::TooLarge
+        ));
     }
 
     #[tokio::test]

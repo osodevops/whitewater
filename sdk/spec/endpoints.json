@@ -501,6 +501,31 @@
         "unavailable(503) no journal quorum"
       ],
       "notes": "re-materializes from retained source beginning; token namespaces replay identities so rows re-apply; same-token retries dedupe"
+    },
+    {
+      "op": "state_store.lookup",
+      "method": "POST",
+      "path": "/v1/state-stores/lookup",
+      "auth": "admin (client-key scoped auth is future work)",
+      "request": {
+        "store": "name",
+        "key_base64": "bytes (primary row key)"
+      },
+      "response": {
+        "store_id": "uuid",
+        "found": "bool",
+        "payload_base64": "bytes|null",
+        "applied_cursor": "string|null (journal-sequence cursor the row last applied at)",
+        "applied_seq": "u64 (highest journal sequence applied by the serving replica)",
+        "committed_seq": "u64 (highest committed sequence on the serving replica)",
+        "behind": "bool (applied_seq < committed_seq: replica still applying)",
+        "served_by": "string (Node identity that served the row)"
+      },
+      "errors": [
+        "refused(400) missing store / empty or oversized key",
+        "unavailable(503) no replica could serve the lookup"
+      ],
+      "notes": "primary-key point read; served locally when the ingress Node holds a replica, else forwarded over the authenticated internal read route; freshness is reported, not enforced (strict reads are future work)"
     }
   ]
 }

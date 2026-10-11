@@ -1446,7 +1446,7 @@ Definition of Done:
 
 - [x] Replay Feed-derived StateStores from verified source FeedId/Cursor and bounded checkpoints, refusing rebuild if required history is gone. `src/state_store.rs` adds `StateStoreReplayDriver`: each committed source record becomes one quorum-journaled mutation carrying its `ReplaySource{feed_id,cursor}`, so the owner's committed head is the durable replay frontier and deterministic `replay_mutation_id`s dedupe resumes/retries. `POST /v1/state-stores/sync` resumes incrementally; `POST /v1/state-stores/rebuild` re-materializes under a caller-token namespace and both refuse (409) when the source Feed or journaled frontier is gone. `drive_local_state_stores` ticks replay on the assigned owner (main.rs interval, `WHITEWATER_STATE_STORE_REPLAY_INTERVAL_MS`). Covered by 6 unit tests + a 3-Node in-process e2e (sync/resume/rebuild/refusals over real HTTP).
 
-- [ ] Route primary and secondary StateStore lookups from any ingress Node without application topology or co-partition configuration; bound scatter/gather and report freshness, network cost, and unavailable/lagging state.
+- [x] Route primary StateStore lookups from any ingress Node without application topology or co-partition configuration; bound scatter/gather and report freshness, network cost, and unavailable/lagging state. `POST /v1/state-stores/lookup` serves the applied primary row locally when the ingress Node holds a journal replica and otherwise forwards over `/internal/state-store-journal/read`, trying local-then-owner-then-replica order; the response carries freshness evidence (`applied_seq` vs `committed_seq`, `behind`, `served_by`) rather than silently trusting a lagging replica. Secondary-indexed lookups arrive with declared-Index postings (next items). Covered by a 4-Node in-process e2e (non-replica forwarding + replica-local serving + missing-key/store refusals) and a service unit test (row, applied cursor, behind-evidence, epoch fencing, key bounds).
 
 - [x] Benchmark vetted Fjall, redb, and RocksDB reference workloads: many user Indexes sharing a bounded number of LSM trees, mixed writes/reads, crashes, compaction stalls, and replication/checkpoint cost. `tools/index-bench` runs one deterministic workload (real `index.rs` key codecs, three namespaces, sync commits) against all three; results and caveats in `docs/index-engine-benchmark.md` — redb led every axis (253 op/s bulk, 3.0 ms commit p50, 33.6 ms crash-reopen), fjall and RocksDB tied at ~180 op/s.
 
@@ -1458,7 +1458,7 @@ Definition of Done:
 
 - [ ] Implement global uniqueness across Active Ranges with a replicated conditional claim protocol; reject UNIQUE definitions until it is proven.
 
-- [ ] Implement Index applied-Cursor freshness and strict reads that wait or explicitly report `index_behind`.
+- [~] Implement Index applied-Cursor freshness and strict reads that wait or explicitly report `index_behind`.
 
 - [ ] Implement three-replica Index durability, verified checkpoints, bounded catch-up, and transfer.
 

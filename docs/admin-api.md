@@ -187,7 +187,7 @@ A declared store already has a working RF3 write path:
 - **Manual stores** accept `POST /v1/state-stores/mutate` (`{ "store": name, "mutation_id": uuid, "op": "put_row" | "delete_row" }`). `mutation_id` is the caller-owned idempotency identity: retries dedupe, changed contents conflict.
 - **Feed-derived stores** materialize committed source history: `POST /v1/state-stores/sync` resumes from the durable journaled frontier; `POST /v1/state-stores/rebuild` re-materializes under a caller `token` namespace. Both refuse with 409 when the source Feed or journaled frontier is gone rather than silently producing a partial store. Owning Nodes also drive bounded replay passes automatically.
 
-Lookup/query APIs remain planned: a populated store is durable state, not yet a queryable resource.
+Primary-key lookups exist: `POST /v1/state-stores/lookup` (`{ "store": name, "key_base64": bytes }` returns the row plus freshness evidence (`applied_seq`, `committed_seq`, `behind`, `served_by`). It is served locally when the ingress Node holds a journal replica and otherwise forwarded internally — no application topology knowledge required. Declared secondary Indexes and freshness-strict reads remain planned.
 
 Reader start variants:
 

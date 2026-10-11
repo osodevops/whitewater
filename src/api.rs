@@ -599,6 +599,12 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             ),
         )
         .route(
+            "/internal/state-store-journal/read",
+            subscription_key_layer(
+                post(state_store_journal_read_local).layer(DefaultBodyLimit::max(64 * 1024)),
+            ),
+        )
+        .route(
             "/internal/pipe/drive",
             subscription_key_layer(post(pipe_drive_local).layer(DefaultBodyLimit::max(64 * 1024))),
         )
@@ -614,6 +620,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/state-stores/mutate", post(state_store_mutate))
         .route("/v1/state-stores/sync", post(state_store_sync))
         .route("/v1/state-stores/rebuild", post(state_store_rebuild))
+        .route("/v1/state-stores/lookup", post(state_store_lookup))
         .route("/v1/writers/append", post(writer_session_append))
         .route("/v1/writers/append-batch", post(writer_batch_append))
         .route("/v1/readers/open", post(reader_open))
@@ -2449,6 +2456,159 @@ async fn state_store_journal_lookup_local(
             .await
             .map_err(state_store_api_error)?,
     ))
+}
+
+async fn state_store_journal_read_local(
+    State(state): State<AppState>,
+    Json(request): Json<crate::state_store::StateStoreReadRequest>,
+) -> Result<
+    Json<crate::state_store::StateStoreReplicaReply<crate::state_store::StateStoreReadOutcome>>,
+    ApiError,
+> {
+    state
+        .state_store_journal
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("StateStore journal replica is not configured"))?
+        .read_row(request)
+        .await
+        .map(Json)
+        .map_err(state_store_api_error)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateStoreLookupApiRequest {
+    store: String,
+    key_base64: String,
+}
+
+#[derive(Serialize)]
+struct StateStoreLookupApiResponse {
+    store_id: Uuid,
+    found: bool,
+    payload_base64: Option<String>,
+    applied_cursor: Option<String>,
+    /// Freshness evidence from the serving replica: `applied_seq` behind
+    /// `committed_seq` means the replica is still applying the journal.
+    applied_seq: u64,
+    committed_seq: u64,
+    behind: bool,
+    served_by: String,
+}
+
+/// `POST /v1/state-stores/lookup` — point lookup on a StateStore's primary
+/// key served by any ingress Node. The handler prefers the local replica
+/// and otherwise forwards over the authenticated internal read route,
+/// returning freshness evidence so callers can see a lagging replica
+/// rather than silently trusting stale state.
+async fn state_store_lookup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<StateStoreLookupApiRequest>,
+) -> Result<Json<StateStoreLookupApiResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let store = state
+        .control
+        .declared_state_store_by_name(&request.store)
+        .await
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
+        })?;
+    let assignment = state
+        .control
+        .active_state_store_assignment_by_id(store.store_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("StateStore has no mutation-journal placement"))?;
+    let key = decode_base64("key_base64", &request.key_base64)?;
+    if key.is_empty() || key.len() > crate::state_store::STATE_STORE_MAX_KEY_BYTES {
+        return Err(ApiError::bad_request(
+            "key_base64 is empty or exceeds the row-key budget",
+        ));
+    }
+    // Candidate order: the local replica first (no network hop), then the
+    // owner (freshest application), then the remaining replicas.
+    let mut candidates: Vec<StorageNodeId> = Vec::new();
+    if let Some(local) = &state.storage_node_id {
+        if assignment.replicas.contains(local) {
+            candidates.push(local.clone());
+        }
+    }
+    candidates.push(assignment.owner.clone());
+    for replica in assignment.replicas.iter() {
+        if !candidates.contains(replica) {
+            candidates.push(replica.clone());
+        }
+    }
+    let transport_state = state.clone();
+    let mut last_error: Option<ApiError> = None;
+    for replica in &candidates {
+        let read = crate::state_store::StateStoreReadRequest {
+            owner: assignment.owner.clone(),
+            receiver: replica.clone(),
+            store_id: store.store_id,
+            ownership_epoch: assignment.ownership_epoch,
+            key: key.clone(),
+        };
+        let outcome = if Some(replica) == state.storage_node_id.as_ref()
+            && state.state_store_journal.is_some()
+        {
+            state
+                .state_store_journal
+                .as_ref()
+                .unwrap()
+                .read_row(read)
+                .await
+                .map_err(state_store_api_error)
+        } else {
+            let transport: Arc<dyn crate::state_store::StateStoreMutationTransport> =
+                match &transport_state.internal_mtls {
+                    Some(material) => Arc::new(
+                        crate::state_store::HttpStateStoreMutationTransport::new_mtls(
+                            assignment.clone(),
+                            transport_state.control_endpoints.as_ref().clone(),
+                            &material.ca_pem,
+                            &material.identity_pem,
+                            Duration::from_secs(5),
+                        )
+                        .map_err(state_store_api_error)?,
+                    ),
+                    None => Arc::new(
+                        crate::state_store::HttpStateStoreMutationTransport::new(
+                            assignment.clone(),
+                            transport_state.control_endpoints.as_ref().clone(),
+                            transport_state.internal_key.clone().ok_or_else(|| {
+                                ApiError::unavailable("internal credential is not configured")
+                            })?,
+                            Duration::from_secs(5),
+                        )
+                        .map_err(|error| ApiError::unavailable(error.to_string()))?,
+                    ),
+                };
+            transport
+                .read(replica, read)
+                .await
+                .map_err(state_store_api_error)
+        };
+        match outcome {
+            Ok(reply) => {
+                let result = reply.result;
+                return Ok(Json(StateStoreLookupApiResponse {
+                    store_id: store.store_id,
+                    found: result.row.is_some(),
+                    payload_base64: result.row.as_ref().map(|row| STANDARD.encode(&row.payload)),
+                    applied_cursor: result.row.map(|row| row.applied_cursor),
+                    applied_seq: result.applied_seq,
+                    committed_seq: result.committed_seq,
+                    behind: result.applied_seq < result.committed_seq,
+                    served_by: reply.replica.to_string(),
+                }));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        ApiError::unavailable("no StateStore journal replica could serve the lookup")
+    }))
 }
 
 /// Build the mutation coordinator bound to a StateStore's RF3 placement over
@@ -8564,6 +8724,219 @@ mod tests {
             .unwrap();
         let (status, _body) =
             sync("/v1/state-stores/sync", json!({ "store": "orders.manual" })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn state_store_lookup_routes_from_any_ingress_node_and_reports_freshness() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        // Four storage Nodes — the rendezvous placement picks three, so the
+        // remaining Node exercises the ingress-forwarding path.
+        let nodes: Vec<crate::active_range::StorageNodeId> =
+            ["storage-1", "storage-2", "storage-3", "storage-4"]
+                .into_iter()
+                .map(|name| crate::active_range::StorageNodeId::try_new(name).unwrap())
+                .collect();
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store.clone(),
+                nodes.clone(),
+            )
+            .unwrap(),
+        );
+        control.execute("CREATE SPACE accounts;").await.unwrap();
+        control
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.profiles".to_owned(),
+                source: crate::control::StateStoreSourceRequest::Manual,
+            }])
+            .await
+            .unwrap();
+        let definition = control
+            .declared_state_store_by_name("accounts.profiles")
+            .await
+            .unwrap();
+        let assignment = control
+            .active_state_store_assignment_by_id(definition.store_id)
+            .await
+            .unwrap();
+        assert_eq!(assignment.replicas.iter().count(), 3);
+        let non_replica = nodes
+            .iter()
+            .find(|node| !assignment.replicas.contains(node))
+            .expect("four-node pool leaves one non-replica")
+            .clone();
+
+        let control_key = "this-is-a-long-control-plane-key".to_owned();
+        let mut listeners = Vec::new();
+        let mut endpoints = BTreeMap::new();
+        for node in &nodes {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            endpoints.insert(
+                node.clone(),
+                format!("http://{}", listener.local_addr().unwrap()),
+            );
+            listeners.push(listener);
+        }
+        for (index, node) in nodes.iter().enumerate() {
+            let listener = listeners.remove(0);
+            listener.set_nonblocking(true).unwrap();
+            let journal = Arc::new(
+                crate::state_store::FjallStateStoreMutationJournal::open(
+                    directory.path().join(format!("journal-{index}")),
+                )
+                .unwrap(),
+            );
+            let index_store: Arc<dyn crate::index::IndexStore> = Arc::new(
+                crate::index::FjallIndexStore::open(
+                    directory.path().join(format!("index-{index}")),
+                )
+                .unwrap(),
+            );
+            let service = crate::state_store::StateStoreMutationService::new(
+                node.clone(),
+                control.clone(),
+                journal,
+                Arc::new(crate::state_store::IndexStoreStateApply::new(index_store)),
+            );
+            let membership = Arc::new(MembershipService::new(
+                MemberAnnouncement {
+                    node_id: format!("test-node-{index}"),
+                    api_url: "http://test-node:7070".to_owned(),
+                    capacity: 100,
+                },
+                vec![],
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            ));
+            let state = AppState {
+                store: store.clone(),
+                membership,
+                demand: DemandMetrics::default(),
+                autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                control: control.clone(),
+                control_plane: None,
+                progress_authority: control.clone(),
+                replica_append: None,
+                majority_append: None,
+                subscription_progress: None,
+                effect_journal: None,
+                state_store_journal: Some(Arc::new(service)),
+                subscription_mtls_enabled: false,
+                storage_node_id: Some(node.clone()),
+                control_endpoints: Arc::new(endpoints.clone().into()),
+                internal_key: Some(control_key.clone()),
+                internal_http: reqwest::Client::new(),
+                internal_mtls: None,
+                admin_auth: AdminAuthenticator::new(Some(
+                    "this-is-a-long-development-api-key".to_owned(),
+                ))
+                .unwrap(),
+            };
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, router(state)).await.unwrap();
+            });
+        }
+
+        // One mutation through the quorum on a replica node.
+        let client = reqwest::Client::new();
+        let replica_node = assignment.replicas.iter().next().unwrap().clone();
+        let response = client
+            .post(format!(
+                "{}/v1/state-stores/mutate",
+                endpoints[&replica_node]
+            ))
+            .bearer_auth("this-is-a-long-development-api-key")
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+                "mutation_id": Uuid::new_v4(),
+                "op": {
+                    "kind": "put_row",
+                    "key_base64": STANDARD.encode(b"user-9"),
+                    "payload_base64": STANDARD.encode(b"plan-ent"),
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let lookup = |node: &crate::active_range::StorageNodeId| {
+            let client = client.clone();
+            let url = format!("{}/v1/state-stores/lookup", endpoints[node]);
+            async move {
+                let response = client
+                    .post(url)
+                    .bearer_auth("this-is-a-long-development-api-key")
+                    .json(&serde_json::json!({
+                        "store": "accounts.profiles",
+                        "key_base64": STANDARD.encode(b"user-9"),
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                (response.status(), response.json::<Value>().await.unwrap())
+            }
+        };
+
+        // A non-replica ingress forwards to a journal replica and returns
+        // the applied row with freshness evidence.
+        let (status, body) = lookup(&non_replica).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["found"], true);
+        assert_eq!(body["applied_seq"], 1);
+        assert_eq!(body["committed_seq"], 1);
+        assert_eq!(body["behind"], false);
+        assert_eq!(
+            STANDARD
+                .decode(body["payload_base64"].as_str().unwrap())
+                .unwrap(),
+            b"plan-ent"
+        );
+        assert_ne!(body["served_by"].as_str().unwrap(), non_replica.as_str());
+
+        // A replica answers the same lookup locally.
+        let (status, body) = lookup(&replica_node).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["found"], true);
+
+        // Unknown keys and unknown stores answer cleanly.
+        let response = client
+            .post(format!(
+                "{}/v1/state-stores/lookup",
+                endpoints[&replica_node]
+            ))
+            .bearer_auth("this-is-a-long-development-api-key")
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+                "key_base64": STANDARD.encode(b"absent"),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["found"], false);
+        let (status, _body) = {
+            let response = client
+                .post(format!(
+                    "{}/v1/state-stores/lookup",
+                    endpoints[&replica_node]
+                ))
+                .bearer_auth("this-is-a-long-development-api-key")
+                .json(&serde_json::json!({
+                    "store": "accounts.missing",
+                    "key_base64": STANDARD.encode(b"k"),
+                }))
+                .send()
+                .await
+                .unwrap();
+            (response.status(), ())
+        };
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
