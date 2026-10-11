@@ -63,7 +63,8 @@
         "member_id": "{{uuid:member1}}", "member_epoch": "{{join.member_epoch}}",
         "work_id": "{{uuid:work1}}", "lease_epoch": "{{claim.lease.lease_epoch}}"
       },
-      "bind": "released"
+      "bind": "released",
+      "expect": {"error_code": "lease.stale_lease"}
     }
   ]
 }
