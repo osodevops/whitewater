@@ -193,9 +193,7 @@ shadow-generation posting set from retained committed Feed history
 (`IndexFieldSpec` key/metadata/json-projection extraction), refuses the
 pass when the source or resume frontier is gone, and commits
 `CompleteIndexBuild` for atomic `building` → `active` activation; prior
-generations retire through a bounded sweep. Index query routing is still
-planned — declarations, rebuilds, and inspection exist; `GET` and
-exact/prefix/range reads do not.
+generations retire through a bounded sweep. Active Indexes answer logical queries through `POST /v1/indexes/query` (`{ "index": name, "mode": "exact" | "prefix" | "range", ... }`) — the same semantics as WCL `GET INDEX` — resolving the logical name to the active generation and serving from any ingress Node: a Node that materializes the postings answers locally, a strict read whose local postings lag the activation frontier forwards (bounded) to fresher peers, and failures surface `index_not_found` (404), `index_not_ready` (409 while declared/building), or `index_behind` (409 strict, no Node reached the frontier in the bounded wait). Rows return `key_base64`/`payload_base64` plus freshness evidence (`applied_cursor`, `target_cursor`, `behind`, `truncated`, `served_by`); `limit` defaults to 256 (1..=1000) and results cap at 16 MiB.
 
 Reader start variants:
 

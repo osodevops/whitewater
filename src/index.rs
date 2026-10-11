@@ -82,6 +82,8 @@ pub enum IndexKeyError {
     DuplicateIndex(IndexId),
     #[error("a unique Index value is already claimed by another application Key")]
     UniqueConflict,
+    #[error("an encoded Index key is truncated or mistagged")]
+    CorruptKey,
 }
 
 pub fn primary_key(reference: &PrimaryRef) -> Result<Vec<u8>, IndexKeyError> {
@@ -270,6 +272,90 @@ fn append_escaped_bytes(key: &mut Vec<u8>, bytes: &[u8]) -> Result<(), IndexKeyE
     Ok(())
 }
 
+/// Decode one typed value beginning at `offset`, returning the value and
+/// the offset just past it (past the escaped terminator for Bytes/Text).
+/// Fails closed on truncated or mistagged bytes — postings under an
+/// acknowledged prefix must decode cleanly.
+fn decode_value_at(key: &[u8], offset: usize) -> Result<(IndexValue, usize), IndexKeyError> {
+    match key.get(offset) {
+        Some(0) => Ok((IndexValue::Null, offset + 1)),
+        Some(1) => match key.get(offset + 1) {
+            Some(0) => Ok((IndexValue::Bool(false), offset + 2)),
+            Some(1) => Ok((IndexValue::Bool(true), offset + 2)),
+            _ => Err(IndexKeyError::CorruptKey),
+        },
+        Some(2) => {
+            let end = offset + 9;
+            let raw: [u8; 8] = key
+                .get(offset + 1..end)
+                .and_then(|slice| <[u8; 8]>::try_from(slice).ok())
+                .ok_or(IndexKeyError::CorruptKey)?;
+            Ok((
+                IndexValue::I64((u64::from_be_bytes(raw) ^ (1_u64 << 63)) as i64),
+                end,
+            ))
+        }
+        Some(tag @ (3 | 4)) => {
+            let mut bytes = Vec::new();
+            let mut cursor = offset + 1;
+            loop {
+                match key.get(cursor) {
+                    Some(0) => match key.get(cursor + 1) {
+                        Some(0) => {
+                            cursor += 2;
+                            break;
+                        }
+                        Some(1) => {
+                            bytes.push(0);
+                            cursor += 2;
+                        }
+                        _ => return Err(IndexKeyError::CorruptKey),
+                    },
+                    Some(&byte) => {
+                        bytes.push(byte);
+                        cursor += 1;
+                    }
+                    None => return Err(IndexKeyError::CorruptKey),
+                }
+            }
+            let value = if *tag == 3 {
+                IndexValue::Bytes(bytes)
+            } else {
+                IndexValue::Text(String::from_utf8(bytes).map_err(|_| IndexKeyError::CorruptKey)?)
+            };
+            Ok((value, cursor))
+        }
+        _ => Err(IndexKeyError::CorruptKey),
+    }
+}
+
+/// Total order matching the encoded key order: Null < Bool < I64 < Bytes <
+/// Text, with Bool false < true, I64 numeric, and Bytes/Text bytewise.
+/// Used by bounded range scans to compare a decoded posting field against
+/// caller bounds without re-encoding per key.
+fn cmp_index_value(left: &IndexValue, right: &IndexValue) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    fn tag(value: &IndexValue) -> u8 {
+        match value {
+            IndexValue::Null => 0,
+            IndexValue::Bool(_) => 1,
+            IndexValue::I64(_) => 2,
+            IndexValue::Bytes(_) => 3,
+            IndexValue::Text(_) => 4,
+        }
+    }
+    match tag(left).cmp(&tag(right)) {
+        Ordering::Equal => match (left, right) {
+            (IndexValue::Bool(a), IndexValue::Bool(b)) => a.cmp(b),
+            (IndexValue::I64(a), IndexValue::I64(b)) => a.cmp(b),
+            (IndexValue::Bytes(a), IndexValue::Bytes(b)) => a.cmp(b),
+            (IndexValue::Text(a), IndexValue::Text(b)) => a.as_bytes().cmp(b.as_bytes()),
+            _ => Ordering::Equal,
+        },
+        order => order,
+    }
+}
+
 fn bounded(key: Vec<u8>) -> Result<Vec<u8>, IndexKeyError> {
     if key.len() > MAX_KEY_BYTES {
         return Err(IndexKeyError::KeyTooLarge);
@@ -361,6 +447,31 @@ pub trait IndexStore: Send + Sync {
     /// or one Index) and strip the entries from affected rows. Bounded per
     /// call; callers loop until it returns zero.
     fn drop_index_postings(&self, id: IndexId, limit: usize) -> Result<usize, IndexStoreError>;
+
+    /// Prefix scan: rows whose posting under `id` starts with
+    /// `leading_values`, optionally narrowing the next field to text
+    /// beginning with `partial_text`. Bounded by `limit` rows and a
+    /// payload-byte budget.
+    fn lookup_prefix(
+        &self,
+        id: IndexId,
+        leading_values: &[IndexValue],
+        partial_text: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<IndexRow>, IndexStoreError>;
+
+    /// Bounded range scan on the field following `leading_values`
+    /// (leading fields are exact-equal, like a composite leftmost match).
+    /// Bounds are typed `IndexValue` endpoints; inclusive/exclusive on
+    /// either side.
+    fn lookup_range(
+        &self,
+        id: IndexId,
+        leading_values: &[IndexValue],
+        lower: std::ops::Bound<IndexValue>,
+        upper: std::ops::Bound<IndexValue>,
+        limit: usize,
+    ) -> Result<Vec<IndexRow>, IndexStoreError>;
 }
 
 /// The posting namespace one rebuild generation writes under: deterministic
@@ -578,6 +689,146 @@ impl IndexStore for FjallIndexStore {
                     .entries
                     .iter()
                     .any(|entry| entry.id == id && entry.values == values)
+            {
+                return Err(IndexStoreError::DanglingPosting);
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    fn lookup_prefix(
+        &self,
+        id: IndexId,
+        leading_values: &[IndexValue],
+        partial_text: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<IndexRow>, IndexStoreError> {
+        if !(1..=1_000).contains(&limit) {
+            return Err(IndexStoreError::InvalidLimit);
+        }
+        // A partial-text clause only narrows a Text field.
+        if partial_text.is_some() && leading_values.len() >= MAX_COLUMNS {
+            return Err(IndexKeyError::InvalidFieldCount.into());
+        }
+        let prefix = match partial_text {
+            Some(partial) => text_prefix(id, leading_values, partial)?,
+            None => posting_prefix(id, leading_values)?,
+        };
+        let snapshot = self.db.read_tx();
+        let mut rows = Vec::new();
+        let mut bytes_seen = 0_usize;
+        for entry in snapshot.prefix(&self.entries, prefix).take(limit) {
+            let (_, reference_key) = entry.into_inner()?;
+            let stored = snapshot
+                .get(&self.primary, &reference_key)?
+                .ok_or(IndexStoreError::DanglingPosting)?;
+            bytes_seen = bytes_seen
+                .checked_add(stored.len())
+                .ok_or(IndexStoreError::QueryTooLarge)?;
+            if bytes_seen > 16 * 1024 * 1024 {
+                return Err(IndexStoreError::QueryTooLarge);
+            }
+            let row: IndexRow = serde_json::from_slice(&stored)?;
+            if primary_key(&row.reference)?.as_slice() != &*reference_key {
+                return Err(IndexStoreError::DanglingPosting);
+            }
+            let Some(entry) = row.entries.iter().find(|entry| entry.id == id) else {
+                return Err(IndexStoreError::DanglingPosting);
+            };
+            if !entry.values.starts_with(leading_values)
+                || partial_text.is_some_and(|partial| {
+                    !matches!(
+                        entry.values.get(leading_values.len()),
+                        Some(IndexValue::Text(text)) if text.starts_with(partial)
+                    )
+                })
+            {
+                return Err(IndexStoreError::DanglingPosting);
+            }
+            rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    fn lookup_range(
+        &self,
+        id: IndexId,
+        leading_values: &[IndexValue],
+        lower: std::ops::Bound<IndexValue>,
+        upper: std::ops::Bound<IndexValue>,
+        limit: usize,
+    ) -> Result<Vec<IndexRow>, IndexStoreError> {
+        use std::ops::Bound;
+        if !(1..=1_000).contains(&limit) {
+            return Err(IndexStoreError::InvalidLimit);
+        }
+        let leading_prefix = posting_prefix(id, leading_values)?;
+        // Start the byte range at the inclusive encoding of the lower bound
+        // (or the bare leading prefix when unbounded); ordering is
+        // preserved by the key codec so this skips every key below lower.
+        let start = match &lower {
+            Bound::Included(value) | Bound::Excluded(value) => {
+                let mut key = leading_prefix.clone();
+                append_value(&mut key, value)?;
+                key
+            }
+            Bound::Unbounded => leading_prefix.clone(),
+        };
+        let snapshot = self.db.read_tx();
+        let mut rows = Vec::new();
+        let mut bytes_seen = 0_usize;
+        for guard in snapshot.range(&self.entries, start..) {
+            if rows.len() >= limit {
+                break;
+            }
+            let (key, reference_key) = guard.into_inner()?;
+            if !key.starts_with(&leading_prefix) {
+                break;
+            }
+            let (value, _) = decode_value_at(&key, leading_prefix.len())?;
+            let above_lower = match &lower {
+                Bound::Included(bound) => {
+                    cmp_index_value(&value, bound) != std::cmp::Ordering::Less
+                }
+                Bound::Excluded(bound) => {
+                    cmp_index_value(&value, bound) == std::cmp::Ordering::Greater
+                }
+                Bound::Unbounded => true,
+            };
+            let below_upper = match &upper {
+                Bound::Included(bound) => {
+                    cmp_index_value(&value, bound) != std::cmp::Ordering::Greater
+                }
+                Bound::Excluded(bound) => {
+                    cmp_index_value(&value, bound) == std::cmp::Ordering::Less
+                }
+                Bound::Unbounded => true,
+            };
+            if !below_upper {
+                break;
+            }
+            if !above_lower {
+                continue;
+            }
+            let stored = snapshot
+                .get(&self.primary, reference_key.as_ref())?
+                .ok_or(IndexStoreError::DanglingPosting)?;
+            bytes_seen = bytes_seen
+                .checked_add(stored.len())
+                .ok_or(IndexStoreError::QueryTooLarge)?;
+            if bytes_seen > 16 * 1024 * 1024 {
+                return Err(IndexStoreError::QueryTooLarge);
+            }
+            let row: IndexRow = serde_json::from_slice(&stored)?;
+            if primary_key(&row.reference)?.as_slice() != reference_key.as_ref() {
+                return Err(IndexStoreError::DanglingPosting);
+            }
+            let Some(entry) = row.entries.iter().find(|entry| entry.id == id) else {
+                return Err(IndexStoreError::DanglingPosting);
+            };
+            if !entry.values.starts_with(leading_values)
+                || entry.values.get(leading_values.len()) != Some(&value)
             {
                 return Err(IndexStoreError::DanglingPosting);
             }
@@ -1174,5 +1425,157 @@ mod tests {
         );
         assert!(store.delete(&reference(b"ana"), "cursor-2").unwrap());
         assert!(store.get(&reference(b"ana")).unwrap().is_none());
+    }
+
+    fn multi_entry(id: Uuid, values: Vec<IndexValue>) -> IndexEntry {
+        IndexEntry {
+            id: IndexId(id),
+            values,
+            unique: false,
+        }
+    }
+
+    #[test]
+    fn fjall_lookup_prefix_matches_leading_values_and_partial_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+        let id = Uuid::from_u128(41);
+        for (key, city, age) in [
+            (b"alice".as_slice(), "London", 23_i64),
+            (b"amy".as_slice(), "London", 31),
+            (b"bob".as_slice(), "London", 40),
+            (b"carol".as_slice(), "Los Angeles", 19),
+        ] {
+            store
+                .upsert(
+                    &reference(key),
+                    key,
+                    &[multi_entry(
+                        id,
+                        vec![IndexValue::Text(city.to_owned()), IndexValue::I64(age)],
+                    )],
+                    "cursor-1",
+                )
+                .unwrap();
+        }
+        let index_id = IndexId(id);
+        // Leading-only prefix on the first field.
+        let london = store
+            .lookup_prefix(index_id, &[IndexValue::Text("London".to_owned())], None, 10)
+            .unwrap();
+        assert_eq!(london.len(), 3);
+        // Partial text narrows the *next* field — so an I64 next field
+        // simply finds nothing rather than erroring.
+        let leading_city = [IndexValue::Text("L".to_owned())];
+        let cities = store.lookup_prefix(index_id, &[], Some("Lo"), 10).unwrap();
+        assert_eq!(cities.len(), 4);
+        assert!(leading_city[0] == IndexValue::Text("L".to_owned()));
+        let lo = store.lookup_prefix(index_id, &[], Some("Lon"), 10).unwrap();
+        assert_eq!(lo.len(), 3);
+        // Limits bound results deterministically (posting-key order).
+        let capped = store
+            .lookup_prefix(index_id, &[IndexValue::Text("London".to_owned())], None, 1)
+            .unwrap();
+        assert_eq!(capped.len(), 1);
+    }
+
+    #[test]
+    fn fjall_lookup_range_bounds_the_next_field_with_typed_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+        let id = Uuid::from_u128(42);
+        for (key, region, score) in [
+            (b"a".as_slice(), "US", -5_i64),
+            (b"b".as_slice(), "US", 0),
+            (b"c".as_slice(), "US", 7),
+            (b"d".as_slice(), "US", 42),
+            (b"e".as_slice(), "EU", 10),
+        ] {
+            store
+                .upsert(
+                    &reference(key),
+                    key,
+                    &[multi_entry(
+                        id,
+                        vec![IndexValue::Text(region.to_owned()), IndexValue::I64(score)],
+                    )],
+                    "cursor-1",
+                )
+                .unwrap();
+        }
+        let index_id = IndexId(id);
+        let us = [IndexValue::Text("US".to_owned())];
+        // Inclusive [0, 7] keeps b, c and respects signed order (a=-5 < 0).
+        let rows = store
+            .lookup_range(
+                index_id,
+                &us,
+                std::ops::Bound::Included(IndexValue::I64(0)),
+                std::ops::Bound::Included(IndexValue::I64(7)),
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.reference.application_key.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"b".as_slice(), b"c".as_slice()]
+        );
+        // Exclusive lower bound drops 0.
+        let rows = store
+            .lookup_range(
+                index_id,
+                &us,
+                std::ops::Bound::Excluded(IndexValue::I64(0)),
+                std::ops::Bound::Unbounded,
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.reference.application_key.as_slice())
+                .collect::<Vec<_>>(),
+            vec![b"c".as_slice(), b"d".as_slice()]
+        );
+        // Range stops at the leading-prefix boundary: EU rows never appear.
+        let rows = store
+            .lookup_range(
+                index_id,
+                &us,
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Unbounded,
+                10,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 4);
+        assert!(rows
+            .iter()
+            .all(|row| row.reference.application_key != b"e".to_vec()));
+    }
+
+    #[test]
+    fn fjall_lookup_rejects_dangling_postings_and_bad_limits() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+        let id = Uuid::from_u128(43);
+        let entry = multi_entry(id, vec![IndexValue::I64(9)]);
+        // Plant a posting with no primary row — the corruption the
+        // dereference check exists to catch.
+        let orphan = posting_key(&entry, &reference(b"gone")).unwrap();
+        store.entries.insert(orphan, "").unwrap();
+        let error = store.lookup_prefix(IndexId(id), &[], None, 10).unwrap_err();
+        assert!(matches!(error, IndexStoreError::DanglingPosting));
+        assert!(matches!(
+            store
+                .lookup_range(
+                    IndexId(id),
+                    &[],
+                    std::ops::Bound::Unbounded,
+                    std::ops::Bound::Unbounded,
+                    0,
+                )
+                .unwrap_err(),
+            IndexStoreError::InvalidLimit
+        ));
     }
 }

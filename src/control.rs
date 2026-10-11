@@ -18,6 +18,7 @@ use crate::{
         RangeMap, RangeRoute, ReplicaSet, StagedWriterSequence, StorageNodeId,
         ACTIVE_RANGE_REPLICA_COUNT,
     },
+    index::IndexValue,
     reader::SubscriptionProgressAssignment,
     storage::{LogStore, StorageError},
 };
@@ -151,6 +152,41 @@ impl IndexBuildStage {
             Self::Building { generation } | Self::Active { generation } => Some(*generation),
         }
     }
+}
+
+/// One inclusive/exclusive endpoint of a bounded Index range query.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexBound {
+    pub value: IndexValue,
+    #[serde(default = "bound_inclusive")]
+    pub inclusive: bool,
+}
+
+fn bound_inclusive() -> bool {
+    true
+}
+
+/// The read shape a `GET INDEX` statement or typed query request asks the
+/// data plane for. `Exact` supplies every declared field; `Prefix`
+/// matches leading complete fields plus an optional text prefix on the
+/// next field; `Range` bounds the field after `leading` exact-equals.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexQueryPredicate {
+    Exact {
+        values: Vec<IndexValue>,
+    },
+    Prefix {
+        leading: Vec<IndexValue>,
+        #[serde(default)]
+        partial_text: Option<String>,
+    },
+    Range {
+        #[serde(default)]
+        leading: Vec<IndexValue>,
+        lower: IndexBound,
+        upper: IndexBound,
+    },
 }
 
 /// A Control Plane-persisted secondary Index definition. `applied_cursor`
@@ -583,6 +619,19 @@ pub enum Command {
         generation: u64,
         applied_cursor: String,
     },
+    /// Data-plane read against an activated Index generation. The catalog
+    /// never applies it — the API layer intercepts and answers against the
+    /// local (or freshest reachable) materialized postings.
+    GetIndex {
+        index: String,
+        predicate: IndexQueryPredicate,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        strict: bool,
+        #[serde(default)]
+        wait_ms: Option<u64>,
+    },
     DefinePipe {
         name: String,
         subscription: String,
@@ -816,6 +865,7 @@ impl Command {
                 | Self::ExplainAccess { .. }
                 | Self::InspectPlacement { .. }
                 | Self::InspectStorageDrain { .. }
+                | Self::GetIndex { .. }
         )
     }
 
@@ -2520,6 +2570,10 @@ impl ControlController {
                 state.reader_frontiers.remove(&updated.reader_id);
                 Ok((format!("moved Reader {reader} position"), json!(updated)))
             }
+            Command::GetIndex { .. } => Err(ControlError::InvalidOperation(
+                "GET INDEX is answered by the data-plane Index query endpoint;                  the catalog does not materialize postings"
+                    .to_owned(),
+            )),
             Command::InspectPlacement { feed } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
                 let assignment = state.active_ranges.get(&feed_id).ok_or_else(|| {
@@ -3764,7 +3818,10 @@ fn split_statements(script: &str) -> Result<Vec<String>, ControlError> {
     let mut chars = script.chars().peekable();
     while let Some(character) = chars.next() {
         match character {
+            // Keep the doubled quote verbatim: this pass only finds statement
+            // boundaries; tokenize() performs the actual un-escaping.
             '\'' if quoted && chars.peek() == Some(&'\'') => {
+                current.push('\'');
                 current.push('\'');
                 chars.next();
             }
@@ -3885,8 +3942,56 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                     Ok(Command::CreateReader { name, feed, start })
                 }
             }
+            Some("INDEX") => {
+                // CREATE INDEX <name> ON <feed> FIELDS <field>[,<field>]*
+                expect_keyword(&tokens, 3, "ON")?;
+                expect_keyword(&tokens, 5, "FIELDS")?;
+                let mut position = 6;
+                let mut fields = Vec::new();
+                while position < tokens.len() {
+                    let field = match keyword(position).as_deref() {
+                        Some("KEY") => {
+                            position += 1;
+                            IndexFieldSpec::Key
+                        }
+                        Some("METADATA") => {
+                            let name = token(&tokens, position + 1)?.to_owned();
+                            position += 2;
+                            IndexFieldSpec::Metadata { name }
+                        }
+                        Some("JSON") => {
+                            let field = token(&tokens, position + 1)?.to_owned();
+                            position += 2;
+                            IndexFieldSpec::Projection {
+                                extractor: "json".to_owned(),
+                                version: 1,
+                                field,
+                            }
+                        }
+                        _ => {
+                            return Err(ControlError::Syntax(format!(
+                                "CREATE INDEX FIELDS accepts KEY, METADATA 'name', or JSON 'path' at position {}",
+                                position + 1
+                            )))
+                        }
+                    };
+                    fields.push(field);
+                    if position < tokens.len() {
+                        expect_keyword(&tokens, position, ",")?;
+                        position += 1;
+                    }
+                }
+                Ok(Command::DefineIndex {
+                    name: token(&tokens, 2)?.to_owned(),
+                    feed: token(&tokens, 4)?.to_owned(),
+                    fields,
+                    unique: false,
+                    collation: IndexCollation::Binary,
+                    consistency: IndexConsistency::Eventual,
+                })
+            }
             _ => Err(ControlError::Syntax(
-                "CREATE supports DOMAIN, FEED, WRITER, READER, SUBSCRIPTION, PIPE, and ROLE (SPACE is a compatibility alias)".to_owned(),
+                "CREATE supports DOMAIN, FEED, WRITER, READER, SUBSCRIPTION, PIPE, ROLE, and INDEX (SPACE is a compatibility alias)".to_owned(),
             )),
         },
         Some("OPEN") => {
@@ -3907,6 +4012,98 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                         "Writer session epoch must be an unsigned integer".to_owned(),
                     )
                 })?,
+            })
+        }
+        Some("GET") => {
+            expect_keyword(&tokens, 1, "INDEX")?;
+            let index = token(&tokens, 2)?.to_owned();
+            let mut position = 3;
+            let predicate = match keyword(position).as_deref() {
+                Some("EQ") => {
+                    position += 1;
+                    let (values, next) = parse_index_literal_list(&tokens, position)?;
+                    position = next;
+                    IndexQueryPredicate::Exact { values }
+                }
+                Some("PREFIX") => {
+                    position += 1;
+                    let (leading, next) = parse_index_literal_list(&tokens, position)?;
+                    position = next;
+                    let partial_text = if keyword(position).as_deref() == Some("MATCH") {
+                        let text = token(&tokens, position + 1)?.to_owned();
+                        position += 2;
+                        Some(text)
+                    } else {
+                        None
+                    };
+                    IndexQueryPredicate::Prefix {
+                        leading,
+                        partial_text,
+                    }
+                }
+                Some("RANGE") => {
+                    position += 1;
+                    let (lower, next) = parse_index_bound(&tokens, position)?;
+                    position = next;
+                    expect_keyword(&tokens, position, "TO")?;
+                    let (upper, next) = parse_index_bound(&tokens, position + 1)?;
+                    position = next;
+                    IndexQueryPredicate::Range {
+                        leading: Vec::new(),
+                        lower,
+                        upper,
+                    }
+                }
+                _ => {
+                    return Err(ControlError::Syntax(
+                        "GET INDEX supports EQ, PREFIX [.. MATCH 'text'], and RANGE <lo> TO <hi>"
+                            .to_owned(),
+                    ))
+                }
+            };
+            let mut limit = None;
+            let mut strict = false;
+            let mut wait_ms = None;
+            while position < tokens.len() {
+                match keyword(position).as_deref() {
+                    Some("LIMIT") => {
+                        limit = Some(
+                            token(&tokens, position + 1)?.parse::<usize>().map_err(|_| {
+                                ControlError::Syntax(
+                                    "GET INDEX LIMIT must be a positive integer".to_owned(),
+                                )
+                            })?,
+                        );
+                        position += 2;
+                    }
+                    Some("STRICT") => {
+                        strict = true;
+                        position += 1;
+                    }
+                    Some("WAIT") => {
+                        wait_ms = Some(
+                            token(&tokens, position + 1)?.parse::<u64>().map_err(|_| {
+                                ControlError::Syntax(
+                                    "GET INDEX WAIT must be milliseconds".to_owned(),
+                                )
+                            })?,
+                        );
+                        position += 2;
+                    }
+                    _ => {
+                        return Err(ControlError::Syntax(format!(
+                            "unexpected GET INDEX clause at position {}",
+                            position + 1
+                        )))
+                    }
+                }
+            }
+            Ok(Command::GetIndex {
+                index,
+                predicate,
+                limit,
+                strict,
+                wait_ms,
             })
         }
         Some("REBUILD") => match keyword(1).as_deref() {
@@ -4149,6 +4346,80 @@ fn parse_show_kind(token: &str) -> Result<ShowKind, ControlError> {
             "unsupported SHOW resource {token}"
         ))),
     }
+}
+
+/// One WCL literal inside a `GET INDEX` predicate: bare integers are
+/// `I64`, `TRUE`/`FALSE`/`NULL` map to their typed values, `B64 'data'`
+/// decodes base64 `Bytes`, and any other token is `Text`.
+fn parse_index_literal(
+    tokens: &[String],
+    position: usize,
+) -> Result<(IndexValue, usize), ControlError> {
+    let raw = token(tokens, position)?;
+    if raw.eq_ignore_ascii_case("B64") {
+        let encoded = token(tokens, position + 1)?;
+        let bytes =
+            base64::engine::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+                .map_err(|_| ControlError::Syntax("B64 literal is not valid base64".to_owned()))?;
+        return Ok((IndexValue::Bytes(bytes), position + 2));
+    }
+    if raw.eq_ignore_ascii_case("TEXT") {
+        return Ok((
+            IndexValue::Text(token(tokens, position + 1)?.to_owned()),
+            position + 2,
+        ));
+    }
+    if raw.eq_ignore_ascii_case("TRUE") {
+        return Ok((IndexValue::Bool(true), position + 1));
+    }
+    if raw.eq_ignore_ascii_case("FALSE") {
+        return Ok((IndexValue::Bool(false), position + 1));
+    }
+    if raw.eq_ignore_ascii_case("NULL") {
+        return Ok((IndexValue::Null, position + 1));
+    }
+    if let Ok(number) = raw.parse::<i64>() {
+        return Ok((IndexValue::I64(number), position + 1));
+    }
+    Ok((IndexValue::Text(raw.to_owned()), position + 1))
+}
+
+fn parse_index_literal_list(
+    tokens: &[String],
+    mut position: usize,
+) -> Result<(Vec<IndexValue>, usize), ControlError> {
+    let mut values = Vec::new();
+    loop {
+        let (value, next) = parse_index_literal(tokens, position)?;
+        values.push(value);
+        position = next;
+        if tokens.get(position).map(String::as_str) == Some(",") {
+            position += 1;
+            continue;
+        }
+        return Ok((values, position));
+    }
+}
+
+fn parse_index_bound(
+    tokens: &[String],
+    position: usize,
+) -> Result<(IndexBound, usize), ControlError> {
+    let raw = token(tokens, position)?;
+    if raw.eq_ignore_ascii_case("MIN") || raw.eq_ignore_ascii_case("MAX") {
+        return Err(ControlError::Syntax(
+            "open RANGE bounds (MIN/MAX) are not supported in WCL; use the typed query API"
+                .to_owned(),
+        ));
+    }
+    let (value, next) = parse_index_literal(tokens, position)?;
+    Ok((
+        IndexBound {
+            value,
+            inclusive: true,
+        },
+        next,
+    ))
 }
 
 fn parse_action(token: &str) -> Result<PermissionAction, ControlError> {
@@ -4932,6 +5203,7 @@ fn command_label(command: &Command) -> String {
         Command::DefineStateStore { .. } => "DEFINE STATE STORE",
         Command::DefineIndex { .. } => "DEFINE INDEX",
         Command::RebuildIndex { .. } => "REBUILD INDEX",
+        Command::GetIndex { .. } => "GET INDEX",
         Command::RebuildIndexesInDomain { .. } => "REBUILD INDEXES IN DOMAIN",
         Command::CompleteIndexBuild { .. } => "COMPLETE INDEX BUILD",
         Command::DefinePipe { .. } => "DEFINE PIPE",
@@ -6523,5 +6795,120 @@ mod tests {
         assert!(dropped.results[0]
             .message
             .contains("without purging stored history"));
+    }
+
+    #[test]
+    fn wcl_parses_create_index_and_get_index_predicates() {
+        // CREATE INDEX binds a logical name to a source Feed and typed fields.
+        let commands = parse_wcl(
+            "CREATE INDEX accounts.orders.by.customer ON accounts.orders FIELDS KEY, METADATA 'tenant', JSON 'customer.id';",
+        )
+        .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert!(matches!(
+            &commands[0],
+            Command::DefineIndex { name, feed, fields, unique: false, .. }
+                if name == "accounts.orders.by.customer"
+                    && feed == "accounts.orders"
+                    && fields.len() == 3
+        ));
+
+        // Exact predicate with mixed typed literals, limit, strict, wait.
+        let commands = parse_wcl(
+            "GET INDEX accounts.orders.by.customer EQ 42, 'it''s fine;', TRUE, NULL LIMIT 10 STRICT WAIT 250;",
+        )
+        .unwrap();
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            Command::GetIndex {
+                index,
+                predicate,
+                limit,
+                strict,
+                wait_ms,
+            } => {
+                assert_eq!(index, "accounts.orders.by.customer");
+                assert_eq!(*limit, Some(10));
+                assert!(*strict);
+                assert_eq!(*wait_ms, Some(250));
+                match predicate {
+                    IndexQueryPredicate::Exact { values } => {
+                        assert_eq!(
+                            *values,
+                            vec![
+                                IndexValue::I64(42),
+                                IndexValue::Text("it's fine;".to_owned()),
+                                IndexValue::Bool(true),
+                                IndexValue::Null,
+                            ]
+                        );
+                    }
+                    other => panic!("expected exact predicate, got {other:?}"),
+                }
+            }
+            other => panic!("expected GET INDEX, got {other:?}"),
+        }
+
+        // Prefix predicate: leading complete fields plus MATCH text.
+        let commands = parse_wcl("GET INDEX idx PREFIX 'US' MATCH 'ali'").unwrap();
+        match &commands[0] {
+            Command::GetIndex { predicate, .. } => match predicate {
+                IndexQueryPredicate::Prefix {
+                    leading,
+                    partial_text,
+                } => {
+                    assert_eq!(*leading, vec![IndexValue::Text("US".to_owned())]);
+                    assert_eq!(partial_text.as_deref(), Some("ali"));
+                }
+                other => panic!("expected prefix, got {other:?}"),
+            },
+            other => panic!("expected GET INDEX, got {other:?}"),
+        }
+
+        // Range predicate with inclusive integer bounds.
+        let commands = parse_wcl("GET INDEX idx RANGE 0 TO 100 LIMIT 5").unwrap();
+        match &commands[0] {
+            Command::GetIndex { predicate, .. } => match predicate {
+                IndexQueryPredicate::Range { lower, upper, .. } => {
+                    assert_eq!(
+                        *lower,
+                        IndexBound {
+                            value: IndexValue::I64(0),
+                            inclusive: true
+                        }
+                    );
+                    assert_eq!(
+                        *upper,
+                        IndexBound {
+                            value: IndexValue::I64(100),
+                            inclusive: true
+                        }
+                    );
+                }
+                other => panic!("expected range, got {other:?}"),
+            },
+            other => panic!("expected GET INDEX, got {other:?}"),
+        }
+
+        // TEXT literal forces string typing even for digits.
+        let commands = parse_wcl("GET INDEX idx EQ TEXT '42'").unwrap();
+        match &commands[0] {
+            Command::GetIndex { predicate, .. } => match predicate {
+                IndexQueryPredicate::Exact { values } => {
+                    assert_eq!(*values, vec![IndexValue::Text("42".to_owned())]);
+                }
+                other => panic!("expected exact, got {other:?}"),
+            },
+            other => panic!("expected GET INDEX, got {other:?}"),
+        }
+
+        // GET INDEX is read-only; the catalog never applies it.
+        assert!(commands[0].is_read_only());
+
+        // Errors are actionable.
+        assert!(parse_wcl("GET INDEX idx").is_err());
+        assert!(parse_wcl("GET INDEX idx FOO 1").is_err());
+        assert!(parse_wcl("GET INDEX idx RANGE 0").is_err());
+        assert!(parse_wcl("GET INDEX idx RANGE MIN TO 5").is_err());
     }
 }

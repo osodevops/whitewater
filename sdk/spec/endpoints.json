@@ -529,6 +529,44 @@
         "conflict(409) code=index_behind: strict freshness unreachable within the bounded wait"
       ],
       "notes": "primary-key point read; served locally when the ingress Node holds a replica, else forwarded over the authenticated internal read route; non-strict requests report freshness honestly via behind/applied_seq/committed_seq; strict requests wait (bounded) and return index_behind rather than serve a stale snapshot"
+    },
+    {
+      "op": "index.query",
+      "method": "POST",
+      "path": "/v1/indexes/query",
+      "auth": "admin (client-key scoped auth is future work)",
+      "request": {
+        "index": "logical Index name (space/feed-scoped catalog definition)",
+        "mode": "exact | prefix | range",
+        "values": "[typed] exact only: one per declared field ({kind: null|bool|i64|text|bytes, value|value_base64})",
+        "leading": "[typed] prefix/range only: leading exact-equal fields (default [])",
+        "partial_text": "string (prefix only; narrows the field after leading)",
+        "lower": "bound (range only: {value: typed, inclusive: bool default true})",
+        "upper": "bound (range only: {value: typed, inclusive: bool default true})",
+        "limit": "usize (optional, default 256, bounded 1..=1000; results cap at 16 MiB)",
+        "strict": "bool (optional; serving Node bounded-waits for its checkpoint to reach the activation frontier)",
+        "wait_ms": "u64 (optional, default 500, capped at 2000; bounds the strict freshness wait)"
+      },
+      "response": {
+        "index": "string (logical name)",
+        "index_id": "uuid",
+        "generation": "u64 (active generation that served)",
+        "rows": "[{key_base64, payload_base64}]",
+        "applied_cursor": "string|null (posting frontier materialized by the serving Node)",
+        "target_cursor": "string|null (committed activation frontier)",
+        "behind": "bool (applied_cursor lags target_cursor)",
+        "truncated": "bool (limit cut the result)",
+        "served_by": "string (Node identity that served)"
+      },
+      "errors": [
+        "refused(400) invalid predicate shape/width/limit or corrupt key encoding",
+        "not_found(404) code=index_not_found: unknown Index",
+        "conflict(409) code=index_not_ready: declared or building — activate a completed generation first",
+        "conflict(409) code=index_behind: strict freshness unreachable within the bounded wait",
+        "unavailable(503) no Node could serve the query",
+        "internal(500) code=index_corrupt: dangling posting or inconsistent primary row"
+      ],
+      "notes": "logical GET/exact/prefix/range over persisted Indexes; physical ranges/replicas stay hidden — ingress serves locally when it materializes the generation, else forwards (bounded) over the authenticated internal index/query route; strict waits and reports index_behind rather than serving a stale snapshot; WCL GET INDEX runs the identical data-plane path"
     }
   ]
 }

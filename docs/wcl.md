@@ -518,11 +518,18 @@ DESCRIBE INDEX orders.by.customer;
 
 ## Declare a secondary Index
 
-Secondary Indexes are declared through the typed Control Plane command
-surface (`POST /v1/admin/commands`), then inspected via `SHOW INDEXES;`
-and `DESCRIBE INDEX <name>;`. A definition is Domain-scoped, names its
-source Feed, and carries typed fields/extractors plus collation and
-consistency intent:
+Secondary Indexes are declared via WCL `CREATE INDEX` or the typed
+Control Plane command surface (`POST /v1/admin/commands`), then
+inspected via `SHOW INDEXES;` and `DESCRIBE INDEX <name>;`. WCL form:
+
+```sql
+CREATE INDEX orders.by.customer ON orders.created
+    FIELDS KEY, METADATA 'tenant', JSON 'customer.id';
+```
+
+The typed-command equivalent is Domain-scoped, names its source Feed,
+and carries the same fields/extractors plus collation and consistency
+intent:
 
 ```json
 {"command": "define_index",
@@ -563,9 +570,36 @@ idempotently. Nodes that activate before building locally keep applying
 committed history until their shadow covers the committed
 `applied_cursor`.
 
-Index **queries** are still not exposed — automatic routing, `GET`, and
-exact/prefix/range reads land with the query milestone. `SHOW INDEXES;`
-and `DESCRIBE INDEX <name>;` report `stage` (`declared`,
+Index **queries** are served by `GET INDEX` and the typed
+`POST /v1/indexes/query` endpoint — both resolve the logical Index name,
+select the `active` generation, and answer from materialized postings.
+The ingress Node serves locally when it holds the postings; under
+`STRICT` a Node still catching up to the activation frontier waits a
+bounded `WAIT` (default 500 ms, cap 2000 ms) and otherwise forwards to a
+fresher peer — or fails `index_behind` rather than serve stale data.
+Physical ranges and replica identity stay internal; the response reports
+`applied_cursor`, `target_cursor`, `behind`, and `served_by` for
+verifiable freshness.
+
+```sql
+GET INDEX orders.by.customer EQ 42, 'acme';
+GET INDEX orders.by.region PREFIX 'US' MATCH 'sea' LIMIT 100;
+GET INDEX orders.by.score RANGE 0 TO 500 STRICT WAIT 250;
+```
+
+Predicates: `EQ` supplies one typed literal per declared field
+(comma-separated); `PREFIX` matches leading complete fields plus an
+optional `MATCH 'text'` prefix on the next field; `RANGE` bounds the
+first field between inclusive `lo TO hi`. Literals are `42` (i64),
+`'text'` (quoted, `''` escapes a quote), `TEXT '42'` (force a digit
+string to text), `TRUE`/`FALSE`, `NULL`, and `B64 'aGk='` for raw bytes.
+`LIMIT` defaults to 256, bounded 1..=1000; result payloads cap at 16 MiB.
+A `GET INDEX` statement is read-only and cannot be mixed with mutating
+statements in one script; `declared`/`building` Indexes refuse with
+`index_not_ready` (HTTP 409) instead of returning a misleadingly empty
+result.
+
+`SHOW INDEXES;` and `DESCRIBE INDEX <name>;` report `stage` (`declared`,
 `{"building":{"generation":N}}`, or `{"active":{"generation":N}}`) and
 `applied_cursor`. `RENAME INDEX` and `DROP INDEX` work on declared
 definitions.
@@ -887,8 +921,6 @@ The next useful statements are:
 ```sql
 
 CREATE SUBSCRIPTION
-
-CREATE INDEX
 
 CREATE PIPE
 

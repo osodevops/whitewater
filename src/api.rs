@@ -432,6 +432,8 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             state.clone(),
             authorize_replica_append,
         ));
+    let index_query_route =
+        subscription_key_layer(post(index_query_internal).layer(DefaultBodyLimit::max(64 * 1024)));
     let catalog_snapshot_route = post(catalog_snapshot)
         .layer(DefaultBodyLimit::max(16 * 1024))
         .layer(middleware::from_fn_with_state(
@@ -456,6 +458,7 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             post(control_plane_full_snapshot),
         )
         .route("/internal/catalog/snapshot", catalog_snapshot_route)
+        .route("/internal/index/query", index_query_route)
         .route("/internal/control-plane/write", post(control_plane_write))
         .route(
             "/internal/control-plane/commands",
@@ -633,6 +636,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/state-stores/sync", post(state_store_sync))
         .route("/v1/state-stores/rebuild", post(state_store_rebuild))
         .route("/v1/state-stores/lookup", post(state_store_lookup))
+        .route("/v1/indexes/query", post(index_query))
         .route("/v1/writers/append", post(writer_session_append))
         .route("/v1/writers/append-batch", post(writer_batch_append))
         .route("/v1/readers/open", post(reader_open))
@@ -727,16 +731,21 @@ async fn execute_admin_wcl(
     authorize_admin(&state, &headers)?;
     let _request = state.demand.begin_request();
     let request_id = request.request_id.unwrap_or_else(Uuid::new_v4);
+    let commands = crate::control::parse_wcl(&request.script)?;
+    if let Some(execution) = evaluate_data_plane_reads(&state, commands.clone(), request_id).await?
+    {
+        return Ok(Json(execution));
+    }
     Ok(Json(match &state.control_plane {
         Some(control_plane) => {
             control_plane
-                .execute_wcl_with_request_id(&request.script, request_id)
+                .execute_commands_with_request_id(commands, request_id)
                 .await?
         }
         None => {
             state
                 .control
-                .execute_with_request_id(&request.script, request_id)
+                .execute_commands_with_request_id(commands, request_id)
                 .await?
         }
     }))
@@ -759,6 +768,11 @@ async fn execute_admin_commands(
     }
     let _request = state.demand.begin_request();
     let request_id = request.request_id.unwrap_or_else(Uuid::new_v4);
+    if let Some(execution) =
+        evaluate_data_plane_reads(&state, request.commands.clone(), request_id).await?
+    {
+        return Ok(Json(execution));
+    }
     Ok(Json(match &state.control_plane {
         Some(control_plane) => {
             control_plane
@@ -2555,6 +2569,660 @@ struct StateStoreLookupApiResponse {
     committed_seq: u64,
     behind: bool,
     served_by: String,
+}
+
+// ---------------------------------------------------------------------------
+// Logical Index queries
+// ---------------------------------------------------------------------------
+
+/// Default bounded wait for a strict Index read to observe its activation
+/// frontier locally (and the forwarded bound each peer waits).
+const INDEX_QUERY_DEFAULT_WAIT_MS: u64 = 500;
+/// Cap on the caller-supplied wait so a strict read can never pin a request.
+const INDEX_QUERY_MAX_WAIT_MS: u64 = 2_000;
+/// Maximum peer Nodes a strict query may forward to. The logical contract
+/// hides physical placement; the bound keeps scatter/gather predictable.
+const INDEX_QUERY_MAX_PEERS: usize = 8;
+
+fn index_query_inclusive() -> bool {
+    true
+}
+
+/// Wire form of one typed Index field value. Bytes travel base64 like every
+/// other binary field on the Admin API.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum IndexValueWire {
+    Null,
+    Bool { value: bool },
+    I64 { value: i64 },
+    Text { value: String },
+    Bytes { value_base64: String },
+}
+
+impl IndexValueWire {
+    fn into_value(self) -> Result<crate::index::IndexValue, ApiError> {
+        Ok(match self {
+            Self::Null => crate::index::IndexValue::Null,
+            Self::Bool { value } => crate::index::IndexValue::Bool(value),
+            Self::I64 { value } => crate::index::IndexValue::I64(value),
+            Self::Text { value } => crate::index::IndexValue::Text(value),
+            Self::Bytes { value_base64 } => {
+                crate::index::IndexValue::Bytes(decode_base64("value_base64", &value_base64)?)
+            }
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct IndexBoundWire {
+    value: IndexValueWire,
+    #[serde(default = "index_query_inclusive")]
+    inclusive: bool,
+}
+
+/// `POST /v1/indexes/query` request. `mode` selects the read shape:
+/// `exact` supplies every declared field, `prefix` matches leading fields
+/// plus an optional text prefix, `range` bounds the field after `leading`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct IndexQueryRequest {
+    index: String,
+    #[serde(flatten)]
+    mode: IndexQueryModeWire,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    strict: bool,
+    #[serde(default)]
+    wait_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum IndexQueryModeWire {
+    Exact {
+        values: Vec<IndexValueWire>,
+    },
+    Prefix {
+        #[serde(default)]
+        leading: Vec<IndexValueWire>,
+        #[serde(default)]
+        partial_text: Option<String>,
+    },
+    Range {
+        #[serde(default)]
+        leading: Vec<IndexValueWire>,
+        lower: IndexBoundWire,
+        upper: IndexBoundWire,
+    },
+}
+
+impl IndexQueryModeWire {
+    fn into_predicate(self) -> Result<crate::control::IndexQueryPredicate, ApiError> {
+        Ok(match self {
+            Self::Exact { values } => crate::control::IndexQueryPredicate::Exact {
+                values: values
+                    .into_iter()
+                    .map(IndexValueWire::into_value)
+                    .collect::<Result<_, _>>()?,
+            },
+            Self::Prefix {
+                leading,
+                partial_text,
+            } => crate::control::IndexQueryPredicate::Prefix {
+                leading: leading
+                    .into_iter()
+                    .map(IndexValueWire::into_value)
+                    .collect::<Result<_, _>>()?,
+                partial_text,
+            },
+            Self::Range {
+                leading,
+                lower,
+                upper,
+            } => crate::control::IndexQueryPredicate::Range {
+                leading: leading
+                    .into_iter()
+                    .map(IndexValueWire::into_value)
+                    .collect::<Result<_, _>>()?,
+                lower: crate::control::IndexBound {
+                    value: lower.value.into_value()?,
+                    inclusive: lower.inclusive,
+                },
+                upper: crate::control::IndexBound {
+                    value: upper.value.into_value()?,
+                    inclusive: upper.inclusive,
+                },
+            },
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct IndexQueryRow {
+    key_base64: String,
+    payload_base64: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct IndexQueryResponse {
+    index: String,
+    index_id: Uuid,
+    generation: u64,
+    rows: Vec<IndexQueryRow>,
+    /// Frontier this Node's materialized postings have applied, as recorded
+    /// by the generation's durable checkpoint.
+    applied_cursor: Option<String>,
+    /// Frontier the catalog committed when the generation activated.
+    target_cursor: Option<String>,
+    /// True when the serving Node's postings lag the activation frontier.
+    behind: bool,
+    /// True when `limit` cut the result; callers narrow the predicate.
+    truncated: bool,
+    served_by: String,
+}
+
+fn index_store_api_error(error: crate::index::IndexStoreError) -> ApiError {
+    match error {
+        crate::index::IndexStoreError::InvalidLimit
+        | crate::index::IndexStoreError::QueryTooLarge
+        | crate::index::IndexStoreError::Key(_) => ApiError::bad_request(error.to_string()),
+        crate::index::IndexStoreError::DanglingPosting
+        | crate::index::IndexStoreError::CorruptPrimary => ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("Index postings failed verification: {error}"),
+            code: Some("index_corrupt"),
+        },
+        other => ApiError::unavailable(other.to_string()),
+    }
+}
+
+/// Answer one `GET INDEX` / `POST /v1/indexes/query` request against the
+/// Node-local Index engine. Resolves the logical Index name, fences on the
+/// catalog-persisted build stage, waits (bounded) for the activation
+/// frontier under `strict`, then runs the typed predicate against the
+/// active generation's postings.
+async fn index_query_local(
+    state: &AppState,
+    index_name: &str,
+    predicate: &crate::control::IndexQueryPredicate,
+    limit: usize,
+    strict: bool,
+    wait_ms: u64,
+) -> Result<IndexQueryResponse, ApiError> {
+    let definition = state
+        .control
+        .declared_index_by_name(index_name)
+        .await
+        .ok_or_else(|| ApiError {
+            status: StatusCode::NOT_FOUND,
+            message: format!("Index does not exist: {index_name}"),
+            code: Some("index_not_found"),
+        })?;
+    let generation = match definition.stage {
+        crate::control::IndexBuildStage::Active { generation } => generation,
+        ref stage => {
+            let stage_label = match stage {
+                crate::control::IndexBuildStage::Declared => "declared (no build has run)",
+                crate::control::IndexBuildStage::Building { .. } => {
+                    "building (a generation is materializing)"
+                }
+                crate::control::IndexBuildStage::Active { .. } => unreachable!(),
+            };
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: format!(
+                    "Index {index_name} is {stage_label}; activate a completed build before querying"
+                ),
+                code: Some("index_not_ready"),
+            });
+        }
+    };
+    let index = state
+        .state_store_journal
+        .as_ref()
+        .and_then(|service| service.index_store())
+        .ok_or_else(|| ApiError::unavailable("this Node does not materialize Index postings"))?;
+    let field_count = definition.fields.len();
+    match predicate {
+        crate::control::IndexQueryPredicate::Exact { values } if values.len() != field_count => {
+            return Err(ApiError::bad_request(format!(
+                "exact lookup requires {field_count} values (one per declared field), got {}",
+                values.len()
+            )));
+        }
+        crate::control::IndexQueryPredicate::Exact { .. } => {}
+        crate::control::IndexQueryPredicate::Prefix {
+            leading,
+            partial_text,
+        } => {
+            let width = leading.len() + usize::from(partial_text.is_some());
+            if leading.len() >= field_count || width > field_count {
+                return Err(ApiError::bad_request(format!(
+                    "prefix lookup may bound at most {field_count} leading fields, got {width}"
+                )));
+            }
+        }
+        crate::control::IndexQueryPredicate::Range { leading, .. } => {
+            if leading.len() >= field_count {
+                return Err(ApiError::bad_request(format!(
+                    "range lookup leaves no field to bound: {} leading values for {field_count} fields",
+                    leading.len()
+                )));
+            }
+        }
+    };
+    let shadow = crate::index::shadow_index_id(definition.index_id, generation);
+    let target = definition.applied_cursor.clone();
+    let wait_ms = wait_ms.min(INDEX_QUERY_MAX_WAIT_MS);
+    // Under strict, bounded-wait for this Node's checkpoint to reach the
+    // activation frontier before reading — the catalog committed the target
+    // cursor, so a materializing Node converges there.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    let index_read = index.clone();
+    let predicate = predicate.clone();
+    if strict {
+        // Bounded-wait for the checkpoint; filesystem reads stay off the
+        // Tokio executor.
+        let index_wait = index.clone();
+        loop {
+            let index_wait = index_wait.clone();
+            let frontier = tokio::task::spawn_blocking(move || index_wait.last_applied(shadow))
+                .await
+                .map_err(|_| ApiError::unavailable("Index freshness check did not complete"))?
+                .map_err(index_store_api_error)?;
+            if frontier.as_deref() == target.as_deref() || std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+    let rows = tokio::task::spawn_blocking(move || match &predicate {
+        crate::control::IndexQueryPredicate::Exact { values } => {
+            index_read.lookup_exact(shadow, values, limit)
+        }
+        crate::control::IndexQueryPredicate::Prefix {
+            leading,
+            partial_text,
+        } => index_read.lookup_prefix(shadow, leading, partial_text.as_deref(), limit),
+        crate::control::IndexQueryPredicate::Range {
+            leading,
+            lower,
+            upper,
+        } => index_read.lookup_range(
+            shadow,
+            leading,
+            if lower.inclusive {
+                std::ops::Bound::Included(lower.value.clone())
+            } else {
+                std::ops::Bound::Excluded(lower.value.clone())
+            },
+            if upper.inclusive {
+                std::ops::Bound::Included(upper.value.clone())
+            } else {
+                std::ops::Bound::Excluded(upper.value.clone())
+            },
+            limit,
+        ),
+    })
+    .await
+    .map_err(|_| ApiError::unavailable("Index query task did not complete"))?
+    .map_err(index_store_api_error)?;
+    let frontier = index.last_applied(shadow).map_err(index_store_api_error)?;
+    let behind = frontier.as_deref() != target.as_deref();
+    Ok(IndexQueryResponse {
+        index: definition.name.clone(),
+        index_id: definition.index_id,
+        generation,
+        truncated: rows.len() == limit,
+        rows: rows
+            .into_iter()
+            .map(|row| IndexQueryRow {
+                key_base64: STANDARD.encode(&row.reference.application_key),
+                payload_base64: STANDARD.encode(&row.payload),
+            })
+            .collect(),
+        applied_cursor: frontier,
+        target_cursor: target,
+        behind,
+        served_by: state
+            .storage_node_id
+            .as_ref()
+            .map(|node| node.to_string())
+            .unwrap_or_else(|| state.membership.local().node_id.clone()),
+    })
+}
+
+/// POST one query to a peer Node's internal Index query route. Shared-key
+/// on the plain internal plane, pinned identity on the mTLS plane — the
+/// same credentials the data-plane replica routes use.
+async fn post_internal_index_query(
+    state: &AppState,
+    node: &StorageNodeId,
+    request: &IndexQueryRequest,
+) -> Result<IndexQueryResponse, ApiError> {
+    let endpoint = state
+        .control_endpoints
+        .resolve(node)
+        .await
+        .ok_or_else(|| ApiError::unavailable(format!("Node {node} endpoint is unavailable")))?;
+    let url = format!("{}/internal/index/query", endpoint.trim_end_matches('/'));
+    let response = match &state.internal_mtls {
+        Some(material) => {
+            let ca = reqwest::Certificate::from_pem(&material.ca_pem)
+                .map_err(|_| ApiError::unavailable("internal mTLS CA is invalid"))?;
+            let identity = reqwest::Identity::from_pem(&material.identity_pem)
+                .map_err(|_| ApiError::unavailable("internal mTLS identity is invalid"))?;
+            reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(1))
+                .timeout(std::time::Duration::from_secs(5))
+                .https_only(true)
+                .tls_built_in_root_certs(false)
+                .add_root_certificate(ca)
+                .identity(identity)
+                .build()
+                .map_err(|_| ApiError::unavailable("internal mTLS client failed to build"))?
+                .post(url)
+                .json(request)
+                .send()
+                .await
+        }
+        None => {
+            let key = state
+                .internal_key
+                .clone()
+                .ok_or_else(|| ApiError::unavailable("internal credential is not configured"))?;
+            state
+                .internal_http
+                .post(url)
+                .header("x-whitewater-control-key", key)
+                .json(request)
+                .send()
+                .await
+        }
+    }
+    .map_err(|error| ApiError::unavailable(format!("Node {node}: {error}")))?;
+    if response.status() == StatusCode::CONFLICT {
+        let body: serde_json::Value = response.json().await.unwrap_or_default();
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: body
+                .get("message")
+                .and_then(|value| value.as_str())
+                .unwrap_or("peer Index is behind or not ready")
+                .to_owned(),
+            code: match body.get("code").and_then(|value| value.as_str()) {
+                Some("index_behind") => Some("index_behind"),
+                Some("index_not_ready") => Some("index_not_ready"),
+                _ => None,
+            },
+        });
+    }
+    if !response.status().is_success() {
+        return Err(ApiError::unavailable(format!(
+            "Node {node} rejected the Index query ({})",
+            response.status()
+        )));
+    }
+    response
+        .json()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))
+}
+
+/// `POST /v1/indexes/query` — logical GET/exact/prefix/range against the
+/// active Index generation. The local Node answers when it materializes the
+/// postings; under `strict` a still-catching-up Node forwards (bounded) to
+/// peers until one reaches the activation frontier, else `index_behind`.
+async fn index_query(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<IndexQueryRequest>,
+) -> Result<Json<IndexQueryResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let predicate = request.mode.clone().into_predicate()?;
+    run_index_query(
+        &state,
+        &request.index,
+        &predicate,
+        request.limit.unwrap_or(256),
+        request.strict,
+        request.wait_ms.unwrap_or(INDEX_QUERY_DEFAULT_WAIT_MS),
+    )
+    .await
+    .map(Json)
+}
+
+/// `POST /internal/index/query` — peer-forwarded Index read. Answers from
+/// local materialized postings only; the forwarding bound lives on the
+/// ingress Node so a query can never fan out recursively.
+async fn index_query_internal(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<IndexQueryRequest>,
+) -> Result<Json<IndexQueryResponse>, ApiError> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let predicate = request.mode.clone().into_predicate()?;
+    index_query_local(
+        &state,
+        &request.index,
+        &predicate,
+        request.limit.unwrap_or(256),
+        request.strict,
+        request.wait_ms.unwrap_or(INDEX_QUERY_DEFAULT_WAIT_MS),
+    )
+    .await
+    .map(Json)
+}
+
+async fn run_index_query(
+    state: &AppState,
+    index_name: &str,
+    predicate: &crate::control::IndexQueryPredicate,
+    limit: usize,
+    strict: bool,
+    wait_ms: u64,
+) -> Result<IndexQueryResponse, ApiError> {
+    match index_query_local(state, index_name, predicate, limit, strict, wait_ms).await {
+        Ok(response) if !(strict && response.behind) => return Ok(response),
+        Ok(response) => response,
+        Err(error)
+            if error.status == StatusCode::NOT_FOUND || error.status == StatusCode::BAD_REQUEST =>
+        {
+            return Err(error)
+        }
+        Err(error) => {
+            let last_error = error;
+            let mut peers: Vec<StorageNodeId> = state
+                .control_endpoints
+                .all()
+                .await
+                .into_keys()
+                .filter(|node| state.storage_node_id.as_ref() != Some(node))
+                .take(INDEX_QUERY_MAX_PEERS)
+                .collect();
+            peers.sort();
+            for peer in peers {
+                let wire = index_query_wire_request(index_name, predicate, limit, strict, wait_ms);
+                match post_internal_index_query(state, &peer, &wire).await {
+                    Ok(response) if !(strict && response.behind) => return Ok(response),
+                    Ok(_) | Err(_) => {
+                        continue;
+                    }
+                }
+            }
+            return Err(last_error);
+        }
+    };
+    // Strict path: local postings lag the activation frontier. Try bounded
+    // peer reads; a peer waits its own bound and may answer fresh.
+    let mut last_error = ApiError {
+        status: StatusCode::CONFLICT,
+        message: "no Node materialized the Index at its activation frontier".to_owned(),
+        code: Some("index_behind"),
+    };
+    let mut peers: Vec<StorageNodeId> = state
+        .control_endpoints
+        .all()
+        .await
+        .into_keys()
+        .filter(|node| state.storage_node_id.as_ref() != Some(node))
+        .take(INDEX_QUERY_MAX_PEERS)
+        .collect();
+    peers.sort();
+    for peer in peers {
+        let wire = index_query_wire_request(index_name, predicate, limit, strict, wait_ms);
+        match post_internal_index_query(state, &peer, &wire).await {
+            Ok(response) if !response.behind => return Ok(response),
+            Ok(response) => {
+                last_error = ApiError {
+                    status: StatusCode::CONFLICT,
+                    message: format!(
+                        "Node {peer} applied cursor {:?} lags activation frontier {:?}",
+                        response.applied_cursor, response.target_cursor
+                    ),
+                    code: Some("index_behind"),
+                };
+            }
+            Err(error) => last_error = error,
+        }
+    }
+    Err(last_error)
+}
+
+/// Intercept `GET INDEX` statements before the catalog executes them: the
+/// catalog never materializes postings, so data-plane reads are answered by
+/// the local Index engine (or a peer under strict). Returns `Ok(None)`
+/// when no statement needs the data plane. A script mixing `GET INDEX`
+/// with mutations is refused — reads in it could not observe the committed
+/// outcome of sibling writes.
+async fn evaluate_data_plane_reads(
+    state: &AppState,
+    commands: Vec<crate::control::Command>,
+    request_id: Uuid,
+) -> Result<Option<crate::control::ControlExecution>, ApiError> {
+    if !commands
+        .iter()
+        .any(|command| matches!(command, crate::control::Command::GetIndex { .. }))
+    {
+        return Ok(None);
+    }
+    if !commands.iter().all(|command| command.is_read_only()) {
+        return Err(ApiError::bad_request(
+            "GET INDEX cannot be combined with mutating statements in one request",
+        ));
+    }
+    let mut results = Vec::with_capacity(commands.len());
+    for command in commands {
+        match command {
+            crate::control::Command::GetIndex {
+                index,
+                predicate,
+                limit,
+                strict,
+                wait_ms,
+            } => {
+                let response = run_index_query(
+                    state,
+                    &index,
+                    &predicate,
+                    limit.unwrap_or(256),
+                    strict,
+                    wait_ms.unwrap_or(INDEX_QUERY_DEFAULT_WAIT_MS),
+                )
+                .await?;
+                results.push(crate::control::StatementResult {
+                    statement: "GET INDEX".to_owned(),
+                    message: format!("Index {index} query returned {} rows", response.rows.len()),
+                    data: serde_json::to_value(&response).unwrap_or_else(|_| serde_json::json!({})),
+                });
+            }
+            other => {
+                let result = match &state.control_plane {
+                    Some(control_plane) => control_plane
+                        .execute_commands_with_request_id(vec![other], request_id)
+                        .await?
+                        .results
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            ApiError::unavailable("Control Plane returned no statement result")
+                        })?,
+                    None => state.control.execute_query(other).await?,
+                };
+                results.push(result);
+            }
+        }
+    }
+    let (authority, warning) = match &state.control_plane {
+        Some(_) => ("control_plane".to_owned(), String::new()),
+        None => (
+            "local_prototype".to_owned(),
+            "Catalog state is local to this Node and is not replicated authority until the Control Plane is implemented.".to_owned(),
+        ),
+    };
+    Ok(Some(crate::control::ControlExecution {
+        request_id,
+        revision: state.control.revision().await,
+        authority,
+        warning,
+        results,
+    }))
+}
+
+fn index_query_wire_request(
+    index_name: &str,
+    predicate: &crate::control::IndexQueryPredicate,
+    limit: usize,
+    strict: bool,
+    wait_ms: u64,
+) -> IndexQueryRequest {
+    let mode = match predicate {
+        crate::control::IndexQueryPredicate::Exact { values } => IndexQueryModeWire::Exact {
+            values: values.iter().cloned().map(index_value_wire).collect(),
+        },
+        crate::control::IndexQueryPredicate::Prefix {
+            leading,
+            partial_text,
+        } => IndexQueryModeWire::Prefix {
+            leading: leading.iter().cloned().map(index_value_wire).collect(),
+            partial_text: partial_text.clone(),
+        },
+        crate::control::IndexQueryPredicate::Range {
+            leading,
+            lower,
+            upper,
+        } => IndexQueryModeWire::Range {
+            leading: leading.iter().cloned().map(index_value_wire).collect(),
+            lower: IndexBoundWire {
+                value: index_value_wire(lower.value.clone()),
+                inclusive: lower.inclusive,
+            },
+            upper: IndexBoundWire {
+                value: index_value_wire(upper.value.clone()),
+                inclusive: upper.inclusive,
+            },
+        },
+    };
+    IndexQueryRequest {
+        index: index_name.to_owned(),
+        mode,
+        limit: Some(limit),
+        strict,
+        wait_ms: Some(wait_ms),
+    }
+}
+
+fn index_value_wire(value: crate::index::IndexValue) -> IndexValueWire {
+    match value {
+        crate::index::IndexValue::Null => IndexValueWire::Null,
+        crate::index::IndexValue::Bool(value) => IndexValueWire::Bool { value },
+        crate::index::IndexValue::I64(value) => IndexValueWire::I64 { value },
+        crate::index::IndexValue::Text(value) => IndexValueWire::Text { value },
+        crate::index::IndexValue::Bytes(bytes) => IndexValueWire::Bytes {
+            value_base64: STANDARD.encode(bytes),
+        },
+    }
 }
 
 /// `POST /v1/state-stores/lookup` — point lookup on a StateStore's primary
@@ -9169,6 +9837,333 @@ mod tests {
                 "local shadow frontier matches the activated cursor"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn index_query_routes_logically_over_exact_prefix_range_and_wcl() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let nodes: Vec<crate::active_range::StorageNodeId> =
+            ["storage-1", "storage-2", "storage-3"]
+                .into_iter()
+                .map(|name| crate::active_range::StorageNodeId::try_new(name).unwrap())
+                .collect();
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store.clone(),
+                nodes.clone(),
+            )
+            .unwrap(),
+        );
+        control
+            .execute("CREATE SPACE orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        control
+            .execute_commands(vec![Command::DefineIndex {
+                name: "orders.events.by.key".to_owned(),
+                feed: "orders.events".to_owned(),
+                fields: vec![crate::control::IndexFieldSpec::Key],
+                unique: false,
+                collation: crate::control::IndexCollation::Binary,
+                consistency: crate::control::IndexConsistency::Eventual,
+            }])
+            .await
+            .unwrap();
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        let range = control.active_range_assignment(feed.feed_id).await.unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id: feed.feed_id,
+            range_id: range.range_id,
+            generation: range.generation,
+            ownership_epoch: range.ownership_epoch,
+        };
+        for replica in range.replicas.iter() {
+            let index = nodes.iter().position(|node| node == replica).unwrap();
+            crate::active_range::store::seed_committed_history_shaped(
+                &directory.path().join(format!("ranges-{index}")),
+                &descriptor,
+                4,
+                &|sequence| format!("user-{sequence}").into_bytes(),
+                &|sequence| sequence as i64,
+                8,
+            );
+        }
+
+        let control_key = "this-is-a-long-control-plane-key".to_owned();
+        let mut listeners = Vec::new();
+        let mut endpoints = BTreeMap::new();
+        for node in &nodes {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            endpoints.insert(
+                node.clone(),
+                format!("http://{}", listener.local_addr().unwrap()),
+            );
+            listeners.push(listener);
+        }
+        let mut states = Vec::new();
+        for (index, node) in nodes.iter().enumerate() {
+            let listener = listeners.remove(0);
+            listener.set_nonblocking(true).unwrap();
+            let journal = Arc::new(
+                crate::state_store::FjallStateStoreMutationJournal::open(
+                    directory.path().join(format!("journal-{index}")),
+                )
+                .unwrap(),
+            );
+            let index_store: Arc<dyn crate::index::IndexStore> = Arc::new(
+                crate::index::FjallIndexStore::open(
+                    directory.path().join(format!("index-{index}")),
+                )
+                .unwrap(),
+            );
+            let membership = Arc::new(MembershipService::new(
+                MemberAnnouncement {
+                    node_id: format!("test-node-{index}"),
+                    api_url: "http://test-node:7070".to_owned(),
+                    capacity: 100,
+                },
+                vec![],
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            ));
+            let state = AppState {
+                store: store.clone(),
+                membership,
+                demand: DemandMetrics::default(),
+                autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                control: control.clone(),
+                control_plane: None,
+                progress_authority: control.clone(),
+                replica_append: Some(Arc::new(ReplicaAppendService::new(
+                    directory.path().join(format!("ranges-{index}")),
+                    node.clone(),
+                    control.clone(),
+                ))),
+                majority_append: None,
+                subscription_progress: None,
+                effect_journal: None,
+                state_store_journal: Some(Arc::new(
+                    crate::state_store::StateStoreMutationService::new(
+                        node.clone(),
+                        control.clone(),
+                        journal,
+                        Arc::new(crate::state_store::IndexStoreStateApply::new(
+                            index_store.clone(),
+                        )),
+                    ),
+                )),
+                subscription_mtls_enabled: false,
+                storage_node_id: Some(node.clone()),
+                control_endpoints: Arc::new(endpoints.clone().into()),
+                internal_key: Some(control_key.clone()),
+                internal_http: reqwest::Client::new(),
+                internal_mtls: None,
+                admin_auth: AdminAuthenticator::new(Some(
+                    "this-is-a-long-development-api-key".to_owned(),
+                ))
+                .unwrap(),
+            };
+            states.push(state.clone());
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, router(state)).await.unwrap();
+            });
+        }
+
+        let client = reqwest::Client::new();
+        let admin = "this-is-a-long-development-api-key";
+        let user1 = STANDARD.encode(b"user-1");
+
+        // A declared-but-unbuilt Index refuses honestly rather than serving
+        // an empty result set.
+        let response = client
+            .post(format!("{}/v1/indexes/query", endpoints[&nodes[0]]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "index": "orders.events.by.key",
+                "mode": "exact",
+                "values": [{"kind": "bytes", "value_base64": user1}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["code"],
+            "index_not_ready"
+        );
+
+        // An unknown Index is a 404 with an actionable code.
+        let response = client
+            .post(format!("{}/v1/indexes/query", endpoints[&nodes[0]]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "index": "orders.events.missing",
+                "mode": "exact",
+                "values": [{"kind": "bytes", "value_base64": user1}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Mixing a data-plane read with a mutation is refused outright.
+        let response = client
+            .post(format!("{}/v1/control/execute", endpoints[&nodes[0]]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "script": "GET INDEX orders.events.by.key EQ B64 'dXNlci0x'; CREATE FEED orders.other;",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Build + activate generation 1: only the first Node drives, so the
+        // other two legitimately lag the activation frontier.
+        let response = client
+            .post(format!("{}/v1/control/execute", endpoints[&nodes[0]]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "script": "REBUILD INDEX orders.events.by.key;",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let outcomes = drive_local_index_builds(&states[0], 64).await;
+        assert!(outcomes.iter().any(|outcome| matches!(
+            outcome,
+            IndexBuildDriveOutcome::Activated { .. } | IndexBuildDriveOutcome::Building { .. }
+        )));
+        let definition = control
+            .declared_index_by_name("orders.events.by.key")
+            .await
+            .unwrap();
+        assert!(matches!(
+            definition.stage,
+            crate::control::IndexBuildStage::Active { generation: 1 }
+        ));
+
+        // Exact lookup on the builder Node.
+        let response = client
+            .post(format!("{}/v1/indexes/query", endpoints[&nodes[0]]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "index": "orders.events.by.key",
+                "mode": "exact",
+                "values": [{"kind": "bytes", "value_base64": STANDARD.encode(b"user-2")}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(body["behind"], false);
+        assert_eq!(body["served_by"], "storage-1");
+        assert_eq!(
+            body["rows"][0]["key_base64"].as_str().unwrap(),
+            STANDARD.encode(b"user-2")
+        );
+
+        // Prefix with no leading values pages the whole generation.
+        let response = client
+            .post(format!("{}/v1/indexes/query", endpoints[&nodes[0]]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "index": "orders.events.by.key",
+                "mode": "prefix",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["rows"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+
+        // Range over the single Bytes field respects byte ordering.
+        let response = client
+            .post(format!("{}/v1/indexes/query", endpoints[&nodes[0]]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "index": "orders.events.by.key",
+                "mode": "range",
+                "lower": {"value": {"kind": "bytes", "value_base64": STANDARD.encode(b"user-2")}, "inclusive": true},
+                "upper": {"value": {"kind": "bytes", "value_base64": STANDARD.encode(b"user-3")}, "inclusive": true},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+
+        // Non-strict ingress on a lagging Node answers honestly: behind=true.
+        let response = client
+            .post(format!("{}/v1/indexes/query", endpoints[&nodes[2]]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "index": "orders.events.by.key",
+                "mode": "exact",
+                "values": [{"kind": "bytes", "value_base64": user1}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["behind"], true);
+        assert_eq!(body["served_by"], "storage-3");
+
+        // Strict on the same lagging Node waits its bound, then forwards to
+        // the builder peer which answers at the activation frontier.
+        let response = client
+            .post(format!("{}/v1/indexes/query", endpoints[&nodes[2]]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "index": "orders.events.by.key",
+                "mode": "exact",
+                "values": [{"kind": "bytes", "value_base64": user1}],
+                "strict": true,
+                "wait_ms": 50,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["behind"], false);
+        assert_eq!(body["served_by"], "storage-1");
+        assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+
+        // WCL GET INDEX runs the same data-plane path through the control
+        // endpoint and reports rows in the statement result.
+        let response = client
+            .post(format!("{}/v1/control/execute", endpoints[&nodes[0]]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "script": "GET INDEX orders.events.by.key EQ B64 'dXNlci0x' LIMIT 5;",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["results"].as_array().unwrap().len(), 1);
+        assert_eq!(body["results"][0]["statement"], "GET INDEX");
+        assert_eq!(
+            body["results"][0]["data"]["rows"].as_array().unwrap().len(),
+            1
+        );
     }
 
     #[tokio::test]
