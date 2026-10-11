@@ -1,0 +1,59 @@
+{
+  "scenario": "reader-fetch-ack-resume",
+  "requires": ["admin.wcl", "writer.append", "reader.open", "reader.fetch", "reader.ack", "reader.close"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN sdk{{uniq}}; CREATE FEED sdk{{uniq}}.events; CREATE WRITER wr{{uniq}} TO sdk{{uniq}}.events; OPEN WRITER SESSION wr{{uniq}}; CREATE READER rd{{uniq}} FROM sdk{{uniq}}.events START AT BEGINNING;"
+      },
+      "bind": "setup"
+    },
+    {
+      "op": "writer.append_batch",
+      "args": {
+        "records": [
+          {"request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "k1"}, "payload": {"utf8": "a"}, "event_time_ns": "1700000000000000001"},
+          {"request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "k1"}, "payload": {"utf8": "b"}, "event_time_ns": "1700000000000000002"},
+          {"request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "k2"}, "payload": {"utf8": "c"}, "event_time_ns": "1700000000000000003"}
+        ]
+      },
+      "bind": "appends"
+    },
+    {
+      "op": "reader.open",
+      "args": {"request_id": "{{uuid}}", "reader": "rd{{uniq}}", "capacity": 64},
+      "bind": "open",
+      "expect": {"session_epoch": "!=null", "reader_id": "!=null"}
+    },
+    {
+      "op": "reader.fetch",
+      "args": {"request_id": "{{uuid}}", "reader": "rd{{uniq}}", "session_epoch": "{{open.session_epoch}}", "limit": 2},
+      "bind": "page1",
+      "expect": {"records": "len>=1", "delivered_cursor": "!=null"}
+    },
+    {
+      "op": "reader.ack",
+      "args": {"request_id": "{{uuid}}", "reader": "rd{{uniq}}", "session_epoch": "{{open.session_epoch}}", "cursor": "{{page1.delivered_cursor}}"},
+      "bind": "ack",
+      "expect": {"acknowledged_cursor": "==page1.delivered_cursor"}
+    },
+    {
+      "op": "reader.close",
+      "args": {"request_id": "{{uuid}}", "reader": "rd{{uniq}}", "session_epoch": "{{open.session_epoch}}"},
+      "bind": "closed"
+    },
+    {
+      "op": "reader.open",
+      "args": {"request_id": "{{uuid}}", "reader": "rd{{uniq}}", "capacity": 64},
+      "bind": "reopen",
+      "expect": {"acknowledged_cursor": "==page1.delivered_cursor"}
+    },
+    {
+      "op": "reader.fetch",
+      "args": {"request_id": "{{uuid}}", "reader": "rd{{uniq}}", "session_epoch": "{{reopen.session_epoch}}", "limit": 8},
+      "bind": "page2",
+      "expect": {"records": "len>=1"}
+    }
+  ]
+}

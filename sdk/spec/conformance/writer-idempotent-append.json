@@ -1,0 +1,79 @@
+{
+  "scenario": "writer-idempotent-append",
+  "requires": ["admin.wcl", "writer.append", "writer.append_batch"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN sdk{{uniq}}; CREATE FEED sdk{{uniq}}.events; CREATE WRITER wr{{uniq}} TO sdk{{uniq}}.events; OPEN WRITER SESSION wr{{uniq}};"
+      },
+      "bind": "setup"
+    },
+    {
+      "op": "writer.append",
+      "args": {
+        "request_id": "{{uuid:append1}}",
+        "writer": "wr{{uniq}}",
+        "session_epoch": "{{setup.results[3].data.session_epoch}}",
+        "key": {"utf8": "order-1"},
+        "payload": {"utf8": "created"},
+        "event_time_ns": "1700000000000000001",
+        "metadata": {"source": {"utf8": "conformance"}}
+      },
+      "bind": "first",
+      "expect": {
+        "deduplicated": false,
+        "cursor": "!=null",
+        "message_id": "!=null",
+        "feedback.hot_key": false
+      }
+    },
+    {
+      "op": "writer.append",
+      "args": {
+        "request_id": "{{uuid:append1}}",
+        "writer": "wr{{uniq}}",
+        "session_epoch": "{{setup.results[3].data.session_epoch}}",
+        "key": {"utf8": "order-1"},
+        "payload": {"utf8": "created"},
+        "event_time_ns": "1700000000000000001",
+        "metadata": {"source": {"utf8": "conformance"}}
+      },
+      "bind": "retry",
+      "expect": {
+        "deduplicated": true,
+        "cursor": "==first.cursor",
+        "message_id": "==first.message_id"
+      }
+    },
+    {
+      "op": "writer.append_batch",
+      "args": {
+        "records": [
+          {
+            "request_id": "{{uuid}}",
+            "writer": "wr{{uniq}}",
+            "session_epoch": "{{setup.results[3].data.session_epoch}}",
+            "key": {"utf8": "order-1"},
+            "payload": {"utf8": "b1"},
+            "event_time_ns": "1700000000000000002"
+          },
+          {
+            "request_id": "{{uuid}}",
+            "writer": "wr{{uniq}}",
+            "session_epoch": "{{setup.results[3].data.session_epoch}}",
+            "key": {"utf8": "order-2"},
+            "payload": {"utf8": "b2"},
+            "event_time_ns": "1700000000000000003"
+          }
+        ]
+      },
+      "expect": {
+        "results": "len>=2",
+        "results[0].cursor": "!=null",
+        "results[1].cursor": "!=null",
+        "feedback.hot_key": false
+      }
+    }
+  ]
+}

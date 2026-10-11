@@ -1,0 +1,69 @@
+{
+  "scenario": "subscription-member-drain",
+  "requires": ["admin.wcl", "writer.append_batch", "member.join", "member.claim", "member.fetch", "member.ack", "member.release"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN sdk{{uniq}}; CREATE FEED sdk{{uniq}}.events; CREATE WRITER wr{{uniq}} TO sdk{{uniq}}.events; OPEN WRITER SESSION wr{{uniq}}; CREATE SUBSCRIPTION sdk{{uniq}}.sub FROM sdk{{uniq}}.events START AT BEGINNING;"
+      },
+      "bind": "setup"
+    },
+    {
+      "op": "writer.append_batch",
+      "args": {
+        "records": [
+          {"request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "k1"}, "payload": {"utf8": "m1"}, "event_time_ns": "1700000000000000001"},
+          {"request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "k2"}, "payload": {"utf8": "m2"}, "event_time_ns": "1700000000000000002"}
+        ]
+      },
+      "bind": "appends"
+    },
+    {
+      "op": "member.join",
+      "args": {"subscription": "sdk{{uniq}}.sub", "request_id": "{{uuid}}", "member_id": "{{uuid:member1}}"},
+      "bind": "join",
+      "expect": {"member_epoch": "!=null", "ownership_epoch": "!=null"}
+    },
+    {
+      "op": "member.claim",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub", "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}", "member_epoch": "{{join.member_epoch}}",
+        "work_id": "{{uuid:work1}}", "lease_ticks": 60
+      },
+      "bind": "claim",
+      "expect": {"lease": "!=null", "lease.lease_epoch": "!=null"}
+    },
+    {
+      "op": "member.fetch",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub", "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}", "member_epoch": "{{join.member_epoch}}",
+        "work_id": "{{uuid:work1}}", "lease_epoch": "{{claim.lease.lease_epoch}}",
+        "limit": 8
+      },
+      "bind": "delivered",
+      "expect": {"records": "len>=1", "cursor": "!=null"}
+    },
+    {
+      "op": "member.ack",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub", "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}", "member_epoch": "{{join.member_epoch}}",
+        "work_id": "{{uuid:work1}}", "lease_epoch": "{{claim.lease.lease_epoch}}",
+        "cursor": "{{delivered.cursor}}", "positions": "{{delivered.positions}}"
+      },
+      "bind": "acked"
+    },
+    {
+      "op": "member.release",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub", "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}", "member_epoch": "{{join.member_epoch}}",
+        "work_id": "{{uuid:work1}}", "lease_epoch": "{{claim.lease.lease_epoch}}"
+      },
+      "bind": "released"
+    }
+  ]
+}

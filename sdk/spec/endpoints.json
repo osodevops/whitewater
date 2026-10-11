@@ -1,0 +1,237 @@
+{
+  "spec": "whitewater-protocol",
+  "version": "1.0.0",
+  "status": "draft",
+  "scalar_types": {
+    "uuid": "canonical UUID string",
+    "i64ns": "signed 64-bit integer encoded as a decimal string",
+    "bytes": "standard base64 string",
+    "cursor": "opaque string | null; pass-through, never parse",
+    "metadata": "object mapping UTF-8 names to base64 byte values",
+    "name": "dotted lowercase name ^[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)*$ max 512 bytes"
+  },
+  "common_types": {
+    "Record": {
+      "cursor": "cursor",
+      "message_id": "uuid",
+      "producer_id": "uuid",
+      "sequence": "u64",
+      "event_time_ns": "i64ns",
+      "ingest_time_ns": "i64ns",
+      "key_base64": "bytes",
+      "payload_base64": "bytes",
+      "metadata_base64": "metadata"
+    },
+    "WriterServerFeedback": {
+      "recommended_batch_count": "u64",
+      "recommended_batch_bytes": "u64",
+      "pressure": "f64",
+      "retry_after_ms": "u64",
+      "max_frame_bytes": "u64",
+      "hot_key": "bool (default false)"
+    },
+    "WriterAppendResponse": {
+      "message_id": "uuid",
+      "cursor": "cursor",
+      "deduplicated": "bool",
+      "durability": "string",
+      "feedback": "WriterServerFeedback"
+    },
+    "StatementResult": {
+      "statement": "string",
+      "message": "string",
+      "data": "object (statement-specific)"
+    },
+    "ControlExecution": {
+      "request_id": "uuid",
+      "revision": "u64",
+      "authority": "string (e.g. control_plane)",
+      "warning": "string",
+      "results": "StatementResult[]"
+    }
+  },
+  "endpoints": [
+    {
+      "op": "health",
+      "method": "GET", "path": "/health",
+      "auth": "none",
+      "response": { "status": "string" },
+      "notes": "liveness; any Node"
+    },
+    {
+      "op": "admin.wcl",
+      "method": "POST", "path": "/v1/admin/wcl",
+      "auth": "admin",
+      "request": { "request_id": "uuid?", "script": "string" },
+      "response": "ControlExecution",
+      "errors": ["refused(400) syntax/exists/not-found", "unavailable(503) quorum"]
+    },
+    {
+      "op": "admin.commands",
+      "method": "POST", "path": "/v1/admin/commands",
+      "auth": "admin",
+      "request": { "request_id": "uuid?", "commands": "Command[]" },
+      "response": "ControlExecution",
+      "errors": ["refused(400)", "unavailable(503)"]
+    },
+    {
+      "op": "writer.append",
+      "method": "POST", "path": "/v1/writers/append",
+      "auth": "admin (client-key scoped auth is future work)",
+      "request": {
+        "request_id": "uuid", "writer": "name", "session_epoch": "u64",
+        "event_time_ns": "i64ns?", "key_base64": "bytes",
+        "payload_base64": "bytes", "metadata_base64": "metadata"
+      },
+      "response": "WriterAppendResponse",
+      "errors": ["conflict(409) stale_epoch/fencing", "unavailable(503) freeze/quorum; retry identical request_id"]
+    },
+    {
+      "op": "writer.append_batch",
+      "method": "POST", "path": "/v1/writers/append-batch",
+      "auth": "admin",
+      "request": { "records": "WriterSessionAppendRequest[] (bounded)" },
+      "response": { "results": "WriterAppendResponse[]", "feedback": "WriterServerFeedback" },
+      "errors": ["conflict(409)", "unavailable(503)"]
+    },
+    {
+      "op": "reader.open",
+      "method": "POST", "path": "/v1/readers/open",
+      "auth": "admin",
+      "request": { "request_id": "uuid", "reader": "name", "capacity": "u64" },
+      "response": {
+        "reader_id": "uuid", "feed_id": "uuid", "session_epoch": "u64",
+        "capacity": "u64", "delivered_cursor": "cursor", "acknowledged_cursor": "cursor"
+      },
+      "errors": ["conflict(409)", "unavailable(503)"]
+    },
+    {
+      "op": "reader.fetch",
+      "method": "POST", "path": "/v1/readers/fetch",
+      "auth": "admin",
+      "request": { "request_id": "uuid", "reader": "name", "session_epoch": "u64", "limit": "u64?" },
+      "response": {
+        "records": "Record[]", "delivered_cursor": "cursor",
+        "acknowledged_cursor": "cursor", "recommended_capacity": "u64",
+        "retry_after_ms": "u64"
+      },
+      "errors": ["conflict(409) stale_epoch", "unavailable(503)"]
+    },
+    {
+      "op": "reader.ack",
+      "method": "POST", "path": "/v1/readers/ack",
+      "auth": "admin",
+      "request": { "request_id": "uuid", "reader": "name", "session_epoch": "u64", "cursor": "cursor" },
+      "response": "ReaderSessionResponse",
+      "errors": ["conflict(409)", "unavailable(503)"]
+    },
+    {
+      "op": "reader.close",
+      "method": "POST", "path": "/v1/readers/close",
+      "auth": "admin",
+      "request": "same shape as reader.fetch",
+      "response": "ReaderSessionResponse",
+      "errors": ["conflict(409)", "unavailable(503)"]
+    },
+    {
+      "op": "reader.temporary_fetch",
+      "method": "POST", "path": "/v1/readers/temporary/fetch",
+      "auth": "admin",
+      "request": {
+        "feed": "name", "after": "cursor?", "limit": "u64?",
+        "new_only": "bool", "tail": "bool", "wait_ms": "u64?",
+        "after_event_time_ns": "i64ns?"
+      },
+      "response": { "records": "Record[]", "next_cursor": "cursor" },
+      "errors": ["refused(400) invalid combination", "unavailable(503)"]
+    },
+    {
+      "op": "feed.records",
+      "method": "GET", "path": "/v1/feeds/records?feed=<name>&limit=<n>&after=<cursor>",
+      "auth": "admin",
+      "response": "Record[]",
+      "errors": ["unavailable(503)"]
+    },
+    {
+      "op": "subscription.member.join",
+      "method": "POST", "path": "/v1/subscriptions/members/join",
+      "auth": "admin",
+      "request": { "subscription": "name", "request_id": "uuid", "member_id": "uuid" },
+      "response": "SubscriptionMemberResponse { member_epoch, tick, ownership_epoch }",
+      "errors": ["conflict(409)", "unavailable(503)"]
+    },
+    {
+      "op": "subscription.member.claim",
+      "method": "POST", "path": "/v1/subscriptions/members/claim",
+      "auth": "admin",
+      "request": { "subscription": "name", "request_id": "uuid", "member_id": "uuid", "member_epoch": "u64", "work_id": "uuid", "lease_ticks": "u64? (default 30, max 600)", "lease_epoch": "u64?" },
+      "response": "SubscriptionMemberResponse { lease: { work_id, member_id, member_epoch, lease_epoch, expires_at_tick } }",
+      "errors": ["lease.busy(409)", "lease.capacity(409)", "lease.stale_lease(409)", "conflict(409)", "unavailable(503)"]
+    },
+    {
+      "op": "subscription.member.renew",
+      "method": "POST", "path": "/v1/subscriptions/members/renew",
+      "auth": "admin",
+      "request": "same shape as claim (lease_epoch required)",
+      "errors": ["lease.stale_lease(409)", "conflict(409)", "unavailable(503)"]
+    },
+    {
+      "op": "subscription.member.release",
+      "method": "POST", "path": "/v1/subscriptions/members/release",
+      "auth": "admin",
+      "request": { "subscription": "name", "request_id": "uuid", "member_id": "uuid", "member_epoch": "u64", "work_id": "uuid", "lease_epoch": "u64" },
+      "errors": ["conflict(409)", "unavailable(503)"]
+    },
+    {
+      "op": "subscription.member.fetch",
+      "method": "POST", "path": "/v1/subscriptions/members/fetch",
+      "auth": "admin",
+      "request": { "subscription": "name", "request_id": "uuid", "member_id": "uuid", "member_epoch": "u64", "work_id": "uuid", "lease_epoch": "u64", "limit": "u64? (clamped 1..256)" },
+      "response": { "request_id": "uuid", "records": "Record[]", "cursor": "cursor", "positions": "map<string,string>", "ownership_epoch": "u64" },
+      "errors": ["lease.stale_lease(409)", "conflict(409)", "unavailable(503)"]
+    },
+    {
+      "op": "subscription.member.ack",
+      "method": "POST", "path": "/v1/subscriptions/members/ack",
+      "auth": "admin",
+      "request": { "subscription": "name", "request_id": "uuid", "member_id": "uuid", "member_epoch": "u64", "work_id": "uuid", "lease_epoch": "u64", "cursor": "cursor?", "positions": "map<string,string>?" },
+      "response": "SubscriptionMemberResponse",
+      "errors": ["lease.stale_lease(409)", "conflict(409)", "unavailable(503)"]
+    },
+    {
+      "op": "subscription.member.state",
+      "method": "GET", "path": "/v1/subscriptions/members/state?subscription=<name>",
+      "auth": "admin",
+      "response": "members, leases, frontier",
+      "errors": ["unavailable(503)"]
+    },
+    {
+      "op": "admin.demand.hot_keys",
+      "method": "GET", "path": "/v1/admin/demand/hot-keys",
+      "auth": "admin",
+      "response": { "hot_keys": [{ "feed": "name", "range_id": "string", "range_start": "string", "range_end_exclusive": "string|null", "token": "string", "share_bps": "u64", "window_records": "u64", "window_bytes": "u64", "next_token": "string|null", "isolating_boundary": "string|null" }] },
+      "errors": []
+    },
+    {
+      "op": "admin.subscriptions.progress",
+      "method": "GET", "path": "/v1/admin/subscriptions/progress?subscription=<name>",
+      "auth": "admin",
+      "response": "assignment + committed frontier + member/lease summary + per-replica reachability",
+      "errors": []
+    },
+    {
+      "op": "node.metrics",
+      "method": "GET", "path": "/v1/node/metrics",
+      "auth": "admin",
+      "response": "node-local counters incl. demand",
+      "errors": []
+    },
+    {
+      "op": "cluster.members",
+      "method": "GET", "path": "/v1/cluster/members",
+      "auth": "admin",
+      "response": "discovery view (not consensus)",
+      "errors": []
+    }
+  ]
+}

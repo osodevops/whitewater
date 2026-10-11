@@ -1,0 +1,36 @@
+{
+  "scenario": "nanoseconds-and-keys",
+  "requires": ["admin.wcl", "writer.append", "feed.records"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN sdk{{uniq}}; CREATE FEED sdk{{uniq}}.events; CREATE WRITER wr{{uniq}} TO sdk{{uniq}}.events; OPEN WRITER SESSION wr{{uniq}};"
+      },
+      "bind": "setup"
+    },
+    {
+      "op": "writer.append_batch",
+      "args": {
+        "records": [
+          {"request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "epoch-edge"}, "payload": {"hex": "00ff"}, "event_time_ns": "0"},
+          {"request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"hex": "deadbeef"}, "payload": {"utf8": "neg"}, "event_time_ns": "-9223372036854775808"},
+          {"request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "big"}, "payload": {"utf8": "max"}, "event_time_ns": "9223372036854775807"}
+        ]
+      },
+      "bind": "appends",
+      "expect": {"results": "len>=3"}
+    },
+    {
+      "op": "feed.records",
+      "args": {"feed": "sdk{{uniq}}.events", "limit": 10},
+      "bind": "read",
+      "expect": {
+        "records": "len>=3",
+        "records[1].event_time_ns": "-9223372036854775808",
+        "records[2].event_time_ns": "9223372036854775807",
+        "records[1].key_base64": "3q2+7w=="
+      }
+    }
+  ]
+}
