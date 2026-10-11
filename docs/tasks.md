@@ -1442,9 +1442,9 @@ Definition of Done:
 
 - [x] Define and persist versioned application-owned secondary Index definitions with typed fields/extractors, collation, consistency, scope, and build state through the Control Plane. `StoredIndexDefinition` binds an Index to a space+feed with `IndexFieldSpec` extractor projections, `IndexCollation`, `IndexConsistency`, and `IndexBuildStage` (declared-only until the build pipeline lands); catalog `indexes` map persists via snapshot serde-default; WCL gains `SHOW INDEXES`/`DESCRIBE INDEX` plus rename/drop; snapshot round-trip + idempotent re-definition covered in `src/control.rs` tests.
 
-- [~] Replicate manual StateStore mutations and their idempotency identities on RF3 with a Whitewater-managed durable journal; never claim a manually populated store can be recreated from unrelated Feed history.
+- [x] Replicate manual StateStore mutations and their idempotency identities on RF3 with a Whitewater-managed durable journal; never claim a manually populated store can be recreated from unrelated Feed history. `src/state_store.rs` adds `FjallStateStoreMutationJournal` (owner-allocated gap-free sequence, `mutation_id` dedupe/conflict, prepare/commit durability) behind `StateStoreMutationCoordinator` (owner-mandatory quorum of 2, digest-verified commit evidence, ambiguous-commit recovery) and `StateStoreMutationService`; placement is a persisted rendezvous-hashed `StateStoreAssignment` on `DefineStateStore`; committed mutations apply to the local `IndexStore` with monotonic checkpoints. `POST /v1/state-stores/mutate` plus `/internal/state-store-journal/{prepare,commit,inspect,lookup}` routes; 7 journal tests + a 3-Node in-process HTTP e2e cover quorum, dedupe, restart, apply, and fencing.
 
-- [ ] Replay Feed-derived StateStores from verified source FeedId/Cursor and bounded checkpoints, refusing rebuild if required history is gone.
+- [~] Replay Feed-derived StateStores from verified source FeedId/Cursor and bounded checkpoints, refusing rebuild if required history is gone.
 
 - [ ] Route primary and secondary StateStore lookups from any ingress Node without application topology or co-partition configuration; bound scatter/gather and report freshness, network cost, and unavailable/lagging state.
 

@@ -414,6 +414,8 @@ struct CatalogState {
     #[serde(default)]
     subscription_progress_assignments: BTreeMap<Uuid, SubscriptionProgressAssignment>,
     #[serde(default)]
+    state_store_assignments: BTreeMap<Uuid, crate::state_store::StateStoreAssignment>,
+    #[serde(default)]
     reader_frontiers: BTreeMap<Uuid, ReaderFrontier>,
     roles: BTreeMap<Uuid, RoleDefinition>,
     grants: BTreeMap<Uuid, NamespaceGrant>,
@@ -472,6 +474,7 @@ impl Default for CatalogState {
             readers: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
             subscription_progress_assignments: BTreeMap::new(),
+            state_store_assignments: BTreeMap::new(),
             reader_frontiers: BTreeMap::new(),
             roles: BTreeMap::new(),
             grants: BTreeMap::new(),
@@ -820,6 +823,21 @@ pub struct FixedSubscriptionProgressPlacement {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FixedStateStorePlacement {
+    pub owner: StorageNodeId,
+    pub replicas: [StorageNodeId; ACTIVE_RANGE_REPLICA_COUNT],
+}
+
+/// Consensus-prepared replica placements computed before a command is
+/// committed, so every replica applies identical assignments.
+#[derive(Clone, Debug, Default)]
+pub struct FixedPlacements {
+    pub active_range: Option<FixedActiveRangePlacement>,
+    pub subscription_progress: Option<FixedSubscriptionProgressPlacement>,
+    pub state_store: Option<FixedStateStorePlacement>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicatedCommand {
     pub request_id: Uuid,
     pub issued_at_ns: i64,
@@ -828,6 +846,8 @@ pub struct ReplicatedCommand {
     pub fixed_active_range: Option<FixedActiveRangePlacement>,
     #[serde(default)]
     pub fixed_subscription_progress: Option<FixedSubscriptionProgressPlacement>,
+    #[serde(default)]
+    pub fixed_state_store: Option<FixedStateStorePlacement>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -973,6 +993,14 @@ impl ControlController {
                 )
             })
             .transpose()?;
+        let fixed_state_store = matches!(&command, Command::DefineStateStore { .. })
+            .then(|| {
+                self.select_fixed_state_store(
+                    &state,
+                    derived_resource_id(request_id, "state-store"),
+                )
+            })
+            .transpose()?;
         drop(state);
         Ok(ReplicatedCommand {
             request_id,
@@ -980,6 +1008,7 @@ impl ControlController {
             command,
             fixed_active_range,
             fixed_subscription_progress,
+            fixed_state_store,
         })
     }
 
@@ -1129,6 +1158,39 @@ impl ControlController {
         })
     }
 
+    fn select_fixed_state_store(
+        &self,
+        state: &CatalogState,
+        store_id: Uuid,
+    ) -> Result<FixedStateStorePlacement, ControlError> {
+        let mut ranked = self
+            .storage_pool(state)
+            .into_iter()
+            .map(|node| {
+                let mut hash = blake3::Hasher::new();
+                hash.update(b"whitewater-state-store-v1");
+                hash.update(store_id.as_bytes());
+                hash.update(node.as_str().as_bytes());
+                (*hash.finalize().as_bytes(), node)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_unstable_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
+        });
+        let replicas: [StorageNodeId; ACTIVE_RANGE_REPLICA_COUNT] = ranked.into_iter()
+            .take(ACTIVE_RANGE_REPLICA_COUNT).map(|(_, node)| node).collect::<Vec<_>>()
+            .try_into().map_err(|replicas: Vec<StorageNodeId>| {
+                ControlError::InvalidOperation(format!(
+                    "StateStore requires at least three eligible storage Nodes; only {} are configured",
+                    replicas.len(),
+                ))
+            })?;
+        Ok(FixedStateStorePlacement {
+            owner: replicas[0].clone(),
+            replicas,
+        })
+    }
+
     pub async fn execute(&self, script: &str) -> Result<ControlExecution, ControlError> {
         self.execute_with_request_id(script, Uuid::new_v4()).await
     }
@@ -1213,7 +1275,13 @@ impl ControlController {
         let statement = command_label(&command);
         let mut state = self.state.lock().await;
         let (message, data) = self
-            .apply(&mut state, command, Uuid::nil(), 0, None, None)
+            .apply(
+                &mut state,
+                command,
+                Uuid::nil(),
+                0,
+                FixedPlacements::default(),
+            )
             .await?;
         Ok(StatementResult {
             statement,
@@ -1235,6 +1303,7 @@ impl ControlController {
             command,
             fixed_active_range,
             fixed_subscription_progress,
+            fixed_state_store,
         } = request;
         let statement = command_label(&command);
         let response = match self
@@ -1243,8 +1312,11 @@ impl ControlController {
                 command,
                 request_id,
                 issued_at_ns,
-                fixed_active_range,
-                fixed_subscription_progress,
+                FixedPlacements {
+                    active_range: fixed_active_range,
+                    subscription_progress: fixed_subscription_progress,
+                    state_store: fixed_state_store,
+                },
             )
             .await
         {
@@ -1360,6 +1432,18 @@ impl ControlController {
             assignment.ownership_epoch,
         )
         .ok()
+    }
+
+    /// The RF3 mutation-journal placement of a still-active StateStore.
+    pub async fn active_state_store_assignment_by_id(
+        &self,
+        store_id: Uuid,
+    ) -> Option<crate::state_store::StateStoreAssignment> {
+        let state = self.state.lock().await;
+        // StateStoreDefinitions carry build `stage` rather than ResourceStatus;
+        // a present definition with an assignment is active.
+        state.state_stores.get(&store_id)?;
+        state.state_store_assignments.get(&store_id).cloned()
     }
 
     pub(crate) async fn active_subscription_feed_by_id(
@@ -1673,8 +1757,7 @@ impl ControlController {
         command: Command,
         request_id: Uuid,
         issued_at_ns: i64,
-        fixed_active_range: Option<FixedActiveRangePlacement>,
-        fixed_subscription_progress: Option<FixedSubscriptionProgressPlacement>,
+        fixed: FixedPlacements,
     ) -> Result<(String, Value), ControlError> {
         match command {
             Command::CreateDomain { name } | Command::CreateSpace { name } => {
@@ -1700,7 +1783,7 @@ impl ControlController {
                 )?;
                 let space_id = owning_space(state, &name)?.space_id;
                 let feed_id = derived_resource_id(request_id, "feed");
-                let placement = fixed_active_range.ok_or_else(|| {
+                let placement = fixed.active_range.ok_or_else(|| {
                     ControlError::InvalidOperation(
                         "Feed creation has no consensus-prepared Active Range placement".to_owned(),
                     )
@@ -1755,8 +1838,23 @@ impl ControlController {
                         }
                     }
                 };
+                let store_id = derived_resource_id(request_id, "state-store");
+                let fixed = fixed.state_store.ok_or_else(|| {
+                    ControlError::InvalidOperation(
+                        "StateStore declaration has no consensus-prepared placement".to_owned(),
+                    )
+                })?;
+                let replicas = ReplicaSet::try_new(fixed.replicas)
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let assignment = crate::state_store::StateStoreAssignment::try_new(
+                    store_id,
+                    fixed.owner,
+                    replicas,
+                    1,
+                )
+                .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
                 let definition = StateStoreDefinition {
-                    store_id: derived_resource_id(request_id, "state-store"),
+                    store_id,
                     name: name.clone(),
                     space_id,
                     source,
@@ -1766,8 +1864,9 @@ impl ControlController {
                 state
                     .state_stores
                     .insert(definition.store_id, definition.clone());
+                state.state_store_assignments.insert(store_id, assignment);
                 Ok((
-                    format!("declared StateStore {name}; no data is served until RF3 activation"),
+                    format!("declared StateStore {name} with RF3 mutation journal placement"),
                     json!(definition),
                 ))
             }
@@ -2032,7 +2131,7 @@ impl ControlController {
                             "Subscription source Feed placement is not applied".to_owned(),
                         )
                     })?;
-                let fixed = fixed_subscription_progress.ok_or_else(|| {
+                let fixed = fixed.subscription_progress.ok_or_else(|| {
                     ControlError::InvalidOperation(
                         "Subscription progress has no consensus-prepared placement".to_owned(),
                     )
@@ -2645,7 +2744,7 @@ impl ControlController {
                 let candidate_map = current_map
                     .split(source_route.range_id, split_at, right_range_id)
                     .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
-                let placement = fixed_active_range.ok_or_else(|| {
+                let placement = fixed.active_range.ok_or_else(|| {
                     ControlError::InvalidOperation(
                         "split preparation has no consensus-prepared RF3 placement".to_owned(),
                     )
@@ -5296,6 +5395,7 @@ mod tests {
             },
             fixed_active_range: None,
             fixed_subscription_progress: None,
+            fixed_state_store: None,
         };
         let left_result = left.apply_replicated(request.clone()).await;
         let right_result = right.apply_replicated(request.clone()).await;
@@ -5388,6 +5488,17 @@ mod tests {
                 .source,
             StateStoreSource::Feed { feed_id },
         );
+        // RF3 mutation-journal placement travels with the snapshot.
+        let profiles = follower
+            .declared_state_store_by_name("accounts.profiles")
+            .await
+            .unwrap();
+        let assignment = follower
+            .active_state_store_assignment_by_id(profiles.store_id)
+            .await
+            .expect("declared StateStore carries an RF3 placement");
+        assert_eq!(assignment.ownership_epoch, 1);
+        assert!(assignment.replicas.iter().count() >= 3);
         drop(leader);
         let reopened = new_controller(&directory);
         assert_eq!(

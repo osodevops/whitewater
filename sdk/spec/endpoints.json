@@ -435,6 +435,29 @@
       "auth": "admin",
       "response": "discovery view (not consensus)",
       "errors": []
+    },
+    {
+      "op": "state_store.mutate",
+      "method": "POST",
+      "path": "/v1/state-stores/mutate",
+      "auth": "admin (client-key scoped auth is future work)",
+      "request": {
+        "store": "name",
+        "mutation_id": "uuid (caller idempotency identity)",
+        "op": "put_row{key_base64,payload_base64} | delete_row{key_base64}"
+      },
+      "response": {
+        "store_id": "uuid",
+        "mutation_id": "uuid",
+        "sequence": "u64 (store-local journal order)",
+        "deduplicated": "bool"
+      },
+      "errors": [
+        "refused(400) feed-sourced store / missing store / bounds",
+        "conflict(409) mutation_id reused with different content",
+        "unavailable(503) no quorum; retry identical mutation_id"
+      ],
+      "notes": "manual StateStores only; RF3 journal quorum commits before ack; sequence is owner-allocated"
     }
   ]
 }

@@ -164,6 +164,31 @@ async fn main() -> Result<()> {
         None
     };
 
+    let state_store_journal = if let Some(local) = &replica_append {
+        let journal_path = config.data_dir.join("state-store-journal");
+        let index_path = config.data_dir.join("state-store-index");
+        let journal = tokio::task::spawn_blocking(move || {
+            finnstream::state_store::FjallStateStoreMutationJournal::open(journal_path)
+        })
+        .await??;
+        let index = tokio::task::spawn_blocking(move || {
+            finnstream::index::FjallIndexStore::open(index_path)
+        })
+        .await??;
+        Some(Arc::new(
+            finnstream::state_store::StateStoreMutationService::new(
+                local.local_node().clone(),
+                control.clone(),
+                Arc::new(journal),
+                Arc::new(finnstream::state_store::IndexStoreStateApply::new(
+                    Arc::new(index),
+                )),
+            ),
+        ))
+    } else {
+        None
+    };
+
     let majority_append = match (
         replica_append.clone(),
         config.control_plane_key.clone(),
@@ -625,6 +650,7 @@ async fn main() -> Result<()> {
         replica_append,
         subscription_progress,
         effect_journal,
+        state_store_journal,
         subscription_mtls_enabled: config.subscription_mtls.is_some(),
         majority_append,
         control_endpoints: Arc::new(control_endpoints.clone()),
