@@ -1712,6 +1712,13 @@ impl ControlController {
             .cloned()
     }
 
+    /// Resolves a Feed by immutable id regardless of status — dropped
+    /// Feeds still deliver retained history, and the current name is the
+    /// honest source label for those deliveries.
+    pub(crate) async fn feed_definition_by_id(&self, feed_id: Uuid) -> Option<FeedDefinition> {
+        self.state.lock().await.feeds.get(&feed_id).cloned()
+    }
+
     pub async fn active_feed_by_name(&self, name: &str) -> Option<FeedDefinition> {
         self.state
             .lock()

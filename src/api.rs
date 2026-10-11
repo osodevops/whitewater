@@ -1789,13 +1789,17 @@ async fn subscription_member_fetch(
         })?;
     let (delivered, positions) = fetch_frontier_page(&state, &frontier, limit).await?;
     let cursor = delivered.last().map(|(cursor, _)| cursor.clone());
+    let source = record_source_by_id(&state, frontier.feed_id).await;
     let records = delivered
         .into_iter()
         .map(|(frame_cursor, record)| {
-            record_response(crate::domain::CursorRecord {
-                cursor: frame_cursor,
-                record,
-            })
+            record_response(
+                crate::domain::CursorRecord {
+                    cursor: frame_cursor,
+                    record,
+                },
+                source.clone(),
+            )
         })
         .collect();
     Ok(Json(SubscriptionMemberFetchResponse {
@@ -4487,14 +4491,18 @@ async fn reader_fetch(
         });
         frames.truncate(limit);
     }
+    let source = record_source_by_id(&state, reader.feed_id).await;
     let records = frames
         .into_iter()
         .map(|item| {
             decode_record(&item.frame).map(|record| {
-                record_response(CursorRecord {
-                    cursor: item.cursor,
-                    record,
-                })
+                record_response(
+                    CursorRecord {
+                        cursor: item.cursor,
+                        record,
+                    },
+                    source.clone(),
+                )
             })
         })
         .collect::<Result<Vec<_>, _>>()
@@ -4706,14 +4714,18 @@ async fn temporary_reader_fetch(
             frames = frames.split_off(frames.len() - limit);
         }
         if !frames.is_empty() || tokio::time::Instant::now() >= deadline {
+            let source = record_source_by_name(&state, &request.feed).await;
             let records = frames
                 .into_iter()
                 .map(|item| {
                     decode_record(&item.frame).map(|record| {
-                        record_response(CursorRecord {
-                            cursor: item.cursor,
-                            record,
-                        })
+                        record_response(
+                            CursorRecord {
+                                cursor: item.cursor,
+                                record,
+                            },
+                            source.clone(),
+                        )
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()
@@ -8493,10 +8505,13 @@ async fn read_feed_records(
         .map(|item| {
             decode_record(&item.frame)
                 .map(|record| {
-                    record_response(CursorRecord {
-                        cursor: item.cursor,
-                        record,
-                    })
+                    record_response(
+                        CursorRecord {
+                            cursor: item.cursor,
+                            record,
+                        },
+                        RecordSource::of(&feed),
+                    )
                 })
                 .map_err(|error| ApiError::unavailable(error.to_string()))
         })
@@ -8625,6 +8640,65 @@ struct ReadQuery {
     limit: Option<usize>,
 }
 
+/// Server-owned delivery source attached to every consumer record —
+/// typed separately from writer-provided `metadata_base64` so
+/// applications cannot spoof or overwrite it. `feed_name` is the last
+/// dotted segment, `full_feed_name` the Domain-qualified name, and
+/// `feed_id` the immutable identity (no range topology is exposed).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecordSource {
+    pub feed_name: String,
+    pub full_feed_name: String,
+    pub feed_id: Uuid,
+}
+
+impl RecordSource {
+    fn of(feed: &crate::control::FeedDefinition) -> Self {
+        Self {
+            feed_name: feed
+                .name
+                .rsplit('.')
+                .next()
+                .unwrap_or(feed.name.as_str())
+                .to_owned(),
+            full_feed_name: feed.name.clone(),
+            feed_id: feed.feed_id,
+        }
+    }
+
+    /// Fallback for deliveries whose Feed is not catalog-resolvable
+    /// (prototype streams): the name carries through with a nil identity.
+    fn named(name: &str) -> Self {
+        Self {
+            feed_name: name.rsplit('.').next().unwrap_or(name).to_owned(),
+            full_feed_name: name.to_owned(),
+            feed_id: Uuid::nil(),
+        }
+    }
+}
+
+async fn record_source_by_name(state: &AppState, name: &str) -> RecordSource {
+    state
+        .control
+        .active_feed_by_name(name)
+        .await
+        .map(|feed| RecordSource::of(&feed))
+        .unwrap_or_else(|| RecordSource::named(name))
+}
+
+async fn record_source_by_id(state: &AppState, feed_id: Uuid) -> RecordSource {
+    state
+        .control
+        .feed_definition_by_id(feed_id)
+        .await
+        .map(|feed| RecordSource::of(&feed))
+        .unwrap_or_else(|| RecordSource {
+            feed_name: feed_id.simple().to_string(),
+            full_feed_name: feed_id.simple().to_string(),
+            feed_id,
+        })
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RecordResponse {
     pub cursor: String,
@@ -8636,6 +8710,7 @@ pub struct RecordResponse {
     pub key_base64: String,
     pub payload_base64: String,
     pub metadata_base64: BTreeMap<String, String>,
+    pub source: RecordSource,
 }
 
 async fn read_records(
@@ -8652,8 +8727,12 @@ async fn read_records(
         )
         .await?;
     state.demand.record_read(records.len());
+    let source = record_source_by_name(&state, &query.stream).await;
     Ok(Json(
-        records.into_iter().map(record_response).collect::<Vec<_>>(),
+        records
+            .into_iter()
+            .map(|record| record_response(record, source.clone()))
+            .collect::<Vec<_>>(),
     ))
 }
 
@@ -8735,7 +8814,7 @@ async fn cluster_leave(
     StatusCode::NO_CONTENT
 }
 
-fn record_response(value: CursorRecord) -> RecordResponse {
+fn record_response(value: CursorRecord, source: RecordSource) -> RecordResponse {
     let StoredRecord {
         message_id,
         producer_id,
@@ -8759,6 +8838,7 @@ fn record_response(value: CursorRecord) -> RecordResponse {
             .into_iter()
             .map(|(name, value)| (name, STANDARD.encode(value)))
             .collect(),
+        source,
     }
 }
 
@@ -8996,21 +9076,29 @@ mod tests {
 
     #[test]
     fn record_response_serializes_metadata_not_headers() {
-        let response = record_response(CursorRecord {
-            cursor: "cursor".to_owned(),
-            record: StoredRecord {
-                message_id: Uuid::new_v4(),
-                producer_id: Uuid::new_v4(),
-                producer_sequence: 1,
-                event_time_ns: 1_000_000_001,
-                ingest_time_ns: 1_000_000_002,
-                key: b"key".to_vec(),
-                payload: b"value".to_vec(),
-                metadata: BTreeMap::from([("trace-id".to_owned(), b"trace".to_vec())]),
+        let response = record_response(
+            CursorRecord {
+                cursor: "cursor".to_owned(),
+                record: StoredRecord {
+                    message_id: Uuid::new_v4(),
+                    producer_id: Uuid::new_v4(),
+                    producer_sequence: 1,
+                    event_time_ns: 1_000_000_001,
+                    ingest_time_ns: 1_000_000_002,
+                    key: b"key".to_vec(),
+                    payload: b"value".to_vec(),
+                    metadata: BTreeMap::from([("trace-id".to_owned(), b"trace".to_vec())]),
+                },
             },
-        });
+            RecordSource::named("orders.created"),
+        );
         let json = serde_json::to_value(response).unwrap();
         assert!(json.get("metadata_base64").is_some());
+        // Server-owned source ships beside writer metadata: last dotted
+        // segment, full Domain-qualified name, immutable FeedId.
+        assert_eq!(json["source"]["feed_name"], "created");
+        assert_eq!(json["source"]["full_feed_name"], "orders.created");
+        assert!(json["source"]["feed_id"].is_string());
         assert!(json.get("headers_base64").is_none());
         assert_eq!(json["event_time_ns"], "1000000001");
         assert_eq!(json["ingest_time_ns"], "1000000002");

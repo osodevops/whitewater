@@ -20,7 +20,13 @@
       "ingest_time_ns": "i64ns",
       "key_base64": "bytes",
       "payload_base64": "bytes",
-      "metadata_base64": "metadata"
+      "metadata_base64": "metadata",
+      "source": "RecordSource"
+    },
+    "RecordSource": {
+      "feed_name": "string (last dotted Feed segment, e.g. created)",
+      "full_feed_name": "string (Domain-qualified, e.g. orders.created)",
+      "feed_id": "uuid (immutable identity; nil for prototype streams)"
     },
     "WriterServerFeedback": {
       "recommended_batch_count": "u64",
