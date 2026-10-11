@@ -1448,7 +1448,7 @@ Definition of Done:
 
 - [ ] Route primary and secondary StateStore lookups from any ingress Node without application topology or co-partition configuration; bound scatter/gather and report freshness, network cost, and unavailable/lagging state.
 
-- [ ] Benchmark vetted Fjall, redb, and RocksDB reference workloads: many user Indexes sharing a bounded number of LSM trees, mixed writes/reads, crashes, compaction stalls, and replication/checkpoint cost.
+- [x] Benchmark vetted Fjall, redb, and RocksDB reference workloads: many user Indexes sharing a bounded number of LSM trees, mixed writes/reads, crashes, compaction stalls, and replication/checkpoint cost. `tools/index-bench` runs one deterministic workload (real `index.rs` key codecs, three namespaces, sync commits) against all three; results and caveats in `docs/index-engine-benchmark.md` — redb led every axis (253 op/s bulk, 3.0 ms commit p50, 33.6 ms crash-reopen), fjall and RocksDB tied at ~180 op/s.
 
 - [ ] Select and integrate an Index Engine behind a narrow transactional interface; validate serializable read-modify-write, durable batch semantics, and memory/disk budgets.
 
