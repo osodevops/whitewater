@@ -2957,7 +2957,7 @@ mod tests {
         );
         let mutation = SubscriptionProgressMutation {
             subscription_id: subscription.subscription_id,
-            feed_id: subscription.feed_id,
+            feed_id: subscription.source.feed_id().unwrap(),
             ownership_epoch: 1,
             sequence: 1,
             request_id: Uuid::from_u128(700),
@@ -4047,7 +4047,7 @@ mod tests {
         ));
         let adopted_committed = SubscriptionProgressMutation {
             subscription_id: subscription.subscription_id,
-            feed_id: subscription.feed_id,
+            feed_id: subscription.source.feed_id().unwrap(),
             ownership_epoch: 2,
             sequence: 1,
             request_id: Uuid::from_u128(9_999),

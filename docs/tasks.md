@@ -1454,7 +1454,7 @@ Definition of Done:
 
 - [ ] Co-design Feed commit and required synchronous primary/secondary Index mutations across the existing file log and replicated Index state; do not claim cross-engine atomicity from a local Fjall write batch.
 
-- [ ] Implement current-state primary rows and arbitrary declared nonunique secondary Indexes in one shared entries keyspace; atomically remove stale entries on update/delete.
+- [x] Implement current-state primary rows and arbitrary declared nonunique secondary Indexes in one shared entries keyspace; atomically remove stale entries on update/delete. `FjallIndexStore` keeps primary rows in the `primary` keyspace and all declared Indexes' postings + unique claims in one shared `entries` keyspace namespaced by IndexId/generation; `upsert`/`delete` run as one Fjall write transaction that removes stale postings and claims atomically (`changing_and_deleting_projection_removes_stale_entries`, `fjall_update_delete_and_conflict_leave_no_stale_postings`, `fjall_multi_entry_batch_commits_all_or_nothing`).
 
 - [ ] Implement global uniqueness across Active Ranges with a replicated conditional claim protocol; reject UNIQUE definitions until it is proven.
 
@@ -1472,11 +1472,11 @@ Definition of Done:
 
 
 
-- [ ] Point lookup never scans a Feed.
+- [x] Point lookup never scans a Feed. `lookup_exact`/`lookup_prefix`/`lookup_range` iterate only the Index-scoped posting prefix/range in the `entries` keyspace and dereference bounded primary rows — no Feed read occurs on the query path.
 
-- [ ] Strict read never silently returns stale state.
+- [x] Strict read never silently returns stale state. `strict` queries bounded-wait for the serving Node's checkpoint to reach the catalog-committed activation frontier, forward (bounded) to fresher peers, and return 409 `index_behind` when no Node reaches it; non-strict reads always report `behind`/`applied_cursor`/`target_cursor` honestly.
 
-- [ ] Index owner loss preserves acknowledged indexed state.
+- [x] Index owner loss preserves acknowledged indexed state. Declared Indexes have no single owner: every Node materializes the active generation's postings under a durable per-generation checkpoint and rebuilds from retained committed Feed history when missing or behind; StateStore journal replicas additionally preserve acknowledged rows through RF3 committed entries, chain-digest checkpoints, and peer transfer/catch-up.
 
 
 
@@ -1486,7 +1486,7 @@ Definition of Done:
 
 - [x] Declare Domain-scoped Subscriptions by logical name and source Feed through typed Control Plane commands and WCL, idempotently across snapshots; `stage=declared` does not allow clients to join or acknowledge. Tests prove a declaration creates no internal/public Feed and refuses cross-Domain sources or unsafe Feed drop.
 
-- [ ] Add a first-class Domain-wide Subscription source alongside exact-Feed sources, without resetting existing SubscriptionIds, FeedIds, or acknowledged Cursors; preserve the serialized `feed_id` of legacy exact-Feed declarations while adding a versioned source variant. Plan typed/WCL `FROM DOMAIN <domain>` as a distinct, versioned source scope bound to immutable Domain identity; a Subscription may start in an empty Domain and automatically cover all current and future authorized Feeds in it. Keep all physical placement and per-Feed progress internal; no global cross-Feed order is promised.
+- [~] Add a first-class Domain-wide Subscription source alongside exact-Feed sources, without resetting existing SubscriptionIds, FeedIds, or acknowledged Cursors; preserve the serialized `feed_id` of legacy exact-Feed declarations while adding a versioned source variant. Plan typed/WCL `FROM DOMAIN <domain>` as a distinct, versioned source scope bound to immutable Domain identity; a Subscription may start in an empty Domain and automatically cover all current and future authorized Feeds in it. Keep all physical placement and per-Feed progress internal; no global cross-Feed order is promised. `SubscriptionSource` is an untagged serde variant — Feed rows keep the legacy `feed_id` column so old snapshots decode unchanged, Domain rows carry `domain_id`. `CREATE SUBSCRIPTION <name> FROM DOMAIN <domain>` and typed `domain` declarations bind the owning Domain's immutable id (cross-Domain sources refuse); an empty Domain is legal. Feed-drop fencing now treats a covering Domain-scoped Subscription as an attached consumer. Member join, pipe bootstrap, and progress on Domain sources refuse 409 honestly until incremental Feed membership tracking lands. Unit coverage proves WCL/typed declaration, empty-Domain start, exactly-one-source and cross-Domain refusal, legacy `feed_id` deserialization, and the drop fence.
 
 - [ ] Track Domain-wide Feed membership incrementally by immutable FeedId: register new Feeds from their first retained record by default (existing Feeds honor the Subscription's declared start policy), durably establish the discovery/initial-frontier boundary so writes during registration cannot be skipped, and survive Control Plane snapshots, restart, owner loss, and backfill/retention limits. Feed rename retains progress; removing or moving a Feed must not pause other Feeds or silently acknowledge/discard its pending workâ€”fence and drain it or require explicit disposition before physical deletion. A replacement Feed with the same name must have fresh progress. Recheck authorization on newly discovered Feeds, bound work/state/egress as Feed counts grow, and explain per-Feed attaching, draining, blocked, and cost states.
 

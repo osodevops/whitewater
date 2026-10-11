@@ -308,7 +308,15 @@ CREATE SUBSCRIPTION orders.billing
 
 
 
-A Subscription belongs to the same Domain as its Feed. It currently remains `declared`: it does not create an internal Feed, permit joining members, or establish shared Cursor progress yet. Existing named Readers remain independent and are not silently converted into shared Subscriptions.
+A Subscription belongs to the same Domain as its Feed. The source can instead be the whole Domain — covering every current and future Feed under immutable Domain identity, with per-Feed progress tracked incrementally (no global cross-Feed order is promised):
+
+```sql
+CREATE SUBSCRIPTION orders.everything
+  FROM DOMAIN orders
+  START AT BEGINNING;
+```
+
+Either way the Subscription remains `declared` until member delivery lands: it does not create an internal Feed, permit joining members, or establish shared Cursor progress yet — member join on a Domain source is refused honestly until incremental Feed membership tracking ships. Existing named Readers remain independent and are not silently converted into shared Subscriptions.
 
 
 

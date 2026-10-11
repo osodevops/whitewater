@@ -434,7 +434,7 @@ async fn subscription_coordinator_uses_private_catalog_placement_and_refuses_leg
     .unwrap();
     let mutation = SubscriptionProgressMutation {
         subscription_id: subscription.subscription_id,
-        feed_id: subscription.feed_id,
+        feed_id: subscription.source.feed_id().unwrap(),
         ownership_epoch: 1,
         sequence: 1,
         request_id: Uuid::from_u128(500),
@@ -1282,7 +1282,12 @@ async fn subscription_progress_recovery_moves_owner_preserves_committed_and_fenc
     .await
     .unwrap();
     let owner = coordinator.assignment().owner.clone();
-    let first = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    let first = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        1,
+    );
     coordinator.apply(first.clone()).await.unwrap();
 
     for set in [
@@ -1314,8 +1319,12 @@ async fn subscription_progress_recovery_moves_owner_preserves_committed_and_fenc
     .unwrap();
     assert_eq!(recovered.assignment(), &outcome.assignment);
 
-    let mut stale_write =
-        progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 2);
+    let mut stale_write = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        2,
+    );
     stale_write.request_id = Uuid::from_u128(5_500);
     assert!(matches!(
         coordinator.apply(stale_write).await,
@@ -1329,7 +1338,12 @@ async fn subscription_progress_recovery_moves_owner_preserves_committed_and_fenc
             | Err(SubscriptionProgressError::NoQuorum)
     ));
 
-    let next = progress_mutation(subscription.subscription_id, subscription.feed_id, 2, 2);
+    let next = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        2,
+        2,
+    );
     recovered.apply(next.clone()).await.unwrap();
     assert_eq!(recovered.read_committed().await.unwrap(), Some(next));
 
@@ -1350,7 +1364,12 @@ async fn subscription_progress_recovery_moves_owner_preserves_committed_and_fenc
     assert_eq!(owner_state.committed, healed.committed);
     assert_eq!(owner_state.committed.unwrap().ownership_epoch, 2);
 
-    let third = progress_mutation(subscription.subscription_id, subscription.feed_id, 2, 3);
+    let third = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        2,
+        3,
+    );
     recovered.apply(third.clone()).await.unwrap();
     assert_eq!(recovered.read_committed().await.unwrap(), Some(third));
 }
@@ -1379,7 +1398,12 @@ async fn subscription_progress_handoff_owner_vacates_a_healthy_owner_and_adopts_
     .await
     .unwrap();
     let owner = coordinator.assignment().owner.clone();
-    let first = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    let first = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        1,
+    );
     coordinator.apply(first.clone()).await.unwrap();
 
     // The drained owner stays healthy and reachable: the caller chooses the
@@ -1451,7 +1475,12 @@ async fn subscription_progress_handoff_owner_retries_converge_after_an_ambiguous
     .await
     .unwrap();
     let owner = coordinator.assignment().owner.clone();
-    let first = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    let first = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        1,
+    );
     coordinator.apply(first.clone()).await.unwrap();
 
     // The placement CAS commits but the new owner cannot be adopted: the step
@@ -1499,11 +1528,10 @@ async fn subscription_progress_recovery_fails_closed_on_insufficient_or_contradi
         TempDir::new().unwrap(),
     ];
     let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
-    transport
-        .feed_ids
-        .lock()
-        .unwrap()
-        .insert(subscription.subscription_id, subscription.feed_id);
+    transport.feed_ids.lock().unwrap().insert(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+    );
     let assignment = SubscriptionProgressAssignment::try_new(
         subscription.subscription_id,
         nodes[2].clone(),
@@ -1528,7 +1556,12 @@ async fn subscription_progress_recovery_fails_closed_on_insufficient_or_contradi
     assert!(empty.committed.is_none());
     assert_eq!(empty.adopted.len(), 2);
 
-    let mut fork_left = progress_mutation(subscription.subscription_id, subscription.feed_id, 2, 1);
+    let mut fork_left = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        2,
+        1,
+    );
     fork_left.cursor = "rf1_left".to_owned();
     let mut fork_right = fork_left.clone();
     fork_right.request_id = Uuid::from_u128(5_999);
@@ -1575,11 +1608,10 @@ async fn subscription_progress_recovery_adopts_latest_committed_under_raced_move
         TempDir::new().unwrap(),
     ];
     let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
-    transport
-        .feed_ids
-        .lock()
-        .unwrap()
-        .insert(subscription.subscription_id, subscription.feed_id);
+    transport.feed_ids.lock().unwrap().insert(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+    );
     let assignment = SubscriptionProgressAssignment::try_new(
         subscription.subscription_id,
         nodes[2].clone(),
@@ -1595,7 +1627,7 @@ async fn subscription_progress_recovery_adopts_latest_committed_under_raced_move
             &nodes[0],
             &progress_mutation(
                 subscription.subscription_id,
-                subscription.feed_id,
+                subscription.source.feed_id().unwrap(),
                 1,
                 sequence,
             ),
@@ -1607,7 +1639,7 @@ async fn subscription_progress_recovery_adopts_latest_committed_under_raced_move
             &nodes[1],
             &progress_mutation(
                 subscription.subscription_id,
-                subscription.feed_id,
+                subscription.source.feed_id().unwrap(),
                 1,
                 sequence,
             ),
@@ -1691,7 +1723,12 @@ async fn subscription_progress_replica_move_seeds_replacement_and_fences_stale_e
         .find(|node| !coordinator.assignment().replicas.contains(node))
         .cloned()
         .unwrap();
-    let first = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    let first = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        1,
+    );
     coordinator.apply(first.clone()).await.unwrap();
 
     // the owner slot cannot be drained through a replica move.
@@ -1744,7 +1781,12 @@ async fn subscription_progress_replica_move_seeds_replacement_and_fences_stale_e
     .await
     .unwrap();
     assert_eq!(moved.assignment(), &outcome.assignment);
-    let next = progress_mutation(subscription.subscription_id, subscription.feed_id, 2, 2);
+    let next = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        2,
+        2,
+    );
     moved.apply(next.clone()).await.unwrap();
     assert_eq!(moved.read_committed().await.unwrap(), Some(next.clone()));
     assert_eq!(
@@ -1756,7 +1798,12 @@ async fn subscription_progress_replica_move_seeds_replacement_and_fences_stale_e
     );
 
     // the old coordinator is fenced by the higher ownership epoch.
-    let stale = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 2);
+    let stale = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        2,
+    );
     assert!(matches!(
         coordinator.apply(stale).await,
         Err(SubscriptionProgressError::StaleEpoch)
@@ -1830,7 +1877,12 @@ async fn subscription_progress_replica_move_drains_unavailable_member() {
         .find(|node| !coordinator.assignment().replicas.contains(node))
         .cloned()
         .unwrap();
-    let first = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    let first = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        1,
+    );
     coordinator.apply(first.clone()).await.unwrap();
 
     // the member being drained is completely unreachable; quorum evidence
@@ -1913,7 +1965,12 @@ async fn subscription_member_leases_replicate_survive_restart_and_recover() {
     let other = Uuid::from_u128(11_002);
     let work = Uuid::from_u128(11_003);
 
-    let frontier = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    let frontier = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        1,
+    );
     coordinator.apply(frontier.clone()).await.unwrap();
 
     // join and claim commit as one quorum mutation on every replica.
@@ -2128,7 +2185,12 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
         Err(SubscriptionProgressError::Conflict)
     ));
 
-    let frontier = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    let frontier = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        1,
+    );
     coordinator.apply(frontier.clone()).await.unwrap();
 
     coordinator
@@ -2329,7 +2391,7 @@ async fn epoch_stale_replica_rows_are_lagging_witnesses_for_reads_and_writes() {
     for sequence in 1..=2 {
         let mutation = progress_mutation(
             subscription.subscription_id,
-            subscription.feed_id,
+            subscription.source.feed_id().unwrap(),
             1,
             sequence,
         );
@@ -2435,8 +2497,18 @@ async fn recovery_then_member_ops_when_a_survivor_lags_one_sequence() {
         .cloned()
         .collect();
     // One survivor lags exactly one committed sequence behind the other.
-    let first = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
-    let second = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 2);
+    let first = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        1,
+    );
+    let second = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        2,
+    );
     plant_committed(&transport, &survivors[0], &first);
     plant_committed(&transport, &survivors[1], &first);
     plant_committed(&transport, &survivors[1], &second);

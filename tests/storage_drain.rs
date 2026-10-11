@@ -258,7 +258,8 @@ impl Fixture {
         self.control
             .execute_commands(vec![Command::CreateSubscription {
                 name: "orders.billing".to_owned(),
-                feed: "orders.events".to_owned(),
+                feed: Some("orders.events".to_owned()),
+                domain: None,
                 start: ReaderStart::Beginning,
             }])
             .await
@@ -605,7 +606,7 @@ impl DrainProgressDriver for LocalDrainProgressDriver {
             .ok_or_else(|| "Subscription is unknown".to_owned())?;
         let transport: Arc<dyn SubscriptionProgressTransport> = Arc::new(LocalProgressTransport {
             replicas: self.replicas.clone(),
-            feed_id: definition.feed_id,
+            feed_id: definition.source.feed_id().unwrap(),
         });
         let coordinator = SubscriptionProgressCoordinator::for_subscription(
             self.control.as_ref(),
@@ -651,13 +652,13 @@ async fn drain_executor_vacates_subscription_progress_references() {
     // carry real progress state across the ownership handoff.
     let seed_transport: Arc<dyn SubscriptionProgressTransport> = Arc::new(LocalProgressTransport {
         replicas: Arc::new(fixture.progress.clone()),
-        feed_id: subscription.feed_id,
+        feed_id: subscription.source.feed_id().unwrap(),
     });
     let seed_coordinator = SubscriptionProgressCoordinator::new(progress.clone(), seed_transport);
     seed_coordinator
         .apply(SubscriptionProgressMutation {
             subscription_id: subscription.subscription_id,
-            feed_id: subscription.feed_id,
+            feed_id: subscription.source.feed_id().unwrap(),
             ownership_epoch: progress.ownership_epoch,
             sequence: 1,
             request_id: Uuid::new_v4(),

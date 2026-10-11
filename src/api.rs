@@ -1443,9 +1443,14 @@ async fn subscription_member_join(
     } else {
         // First member: establish the declared-start frontier and the Join
         // lease transition in one atomic sequence-1 quorum mutation.
+        let source_feed = definition.source.feed_id().ok_or_else(|| ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Subscription has a Domain source; member sessions arrive with Domain-wide progress tracking".to_owned(),
+            code: None,
+        })?;
         let range_assignments = state
             .control
-            .active_range_assignments_for_feed(definition.feed_id)
+            .active_range_assignments_for_feed(source_feed)
             .await;
         if range_assignments.is_empty() {
             return Err(ApiError::unavailable(
@@ -1519,7 +1524,7 @@ async fn subscription_member_join(
         coordinator
             .apply(crate::reader::SubscriptionProgressMutation {
                 subscription_id: assignment.subscription_id,
-                feed_id: definition.feed_id,
+                feed_id: definition.source.feed_id().unwrap(),
                 ownership_epoch: assignment.ownership_epoch,
                 sequence: 1,
                 request_id: request.request_id,
@@ -2069,9 +2074,14 @@ async fn bootstrap_pipe_frontier(
     definition: &crate::control::SubscriptionDefinition,
     assignment: &crate::reader::SubscriptionProgressAssignment,
 ) -> Result<crate::reader::SubscriptionProgressMutation, ApiError> {
+    let source_feed = definition.source.feed_id().ok_or_else(|| ApiError {
+        status: StatusCode::CONFLICT,
+        message: "Subscription has a Domain source; member sessions arrive with Domain-wide progress tracking".to_owned(),
+        code: None,
+    })?;
     let range_assignments = state
         .control
-        .active_range_assignments_for_feed(definition.feed_id)
+        .active_range_assignments_for_feed(source_feed)
         .await;
     if range_assignments.is_empty() {
         return Err(ApiError::unavailable(
@@ -2141,13 +2151,10 @@ async fn bootstrap_pipe_frontier(
     };
     Ok(crate::reader::SubscriptionProgressMutation {
         subscription_id: assignment.subscription_id,
-        feed_id: definition.feed_id,
+        feed_id: source_feed,
         ownership_epoch: assignment.ownership_epoch,
         sequence: 1,
-        request_id: crate::pipe::pipe_frontier_request_id(
-            assignment.subscription_id,
-            definition.feed_id,
-        ),
+        request_id: crate::pipe::pipe_frontier_request_id(assignment.subscription_id, source_feed),
         expected_cursor: None,
         cursor: start_cursor,
         positions,
@@ -6869,7 +6876,7 @@ async fn admin_subscription_progress(
     Ok(Json(json!({
         "subscription": query.subscription,
         "subscription_id": definition.subscription_id,
-        "feed_id": definition.feed_id,
+        "source": definition.source,
         "assignment": {
             "owner": assignment.owner,
             "replicas": assignment.replicas,
@@ -10812,7 +10819,8 @@ mod tests {
                     },
                     Command::CreateSubscription {
                         name: "orders.billing".to_owned(),
-                        feed: "orders.events".to_owned(),
+                        feed: Some("orders.events".to_owned()),
+                        domain: None,
                         start: crate::control::ReaderStart::Beginning,
                     },
                 ])
@@ -11207,7 +11215,7 @@ mod tests {
             .clone();
         let mutation = crate::reader::SubscriptionProgressMutation {
             subscription_id: subscription.subscription_id,
-            feed_id: subscription.feed_id,
+            feed_id: subscription.source.feed_id().unwrap(),
             ownership_epoch: assignment.ownership_epoch,
             sequence: 1,
             request_id: Uuid::from_u128(877),
@@ -11337,7 +11345,7 @@ mod tests {
         .unwrap();
         let mutation = crate::reader::SubscriptionProgressMutation {
             subscription_id: subscription.subscription_id,
-            feed_id: subscription.feed_id,
+            feed_id: subscription.source.feed_id().unwrap(),
             ownership_epoch: assignment.ownership_epoch,
             sequence: 1,
             request_id: Uuid::from_u128(900),
@@ -11548,7 +11556,7 @@ mod tests {
             .unwrap();
         let mutation = crate::reader::SubscriptionProgressMutation {
             subscription_id: subscription.subscription_id,
-            feed_id: subscription.feed_id,
+            feed_id: subscription.source.feed_id().unwrap(),
             ownership_epoch: assignment.ownership_epoch,
             sequence: 1,
             request_id: Uuid::from_u128(960),
@@ -12154,7 +12162,7 @@ mod tests {
             request_id: Uuid::from_u128(942),
             transition: crate::effect::EffectTransition::Declare {
                 consume: Some(crate::effect::EffectConsume {
-                    feed_id: subscription.feed_id,
+                    feed_id: subscription.source.feed_id().unwrap(),
                     expected_cursor: None,
                     cursor: "effect-1".to_owned(),
                     positions: BTreeMap::from([(
@@ -13294,17 +13302,20 @@ mod tests {
                 },
                 Command::CreateSubscription {
                     name: "orders.billing".to_owned(),
-                    feed: "orders.events".to_owned(),
+                    feed: Some("orders.events".to_owned()),
+                    domain: None,
                     start: crate::control::ReaderStart::Beginning,
                 },
                 Command::CreateSubscription {
                     name: "orders.fresh".to_owned(),
-                    feed: "orders.events".to_owned(),
+                    feed: Some("orders.events".to_owned()),
+                    domain: None,
                     start: crate::control::ReaderStart::Beginning,
                 },
                 Command::CreateSubscription {
                     name: "orders.now".to_owned(),
-                    feed: "orders.events".to_owned(),
+                    feed: Some("orders.events".to_owned()),
+                    domain: None,
                     start: crate::control::ReaderStart::Now,
                 },
             ])
@@ -13482,7 +13493,7 @@ mod tests {
         coordinator
             .apply(crate::reader::SubscriptionProgressMutation {
                 subscription_id: assignment.subscription_id,
-                feed_id: definition.feed_id,
+                feed_id: definition.source.feed_id().unwrap(),
                 ownership_epoch: assignment.ownership_epoch,
                 sequence: 1,
                 request_id: Uuid::from_u128(0x9001),

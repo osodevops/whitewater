@@ -285,12 +285,48 @@ pub enum SubscriptionStage {
     Declared,
 }
 
+/// Versioned source scope a Subscription consumes. `Feed` pins the
+/// immutable `feed_id` of one exact-Feed source — the wire field is still
+/// named `feed_id`, so catalog rows and commands written before the
+/// variant existed decode unchanged. `Domain` binds the immutable
+/// `domain_id`: the Subscription covers every current and future Feed in
+/// the Domain, with per-Feed progress tracked incrementally (no global
+/// cross-Feed ordering is promised).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum SubscriptionSource {
+    Feed { feed_id: Uuid },
+    Domain { domain_id: Uuid },
+}
+
+impl SubscriptionSource {
+    /// The pinned Feed identity for exact-Feed sources; `None` for
+    /// Domain-scoped sources, whose member Feeds attach incrementally.
+    pub fn feed_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Feed { feed_id } => Some(*feed_id),
+            Self::Domain { .. } => None,
+        }
+    }
+
+    /// The bound Domain identity for Domain-scoped sources.
+    pub fn domain_id(&self) -> Option<Uuid> {
+        match self {
+            Self::Domain { domain_id } => Some(*domain_id),
+            Self::Feed { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SubscriptionDefinition {
     pub subscription_id: Uuid,
     pub name: String,
     pub space_id: Uuid,
-    pub feed_id: Uuid,
+    /// Serialized inline so the legacy `feed_id` column decodes as the
+    /// `Feed` variant and Domain rows carry `domain_id` instead.
+    #[serde(flatten)]
+    pub source: SubscriptionSource,
     pub start: ReaderStart,
     pub stage: SubscriptionStage,
     pub status: ResourceStatus,
@@ -665,7 +701,14 @@ pub enum Command {
     },
     CreateSubscription {
         name: String,
-        feed: String,
+        /// Exact-Feed source name; legacy serialized commands carry this
+        /// field, so it stays optional rather than renamed.
+        #[serde(default)]
+        feed: Option<String>,
+        /// Domain-wide source: the Subscription covers every Feed in the
+        /// named Domain, current and future.
+        #[serde(default)]
+        domain: Option<String>,
         start: ReaderStart,
     },
     OpenReaderSession {
@@ -1548,7 +1591,7 @@ impl ControlController {
             .subscriptions
             .get(&subscription_id)
             .filter(|item| item.status == ResourceStatus::Active)
-            .map(|item| item.feed_id)
+            .and_then(|item| item.source.feed_id())
     }
 
     pub(crate) async fn active_reader_frontier(&self, reader_id: Uuid) -> Option<ReaderFrontier> {
@@ -2125,7 +2168,7 @@ impl ControlController {
                         "Pipe output Feed must belong to its Domain".to_owned(),
                     ));
                 }
-                if output.feed_id == subscription.feed_id {
+                if subscription.source.feed_id() == Some(output.feed_id) {
                     return Err(ControlError::InvalidOperation(
                         "Pipe output Feed cannot be its own input Feed".to_owned(),
                     ));
@@ -2276,7 +2319,12 @@ impl ControlController {
                     .insert(definition.reader_id, definition.clone());
                 Ok((format!("created Reader {name}"), json!(definition)))
             }
-            Command::CreateSubscription { name, feed, start } => {
+            Command::CreateSubscription {
+                name,
+                feed,
+                domain,
+                start,
+            } => {
                 validate_dotted_name(&name)?;
                 ensure_name_available(
                     state
@@ -2286,36 +2334,65 @@ impl ControlController {
                     &name,
                 )?;
                 let space_id = owning_space(state, &name)?.space_id;
-                let feed_id = {
-                    let source = active_feed(state, &feed)?;
-                    if source.space_id != space_id {
-                        return Err(ControlError::InvalidOperation(
-                            "Subscription and source Feed must belong to the same Domain"
-                                .to_owned(),
-                        ));
+                let source = match (feed, domain) {
+                    (Some(feed), None) => {
+                        let source = active_feed(state, &feed)?;
+                        if source.space_id != space_id {
+                            return Err(ControlError::InvalidOperation(
+                                "Subscription and source Feed must belong to the same Domain"
+                                    .to_owned(),
+                            ));
+                        }
+                        SubscriptionSource::Feed {
+                            feed_id: source.feed_id,
+                        }
                     }
-                    source.feed_id
+                    (None, Some(domain)) => {
+                        // Domain-scoped source: binds the immutable Domain
+                        // identity; member Feeds attach incrementally, so an
+                        // empty Domain is a legal start. The Domain must
+                        // still be the Subscription's own — cross-Domain
+                        // consumption is refused like a cross-Domain Feed.
+                        let source = active_space(state, &domain)?;
+                        if source.space_id != space_id {
+                            return Err(ControlError::InvalidOperation(
+                                "Subscription and source Domain must be the same Domain"
+                                    .to_owned(),
+                            ));
+                        }
+                        SubscriptionSource::Domain {
+                            domain_id: source.space_id,
+                        }
+                    }
+                    _ => {
+                        return Err(ControlError::InvalidOperation(
+                            "Subscription needs exactly one source: feed or domain".to_owned(),
+                        ))
+                    }
                 };
                 let subscription_id = derived_resource_id(request_id, "subscription");
-                let range_id = state
-                    .range_maps
-                    .get(&feed_id)
-                    .and_then(|map| map.routes().first())
-                    .map(|route| route.range_id)
-                    .ok_or_else(|| {
-                        ControlError::InvalidOperation(
-                            "Subscription source Feed has no committed range placement".to_owned(),
-                        )
-                    })?;
-                state
-                    .range_assignments
-                    .get(&range_id)
-                    .filter(|assignment| assignment.feed_id == feed_id)
-                    .ok_or_else(|| {
-                        ControlError::InvalidOperation(
-                            "Subscription source Feed placement is not applied".to_owned(),
-                        )
-                    })?;
+                if let Some(feed_id) = source.feed_id() {
+                    let range_id = state
+                        .range_maps
+                        .get(&feed_id)
+                        .and_then(|map| map.routes().first())
+                        .map(|route| route.range_id)
+                        .ok_or_else(|| {
+                            ControlError::InvalidOperation(
+                                "Subscription source Feed has no committed range placement"
+                                    .to_owned(),
+                            )
+                        })?;
+                    state
+                        .range_assignments
+                        .get(&range_id)
+                        .filter(|assignment| assignment.feed_id == feed_id)
+                        .ok_or_else(|| {
+                            ControlError::InvalidOperation(
+                                "Subscription source Feed placement is not applied".to_owned(),
+                            )
+                        })?;
+                }
                 let fixed = fixed.subscription_progress.ok_or_else(|| {
                     ControlError::InvalidOperation(
                         "Subscription progress has no consensus-prepared placement".to_owned(),
@@ -2334,7 +2411,7 @@ impl ControlController {
                     subscription_id,
                     name: name.clone(),
                     space_id,
-                    feed_id,
+                    source,
                     start,
                     stage: SubscriptionStage::Declared,
                     status: ResourceStatus::Active,
@@ -3621,7 +3698,7 @@ impl ControlController {
                 if new_space_id != existing.space_id
                     && state.subscriptions.values().any(|subscription| {
                         subscription.status == ResourceStatus::Active
-                            && subscription.feed_id == existing.feed_id
+                            && subscription.source.feed_id() == Some(existing.feed_id)
                     })
                 {
                     return Err(ControlError::InvalidOperation(
@@ -3712,7 +3789,16 @@ impl ControlController {
                         item.status == ResourceStatus::Active && item.feed_id == feed_id
                     })
                     || state.subscriptions.values().any(|item| {
-                        item.status == ResourceStatus::Active && item.feed_id == feed_id
+                        item.status == ResourceStatus::Active
+                            && (item.source.feed_id() == Some(feed_id)
+                                // A Domain-scoped Subscription covers this Feed
+                                // as soon as membership attaches — dropping the
+                                // Feed under it is unsafe until detach lands.
+                                || (item.source.domain_id().is_some()
+                                    && item.space_id
+                                        == active_feed(state, name)
+                                            .map(|feed| feed.space_id)
+                                            .unwrap_or_default()))
                     })
                     || state.pipes.values().any(|item| {
                         item.status == ResourceStatus::Active && item.output_feed_id == feed_id
@@ -3927,19 +4013,38 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             }
             Some("READER") | Some("SUBSCRIPTION") => {
                 expect_keyword(&tokens, 3, "FROM")?;
-                let start = if tokens.len() == 5 {
+                // `FROM DOMAIN <domain>` selects the Domain-wide source;
+                // `FROM <feed>` keeps the exact-Feed form.
+                let domain_source = keyword(4).as_deref() == Some("DOMAIN");
+                let source_index = if domain_source { 5 } else { 4 };
+                let start = if tokens.len() == source_index + 1 {
                     ReaderStart::Beginning
                 } else {
-                    expect_keyword(&tokens, 5, "START")?;
-                    expect_keyword(&tokens, 6, "AT")?;
-                    parse_reader_start(&tokens, 7)?
+                    expect_keyword(&tokens, source_index + 1, "START")?;
+                    expect_keyword(&tokens, source_index + 2, "AT")?;
+                    parse_reader_start(&tokens, source_index + 3)?
                 };
                 let name = token(&tokens, 2)?.to_owned();
-                let feed = token(&tokens, 4)?.to_owned();
+                let source = token(&tokens, source_index)?.to_owned();
                 if keyword(1).as_deref() == Some("SUBSCRIPTION") {
-                    Ok(Command::CreateSubscription { name, feed, start })
+                    Ok(Command::CreateSubscription {
+                        name,
+                        feed: (!domain_source).then_some(source.clone()),
+                        domain: domain_source.then_some(source),
+                        start,
+                    })
                 } else {
-                    Ok(Command::CreateReader { name, feed, start })
+                    if domain_source {
+                        return Err(ControlError::Syntax(
+                            "Readers consume an exact Feed; FROM DOMAIN applies to SUBSCRIPTION"
+                                .to_owned(),
+                        ));
+                    }
+                    Ok(Command::CreateReader {
+                        name,
+                        feed: source,
+                        start,
+                    })
                 }
             }
             Some("INDEX") => {
@@ -6433,7 +6538,8 @@ mod tests {
         let request_id = Uuid::from_u128(77_001);
         let command = Command::CreateSubscription {
             name: "accounts.billing".to_owned(),
-            feed: "accounts.users".to_owned(),
+            feed: Some("accounts.users".to_owned()),
+            domain: None,
             start: ReaderStart::Beginning,
         };
         let first = controller
@@ -6463,7 +6569,7 @@ mod tests {
                 .space_id
         );
         assert_eq!(
-            definition.feed_id,
+            definition.source.feed_id().unwrap(),
             controller
                 .active_feed_by_name("accounts.users")
                 .await
@@ -6481,7 +6587,8 @@ mod tests {
         assert!(controller
             .execute_commands(vec![Command::CreateSubscription {
                 name: "accounts.billing".to_owned(),
-                feed: "accounts.users".to_owned(),
+                feed: Some("accounts.users".to_owned()),
+                domain: None,
                 start: ReaderStart::Beginning,
             }])
             .await
@@ -6489,7 +6596,8 @@ mod tests {
         assert!(controller
             .execute_commands(vec![Command::CreateSubscription {
                 name: "accounts.crossspace".to_owned(),
-                feed: "other.events".to_owned(),
+                feed: Some("other.events".to_owned()),
+                domain: None,
                 start: ReaderStart::Beginning,
             }])
             .await
@@ -6910,5 +7018,119 @@ mod tests {
         assert!(parse_wcl("GET INDEX idx FOO 1").is_err());
         assert!(parse_wcl("GET INDEX idx RANGE 0").is_err());
         assert!(parse_wcl("GET INDEX idx RANGE MIN TO 5").is_err());
+    }
+
+    #[tokio::test]
+    async fn domain_scoped_subscription_source_binds_domain_identity_and_stays_compatible() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SPACE other; CREATE FEED other.events;")
+            .await
+            .unwrap();
+
+        // WCL FROM DOMAIN binds the immutable Domain identity.
+        let commands = parse_wcl("CREATE SUBSCRIPTION orders.all FROM DOMAIN orders;").unwrap();
+        assert!(matches!(
+            &commands[0],
+            Command::CreateSubscription {
+                feed: None,
+                domain: Some(domain),
+                ..
+            } if domain == "orders"
+        ));
+        controller.execute_commands(commands).await.unwrap();
+        let definition = controller
+            .active_subscription_by_name("orders.all")
+            .await
+            .unwrap();
+        let domain = controller
+            .state
+            .lock()
+            .await
+            .spaces
+            .values()
+            .find(|space| space.name == "orders")
+            .unwrap()
+            .space_id;
+        assert_eq!(
+            definition.source,
+            SubscriptionSource::Domain { domain_id: domain }
+        );
+        // Empty Domain coverage is legal: no Feed needed at declaration.
+        // Readers stay exact-Feed: FROM DOMAIN is refused there.
+        assert!(parse_wcl("CREATE READER orders.r FROM DOMAIN orders;").is_err());
+
+        // Typed command takes either scope, but exactly one.
+        controller
+            .execute_commands(vec![Command::CreateSubscription {
+                name: "orders.exact".to_owned(),
+                feed: Some("orders.events".to_owned()),
+                domain: None,
+                start: ReaderStart::Beginning,
+            }])
+            .await
+            .unwrap();
+        assert!(matches!(
+            controller
+                .active_subscription_by_name("orders.exact")
+                .await
+                .unwrap()
+                .source,
+            SubscriptionSource::Feed { .. }
+        ));
+        assert!(controller
+            .execute_commands(vec![Command::CreateSubscription {
+                name: "orders.both".to_owned(),
+                feed: Some("orders.events".to_owned()),
+                domain: Some("orders".to_owned()),
+                start: ReaderStart::Beginning,
+            }])
+            .await
+            .is_err());
+        assert!(controller
+            .execute_commands(vec![Command::CreateSubscription {
+                name: "orders.neither".to_owned(),
+                feed: None,
+                domain: None,
+                start: ReaderStart::Beginning,
+            }])
+            .await
+            .is_err());
+        // Cross-Domain sources refuse like cross-Domain Feeds.
+        assert!(controller
+            .execute_commands(vec![Command::CreateSubscription {
+                name: "other.borrowed".to_owned(),
+                feed: None,
+                domain: Some("orders".to_owned()),
+                start: ReaderStart::Beginning,
+            }])
+            .await
+            .is_err());
+
+        // Legacy rows written before the variant deserialize as Feed.
+        let legacy: SubscriptionDefinition = serde_json::from_value(serde_json::json!({
+            "subscription_id": Uuid::from_u128(9),
+            "name": "orders.legacy",
+            "space_id": domain,
+            "feed_id": Uuid::from_u128(8),
+            "start": {"kind": "beginning"},
+            "stage": "declared",
+            "status": "active",
+            "created_at_ns": 1
+        }))
+        .unwrap();
+        assert_eq!(legacy.source.feed_id().unwrap(), Uuid::from_u128(8));
+
+        // Dropping a Feed under a covering Domain-scoped Subscription is
+        // fenced — membership detach lands with domain membership tracking.
+        controller
+            .execute("CREATE SUBSCRIPTION orders.cover FROM DOMAIN orders;")
+            .await
+            .unwrap();
+        assert!(controller
+            .execute("DROP FEED orders.events;")
+            .await
+            .is_err());
     }
 }

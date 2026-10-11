@@ -137,7 +137,8 @@ async fn subscription_progress_uses_the_full_candidate_pool_without_changing_rf3
                 .execute_commands_with_request_id(
                     vec![Command::CreateSubscription {
                         name: format!("orders.sub{index}"),
-                        feed: "orders.created".to_owned(),
+                        feed: Some("orders.created".to_owned()),
+                        domain: None,
                         start: ReaderStart::Beginning,
                     }],
                     Uuid::from_u128(40_000 + index),
@@ -199,7 +200,8 @@ async fn follower_uses_leader_subscription_placement_not_local_candidates() {
             1_700_000_000,
             Command::CreateSubscription {
                 name: "orders.billing".to_owned(),
-                feed: "orders.created".to_owned(),
+                feed: Some("orders.created".to_owned()),
+                domain: None,
                 start: ReaderStart::Beginning,
             },
         )
@@ -249,7 +251,7 @@ async fn subscription_definition_survives_catalog_snapshot_without_creating_a_fe
         .await
         .unwrap();
     assert_eq!(
-        subscription.feed_id,
+        subscription.source.feed_id().unwrap(),
         source
             .active_feed_by_name("orders.created")
             .await
@@ -1629,7 +1631,8 @@ async fn drain_plan_explains_ordered_moves_and_unplannable_references() {
     control
         .execute_commands(vec![Command::CreateSubscription {
             name: "orders.billing".to_owned(),
-            feed: "orders.created".to_owned(),
+            feed: Some("orders.created".to_owned()),
+            domain: None,
             start: ReaderStart::Beginning,
         }])
         .await
