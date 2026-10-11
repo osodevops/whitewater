@@ -9,6 +9,11 @@ pub struct WriterServerFeedback {
     pub pressure: f64,
     pub retry_after_ms: u64,
     pub max_frame_bytes: usize,
+    /// The appended Key is flagged hot in its Active Range: per-Key ordering
+    /// means it cannot be parallelized, so the Writer should spread or shed
+    /// load for this Key rather than scaling batch sizes.
+    #[serde(default)]
+    pub hot_key: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +106,7 @@ mod tests {
             pressure: 0.8,
             retry_after_ms: 50,
             max_frame_bytes: 64_000,
+            hot_key: false,
         };
         policy.observe_retry(true);
         let pressured = policy.plan(Some(&feedback));

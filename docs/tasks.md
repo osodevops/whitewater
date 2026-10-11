@@ -1308,7 +1308,7 @@ Definition of Done:
 
 - [ ] Persist an authoritative committed-frontier proof that survives loss of two local copies; current per-read RF3 corroboration cannot prove history that has already disappeared from a majority.
 
-- [ ] Add hot-key detection and isolation.
+- [x] Add hot-key detection and isolation: bounded per-Key demand tracking (top shares, weighted median split token, untracked-budget accounting) feeds a sustained-share `HotKeyTracker` with hysteresis and a minimum-window floor; flagged Keys tighten Writer feedback (`hot_key: true`), steer the autoscaler to split at the Key's token edge so unrelated Keys are carved away, clear only on sustained sub-threshold share, expire after idle TTL, and reconcile away when ranges retire. `GET /v1/admin/demand/hot-keys` reports feed, range bounds, token, share, window evidence, and the isolating boundary. A strictly ordered hot Key can be isolated but is never claimed parallelizable. Live three-Node Compose acceptance (`python scripts/test-hot-keys.py`, `compose.hotkeys.yml`) proves sustained dominance flags the Key, Writer feedback distinguishes hot and cold Keys, and the automatic split lands the Key exactly at a child range boundary with the flag re-landing on the isolated child.
 
 
 

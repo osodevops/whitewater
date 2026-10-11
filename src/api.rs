@@ -56,7 +56,7 @@ use crate::{
         ControlNodeId, ControlPlane, ControlPlaneError, ControlTypeConfig, FullSnapshotRequest,
         InternalCommandsRequest, InternalCommandsResponse, InternalWriteResponse,
     },
-    demand::{DemandMetrics, DemandSnapshot},
+    demand::{isolation_split_boundary, DemandMetrics, DemandSnapshot, HotKeyEvidence},
     domain::{AppendInput, CursorRecord, StorageStats, StoredRecord},
     membership::{JoinResponse, MemberAnnouncement, MemberView, MembershipService},
     reader::{
@@ -636,6 +636,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/admin/subscriptions/progress",
             get(admin_subscription_progress),
         )
+        .route("/v1/admin/demand/hot-keys", get(admin_hot_keys))
         .route("/v1/admin/control-plane", get(control_plane_status))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
@@ -5326,6 +5327,68 @@ struct InternalOwnerAppendResponse {
     result: Option<WriterAppendResponse>,
     error: Option<String>,
     retryable: bool,
+    /// Machine-readable refusal code forwarded from the owner's ApiError so
+    /// ingress Nodes can distinguish retryable classes (e.g. sequence healing).
+    #[serde(default)]
+    code: Option<String>,
+}
+
+/// `GET /v1/admin/demand/hot-keys`
+///
+/// Node-local view of Keys flagged for sustained dominant append demand
+/// inside an Active Range. Per-Key ordering means a hot Key cannot be
+/// parallelized; the flag drives isolating splits and tightened Writer
+/// feedback rather than pretending the range can fan out. Detection is
+/// ingress-local, so query the Node receiving the appends (or every Node in
+/// a multi-ingress topology).
+async fn admin_hot_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let maps = state.control.active_feed_range_maps().await;
+    let mut evidence = state.demand.hot_keys();
+    evidence.sort_by(|left, right| left.range_id.cmp(&right.range_id));
+    let hot_keys: Vec<serde_json::Value> = evidence
+        .iter()
+        .map(|evidence| {
+            let feed_bounds = maps.iter().find_map(|(feed, map)| {
+                map.routes()
+                    .iter()
+                    .find(|route| route.range_id == evidence.range_id)
+                    .map(|route| (feed.clone(), route.bounds.clone()))
+            });
+            hot_key_entry(*evidence, feed_bounds)
+        })
+        .collect();
+    Ok(Json(json!({ "hot_keys": hot_keys })))
+}
+
+fn hot_key_entry(
+    evidence: HotKeyEvidence,
+    feed_bounds: Option<(String, crate::active_range::KeyRange)>,
+) -> serde_json::Value {
+    let (feed, bounds) = feed_bounds
+        .map(|(feed, bounds)| (Some(feed), Some(bounds)))
+        .unwrap_or((None, None));
+    let isolating_boundary = bounds
+        .as_ref()
+        .and_then(|bounds| isolation_split_boundary(bounds, &evidence));
+    json!({
+        "feed": feed,
+        "range_id": evidence.range_id,
+        "range_start": bounds.as_ref().map(|bounds| bounds.start),
+        "range_end_exclusive": bounds.as_ref().and_then(|bounds| bounds.end_exclusive),
+        "token": evidence.token,
+        "share_bps": evidence.share_bps,
+        "window_records": evidence.window_records,
+        "window_bytes": evidence.window_bytes,
+        "next_token": evidence.next_token,
+        // Where the autoscaler would split to isolate this Key; null when
+        // every observed append uses this one Key and nothing can be carved
+        // away — a strictly ordered hot Key cannot be parallelized.
+        "isolating_boundary": isolating_boundary,
+    })
 }
 
 async fn writer_batch_append(
@@ -5364,9 +5427,10 @@ async fn writer_batch_append(
                 .0,
         );
     }
+    let hot_key = results.iter().any(|result| result.feedback.hot_key);
     Ok(Json(WriterBatchAppendResponse {
         results,
-        feedback: writer_feedback(&state.demand),
+        feedback: writer_feedback(&state.demand, hot_key),
     }))
 }
 
@@ -5440,14 +5504,59 @@ async fn writer_session_append(
         .active_range_for_key(feed.feed_id, &routing_key)
         .await
         .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
+    let result = session_append_with_sequence(
+        &state,
+        &headers,
+        &request,
+        &feed.name,
+        writer.writer_id,
+        route.range_id,
+        "writer-range",
+    )
+    .await;
+    match result {
+        Err(error) if error.code == Some("writer.stale_sequence") => {
+            // The deduped allocation pinned a sequence the Writer's stream
+            // has already passed — a refused append consumed the number
+            // without landing the record. Re-allocate under a distinct
+            // identity so the retry lands at the stream tail; frame-digest
+            // and cursor dedup still fence any double-apply.
+            session_append_with_sequence(
+                &state,
+                &headers,
+                &request,
+                &feed.name,
+                writer.writer_id,
+                route.range_id,
+                "writer-range-reseq",
+            )
+            .await
+            .map(Json)
+        }
+        other => other.map(Json),
+    }
+}
+
+/// Allocate the Writer's next per-range sequence under `allocation_scope`
+/// and append the record through the routed owner path.
+#[allow(clippy::too_many_arguments)]
+async fn session_append_with_sequence(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: &WriterSessionAppendRequest,
+    feed_name: &str,
+    writer_id: Uuid,
+    range_id: crate::active_range::RangeId,
+    allocation_scope: &str,
+) -> Result<WriterAppendResponse, ApiError> {
     let commands = vec![crate::control::Command::AllocateWriterRangeSequence {
-        writer: request.writer,
+        writer: request.writer.clone(),
         session_epoch: request.session_epoch,
-        range_id: route.range_id,
+        range_id,
     }];
     let allocation_request_id = deterministic_uuid(
         request.request_id,
-        &format!("writer-range:{}", route.range_id),
+        &format!("{allocation_scope}:{range_id}"),
     );
     let execution = match &state.control_plane {
         Some(control_plane) => control_plane
@@ -5465,21 +5574,22 @@ async fn writer_session_append(
         .as_u64()
         .ok_or_else(|| ApiError::unavailable("Writer sequence allocation returned no sequence"))?;
     client_append(
-        State(state),
-        headers,
+        State(state.clone()),
+        headers.clone(),
         Json(ClientAppendRequest {
             request_id: request.request_id,
-            feed: feed.name,
-            writer_session_id: writer.writer_id,
+            feed: feed_name.to_owned(),
+            writer_session_id: writer_id,
             writer_epoch: request.session_epoch,
             sequence,
-            event_time_ns: request.event_time_ns,
-            key_base64: request.key_base64,
-            payload_base64: request.payload_base64,
-            metadata_base64: request.metadata_base64,
+            event_time_ns: request.event_time_ns.clone(),
+            key_base64: request.key_base64.clone(),
+            payload_base64: request.payload_base64.clone(),
+            metadata_base64: request.metadata_base64.clone(),
         }),
     )
     .await
+    .map(|Json(response)| response)
 }
 
 async fn client_append(
@@ -5568,8 +5678,10 @@ async fn route_append_to_owner(
         message: response
             .error
             .unwrap_or_else(|| "Append Owner returned no result".to_owned()),
-
-        code: None,
+        code: match response.code.as_deref() {
+            Some("writer.stale_sequence") => Some("writer.stale_sequence"),
+            _ => None,
+        },
     })
 }
 
@@ -5582,11 +5694,13 @@ async fn owner_append(
             result: Some(result),
             error: None,
             retryable: false,
+            code: None,
         },
         Err(error) => InternalOwnerAppendResponse {
             result: None,
             retryable: error.status == StatusCode::SERVICE_UNAVAILABLE,
             error: Some(error.message),
+            code: error.code.map(str::to_owned),
         },
     })
 }
@@ -5675,23 +5789,40 @@ async fn owner_append_local(
             frame_base64: STANDARD.encode(frame),
         })
         .await
-        .map_err(majority_api_error)?;
+        .map_err(|error| {
+            // A refused append leaves its allocated Writer sequence
+            // unconsumed; once later appends advance the stream, the
+            // deduped allocation can never fill the hole. Tag it so the
+            // session append path can re-allocate and heal the retry.
+            if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
+                && error.message.contains("is stale; latest accepted sequence")
+            {
+                ApiError {
+                    status: StatusCode::CONFLICT,
+                    message: error.message,
+                    code: Some("writer.stale_sequence"),
+                }
+            } else {
+                majority_api_error(error)
+            }
+        })?;
     state
         .demand
         .record_range_append(assignment.range_id, &pressure_key, pressure_bytes);
+    let hot_key = state.demand.is_hot_key(assignment.range_id, &pressure_key);
     Ok(WriterAppendResponse {
         message_id: result.message_id,
         cursor: result.cursor,
         deduplicated: result.deduplicated,
         durability: "majority_committed".to_owned(),
-        feedback: writer_feedback(&state.demand),
+        feedback: writer_feedback(&state.demand, hot_key),
     })
 }
 
-fn writer_feedback(demand: &DemandMetrics) -> WriterServerFeedback {
+fn writer_feedback(demand: &DemandMetrics, hot_key: bool) -> WriterServerFeedback {
     let snapshot = demand.snapshot();
     let pressure = (snapshot.requests_in_flight as f64 / 100.0).clamp(0.0, 1.0);
-    WriterServerFeedback {
+    let mut feedback = WriterServerFeedback {
         recommended_batch_count: if pressure > 0.75 { 16 } else { 100 },
         recommended_batch_bytes: if pressure > 0.75 {
             256 * 1024
@@ -5701,7 +5832,16 @@ fn writer_feedback(demand: &DemandMetrics) -> WriterServerFeedback {
         pressure,
         retry_after_ms: if pressure > 0.9 { 50 } else { 0 },
         max_frame_bytes: crate::codec::MAX_FRAME_BYTES,
+        hot_key,
+    };
+    if hot_key {
+        // A flagged hot Key cannot be parallelized without relaxing same-Key
+        // ordering; ask the Writer to shed per-Key throughput instead.
+        feedback.recommended_batch_count = feedback.recommended_batch_count.min(8);
+        feedback.recommended_batch_bytes = feedback.recommended_batch_bytes.min(64 * 1024);
+        feedback.retry_after_ms = feedback.retry_after_ms.max(25);
     }
+    feedback
 }
 
 fn feed_cursor(feed_id: Uuid, request_id: Uuid) -> String {
@@ -7153,6 +7293,18 @@ mod tests {
         membership::MemberAnnouncement,
         storage::FileLogStore,
     };
+
+    #[test]
+    fn writer_feedback_tightens_guidance_for_flagged_hot_key() {
+        let demand = DemandMetrics::default();
+        let normal = writer_feedback(&demand, false);
+        let hot = writer_feedback(&demand, true);
+        assert!(!normal.hot_key);
+        assert!(hot.hot_key);
+        assert!(hot.retry_after_ms >= 25);
+        assert!(hot.recommended_batch_count <= 8);
+        assert!(hot.recommended_batch_bytes <= 64 * 1024);
+    }
 
     #[test]
     fn append_request_uses_metadata_and_accepts_the_prototype_header_alias() {

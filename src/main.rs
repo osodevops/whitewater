@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::Result;
 use finnstream::{
@@ -16,7 +20,7 @@ use finnstream::{
     config::NodeConfig,
     control::ControlController,
     control_plane::ControlPlane,
-    demand::DemandMetrics,
+    demand::{isolation_split_boundary, DemandMetrics, HotKeyObservation, HotKeyTracker},
     internal_plane::{CatalogSyncSupervisor, HttpCatalogSnapshotSource, InternalEndpoints},
     membership::{MemberAnnouncement, MembershipService},
     reader::{
@@ -387,6 +391,14 @@ async fn main() -> Result<()> {
             .ok()
             .and_then(|value| value.parse::<u32>().ok())
             .unwrap_or(60);
+        let hot_sustained = std::env::var("WHITEWATER_HOT_KEY_SUSTAINED_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(2);
+        let hot_clear = std::env::var("WHITEWATER_HOT_KEY_CLEAR_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(15);
         let internal_key = config.control_plane_key.clone()?;
         let peer_endpoints = control_endpoints.clone();
         let peer_client = match build_internal_client(Duration::from_secs(5)) {
@@ -399,6 +411,7 @@ async fn main() -> Result<()> {
         let endpoint = format!("http://127.0.0.1:{}", config.bind_addr.port());
         Some(tokio::spawn(async move {
             let mut split_trackers = BTreeMap::new();
+            let mut hot_trackers = BTreeMap::new();
             let mut cold_trackers = BTreeMap::new();
             let mut previous_totals = BTreeMap::new();
             let client = reqwest::Client::new();
@@ -407,12 +420,79 @@ async fn main() -> Result<()> {
                 tokio::select! {
                     _ = interval.tick() => {
                         for sample in demand.take_range_pressure_samples() {
+                            // Hot-Key detection observes every windowed
+                            // sample, not just windows that pass the split
+                            // threshold: a dominant Key deserves isolation
+                            // evidence even below the range-split rate.
+                            let observation = hot_trackers
+                                .entry(sample.range_id)
+                                .or_insert_with(|| {
+                                    HotKeyTracker::new(hot_sustained, hot_clear)
+                                })
+                                .observe(&sample);
+                            match observation {
+                                HotKeyObservation::Flagged(evidence) => {
+                                    tracing::warn!(
+                                        range_id = %sample.range_id,
+                                        token = %evidence.token,
+                                        share_bps = evidence.share_bps,
+                                        "sustained hot Key flagged; isolating splits and tightened Writer feedback apply"
+                                    );
+                                    demand.set_hot_key(evidence);
+                                }
+                                HotKeyObservation::Cleared(range_id) => {
+                                    tracing::info!(range_id = %range_id, "hot Key flag cleared after sustained sub-threshold share");
+                                    demand.clear_hot_key(range_id);
+                                }
+                                HotKeyObservation::Unchanged => {
+                                    if let Some(current) = hot_trackers
+                                        .get(&sample.range_id)
+                                        .and_then(|tracker| tracker.flagged())
+                                    {
+                                        demand.set_hot_key(current);
+                                    }
+                                }
+                            }
                             let rate = sample.records.saturating_mul(1_000) / interval_ms;
                             let tracker = split_trackers.entry(sample.range_id)
                                 .or_insert_with(|| SplitPressureTracker::new(threshold, sustained, cooldown));
                             if !tracker.observe(rate) { continue; }
-                            let Some(split_at) = sample.split_token else { continue; };
-                            let Some(feed) = control.active_feed_name_for_range(sample.range_id).await else { continue; };
+                            let Some((feed, bounds)) = control
+                                .active_feed_range_maps()
+                                .await
+                                .into_iter()
+                                .find_map(|(feed, map)| {
+                                    map.routes()
+                                        .iter()
+                                        .find(|route| route.range_id == sample.range_id)
+                                        .map(|route| (feed, route.bounds.clone()))
+                                })
+                            else { continue; };
+                            let split_at = match demand.hot_key(sample.range_id) {
+                                Some(hot) => match isolation_split_boundary(&bounds, &hot) {
+                                    Some(boundary) => {
+                                        tracing::info!(
+                                            range_id = %sample.range_id,
+                                            token = %hot.token,
+                                            boundary = %boundary,
+                                            "splitting at hot Key edge to isolate it from unrelated Keys"
+                                        );
+                                        boundary
+                                    }
+                                    None => {
+                                        tracing::info!(
+                                            range_id = %sample.range_id,
+                                            token = %hot.token,
+                                            "hot Key is the only observed Key in this range; nothing to isolate"
+                                        );
+                                        continue;
+                                    }
+                                },
+                                None => {
+                                    let Some(split_at) = sample.split_token else { continue; };
+                                    split_at
+                                }
+                            };
                             tokio::time::sleep(Duration::from_secs(5)).await;
                             let response = client
                                 .post(format!("{endpoint}/v1/admin/ranges/split"))
@@ -435,6 +515,24 @@ async fn main() -> Result<()> {
                                     tracing::warn!(range_id = %sample.range_id, %status, %detail, "automatic Active Range split deferred");
                                 }
                                 Err(error) => tracing::warn!(range_id = %sample.range_id, %error, "automatic Active Range split request failed"),
+                            }
+                        }
+                        // Retire flags and trackers whose ranges no longer
+                        // exist — splits and merges decided on any Node
+                        // replace range IDs, and lingering evidence for a
+                        // dead range can never clear itself.
+                        let live_ranges: BTreeSet<_> = control
+                            .active_feed_range_maps()
+                            .await
+                            .iter()
+                            .flat_map(|(_, map)| {
+                                map.routes().iter().map(|route| route.range_id)
+                            })
+                            .collect();
+                        hot_trackers.retain(|range_id, _| live_ranges.contains(range_id));
+                        for evidence in demand.hot_keys() {
+                            if !live_ranges.contains(&evidence.range_id) {
+                                demand.clear_hot_key(evidence.range_id);
                             }
                         }
                         if control_plane.status().await.state == "leader" {

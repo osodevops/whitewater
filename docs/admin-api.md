@@ -461,6 +461,36 @@ Returns the Subscription's current progress assignment (owner, RF3 replica set, 
 
 `committed` is `null` when no quorum-readable frontier exists (never joined, or mid-recovery). `replicas[].committed_epoch` behind `assignment.ownership_epoch` marks a lagging replica that adoption has not yet caught up.
 
+### Inspect flagged hot Keys
+
+```http
+GET /v1/admin/demand/hot-keys
+Authorization: Bearer <admin-key>
+```
+
+Returns the Node-local set of Keys flagged for sustained dominant append demand inside their Active Range. Detection requires the dominant Key to hold at least half of a range's windowed appends across consecutive sampling windows (see `WHITEWATER_HOT_KEY_SUSTAINED_SAMPLES`), and the flag clears only after the Key's share stays below the hysteresis floor for `WHITEWATER_HOT_KEY_CLEAR_SAMPLES` consecutive windows, so short-lived bursts neither flag nor flap.
+
+```json
+{
+  "hot_keys": [
+    {
+      "feed": "orders.events",
+      "range_id": "...",
+      "token": "<key-token>",
+      "share_bps": 8900,
+      "window_records": 420,
+      "window_bytes": 186500,
+      "next_token": "<key-token>",
+      "isolating_boundary": "<key-token>"
+    }
+  ]
+}
+```
+
+`token` is the deterministic KeyToken, not the raw Key bytes. `isolating_boundary` is where the autoscaler splits to push the hot Key toward a range edge; it is `null` when every observed append in the range uses this one Key — a strictly ordered hot Key cannot be parallelized, only isolated. Detection is ingress-local to the Append Owner, so in a multi-ingress topology query the owning Node (or every Node).
+
+While a Key is flagged, appends for it return `feedback.hot_key: true` with tightened batch guidance and `retry_after_ms`; unrelated Keys in the same range keep normal guidance, and sustained range pressure splits at the Key's edge rather than the weighted median so unrelated Keys migrate away.
+
 
 ### Grant
 
