@@ -1552,23 +1552,23 @@ Definition of Done:
 
 - [x] Define the intended language-neutral Writer, Reader, Subscription, StateStore, Pipe, Cursor, ordering, and idempotent effect semantics; publish the guide/conformance delivery plan (`docs/streams-clients.md`).
 
-- [ ] Version and publish canonical language-neutral request/response schemas, capability negotiation, TLS/auth defaults, byte/Metadata/nanosecond encodings, and bounded transport limits without exposing Active Range topology.
+- [~] Version and publish canonical language-neutral request/response schemas, capability negotiation, TLS/auth defaults, byte/Metadata/nanosecond encodings, and bounded transport limits without exposing Active Range topology. Corpus lives in `sdk/spec/`: `PROTOCOL.md`, `endpoints.json`, `VERSION`, and `conformance/` — eight fixtures covering WCL resources, idempotent appends, Reader resume, nanosecond/binary-key handling, Subscription member drain, Feed access, authentication refusal, and Writer-sequence fencing. Capability negotiation and transport limits remain open.
 
-- [ ] Define stable structured error codes, scope, retryability, ambiguous-commit handling, backoff, and next safe action; refuse unsupported server capabilities instead of silently downgrading safety.
+- [~] Define stable structured error codes, scope, retryability, ambiguous-commit handling, backoff, and next safe action; refuse unsupported server capabilities instead of silently downgrading safety. Wire `code` values are catalogued in `sdk/spec/PROTOCOL.md` and mapped to typed errors in all five external SDKs; conformance exercises `writer.stale_sequence`, `lease.stale_lease`, status-409 sequence conflicts, and 401 authentication refusals. Ambiguous-result handling is specified but not yet exercised by a fixture.
 
 - [ ] Complete the Rust application SDK beyond AdminClient: ergonomic Writer, Reader, StateStore, Subscription, and processing-effect faÃ§ades once the underlying services pass tests.
 
-- [ ] Implement Python async and sync clients with the same server contract and a runnable Writer/Reader quickstart, then the same StateStore/Pipe guide when implemented.
+- [~] Implement Python async and sync clients with the same server contract and a runnable Writer/Reader quickstart, then the same StateStore/Pipe guide when implemented. `osodevops/whitewater-python` @ `480ae4c` ships Admin/Writer/Reader/Subscription-member/Feed facades incl. `feeds.records`/`temporary_fetch`/`append` and `admin.commands`; 17/17 tests green including eight shared scenarios. Async surface, quickstart guide, and StateStore/Pipe remain.
 
-- [ ] Implement Java asynchronous and optional blocking clients with the same server contract; no Java-only Pipe or local-state semantics.
+- [~] Implement Java asynchronous and optional blocking clients with the same server contract; no Java-only Pipe or local-state semantics. `osodevops/whitewater-java` @ `e66fa79` ships Admin (WCL + typed commands), Writer, Reader, Subscription member, and Feed clients on Java 17+ with Jackson + java.net.http; 15 unit + 8 shared conformance scenarios pass live. StateStore/Pipe surfaces arrive with the server-side milestones.
 
-- [ ] Implement C# Task/IAsyncEnumerable clients with the same server contract, cancellation, and native byte/Guid/long representations.
+- [~] Implement C# Task/IAsyncEnumerable clients with the same server contract, cancellation, and native byte/Guid/long representations. `osodevops/whitewater-dotnet` @ `073159d` ships a zero-dependency .NET 8 client with `AdminClient`/`WriterSessionClient`/`ReaderSessionClient`/`SubscriptionMemberClient`/`FeedClient`; 9/9 tests green including eight shared scenarios. `IAsyncEnumerable` streaming readers arrive with the server-side iteration surface.
 
-- [ ] Implement a Node.js/TypeScript client with Promise/AsyncIterable, Buffer/Uint8Array, AbortSignal, and `bigint` nanoseconds serialized as decimal JSON strings; never expose 64-bit time as an imprecise JS number.
+- [~] Implement a Node.js/TypeScript client with Promise/AsyncIterable, Buffer/Uint8Array, AbortSignal, and `bigint` nanoseconds serialized as decimal JSON strings; never expose 64-bit time as an imprecise JS number. `osodevops/whitewater-node` @ `b8ed78c` ships `WhitewaterClient` (fetch transport, `bigint` times, feeds + commands surfaces); 16/16 tests green including eight shared scenarios. AsyncIterable readers arrive with the iteration surface.
 
-- [ ] Implement a Go client with context.Context cancellation, []byte records/Metadata, int64 nanoseconds, bounded iteration, and the same ambiguity/idempotency guarantees.
+- [~] Implement a Go client with context.Context cancellation, []byte records/Metadata, int64 nanoseconds, bounded iteration, and the same ambiguity/idempotency guarantees. `osodevops/whitewater-go` @ `cdf977d` ships a zero-dependency context-first client with `*Error`/`Kind` classification plus Feeds/commands surfaces; 14 tests green including eight shared scenarios via the `golang` container.
 
-- [ ] Run one shared three-Node conformance suite for all six libraries: exact bytes/time/Cursor results, identical duplicate and conflicting retries, stale epochs, Reader redelivery/ack, bounded capacity, loss of an owner, restart, authentication errors, and later atomic enrichment/state freshness.
+- [~] Run one shared three-Node conformance suite for all six libraries: exact bytes/time/Cursor results, identical duplicate and conflicting retries, stale epochs, Reader redelivery/ack, bounded capacity, loss of an owner, restart, authentication errors, and later atomic enrichment/state freshness. Eight shared fixtures pass live on Java (`ConformanceRunnerIT`), Python, Node, .NET (`ConformanceRunner` xUnit), and Go (`TestSharedConformanceCorpus`), including Feed access, 401 auth refusal (`error_status`), and Writer-sequence fencing. Remaining: owner-loss/restart chaos fixtures, ambiguous-commit exercise, and the in-tree Rust SDK.
 
 - [ ] Provide per-language unit-test doubles and publish matching runnable user guides for append/read/replay, state/index queries, enrichment, rolling-window aggregation, late-event policy, failure handling, migration from Kafka Streams, and safe operator diagnostics; mark chapters unsupported until server and SDK evidence passes.
 
