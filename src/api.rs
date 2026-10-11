@@ -661,6 +661,10 @@ pub fn router(state: AppState) -> Router {
             post(subscription_member_release),
         )
         .route(
+            "/v1/subscriptions/members/transfer",
+            post(subscription_member_transfer),
+        )
+        .route(
             "/v1/subscriptions/members/ack",
             post(subscription_member_ack),
         )
@@ -1113,6 +1117,21 @@ struct SubscriptionMemberReleaseRequest {
     member_epoch: u64,
     work_id: Uuid,
     lease_epoch: u64,
+}
+
+#[derive(Deserialize)]
+struct SubscriptionMemberTransferRequest {
+    subscription: String,
+    request_id: Uuid,
+    work_id: Uuid,
+    /// Current holder + its grant epoch — fencing evidence so a stale
+    /// transfer cannot clobber a newer assignment.
+    member_id: Uuid,
+    lease_epoch: u64,
+    /// Target member and its current member epoch.
+    to_member_id: Uuid,
+    to_member_epoch: u64,
+    lease_ticks: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -1633,6 +1652,36 @@ async fn subscription_member_release(
         member_state,
     );
     response.member_epoch = Some(request.member_epoch);
+    Ok(Json(response))
+}
+
+async fn subscription_member_transfer(
+    State(state): State<AppState>,
+    Json(request): Json<SubscriptionMemberTransferRequest>,
+) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
+    let lease_ticks = member_lease_ticks(request.lease_ticks)?;
+    let (coordinator, assignment, _definition) =
+        member_coordinator_recovering(&state, &request.subscription).await?;
+    let member_state = member_apply(
+        &coordinator,
+        request.request_id,
+        vec![crate::reader::SubscriptionLeaseOp::Transfer {
+            work_id: request.work_id,
+            from_member_id: request.member_id,
+            from_lease_epoch: request.lease_epoch,
+            to_member_id: request.to_member_id,
+            to_member_epoch: request.to_member_epoch,
+            lease_ticks,
+        }],
+    )
+    .await?;
+    let mut response = member_response(
+        request.subscription,
+        assignment.ownership_epoch,
+        member_state,
+    );
+    response.member_epoch = Some(request.to_member_epoch);
+    response.lease = response.leases.get(&request.work_id).cloned();
     Ok(Json(response))
 }
 
@@ -13890,6 +13939,58 @@ mod tests {
             vec!["cursor-11", "cursor-12"]
         );
 
+        // Incremental lease transfer: a second member joins, the work
+        // moves to it with a bumped lease epoch — the old holder's grant
+        // is fenced instantly and only the target can continue.
+        let other = Uuid::from_u128(0x4444);
+        let (status, body) = post(
+            "join",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(16),
+                "member_id": other}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["member_epoch"], json!(1));
+        // Stale transfer evidence refuses rather than clobbering.
+        let (status, _) = post(
+            "transfer",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(17),
+                "work_id": work, "member_id": member, "lease_epoch": 99,
+                "to_member_id": other, "to_member_epoch": 1, "lease_ticks": 60}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, body) = post(
+            "transfer",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(17),
+                "work_id": work, "member_id": member, "lease_epoch": reclaimed_epoch,
+                "to_member_id": other, "to_member_epoch": 1, "lease_ticks": 60}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let moved = body["lease"].clone();
+        assert_eq!(moved["member_id"], json!(other));
+        assert_eq!(moved["member_epoch"], json!(1));
+        assert_eq!(moved["lease_epoch"], json!(reclaimed_epoch + 1));
+        // The old holder's grant is fenced: its fetch with the stale epoch
+        // conflicts while the new holder's succeeds.
+        let (status, _) = post(
+            "fetch",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(18),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_epoch": reclaimed_epoch}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(18),
+                "member_id": other, "member_epoch": 1, "work_id": work,
+                "lease_epoch": moved["lease_epoch"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
         // A Subscription with no committed frontier bootstraps its declared
         // start atomically with the first member join.
         let (status, body) = post(
@@ -14024,7 +14125,7 @@ mod tests {
         );
         assert_eq!(body["assignment"]["replicas"].as_array().unwrap().len(), 3);
         assert!(body["committed"]["cursor"].is_string(), "{body}");
-        assert_eq!(body["members"]["member_count"], json!(1));
+        assert_eq!(body["members"]["member_count"], json!(2));
         assert_eq!(body["replicas"].as_array().unwrap().len(), 3);
         assert!(body["replicas"]
             .as_array()

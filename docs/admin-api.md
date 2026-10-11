@@ -291,6 +291,15 @@ POST /v1/subscriptions/members/renew
 POST /v1/subscriptions/members/release
 { "...": "...", "lease_epoch": 1 }
 
+POST /v1/subscriptions/members/transfer
+{ "subscription": "orders.billing", "request_id": "...", "work_id": "...",
+  "member_id": "...", "lease_epoch": 3,
+  "to_member_id": "...", "to_member_epoch": 1, "lease_ticks": 60 }
+  -> moves one work lease to another joined member, bumping lease_epoch so
+     the previous holder can never acknowledge it; stale source evidence is
+     refused (409), as is a full target. Bounded batched transfers ride the
+     same journal ops, so a rebalance is incremental, not stop-the-world.
+
 POST /v1/subscriptions/members/fetch
 { "...": "...", "work_id": "...", "lease_epoch": 1, "limit": 100 }
 

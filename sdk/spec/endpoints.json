@@ -337,6 +337,29 @@
       ]
     },
     {
+      "op": "subscription.member.transfer",
+      "method": "POST",
+      "path": "/v1/subscriptions/members/transfer",
+      "auth": "admin",
+      "request": {
+        "subscription": "name",
+        "request_id": "uuid",
+        "work_id": "uuid",
+        "member_id": "uuid (current holder — fencing evidence)",
+        "lease_epoch": "u64 (holder's grant epoch)",
+        "to_member_id": "uuid",
+        "to_member_epoch": "u64 (target's current member epoch)",
+        "lease_ticks": "u64?"
+      },
+      "response": "SubscriptionMemberResponse { lease }",
+      "errors": [
+        "lease.stale_lease(409)",
+        "lease.capacity(409)",
+        "conflict(409)",
+        "unavailable(503)"
+      ]
+    },
+    {
       "op": "subscription.member.fetch",
       "method": "POST",
       "path": "/v1/subscriptions/members/fetch",

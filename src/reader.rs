@@ -249,6 +249,18 @@ pub struct SubscriptionWorkLease {
     pub expires_at_tick: u64,
 }
 
+/// One incremental lease handoff: the work item, the current holder's
+/// fencing evidence, and the target member + lease duration.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubscriptionLeaseTransfer {
+    pub work_id: Uuid,
+    pub from_member_id: Uuid,
+    pub from_lease_epoch: u64,
+    pub to_member_id: Uuid,
+    pub to_member_epoch: u64,
+    pub lease_ticks: u64,
+}
+
 pub const SUBSCRIPTION_LEASE_MAX_WORK: usize = 256;
 pub const SUBSCRIPTION_LEASE_MAX_MEMBER_WORK: usize = 32;
 pub const SUBSCRIPTION_LEASE_MAX_OPS: usize = 16;
@@ -286,6 +298,16 @@ pub enum SubscriptionLeaseOp {
         member_id: Uuid,
         member_epoch: u64,
         lease_epoch: u64,
+    },
+    /// Moves one work lease to another joined member — the incremental
+    /// handoff primitive: one item at a time, never a global rebalance.
+    Transfer {
+        work_id: Uuid,
+        from_member_id: Uuid,
+        from_lease_epoch: u64,
+        to_member_id: Uuid,
+        to_member_epoch: u64,
+        lease_ticks: u64,
     },
 }
 
@@ -442,6 +464,69 @@ impl SubscriptionLeaseTracker {
             })
     }
 
+    /// Transfers one work lease to another joined member. The stored
+    /// grant must match the caller's source evidence (holder + lease
+    /// epoch); the grant's `lease_epoch` advances so the previous holder
+    /// can never acknowledge it, while the target can immediately.
+    /// Replaying an already-applied transfer returns the moved grant.
+    pub fn transfer(
+        &mut self,
+        transfer: &SubscriptionLeaseTransfer,
+        now_tick: u64,
+        max_member_work: usize,
+    ) -> Result<SubscriptionWorkLease, SubscriptionLeaseError> {
+        self.check_tick(now_tick, transfer.lease_ticks)?;
+        if self.member_epochs.get(&transfer.to_member_id) != Some(&transfer.to_member_epoch) {
+            return Err(SubscriptionLeaseError::StaleLease);
+        }
+        if max_member_work == 0 {
+            return Err(SubscriptionLeaseError::Capacity);
+        }
+        let existing = self
+            .leases
+            .get(&transfer.work_id)
+            .ok_or(SubscriptionLeaseError::StaleLease)?;
+        if existing.member_id == transfer.to_member_id
+            && existing.member_epoch == transfer.to_member_epoch
+        {
+            return Ok(existing.clone());
+        }
+        if existing.member_id != transfer.from_member_id
+            || existing.lease_epoch != transfer.from_lease_epoch
+        {
+            return Err(SubscriptionLeaseError::StaleLease);
+        }
+        let active_for_target = self
+            .leases
+            .values()
+            .filter(|lease| {
+                lease.member_id == transfer.to_member_id
+                    && lease.member_epoch == transfer.to_member_epoch
+                    && now_tick < lease.expires_at_tick
+            })
+            .count();
+        if active_for_target >= max_member_work {
+            return Err(SubscriptionLeaseError::Capacity);
+        }
+        let lease_epoch = existing
+            .lease_epoch
+            .checked_add(1)
+            .ok_or(SubscriptionLeaseError::InvalidClock)?;
+        let expires_at_tick = now_tick
+            .checked_add(transfer.lease_ticks)
+            .ok_or(SubscriptionLeaseError::InvalidClock)?;
+        let grant = SubscriptionWorkLease {
+            work_id: transfer.work_id,
+            member_id: transfer.to_member_id,
+            member_epoch: transfer.to_member_epoch,
+            lease_epoch,
+            expires_at_tick,
+        };
+        self.leases.insert(transfer.work_id, grant.clone());
+        self.last_tick = now_tick;
+        Ok(grant)
+    }
+
     pub fn from_state(state: SubscriptionMemberState, max_work: usize) -> Self {
         let mut tracker = Self::new(max_work);
         tracker.leases = state.leases;
@@ -528,6 +613,27 @@ impl SubscriptionLeaseTracker {
                 lease_epoch: *lease_epoch,
                 expires_at_tick: 0,
             }),
+            SubscriptionLeaseOp::Transfer {
+                work_id,
+                from_member_id,
+                from_lease_epoch,
+                to_member_id,
+                to_member_epoch,
+                lease_ticks,
+            } => self
+                .transfer(
+                    &SubscriptionLeaseTransfer {
+                        work_id: *work_id,
+                        from_member_id: *from_member_id,
+                        from_lease_epoch: *from_lease_epoch,
+                        to_member_id: *to_member_id,
+                        to_member_epoch: *to_member_epoch,
+                        lease_ticks: *lease_ticks,
+                    },
+                    now_tick,
+                    SUBSCRIPTION_LEASE_MAX_MEMBER_WORK,
+                )
+                .map(|_| ()),
         }
     }
 
@@ -4085,5 +4191,193 @@ mod tests {
             .result;
         assert_eq!(inspection.committed, Some(adopted_committed));
         assert!(inspection.prepared.is_none());
+    }
+
+    #[test]
+    fn subscription_lease_transfer_moves_work_incrementally_and_fences_the_source() {
+        let mut tracker = SubscriptionLeaseTracker::new(16);
+        let alice = Uuid::from_u128(1);
+        let bob = Uuid::from_u128(2);
+        let work = Uuid::from_u128(9);
+        tracker.fence_member(alice, 1).unwrap();
+        tracker.fence_member(bob, 1).unwrap();
+        let grant = tracker.claim(work, alice, 1, 10, 30, 4).unwrap();
+        assert!(tracker.can_ack(&grant, 10));
+
+        // Stale source evidence and unjoined targets refuse.
+        assert_eq!(
+            tracker.transfer(
+                &SubscriptionLeaseTransfer {
+                    work_id: work,
+                    from_member_id: alice,
+                    from_lease_epoch: 9,
+                    to_member_id: bob,
+                    to_member_epoch: 1,
+                    lease_ticks: 30
+                },
+                10,
+                4
+            ),
+            Err(SubscriptionLeaseError::StaleLease)
+        );
+        assert_eq!(
+            tracker.transfer(
+                &SubscriptionLeaseTransfer {
+                    work_id: work,
+                    from_member_id: alice,
+                    from_lease_epoch: 1,
+                    to_member_id: Uuid::from_u128(3),
+                    to_member_epoch: 1,
+                    lease_ticks: 30
+                },
+                10,
+                4
+            ),
+            Err(SubscriptionLeaseError::StaleLease)
+        );
+
+        // The transfer bumps lease_epoch: the old grant can never
+        // acknowledge, the target's new grant can.
+        let moved = tracker
+            .transfer(
+                &SubscriptionLeaseTransfer {
+                    work_id: work,
+                    from_member_id: alice,
+                    from_lease_epoch: 1,
+                    to_member_id: bob,
+                    to_member_epoch: 1,
+                    lease_ticks: 30,
+                },
+                11,
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            (moved.member_id, moved.member_epoch, moved.lease_epoch),
+            (bob, 1, 2)
+        );
+        assert_eq!(moved.expires_at_tick, 41);
+        assert!(!tracker.can_ack(&grant, 11));
+        assert!(tracker.can_ack(&moved, 11));
+
+        // A replayed transfer returns the moved grant rather than
+        // demanding now-stale source evidence.
+        let replayed = tracker
+            .transfer(
+                &SubscriptionLeaseTransfer {
+                    work_id: work,
+                    from_member_id: alice,
+                    from_lease_epoch: 1,
+                    to_member_id: bob,
+                    to_member_epoch: 1,
+                    lease_ticks: 30,
+                },
+                11,
+                4,
+            )
+            .unwrap();
+        assert_eq!(replayed, moved);
+
+        // Transfer respects the target's per-member bound.
+        for extra in 0..3u128 {
+            tracker
+                .claim(Uuid::from_u128(100 + extra), bob, 1, 12, 30, 4)
+                .unwrap();
+        }
+        let overflow = Uuid::from_u128(200);
+        let held = tracker.claim(overflow, alice, 1, 12, 30, 4).unwrap();
+        assert_eq!(
+            tracker.transfer(
+                &SubscriptionLeaseTransfer {
+                    work_id: overflow,
+                    from_member_id: alice,
+                    from_lease_epoch: held.lease_epoch,
+                    to_member_id: bob,
+                    to_member_epoch: 1,
+                    lease_ticks: 30
+                },
+                13,
+                4
+            ),
+            Err(SubscriptionLeaseError::Capacity)
+        );
+    }
+
+    #[test]
+    fn subscription_lease_transfer_commits_through_the_member_journal() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let replica = FjallSubscriptionProgressReplica::open(directory.path()).unwrap();
+        let subscription_id = Uuid::from_u128(620);
+        let feed_id = Uuid::from_u128(621);
+        let holder = Uuid::from_u128(622);
+        let target = Uuid::from_u128(623);
+        let work = Uuid::from_u128(624);
+
+        // Both members join; the holder claims the work.
+        let mut join = subscription_progress_mutation(subscription_id, feed_id, 1, 1);
+        join.lease_ops = vec![
+            SubscriptionLeaseOp::Join {
+                member_id: holder,
+                member_epoch: 1,
+            },
+            SubscriptionLeaseOp::Join {
+                member_id: target,
+                member_epoch: 1,
+            },
+            SubscriptionLeaseOp::Claim {
+                work_id: work,
+                member_id: holder,
+                member_epoch: 1,
+                lease_ticks: 30,
+            },
+        ];
+        commit_direct(&replica, &join);
+
+        // Incremental transfer replicates as one journal mutation.
+        let mut transfer = subscription_progress_mutation(subscription_id, feed_id, 1, 2);
+        transfer.lease_ops = vec![SubscriptionLeaseOp::Transfer {
+            work_id: work,
+            from_member_id: holder,
+            from_lease_epoch: 1,
+            to_member_id: target,
+            to_member_epoch: 1,
+            lease_ticks: 40,
+        }];
+        commit_direct(&replica, &transfer);
+        let state = replica.local_state(subscription_id).unwrap();
+        let moved = state.members.leases.get(&work).unwrap();
+        assert_eq!(
+            (moved.member_id, moved.member_epoch, moved.lease_epoch),
+            (target, 1, 2)
+        );
+
+        // The fenced source cannot release or ack the moved lease.
+        let mut stale_release = subscription_progress_mutation(subscription_id, feed_id, 1, 3);
+        stale_release.tick = 30;
+        stale_release.lease_ops = vec![SubscriptionLeaseOp::Release {
+            work_id: work,
+            member_id: holder,
+            member_epoch: 1,
+            lease_epoch: 1,
+        }];
+        assert!(matches!(
+            replica.prepare(stale_release),
+            Err(SubscriptionProgressError::Lease(
+                SubscriptionLeaseError::StaleLease
+            ))
+        ));
+
+        // A stale transfer — evidence predates the moved grant — refuses.
+        let mut stale_transfer = subscription_progress_mutation(subscription_id, feed_id, 1, 3);
+        stale_transfer.tick = 30;
+        stale_transfer.lease_ops = vec![SubscriptionLeaseOp::Transfer {
+            work_id: work,
+            from_member_id: holder,
+            from_lease_epoch: 1,
+            to_member_id: holder,
+            to_member_epoch: 1,
+            lease_ticks: 10,
+        }];
+        assert!(replica.prepare(stale_transfer).is_err());
     }
 }
