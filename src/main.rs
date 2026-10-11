@@ -313,7 +313,6 @@ async fn main() -> Result<()> {
             let driver = AdminDrainDriver::new(
                 format!("http://127.0.0.1:{}", config.bind_addr.port()),
                 admin_key,
-                control_plane.clone(),
                 Duration::from_secs(60),
             )?;
             let move_budget = std::env::var("WHITEWATER_DRAIN_MOVE_BUDGET")

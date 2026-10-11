@@ -30,6 +30,16 @@ pub trait DrainMoveDriver: Send + Sync {
     async fn apply(&self, command: Command) -> Result<(), String>;
 }
 
+/// Executes one planned Subscription progress placement step — owner handoff
+/// or replica move — through the progress coordinator's inspect/CAS/re-stamp/
+/// adoption flow. Committing the catalog command alone would strand progress
+/// replicas at the previous ownership epoch and wedge the Subscription, so
+/// progress steps are never metadata-only swaps.
+#[async_trait]
+pub trait DrainProgressDriver: Send + Sync {
+    async fn apply(&self, command: Command) -> Result<(), String>;
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct StorageDrainReport {
     pub node: StorageNodeId,
@@ -91,6 +101,7 @@ pub struct StorageDrainExecutor {
     follower_control: Arc<dyn FollowerMoveControl>,
     owner_control: Arc<dyn OwnerMoveControl>,
     transport: Arc<dyn ReplicaTransport>,
+    progress: Arc<dyn DrainProgressDriver>,
     batch_size: usize,
 }
 
@@ -101,6 +112,7 @@ impl StorageDrainExecutor {
         follower_control: Arc<dyn FollowerMoveControl>,
         owner_control: Arc<dyn OwnerMoveControl>,
         transport: Arc<dyn ReplicaTransport>,
+        progress: Arc<dyn DrainProgressDriver>,
     ) -> Self {
         Self {
             control,
@@ -108,6 +120,7 @@ impl StorageDrainExecutor {
             follower_control,
             owner_control,
             transport,
+            progress,
             batch_size: DEFAULT_DRAIN_BATCH,
         }
     }
@@ -224,7 +237,10 @@ impl StorageDrainExecutor {
             }
             command @ (Command::MoveSubscriptionProgressReplica { .. }
             | Command::RecoverSubscriptionProgressOwner { .. }) => {
-                self.execute(command).await?;
+                self.progress
+                    .apply(command)
+                    .await
+                    .map_err(StorageDrainError::Command)?;
             }
             _ => return Err(StorageDrainError::UnexpectedCommand),
         }

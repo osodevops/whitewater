@@ -628,6 +628,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/ranges/merge", post(admin_merge_ranges))
         .route("/v1/admin/ranges/move-follower", post(admin_move_follower))
         .route("/v1/admin/ranges/move-owner", post(admin_move_owner))
+        .route(
+            "/v1/admin/subscriptions/move-progress",
+            post(admin_move_subscription_progress),
+        )
         .route("/v1/admin/control-plane", get(control_plane_status))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
@@ -4921,7 +4925,6 @@ pub struct AdminMoveOwnerRequest {
 pub struct AdminDrainDriver {
     endpoint: String,
     admin_key: String,
-    control_plane: Arc<ControlPlane>,
     http: reqwest::Client,
 }
 
@@ -4929,13 +4932,11 @@ impl AdminDrainDriver {
     pub fn new(
         endpoint: String,
         admin_key: String,
-        control_plane: Arc<ControlPlane>,
         timeout: Duration,
     ) -> Result<Self, reqwest::Error> {
         Ok(Self {
             endpoint: endpoint.trim_end_matches('/').to_owned(),
             admin_key,
-            control_plane,
             http: reqwest::Client::builder().timeout(timeout).build()?,
         })
     }
@@ -4997,12 +4998,10 @@ impl DrainMoveDriver for AdminDrainDriver {
                 .await
             }
             command @ (crate::control::Command::MoveSubscriptionProgressReplica { .. }
-            | crate::control::Command::RecoverSubscriptionProgressOwner { .. }) => self
-                .control_plane
-                .execute_commands(vec![command])
-                .await
-                .map(|_| ())
-                .map_err(|error| error.to_string()),
+            | crate::control::Command::RecoverSubscriptionProgressOwner { .. }) => {
+                self.post("/v1/admin/subscriptions/move-progress", &command)
+                    .await
+            }
             _ => Err("drain plan emitted an unexpected command".to_owned()),
         }
     }
@@ -5140,6 +5139,68 @@ async fn admin_move_owner(
         json!({ "status": "activated", "assignment": plan.candidate_assignment,
         "committed_position": evidence.target_commit }),
     ))
+}
+
+/// Applies a planned Subscription progress placement step — owner handoff or
+/// replica move — through the progress coordinator's evidence/CAS/re-stamp/
+/// adoption flow. Storage drain routes these commands here: committing the
+/// placement CAS alone would strand progress replicas at the previous
+/// ownership epoch and wedge the Subscription.
+async fn admin_move_subscription_progress(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(command): Json<crate::control::Command>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    enum ProgressMove {
+        Handoff(StorageNodeId),
+        Replica(StorageNodeId, StorageNodeId),
+    }
+    let (subscription_id, step) = match command {
+        crate::control::Command::RecoverSubscriptionProgressOwner {
+            subscription_id,
+            new_owner,
+            ..
+        } => (subscription_id, ProgressMove::Handoff(new_owner)),
+        crate::control::Command::MoveSubscriptionProgressReplica {
+            subscription_id,
+            replaced,
+            replacement,
+            ..
+        } => (
+            subscription_id,
+            ProgressMove::Replica(replaced, replacement),
+        ),
+        _ => {
+            return Err(ApiError::bad_request(
+                "expected a Subscription progress move command",
+            ))
+        }
+    };
+    let assignment = state
+        .control
+        .active_subscription_progress_assignment_by_id(subscription_id)
+        .await
+        .ok_or_else(|| ApiError::bad_request("Subscription progress placement is unknown"))?;
+    let (coordinator, _) = member_assignment_coordinator(&state, assignment)?;
+    let outcome = match step {
+        ProgressMove::Handoff(new_owner) => {
+            coordinator
+                .handoff_owner(state.progress_authority.as_ref(), &new_owner)
+                .await
+        }
+        ProgressMove::Replica(replaced, replacement) => {
+            coordinator
+                .move_replica(state.progress_authority.as_ref(), &replaced, &replacement)
+                .await
+        }
+    }
+    .map_err(subscription_progress_api_error)?;
+    Ok(Json(json!({
+        "status": "applied",
+        "assignment": outcome.assignment,
+        "adopted": outcome.adopted,
+    })))
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

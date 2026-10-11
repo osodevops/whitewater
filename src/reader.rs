@@ -2530,14 +2530,49 @@ impl SubscriptionProgressCoordinator {
         &self,
         control: &A,
     ) -> Result<SubscriptionRecoveryOutcome, SubscriptionProgressError> {
+        let evidence = self.inspect_evidence().await?;
+        let (recovered, member_state) = Self::recovered_committed(&evidence)?;
+        let proposed_owner = self.recovery_owner(&evidence, recovered.as_ref())?;
+        self.commit_owner_move(control, proposed_owner, recovered, member_state)
+            .await
+    }
+
+    /// Moves Subscription progress ownership to a caller-chosen replica while
+    /// the current owner may still be reachable. Storage drain uses this to
+    /// vacate a specific healthy Node; `recover_lost_owner` derives its own
+    /// target because it runs after owner loss. A placement that already
+    /// moved — a committed CAS from an earlier attempt or a racing mover —
+    /// converges through `synchronize_placement` rather than erroring, so a
+    /// retried handoff still adopts replicas at the live epoch.
+    pub async fn handoff_owner<A: SubscriptionPlacementAuthority + ?Sized>(
+        &self,
+        control: &A,
+        new_owner: &crate::active_range::StorageNodeId,
+    ) -> Result<SubscriptionRecoveryOutcome, SubscriptionProgressError> {
+        if !self.assignment.replicas.contains(new_owner) {
+            return Err(SubscriptionProgressError::InvalidAssignment);
+        }
+        if *new_owner == self.assignment.owner {
+            return self.synchronize_placement().await;
+        }
+        let evidence = self.inspect_evidence().await?;
+        let (recovered, member_state) = Self::recovered_committed(&evidence)?;
+        self.commit_owner_move(control, new_owner.clone(), recovered, member_state)
+            .await
+    }
+
+    async fn commit_owner_move<A: SubscriptionPlacementAuthority + ?Sized>(
+        &self,
+        control: &A,
+        proposed_owner: crate::active_range::StorageNodeId,
+        recovered: Option<SubscriptionProgressMutation>,
+        member_state: SubscriptionMemberState,
+    ) -> Result<SubscriptionRecoveryOutcome, SubscriptionProgressError> {
         let next_epoch = self
             .assignment
             .ownership_epoch
             .checked_add(1)
             .ok_or(SubscriptionProgressError::Sequence)?;
-        let evidence = self.inspect_evidence().await?;
-        let (recovered, member_state) = Self::recovered_committed(&evidence)?;
-        let proposed_owner = self.recovery_owner(&evidence, recovered.as_ref())?;
         let (owner, ownership_epoch) = match control
             .execute_placement_commands(vec![
                 crate::control::Command::RecoverSubscriptionProgressOwner {
@@ -2592,6 +2627,13 @@ impl SubscriptionProgressCoordinator {
         replaced: &crate::active_range::StorageNodeId,
         replacement: &crate::active_range::StorageNodeId,
     ) -> Result<SubscriptionRecoveryOutcome, SubscriptionProgressError> {
+        if !self.assignment.replicas.contains(replaced)
+            && self.assignment.replicas.contains(replacement)
+        {
+            // An earlier attempt's placement CAS already landed; converge by
+            // re-adopting the recovered state at the live epoch.
+            return self.synchronize_placement().await;
+        }
         if !self.assignment.replicas.contains(replaced)
             || self.assignment.replicas.contains(replacement)
             || *replaced == self.assignment.owner

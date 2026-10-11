@@ -402,6 +402,39 @@ The Control Plane persists the plan but keeps the original RF3 assignment author
 
 The current HTTP staging prototype transfers one bounded record per internal request and refuses ranges above 10,000 committed records; the original RF3 assignment remains active on refusal. The prepared plan remains visible in `INSPECT PLACEMENT`; after confirming activation was not submitted, an operator can clear it with the typed `abort_follower_move` command and its `plan_id`. Checkpointed streaming for larger histories and a foreground-SLO-aware movement budget remain planned. The regular three-Node development Riverbed has no spare eligible fourth Node. `compose.m4-move.yml` provides an **isolated, test-only four-voter** Riverbed for `python scripts/test-m4-follower-move.py`. This is not production role-separated storage placement. Append Owner movement uses the authenticated development workflow above; automatic Node drain remains planned.
 
+### Move Subscription progress placement
+
+Storage drain routes planned Subscription progress placement steps — owner handoff or replica replacement — through this endpoint rather than committing the placement command alone. The coordinator inspects replica evidence, compare-and-sets the placement through the Control Plane, re-stamps the recovered frontier at the new ownership epoch, and adopts it on the replica set; committing only the catalog step would strand progress replicas at the previous epoch and wedge the Subscription's progress until recovery.
+
+```http
+POST /v1/admin/subscriptions/move-progress
+Authorization: Bearer <admin-key>
+Content-Type: application/json
+```
+
+```json
+{
+  "command": "recover_subscription_progress_owner",
+  "subscription_id": "632a51da-5945-4cac-a541-cdb9e63cd5b4",
+  "expected_ownership_epoch": 1,
+  "new_owner": "control-2"
+}
+```
+
+or
+
+```json
+{
+  "command": "move_subscription_progress_replica",
+  "subscription_id": "632a51da-5945-4cac-a541-cdb9e63cd5b4",
+  "expected_ownership_epoch": 1,
+  "replaced": "control-3",
+  "replacement": "control-4"
+}
+```
+
+The response reports the adopted assignment and the replica Nodes that confirmed adoption. The step is safe to retry: if the placement change already landed — including under a different target chosen by a racing actor — the coordinator converges replicas at the live epoch instead of forcing the planned target.
+
 ### Grant
 
 ```json

@@ -10,9 +10,9 @@ pub mod split;
 pub mod store;
 
 pub use drain::{
-    DrainCommandAuthority, DrainMoveDriver, LocalDrainDriver, StorageDrainError,
-    StorageDrainExecutor, StorageDrainOutcome, StorageDrainReport, StorageDrainStatus,
-    StorageDrainSupervisor,
+    DrainCommandAuthority, DrainMoveDriver, DrainProgressDriver, LocalDrainDriver,
+    StorageDrainError, StorageDrainExecutor, StorageDrainOutcome, StorageDrainReport,
+    StorageDrainStatus, StorageDrainSupervisor,
 };
 pub use majority::{
     HttpReplicaTransport, MajorityAppendCoordinator, MajorityAppendError, MajorityAppendErrorCode,

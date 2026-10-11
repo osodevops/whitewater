@@ -1356,6 +1356,134 @@ async fn subscription_progress_recovery_moves_owner_preserves_committed_and_fenc
 }
 
 #[tokio::test]
+async fn subscription_progress_handoff_owner_vacates_a_healthy_owner_and_adopts_all() {
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let owner = coordinator.assignment().owner.clone();
+    let first = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    coordinator.apply(first.clone()).await.unwrap();
+
+    // The drained owner stays healthy and reachable: the caller chooses the
+    // target, so a drain can never route ownership back to the leaving Node.
+    let target = nodes.iter().find(|node| **node != owner).unwrap().clone();
+    let outsider = StorageNodeId::try_new("progress-outsider").unwrap();
+    assert!(matches!(
+        coordinator.handoff_owner(&controller, &outsider).await,
+        Err(SubscriptionProgressError::InvalidAssignment)
+    ));
+
+    let outcome = coordinator
+        .handoff_owner(&controller, &target)
+        .await
+        .unwrap();
+    assert_eq!(outcome.assignment.owner, target);
+    assert_eq!(outcome.assignment.ownership_epoch, 2);
+    assert_eq!(outcome.adopted.len(), 3);
+    let recovered = outcome.committed.clone().unwrap();
+    assert_eq!(recovered.ownership_epoch, 2);
+    assert_eq!(recovered.cursor, first.cursor);
+    assert_eq!(recovered.request_id, first.request_id);
+
+    // Every replica — including the still-healthy old owner — carries the
+    // re-stamped frontier, so reads at the new epoch hold quorum.
+    for node in &nodes {
+        let state = transport.stores[node]
+            .local_state(subscription.subscription_id)
+            .unwrap();
+        assert_eq!(
+            state.committed.as_ref().unwrap().ownership_epoch,
+            2,
+            "{node} was not adopted"
+        );
+    }
+
+    // A retry after the placement CAS already landed converges through
+    // adoption at the live epoch rather than erroring or bumping again.
+    let retried = coordinator
+        .handoff_owner(&controller, &target)
+        .await
+        .unwrap();
+    assert_eq!(retried.assignment.ownership_epoch, 2);
+    assert_eq!(retried.assignment.owner, target);
+    assert_eq!(retried.adopted.len(), 3);
+}
+
+#[tokio::test]
+async fn subscription_progress_handoff_owner_retries_converge_after_an_ambiguous_cas() {
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let owner = coordinator.assignment().owner.clone();
+    let first = progress_mutation(subscription.subscription_id, subscription.feed_id, 1, 1);
+    coordinator.apply(first.clone()).await.unwrap();
+
+    // The placement CAS commits but the new owner cannot be adopted: the step
+    // reports failure while the catalog already moved.
+    let target = nodes.iter().find(|node| **node != owner).unwrap().clone();
+    transport.adopt_down.lock().unwrap().insert(target.clone());
+    assert!(matches!(
+        coordinator.handoff_owner(&controller, &target).await,
+        Err(SubscriptionProgressError::NoQuorum)
+    ));
+    transport.adopt_down.lock().unwrap().clear();
+
+    // Retrying with a coordinator rebuilt on the landed placement converges
+    // the replicas at epoch 2 — no second CAS, no skipped epoch.
+    let healed = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let outcome = healed.handoff_owner(&controller, &target).await.unwrap();
+    assert_eq!(outcome.assignment.ownership_epoch, 2);
+    assert_eq!(outcome.assignment.owner, target);
+    assert_eq!(outcome.adopted.len(), 3);
+    assert_eq!(
+        healed.read_committed().await.unwrap().unwrap().cursor,
+        first.cursor
+    );
+}
+
+#[tokio::test]
 async fn subscription_progress_recovery_fails_closed_on_insufficient_or_contradictory_evidence() {
     let directory = TempDir::new().unwrap();
     let nodes = progress_nodes();

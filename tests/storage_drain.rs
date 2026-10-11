@@ -11,15 +11,22 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use finnstream::{
     active_range::{
         AppendIdentity, CommitPosition, DrainCommandAuthority, DrainMoveDriver,
-        FollowerMoveControl, FollowerMoveCopyResult, FollowerMoveExecutor, LocalDrainDriver,
-        MajorityAppendCoordinator, OwnerMoveControl, OwnerMoveEvidence, RangeGeneration,
-        RangePosition, ReplicaAppendAccepted, ReplicaAppendRequest, ReplicaAppendService,
-        ReplicaCommitAccepted, ReplicaCommitRequest, ReplicaTransport, ReplicaTransportError,
-        StorageDrainExecutor, StorageDrainStatus, StorageDrainSupervisor, StorageNodeId,
+        DrainProgressDriver, FollowerMoveControl, FollowerMoveCopyResult, FollowerMoveExecutor,
+        LocalDrainDriver, MajorityAppendCoordinator, OwnerMoveControl, OwnerMoveEvidence,
+        RangeGeneration, RangeId, RangePosition, ReplicaAppendAccepted, ReplicaAppendRequest,
+        ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest, ReplicaTransport,
+        ReplicaTransportError, StorageDrainExecutor, StorageDrainStatus, StorageDrainSupervisor,
+        StorageNodeId,
     },
     codec::encode_record,
     control::{Command, ControlController, RangeMovePlan, RangeOwnerMovePlan, ReaderStart},
     domain::StoredRecord,
+    reader::{
+        FjallSubscriptionProgressReplica, SubscriptionCommitEvidence, SubscriptionMemberState,
+        SubscriptionPrepareVote, SubscriptionProgressCoordinator, SubscriptionProgressError,
+        SubscriptionProgressInspection, SubscriptionProgressMutation,
+        SubscriptionProgressTransport, SubscriptionReplicaReply,
+    },
     storage::{FileLogStore, LogStore},
 };
 use tempfile::TempDir;
@@ -141,6 +148,7 @@ struct Fixture {
     _directory: TempDir,
     control: Arc<ControlController>,
     services: BTreeMap<StorageNodeId, Arc<ReplicaAppendService>>,
+    progress: BTreeMap<StorageNodeId, Arc<FjallSubscriptionProgressReplica>>,
     executor: StorageDrainExecutor,
 }
 
@@ -172,6 +180,20 @@ impl Fixture {
         } else {
             vec!["storage-1", "storage-2", "storage-3"]
         };
+        let progress = nodes
+            .iter()
+            .map(|value| {
+                (
+                    node(value),
+                    Arc::new(
+                        FjallSubscriptionProgressReplica::open(
+                            directory.path().join(format!("{value}-progress")),
+                        )
+                        .unwrap(),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let services = nodes
             .into_iter()
             .map(|value| {
@@ -184,22 +206,30 @@ impl Fixture {
                 (node, service)
             })
             .collect::<BTreeMap<_, _>>();
-        let executor = Self::executor(control.clone());
+        let executor = Self::executor(control.clone(), &progress);
         Self {
             _directory: directory,
             control,
             services,
+            progress,
             executor,
         }
     }
 
-    fn executor(control: Arc<ControlController>) -> StorageDrainExecutor {
+    fn executor(
+        control: Arc<ControlController>,
+        progress: &BTreeMap<StorageNodeId, Arc<FjallSubscriptionProgressReplica>>,
+    ) -> StorageDrainExecutor {
         StorageDrainExecutor::new(
             control.clone(),
             Arc::new(LocalDrainAuthority(control.clone())),
             Arc::new(LocalMoveControl(control.clone())),
             Arc::new(LocalMoveControl(control.clone())),
             Arc::new(UnusedTransport),
+            Arc::new(LocalDrainProgressDriver::new(
+                control.clone(),
+                Arc::new(progress.clone()),
+            )),
         )
     }
 
@@ -207,7 +237,7 @@ impl Fixture {
         StorageDrainSupervisor::new(
             self.control.clone(),
             Arc::new(LocalDrainDriver::new(
-                Self::executor(self.control.clone()),
+                Self::executor(self.control.clone(), &self.progress),
                 Arc::new(self.services.clone()),
             )),
         )
@@ -393,6 +423,214 @@ async fn drain_executor_vacates_an_owner_through_ordered_moves() {
         .unwrap();
 }
 
+/// In-process Subscription progress transport for the drain executor tests:
+/// the same shape the production HTTP transport serves, without network.
+struct LocalProgressTransport {
+    replicas: Arc<BTreeMap<StorageNodeId, Arc<FjallSubscriptionProgressReplica>>>,
+    feed_id: Uuid,
+}
+
+impl LocalProgressTransport {
+    fn replica(
+        &self,
+        node: &StorageNodeId,
+    ) -> Result<Arc<FjallSubscriptionProgressReplica>, SubscriptionProgressError> {
+        self.replicas
+            .get(node)
+            .cloned()
+            .ok_or(SubscriptionProgressError::InvalidAssignment)
+    }
+}
+
+#[async_trait]
+impl SubscriptionProgressTransport for LocalProgressTransport {
+    async fn prepare(
+        &self,
+        replica: &StorageNodeId,
+        mutation: SubscriptionProgressMutation,
+    ) -> Result<SubscriptionReplicaReply<SubscriptionPrepareVote>, SubscriptionProgressError> {
+        let store = self.replica(replica)?;
+        let subscription_id = mutation.subscription_id;
+        let ownership_epoch = mutation.ownership_epoch;
+        let vote = tokio::task::spawn_blocking(move || store.prepare(mutation))
+            .await
+            .map_err(|_| SubscriptionProgressError::Unavailable)??;
+        Ok(SubscriptionReplicaReply {
+            replica: replica.clone(),
+            subscription_id,
+            ownership_epoch,
+            result: vote,
+        })
+    }
+
+    async fn commit(
+        &self,
+        replica: &StorageNodeId,
+        evidence: SubscriptionCommitEvidence,
+    ) -> Result<SubscriptionReplicaReply<SubscriptionProgressMutation>, SubscriptionProgressError>
+    {
+        let store = self.replica(replica)?;
+        let result = tokio::task::spawn_blocking(move || store.commit_with_quorum(evidence))
+            .await
+            .map_err(|_| SubscriptionProgressError::Unavailable)??;
+        Ok(SubscriptionReplicaReply {
+            replica: replica.clone(),
+            subscription_id: result.subscription_id,
+            ownership_epoch: result.ownership_epoch,
+            result,
+        })
+    }
+
+    async fn committed(
+        &self,
+        replica: &StorageNodeId,
+        subscription_id: Uuid,
+        ownership_epoch: u64,
+    ) -> Result<
+        SubscriptionReplicaReply<Option<SubscriptionProgressMutation>>,
+        SubscriptionProgressError,
+    > {
+        let store = self.replica(replica)?;
+        let result = tokio::task::spawn_blocking(move || store.local_committed(subscription_id))
+            .await
+            .map_err(|_| SubscriptionProgressError::Unavailable)??;
+        Ok(SubscriptionReplicaReply {
+            replica: replica.clone(),
+            subscription_id,
+            ownership_epoch,
+            result,
+        })
+    }
+
+    async fn inspect(
+        &self,
+        replica: &StorageNodeId,
+        subscription_id: Uuid,
+        ownership_epoch: u64,
+    ) -> Result<SubscriptionReplicaReply<SubscriptionProgressInspection>, SubscriptionProgressError>
+    {
+        let store = self.replica(replica)?;
+        let result = tokio::task::spawn_blocking(move || store.local_state(subscription_id))
+            .await
+            .map_err(|_| SubscriptionProgressError::Unavailable)??;
+        Ok(SubscriptionReplicaReply {
+            replica: replica.clone(),
+            subscription_id,
+            ownership_epoch,
+            result,
+        })
+    }
+
+    async fn adopt(
+        &self,
+        replica: &StorageNodeId,
+        _owner: &StorageNodeId,
+        subscription_id: Uuid,
+        ownership_epoch: u64,
+        committed: Option<SubscriptionProgressMutation>,
+        members: SubscriptionMemberState,
+    ) -> Result<
+        SubscriptionReplicaReply<Option<SubscriptionProgressMutation>>,
+        SubscriptionProgressError,
+    > {
+        let store = self.replica(replica)?;
+        let feed_id = self.feed_id;
+        let result = tokio::task::spawn_blocking(move || {
+            store.adopt_recovered(
+                subscription_id,
+                feed_id,
+                ownership_epoch,
+                committed,
+                members,
+            )
+        })
+        .await
+        .map_err(|_| SubscriptionProgressError::Unavailable)??;
+        Ok(SubscriptionReplicaReply {
+            replica: replica.clone(),
+            subscription_id,
+            ownership_epoch,
+            result,
+        })
+    }
+}
+
+/// Runs planned Subscription progress drain steps through the coordinator's
+/// inspect/CAS/re-stamp/adoption flow against in-process replicas — the same
+/// contract `AdminDrainDriver` reaches through the admin move endpoint.
+struct LocalDrainProgressDriver {
+    control: Arc<ControlController>,
+    replicas: Arc<BTreeMap<StorageNodeId, Arc<FjallSubscriptionProgressReplica>>>,
+}
+
+impl LocalDrainProgressDriver {
+    fn new(
+        control: Arc<ControlController>,
+        replicas: Arc<BTreeMap<StorageNodeId, Arc<FjallSubscriptionProgressReplica>>>,
+    ) -> Self {
+        Self { control, replicas }
+    }
+}
+
+#[async_trait]
+impl DrainProgressDriver for LocalDrainProgressDriver {
+    async fn apply(&self, command: Command) -> Result<(), String> {
+        enum ProgressMove {
+            Handoff(StorageNodeId),
+            Replica(StorageNodeId, StorageNodeId),
+        }
+        let (subscription_id, step) = match command {
+            Command::RecoverSubscriptionProgressOwner {
+                subscription_id,
+                new_owner,
+                ..
+            } => (subscription_id, ProgressMove::Handoff(new_owner)),
+            Command::MoveSubscriptionProgressReplica {
+                subscription_id,
+                replaced,
+                replacement,
+                ..
+            } => (
+                subscription_id,
+                ProgressMove::Replica(replaced, replacement),
+            ),
+            _ => {
+                return Err("expected a Subscription progress move command".to_owned());
+            }
+        };
+        let definition = self
+            .control
+            .active_subscription_by_id(subscription_id)
+            .await
+            .ok_or_else(|| "Subscription is unknown".to_owned())?;
+        let transport: Arc<dyn SubscriptionProgressTransport> = Arc::new(LocalProgressTransport {
+            replicas: self.replicas.clone(),
+            feed_id: definition.feed_id,
+        });
+        let coordinator = SubscriptionProgressCoordinator::for_subscription(
+            self.control.as_ref(),
+            subscription_id,
+            transport,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        match step {
+            ProgressMove::Handoff(new_owner) => {
+                coordinator
+                    .handoff_owner(self.control.as_ref(), &new_owner)
+                    .await
+            }
+            ProgressMove::Replica(replaced, replacement) => {
+                coordinator
+                    .move_replica(self.control.as_ref(), &replaced, &replacement)
+                    .await
+            }
+        }
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+}
+
 #[tokio::test]
 async fn drain_executor_vacates_subscription_progress_references() {
     let fixture = Fixture::new().await;
@@ -408,6 +646,32 @@ async fn drain_executor_vacates_subscription_progress_references() {
         .await
         .unwrap();
     let drained = progress.owner.clone();
+
+    // Seed a committed frontier like a member join would, so the drain has to
+    // carry real progress state across the ownership handoff.
+    let seed_transport: Arc<dyn SubscriptionProgressTransport> = Arc::new(LocalProgressTransport {
+        replicas: Arc::new(fixture.progress.clone()),
+        feed_id: subscription.feed_id,
+    });
+    let seed_coordinator = SubscriptionProgressCoordinator::new(progress.clone(), seed_transport);
+    seed_coordinator
+        .apply(SubscriptionProgressMutation {
+            subscription_id: subscription.subscription_id,
+            feed_id: subscription.feed_id,
+            ownership_epoch: progress.ownership_epoch,
+            sequence: 1,
+            request_id: Uuid::new_v4(),
+            expected_cursor: None,
+            cursor: "beginning".to_owned(),
+            positions: BTreeMap::from([(
+                RangeId::from_uuid(Uuid::from_u128(0xD0A1)),
+                "".to_owned(),
+            )]),
+            tick: 1,
+            lease_ops: Vec::new(),
+        })
+        .await
+        .unwrap();
 
     fixture
         .control
@@ -428,6 +692,17 @@ async fn drain_executor_vacates_subscription_progress_references() {
         .unwrap();
     assert!(!current.replicas.contains(&drained));
     assert_ne!(current.owner, drained);
+    // Every surviving replica adopted the re-stamped frontier at the live
+    // ownership epoch — reads and writes proceed where a catalog-only move
+    // would have left the Subscription fenced at the old epoch.
+    for replica in current.replicas.iter() {
+        let adopted = fixture.progress[replica]
+            .local_committed(subscription.subscription_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(adopted.ownership_epoch, current.ownership_epoch);
+        assert_eq!(adopted.cursor, "beginning");
+    }
     fixture
         .control
         .execute(&format!("RETIRE STORAGE NODE {drained};"))
@@ -587,7 +862,7 @@ async fn supervisor_retries_after_driver_failure() {
         fixture.control.clone(),
         Arc::new(FlakyDriver {
             inner: LocalDrainDriver::new(
-                Fixture::executor(fixture.control.clone()),
+                Fixture::executor(fixture.control.clone(), &fixture.progress),
                 Arc::new(fixture.services.clone()),
             ),
             failures: 1,
