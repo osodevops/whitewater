@@ -1440,7 +1440,7 @@ Definition of Done:
 
 - [x] Persist idempotent Domain-scoped StateStore declarations with manual or same-Domain Feed source in Control Plane catalogs and snapshots; their `declared` stage explicitly cannot serve data (`src/control.rs`).
 
-- [ ] Define and persist versioned application-owned secondary Index definitions with typed fields/extractors, collation, consistency, scope, and build state through the Control Plane.
+- [~] Define and persist versioned application-owned secondary Index definitions with typed fields/extractors, collation, consistency, scope, and build state through the Control Plane.
 
 - [ ] Replicate manual StateStore mutations and their idempotency identities on RF3 with a Whitewater-managed durable journal; never claim a manually populated store can be recreated from unrelated Feed history.
 
