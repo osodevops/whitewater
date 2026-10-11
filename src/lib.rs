@@ -11,6 +11,7 @@ pub mod demand;
 pub mod domain;
 pub mod effect;
 pub mod index;
+pub mod index_build;
 pub mod internal_plane;
 pub mod membership;
 pub mod pipe;

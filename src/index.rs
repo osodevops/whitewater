@@ -356,6 +356,24 @@ pub trait IndexStore: Send + Sync {
         after_key: Option<&[u8]>,
         limit: usize,
     ) -> Result<Vec<IndexRow>, IndexStoreError>;
+
+    /// Drop up to `limit` postings claimed by `id` (one shadow generation
+    /// or one Index) and strip the entries from affected rows. Bounded per
+    /// call; callers loop until it returns zero.
+    fn drop_index_postings(&self, id: IndexId, limit: usize) -> Result<usize, IndexStoreError>;
+}
+
+/// The posting namespace one rebuild generation writes under: deterministic
+/// so every replica derives the same shadow identity, and disjoint from the
+/// serving generation's postings until activation swaps which generation
+/// readers consult.
+pub fn shadow_index_id(index_id: uuid::Uuid, generation: u64) -> IndexId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(index_id.as_bytes());
+    hasher.update(&generation.to_be_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    IndexId(uuid::Uuid::from_bytes(bytes))
 }
 
 /// Fjall crash-recovery replays the write journal, so its size bounds reopen
@@ -436,7 +454,20 @@ impl IndexStore for FjallIndexStore {
                 return Err(IndexStoreError::CorruptPrimary);
             }
             if previous.applied_cursor == cursor && previous != &row {
-                return Err(IndexStoreError::CursorConflict);
+                // The same record cursor may legitimately write the row a
+                // second time when a shadow rebuild generation registers an
+                // additional entry: payload unchanged, prior entries intact,
+                // only new-id entries added. Anything else at the same
+                // cursor is a divergent write and still fences.
+                let additive_only = previous.payload == row.payload
+                    && row.entries.len() > previous.entries.len()
+                    && previous
+                        .entries
+                        .iter()
+                        .all(|entry| row.entries.contains(entry));
+                if !additive_only {
+                    return Err(IndexStoreError::CursorConflict);
+                }
             }
         }
         let previous_entries = previous
@@ -458,7 +489,16 @@ impl IndexStore for FjallIndexStore {
         }
         tx.insert(&self.primary, key, encoded);
         for entry in entries {
-            tx.insert(&self.checkpoints, entry.id.0.as_bytes(), cursor.as_bytes());
+            // Per-id checkpoints never regress: a shadow build replaying
+            // history behind the serving generation's frontier must not
+            // lower that generation's recorded frontier.
+            let existing = tx.get(&self.checkpoints, entry.id.0.as_bytes())?;
+            let dominated = existing
+                .as_deref()
+                .is_some_and(|applied| applied >= cursor.as_bytes());
+            if !dominated {
+                tx.insert(&self.checkpoints, entry.id.0.as_bytes(), cursor.as_bytes());
+            }
         }
         tx.commit()?;
         Ok(())
@@ -584,6 +624,72 @@ impl IndexStore for FjallIndexStore {
             }
         }
         Ok(rows)
+    }
+
+    fn drop_index_postings(&self, id: IndexId, limit: usize) -> Result<usize, IndexStoreError> {
+        let limit = limit.clamp(1, 1_024);
+        // Both families in `entries` (postings and unique claims) share the
+        // `index_prefix(family, id)` layout and carry the primary row key as
+        // their value, so one bounded sweep removes both.
+        let snapshot = self.db.read_tx();
+        let mut primary_keys = Vec::new();
+        let mut posting_keys = Vec::new();
+        for family in [POSTING, UNIQUE_CLAIM] {
+            let prefix = index_prefix(family, id);
+            for guard in snapshot.prefix(&self.entries, prefix) {
+                let (key, value) = guard.into_inner()?;
+                posting_keys.push(key.to_vec());
+                primary_keys.push(value.to_vec());
+                if posting_keys.len() >= limit {
+                    break;
+                }
+            }
+            if posting_keys.len() >= limit {
+                break;
+            }
+        }
+        if posting_keys.is_empty() {
+            // Prefix is empty: the generation checkpoint goes with its last
+            // posting so a later driver pass treats the id as fully retired.
+            let mut tx = self
+                .db
+                .write_tx()
+                .durability(Some(fjall::PersistMode::SyncAll));
+            tx.remove(&self.checkpoints, id.0.as_bytes());
+            tx.commit()?;
+            return Ok(0);
+        }
+        let mut tx = self
+            .db
+            .write_tx()
+            .durability(Some(fjall::PersistMode::SyncAll));
+        let mut removed = 0usize;
+        let mut touched = std::collections::BTreeSet::new();
+        for (posting_key, reference_key) in posting_keys.iter().zip(primary_keys.iter()) {
+            tx.remove(&self.entries, posting_key.clone());
+            removed += 1;
+            if touched.insert(reference_key.clone()) {
+                if let Some(bytes) = tx.get(&self.primary, reference_key.clone())? {
+                    let mut row: IndexRow = serde_json::from_slice(&bytes)?;
+                    let before = row.entries.len();
+                    row.entries.retain(|entry| entry.id != id);
+                    if row.entries.len() != before {
+                        tx.insert(
+                            &self.primary,
+                            reference_key.clone(),
+                            serde_json::to_vec(&row)?,
+                        );
+                    }
+                }
+            }
+        }
+        // The generation's applied-Cursor checkpoint is dropped with its
+        // last posting; builders re-derive it on the next pass.
+        if removed < limit {
+            tx.remove(&self.checkpoints, id.0.as_bytes());
+        }
+        tx.commit()?;
+        Ok(removed)
     }
 
     fn last_applied(&self, id: IndexId) -> Result<Option<String>, IndexStoreError> {

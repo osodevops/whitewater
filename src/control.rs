@@ -136,6 +136,21 @@ pub enum IndexConsistency {
 pub enum IndexBuildStage {
     /// Persisted definition; no extraction or backfill has run.
     Declared,
+    /// A rebuild pass is materializing generation `generation` into the
+    /// shadow generation while the previous generation keeps serving.
+    Building { generation: u64 },
+    /// Generation `generation` is the serving generation.
+    Active { generation: u64 },
+}
+
+impl IndexBuildStage {
+    /// The generation currently building or serving, if any.
+    pub fn generation(&self) -> Option<u64> {
+        match self {
+            Self::Declared => None,
+            Self::Building { generation } | Self::Active { generation } => Some(*generation),
+        }
+    }
 }
 
 /// A Control Plane-persisted secondary Index definition. `applied_cursor`
@@ -551,6 +566,22 @@ pub enum Command {
         collation: IndexCollation,
         #[serde(default)]
         consistency: IndexConsistency,
+    },
+    /// Rebuild one declared Index from retained Feed history into a new
+    /// shadow generation; activation is a separate atomic step.
+    RebuildIndex {
+        name: String,
+    },
+    /// Rebuild every declared Index whose source Feed lives in the Domain.
+    RebuildIndexesInDomain {
+        domain: String,
+    },
+    /// Atomically activate a completed shadow generation. The driver calls
+    /// this once its local build caught the committed frontier.
+    CompleteIndexBuild {
+        index_id: Uuid,
+        generation: u64,
+        applied_cursor: String,
     },
     DefinePipe {
         name: String,
@@ -1568,6 +1599,12 @@ impl ControlController {
             .cloned()
     }
 
+    /// Every persisted Index definition — the rebuild driver scans these
+    /// for `Building` stages each tick.
+    pub async fn index_definitions(&self) -> Vec<StoredIndexDefinition> {
+        self.state.lock().await.indexes.values().cloned().collect()
+    }
+
     pub async fn declared_index_by_name(&self, name: &str) -> Option<StoredIndexDefinition> {
         self.state
             .lock()
@@ -1926,6 +1963,93 @@ impl ControlController {
                     format!("declared Index {name} on Feed {feed}; no data is served until build and RF3 activation"),
                     json!(definition),
                 ))
+            }
+            Command::RebuildIndex { name } => {
+                let index_id = state
+                    .indexes
+                    .values()
+                    .find(|item| item.name == name)
+                    .map(|item| item.index_id)
+                    .ok_or_else(|| ControlError::NotFound(format!("Index {name}")))?;
+                let item = state.indexes.get_mut(&index_id).expect("Index exists");
+                let generation = match item.stage {
+                    IndexBuildStage::Building { generation } => {
+                        // Re-issuing the same in-flight rebuild is
+                        // idempotent: the generation does not advance and
+                        // drivers resume their existing shadow.
+                        return Ok((
+                            format!(
+                                "Index {name} rebuild already in flight (generation {generation})"
+                            ),
+                            json!(item.clone()),
+                        ));
+                    }
+                    IndexBuildStage::Declared => 1,
+                    IndexBuildStage::Active { generation } => generation + 1,
+                };
+                item.stage = IndexBuildStage::Building { generation };
+                item.applied_cursor = None;
+                Ok((
+                    format!("rebuilding Index {name} as shadow generation {generation}"),
+                    json!(item.clone()),
+                ))
+            }
+            Command::RebuildIndexesInDomain { domain } => {
+                let space = active_space(state, &domain)?.space_id;
+                let mut rebuilt = Vec::new();
+                for item in state.indexes.values_mut() {
+                    if item.space_id != space {
+                        continue;
+                    }
+                    match item.stage {
+                        IndexBuildStage::Building { .. } => {}
+                        IndexBuildStage::Declared => {
+                            item.stage = IndexBuildStage::Building { generation: 1 };
+                            item.applied_cursor = None;
+                            rebuilt.push(item.name.clone());
+                        }
+                        IndexBuildStage::Active { generation } => {
+                            item.stage = IndexBuildStage::Building {
+                                generation: generation + 1,
+                            };
+                            item.applied_cursor = None;
+                            rebuilt.push(item.name.clone());
+                        }
+                    }
+                }
+                Ok((
+                    format!("rebuilding {} Index(es) in Domain {domain}", rebuilt.len()),
+                    json!({ "rebuilt": rebuilt }),
+                ))
+            }
+            Command::CompleteIndexBuild {
+                index_id,
+                generation,
+                applied_cursor,
+            } => {
+                let item = state
+                    .indexes
+                    .get_mut(&index_id)
+                    .ok_or_else(|| ControlError::NotFound(format!("Index {index_id}")))?;
+                match item.stage {
+                    IndexBuildStage::Building {
+                        generation: building,
+                    } if building == generation => {
+                        item.stage = IndexBuildStage::Active { generation };
+                        item.applied_cursor = Some(applied_cursor.clone());
+                        Ok((
+                            format!(
+                                "activated Index {} generation {generation} at Cursor {applied_cursor}",
+                                item.name
+                            ),
+                            json!(item.clone()),
+                        ))
+                    }
+                    _ => Err(ControlError::InvalidOperation(format!(
+                        "Index {} is not building generation {generation}",
+                        item.name
+                    ))),
+                }
             }
             Command::DefinePipe {
                 name,
@@ -3785,6 +3909,25 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 })?,
             })
         }
+        Some("REBUILD") => match keyword(1).as_deref() {
+            Some("INDEX") => Ok(Command::RebuildIndex {
+                name: token(&tokens, 2)?.to_owned(),
+            }),
+            Some("INDEXES") => {
+                expect_keyword(&tokens, 2, "IN")?;
+                match keyword(3).as_deref() {
+                    Some("DOMAIN") | Some("SPACE") => Ok(Command::RebuildIndexesInDomain {
+                        domain: token(&tokens, 4)?.to_owned(),
+                    }),
+                    _ => Err(ControlError::Syntax(
+                        "REBUILD INDEXES IN supports DOMAIN or SPACE".to_owned(),
+                    )),
+                }
+            }
+            _ => Err(ControlError::Syntax(
+                "REBUILD supports INDEX and INDEXES IN DOMAIN".to_owned(),
+            )),
+        },
         Some("REVOKE") => {
             expect_keyword(&tokens, 1, "WRITER")?;
             expect_keyword(&tokens, 2, "SESSION")?;
@@ -4788,6 +4931,9 @@ fn command_label(command: &Command) -> String {
         Command::CreateFeed { .. } => "CREATE FEED",
         Command::DefineStateStore { .. } => "DEFINE STATE STORE",
         Command::DefineIndex { .. } => "DEFINE INDEX",
+        Command::RebuildIndex { .. } => "REBUILD INDEX",
+        Command::RebuildIndexesInDomain { .. } => "REBUILD INDEXES IN DOMAIN",
+        Command::CompleteIndexBuild { .. } => "COMPLETE INDEX BUILD",
         Command::DefinePipe { .. } => "DEFINE PIPE",
         Command::CreateWriter { .. } => "CREATE WRITER",
         Command::OpenWriterSession { .. } => "OPEN WRITER SESSION",
@@ -5681,6 +5827,150 @@ mod tests {
                 .stage,
             IndexBuildStage::Declared,
         );
+    }
+
+    #[tokio::test]
+    async fn index_rebuild_advances_generations_and_activation_is_atomic() {
+        let directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader
+            .execute("CREATE SPACE accounts; CREATE FEED accounts.orders;")
+            .await
+            .unwrap();
+        let fields = vec![IndexFieldSpec::Key];
+        for name in ["accounts.orders.by.customer", "accounts.orders.by.tenant"] {
+            leader
+                .execute_commands(vec![Command::DefineIndex {
+                    name: name.to_owned(),
+                    feed: "accounts.orders".to_owned(),
+                    fields: fields.clone(),
+                    unique: false,
+                    collation: IndexCollation::Binary,
+                    consistency: IndexConsistency::Eventual,
+                }])
+                .await
+                .unwrap();
+        }
+
+        // REBUILD INDEX moves Declared -> Building{1}; re-issuing the same
+        // rebuild is idempotent and does not advance the generation.
+        leader
+            .execute("REBUILD INDEX accounts.orders.by.customer;")
+            .await
+            .unwrap();
+        let index = leader
+            .declared_index_by_name("accounts.orders.by.customer")
+            .await
+            .unwrap();
+        assert_eq!(index.stage, IndexBuildStage::Building { generation: 1 });
+        leader
+            .execute("REBUILD INDEX accounts.orders.by.customer;")
+            .await
+            .unwrap();
+        assert_eq!(
+            leader
+                .declared_index_by_name("accounts.orders.by.customer")
+                .await
+                .unwrap()
+                .stage,
+            IndexBuildStage::Building { generation: 1 }
+        );
+
+        // Completion must name the in-flight generation; a stale or unknown
+        // generation is refused.
+        assert!(leader
+            .execute_commands(vec![Command::CompleteIndexBuild {
+                index_id: index.index_id,
+                generation: 9,
+                applied_cursor: "cursor-1".to_owned(),
+            }])
+            .await
+            .is_err());
+        leader
+            .execute_commands(vec![Command::CompleteIndexBuild {
+                index_id: index.index_id,
+                generation: 1,
+                applied_cursor: "cursor-3".to_owned(),
+            }])
+            .await
+            .unwrap();
+        let index = leader
+            .declared_index_by_name("accounts.orders.by.customer")
+            .await
+            .unwrap();
+        assert_eq!(index.stage, IndexBuildStage::Active { generation: 1 });
+        assert_eq!(index.applied_cursor.as_deref(), Some("cursor-3"));
+
+        // Rebuilding an Active index opens the NEXT shadow generation.
+        leader
+            .execute("REBUILD INDEX accounts.orders.by.customer;")
+            .await
+            .unwrap();
+        assert_eq!(
+            leader
+                .declared_index_by_name("accounts.orders.by.customer")
+                .await
+                .unwrap()
+                .stage,
+            IndexBuildStage::Building { generation: 2 }
+        );
+
+        // REBUILD INDEXES IN DOMAIN covers every declared index in the
+        // domain and leaves others alone.
+        leader
+            .execute("REBUILD INDEXES IN DOMAIN accounts;")
+            .await
+            .unwrap();
+        assert_eq!(
+            leader
+                .declared_index_by_name("accounts.orders.by.tenant")
+                .await
+                .unwrap()
+                .stage,
+            IndexBuildStage::Building { generation: 1 }
+        );
+        // The already-building index keeps its in-flight generation.
+        assert_eq!(
+            leader
+                .declared_index_by_name("accounts.orders.by.customer")
+                .await
+                .unwrap()
+                .stage,
+            IndexBuildStage::Building { generation: 2 }
+        );
+        // Unknown names and missing indexes refuse.
+        assert!(leader
+            .execute("REBUILD INDEX accounts.missing;")
+            .await
+            .is_err());
+        assert!(leader
+            .execute("REBUILD INDEXES IN DOMAIN missing;")
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn rebuild_wcl_parses_index_and_domain_forms() {
+        let commands = parse_wcl(
+            "REBUILD INDEX orders.events.by.customer; \
+             REBUILD INDEXES IN DOMAIN orders; \
+             REBUILD INDEXES IN SPACE orders;",
+        )
+        .unwrap();
+        assert_eq!(commands.len(), 3);
+        assert!(matches!(
+            &commands[0],
+            Command::RebuildIndex { name } if name == "orders.events.by.customer"
+        ));
+        assert!(matches!(
+            &commands[1],
+            Command::RebuildIndexesInDomain { domain } if domain == "orders"
+        ));
+        assert!(matches!(
+            &commands[2],
+            Command::RebuildIndexesInDomain { domain } if domain == "orders"
+        ));
+        assert!(parse_wcl("REBUILD INDEXES orders;").is_err());
     }
 
     #[tokio::test]

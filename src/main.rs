@@ -692,6 +692,26 @@ async fn main() -> Result<()> {
                             }
                         }
                         for outcome in
+                            finnstream::api::drive_local_index_builds(&state, 128).await
+                        {
+                            use finnstream::api::IndexBuildDriveOutcome as Outcome;
+                            match outcome {
+                                Outcome::Building { index_id, generation, applied } => {
+                                    tracing::debug!(%index_id, generation, applied, "index shadow build pass applied")
+                                }
+                                Outcome::Activated { index_id, generation } => {
+                                    tracing::info!(%index_id, generation, "index shadow generation activated")
+                                }
+                                Outcome::Refused { index_id, message } => {
+                                    tracing::warn!(%index_id, %message, "index rebuild refused")
+                                }
+                                Outcome::Failed { index_id, message } => {
+                                    tracing::warn!(%index_id, %message, "index build pass failed")
+                                }
+                                Outcome::Superseded { .. } => {}
+                            }
+                        }
+                        for outcome in
                             finnstream::api::drive_local_state_store_catch_ups(&state, 128).await
                         {
                             use finnstream::api::StateStoreCatchUpDriveOutcome as Outcome;

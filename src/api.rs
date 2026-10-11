@@ -2873,11 +2873,23 @@ impl crate::state_store::FeedReplaySource for CommittedFeedReplaySource {
                     message_id: record.message_id,
                     cursor: frame.cursor.clone(),
                     key: record.key,
+                    metadata: record.metadata,
                     payload: record.payload,
                 })
             })
             .collect()
     }
+}
+
+fn index_build_driver(state: &AppState) -> Option<crate::index_build::IndexBuildDriver> {
+    let index = state.state_store_journal.as_ref()?.index_store()?;
+    Some(crate::index_build::IndexBuildDriver::new(
+        state.control.clone(),
+        Arc::new(CommittedFeedReplaySource {
+            state: state.clone(),
+        }),
+        index,
+    ))
 }
 
 fn state_store_replay_driver(state: &AppState) -> crate::state_store::StateStoreReplayDriver {
@@ -3082,6 +3094,74 @@ pub async fn drive_local_state_stores(
         }
     }
     outcomes
+}
+
+/// Per-Index outcome of one shadow-generation build drive cycle.
+#[derive(Clone, Debug)]
+pub enum IndexBuildDriveOutcome {
+    /// Records applied to the shadow generation this cycle.
+    Building {
+        index_id: Uuid,
+        generation: u64,
+        applied: usize,
+    },
+    /// The shadow consumed the committed frontier and the Control Plane
+    /// committed the atomic activation.
+    Activated { index_id: Uuid, generation: u64 },
+    /// Another Node completed the same generation first; idempotent.
+    Superseded { index_id: Uuid, generation: u64 },
+    /// Rebuild refused: the source Feed or the retained resume frontier is
+    /// gone; the definition stays Building until an operator intervenes.
+    Refused { index_id: Uuid, message: String },
+    /// The pass failed transiently; the durable shadow Cursor makes the
+    /// next cycle a safe resume.
+    Failed { index_id: Uuid, message: String },
+}
+
+/// One supervisor tick: for every catalog Index in `Building`, apply one
+/// bounded pass of committed history to this Node's shadow generation, then
+/// atomically activate through the Control Plane when caught up. Every Data
+/// Node builds deterministically from the same immutable history, so local
+/// shadows converge without placement; activation is idempotent.
+pub async fn drive_local_index_builds(
+    state: &AppState,
+    limit: usize,
+) -> Vec<IndexBuildDriveOutcome> {
+    let Some(driver) = index_build_driver(state) else {
+        return Vec::new();
+    };
+    driver
+        .run(limit)
+        .await
+        .into_iter()
+        .map(|(index_id, result)| match result {
+            Ok(pass) if pass.activated => IndexBuildDriveOutcome::Activated {
+                index_id,
+                generation: pass.generation,
+            },
+            Ok(pass) if pass.superseded => IndexBuildDriveOutcome::Superseded {
+                index_id,
+                generation: pass.generation,
+            },
+            Ok(pass) => IndexBuildDriveOutcome::Building {
+                index_id,
+                generation: pass.generation,
+                applied: pass.applied,
+            },
+            Err(
+                crate::index_build::IndexBuildError::SourceUnavailable
+                | crate::index_build::IndexBuildError::FrontierOutOfRange,
+            ) => IndexBuildDriveOutcome::Refused {
+                index_id,
+                message: "Index rebuild refused; source history is gone or out of retention"
+                    .to_owned(),
+            },
+            Err(error) => IndexBuildDriveOutcome::Failed {
+                index_id,
+                message: error.to_string(),
+            },
+        })
+        .collect()
 }
 
 /// Outcome of one catch-up pass on a locally replicated StateStore.
@@ -8885,6 +8965,210 @@ mod tests {
         let (status, _body) =
             sync("/v1/state-stores/sync", json!({ "store": "orders.manual" })).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn index_rebuild_builds_shadow_and_activates_over_http() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let nodes: Vec<crate::active_range::StorageNodeId> =
+            ["storage-1", "storage-2", "storage-3"]
+                .into_iter()
+                .map(|name| crate::active_range::StorageNodeId::try_new(name).unwrap())
+                .collect();
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store.clone(),
+                nodes.clone(),
+            )
+            .unwrap(),
+        );
+        control
+            .execute("CREATE SPACE orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        control
+            .execute_commands(vec![Command::DefineIndex {
+                name: "orders.events.by.key".to_owned(),
+                feed: "orders.events".to_owned(),
+                fields: vec![crate::control::IndexFieldSpec::Key],
+                unique: false,
+                collation: crate::control::IndexCollation::Binary,
+                consistency: crate::control::IndexConsistency::Eventual,
+            }])
+            .await
+            .unwrap();
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        let range = control.active_range_assignment(feed.feed_id).await.unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id: feed.feed_id,
+            range_id: range.range_id,
+            generation: range.generation,
+            ownership_epoch: range.ownership_epoch,
+        };
+        for replica in range.replicas.iter() {
+            let index = nodes.iter().position(|node| node == replica).unwrap();
+            crate::active_range::store::seed_committed_history_shaped(
+                &directory.path().join(format!("ranges-{index}")),
+                &descriptor,
+                4,
+                &|sequence| format!("user-{sequence}").into_bytes(),
+                &|sequence| sequence as i64,
+                8,
+            );
+        }
+
+        let control_key = "this-is-a-long-control-plane-key".to_owned();
+        let mut listeners = Vec::new();
+        let mut endpoints = BTreeMap::new();
+        for node in &nodes {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            endpoints.insert(
+                node.clone(),
+                format!("http://{}", listener.local_addr().unwrap()),
+            );
+            listeners.push(listener);
+        }
+        let mut states = Vec::new();
+        for (index, node) in nodes.iter().enumerate() {
+            let listener = listeners.remove(0);
+            listener.set_nonblocking(true).unwrap();
+            let journal = Arc::new(
+                crate::state_store::FjallStateStoreMutationJournal::open(
+                    directory.path().join(format!("journal-{index}")),
+                )
+                .unwrap(),
+            );
+            let index_store: Arc<dyn crate::index::IndexStore> = Arc::new(
+                crate::index::FjallIndexStore::open(
+                    directory.path().join(format!("index-{index}")),
+                )
+                .unwrap(),
+            );
+            let membership = Arc::new(MembershipService::new(
+                MemberAnnouncement {
+                    node_id: format!("test-node-{index}"),
+                    api_url: "http://test-node:7070".to_owned(),
+                    capacity: 100,
+                },
+                vec![],
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            ));
+            let state = AppState {
+                store: store.clone(),
+                membership,
+                demand: DemandMetrics::default(),
+                autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                control: control.clone(),
+                control_plane: None,
+                progress_authority: control.clone(),
+                replica_append: Some(Arc::new(ReplicaAppendService::new(
+                    directory.path().join(format!("ranges-{index}")),
+                    node.clone(),
+                    control.clone(),
+                ))),
+                majority_append: None,
+                subscription_progress: None,
+                effect_journal: None,
+                state_store_journal: Some(Arc::new(
+                    crate::state_store::StateStoreMutationService::new(
+                        node.clone(),
+                        control.clone(),
+                        journal,
+                        Arc::new(crate::state_store::IndexStoreStateApply::new(
+                            index_store.clone(),
+                        )),
+                    ),
+                )),
+                subscription_mtls_enabled: false,
+                storage_node_id: Some(node.clone()),
+                control_endpoints: Arc::new(endpoints.clone().into()),
+                internal_key: Some(control_key.clone()),
+                internal_http: reqwest::Client::new(),
+                internal_mtls: None,
+                admin_auth: AdminAuthenticator::new(Some(
+                    "this-is-a-long-development-api-key".to_owned(),
+                ))
+                .unwrap(),
+            };
+            states.push(state.clone());
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, router(state)).await.unwrap();
+            });
+        }
+
+        let client = reqwest::Client::new();
+        // The public WCL statement moves the Index into Building over HTTP.
+        let response = client
+            .post(format!("{}/v1/control/execute", endpoints[&nodes[0]]))
+            .bearer_auth("this-is-a-long-development-api-key")
+            .json(&serde_json::json!({
+                "script": "REBUILD INDEX orders.events.by.key;",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let definition = control
+            .declared_index_by_name("orders.events.by.key")
+            .await
+            .unwrap();
+        assert!(matches!(
+            definition.stage,
+            crate::control::IndexBuildStage::Building { generation: 1 }
+        ));
+
+        // One bounded drive pass on each Node materializes the local shadow
+        // and the first completer atomically activates generation 1.
+        for state in &states {
+            let outcomes = drive_local_index_builds(state, 64).await;
+            assert!(
+                outcomes.iter().any(|outcome| matches!(
+                    outcome,
+                    IndexBuildDriveOutcome::Activated { .. }
+                        | IndexBuildDriveOutcome::Superseded { .. }
+                        | IndexBuildDriveOutcome::Building { .. }
+                )),
+                "{outcomes:?}"
+            );
+        }
+        let updated = control
+            .declared_index_by_name("orders.events.by.key")
+            .await
+            .unwrap();
+        assert!(matches!(
+            updated.stage,
+            crate::control::IndexBuildStage::Active { generation: 1 }
+        ));
+        assert!(updated.applied_cursor.is_some());
+
+        // Every Node's local shadow holds a posting per committed key.
+        let shadow = crate::index::shadow_index_id(definition.index_id, 1);
+        for state in &states {
+            let index = state
+                .state_store_journal
+                .as_ref()
+                .unwrap()
+                .index_store()
+                .unwrap();
+            let rows = index
+                .lookup_exact(
+                    shadow,
+                    &[crate::index::IndexValue::Bytes(b"user-2".to_vec())],
+                    8,
+                )
+                .unwrap();
+            assert_eq!(rows.len(), 1, "shadow resolves user-2 on every Node");
+            assert_eq!(
+                index.last_applied(shadow).unwrap(),
+                updated.applied_cursor,
+                "local shadow frontier matches the activated cursor"
+            );
+        }
     }
 
     #[tokio::test]

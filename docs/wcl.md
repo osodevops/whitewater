@@ -541,10 +541,34 @@ consistency intent:
 `consistency` to `eventual`; `strict` is accepted as intent. `unique`
 is rejected until the replicated conditional-claim protocol exists.
 
-Declared Indexes persist in the replicated catalog and snapshots but
-serve **no data** — the stage stays `declared` until extraction, RF3
-replication, and the Feed-to-Index commit land. `RENAME INDEX` and
-`DROP INDEX` work on declared definitions.
+Declared Indexes persist in the replicated catalog and snapshots. The
+stage stays `declared` until a rebuild materializes a generation:
+
+```sql
+REBUILD INDEX orders.by.customer;
+REBUILD INDEXES IN DOMAIN orders;    -- SPACE is accepted as an alias
+```
+
+`REBUILD INDEX` moves the definition to `building` with a generation
+number; every Data Node then materializes that generation's postings as a
+**shadow** — derived posting ids coexist with the serving generation, so
+the previous Index state is never mutated mid-rebuild. Each Node resumes
+from its durable shadow Cursor across restarts; retained-history gaps or
+a missing source Feed refuse the pass explicitly rather than activating a
+partial Index. The first Node to consume the committed frontier commits
+`CompleteIndexBuild`, which flips `building` to `active` in one majority
+commit — readers never observe a partially-activated generation — and
+retires prior-generation postings. Concurrent completers are superseded
+idempotently. Nodes that activate before building locally keep applying
+committed history until their shadow covers the committed
+`applied_cursor`.
+
+Index **queries** are still not exposed — automatic routing, `GET`, and
+exact/prefix/range reads land with the query milestone. `SHOW INDEXES;`
+and `DESCRIBE INDEX <name>;` report `stage` (`declared`,
+`{"building":{"generation":N}}`, or `{"active":{"generation":N}}`) and
+`applied_cursor`. `RENAME INDEX` and `DROP INDEX` work on declared
+definitions.
 
 ## Inspect Active Range placement
 

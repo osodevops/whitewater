@@ -1058,6 +1058,13 @@ pub trait StateStoreApply: Send + Sync {
         store_id: Uuid,
         row: &StateStoreTransferRow,
     ) -> Result<(), StateStoreMutationError>;
+
+    /// The backing Index engine when this apply seam is index-backed —
+    /// the shadow-generation Index builder writes alongside StateStore
+    /// rows, scoped by disjoint ids. In-memory test applies report None.
+    fn index_store(&self) -> Option<Arc<dyn crate::index::IndexStore>> {
+        None
+    }
 }
 
 /// Applies manual mutations as primary rows: the store id namespaces
@@ -1072,12 +1079,22 @@ impl IndexStoreStateApply {
         Self { store }
     }
 
+    /// The shared Index engine hosting this Node's StateStore rows and
+    /// declared-Index postings.
+    pub fn store(&self) -> Arc<dyn crate::index::IndexStore> {
+        self.store.clone()
+    }
+
     fn cursor(sequence: u64) -> String {
         format!("{sequence:020}")
     }
 }
 
 impl StateStoreApply for IndexStoreStateApply {
+    fn index_store(&self) -> Option<Arc<dyn crate::index::IndexStore>> {
+        Some(self.store.clone())
+    }
+
     fn apply(&self, mutation: &StateStoreMutation) -> Result<(), StateStoreMutationError> {
         let reference = crate::index::PrimaryRef {
             feed_id: mutation.store_id,
@@ -1742,6 +1759,13 @@ impl StateStoreMutationService {
         }
     }
 
+    /// The Index engine backing this Node's StateStore applies, when the
+    /// apply seam is index-backed — shared with the shadow-generation
+    /// Index builder under disjoint ids.
+    pub fn index_store(&self) -> Option<Arc<dyn crate::index::IndexStore>> {
+        self.apply.index_store()
+    }
+
     async fn check_placement(
         &self,
         store_id: Uuid,
@@ -2281,6 +2305,7 @@ pub struct ReplaySourceRecord {
     pub message_id: Uuid,
     pub cursor: String,
     pub key: Vec<u8>,
+    pub metadata: std::collections::BTreeMap<String, Vec<u8>>,
     pub payload: Vec<u8>,
 }
 
@@ -2966,6 +2991,7 @@ mod tests {
 
     fn replay_record(sequence: u64, key: &str) -> ReplaySourceRecord {
         ReplaySourceRecord {
+            metadata: std::collections::BTreeMap::new(),
             message_id: Uuid::from_u128(0xF00D + sequence as u128),
             cursor: format!("cursor-{sequence}"),
             key: key.as_bytes().to_vec(),
