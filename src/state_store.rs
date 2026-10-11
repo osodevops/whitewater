@@ -29,12 +29,20 @@ pub const STATE_STORE_MAX_KEY_BYTES: usize = 60 * 1024;
 /// Strict reads wait at most this long for a replica's applied position to
 /// reach the committed frontier observed at request entry.
 pub const MAX_STRICT_READ_WAIT_MS: u64 = 2_000;
+/// One catch-up page carries at most this many committed entries and this
+/// many serialized bytes, keeping replica pulls bounded.
+pub const MAX_CATCHUP_PAGE_ENTRIES: usize = 64;
+pub const MAX_CATCHUP_PAGE_BYTES: usize = 8 * 1024 * 1024;
+/// One transfer page carries at most this many rows and bytes.
+pub const MAX_TRANSFER_PAGE_ROWS: usize = 256;
+pub const MAX_TRANSFER_PAGE_BYTES: usize = 8 * 1024 * 1024;
 /// Application-visible row payload budget for manual StateStore mutations.
 pub const STATE_STORE_MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
 const HEAD_KEYSPACE: &str = "state_store_journal_head";
 const ENTRIES_KEYSPACE: &str = "state_store_journal_entries";
 const IDEMPOTENCY_KEYSPACE: &str = "state_store_journal_idempotency";
+const DIGESTS_KEYSPACE: &str = "state_store_journal_digests";
 const JOURNAL_REPLAY_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
 const MEMTABLE_FLUSH_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ALLOCATE_ATTEMPTS: usize = 4;
@@ -161,6 +169,9 @@ pub struct StateStoreJournalInspection {
     pub committed: Option<StateStoreMutation>,
     pub prepared: Option<StateStoreMutation>,
     pub applied_seq: u64,
+    /// Applied chain digest at `applied_seq` (see `StateStoreJournalHead`).
+    #[serde(default)]
+    pub applied_digest: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -233,6 +244,91 @@ pub struct StateStoreReadOutcome {
     pub committed_seq: u64,
 }
 
+/// Bounded committed-entry page request for replica catch-up.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateStoreEntriesRequest {
+    pub owner: StorageNodeId,
+    pub receiver: StorageNodeId,
+    pub store_id: Uuid,
+    pub ownership_epoch: u64,
+    pub after_seq: u64,
+    pub limit: usize,
+}
+
+/// One committed journal entry paired with the serving replica's applied
+/// chain digest at that sequence (`None` while the server has not applied
+/// it yet — verification then waits for a later entry that carries one).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateStoreCommittedEntry {
+    pub mutation: StateStoreMutation,
+    #[serde(default)]
+    pub applied_digest: Option<String>,
+}
+
+/// The bounded page a replica serves for catch-up.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateStoreEntriesPage {
+    pub entries: Vec<StateStoreCommittedEntry>,
+    pub committed_seq: u64,
+    pub applied_seq: u64,
+    #[serde(default)]
+    pub applied_digest: Option<String>,
+}
+
+/// Bounded applied-row page request for checkpoint transfer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateStoreTransferRequest {
+    pub owner: StorageNodeId,
+    pub receiver: StorageNodeId,
+    pub store_id: Uuid,
+    pub ownership_epoch: u64,
+    #[serde(default)]
+    pub after_key: Option<Vec<u8>>,
+    pub limit: usize,
+}
+
+/// One applied row offered by a checkpoint transfer.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateStoreTransferRow {
+    pub key: Vec<u8>,
+    pub payload: Vec<u8>,
+    pub applied_seq: u64,
+}
+
+/// The bounded page a replica serves for transfer. Rows are strictly
+/// ordered by key and only include mutations applied at or below
+/// `pinned_seq`, so the set stays stable while the receiver pages through.
+/// `applied_digest` is the sender's applied chain value at `pinned_seq`;
+/// the receiver installs it and every later catch-up step re-verifies the
+/// chain continued from it against peer-attested digests.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StateStoreTransferPage {
+    pub rows: Vec<StateStoreTransferRow>,
+    pub next_key: Option<Vec<u8>>,
+    pub pinned_seq: u64,
+    #[serde(default)]
+    pub applied_digest: Option<String>,
+}
+
+/// Result of one bounded catch-up pass on this replica.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateStoreCatchUpOutcome {
+    pub store_id: Uuid,
+    pub installed: u64,
+    pub applied: u64,
+    pub committed_seq: u64,
+    pub applied_seq: u64,
+    /// `true` when this replica's applied position reached the freshest
+    /// observed peer's committed position.
+    pub complete: bool,
+}
+
 #[derive(Debug, Error)]
 pub enum StateStoreMutationError {
     #[error(transparent)]
@@ -259,6 +355,8 @@ pub enum StateStoreMutationError {
     AmbiguousCommit,
     #[error("StateStore index apply failed after durable commit")]
     ApplyFailed,
+    #[error("StateStore replica applied state diverges from peer-attested checkpoints")]
+    Diverged,
 }
 
 impl StateStoreMutationError {
@@ -274,6 +372,7 @@ impl StateStoreMutationError {
             Self::Unavailable => "state_store.unavailable",
             Self::AmbiguousCommit => "state_store.ambiguous_commit",
             Self::ApplyFailed => "state_store.apply_failed",
+            Self::Diverged => "state_store.diverged",
             Self::Engine(_) => "state_store.engine",
             Self::Serialization(_) => "state_store.serialization",
         }
@@ -291,6 +390,7 @@ impl StateStoreMutationError {
             "state_store.unavailable" => Self::Unavailable,
             "state_store.ambiguous_commit" => Self::AmbiguousCommit,
             "state_store.apply_failed" => Self::ApplyFailed,
+            "state_store.diverged" => Self::Diverged,
             _ => return None,
         })
     }
@@ -334,6 +434,13 @@ struct StateStoreJournalHead {
     committed_seq: u64,
     committed_mutation_id: Option<Uuid>,
     applied_seq: u64,
+    /// Hash chain over every applied committed mutation:
+    /// `blake3(previous_digest | sequence | mutation_digest)` rooted at the
+    /// store genesis. Replicas that applied the same committed prefix
+    /// always agree on the digest at a shared sequence, which is how
+    /// catch-up verifies transferred or replayed state.
+    #[serde(default)]
+    applied_digest: Option<String>,
     prepared: Option<StateStoreMutation>,
 }
 
@@ -345,6 +452,7 @@ impl StateStoreJournalHead {
             committed_seq: 0,
             committed_mutation_id: None,
             applied_seq: 0,
+            applied_digest: None,
             prepared: None,
         }
     }
@@ -369,6 +477,24 @@ fn mutation_digest(mutation: &StateStoreMutation) -> Result<[u8; 32], StateStore
     Ok(*blake3::hash(&bytes).as_bytes())
 }
 
+/// Extend the applied chain: `blake3(previous | sequence | mutation_digest)`
+/// hex-encoded. `previous` is the digest at `sequence - 1` or the store's
+/// genesis anchor when no prior applied digest exists.
+fn applied_chain_digest(
+    previous: Option<&str>,
+    mutation: &StateStoreMutation,
+) -> Result<String, StateStoreMutationError> {
+    let mutation_digest = mutation_digest(mutation)?;
+    let mut hasher = blake3::Hasher::new();
+    match previous {
+        Some(digest) => hasher.update(digest.as_bytes()),
+        None => hasher.update(b"whitewater-state-store-genesis"),
+    };
+    hasher.update(&mutation.sequence.to_be_bytes());
+    hasher.update(mutation_digest.as_slice());
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 /// One storage Node's durable journal for manual StateStore mutations. The
 /// head keyspace holds per-store ordering/fencing state; `entries` is the
 /// committed mutation log replicas apply from; `idempotency` maps
@@ -378,6 +504,7 @@ pub struct FjallStateStoreMutationJournal {
     head: fjall::SingleWriterTxKeyspace,
     entries: fjall::SingleWriterTxKeyspace,
     idempotency: fjall::SingleWriterTxKeyspace,
+    digests: fjall::SingleWriterTxKeyspace,
 }
 
 impl FjallStateStoreMutationJournal {
@@ -388,11 +515,13 @@ impl FjallStateStoreMutationJournal {
         let head = db.keyspace(HEAD_KEYSPACE, bounded_keyspace)?;
         let entries = db.keyspace(ENTRIES_KEYSPACE, bounded_keyspace)?;
         let idempotency = db.keyspace(IDEMPOTENCY_KEYSPACE, bounded_keyspace)?;
+        let digests = db.keyspace(DIGESTS_KEYSPACE, bounded_keyspace)?;
         Ok(Self {
             db,
             head,
             entries,
             idempotency,
+            digests,
         })
     }
 
@@ -459,6 +588,7 @@ impl FjallStateStoreMutationJournal {
             committed,
             prepared: head.prepared,
             applied_seq: head.applied_seq,
+            applied_digest: head.applied_digest,
         })
     }
 
@@ -502,11 +632,14 @@ impl FjallStateStoreMutationJournal {
     }
 
     /// Durably mark committed entries as applied to the local IndexStore.
-    /// Applied never moves backwards.
+    /// Applied never moves backwards. `digest` is the applied chain value
+    /// at `sequence`, recorded per-entry and on the head so peers can
+    /// verify their own application converged.
     pub fn mark_applied(
         &self,
         store_id: Uuid,
         sequence: u64,
+        digest: &str,
     ) -> Result<(), StateStoreMutationError> {
         let mut tx = self
             .db
@@ -520,12 +653,174 @@ impl FjallStateStoreMutationJournal {
         if head.committed_seq < sequence {
             return Err(StateStoreMutationError::Sequence);
         }
+        tx.insert(
+            &self.digests,
+            entries_key(store_id, sequence),
+            digest.as_bytes(),
+        );
         if head.applied_seq < sequence {
             head.applied_seq = sequence;
+            head.applied_digest = Some(digest.to_owned());
             tx.insert(&self.head, store_id.as_bytes(), serde_json::to_vec(&head)?);
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// The applied chain digest recorded at one sequence, if the replica
+    /// applied that far.
+    pub fn entry_applied_digest(
+        &self,
+        store_id: Uuid,
+        sequence: u64,
+    ) -> Result<Option<String>, StateStoreMutationError> {
+        self.db
+            .read_tx()
+            .get(&self.digests, entries_key(store_id, sequence))?
+            .map(|bytes| String::from_utf8(bytes.to_vec()))
+            .transpose()
+            .map_err(|_| StateStoreMutationError::Conflict)
+    }
+
+    /// Committed entries strictly after `after`, bounded by count and
+    /// serialized bytes, each paired with this replica's applied chain
+    /// digest when it applied that far. Catch-up pages through this.
+    pub fn entries_after(
+        &self,
+        store_id: Uuid,
+        after: u64,
+        limit: usize,
+        byte_budget: usize,
+    ) -> Result<Vec<StateStoreCommittedEntry>, StateStoreMutationError> {
+        let Some(head) = self.read_head(store_id)? else {
+            return Ok(Vec::new());
+        };
+        let mut entries = Vec::new();
+        let mut bytes_seen = 0usize;
+        for sequence in (after + 1)..=head.committed_seq {
+            if entries.len() >= limit {
+                break;
+            }
+            let Some(mutation) = self.entry(store_id, sequence)? else {
+                return Err(StateStoreMutationError::Sequence);
+            };
+            let serialized = serde_json::to_vec(&mutation)?;
+            bytes_seen = bytes_seen
+                .checked_add(serialized.len())
+                .ok_or(StateStoreMutationError::TooLarge)?;
+            // The first entry is always included even when it alone exceeds
+            // the byte budget — a page must make progress or catch-up
+            // deadlocks on a single large mutation.
+            if !entries.is_empty() && bytes_seen > byte_budget {
+                break;
+            }
+            let applied_digest = self.entry_applied_digest(store_id, sequence)?;
+            entries.push(StateStoreCommittedEntry {
+                mutation,
+                applied_digest,
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Install a peer-committed entry during catch-up. The entry was already
+    /// quorum-committed at its origin, so no prepare vote or quorum
+    /// re-evidence is required; the replica durably records it at its
+    /// stated sequence. Existing entries must match exactly — a different
+    /// mutation at the same sequence is a `Conflict`.
+    pub fn install_committed(
+        &self,
+        mutation: &StateStoreMutation,
+    ) -> Result<bool, StateStoreMutationError> {
+        validate_mutation_bounds(mutation)?;
+        let mut tx = self
+            .db
+            .write_tx()
+            .durability(Some(fjall::PersistMode::SyncAll));
+        let head_bytes = tx.get(&self.head, mutation.store_id.as_bytes())?;
+        let mut head = match head_bytes {
+            Some(bytes) => serde_json::from_slice::<StateStoreJournalHead>(&bytes)?,
+            None => StateStoreJournalHead::empty(mutation.store_id, mutation.ownership_epoch),
+        };
+        if mutation.sequence <= head.committed_seq {
+            match tx.get(
+                &self.entries,
+                entries_key(mutation.store_id, mutation.sequence),
+            )? {
+                Some(existing) => {
+                    let existing: StateStoreMutation = serde_json::from_slice(&existing)?;
+                    if existing == *mutation {
+                        tx.commit()?;
+                        return Ok(false);
+                    }
+                    return Err(StateStoreMutationError::Conflict);
+                }
+                // Covered by an installed checkpoint; nothing to do.
+                None => {
+                    tx.commit()?;
+                    return Ok(false);
+                }
+            }
+        }
+        if mutation.sequence != head.committed_seq + 1 {
+            return Err(StateStoreMutationError::Sequence);
+        }
+        tx.insert(
+            &self.entries,
+            entries_key(mutation.store_id, mutation.sequence),
+            serde_json::to_vec(mutation)?,
+        );
+        tx.insert(
+            &self.idempotency,
+            idempotency_key(mutation.store_id, mutation.mutation_id),
+            mutation.sequence.to_be_bytes(),
+        );
+        head.committed_seq = mutation.sequence;
+        head.committed_mutation_id = Some(mutation.mutation_id);
+        tx.insert(
+            &self.head,
+            mutation.store_id.as_bytes(),
+            serde_json::to_vec(&head)?,
+        );
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// Install a transferred checkpoint: the replica's applied position and
+    /// chain digest move to the attested values and the committed floor
+    /// rises to cover the transferred prefix. Applied never moves
+    /// backwards; a checkpoint below the current position is a no-op.
+    pub fn install_checkpoint(
+        &self,
+        store_id: Uuid,
+        ownership_epoch: u64,
+        applied_seq: u64,
+        applied_digest: &str,
+    ) -> Result<bool, StateStoreMutationError> {
+        let mut tx = self
+            .db
+            .write_tx()
+            .durability(Some(fjall::PersistMode::SyncAll));
+        let head_bytes = tx.get(&self.head, store_id.as_bytes())?;
+        let mut head = match head_bytes {
+            Some(bytes) => serde_json::from_slice::<StateStoreJournalHead>(&bytes)?,
+            None => StateStoreJournalHead::empty(store_id, ownership_epoch),
+        };
+        if applied_seq <= head.applied_seq {
+            tx.commit()?;
+            return Ok(false);
+        }
+        head.applied_seq = applied_seq;
+        head.applied_digest = Some(applied_digest.to_owned());
+        head.committed_seq = head.committed_seq.max(applied_seq);
+        tx.insert(
+            &self.digests,
+            entries_key(store_id, applied_seq),
+            applied_digest.as_bytes(),
+        );
+        tx.insert(&self.head, store_id.as_bytes(), serde_json::to_vec(&head)?);
+        tx.commit()?;
+        Ok(true)
     }
 
     /// Durably prepare one mutation. When `mutation.sequence == 0` the owner
@@ -745,6 +1040,24 @@ pub trait StateStoreApply: Send + Sync {
         store_id: Uuid,
         key: &[u8],
     ) -> Result<Option<StateStoreRow>, StateStoreMutationError>;
+
+    /// Ordered applied-row scan for checkpoint transfer, starting strictly
+    /// after `after_key` and bounded by `limit`.
+    fn scan_rows(
+        &self,
+        store_id: Uuid,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<StateStoreTransferRow>, StateStoreMutationError>;
+
+    /// Install one transferred row at its attested applied position. The
+    /// write goes through the same durable apply path as journal replay —
+    /// cursor-conflict rules still fence divergent content.
+    fn install_row(
+        &self,
+        store_id: Uuid,
+        row: &StateStoreTransferRow,
+    ) -> Result<(), StateStoreMutationError>;
 }
 
 /// Applies manual mutations as primary rows: the store id namespaces
@@ -802,6 +1115,49 @@ impl StateStoreApply for IndexStoreStateApply {
             })
             .map_err(|_| StateStoreMutationError::ApplyFailed)
     }
+
+    fn scan_rows(
+        &self,
+        store_id: Uuid,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<StateStoreTransferRow>, StateStoreMutationError> {
+        self.store
+            .scan(store_id, after_key, limit)
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        Ok(StateStoreTransferRow {
+                            key: row.reference.application_key,
+                            payload: row.payload,
+                            applied_seq: row
+                                .applied_cursor
+                                .parse::<u64>()
+                                .map_err(|_| StateStoreMutationError::ApplyFailed)?,
+                        })
+                    })
+                    .collect::<Result<_, StateStoreMutationError>>()
+            })
+            .map_err(|_| StateStoreMutationError::ApplyFailed)?
+    }
+
+    fn install_row(
+        &self,
+        store_id: Uuid,
+        row: &StateStoreTransferRow,
+    ) -> Result<(), StateStoreMutationError> {
+        self.store
+            .upsert(
+                &crate::index::PrimaryRef {
+                    feed_id: store_id,
+                    application_key: row.key.clone(),
+                },
+                &row.payload,
+                &[],
+                &Self::cursor(row.applied_seq),
+            )
+            .map_err(|_| StateStoreMutationError::ApplyFailed)
+    }
 }
 
 /// The wire surface one replica offers the coordinator. Injected so the
@@ -838,6 +1194,20 @@ pub trait StateStoreMutationTransport: Send + Sync {
         replica: &StorageNodeId,
         request: StateStoreReadRequest,
     ) -> Result<StateStoreReplicaReply<StateStoreReadOutcome>, StateStoreMutationError>;
+
+    /// Bounded committed-entry page for replica catch-up.
+    async fn entries(
+        &self,
+        replica: &StorageNodeId,
+        request: StateStoreEntriesRequest,
+    ) -> Result<StateStoreReplicaReply<StateStoreEntriesPage>, StateStoreMutationError>;
+
+    /// Bounded applied-row page for checkpoint transfer.
+    async fn transfer(
+        &self,
+        replica: &StorageNodeId,
+        request: StateStoreTransferRequest,
+    ) -> Result<StateStoreReplicaReply<StateStoreTransferPage>, StateStoreMutationError>;
 }
 
 /// Drives manual mutations through the replicated prepare/commit protocol
@@ -1322,6 +1692,30 @@ impl StateStoreMutationTransport for HttpStateStoreMutationTransport {
         self.send(replica, "/internal/state-store-journal/read", &request)
             .await
     }
+
+    async fn entries(
+        &self,
+        replica: &StorageNodeId,
+        request: StateStoreEntriesRequest,
+    ) -> Result<StateStoreReplicaReply<StateStoreEntriesPage>, StateStoreMutationError> {
+        if request.ownership_epoch != self.assignment.ownership_epoch {
+            return Err(StateStoreMutationError::StaleEpoch);
+        }
+        self.send(replica, "/internal/state-store-journal/entries", &request)
+            .await
+    }
+
+    async fn transfer(
+        &self,
+        replica: &StorageNodeId,
+        request: StateStoreTransferRequest,
+    ) -> Result<StateStoreReplicaReply<StateStoreTransferPage>, StateStoreMutationError> {
+        if request.ownership_epoch != self.assignment.ownership_epoch {
+            return Err(StateStoreMutationError::StaleEpoch);
+        }
+        self.send(replica, "/internal/state-store-journal/transfer", &request)
+            .await
+    }
 }
 
 /// Node-side service fencing journal RPCs against the catalog's current
@@ -1412,7 +1806,6 @@ impl StateStoreMutationService {
             return Err(StateStoreMutationError::Conflict);
         }
         let journal = self.journal.clone();
-        let apply = self.apply.clone();
         let store_id = request.store_id;
         let epoch = request.ownership_epoch;
         let evidence = request.evidence;
@@ -1425,19 +1818,7 @@ impl StateStoreMutationService {
         // sequence, then durably marks the position. Same-sequence replays
         // are index-level idempotent, so a partially applied restart simply
         // re-runs pending entries.
-        let apply_mutation = committed.clone();
-        let apply_result = tokio::task::spawn_blocking(move || apply.apply(&apply_mutation)).await;
-        match apply_result {
-            Ok(Ok(())) => {
-                let journal = self.journal.clone();
-                let sequence = committed.sequence;
-                tokio::task::spawn_blocking(move || journal.mark_applied(store_id, sequence))
-                    .await
-                    .map_err(|_| StateStoreMutationError::Unavailable)??;
-            }
-            Ok(Err(error)) => return Err(error),
-            Err(_) => return Err(StateStoreMutationError::Unavailable),
-        }
+        self.apply_and_mark(&committed).await?;
         Ok(StateStoreReplicaReply {
             replica: self.local_node.clone(),
             store_id,
@@ -1572,18 +1953,317 @@ impl StateStoreMutationService {
             .map_err(|_| StateStoreMutationError::Unavailable)??;
         let mut replayed = 0u64;
         for mutation in pending {
-            let apply = self.apply.clone();
-            let replay = mutation.clone();
-            tokio::task::spawn_blocking(move || apply.apply(&replay))
-                .await
-                .map_err(|_| StateStoreMutationError::Unavailable)??;
-            let journal = self.journal.clone();
-            tokio::task::spawn_blocking(move || journal.mark_applied(store_id, mutation.sequence))
-                .await
-                .map_err(|_| StateStoreMutationError::Unavailable)??;
+            self.apply_and_mark(&mutation).await?;
             replayed += 1;
         }
         Ok(replayed)
+    }
+
+    /// Apply one committed mutation to the local IndexStore, then durably
+    /// record the applied chain digest: `blake3(previous | sequence |
+    /// mutation_digest)`. Replicas applying the same committed prefix
+    /// converge on identical digests, which is what catch-up verifies.
+    async fn apply_and_mark(
+        &self,
+        mutation: &StateStoreMutation,
+    ) -> Result<(), StateStoreMutationError> {
+        let apply = self.apply.clone();
+        let apply_mutation = mutation.clone();
+        tokio::task::spawn_blocking(move || apply.apply(&apply_mutation))
+            .await
+            .map_err(|_| StateStoreMutationError::Unavailable)??;
+        let journal = self.journal.clone();
+        let digest_mutation = mutation.clone();
+        let store_id = mutation.store_id;
+        let sequence = mutation.sequence;
+        tokio::task::spawn_blocking(move || {
+            let previous = sequence
+                .checked_sub(1)
+                .filter(|prior| *prior > 0)
+                .map(|prior| journal.entry_applied_digest(store_id, prior))
+                .transpose()?
+                .flatten();
+            let digest = applied_chain_digest(previous.as_deref(), &digest_mutation)?;
+            journal.mark_applied(store_id, sequence, &digest)
+        })
+        .await
+        .map_err(|_| StateStoreMutationError::Unavailable)??;
+        Ok(())
+    }
+
+    /// Bounded committed-entry page for a catching-up peer. Fenced by the
+    /// same placement/epoch rules as mutation RPCs.
+    pub async fn entries(
+        &self,
+        request: StateStoreEntriesRequest,
+    ) -> Result<StateStoreReplicaReply<StateStoreEntriesPage>, StateStoreMutationError> {
+        let assignment = self
+            .check_placement(
+                request.store_id,
+                &request.owner,
+                &request.receiver,
+                request.ownership_epoch,
+            )
+            .await?;
+        if request.limit == 0 || request.limit > MAX_CATCHUP_PAGE_ENTRIES {
+            return Err(StateStoreMutationError::TooLarge);
+        }
+        let journal = self.journal.clone();
+        let store_id = request.store_id;
+        let after = request.after_seq;
+        let limit = request.limit;
+        let page = tokio::task::spawn_blocking(move || {
+            let entries = journal.entries_after(store_id, after, limit, MAX_CATCHUP_PAGE_BYTES)?;
+            let inspection = journal.inspect(store_id)?;
+            Ok::<_, StateStoreMutationError>(StateStoreEntriesPage {
+                entries,
+                committed_seq: inspection
+                    .committed
+                    .as_ref()
+                    .map(|mutation| mutation.sequence)
+                    .unwrap_or(0),
+                applied_seq: inspection.applied_seq,
+                applied_digest: inspection.applied_digest,
+            })
+        })
+        .await
+        .map_err(|_| StateStoreMutationError::Unavailable)??;
+        Ok(StateStoreReplicaReply {
+            replica: self.local_node.clone(),
+            store_id: request.store_id,
+            ownership_epoch: assignment.ownership_epoch,
+            result: page,
+        })
+    }
+
+    /// Bounded applied-row page for checkpoint transfer. Rows carry the
+    /// sequence they applied at; only rows at or below the pinned applied
+    /// position are offered, so the transferred set is stable while the
+    /// receiver pages through.
+    pub async fn transfer(
+        &self,
+        request: StateStoreTransferRequest,
+    ) -> Result<StateStoreReplicaReply<StateStoreTransferPage>, StateStoreMutationError> {
+        let assignment = self
+            .check_placement(
+                request.store_id,
+                &request.owner,
+                &request.receiver,
+                request.ownership_epoch,
+            )
+            .await?;
+        if request.limit == 0 || request.limit > MAX_TRANSFER_PAGE_ROWS {
+            return Err(StateStoreMutationError::TooLarge);
+        }
+        let journal = self.journal.clone();
+        let apply = self.apply.clone();
+        let store_id = request.store_id;
+        let after_key = request.after_key.clone();
+        let limit = request.limit;
+        let page = tokio::task::spawn_blocking(move || {
+            let inspection = journal.inspect(store_id)?;
+            let pinned = inspection.applied_seq;
+            let mut rows = Vec::new();
+            let mut bytes_seen = 0usize;
+            let mut cursor: Option<Vec<u8>> = after_key;
+            loop {
+                let scanned = apply.scan_rows(store_id, cursor.as_deref(), limit)?;
+                let fetched = scanned.len();
+                for row in scanned {
+                    if row.applied_seq > pinned {
+                        continue;
+                    }
+                    bytes_seen = bytes_seen
+                        .checked_add(row.key.len() + row.payload.len())
+                        .ok_or(StateStoreMutationError::TooLarge)?;
+                    if bytes_seen > MAX_TRANSFER_PAGE_BYTES || rows.len() >= limit {
+                        break;
+                    }
+                    rows.push(row);
+                }
+                if fetched < limit || rows.len() >= limit || bytes_seen > MAX_TRANSFER_PAGE_BYTES {
+                    break;
+                }
+                cursor = rows.last().map(|row| row.key.clone());
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            let next_key = (rows.len() >= limit)
+                .then(|| rows.last().map(|row| row.key.clone()))
+                .flatten();
+            Ok::<_, StateStoreMutationError>(StateStoreTransferPage {
+                rows,
+                next_key,
+                pinned_seq: pinned,
+                applied_digest: inspection.applied_digest,
+            })
+        })
+        .await
+        .map_err(|_| StateStoreMutationError::Unavailable)??;
+        Ok(StateStoreReplicaReply {
+            replica: self.local_node.clone(),
+            store_id: request.store_id,
+            ownership_epoch: assignment.ownership_epoch,
+            result: page,
+        })
+    }
+
+    /// One bounded catch-up pass for a store this Node replicates. The
+    /// replica compares its committed position against the freshest peer,
+    /// installs missing committed entries (each already quorum-committed
+    /// at its origin), then applies pending entries while verifying the
+    /// applied chain digest wherever the source attested one.
+    ///
+    /// `budget` bounds how many entries install+apply in one pass; the
+    /// driver ticks again until `complete`.
+    pub async fn catch_up_replica(
+        &self,
+        transport: &Arc<dyn StateStoreMutationTransport>,
+        assignment: &StateStoreAssignment,
+        budget: usize,
+    ) -> Result<StateStoreCatchUpOutcome, StateStoreMutationError> {
+        if !assignment.replicas.contains(&self.local_node) {
+            return Err(StateStoreMutationError::InvalidAssignment);
+        }
+        let store_id = assignment.store_id;
+        let journal = self.journal.clone();
+        let local = tokio::task::spawn_blocking(move || journal.inspect(store_id))
+            .await
+            .map_err(|_| StateStoreMutationError::Unavailable)??;
+        let local_committed = local
+            .committed
+            .as_ref()
+            .map(|mutation| mutation.sequence)
+            .unwrap_or(0)
+            .max(local.applied_seq);
+
+        // Freshest peer first: owner, then other replicas.
+        let mut sources: Vec<&StorageNodeId> = Vec::new();
+        if assignment.owner != self.local_node {
+            sources.push(&assignment.owner);
+        }
+        for replica in assignment.replicas.iter() {
+            if *replica != self.local_node && !sources.contains(&replica) {
+                sources.push(replica);
+            }
+        }
+        let mut source: Option<(StorageNodeId, u64)> = None;
+        for candidate in sources {
+            match transport
+                .inspect(
+                    candidate,
+                    StateStoreInspectRequest {
+                        owner: assignment.owner.clone(),
+                        receiver: candidate.clone(),
+                        store_id,
+                        ownership_epoch: assignment.ownership_epoch,
+                    },
+                )
+                .await
+            {
+                Ok(reply) => {
+                    let committed = reply
+                        .result
+                        .committed
+                        .as_ref()
+                        .map(|mutation| mutation.sequence)
+                        .unwrap_or(0);
+                    if source
+                        .as_ref()
+                        .map(|(_, seq)| committed > *seq)
+                        .unwrap_or(true)
+                    {
+                        source = Some((candidate.clone(), committed));
+                    }
+                }
+                Err(error) if lagging_witness(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        let Some((source, source_committed)) = source else {
+            return Err(StateStoreMutationError::NoQuorum);
+        };
+
+        let mut installed = 0u64;
+        let mut attested: std::collections::BTreeMap<u64, String> =
+            std::collections::BTreeMap::new();
+        let mut cursor = local_committed;
+        while cursor < source_committed && installed < budget as u64 {
+            let reply = transport
+                .entries(
+                    &source,
+                    StateStoreEntriesRequest {
+                        owner: assignment.owner.clone(),
+                        receiver: source.clone(),
+                        store_id,
+                        ownership_epoch: assignment.ownership_epoch,
+                        after_seq: cursor,
+                        limit: (budget as u64 - installed).min(MAX_CATCHUP_PAGE_ENTRIES as u64)
+                            as usize,
+                    },
+                )
+                .await?;
+            if reply.result.entries.is_empty() {
+                break;
+            }
+            for entry in reply.result.entries {
+                if let Some(digest) = entry.applied_digest.clone() {
+                    attested.insert(entry.mutation.sequence, digest);
+                }
+                let journal = self.journal.clone();
+                let mutation = entry.mutation;
+                cursor = mutation.sequence;
+                let installed_now =
+                    tokio::task::spawn_blocking(move || journal.install_committed(&mutation))
+                        .await
+                        .map_err(|_| StateStoreMutationError::Unavailable)??;
+                if installed_now {
+                    installed += 1;
+                }
+            }
+        }
+
+        // Apply committed-but-unapplied entries, verifying the chain digest
+        // against peer-attested values where the source had applied.
+        let journal = self.journal.clone();
+        let pending = tokio::task::spawn_blocking(move || journal.pending_applies(store_id))
+            .await
+            .map_err(|_| StateStoreMutationError::Unavailable)??;
+        let mut applied = 0u64;
+        for mutation in pending.into_iter().take(budget) {
+            self.apply_and_mark(&mutation).await?;
+            applied += 1;
+            if let Some(attested_digest) = attested.get(&mutation.sequence) {
+                let journal = self.journal.clone();
+                let store_id = mutation.store_id;
+                let sequence = mutation.sequence;
+                let ours = tokio::task::spawn_blocking(move || {
+                    journal.entry_applied_digest(store_id, sequence)
+                })
+                .await
+                .map_err(|_| StateStoreMutationError::Unavailable)??;
+                if ours.as_deref() != Some(attested_digest.as_str()) {
+                    return Err(StateStoreMutationError::Diverged);
+                }
+            }
+        }
+        let journal = self.journal.clone();
+        let inspection = tokio::task::spawn_blocking(move || journal.inspect(store_id))
+            .await
+            .map_err(|_| StateStoreMutationError::Unavailable)??;
+        Ok(StateStoreCatchUpOutcome {
+            store_id,
+            installed,
+            applied,
+            committed_seq: inspection
+                .committed
+                .as_ref()
+                .map(|mutation| mutation.sequence)
+                .unwrap_or(0),
+            applied_seq: inspection.applied_seq,
+            complete: inspection.applied_seq >= source_committed,
+        })
     }
 
     /// Journal store ids for the restart replay sweep.
@@ -1926,11 +2606,12 @@ mod tests {
         journal
             .commit_with_quorum(store_id, 1, &evidence(&vote.mutation, &placement))
             .unwrap();
-        journal.mark_applied(store_id, 1).unwrap();
+        let digest = applied_chain_digest(None, &vote.mutation).unwrap();
+        journal.mark_applied(store_id, 1, &digest).unwrap();
         assert_eq!(journal.applied_seq(store_id).unwrap(), 1);
-        journal.mark_applied(store_id, 1).unwrap();
+        journal.mark_applied(store_id, 1, &digest).unwrap();
         assert!(matches!(
-            journal.mark_applied(store_id, 9),
+            journal.mark_applied(store_id, 9, &digest),
             Err(StateStoreMutationError::Sequence)
         ));
         assert_eq!(journal.pending_applies(store_id).unwrap().len(), 0);
@@ -1954,9 +2635,12 @@ mod tests {
         // Committed but never marked applied → replay applies both.
         let pending = journal.pending_applies(store_id).unwrap();
         assert_eq!(pending.len(), 2);
+        let mut previous: Option<String> = None;
         for m in pending {
             apply.apply(&m).unwrap();
-            journal.mark_applied(store_id, m.sequence).unwrap();
+            let digest = applied_chain_digest(previous.as_deref(), &m).unwrap();
+            journal.mark_applied(store_id, m.sequence, &digest).unwrap();
+            previous = Some(digest);
         }
         let row = index
             .get(&PrimaryRef {
@@ -2107,6 +2791,72 @@ mod tests {
                         .committed
                         .map(|mutation| mutation.sequence)
                         .unwrap_or(0),
+                },
+            })
+        }
+
+        async fn entries(
+            &self,
+            replica: &StorageNodeId,
+            request: StateStoreEntriesRequest,
+        ) -> Result<StateStoreReplicaReply<StateStoreEntriesPage>, StateStoreMutationError>
+        {
+            let journal = self
+                .replies
+                .lock()
+                .unwrap()
+                .get(replica.as_str())
+                .cloned()
+                .ok_or(StateStoreMutationError::Unavailable)?;
+            let entries = journal.entries_after(
+                request.store_id,
+                request.after_seq,
+                request.limit.min(MAX_CATCHUP_PAGE_ENTRIES),
+                MAX_CATCHUP_PAGE_BYTES,
+            )?;
+            let inspection = journal.inspect(request.store_id)?;
+            Ok(StateStoreReplicaReply {
+                replica: replica.clone(),
+                store_id: request.store_id,
+                ownership_epoch: request.ownership_epoch,
+                result: StateStoreEntriesPage {
+                    entries,
+                    committed_seq: inspection
+                        .committed
+                        .as_ref()
+                        .map(|mutation| mutation.sequence)
+                        .unwrap_or(0),
+                    applied_seq: inspection.applied_seq,
+                    applied_digest: inspection.applied_digest,
+                },
+            })
+        }
+
+        async fn transfer(
+            &self,
+            replica: &StorageNodeId,
+            request: StateStoreTransferRequest,
+        ) -> Result<StateStoreReplicaReply<StateStoreTransferPage>, StateStoreMutationError>
+        {
+            let journal = self
+                .replies
+                .lock()
+                .unwrap()
+                .get(replica.as_str())
+                .cloned()
+                .ok_or(StateStoreMutationError::Unavailable)?;
+            // In-memory transports carry no applied index; an empty page
+            // pins at the replica's applied position.
+            let inspection = journal.inspect(request.store_id)?;
+            Ok(StateStoreReplicaReply {
+                replica: replica.clone(),
+                store_id: request.store_id,
+                ownership_epoch: request.ownership_epoch,
+                result: StateStoreTransferPage {
+                    rows: Vec::new(),
+                    next_key: None,
+                    pinned_seq: inspection.applied_seq,
+                    applied_digest: inspection.applied_digest,
                 },
             })
         }
@@ -2489,7 +3239,13 @@ mod tests {
         assert_eq!(lagging.result.applied_seq, 0);
         assert_eq!(lagging.result.committed_seq, 1);
         service.apply.apply(&committed).unwrap();
-        journal.mark_applied(store_id, 1).unwrap();
+        journal
+            .mark_applied(
+                store_id,
+                1,
+                &applied_chain_digest(None, &committed).unwrap(),
+            )
+            .unwrap();
 
         let reply = service.read_row(read(b"user-7", epoch)).await.unwrap();
         assert_eq!(reply.replica, node("storage-1"));
@@ -2532,7 +3288,14 @@ mod tests {
         assert!(lagged.result.applied_seq < 2);
         // After the apply lands, the same strict read serves the row.
         service.apply.apply(&committed).unwrap();
-        journal.mark_applied(store_id, 2).unwrap();
+        let prior = journal.entry_applied_digest(store_id, 1).unwrap();
+        journal
+            .mark_applied(
+                store_id,
+                2,
+                &applied_chain_digest(prior.as_deref(), &committed).unwrap(),
+            )
+            .unwrap();
         let caught = service.read_row(strict).await.unwrap();
         assert!(caught.result.row.is_some());
         assert_eq!(caught.result.applied_seq, 2);
@@ -2582,5 +3345,407 @@ mod tests {
                 .sequence,
             4
         );
+    }
+
+    #[test]
+    fn install_committed_fences_gaps_dedupes_and_conflicts() {
+        let directory = TempDir::new().unwrap();
+        let journal = FjallStateStoreMutationJournal::open(directory.path()).unwrap();
+        let store_id = Uuid::new_v4();
+
+        // Sequence must be gap-free: installing 2 before 1 refuses.
+        let mut second = mutation(store_id, 2, "b");
+        second.ownership_epoch = 7;
+        assert!(matches!(
+            journal.install_committed(&second),
+            Err(StateStoreMutationError::Sequence)
+        ));
+
+        let mut first = mutation(store_id, 1, "a");
+        first.ownership_epoch = 7;
+        assert!(journal.install_committed(&first).unwrap());
+        // Same content at the same sequence dedupes; different content
+        // conflicts.
+        assert!(!journal.install_committed(&first).unwrap());
+        let mut conflicting = first.clone();
+        conflicting.mutation_id = Uuid::new_v4();
+        assert!(matches!(
+            journal.install_committed(&conflicting),
+            Err(StateStoreMutationError::Conflict)
+        ));
+        second.ownership_epoch = 7;
+        assert!(journal.install_committed(&second).unwrap());
+        let inspection = journal.inspect(store_id).unwrap();
+        assert_eq!(inspection.committed.unwrap().sequence, 2);
+        // The installed mutation is idempotency-visible too.
+        assert_eq!(
+            journal
+                .mutation_by_id(store_id, first.mutation_id)
+                .unwrap()
+                .unwrap()
+                .sequence,
+            1
+        );
+    }
+
+    #[test]
+    fn entries_after_bounds_pages_and_reports_digests() {
+        let directory = TempDir::new().unwrap();
+        let journal = FjallStateStoreMutationJournal::open(directory.path()).unwrap();
+        let store_id = Uuid::new_v4();
+        let placement = assignment(store_id);
+        let mut previous: Option<String> = None;
+        for sequence in 1..=5u64 {
+            let vote = journal
+                .prepare(mutation(store_id, 0, &format!("k{sequence}")))
+                .unwrap();
+            let mutation = journal
+                .commit_with_quorum(store_id, 1, &evidence(&vote.mutation, &placement))
+                .unwrap();
+            let digest = applied_chain_digest(previous.as_deref(), &mutation).unwrap();
+            journal.mark_applied(store_id, sequence, &digest).unwrap();
+            previous = Some(digest);
+        }
+
+        let page = journal
+            .entries_after(store_id, 0, 3, MAX_CATCHUP_PAGE_BYTES)
+            .unwrap();
+        assert_eq!(page.len(), 3);
+        assert_eq!(page[0].mutation.sequence, 1);
+        assert_eq!(page[2].mutation.sequence, 3);
+        assert!(page.iter().all(|entry| entry.applied_digest.is_some()));
+        let rest = journal
+            .entries_after(store_id, 3, 64, MAX_CATCHUP_PAGE_BYTES)
+            .unwrap();
+        assert_eq!(rest.len(), 2);
+        // A tiny byte budget still returns at least one entry then stops.
+        let tight = journal.entries_after(store_id, 0, 64, 8).unwrap();
+        assert_eq!(tight.len(), 1);
+        // The chain digest is deterministic: recomputing from genesis lands
+        // on the same value the replica recorded at mark_applied.
+        let head_digest = journal.inspect(store_id).unwrap().applied_digest.unwrap();
+        let mut rebuilt: Option<String> = None;
+        for sequence in 1..=5u64 {
+            let mutation = journal.entry(store_id, sequence).unwrap().unwrap();
+            rebuilt = Some(applied_chain_digest(rebuilt.as_deref(), &mutation).unwrap());
+        }
+        assert_eq!(rebuilt.as_deref(), Some(head_digest.as_str()));
+    }
+
+    #[test]
+    fn install_checkpoint_advances_monotonically() {
+        let directory = TempDir::new().unwrap();
+        let journal = FjallStateStoreMutationJournal::open(directory.path()).unwrap();
+        let store_id = Uuid::new_v4();
+        assert!(journal
+            .install_checkpoint(store_id, 7, 40, "chain-at-40")
+            .unwrap());
+        let inspection = journal.inspect(store_id).unwrap();
+        assert_eq!(inspection.applied_seq, 40);
+        assert_eq!(inspection.applied_digest.as_deref(), Some("chain-at-40"));
+        // Applied never moves backwards.
+        assert!(!journal
+            .install_checkpoint(store_id, 7, 39, "older")
+            .unwrap());
+        let inspection = journal.inspect(store_id).unwrap();
+        assert_eq!(inspection.applied_seq, 40);
+        assert_eq!(inspection.applied_digest.as_deref(), Some("chain-at-40"));
+        // Entries at or below the checkpoint are covered; the next
+        // committed position installs normally.
+        let mut covered = mutation(store_id, 3, "old");
+        covered.ownership_epoch = 7;
+        assert!(!journal.install_committed(&covered).unwrap());
+        let mut next = mutation(store_id, 41, "new");
+        next.ownership_epoch = 7;
+        assert!(journal.install_committed(&next).unwrap());
+    }
+
+    #[tokio::test]
+    async fn catch_up_installs_missing_committed_entries_and_verifies_digests() {
+        let fixture = replay_fixture().await;
+        let store_id = fixture.store.store_id;
+        let assignment = fixture
+            .control
+            .active_state_store_assignment_by_id(store_id)
+            .await
+            .unwrap();
+        let owner = assignment.owner.clone();
+        let epoch = assignment.ownership_epoch;
+        // The lagging replica is the replica that is neither the owner nor
+        // the second quorum member; its journal never sees prepare/commit.
+        let lagging_index = assignment
+            .replicas
+            .iter()
+            .position(|replica| *replica != owner)
+            .unwrap();
+        let lagging_node = assignment
+            .replicas
+            .iter()
+            .nth(lagging_index)
+            .unwrap()
+            .clone();
+        let committing_nodes: Vec<(String, Arc<FjallStateStoreMutationJournal>)> = assignment
+            .replicas
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != lagging_index)
+            .map(|(index, replica)| (replica.to_string(), fixture.journals[index].clone()))
+            .collect();
+        let committing_refs: Vec<(&str, Arc<FjallStateStoreMutationJournal>)> = committing_nodes
+            .iter()
+            .map(|(name, journal)| (name.as_str(), journal.clone()))
+            .collect();
+        let committing = Arc::new(InMemoryTransport::new(&committing_refs));
+        let coordinator = StateStoreMutationCoordinator::new(assignment.clone(), committing);
+        for key in ["alpha", "beta", "gamma"] {
+            let mut m = mutation(store_id, 0, key);
+            m.ownership_epoch = epoch;
+            m.op = StateStoreMutationOp::PutRow {
+                key: key.as_bytes().to_vec(),
+                payload: format!("v-{key}").into_bytes(),
+            };
+            coordinator.mutate(m).await.unwrap();
+        }
+        // The two healthy replicas applied through their journals so they
+        // carry applied chain digests the lagging replica verifies against.
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let services: Vec<StateStoreMutationService> = fixture
+            .journals
+            .iter()
+            .enumerate()
+            .map(|(index, journal)| {
+                let index_store: Arc<dyn IndexStore> =
+                    Arc::new(FjallIndexStore::open(dirs[index].path()).unwrap());
+                StateStoreMutationService::new(
+                    assignment.replicas.iter().nth(index).unwrap().clone(),
+                    fixture.control.clone(),
+                    journal.clone(),
+                    Arc::new(IndexStoreStateApply::new(index_store)),
+                )
+            })
+            .collect();
+        for (index, service) in services.iter().enumerate() {
+            if index != lagging_index {
+                assert_eq!(journal_pending(service, store_id).await, 3);
+                assert_eq!(service.replay_pending(store_id).await.unwrap(), 3);
+            }
+        }
+        // The lagging replica's journal is still empty.
+        let lagging = fixture.journals[lagging_index].inspect(store_id).unwrap();
+        assert!(lagging.committed.is_none());
+        assert_eq!(lagging.applied_seq, 0);
+
+        // Catch up over the in-memory transport that now includes all three.
+        let transport: Arc<dyn StateStoreMutationTransport> = Arc::new(InMemoryTransport::new(&[
+            ("storage-1", fixture.journals[0].clone()),
+            ("storage-2", fixture.journals[1].clone()),
+            ("storage-3", fixture.journals[2].clone()),
+        ]));
+        let outcome = services[lagging_index]
+            .catch_up_replica(&transport, &assignment, 64)
+            .await
+            .unwrap();
+        assert_eq!(outcome.installed, 3);
+        assert_eq!(outcome.applied, 3);
+        assert!(outcome.complete);
+        let caught = fixture.journals[lagging_index].inspect(store_id).unwrap();
+        assert_eq!(caught.committed.unwrap().sequence, 3);
+        assert_eq!(caught.applied_seq, 3);
+        // Chain digests converge with a healthy replica at every sequence.
+        let reference_index = assignment
+            .replicas
+            .iter()
+            .position(|replica| *replica == owner)
+            .unwrap();
+        let reference = fixture.journals[reference_index].inspect(store_id).unwrap();
+        assert_eq!(caught.applied_digest, reference.applied_digest);
+        // The caught-up replica serves the applied rows.
+        let row = services[lagging_index]
+            .read_row(StateStoreReadRequest {
+                owner: owner.clone(),
+                receiver: lagging_node.clone(),
+                store_id,
+                ownership_epoch: epoch,
+                key: b"beta".to_vec(),
+                strict: true,
+                wait_ms: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(row.result.row.unwrap().payload, b"v-beta");
+        assert_eq!(row.result.applied_seq, row.result.committed_seq);
+
+        // A second pass is idle work that stays idempotent.
+        let idle = services[lagging_index]
+            .catch_up_replica(&transport, &assignment, 64)
+            .await
+            .unwrap();
+        assert_eq!(idle.installed, 0);
+        assert_eq!(idle.applied, 0);
+        assert!(idle.complete);
+    }
+
+    #[tokio::test]
+    async fn catch_up_reports_diverged_when_peer_digest_disagrees() {
+        let fixture = replay_fixture().await;
+        let store_id = fixture.store.store_id;
+        let assignment = fixture
+            .control
+            .active_state_store_assignment_by_id(store_id)
+            .await
+            .unwrap();
+        let epoch = assignment.ownership_epoch;
+        let lagging_index = assignment
+            .replicas
+            .iter()
+            .position(|replica| *replica != assignment.owner)
+            .unwrap();
+        let committing_nodes: Vec<(String, Arc<FjallStateStoreMutationJournal>)> = assignment
+            .replicas
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != lagging_index)
+            .map(|(index, replica)| (replica.to_string(), fixture.journals[index].clone()))
+            .collect();
+        let committing_refs: Vec<(&str, Arc<FjallStateStoreMutationJournal>)> = committing_nodes
+            .iter()
+            .map(|(name, journal)| (name.as_str(), journal.clone()))
+            .collect();
+        let committing = Arc::new(InMemoryTransport::new(&committing_refs));
+        let coordinator = StateStoreMutationCoordinator::new(assignment.clone(), committing);
+        let mut first = mutation(store_id, 0, "a");
+        first.ownership_epoch = epoch;
+        coordinator.mutate(first.clone()).await.unwrap();
+        // Poison BOTH reachable replicas' attested digest for sequence 1:
+        // whichever peer the lagging replica pulls from attests a chain
+        // value its own application will not reproduce.
+        let committed = fixture.journals[0]
+            .inspect(store_id)
+            .unwrap()
+            .committed
+            .unwrap();
+        for (index, _) in assignment.replicas.iter().enumerate() {
+            if index != lagging_index {
+                fixture.journals[index]
+                    .mark_applied(store_id, 1, "bogus-attested-digest")
+                    .unwrap();
+            }
+        }
+        let _ = applied_chain_digest(None, &committed).unwrap();
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let service = StateStoreMutationService::new(
+            assignment
+                .replicas
+                .iter()
+                .nth(lagging_index)
+                .unwrap()
+                .clone(),
+            fixture.control.clone(),
+            fixture.journals[lagging_index].clone(),
+            Arc::new(IndexStoreStateApply::new(Arc::new(
+                FjallIndexStore::open(dirs[lagging_index].path()).unwrap(),
+            ))),
+        );
+        let transport: Arc<dyn StateStoreMutationTransport> = Arc::new(InMemoryTransport::new(&[
+            ("storage-1", fixture.journals[0].clone()),
+            ("storage-2", fixture.journals[1].clone()),
+            ("storage-3", fixture.journals[2].clone()),
+        ]));
+        let error = service
+            .catch_up_replica(&transport, &assignment, 64)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StateStoreMutationError::Diverged));
+    }
+
+    #[tokio::test]
+    async fn transfer_pages_applied_rows_and_install_advances_checkpoint() {
+        let fixture = replay_fixture().await;
+        let store_id = fixture.store.store_id;
+        let assignment = fixture
+            .control
+            .active_state_store_assignment_by_id(store_id)
+            .await
+            .unwrap();
+        let epoch = assignment.ownership_epoch;
+        let owner_dir = TempDir::new().unwrap();
+        let owner_index: Arc<dyn IndexStore> =
+            Arc::new(FjallIndexStore::open(owner_dir.path()).unwrap());
+        let owner_apply = Arc::new(IndexStoreStateApply::new(owner_index));
+        let source = StateStoreMutationService::new(
+            node("storage-1"),
+            fixture.control.clone(),
+            fixture.journals[0].clone(),
+            owner_apply,
+        );
+        // Commit + apply three rows on the source through the service path.
+        let committing = Arc::new(InMemoryTransport::new(&[
+            ("storage-1", fixture.journals[0].clone()),
+            ("storage-2", fixture.journals[1].clone()),
+            ("storage-3", fixture.journals[2].clone()),
+        ]));
+        let coordinator =
+            StateStoreMutationCoordinator::new(assignment.clone(), committing.clone());
+        for key in ["k1", "k2", "k3"] {
+            let mut m = mutation(store_id, 0, key);
+            m.ownership_epoch = epoch;
+            m.op = StateStoreMutationOp::PutRow {
+                key: key.as_bytes().to_vec(),
+                payload: format!("payload-{key}").into_bytes(),
+            };
+            coordinator.mutate(m).await.unwrap();
+        }
+        // Commit lands via journal seam; drive the source's pending applies.
+        source.replay_pending(store_id).await.unwrap();
+
+        // Page the transfer at two rows per page.
+        let request = |after: Option<Vec<u8>>| StateStoreTransferRequest {
+            owner: assignment.owner.clone(),
+            receiver: node("storage-1"),
+            store_id,
+            ownership_epoch: epoch,
+            after_key: after,
+            limit: 2,
+        };
+        let first = source.transfer(request(None)).await.unwrap().result;
+        assert_eq!(first.rows.len(), 2);
+        assert_eq!(first.pinned_seq, 3);
+        let next = first.next_key.clone().unwrap();
+        let second = source.transfer(request(Some(next))).await.unwrap().result;
+        assert_eq!(second.rows.len(), 1);
+        assert!(second.next_key.is_none());
+
+        // A fresh replica installs the rows and adopts the checkpoint.
+        let fresh_dir = TempDir::new().unwrap();
+        let fresh_index: Arc<dyn IndexStore> =
+            Arc::new(FjallIndexStore::open(fresh_dir.path()).unwrap());
+        let fresh_apply = IndexStoreStateApply::new(fresh_index.clone());
+        for row in first.rows.iter().chain(second.rows.iter()) {
+            fresh_apply.install_row(store_id, row).unwrap();
+        }
+        fixture.journals[2]
+            .install_checkpoint(store_id, epoch, first.pinned_seq, "attested")
+            .unwrap();
+        let inspection = fixture.journals[2].inspect(store_id).unwrap();
+        assert_eq!(inspection.applied_seq, 3);
+        assert_eq!(inspection.applied_digest.as_deref(), Some("attested"));
+        let row = fresh_index
+            .get(&PrimaryRef {
+                feed_id: store_id,
+                application_key: b"k2".to_vec(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.payload, b"payload-k2");
+    }
+
+    /// Pending committed count on a service's own journal.
+    async fn journal_pending(service: &StateStoreMutationService, store_id: Uuid) -> usize {
+        let journal = service.journal.clone();
+        tokio::task::spawn_blocking(move || journal.pending_applies(store_id))
+            .await
+            .unwrap()
+            .unwrap()
+            .len()
     }
 }

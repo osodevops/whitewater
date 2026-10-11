@@ -605,6 +605,18 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             ),
         )
         .route(
+            "/internal/state-store-journal/entries",
+            subscription_key_layer(
+                post(state_store_journal_entries_local).layer(DefaultBodyLimit::max(64 * 1024)),
+            ),
+        )
+        .route(
+            "/internal/state-store-journal/transfer",
+            subscription_key_layer(
+                post(state_store_journal_transfer_local).layer(DefaultBodyLimit::max(64 * 1024)),
+            ),
+        )
+        .route(
             "/internal/pipe/drive",
             subscription_key_layer(post(pipe_drive_local).layer(DefaultBodyLimit::max(64 * 1024))),
         )
@@ -2475,6 +2487,48 @@ async fn state_store_journal_read_local(
         .map_err(state_store_api_error)
 }
 
+async fn state_store_journal_entries_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::state_store::StateStoreEntriesRequest>,
+) -> Result<
+    Json<crate::state_store::StateStoreReplicaReply<crate::state_store::StateStoreEntriesPage>>,
+    ApiError,
+> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let service = state
+        .state_store_journal
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("StateStore journal replica is not configured"))?;
+    Ok(Json(
+        service
+            .entries(request)
+            .await
+            .map_err(state_store_api_error)?,
+    ))
+}
+
+async fn state_store_journal_transfer_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::state_store::StateStoreTransferRequest>,
+) -> Result<
+    Json<crate::state_store::StateStoreReplicaReply<crate::state_store::StateStoreTransferPage>>,
+    ApiError,
+> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let service = state
+        .state_store_journal
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("StateStore journal replica is not configured"))?;
+    Ok(Json(
+        service
+            .transfer(request)
+            .await
+            .map_err(state_store_api_error)?,
+    ))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StateStoreLookupApiRequest {
@@ -2635,14 +2689,12 @@ async fn state_store_lookup(
 
 /// Build the mutation coordinator bound to a StateStore's RF3 placement over
 /// the configured internal transport (mTLS or shared key).
-fn state_store_coordinator_for(
+fn state_store_transport_for(
     state: &AppState,
-    assignment: crate::state_store::StateStoreAssignment,
-) -> Result<crate::state_store::StateStoreMutationCoordinator, ApiError> {
-    let transport: Arc<dyn crate::state_store::StateStoreMutationTransport> = match &state
-        .internal_mtls
-    {
-        Some(material) => Arc::new(
+    assignment: &crate::state_store::StateStoreAssignment,
+) -> Result<Arc<dyn crate::state_store::StateStoreMutationTransport>, ApiError> {
+    match &state.internal_mtls {
+        Some(material) => Ok(Arc::new(
             crate::state_store::HttpStateStoreMutationTransport::new_mtls(
                 assignment.clone(),
                 state.control_endpoints.as_ref().clone(),
@@ -2651,8 +2703,8 @@ fn state_store_coordinator_for(
                 Duration::from_secs(5),
             )
             .map_err(state_store_api_error)?,
-        ),
-        None => Arc::new(
+        )),
+        None => Ok(Arc::new(
             crate::state_store::HttpStateStoreMutationTransport::new(
                 assignment.clone(),
                 state.control_endpoints.as_ref().clone(),
@@ -2664,8 +2716,15 @@ fn state_store_coordinator_for(
                 Duration::from_secs(5),
             )
             .map_err(|error| ApiError::unavailable(error.to_string()))?,
-        ),
-    };
+        )),
+    }
+}
+
+fn state_store_coordinator_for(
+    state: &AppState,
+    assignment: crate::state_store::StateStoreAssignment,
+) -> Result<crate::state_store::StateStoreMutationCoordinator, ApiError> {
+    let transport = state_store_transport_for(state, &assignment)?;
     Ok(crate::state_store::StateStoreMutationCoordinator::new(
         assignment, transport,
     ))
@@ -3017,6 +3076,85 @@ pub async fn drive_local_state_stores(
                 message: "Feed-derived replay refused; rebuild or re-declare".to_owned(),
             }),
             Err(error) => outcomes.push(StateStoreDriveOutcome::Failed {
+                store_id: store.store_id,
+                message: error.to_string(),
+            }),
+        }
+    }
+    outcomes
+}
+
+/// Outcome of one catch-up pass on a locally replicated StateStore.
+#[derive(Clone, Debug)]
+pub enum StateStoreCatchUpDriveOutcome {
+    /// The replica installed/applied entries or is already caught up.
+    Progress {
+        store_id: Uuid,
+        installed: u64,
+        applied: u64,
+        complete: bool,
+    },
+    /// This Node does not hold a journal replica for the store.
+    NotReplica,
+    /// The pass failed transiently; the next tick retries the same bounded
+    /// work — installed entries and applied digests are idempotent.
+    Failed { store_id: Uuid, message: String },
+}
+
+/// One supervisor tick of StateStore replica catch-up: for every store this
+/// Node replicates, pull missing committed entries from the freshest peer
+/// and apply them, verifying the applied chain digest wherever the source
+/// attested one. Catch-up is what a replica that missed a quorum commit —
+/// restart, network partition, fresh replacement — uses to rejoin without
+/// application or operator involvement.
+pub async fn drive_local_state_store_catch_ups(
+    state: &AppState,
+    budget: usize,
+) -> Vec<StateStoreCatchUpDriveOutcome> {
+    let Some(local) = state.storage_node_id.clone() else {
+        return Vec::new();
+    };
+    let Some(service) = state.state_store_journal.clone() else {
+        return Vec::new();
+    };
+    let mut outcomes = Vec::new();
+    for store in state.control.state_store_definitions().await {
+        let Some(assignment) = state
+            .control
+            .active_state_store_assignment_by_id(store.store_id)
+            .await
+        else {
+            outcomes.push(StateStoreCatchUpDriveOutcome::Failed {
+                store_id: store.store_id,
+                message: "StateStore journal placement is unavailable".to_owned(),
+            });
+            continue;
+        };
+        if !assignment.replicas.contains(&local) {
+            outcomes.push(StateStoreCatchUpDriveOutcome::NotReplica);
+            continue;
+        }
+        let transport = match state_store_transport_for(state, &assignment) {
+            Ok(transport) => transport,
+            Err(error) => {
+                outcomes.push(StateStoreCatchUpDriveOutcome::Failed {
+                    store_id: store.store_id,
+                    message: error.message,
+                });
+                continue;
+            }
+        };
+        match service
+            .catch_up_replica(&transport, &assignment, budget)
+            .await
+        {
+            Ok(outcome) => outcomes.push(StateStoreCatchUpDriveOutcome::Progress {
+                store_id: store.store_id,
+                installed: outcome.installed,
+                applied: outcome.applied,
+                complete: outcome.complete,
+            }),
+            Err(error) => outcomes.push(StateStoreCatchUpDriveOutcome::Failed {
                 store_id: store.store_id,
                 message: error.to_string(),
             }),
@@ -9041,6 +9179,194 @@ mod tests {
         let (status, body) = lookup(&non_replica).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["behind"], true);
+    }
+
+    #[tokio::test]
+    async fn state_store_replica_catches_up_over_internal_http() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let nodes: Vec<crate::active_range::StorageNodeId> =
+            ["storage-1", "storage-2", "storage-3"]
+                .into_iter()
+                .map(|name| crate::active_range::StorageNodeId::try_new(name).unwrap())
+                .collect();
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store.clone(),
+                nodes.clone(),
+            )
+            .unwrap(),
+        );
+        control.execute("CREATE SPACE accounts;").await.unwrap();
+        control
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.profiles".to_owned(),
+                source: crate::control::StateStoreSourceRequest::Manual,
+            }])
+            .await
+            .unwrap();
+        let definition = control
+            .declared_state_store_by_name("accounts.profiles")
+            .await
+            .unwrap();
+        let assignment = control
+            .active_state_store_assignment_by_id(definition.store_id)
+            .await
+            .unwrap();
+
+        let control_key = "this-is-a-long-control-plane-key".to_owned();
+        let mut listeners = Vec::new();
+        let mut endpoints = BTreeMap::new();
+        for node in &nodes {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            endpoints.insert(
+                node.clone(),
+                format!("http://{}", listener.local_addr().unwrap()),
+            );
+            listeners.push(listener);
+        }
+        for (index, node) in nodes.iter().enumerate() {
+            let listener = listeners.remove(0);
+            listener.set_nonblocking(true).unwrap();
+            let journal = Arc::new(
+                crate::state_store::FjallStateStoreMutationJournal::open(
+                    directory.path().join(format!("journal-{index}")),
+                )
+                .unwrap(),
+            );
+            let index_store: Arc<dyn crate::index::IndexStore> = Arc::new(
+                crate::index::FjallIndexStore::open(
+                    directory.path().join(format!("index-{index}")),
+                )
+                .unwrap(),
+            );
+            let service = crate::state_store::StateStoreMutationService::new(
+                node.clone(),
+                control.clone(),
+                journal.clone(),
+                Arc::new(crate::state_store::IndexStoreStateApply::new(
+                    index_store.clone(),
+                )),
+            );
+            let membership = Arc::new(MembershipService::new(
+                MemberAnnouncement {
+                    node_id: format!("catchup-node-{index}"),
+                    api_url: "http://catchup-node:7070".to_owned(),
+                    capacity: 100,
+                },
+                vec![],
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            ));
+            let state = AppState {
+                store: store.clone(),
+                membership,
+                demand: DemandMetrics::default(),
+                autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                control: control.clone(),
+                control_plane: None,
+                progress_authority: control.clone(),
+                replica_append: None,
+                majority_append: None,
+                subscription_progress: None,
+                effect_journal: None,
+                state_store_journal: Some(Arc::new(service)),
+                subscription_mtls_enabled: false,
+                storage_node_id: Some(node.clone()),
+                control_endpoints: Arc::new(endpoints.clone().into()),
+                internal_key: Some(control_key.clone()),
+                internal_http: reqwest::Client::new(),
+                internal_mtls: None,
+                admin_auth: AdminAuthenticator::new(Some(
+                    "this-is-a-long-development-api-key".to_owned(),
+                ))
+                .unwrap(),
+            };
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, router(state)).await.unwrap();
+            });
+        }
+
+        // Mutate over the public API — replicas commit and apply.
+        let client = reqwest::Client::new();
+        for key in ["k1", "k2", "k3"] {
+            let response = client
+                .post(format!("{}/v1/state-stores/mutate", endpoints[&nodes[0]]))
+                .bearer_auth("this-is-a-long-development-api-key")
+                .json(&serde_json::json!({
+                    "store": "accounts.profiles",
+                    "mutation_id": Uuid::new_v4(),
+                    "op": {
+                        "kind": "put_row",
+                        "key_base64": STANDARD.encode(key.as_bytes()),
+                        "payload_base64": STANDARD.encode(format!("payload-{key}").as_bytes()),
+                    }
+                }))
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.text().await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        // A replacement replica with a wiped journal and Index rejoins
+        // under the same Node identity and catches up over real HTTP.
+        let lagging_node = assignment
+            .replicas
+            .iter()
+            .find(|replica| **replica != assignment.owner)
+            .unwrap()
+            .clone();
+        let fresh_journal = Arc::new(
+            crate::state_store::FjallStateStoreMutationJournal::open(
+                directory.path().join("journal-fresh"),
+            )
+            .unwrap(),
+        );
+        let fresh_index: Arc<dyn crate::index::IndexStore> = Arc::new(
+            crate::index::FjallIndexStore::open(directory.path().join("index-fresh")).unwrap(),
+        );
+        let fresh_service = crate::state_store::StateStoreMutationService::new(
+            lagging_node.clone(),
+            control.clone(),
+            fresh_journal.clone(),
+            Arc::new(crate::state_store::IndexStoreStateApply::new(
+                fresh_index.clone(),
+            )),
+        );
+        let transport: Arc<dyn crate::state_store::StateStoreMutationTransport> = Arc::new(
+            crate::state_store::HttpStateStoreMutationTransport::new(
+                assignment.clone(),
+                crate::internal_plane::InternalEndpoints::from(endpoints.clone()),
+                control_key.clone(),
+                Duration::from_secs(5),
+            )
+            .unwrap(),
+        );
+        let outcome = fresh_service
+            .catch_up_replica(&transport, &assignment, 64)
+            .await
+            .unwrap();
+        assert_eq!(outcome.installed, 3);
+        assert_eq!(outcome.applied, 3);
+        assert!(outcome.complete);
+
+        // Chain digests converge with what the replicas durably recorded.
+        let caught = fresh_journal.inspect(definition.store_id).unwrap();
+        assert_eq!(caught.applied_seq, 3);
+        assert!(caught.applied_digest.is_some());
+        let row = fresh_index
+            .get(&crate::index::PrimaryRef {
+                feed_id: definition.store_id,
+                application_key: b"k2".to_vec(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.payload, b"payload-k2");
     }
 
     #[tokio::test]

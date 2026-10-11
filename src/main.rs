@@ -691,6 +691,22 @@ async fn main() -> Result<()> {
                                 Outcome::Idle | Outcome::NotOwner => {}
                             }
                         }
+                        for outcome in
+                            finnstream::api::drive_local_state_store_catch_ups(&state, 128).await
+                        {
+                            use finnstream::api::StateStoreCatchUpDriveOutcome as Outcome;
+                            match outcome {
+                                Outcome::Progress { store_id, installed, applied, complete } => {
+                                    if installed > 0 || applied > 0 {
+                                        tracing::debug!(%store_id, installed, applied, complete, "state store replica caught up")
+                                    }
+                                }
+                                Outcome::Failed { store_id, message } => {
+                                    tracing::warn!(%store_id, %message, "state store catch-up failed")
+                                }
+                                Outcome::NotReplica => {}
+                            }
+                        }
                     }
                     changed = shutdown.changed() => {
                         if changed.is_err() || *shutdown.borrow() { break; }

@@ -345,6 +345,17 @@ pub trait IndexStore: Send + Sync {
 
     /// The last applied Cursor recorded for `id` by a committed batch.
     fn last_applied(&self, id: IndexId) -> Result<Option<String>, IndexStoreError>;
+
+    /// Ordered primary-row scan for one `feed_id` scope (Index or
+    /// StateStore), starting strictly after `after_key` and bounded by
+    /// `limit` rows and an internal byte budget. Replica catch-up and
+    /// checkpoint transfer page through this.
+    fn scan(
+        &self,
+        feed_id: uuid::Uuid,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<IndexRow>, IndexStoreError>;
 }
 
 /// Fjall crash-recovery replays the write journal, so its size bounds reopen
@@ -531,6 +542,46 @@ impl IndexStore for FjallIndexStore {
                 return Err(IndexStoreError::DanglingPosting);
             }
             rows.push(row);
+        }
+        Ok(rows)
+    }
+
+    fn scan(
+        &self,
+        feed_id: uuid::Uuid,
+        after_key: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<IndexRow>, IndexStoreError> {
+        let limit = limit.clamp(1, 1_000);
+        let mut prefix = vec![KEY_VERSION];
+        prefix.extend_from_slice(feed_id.as_bytes());
+        let snapshot = self.db.read_tx();
+        let mut rows = Vec::new();
+        let mut bytes_seen = 0usize;
+        for guard in snapshot.prefix(&self.primary, prefix) {
+            let (key, value) = guard.into_inner()?;
+            bytes_seen = bytes_seen
+                .checked_add(value.len())
+                .ok_or(IndexStoreError::QueryTooLarge)?;
+            if bytes_seen > 16 * 1024 * 1024 {
+                return Err(IndexStoreError::QueryTooLarge);
+            }
+            let row: IndexRow = serde_json::from_slice(&value)?;
+            if primary_key(&row.reference)?.as_slice() != &*key {
+                return Err(IndexStoreError::CorruptPrimary);
+            }
+            if row.reference.feed_id != feed_id {
+                continue;
+            }
+            if let Some(after) = after_key {
+                if row.reference.application_key.as_slice() <= after {
+                    continue;
+                }
+            }
+            rows.push(row);
+            if rows.len() >= limit {
+                break;
+            }
         }
         Ok(rows)
     }
