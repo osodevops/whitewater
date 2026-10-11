@@ -1502,7 +1502,7 @@ Definition of Done:
 
 - [ ] Implement incremental lease transfer.
 
-- [ ] Implement Pipe definitions.
+- [x] Implement Pipe definitions. `PipeDefinition` is a typed catalog resource declared through `CREATE PIPE <domain>.<name> FROM SUBSCRIPTION <sub> TO FEED <feed>` (WCL), the `define_pipe` typed admin command, `DROP PIPE`/`RENAME PIPE`/`DESCRIBE PIPE`/`SHOW PIPES`, and snapshot replication. It binds a consuming Subscription to an output Feed with an extensible `PipeOperation` (`forward` today); same-Domain membership is enforced, a Pipe may not write back to its own input Feed, name reuse after drop stays reserved, and dropping a consumed Subscription or an output Feed is refused while the Pipe is active. Snapshot restore preserves definitions, `pipes_for_subscription` exposes the consumers a journal driver attaches, and unit plus typed-admin tests cover idempotent declaration, cross-Domain/missing/self-loop refusal, drop guards, and restart persistence. A Pipe remains `declared` - no driver or runtime fetches, applies, or checkpoints records yet.
 
 - [ ] Implement atomic consume-and-append.
 

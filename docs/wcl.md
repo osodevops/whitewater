@@ -312,6 +312,34 @@ A Subscription belongs to the same Domain as its Feed. It currently remains `dec
 
 
 
+### Pipe declaration
+
+
+
+```sql
+
+CREATE PIPE orders.enrich
+
+  FROM SUBSCRIPTION orders.billing
+
+  TO FEED orders.enriched;
+
+```
+
+
+
+A Pipe declares a managed consume-process-append binding: the named Subscription's durable frontier drives the input, and every delivered record flows through the declared operation into the output Feed. Today `forward` is the only operation; enrichment and rolling-window operations arrive with their runtimes. A Pipe belongs to the same Domain as its input Subscription and output Feed, may not write back to its own input Feed, and remains `declared`: no records flow until a Pipe driver exists. The consumed Subscription and the output Feed cannot be dropped while the Pipe is active; drop the Pipe first.
+
+
+
+```sql
+
+DROP PIPE orders.enrich;
+
+```
+
+
+
 ### Role
 
 

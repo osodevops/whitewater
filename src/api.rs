@@ -8805,6 +8805,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typed_pipe_declarations_require_admin_access_and_validate_scope() {
+        let directory = TempDir::new().unwrap();
+        let app = admin_test_router(&directory);
+        let request = json!({
+            "request_id": Uuid::new_v4(),
+            "commands": [
+                { "command": "create_space", "name": "accounts" },
+                { "command": "create_feed", "name": "accounts.events" },
+                { "command": "create_feed", "name": "accounts.enriched" },
+                { "command": "create_subscription", "name": "accounts.flow", "feed": "accounts.events", "start": { "kind": "beginning" } },
+                { "command": "define_pipe", "name": "accounts.forward", "subscription": "accounts.flow", "output_feed": "accounts.enriched", "operation": { "operation": "forward" } }
+            ]
+        });
+        let unauthorized = app
+            .clone()
+            .oneshot(admin_request("/v1/admin/commands", request.clone(), None))
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .clone()
+            .oneshot(admin_request(
+                "/v1/admin/commands",
+                request,
+                Some("this-is-a-long-development-api-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let parsed: Value = serde_json::from_slice(&body).unwrap();
+        let pipe = parsed["results"][4]["data"].clone();
+        assert_eq!(pipe["stage"], "declared");
+        assert_eq!(pipe["operation"]["operation"], "forward");
+        // A cross-Domain or self-loop Pipe is refused by the typed path too.
+        let invalid = json!({
+            "request_id": Uuid::new_v4(),
+            "commands": [
+                { "command": "define_pipe", "name": "accounts.loop", "subscription": "accounts.flow", "output_feed": "accounts.events", "operation": { "operation": "forward" } }
+            ]
+        });
+        let rejected = app
+            .oneshot(admin_request(
+                "/v1/admin/commands",
+                invalid,
+                Some("this-is-a-long-development-api-key"),
+            ))
+            .await
+            .unwrap();
+        assert_ne!(rejected.status(), StatusCode::OK);
+    }
+    #[tokio::test]
     async fn public_admin_commands_cannot_forge_reader_frontiers() {
         let directory = TempDir::new().unwrap();
         let app = admin_test_router(&directory);

@@ -77,6 +77,42 @@ pub struct StateStoreDefinition {
     pub created_at_ns: i64,
 }
 
+/// The processing step a Pipe applies to each delivered input record. Only
+/// `Forward` exists today; enrichment and rolling-window operations land with
+/// their runtimes.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum PipeOperation {
+    /// Copy each delivered record to the output Feed unchanged; the effect
+    /// journal replays dedupe on deterministic writer identity.
+    Forward,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PipeStage {
+    /// Persisted in the catalog; no runtime drives it yet.
+    Declared,
+}
+
+/// A declared Pipe: consume one Subscription's deliveries and write one
+/// output Feed, recording input progress and output identity through the
+/// internal effect journal. Physical placement stays an implementation
+/// detail.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PipeDefinition {
+    pub pipe_id: Uuid,
+    pub name: String,
+    pub space_id: Uuid,
+    /// The Subscription whose durable frontier drives this Pipe.
+    pub subscription_id: Uuid,
+    pub operation: PipeOperation,
+    pub output_feed_id: Uuid,
+    pub stage: PipeStage,
+    pub status: ResourceStatus,
+    pub created_at_ns: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriterDefinition {
     pub writer_id: Uuid,
@@ -301,6 +337,8 @@ struct CatalogState {
     feeds: BTreeMap<Uuid, FeedDefinition>,
     #[serde(default)]
     state_stores: BTreeMap<Uuid, StateStoreDefinition>,
+    #[serde(default)]
+    pipes: BTreeMap<Uuid, PipeDefinition>,
     writers: BTreeMap<Uuid, WriterDefinition>,
     readers: BTreeMap<Uuid, ReaderDefinition>,
     #[serde(default)]
@@ -360,6 +398,7 @@ impl Default for CatalogState {
             spaces: BTreeMap::new(),
             feeds: BTreeMap::new(),
             state_stores: BTreeMap::new(),
+            pipes: BTreeMap::new(),
             writers: BTreeMap::new(),
             readers: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
@@ -394,6 +433,7 @@ pub enum ResourceKind {
     Reader,
     Subscription,
     Role,
+    Pipe,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -408,6 +448,7 @@ pub enum ShowKind {
     Roles,
     Grants,
     StorageNodes,
+    Pipes,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -425,6 +466,12 @@ pub enum Command {
     DefineStateStore {
         name: String,
         source: StateStoreSourceRequest,
+    },
+    DefinePipe {
+        name: String,
+        subscription: String,
+        output_feed: String,
+        operation: PipeOperation,
     },
     CreateWriter {
         name: String,
@@ -1327,6 +1374,32 @@ impl ControlController {
             .cloned()
     }
 
+    /// An active Pipe definition by dotted name.
+    pub async fn active_pipe_by_name(&self, name: &str) -> Option<PipeDefinition> {
+        self.state
+            .lock()
+            .await
+            .pipes
+            .values()
+            .find(|pipe| pipe.name == name && pipe.status == ResourceStatus::Active)
+            .cloned()
+    }
+
+    /// Every active Pipe consuming one Subscription's progress assignment;
+    /// the journal driver needs this to attach effect scope.
+    pub async fn pipes_for_subscription(&self, subscription_id: Uuid) -> Vec<PipeDefinition> {
+        self.state
+            .lock()
+            .await
+            .pipes
+            .values()
+            .filter(|pipe| {
+                pipe.status == ResourceStatus::Active && pipe.subscription_id == subscription_id
+            })
+            .cloned()
+            .collect()
+    }
+
     pub async fn active_range_assignment(&self, feed_id: Uuid) -> Option<ActiveRangeAssignment> {
         self.state.lock().await.active_ranges.get(&feed_id).cloned()
     }
@@ -1563,6 +1636,52 @@ impl ControlController {
                     .insert(definition.store_id, definition.clone());
                 Ok((
                     format!("declared StateStore {name}; no data is served until RF3 activation"),
+                    json!(definition),
+                ))
+            }
+            Command::DefinePipe {
+                name,
+                subscription,
+                output_feed,
+                operation,
+            } => {
+                validate_dotted_name(&name)?;
+                ensure_name_available(
+                    state.pipes.values().map(|item| (&item.name, &item.status)),
+                    &name,
+                )?;
+                let space_id = owning_space(state, &name)?.space_id;
+                let subscription = active_subscription(state, &subscription)?;
+                if subscription.space_id != space_id {
+                    return Err(ControlError::InvalidOperation(
+                        "Pipe input Subscription must belong to its Domain".to_owned(),
+                    ));
+                }
+                let output = active_feed(state, &output_feed)?;
+                if output.space_id != space_id {
+                    return Err(ControlError::InvalidOperation(
+                        "Pipe output Feed must belong to its Domain".to_owned(),
+                    ));
+                }
+                if output.feed_id == subscription.feed_id {
+                    return Err(ControlError::InvalidOperation(
+                        "Pipe output Feed cannot be its own input Feed".to_owned(),
+                    ));
+                }
+                let definition = PipeDefinition {
+                    pipe_id: derived_resource_id(request_id, "pipe"),
+                    name: name.clone(),
+                    space_id,
+                    subscription_id: subscription.subscription_id,
+                    operation,
+                    output_feed_id: output.feed_id,
+                    stage: PipeStage::Declared,
+                    status: ResourceStatus::Active,
+                    created_at_ns: issued_at_ns,
+                };
+                state.pipes.insert(definition.pipe_id, definition.clone());
+                Ok((
+                    format!("declared Pipe {name}; no records flow until a Pipe driver exists"),
                     json!(definition),
                 ))
             }
@@ -3089,6 +3208,7 @@ impl ControlController {
                 rename_named(&mut state.subscriptions, current, new, "Subscription")
             }
             ResourceKind::Role => rename_named(&mut state.roles, current, new, "Role"),
+            ResourceKind::Pipe => rename_named(&mut state.pipes, current, new, "Pipe"),
         }
     }
 
@@ -3111,9 +3231,12 @@ impl ControlController {
                     || state.subscriptions.values().any(|item| {
                         item.status == ResourceStatus::Active && item.feed_id == feed_id
                     })
+                    || state.pipes.values().any(|item| {
+                        item.status == ResourceStatus::Active && item.output_feed_id == feed_id
+                    })
                 {
                     return Err(ControlError::InvalidOperation(
-                        "drop attached Writers, Readers, and Subscriptions first".to_owned(),
+                        "drop attached Writers, Readers, Subscriptions, and Pipes first".to_owned(),
                     ));
                 }
                 let item = state.feeds.get_mut(&feed_id).expect("Feed exists");
@@ -3155,12 +3278,20 @@ impl ControlController {
                     .find(|item| item.name == name && item.status == ResourceStatus::Active)
                     .ok_or_else(|| ControlError::NotFound(format!("Subscription {name}")))?
                     .subscription_id;
+                if state.pipes.values().any(|item| {
+                    item.status == ResourceStatus::Active && item.subscription_id == subscription_id
+                }) {
+                    return Err(ControlError::InvalidOperation(
+                        "drop the consuming Pipe first".to_owned(),
+                    ));
+                }
                 let result = drop_named(&mut state.subscriptions, name, "Subscription")?;
                 state
                     .subscription_progress_assignments
                     .remove(&subscription_id);
                 Ok(result)
             }
+            ResourceKind::Pipe => drop_named(&mut state.pipes, name, "Pipe"),
             ResourceKind::Role => {
                 let role_id = active_role(state, name)?.role_id;
                 state.grants.retain(|_, grant| grant.role_id != role_id);
@@ -3278,6 +3409,21 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                     feed: token(&tokens, 4)?.to_owned(),
                 })
             }
+            Some("PIPE") => {
+                // CREATE PIPE <name> FROM SUBSCRIPTION <sub> TO FEED <feed>
+                // declares a forward Pipe; richer operations arrive with
+                // their runtimes.
+                expect_keyword(&tokens, 3, "FROM")?;
+                expect_keyword(&tokens, 4, "SUBSCRIPTION")?;
+                expect_keyword(&tokens, 6, "TO")?;
+                expect_keyword(&tokens, 7, "FEED")?;
+                Ok(Command::DefinePipe {
+                    name: token(&tokens, 2)?.to_owned(),
+                    subscription: token(&tokens, 5)?.to_owned(),
+                    output_feed: token(&tokens, 8)?.to_owned(),
+                    operation: PipeOperation::Forward,
+                })
+            }
             Some("READER") | Some("SUBSCRIPTION") => {
                 expect_keyword(&tokens, 3, "FROM")?;
                 let start = if tokens.len() == 5 {
@@ -3296,7 +3442,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 }
             }
             _ => Err(ControlError::Syntax(
-                "CREATE supports DOMAIN, FEED, WRITER, READER, SUBSCRIPTION, and ROLE (SPACE is a compatibility alias)".to_owned(),
+                "CREATE supports DOMAIN, FEED, WRITER, READER, SUBSCRIPTION, PIPE, and ROLE (SPACE is a compatibility alias)".to_owned(),
             )),
         },
         Some("OPEN") => {
@@ -3515,6 +3661,7 @@ fn parse_resource_kind(token: &str) -> Result<ResourceKind, ControlError> {
         "WRITER" => Ok(ResourceKind::Writer),
         "READER" => Ok(ResourceKind::Reader),
         "SUBSCRIPTION" => Ok(ResourceKind::Subscription),
+        "PIPE" => Ok(ResourceKind::Pipe),
         "ROLE" => Ok(ResourceKind::Role),
         _ => Err(ControlError::Syntax(format!(
             "unsupported resource type {token}"
@@ -3530,6 +3677,7 @@ fn parse_show_kind(token: &str) -> Result<ShowKind, ControlError> {
         "WRITERS" => Ok(ShowKind::Writers),
         "READERS" => Ok(ShowKind::Readers),
         "SUBSCRIPTIONS" => Ok(ShowKind::Subscriptions),
+        "PIPES" => Ok(ShowKind::Pipes),
         "ROLES" => Ok(ShowKind::Roles),
         "GRANTS" => Ok(ShowKind::Grants),
         _ => Err(ControlError::Syntax(format!(
@@ -3769,6 +3917,17 @@ fn active_space_mut<'a>(
         .ok_or_else(|| ControlError::NotFound(format!("Domain {name}")))
 }
 
+fn active_subscription<'a>(
+    state: &'a CatalogState,
+    name: &str,
+) -> Result<&'a SubscriptionDefinition, ControlError> {
+    state
+        .subscriptions
+        .values()
+        .find(|item| item.name == name && item.status == ResourceStatus::Active)
+        .ok_or_else(|| ControlError::NotFound(format!("Subscription {name}")))
+}
+
 fn active_feed<'a>(
     state: &'a CatalogState,
     name: &str,
@@ -3891,6 +4050,7 @@ macro_rules! impl_named_resource {
 impl_named_resource!(WriterDefinition);
 impl_named_resource!(ReaderDefinition);
 impl_named_resource!(SubscriptionDefinition);
+impl_named_resource!(PipeDefinition);
 impl_named_resource!(RoleDefinition);
 
 fn rename_named<T: Clone + Serialize + NamedResource>(
@@ -3957,6 +4117,11 @@ fn show_resources(
             .collect::<Vec<_>>()),
         ShowKind::Subscriptions => json!(state
             .subscriptions
+            .values()
+            .filter(|item| item.status == ResourceStatus::Active)
+            .collect::<Vec<_>>()),
+        ShowKind::Pipes => json!(state
+            .pipes
             .values()
             .filter(|item| item.status == ResourceStatus::Active)
             .collect::<Vec<_>>()),
@@ -4027,6 +4192,12 @@ fn describe_resource(
             .find(|item| item.name == name && item.status == ResourceStatus::Active)
             .map(|item| json!(item))
             .ok_or_else(|| ControlError::NotFound(format!("Subscription {name}"))),
+        ResourceKind::Pipe => state
+            .pipes
+            .values()
+            .find(|item| item.name == name && item.status == ResourceStatus::Active)
+            .map(|item| json!(item))
+            .ok_or_else(|| ControlError::NotFound(format!("Pipe {name}"))),
         ResourceKind::Role => Ok(json!(active_role(state, name)?)),
     }
 }
@@ -4255,6 +4426,7 @@ fn command_label(command: &Command) -> String {
         Command::CreateSpace { .. } => "CREATE SPACE",
         Command::CreateFeed { .. } => "CREATE FEED",
         Command::DefineStateStore { .. } => "DEFINE STATE STORE",
+        Command::DefinePipe { .. } => "DEFINE PIPE",
         Command::CreateWriter { .. } => "CREATE WRITER",
         Command::OpenWriterSession { .. } => "OPEN WRITER SESSION",
         Command::AllocateWriterSequence { .. } => "ALLOCATE WRITER SEQUENCE",
@@ -4310,6 +4482,7 @@ fn resource_name(kind: &ResourceKind) -> &'static str {
         ResourceKind::Writer => "Writer",
         ResourceKind::Reader => "Reader",
         ResourceKind::Subscription => "Subscription",
+        ResourceKind::Pipe => "Pipe",
         ResourceKind::Role => "Role",
     }
 }
@@ -4321,6 +4494,7 @@ fn show_name(kind: &ShowKind) -> &'static str {
         ShowKind::Writers => "Writers",
         ShowKind::Readers => "Readers",
         ShowKind::Subscriptions => "Subscriptions",
+        ShowKind::Pipes => "Pipes",
         ShowKind::Roles => "Roles",
         ShowKind::Grants => "Grants",
         ShowKind::StorageNodes => "Storage Nodes",
@@ -4970,6 +5144,147 @@ mod tests {
                 .source,
             StateStoreSource::Manual,
         );
+    }
+
+    #[tokio::test]
+    async fn pipe_definitions_are_scoped_validated_and_survive_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let follower_directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader
+            .execute(
+                "CREATE SPACE accounts; CREATE FEED accounts.events;                  CREATE FEED accounts.enriched; CREATE SUBSCRIPTION                  accounts.flow FROM accounts.events; CREATE SPACE other;                  CREATE FEED other.enriched; CREATE FEED other.relayed; CREATE SUBSCRIPTION other.flow                  FROM other.enriched;",
+            )
+            .await
+            .unwrap();
+        let request_id = Uuid::from_u128(22_331);
+        let command = vec![Command::DefinePipe {
+            name: "accounts.forward".to_owned(),
+            subscription: "accounts.flow".to_owned(),
+            output_feed: "accounts.enriched".to_owned(),
+            operation: PipeOperation::Forward,
+        }];
+        let first = leader
+            .execute_commands_with_request_id(command.clone(), request_id)
+            .await
+            .unwrap();
+        let repeated = leader
+            .execute_commands_with_request_id(command, request_id)
+            .await
+            .unwrap();
+        assert_eq!(first.results[0].data, repeated.results[0].data);
+        assert_eq!(first.results[0].data["stage"], "declared");
+        assert_eq!(first.results[0].data["operation"]["operation"], "forward");
+        let subscription = leader
+            .active_subscription_by_name("accounts.flow")
+            .await
+            .unwrap();
+        let output = leader
+            .active_feed_by_name("accounts.enriched")
+            .await
+            .unwrap();
+        assert_eq!(
+            first.results[0].data["subscription_id"],
+            subscription.subscription_id.to_string()
+        );
+        assert_eq!(
+            first.results[0].data["output_feed_id"],
+            output.feed_id.to_string()
+        );
+        // A same-named Pipe conflicts rather than silently redeclaring.
+        assert!(leader
+            .execute_commands(vec![Command::DefinePipe {
+                name: "accounts.forward".to_owned(),
+                subscription: "accounts.flow".to_owned(),
+                output_feed: "accounts.enriched".to_owned(),
+                operation: PipeOperation::Forward,
+            }])
+            .await
+            .is_err());
+        // Cross-Domain inputs and outputs, missing resources, and a
+        // self-feeding loop are all refused.
+        for (subscription, output_feed) in [
+            ("other.flow", "accounts.enriched"),
+            ("accounts.flow", "other.enriched"),
+            ("accounts.missing", "accounts.enriched"),
+            ("accounts.flow", "accounts.missing"),
+            ("accounts.flow", "accounts.events"),
+        ] {
+            assert!(
+                leader
+                    .execute_commands(vec![Command::DefinePipe {
+                        name: "accounts.invalid".to_owned(),
+                        subscription: subscription.to_owned(),
+                        output_feed: output_feed.to_owned(),
+                        operation: PipeOperation::Forward,
+                    }])
+                    .await
+                    .is_err(),
+                "{subscription} -> {output_feed} must fail"
+            );
+        }
+        // The consumed Subscription and output Feed cannot drop while the
+        // Pipe is active.
+        assert!(leader
+            .execute("DROP SUBSCRIPTION accounts.flow;")
+            .await
+            .is_err());
+        assert!(leader
+            .execute("DROP FEED accounts.enriched;")
+            .await
+            .is_err());
+        leader.execute("DROP PIPE accounts.forward;").await.unwrap();
+        leader
+            .execute("DROP SUBSCRIPTION accounts.flow; DROP FEED accounts.enriched;")
+            .await
+            .unwrap();
+        // The dropped Pipe name is still reserved, matching sibling rules.
+        assert!(leader
+            .execute_commands(vec![Command::DefinePipe {
+                name: "accounts.forward".to_owned(),
+                subscription: "other.flow".to_owned(),
+                output_feed: "other.enriched".to_owned(),
+                operation: PipeOperation::Forward,
+            }])
+            .await
+            .is_err());
+        leader
+            .execute(
+                "CREATE PIPE accounts.relay FROM SUBSCRIPTION other.flow TO FEED other.relayed;",
+            )
+            .await
+            .unwrap_err();
+        leader
+            .execute("CREATE PIPE other.relay FROM SUBSCRIPTION other.flow TO FEED other.relayed;")
+            .await
+            .unwrap();
+        let follower = new_controller(&follower_directory);
+        follower
+            .install_snapshot_bytes(&leader.snapshot_bytes().await.unwrap())
+            .await
+            .unwrap();
+        let relay = follower.active_pipe_by_name("other.relay").await.unwrap();
+        assert_eq!(relay.operation, PipeOperation::Forward);
+        assert_eq!(relay.stage, PipeStage::Declared);
+        assert_eq!(relay.status, ResourceStatus::Active);
+        let other_subscription = follower
+            .active_subscription_by_name("other.flow")
+            .await
+            .unwrap();
+        assert_eq!(
+            follower
+                .pipes_for_subscription(other_subscription.subscription_id)
+                .await
+                .len(),
+            1
+        );
+        drop(leader);
+        let reopened = new_controller(&directory);
+        assert!(reopened.active_pipe_by_name("other.relay").await.is_some());
+        assert!(reopened
+            .active_pipe_by_name("accounts.forward")
+            .await
+            .is_none());
     }
 
     #[tokio::test]
