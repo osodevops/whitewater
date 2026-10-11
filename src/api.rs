@@ -2480,6 +2480,13 @@ async fn state_store_journal_read_local(
 struct StateStoreLookupApiRequest {
     store: String,
     key_base64: String,
+    /// Wait (bounded) for the serving replica's applied position to reach
+    /// its committed frontier; when no replica catches up in time the
+    /// lookup reports `index_behind` rather than silently serving stale.
+    #[serde(default)]
+    strict: bool,
+    #[serde(default)]
+    wait_ms: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -2548,6 +2555,8 @@ async fn state_store_lookup(
             store_id: store.store_id,
             ownership_epoch: assignment.ownership_epoch,
             key: key.clone(),
+            strict: request.strict,
+            wait_ms: request.wait_ms.unwrap_or(500),
         };
         let outcome = if Some(replica) == state.storage_node_id.as_ref()
             && state.state_store_journal.is_some()
@@ -2592,6 +2601,19 @@ async fn state_store_lookup(
         match outcome {
             Ok(reply) => {
                 let result = reply.result;
+                // Strict reads skip a replica still applying its journal —
+                // a fresher replica may serve instead.
+                if request.strict && result.applied_seq < result.committed_seq {
+                    last_error = Some(ApiError {
+                        status: StatusCode::CONFLICT,
+                        message: format!(
+                            "replica applied sequence {} lags committed sequence {}",
+                            result.applied_seq, result.committed_seq
+                        ),
+                        code: Some("index_behind"),
+                    });
+                    continue;
+                }
                 return Ok(Json(StateStoreLookupApiResponse {
                     store_id: store.store_id,
                     found: result.row.is_some(),
@@ -8781,6 +8803,7 @@ mod tests {
             );
             listeners.push(listener);
         }
+        let mut journals = Vec::new();
         for (index, node) in nodes.iter().enumerate() {
             let listener = listeners.remove(0);
             listener.set_nonblocking(true).unwrap();
@@ -8790,6 +8813,7 @@ mod tests {
                 )
                 .unwrap(),
             );
+            journals.push(journal.clone());
             let index_store: Arc<dyn crate::index::IndexStore> = Arc::new(
                 crate::index::FjallIndexStore::open(
                     directory.path().join(format!("index-{index}")),
@@ -8938,6 +8962,85 @@ mod tests {
             (response.status(), ())
         };
         assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // A strict lookup serves normally once replicas are caught up.
+        let strict_lookup = |node: &crate::active_range::StorageNodeId| {
+            let client = client.clone();
+            let url = format!("{}/v1/state-stores/lookup", endpoints[node]);
+            async move {
+                let response = client
+                    .post(url)
+                    .bearer_auth("this-is-a-long-development-api-key")
+                    .json(&serde_json::json!({
+                        "store": "accounts.profiles",
+                        "key_base64": STANDARD.encode(b"user-9"),
+                        "strict": true,
+                        "wait_ms": 200,
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                (response.status(), response.json::<Value>().await.unwrap())
+            }
+        };
+        let (status, body) = strict_lookup(&non_replica).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // Commit a mutation directly on every replica journal without
+        // applying it — all replicas now lag their committed frontier, and
+        // the strict lookup must surface index_behind rather than serve
+        // stale state.
+        let unapplied = crate::state_store::StateStoreMutation {
+            store_id: definition.store_id,
+            mutation_id: Uuid::new_v4(),
+            request_id: Uuid::new_v4(),
+            ownership_epoch: assignment.ownership_epoch,
+            sequence: 2,
+            op: crate::state_store::StateStoreMutationOp::PutRow {
+                key: b"user-9".to_vec(),
+                payload: b"v2".to_vec(),
+            },
+            issued_at_ns: 1,
+            source: None,
+        };
+        for (index, node) in nodes.iter().enumerate() {
+            if !assignment.replicas.contains(node) {
+                continue;
+            }
+            let journal = &journals[index];
+            let digest = journal.prepare(unapplied.clone()).unwrap().digest;
+            journal
+                .commit_with_quorum(
+                    definition.store_id,
+                    assignment.ownership_epoch,
+                    &crate::state_store::StateStoreCommitEvidence {
+                        store_id: definition.store_id,
+                        request_id: unapplied.request_id,
+                        mutation_id: unapplied.mutation_id,
+                        sequence: 2,
+                        votes: [
+                            (assignment.owner.clone(), digest),
+                            (
+                                assignment
+                                    .replicas
+                                    .iter()
+                                    .find(|n| *n != &assignment.owner)
+                                    .unwrap()
+                                    .clone(),
+                                digest,
+                            ),
+                        ],
+                    },
+                )
+                .unwrap();
+        }
+        let (status, body) = strict_lookup(&non_replica).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], "index_behind");
+        // A non-strict lookup still serves and reports the lag honestly.
+        let (status, body) = lookup(&non_replica).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["behind"], true);
     }
 
     #[tokio::test]

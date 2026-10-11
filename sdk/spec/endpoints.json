@@ -509,7 +509,9 @@
       "auth": "admin (client-key scoped auth is future work)",
       "request": {
         "store": "name",
-        "key_base64": "bytes (primary row key)"
+        "key_base64": "bytes (primary row key)",
+        "strict": "bool (optional; wait for the replica's applied sequence to reach its committed snapshot before serving)",
+        "wait_ms": "u64 (optional, default 500, capped at 2000; bounds the strict freshness wait)"
       },
       "response": {
         "store_id": "uuid",
@@ -523,9 +525,10 @@
       },
       "errors": [
         "refused(400) missing store / empty or oversized key",
-        "unavailable(503) no replica could serve the lookup"
+        "unavailable(503) no replica could serve the lookup",
+        "conflict(409) code=index_behind: strict freshness unreachable within the bounded wait"
       ],
-      "notes": "primary-key point read; served locally when the ingress Node holds a replica, else forwarded over the authenticated internal read route; freshness is reported, not enforced (strict reads are future work)"
+      "notes": "primary-key point read; served locally when the ingress Node holds a replica, else forwarded over the authenticated internal read route; non-strict requests report freshness honestly via behind/applied_seq/committed_seq; strict requests wait (bounded) and return index_behind rather than serve a stale snapshot"
     }
   ]
 }

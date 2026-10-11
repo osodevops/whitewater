@@ -25,6 +25,10 @@ use crate::active_range::{ReplicaSet, StorageNodeId};
 pub const STATE_STORE_MAX_MUTATION_BYTES: usize = 256 * 1024;
 /// Application-visible row key budget for manual StateStore mutations.
 pub const STATE_STORE_MAX_KEY_BYTES: usize = 60 * 1024;
+
+/// Strict reads wait at most this long for a replica's applied position to
+/// reach the committed frontier observed at request entry.
+pub const MAX_STRICT_READ_WAIT_MS: u64 = 2_000;
 /// Application-visible row payload budget for manual StateStore mutations.
 pub const STATE_STORE_MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 
@@ -204,6 +208,12 @@ pub struct StateStoreReadRequest {
     pub store_id: Uuid,
     pub ownership_epoch: u64,
     pub key: Vec<u8>,
+    /// Strict reads wait (bounded by `wait_ms`) for the replica's applied
+    /// position to reach the committed frontier observed at entry.
+    #[serde(default)]
+    pub strict: bool,
+    #[serde(default)]
+    pub wait_ms: u64,
 }
 
 /// One applied StateStore row returned by a replica read.
@@ -1509,14 +1519,32 @@ impl StateStoreMutationService {
         let apply = self.apply.clone();
         let store_id = request.store_id;
         let key = request.key;
+        let strict = request.strict;
+        let wait = std::time::Duration::from_millis(request.wait_ms.min(MAX_STRICT_READ_WAIT_MS));
         let (row, applied_seq, committed_seq) = tokio::task::spawn_blocking(move || {
-            let inspection = journal.inspect(store_id)?;
+            // Strict freshness pins to the commit frontier observed at
+            // entry; chasing a moving target under write load could wait
+            // forever.
+            let mut inspection = journal.inspect(store_id)?;
+            let target = inspection
+                .committed
+                .as_ref()
+                .map(|mutation| mutation.sequence)
+                .unwrap_or(0);
+            if strict {
+                let deadline = std::time::Instant::now() + wait;
+                while inspection.applied_seq < target && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    inspection = journal.inspect(store_id)?;
+                }
+            }
             let row = apply.get_row(store_id, &key)?;
             Ok::<_, StateStoreMutationError>((
                 row,
                 inspection.applied_seq,
                 inspection
                     .committed
+                    .as_ref()
                     .map(|mutation| mutation.sequence)
                     .unwrap_or(0),
             ))
@@ -2424,6 +2452,8 @@ mod tests {
             store_id,
             ownership_epoch: epoch,
             key: key.to_vec(),
+            strict: false,
+            wait_ms: 0,
         };
         // Empty journal: nothing committed or applied yet.
         let empty = service.read_row(read(b"k", epoch)).await.unwrap();
@@ -2432,12 +2462,12 @@ mod tests {
         assert_eq!(empty.result.committed_seq, 0);
 
         // Commit + apply one mutation directly through the journal seam.
-        let mut mutation = mutation(store_id, 1, "user-7");
-        mutation.ownership_epoch = epoch;
-        journal.prepare(mutation.clone()).unwrap();
+        let mut first = mutation(store_id, 1, "user-7");
+        first.ownership_epoch = epoch;
+        journal.prepare(first.clone()).unwrap();
         let votes = [
-            (owner.clone(), mutation_digest(&mutation).unwrap()),
-            (node("storage-2"), mutation_digest(&mutation).unwrap()),
+            (owner.clone(), mutation_digest(&first).unwrap()),
+            (node("storage-2"), mutation_digest(&first).unwrap()),
         ];
         let committed = journal
             .commit_with_quorum(
@@ -2445,8 +2475,8 @@ mod tests {
                 epoch,
                 &StateStoreCommitEvidence {
                     store_id,
-                    request_id: mutation.request_id,
-                    mutation_id: mutation.mutation_id,
+                    request_id: first.request_id,
+                    mutation_id: first.mutation_id,
                     sequence: 1,
                     votes,
                 },
@@ -2472,6 +2502,40 @@ mod tests {
         // Missing key reads back absent without error.
         let missing = service.read_row(read(b"none", epoch)).await.unwrap();
         assert!(missing.result.row.is_none());
+
+        // A strict read on a lagging replica waits, then reports the lag.
+        let mut second = mutation(store_id, 2, "user-8");
+        second.ownership_epoch = epoch;
+        journal.prepare(second.clone()).unwrap();
+        let committed = journal
+            .commit_with_quorum(
+                store_id,
+                epoch,
+                &StateStoreCommitEvidence {
+                    store_id,
+                    request_id: second.request_id,
+                    mutation_id: second.mutation_id,
+                    sequence: 2,
+                    votes: [
+                        (owner.clone(), mutation_digest(&second).unwrap()),
+                        (node("storage-2"), mutation_digest(&second).unwrap()),
+                    ],
+                },
+            )
+            .unwrap();
+        let mut strict = read(b"user-8", epoch);
+        strict.strict = true;
+        strict.wait_ms = 60;
+        let lagged = service.read_row(strict.clone()).await.unwrap();
+        assert!(lagged.result.row.is_none());
+        assert_eq!(lagged.result.committed_seq, 2);
+        assert!(lagged.result.applied_seq < 2);
+        // After the apply lands, the same strict read serves the row.
+        service.apply.apply(&committed).unwrap();
+        journal.mark_applied(store_id, 2).unwrap();
+        let caught = service.read_row(strict).await.unwrap();
+        assert!(caught.result.row.is_some());
+        assert_eq!(caught.result.applied_seq, 2);
 
         // Stale ownership epochs and oversized keys are fenced.
         assert!(matches!(
