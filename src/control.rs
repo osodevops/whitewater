@@ -1385,6 +1385,17 @@ impl ControlController {
             .cloned()
     }
 
+    /// The declared Pipe by immutable id.
+    pub async fn active_pipe_by_id(&self, pipe_id: Uuid) -> Option<PipeDefinition> {
+        self.state
+            .lock()
+            .await
+            .pipes
+            .values()
+            .find(|pipe| pipe.pipe_id == pipe_id && pipe.status == ResourceStatus::Active)
+            .cloned()
+    }
+
     /// Every active Pipe consuming one Subscription's progress assignment;
     /// the journal driver needs this to attach effect scope.
     pub async fn pipes_for_subscription(&self, subscription_id: Uuid) -> Vec<PipeDefinition> {

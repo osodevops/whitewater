@@ -39,6 +39,8 @@ pub struct EffectOutput {
     pub feed_id: Uuid,
     pub key_base64: String,
     pub payload_base64: String,
+    #[serde(default)]
+    pub metadata_base64: std::collections::BTreeMap<String, String>,
     pub event_time_ns: i64,
     pub writer_session_id: Uuid,
     pub writer_epoch: u64,
@@ -539,6 +541,10 @@ fn validate_effect_bounds(mutation: &EffectMutation) -> Result<(), EffectJournal
                 output.key_base64.is_empty()
                     || output.key_base64.len() > EFFECT_MAX_OUTPUT_FIELD
                     || output.payload_base64.len() > EFFECT_MAX_OUTPUT_FIELD
+                    || output
+                        .metadata_base64
+                        .values()
+                        .any(|value| value.len() > EFFECT_MAX_OUTPUT_FIELD)
                     || output.sequence == 0
             }) {
                 return Err(EffectJournalError::TooLarge);
@@ -1422,6 +1428,7 @@ mod tests {
             feed_id: Uuid::new_v4(),
             key_base64: "a2V5".to_owned(),
             payload_base64: "cGF5bG9hZA==".to_owned(),
+            metadata_base64: BTreeMap::new(),
             event_time_ns: 1,
             writer_session_id: Uuid::new_v4(),
             writer_epoch: 1,

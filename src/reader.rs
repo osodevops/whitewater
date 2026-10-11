@@ -1023,6 +1023,12 @@ impl SubscriptionCommitEvidence {
             request_id,
         })
     }
+
+    /// The committed mutation's request identity, for fault filtering and
+    /// diagnostics that must not see quorum votes.
+    pub fn request_id(&self) -> Uuid {
+        self.request_id
+    }
 }
 
 pub struct FjallSubscriptionProgressReplica {

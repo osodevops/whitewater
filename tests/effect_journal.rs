@@ -23,6 +23,7 @@ fn output(sequence: u64) -> EffectOutput {
         feed_id: Uuid::new_v4(),
         key_base64: "a2V5".to_owned(),
         payload_base64: "cGF5bG9hZA==".to_owned(),
+        metadata_base64: BTreeMap::new(),
         event_time_ns: 1,
         writer_session_id: Uuid::new_v4(),
         writer_epoch: 1,

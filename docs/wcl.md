@@ -328,7 +328,9 @@ CREATE PIPE orders.enrich
 
 
 
-A Pipe declares a managed consume-process-append binding: the named Subscription's durable frontier drives the input, and every delivered record flows through the declared operation into the output Feed. Today `forward` is the only operation; enrichment and rolling-window operations arrive with their runtimes. A Pipe belongs to the same Domain as its input Subscription and output Feed, may not write back to its own input Feed, and remains `declared`: no records flow until a Pipe driver exists. The consumed Subscription and the output Feed cannot be dropped while the Pipe is active; drop the Pipe first.
+A Pipe declares a managed consume-process-append binding: the named Subscription's durable frontier drives the input, and every delivered record flows through the declared operation into the output Feed. Today `forward` is the only operation; enrichment and rolling-window operations arrive with their runtimes. A Pipe belongs to the same Domain as its input Subscription and output Feed and may not write back to its own input Feed. The consumed Subscription and the output Feed cannot be dropped while the Pipe is active; drop the Pipe first.
+
+The internal `POST /internal/pipe/drive` route runs one bounded consume-declare-apply cycle on the Subscription's current progress owner: it fetches a page after the committed frontier, commits a `Declare` carrying the frontier evidence and per-record deterministic writer identities, appends outputs through the normal owner-routed append path, commits the consumed frontier, then marks the effect `Applied`. Drivers do not hold a member work lease; concurrent drives over the same frontier produce identical journal mutations, and a stale frontier loses the compare-and-set when committing progress. Until a supervisor loop is scheduled automatically, drives are triggered explicitly over the internal plane.
 
 
 

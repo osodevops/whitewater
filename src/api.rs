@@ -573,6 +573,10 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
                 post(effect_journal_apply_local).layer(DefaultBodyLimit::max(64 * 1024)),
             ),
         )
+        .route(
+            "/internal/pipe/drive",
+            subscription_key_layer(post(pipe_drive_local).layer(DefaultBodyLimit::max(64 * 1024))),
+        )
 }
 
 pub fn router(state: AppState) -> Router {
@@ -1709,6 +1713,36 @@ async fn subscription_member_fetch(
         .ok_or_else(|| {
             ApiError::unavailable("Subscription progress frontier is not established")
         })?;
+    let (delivered, positions) = fetch_frontier_page(&state, &frontier, limit).await?;
+    let cursor = delivered.last().map(|(cursor, _)| cursor.clone());
+    let records = delivered
+        .into_iter()
+        .map(|(frame_cursor, record)| {
+            record_response(crate::domain::CursorRecord {
+                cursor: frame_cursor,
+                record,
+            })
+        })
+        .collect();
+    Ok(Json(SubscriptionMemberFetchResponse {
+        request_id: request.request_id,
+        records,
+        cursor,
+        positions,
+        ownership_epoch: progress_assignment.ownership_epoch,
+    }))
+}
+
+/// Merge the committed pages of every Active Range after a committed
+/// Subscription frontier into one bounded page in (ingest_time, message_id)
+/// order. Returns each record with its frame Cursor plus the updated
+/// per-range positions; member fetches and Pipe drives share this core so
+/// both see identical delivery order and frontier evidence.
+async fn fetch_frontier_page(
+    state: &AppState,
+    frontier: &crate::reader::SubscriptionProgressMutation,
+    limit: usize,
+) -> Result<(Vec<(String, StoredRecord)>, BTreeMap<RangeId, String>), ApiError> {
     let range_assignments = state
         .control
         .active_range_assignments_for_feed(frontier.feed_id)
@@ -1723,9 +1757,9 @@ async fn subscription_member_fetch(
                         .to_owned(),
 
                 code: None,
-});
+            });
         };
-        let mut stream = RangeFrameStream::new(&state, range_assignment);
+        let mut stream = RangeFrameStream::new(state, range_assignment);
         if !position.is_empty() {
             stream.after_cursor = Some(position.clone());
         }
@@ -1743,9 +1777,8 @@ async fn subscription_member_fetch(
 
     let mut heads: Vec<Option<((i64, Uuid), StoredRangeFrame)>> =
         (0..streams.len()).map(|_| None).collect();
-    let mut records: Vec<RecordResponse> = Vec::new();
+    let mut records: Vec<(String, StoredRecord)> = Vec::new();
     let mut positions = frontier.positions.clone();
-    let mut cursor = None;
     let mut bytes = 0_usize;
     loop {
         for index in 0..streams.len() {
@@ -1788,18 +1821,133 @@ async fn subscription_member_fetch(
         let record = decode_record(&frame.frame)
             .map_err(|error| ApiError::unavailable(error.to_string()))?;
         positions.insert(streams[index].0, frame.cursor.clone());
-        cursor = Some(frame.cursor.clone());
-        records.push(record_response(crate::domain::CursorRecord {
-            cursor: frame.cursor,
-            record,
-        }));
+        records.push((frame.cursor, record));
     }
-    Ok(Json(SubscriptionMemberFetchResponse {
-        request_id: request.request_id,
-        records,
-        cursor,
-        positions,
-        ownership_epoch: progress_assignment.ownership_epoch,
+    Ok((records, positions))
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PipeDriveRequest {
+    pipe_id: Uuid,
+    subscription_id: Uuid,
+    owner: StorageNodeId,
+    receiver: StorageNodeId,
+    ownership_epoch: u64,
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct PipeDriveResponse {
+    pipe_id: Uuid,
+    applied: Option<crate::effect::EffectMutation>,
+}
+
+/// Drive one declared Pipe through a bounded Declare -> apply cycle on the
+/// Subscription's current progress owner. The drive runs where the consumed
+/// frontier and the effect journal are placed, and the cycle fences on the
+/// frontier CAS rather than a member work lease: two drivers seeing the same
+/// frontier produce identical mutations (the journal replays them), and one
+/// seeing an older frontier loses the CAS when committing progress.
+async fn pipe_drive_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<PipeDriveRequest>,
+) -> Result<Json<PipeDriveResponse>, ApiError> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let pipe = state
+        .control
+        .active_pipe_by_id(request.pipe_id)
+        .await
+        .ok_or_else(|| ApiError::conflict("Pipe does not exist or is not active"))?;
+    if pipe.subscription_id != request.subscription_id {
+        return Err(ApiError::conflict(
+            "Pipe does not consume the requested Subscription",
+        ));
+    }
+    if pipe.operation != crate::control::PipeOperation::Forward {
+        return Err(ApiError::conflict("Pipe operation is not driveable yet"));
+    }
+    let assignment = state
+        .control
+        .active_subscription_progress_assignment_by_id(request.subscription_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Subscription progress placement is unavailable"))?;
+    if assignment.owner != request.receiver || assignment.owner != request.owner {
+        return Err(ApiError::conflict(
+            "Pipe drive must run on the current progress owner",
+        ));
+    }
+    if assignment.ownership_epoch != request.ownership_epoch {
+        return Err(ApiError::conflict(
+            "Pipe drive epoch does not match the current progress placement",
+        ));
+    }
+    if state.storage_node_id.as_ref() != Some(&request.receiver) {
+        return Err(ApiError::conflict(format!(
+            "Node {} is not the drive receiver {}",
+            state
+                .storage_node_id
+                .as_ref()
+                .map(|node| node.as_str())
+                .unwrap_or("unconfigured"),
+            request.receiver
+        )));
+    }
+    let journal = effect_coordinator_for(&state, assignment.clone())?;
+    let (progress, _) = member_assignment_coordinator(&state, assignment.clone())?;
+    let (sink_progress, _) = member_assignment_coordinator(&state, assignment)?;
+    let sink = LiveEffectApply {
+        state: &state,
+        progress: sink_progress,
+        subscription_id: request.subscription_id,
+        ownership_epoch: request.ownership_epoch,
+    };
+    let driver = crate::pipe::PipeDriver::new(pipe.clone(), Arc::new(journal), Arc::new(progress));
+    let limit = request
+        .limit
+        .unwrap_or(64)
+        .clamp(1, SUBSCRIPTION_MEMBER_FETCH_MAX_LIMIT);
+    let applied = driver
+        .drive_once(
+            limit,
+            |frontier, limit| {
+                let state = &state;
+                let frontier = frontier.clone();
+                async move {
+                    fetch_frontier_page(state, &frontier, limit)
+                        .await
+                        .map(|(delivered, positions)| crate::pipe::FetchedPage {
+                            cursor: delivered
+                                .last()
+                                .map(|(cursor, _)| cursor.clone())
+                                .unwrap_or_else(|| frontier.cursor.clone()),
+                            records: delivered
+                                .into_iter()
+                                .map(|(_, record)| crate::pipe::FetchedRecord {
+                                    message_id: record.message_id,
+                                    key_base64: STANDARD.encode(&record.key),
+                                    payload_base64: STANDARD.encode(&record.payload),
+                                    metadata_base64: record
+                                        .metadata
+                                        .into_iter()
+                                        .map(|(name, value)| (name, STANDARD.encode(value)))
+                                        .collect(),
+                                    event_time_ns: record.event_time_ns,
+                                })
+                                .collect(),
+                            positions,
+                        })
+                        .map_err(|_| crate::effect::EffectJournalError::Unavailable)
+                }
+            },
+            &sink,
+        )
+        .await
+        .map_err(effect_journal_api_error)?;
+    Ok(Json(PipeDriveResponse {
+        pipe_id: pipe.pipe_id,
+        applied,
     }))
 }
 
@@ -1943,6 +2091,45 @@ async fn effect_journal_adopt_local(
     ))
 }
 
+/// Build the journal coordinator bound to a Subscription's progress
+/// assignment over the configured internal transport (mTLS or shared key).
+fn effect_coordinator_for(
+    state: &AppState,
+    assignment: crate::reader::SubscriptionProgressAssignment,
+) -> Result<crate::effect::EffectCoordinator, ApiError> {
+    let effect_transport: Arc<dyn crate::effect::EffectJournalTransport> = match &state
+        .internal_mtls
+    {
+        Some(material) => Arc::new(
+            crate::effect::HttpEffectJournalTransport::new_mtls(
+                assignment.clone(),
+                state.control_endpoints.as_ref().clone(),
+                &material.ca_pem,
+                &material.identity_pem,
+                Duration::from_secs(5),
+            )
+            .map_err(effect_journal_api_error)?,
+        ),
+        None => Arc::new(
+            crate::effect::HttpEffectJournalTransport::new(
+                assignment.clone(),
+                state.control_endpoints.as_ref().clone(),
+                state
+                    .internal_key
+                    .as_ref()
+                    .ok_or_else(|| ApiError::unavailable("internal credential is not configured"))?
+                    .clone(),
+                Duration::from_secs(5),
+            )
+            .map_err(|error| ApiError::unavailable(error.to_string()))?,
+        ),
+    };
+    Ok(crate::effect::EffectCoordinator::new(
+        assignment,
+        effect_transport,
+    ))
+}
+
 /// Drives a committed `Declare` on one Subscription-scoped effect journal
 /// to its `Applied` marker. Runs on the progress owner so side effects and
 /// the terminal journal transition share the frontier authority's epoch
@@ -1981,34 +2168,7 @@ async fn effect_journal_apply_local(
             request.receiver
         )));
     }
-    let effect_transport: Arc<dyn crate::effect::EffectJournalTransport> = match &state
-        .internal_mtls
-    {
-        Some(material) => Arc::new(
-            crate::effect::HttpEffectJournalTransport::new_mtls(
-                assignment.clone(),
-                state.control_endpoints.as_ref().clone(),
-                &material.ca_pem,
-                &material.identity_pem,
-                Duration::from_secs(5),
-            )
-            .map_err(effect_journal_api_error)?,
-        ),
-        None => Arc::new(
-            crate::effect::HttpEffectJournalTransport::new(
-                assignment.clone(),
-                state.control_endpoints.as_ref().clone(),
-                state
-                    .internal_key
-                    .as_ref()
-                    .ok_or_else(|| ApiError::unavailable("internal credential is not configured"))?
-                    .clone(),
-                Duration::from_secs(5),
-            )
-            .map_err(|error| ApiError::unavailable(error.to_string()))?,
-        ),
-    };
-    let journal = crate::effect::EffectCoordinator::new(assignment.clone(), effect_transport);
+    let journal = effect_coordinator_for(&state, assignment.clone())?;
     let (progress, _) = member_assignment_coordinator(&state, assignment)?;
     let sink = LiveEffectApply {
         state: &state,
@@ -2068,7 +2228,7 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
             event_time_ns: Some(output.event_time_ns.to_string()),
             key_base64: output.key_base64.clone(),
             payload_base64: output.payload_base64.clone(),
-            metadata_base64: BTreeMap::new(),
+            metadata_base64: output.metadata_base64.clone(),
         };
         route_append_to_owner(self.state, feed.feed_id, request)
             .await
@@ -8328,6 +8488,7 @@ mod tests {
                     feed_id: Uuid::from_u128(944),
                     key_base64: "a2V5".to_owned(),
                     payload_base64: "cGF5bG9hZA==".to_owned(),
+                    metadata_base64: BTreeMap::new(),
                     event_time_ns: 1,
                     writer_session_id: Uuid::from_u128(945),
                     writer_epoch: 1,
@@ -8510,6 +8671,114 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), expected);
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pipe_drive_requires_the_progress_owner_and_epoch() {
+        let directory = TempDir::new().unwrap();
+        let (app, control_plane, control, _replica) =
+            internal_replica_test_router(&directory).await;
+        control
+            .execute("CREATE FEED orders.enriched; CREATE PIPE orders.forward FROM SUBSCRIPTION orders.billing TO FEED orders.enriched;")
+            .await
+            .unwrap();
+        let pipe = control.active_pipe_by_name("orders.forward").await.unwrap();
+        let assignment = control
+            .active_subscription_progress_assignment_by_id(pipe.subscription_id)
+            .await
+            .unwrap();
+        let local = crate::active_range::StorageNodeId::try_new("control-1").unwrap();
+        let drive = PipeDriveRequest {
+            pipe_id: pipe.pipe_id,
+            subscription_id: pipe.subscription_id,
+            owner: assignment.owner.clone(),
+            receiver: local.clone(),
+            ownership_epoch: assignment.ownership_epoch,
+            limit: Some(4),
+        };
+        let request = |body: serde_json::Value, key: Option<&str>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/internal/pipe/drive")
+                .header("content-type", "application/json");
+            if let Some(key) = key {
+                builder = builder.header("x-whitewater-control-key", key);
+            }
+            builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        assert_eq!(
+            app.clone()
+                .oneshot(request(json!(drive), None))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut wrong_receiver = drive.clone();
+        wrong_receiver.receiver = assignment
+            .replicas
+            .iter()
+            .find(|node| *node != &local)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    json!(wrong_receiver),
+                    Some("this-is-a-long-control-plane-key")
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        let mut wrong_epoch = drive.clone();
+        wrong_epoch.ownership_epoch = assignment.ownership_epoch + 9;
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    json!(wrong_epoch),
+                    Some("this-is-a-long-control-plane-key")
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
+        // On the progress owner the drive reaches the coordinators: with no
+        // established frontier and unreachable peers it degrades to a
+        // retryable failure rather than writing anything.
+        let expected = if assignment.owner == local {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::CONFLICT
+        };
+        let response = app
+            .clone()
+            .oneshot(request(
+                json!(drive),
+                Some("this-is-a-long-control-plane-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+        // A pipe bound to another Subscription is refused before placement.
+        let mut foreign = drive.clone();
+        foreign.pipe_id = Uuid::from_u128(977);
+        assert_eq!(
+            app.clone()
+                .oneshot(request(
+                    json!(foreign),
+                    Some("this-is-a-long-control-plane-key")
+                ))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT
+        );
         control_plane.raft().shutdown().await.unwrap();
     }
 
