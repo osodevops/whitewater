@@ -632,6 +632,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/admin/subscriptions/move-progress",
             post(admin_move_subscription_progress),
         )
+        .route(
+            "/v1/admin/subscriptions/progress",
+            get(admin_subscription_progress),
+        )
         .route("/v1/admin/control-plane", get(control_plane_status))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
@@ -1707,7 +1711,7 @@ async fn subscription_member_fetch(
             status: StatusCode::CONFLICT,
             message: "Subscription work lease is stale, expired, or fenced".to_owned(),
 
-            code: None,
+            code: Some("lease.stale_lease"),
         });
     }
     let frontier = coordinator
@@ -1760,7 +1764,7 @@ async fn fetch_frontier_page(
                     "Subscription frontier does not cover a current Active Range; reconcile progress"
                         .to_owned(),
 
-                code: None,
+                code: Some("conflict"),
             });
         };
         let mut stream = RangeFrameStream::new(state, range_assignment);
@@ -1775,7 +1779,7 @@ async fn fetch_frontier_page(
             message: "Subscription frontier predates an Active Range change; reconcile progress"
                 .to_owned(),
 
-            code: None,
+            code: Some("conflict"),
         });
     }
 
@@ -5200,6 +5204,86 @@ async fn admin_move_subscription_progress(
         "status": "applied",
         "assignment": outcome.assignment,
         "adopted": outcome.adopted,
+    })))
+}
+
+#[derive(Deserialize)]
+struct AdminSubscriptionProgressQuery {
+    subscription: String,
+}
+
+/// Read-only Subscription progress placement view for operators: the current
+/// assignment, committed frontier, member/lease summary, and per-replica
+/// state. An unreachable or epoch-fenced replica reports its own outcome
+/// instead of failing the whole read, so a wedged Subscription stays
+/// diagnosable while it is still wedged.
+async fn admin_subscription_progress(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<AdminSubscriptionProgressQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let (coordinator, assignment, definition) =
+        member_coordinator(&state, &query.subscription).await?;
+    let committed = coordinator
+        .read_committed()
+        .await
+        .ok()
+        .flatten()
+        .map(|mutation| {
+            json!({
+                "cursor": mutation.cursor,
+                "positions": mutation.positions,
+                "sequence": mutation.sequence,
+                "request_id": mutation.request_id,
+                "ownership_epoch": mutation.ownership_epoch,
+                "tick": mutation.tick,
+            })
+        });
+    let member_state = coordinator.member_state().await.ok();
+    let replicas = coordinator
+        .replica_states()
+        .await
+        .into_iter()
+        .map(|(node, result)| match result {
+            Ok(inspection) => json!({
+                "node": node,
+                "reachable": true,
+                "committed_sequence": inspection
+                    .committed
+                    .as_ref()
+                    .map(|mutation| mutation.sequence),
+                "committed_epoch": inspection
+                    .committed
+                    .as_ref()
+                    .map(|mutation| mutation.ownership_epoch),
+                "prepared_pending": inspection.prepared.is_some(),
+                "member_count": inspection.members.member_epochs.len(),
+                "lease_count": inspection.members.leases.len(),
+            }),
+            Err(error) => json!({
+                "node": node,
+                "reachable": false,
+                "error": error.to_string(),
+            }),
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "subscription": query.subscription,
+        "subscription_id": definition.subscription_id,
+        "feed_id": definition.feed_id,
+        "assignment": {
+            "owner": assignment.owner,
+            "replicas": assignment.replicas,
+            "ownership_epoch": assignment.ownership_epoch,
+        },
+        "committed": committed,
+        "members": member_state.as_ref().map(|members| json!({
+            "member_count": members.member_epochs.len(),
+            "lease_count": members.leases.len(),
+            "last_tick": members.last_tick,
+        })),
+        "replicas": replicas,
     })))
 }
 
@@ -10467,6 +10551,48 @@ mod tests {
             json!("cursor-12")
         );
 
+        // The admin progress view reports placement, committed frontier,
+        // member state, and per-replica health in one read.
+        let unauthorized = client
+            .get(format!(
+                "{}/v1/admin/subscriptions/progress?subscription=orders.billing",
+                endpoints[&nodes[0]]
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+        let response = client
+            .get(format!(
+                "{}/v1/admin/subscriptions/progress?subscription=orders.billing",
+                endpoints[&nodes[0]]
+            ))
+            .header("authorization", "Bearer this-is-a-long-development-api-key")
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["subscription"], json!("orders.billing"));
+        assert_eq!(
+            body["assignment"]["owner"].as_str().unwrap(),
+            assignment.owner.to_string()
+        );
+        assert_eq!(
+            body["assignment"]["ownership_epoch"].as_u64().unwrap(),
+            assignment.ownership_epoch
+        );
+        assert_eq!(body["assignment"]["replicas"].as_array().unwrap().len(), 3);
+        assert!(body["committed"]["cursor"].is_string(), "{body}");
+        assert_eq!(body["members"]["member_count"], json!(1));
+        assert_eq!(body["replicas"].as_array().unwrap().len(), 3);
+        assert!(body["replicas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|replica| replica["reachable"] == json!(true)));
+
         // A lost progress owner leaves member reads on surviving quorum
         // evidence while the next mutation transparently recovers placement
         // onto an eligible replica.
@@ -10533,6 +10659,32 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+
+        // The progress view now marks the dead owner's replica unreachable
+        // while the placement names the recovered owner.
+        let response = client
+            .get(format!(
+                "{}/v1/admin/subscriptions/progress?subscription=orders.billing",
+                endpoints[&nodes[survivor_index]]
+            ))
+            .header("authorization", "Bearer this-is-a-long-development-api-key")
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["assignment"]["owner"].as_str().unwrap(),
+            recovered_assignment.owner.to_string()
+        );
+        let dead = body["replicas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|replica| replica["node"].as_str().unwrap() == assignment.owner.to_string())
+            .unwrap();
+        assert_eq!(dead["reachable"], json!(false), "{body}");
 
         for handle in handles {
             handle.abort();

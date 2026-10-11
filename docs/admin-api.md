@@ -435,6 +435,33 @@ or
 
 The response reports the adopted assignment and the replica Nodes that confirmed adoption. The step is safe to retry: if the placement change already landed — including under a different target chosen by a racing actor — the coordinator converges replicas at the live epoch instead of forcing the planned target.
 
+### Inspect Subscription progress placement
+
+```http
+GET /v1/admin/subscriptions/progress?subscription=<domain>.<name>
+Authorization: Bearer <admin-key>
+```
+
+Returns the Subscription's current progress assignment (owner, RF3 replica set, ownership epoch), the committed frontier and member/lease summary, and a per-replica health view. A replica that is unreachable, fenced at an older ownership epoch, or mid-recovery reports its own outcome instead of failing the whole read, so a wedged Subscription stays diagnosable while it is still wedged.
+
+```json
+{
+  "subscription": "orders.billing",
+  "subscription_id": "...",
+  "feed_id": "...",
+  "assignment": {"owner": "control-1", "replicas": ["control-1", "control-2", "control-3"], "ownership_epoch": 2},
+  "committed": {"cursor": "...", "positions": {"<range-id>": "..."}, "sequence": 17, "request_id": "...", "ownership_epoch": 2, "tick": 42},
+  "members": {"member_count": 3, "lease_count": 2, "last_tick": 42},
+  "replicas": [
+    {"node": "control-1", "reachable": true, "committed_sequence": 17, "committed_epoch": 2, "prepared_pending": false, "member_count": 3, "lease_count": 2},
+    {"node": "control-3", "reachable": false, "error": "unavailable"}
+  ]
+}
+```
+
+`committed` is `null` when no quorum-readable frontier exists (never joined, or mid-recovery). `replicas[].committed_epoch` behind `assignment.ownership_epoch` marks a lagging replica that adoption has not yet caught up.
+
+
 ### Grant
 
 ```json

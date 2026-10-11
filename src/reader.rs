@@ -875,6 +875,35 @@ fn lagging_prepare(error: &SubscriptionProgressError) -> bool {
     lagging_witness(error) || matches!(error, SubscriptionProgressError::Lease(_))
 }
 
+/// Decode a replica refusal into the wire-stable progress error when the
+/// response body carries a recognized `code`; fall back to the HTTP status
+/// so uncoded bodies still classify as conflict versus unavailability.
+///
+/// The JSON head is bounded to 4 KiB so an oversized error page cannot make
+/// the coordinator parse unbounded input.
+fn refusal_error(status: reqwest::StatusCode, body: &[u8]) -> SubscriptionProgressError {
+    let head = &body[..body.len().min(4096)];
+    let code = serde_json::from_slice::<serde_json::Value>(head)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("code")
+                .and_then(|code| code.as_str())
+                .map(str::to_owned)
+        });
+    if let Some(error) = code
+        .as_deref()
+        .and_then(SubscriptionProgressError::from_code)
+    {
+        return error;
+    }
+    if status == reqwest::StatusCode::CONFLICT {
+        SubscriptionProgressError::Conflict
+    } else {
+        SubscriptionProgressError::Unavailable
+    }
+}
+
 fn same_progress_identity(
     left: &SubscriptionProgressMutation,
     right: &SubscriptionProgressMutation,
@@ -1822,26 +1851,7 @@ impl HttpSubscriptionProgressTransport {
             let status = response.status();
             let body = response.bytes().await.unwrap_or_default();
             tracing::warn!(node = %node, path, %status, "Subscription progress replica refused");
-            let code = body
-                .get(..4096)
-                .and_then(|head| serde_json::from_slice::<serde_json::Value>(head).ok())
-                .and_then(|value| {
-                    value
-                        .get("code")
-                        .and_then(|code| code.as_str())
-                        .map(str::to_owned)
-                });
-            if let Some(error) = code
-                .as_deref()
-                .and_then(SubscriptionProgressError::from_code)
-            {
-                return Err(error);
-            }
-            return Err(if status == reqwest::StatusCode::CONFLICT {
-                SubscriptionProgressError::Conflict
-            } else {
-                SubscriptionProgressError::Unavailable
-            });
+            return Err(refusal_error(status, &body));
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response
@@ -2376,6 +2386,43 @@ impl SubscriptionProgressCoordinator {
         Ok(evidence)
     }
 
+    /// Per-replica inspection for operations visibility. Unlike
+    /// `inspect_evidence`, an unreachable, stale, or divergent replica does
+    /// not fail the whole read: each assigned replica reports its own outcome
+    /// so operators can see exactly which copy is behind before recovery.
+    pub async fn replica_states(
+        &self,
+    ) -> Vec<(
+        crate::active_range::StorageNodeId,
+        Result<SubscriptionProgressInspection, SubscriptionProgressError>,
+    )> {
+        let replies = futures_util::future::join_all(self.assignment.replicas.iter().map(|node| {
+            self.transport.inspect(
+                node,
+                self.assignment.subscription_id,
+                self.assignment.ownership_epoch,
+            )
+        }))
+        .await;
+        self.assignment
+            .replicas
+            .iter()
+            .cloned()
+            .zip(replies)
+            .map(|(node, reply)| {
+                let result = reply.and_then(|reply| {
+                    if reply.replica != node
+                        || reply.subscription_id != self.assignment.subscription_id
+                    {
+                        return Err(SubscriptionProgressError::InvalidAssignment);
+                    }
+                    Ok(reply.result)
+                });
+                (node, result)
+            })
+            .collect()
+    }
+
     fn recovered_committed(
         evidence: &[(
             crate::active_range::StorageNodeId,
@@ -2813,6 +2860,57 @@ impl SubscriptionProgressCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusal_error_decodes_wire_codes_regardless_of_body_size() {
+        // Regression: the transport previously truncated the refusal body
+        // with `body.get(..4096)`, which returns `None` for any body shorter
+        // than 4 KiB and collapsed every coded refusal (lease fences, stale
+        // epochs) into a bare `Conflict`.
+        let busy = br#"{"code":"lease.busy","error":"leased"}"#;
+        let decoded = refusal_error(reqwest::StatusCode::CONFLICT, busy);
+        assert!(matches!(
+            decoded,
+            SubscriptionProgressError::Lease(SubscriptionLeaseError::Busy)
+        ));
+        assert_eq!(decoded.code(), "lease.busy");
+
+        let stale = br#"{"code":"stale_epoch","error":"old"}"#;
+        assert_eq!(
+            refusal_error(reqwest::StatusCode::CONFLICT, stale).code(),
+            "stale_epoch"
+        );
+        let sequence = br#"{"code":"sequence","error":"gap"}"#;
+        assert_eq!(
+            refusal_error(reqwest::StatusCode::CONFLICT, sequence).code(),
+            "sequence"
+        );
+        // The wire code wins over status when both are present.
+        assert_eq!(
+            refusal_error(reqwest::StatusCode::SERVICE_UNAVAILABLE, busy).code(),
+            "lease.busy"
+        );
+        assert_eq!(
+            refusal_error(reqwest::StatusCode::CONFLICT, b"plain refusal").code(),
+            "conflict"
+        );
+        assert_eq!(
+            refusal_error(reqwest::StatusCode::CONFLICT, b"{}").code(),
+            "conflict"
+        );
+        assert_eq!(
+            refusal_error(reqwest::StatusCode::BAD_GATEWAY, b"{}").code(),
+            "unavailable"
+        );
+        // Bodies beyond the 4 KiB inspection head fall back to status.
+        let mut oversized = br#"{"code":"lease.busy","pad":""#.to_vec();
+        oversized.extend(std::iter::repeat_n(b' ', 5000));
+        oversized.extend_from_slice(b"}");
+        assert_eq!(
+            refusal_error(reqwest::StatusCode::CONFLICT, &oversized).code(),
+            "conflict"
+        );
+    }
 
     #[tokio::test]
     async fn subscription_replica_service_fences_placement_before_mutating_fjall() {
