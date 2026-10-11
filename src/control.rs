@@ -88,6 +88,72 @@ pub enum PipeOperation {
     Forward,
 }
 
+/// One typed field of an application-owned secondary Index — the catalog and
+/// wire shape; the storage codec mapping to `index::IndexField` arrives with
+/// the extraction pipeline.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum IndexFieldSpec {
+    /// The record's application Key.
+    Key,
+    /// A named record Metadata entry.
+    Metadata { name: String },
+    /// A versioned extractor projection, e.g. a JSON-path field pull.
+    Projection {
+        extractor: String,
+        version: u32,
+        field: String,
+    },
+}
+
+/// How an Index collates Text values. Persisted on the definition so a later
+/// change is a new Index version rather than a silent semantic change.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexCollation {
+    /// Bytewise UTF-8 ordering — matches the encoded posting order.
+    #[default]
+    Binary,
+}
+
+/// The read consistency a declared Index intends to honour once serving.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexConsistency {
+    /// Lookups may lag the applied Cursor; freshness is reported.
+    #[default]
+    Eventual,
+    /// Lookups fence on the requested applied Cursor. Declared only — strict
+    /// queries stay unavailable until the replicated Feed-to-Index commit and
+    /// safe rebuild protocol land.
+    Strict,
+}
+
+/// Build state of a declared Index. Only `declared` exists until the
+/// extraction/build pipeline and RF3 Index replicas are implemented.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexBuildStage {
+    /// Persisted definition; no extraction or backfill has run.
+    Declared,
+}
+
+/// A Control Plane-persisted secondary Index definition. `applied_cursor`
+/// records build progress against the source Feed; `None` while `declared`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StoredIndexDefinition {
+    pub index_id: Uuid,
+    pub name: String,
+    pub space_id: Uuid,
+    pub feed_id: Uuid,
+    pub fields: Vec<IndexFieldSpec>,
+    pub collation: IndexCollation,
+    pub consistency: IndexConsistency,
+    pub stage: IndexBuildStage,
+    pub applied_cursor: Option<String>,
+    pub created_at_ns: i64,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PipeStage {
@@ -338,6 +404,8 @@ struct CatalogState {
     #[serde(default)]
     state_stores: BTreeMap<Uuid, StateStoreDefinition>,
     #[serde(default)]
+    indexes: BTreeMap<Uuid, StoredIndexDefinition>,
+    #[serde(default)]
     pipes: BTreeMap<Uuid, PipeDefinition>,
     writers: BTreeMap<Uuid, WriterDefinition>,
     readers: BTreeMap<Uuid, ReaderDefinition>,
@@ -398,6 +466,7 @@ impl Default for CatalogState {
             spaces: BTreeMap::new(),
             feeds: BTreeMap::new(),
             state_stores: BTreeMap::new(),
+            indexes: BTreeMap::new(),
             pipes: BTreeMap::new(),
             writers: BTreeMap::new(),
             readers: BTreeMap::new(),
@@ -434,6 +503,7 @@ pub enum ResourceKind {
     Subscription,
     Role,
     Pipe,
+    Index,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -449,6 +519,7 @@ pub enum ShowKind {
     Grants,
     StorageNodes,
     Pipes,
+    Indexes,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -466,6 +537,17 @@ pub enum Command {
     DefineStateStore {
         name: String,
         source: StateStoreSourceRequest,
+    },
+    DefineIndex {
+        name: String,
+        feed: String,
+        fields: Vec<IndexFieldSpec>,
+        #[serde(default)]
+        unique: bool,
+        #[serde(default)]
+        collation: IndexCollation,
+        #[serde(default)]
+        consistency: IndexConsistency,
     },
     DefinePipe {
         name: String,
@@ -1391,6 +1473,16 @@ impl ControlController {
             .cloned()
     }
 
+    pub async fn declared_index_by_name(&self, name: &str) -> Option<StoredIndexDefinition> {
+        self.state
+            .lock()
+            .await
+            .indexes
+            .values()
+            .find(|item| item.name == name)
+            .cloned()
+    }
+
     /// An active Pipe definition by dotted name.
     pub async fn active_pipe_by_name(&self, name: &str) -> Option<PipeDefinition> {
         self.state
@@ -1676,6 +1768,52 @@ impl ControlController {
                     .insert(definition.store_id, definition.clone());
                 Ok((
                     format!("declared StateStore {name}; no data is served until RF3 activation"),
+                    json!(definition),
+                ))
+            }
+            Command::DefineIndex {
+                name,
+                feed,
+                fields,
+                unique,
+                collation,
+                consistency,
+            } => {
+                validate_dotted_name(&name)?;
+                if unique {
+                    return Err(ControlError::InvalidOperation(
+                        "UNIQUE Indexes require the replicated conditional-claim protocol; declare non-unique Indexes until it exists"
+                            .to_owned(),
+                    ));
+                }
+                validate_index_fields(&fields)?;
+                if state.indexes.values().any(|item| item.name == name) {
+                    return Err(ControlError::AlreadyExists(name));
+                }
+                let space_id = owning_space(state, &name)?.space_id;
+                let feed_definition = active_feed(state, &feed)?;
+                if feed_definition.space_id != space_id {
+                    return Err(ControlError::InvalidOperation(
+                        "Index source Feed must belong to its Domain".to_owned(),
+                    ));
+                }
+                let definition = StoredIndexDefinition {
+                    index_id: derived_resource_id(request_id, "index"),
+                    name: name.clone(),
+                    space_id,
+                    feed_id: feed_definition.feed_id,
+                    fields,
+                    collation,
+                    consistency,
+                    stage: IndexBuildStage::Declared,
+                    applied_cursor: None,
+                    created_at_ns: issued_at_ns,
+                };
+                state
+                    .indexes
+                    .insert(definition.index_id, definition.clone());
+                Ok((
+                    format!("declared Index {name} on Feed {feed}; no data is served until build and RF3 activation"),
                     json!(definition),
                 ))
             }
@@ -3249,6 +3387,23 @@ impl ControlController {
             }
             ResourceKind::Role => rename_named(&mut state.roles, current, new, "Role"),
             ResourceKind::Pipe => rename_named(&mut state.pipes, current, new, "Pipe"),
+            ResourceKind::Index => {
+                // Declared Indexes are catalog-only: renaming changes the
+                // definition name without touching storage state.
+                if state.indexes.values().any(|item| item.name == new) {
+                    return Err(ControlError::AlreadyExists(format!("Index {new}")));
+                }
+                let item = state
+                    .indexes
+                    .values_mut()
+                    .find(|item| item.name == current)
+                    .ok_or_else(|| ControlError::NotFound(format!("Index {current}")))?;
+                item.name = new.to_owned();
+                Ok((
+                    format!("renamed Index {current} to {new}"),
+                    serde_json::to_value(item.clone())?,
+                ))
+            }
         }
     }
 
@@ -3332,6 +3487,21 @@ impl ControlController {
                 Ok(result)
             }
             ResourceKind::Pipe => drop_named(&mut state.pipes, name, "Pipe"),
+            ResourceKind::Index => {
+                // Nothing depends on a declared Index and no built data can
+                // exist yet, so dropping removes the definition outright.
+                let index_id = state
+                    .indexes
+                    .values()
+                    .find(|item| item.name == name)
+                    .map(|item| item.index_id)
+                    .ok_or_else(|| ControlError::NotFound(format!("Index {name}")))?;
+                let item = state.indexes.remove(&index_id).expect("Index exists");
+                Ok((
+                    format!("dropped declared Index {name}; no built data existed"),
+                    json!(item),
+                ))
+            }
             ResourceKind::Role => {
                 let role_id = active_role(state, name)?.role_id;
                 state.grants.retain(|_, grant| grant.role_id != role_id);
@@ -3702,6 +3872,7 @@ fn parse_resource_kind(token: &str) -> Result<ResourceKind, ControlError> {
         "READER" => Ok(ResourceKind::Reader),
         "SUBSCRIPTION" => Ok(ResourceKind::Subscription),
         "PIPE" => Ok(ResourceKind::Pipe),
+        "INDEX" => Ok(ResourceKind::Index),
         "ROLE" => Ok(ResourceKind::Role),
         _ => Err(ControlError::Syntax(format!(
             "unsupported resource type {token}"
@@ -3718,6 +3889,7 @@ fn parse_show_kind(token: &str) -> Result<ShowKind, ControlError> {
         "READERS" => Ok(ShowKind::Readers),
         "SUBSCRIPTIONS" => Ok(ShowKind::Subscriptions),
         "PIPES" => Ok(ShowKind::Pipes),
+        "INDEXES" => Ok(ShowKind::Indexes),
         "ROLES" => Ok(ShowKind::Roles),
         "GRANTS" => Ok(ShowKind::Grants),
         _ => Err(ControlError::Syntax(format!(
@@ -3753,6 +3925,38 @@ fn expect_keyword(tokens: &[String], index: usize, expected: &str) -> Result<(),
             index + 1
         )))
     }
+}
+
+fn validate_index_fields(fields: &[IndexFieldSpec]) -> Result<(), ControlError> {
+    if fields.is_empty() || fields.len() > 16 {
+        return Err(ControlError::InvalidOperation(format!(
+            "an Index needs between 1 and 16 fields, got {}",
+            fields.len()
+        )));
+    }
+    for field in fields {
+        match field {
+            IndexFieldSpec::Key => {}
+            IndexFieldSpec::Metadata { name } if !name.is_empty() && name.len() <= 256 => {}
+            IndexFieldSpec::Metadata { .. } => {
+                return Err(ControlError::InvalidOperation(
+                    "Index Metadata field names must be 1-256 bytes".to_owned(),
+                ));
+            }
+            IndexFieldSpec::Projection {
+                extractor, field, ..
+            } if !extractor.is_empty()
+                && extractor.len() <= 256
+                && !field.is_empty()
+                && field.len() <= 256 => {}
+            IndexFieldSpec::Projection { .. } => {
+                return Err(ControlError::InvalidOperation(
+                    "Index Projection extractors and fields must be 1-256 bytes".to_owned(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_dotted_name(name: &str) -> Result<(), ControlError> {
@@ -4165,6 +4369,7 @@ fn show_resources(
             .values()
             .filter(|item| item.status == ResourceStatus::Active)
             .collect::<Vec<_>>()),
+        ShowKind::Indexes => json!(state.indexes.values().collect::<Vec<_>>()),
         ShowKind::Roles => json!(state
             .roles
             .values()
@@ -4238,6 +4443,12 @@ fn describe_resource(
             .find(|item| item.name == name && item.status == ResourceStatus::Active)
             .map(|item| json!(item))
             .ok_or_else(|| ControlError::NotFound(format!("Pipe {name}"))),
+        ResourceKind::Index => state
+            .indexes
+            .values()
+            .find(|item| item.name == name)
+            .map(|item| json!(item))
+            .ok_or_else(|| ControlError::NotFound(format!("Index {name}"))),
         ResourceKind::Role => Ok(json!(active_role(state, name)?)),
     }
 }
@@ -4466,6 +4677,7 @@ fn command_label(command: &Command) -> String {
         Command::CreateSpace { .. } => "CREATE SPACE",
         Command::CreateFeed { .. } => "CREATE FEED",
         Command::DefineStateStore { .. } => "DEFINE STATE STORE",
+        Command::DefineIndex { .. } => "DEFINE INDEX",
         Command::DefinePipe { .. } => "DEFINE PIPE",
         Command::CreateWriter { .. } => "CREATE WRITER",
         Command::OpenWriterSession { .. } => "OPEN WRITER SESSION",
@@ -4523,6 +4735,7 @@ fn resource_name(kind: &ResourceKind) -> &'static str {
         ResourceKind::Reader => "Reader",
         ResourceKind::Subscription => "Subscription",
         ResourceKind::Pipe => "Pipe",
+        ResourceKind::Index => "Index",
         ResourceKind::Role => "Role",
     }
 }
@@ -4535,6 +4748,7 @@ fn show_name(kind: &ShowKind) -> &'static str {
         ShowKind::Readers => "Readers",
         ShowKind::Subscriptions => "Subscriptions",
         ShowKind::Pipes => "Pipes",
+        ShowKind::Indexes => "Indexes",
         ShowKind::Roles => "Roles",
         ShowKind::Grants => "Grants",
         ShowKind::StorageNodes => "Storage Nodes",
@@ -5183,6 +5397,167 @@ mod tests {
                 .unwrap()
                 .source,
             StateStoreSource::Manual,
+        );
+    }
+
+    #[tokio::test]
+    async fn index_definitions_are_validated_scoped_idempotent_and_survive_snapshot() {
+        let directory = TempDir::new().unwrap();
+        let follower_directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader
+            .execute("CREATE SPACE accounts; CREATE FEED accounts.orders; CREATE SPACE other; CREATE FEED other.orders;")
+            .await
+            .unwrap();
+        let fields = vec![
+            IndexFieldSpec::Key,
+            IndexFieldSpec::Metadata {
+                name: "tenant".to_owned(),
+            },
+            IndexFieldSpec::Projection {
+                extractor: "json.path".to_owned(),
+                version: 1,
+                field: "customer.id".to_owned(),
+            },
+        ];
+        let request_id = Uuid::from_u128(99_001);
+        let command = vec![Command::DefineIndex {
+            name: "accounts.orders.by.customer".to_owned(),
+            feed: "accounts.orders".to_owned(),
+            fields: fields.clone(),
+            unique: false,
+            collation: IndexCollation::Binary,
+            consistency: IndexConsistency::Eventual,
+        }];
+        let first = leader
+            .execute_commands_with_request_id(command.clone(), request_id)
+            .await
+            .unwrap();
+        let repeated = leader
+            .execute_commands_with_request_id(command, request_id)
+            .await
+            .unwrap();
+        assert_eq!(first.results[0].data, repeated.results[0].data);
+        assert_eq!(first.results[0].data["stage"], "declared");
+        assert_eq!(first.results[0].data["consistency"], "eventual");
+        assert_eq!(first.results[0].data["collation"], "binary");
+        let feed_id = leader
+            .active_feed_by_name("accounts.orders")
+            .await
+            .unwrap()
+            .feed_id;
+        assert_eq!(first.results[0].data["feed_id"], feed_id.to_string());
+        assert_eq!(first.results[0].data["fields"].as_array().unwrap().len(), 3);
+
+        // UNIQUE stays refused until the replicated conditional-claim
+        // protocol exists.
+        assert!(leader
+            .execute_commands(vec![Command::DefineIndex {
+                name: "accounts.unique.customer".to_owned(),
+                feed: "accounts.orders".to_owned(),
+                fields: fields.clone(),
+                unique: true,
+                collation: IndexCollation::Binary,
+                consistency: IndexConsistency::Eventual,
+            }])
+            .await
+            .is_err());
+        // Duplicate name, cross-Domain feed, and unknown feed are refused.
+        for (name, feed) in [
+            ("accounts.orders.by.customer", "accounts.orders"),
+            ("accounts.cross.domain", "other.orders"),
+            ("accounts.unknown", "accounts.missing"),
+        ] {
+            assert!(leader
+                .execute_commands(vec![Command::DefineIndex {
+                    name: name.to_owned(),
+                    feed: feed.to_owned(),
+                    fields: fields.clone(),
+                    unique: false,
+                    collation: IndexCollation::Binary,
+                    consistency: IndexConsistency::Eventual,
+                }])
+                .await
+                .is_err());
+        }
+        // Field bounds: 1..=16 entries, non-empty and <=256-byte names.
+        for bad in [
+            vec![],
+            vec![IndexFieldSpec::Key; 17],
+            vec![IndexFieldSpec::Metadata {
+                name: String::new(),
+            }],
+            vec![IndexFieldSpec::Projection {
+                extractor: String::new(),
+                version: 1,
+                field: "f".to_owned(),
+            }],
+        ] {
+            assert!(leader
+                .execute_commands(vec![Command::DefineIndex {
+                    name: "accounts.bad".to_owned(),
+                    feed: "accounts.orders".to_owned(),
+                    fields: bad,
+                    unique: false,
+                    collation: IndexCollation::Binary,
+                    consistency: IndexConsistency::Eventual,
+                }])
+                .await
+                .is_err());
+        }
+
+        // SHOW INDEXES and DESCRIBE INDEX expose the persisted definition.
+        let shown = leader.execute("SHOW INDEXES;").await.unwrap();
+        assert_eq!(shown.results[0].data.as_array().unwrap().len(), 1);
+        let described = leader
+            .execute("DESCRIBE INDEX accounts.orders.by.customer;")
+            .await
+            .unwrap();
+        assert_eq!(
+            described.results[0].data["name"],
+            "accounts.orders.by.customer"
+        );
+        // Minimal typed-command JSON defaults unique/collation/consistency.
+        let minimal: Command = serde_json::from_value(serde_json::json!({
+            "command": "define_index",
+            "name": "accounts.minimal",
+            "feed": "accounts.orders",
+            "fields": [{"kind": "key"}]
+        }))
+        .unwrap();
+        assert!(matches!(
+            minimal,
+            Command::DefineIndex {
+                unique: false,
+                collation: IndexCollation::Binary,
+                consistency: IndexConsistency::Eventual,
+                ..
+            }
+        ));
+
+        let follower = new_controller(&follower_directory);
+        follower
+            .install_snapshot_bytes(&leader.snapshot_bytes().await.unwrap())
+            .await
+            .unwrap();
+        assert_eq!(follower.state.lock().await.indexes.len(), 1);
+        assert_eq!(
+            follower
+                .declared_index_by_name("accounts.orders.by.customer")
+                .await
+                .unwrap()
+                .feed_id,
+            feed_id,
+        );
+        drop(leader);
+        let reopened = new_controller(&directory);
+        assert_eq!(
+            reopened
+                .declared_index_by_name("accounts.orders.by.customer")
+                .await
+                .unwrap()
+                .stage,
+            IndexBuildStage::Declared,
         );
     }
 

@@ -482,6 +482,8 @@ SHOW ROLES;
 
 SHOW GRANTS;
 
+SHOW INDEXES;
+
 ```
 
 
@@ -508,9 +510,41 @@ DESCRIBE SUBSCRIPTION orders.billing;
 
 DESCRIBE ROLE orderanalytics;
 
+DESCRIBE INDEX orders.by.customer;
+
 ```
 
 
+
+## Declare a secondary Index
+
+Secondary Indexes are declared through the typed Control Plane command
+surface (`POST /v1/admin/commands`), then inspected via `SHOW INDEXES;`
+and `DESCRIBE INDEX <name>;`. A definition is Domain-scoped, names its
+source Feed, and carries typed fields/extractors plus collation and
+consistency intent:
+
+```json
+{"command": "define_index",
+ "name": "orders.by.customer",
+ "feed": "orders.created",
+ "fields": [
+   {"kind": "metadata", "name": "tenant"},
+   {"kind": "projection", "extractor": "json.path", "version": 1,
+    "field": "customer.id"}],
+ "collation": "binary",
+ "consistency": "eventual"}
+```
+
+`fields` take 1–16 entries of `key`, `metadata`, or versioned
+`projection` extractor specs. `collation` defaults to `binary` and
+`consistency` to `eventual`; `strict` is accepted as intent. `unique`
+is rejected until the replicated conditional-claim protocol exists.
+
+Declared Indexes persist in the replicated catalog and snapshots but
+serve **no data** — the stage stays `declared` until extraction, RF3
+replication, and the Feed-to-Index commit land. `RENAME INDEX` and
+`DROP INDEX` work on declared definitions.
 
 ## Inspect Active Range placement
 
