@@ -14184,4 +14184,429 @@ mod tests {
             .insert(Uuid::from_u128(9_104), 1);
         assert!(subscription_placement_diverged(&members));
     }
+
+    /// The M7 proof: Domain-wide membership and server-owned source
+    /// Metadata behave correctly on an isolated multi-Node Riverbed —
+    /// empty+populated Domain declaration, incremental attach, concurrent
+    /// independent Subscriptions, in-flight Reader across rename,
+    /// cross-Domain drain/reattach, fenced drop + same-name replacement,
+    /// and reads that keep working with one replica unavailable.
+    #[tokio::test]
+    async fn domain_subscriptions_and_source_metadata_on_an_isolated_riverbed() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let nodes: Vec<crate::active_range::StorageNodeId> =
+            ["storage-1", "storage-2", "storage-3"]
+                .into_iter()
+                .map(|name| crate::active_range::StorageNodeId::try_new(name).unwrap())
+                .collect();
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store.clone(),
+                nodes.clone(),
+            )
+            .unwrap(),
+        );
+        control
+            .execute("CREATE SPACE orders; CREATE SPACE other;")
+            .await
+            .unwrap();
+
+        // Empty-Domain declaration is legal; no member Feeds yet.
+        control
+            .execute("CREATE SUBSCRIPTION orders.all FROM DOMAIN orders;")
+            .await
+            .unwrap();
+        let described = control
+            .execute("DESCRIBE SUBSCRIPTION orders.all;")
+            .await
+            .unwrap();
+        assert_eq!(
+            described.results[0].data["member_feeds"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // Feeds attach in the same commit that creates them — new Feeds
+        // start at their first retained record.
+        control
+            .execute("CREATE FEED orders.events; CREATE FEED orders.audit;")
+            .await
+            .unwrap();
+        // Independent Subscriptions coexist: a second Domain source, an
+        // exact-Feed one, and a named Reader for the delivery proof.
+        control
+            .execute("CREATE SUBSCRIPTION orders.tail FROM DOMAIN orders START AT NOW;")
+            .await
+            .unwrap();
+        control
+            .execute("CREATE SUBSCRIPTION orders.pinned FROM orders.events;")
+            .await
+            .unwrap();
+        control
+            .execute("CREATE READER orders.reader FROM orders.events;")
+            .await
+            .unwrap();
+        control
+            .execute("CREATE SUBSCRIPTION other.cover FROM DOMAIN other;")
+            .await
+            .unwrap();
+
+        // Seed committed history on both Feeds' replicas (one replica root
+        // per Node; range directories key by feed_id underneath).
+        for feed_name in ["orders.events", "orders.audit"] {
+            let feed = control.active_feed_by_name(feed_name).await.unwrap();
+            let range = control.active_range_assignment(feed.feed_id).await.unwrap();
+            let descriptor = ActiveRangeDescriptor {
+                feed_id: feed.feed_id,
+                range_id: range.range_id,
+                generation: range.generation,
+                ownership_epoch: range.ownership_epoch,
+            };
+            for replica in range.replicas.iter() {
+                let index = nodes.iter().position(|node| node == replica).unwrap();
+                crate::active_range::store::seed_committed_history_shaped(
+                    &directory.path().join(format!("ranges-{index}")),
+                    &descriptor,
+                    4,
+                    &|sequence| format!("key-{feed_name}-{sequence}").into_bytes(),
+                    &|sequence| sequence as i64,
+                    8,
+                );
+            }
+        }
+
+        let control_key = "this-is-a-long-control-plane-key".to_owned();
+        let mut listeners = Vec::new();
+        let mut endpoints = BTreeMap::new();
+        for node in &nodes {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            endpoints.insert(
+                node.clone(),
+                format!("http://{}", listener.local_addr().unwrap()),
+            );
+            listeners.push(listener);
+        }
+        let mut servers = Vec::new();
+        for (index, node) in nodes.iter().enumerate() {
+            let listener = listeners.remove(0);
+            listener.set_nonblocking(true).unwrap();
+            let membership = Arc::new(MembershipService::new(
+                MemberAnnouncement {
+                    node_id: format!("test-node-{index}"),
+                    api_url: "http://test-node:7070".to_owned(),
+                    capacity: 100,
+                },
+                vec![],
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            ));
+            let state = AppState {
+                store: store.clone(),
+                membership,
+                demand: DemandMetrics::default(),
+                autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                control: control.clone(),
+                control_plane: None,
+                progress_authority: control.clone(),
+                replica_append: Some(Arc::new(ReplicaAppendService::new(
+                    directory.path().join(format!("ranges-{index}")),
+                    node.clone(),
+                    control.clone(),
+                ))),
+                majority_append: None,
+                subscription_progress: None,
+                effect_journal: None,
+                state_store_journal: None,
+                subscription_mtls_enabled: false,
+                storage_node_id: Some(node.clone()),
+                control_endpoints: Arc::new(endpoints.clone().into()),
+                internal_key: Some(control_key.clone()),
+                internal_http: reqwest::Client::new(),
+                internal_mtls: None,
+                admin_auth: AdminAuthenticator::new(Some(
+                    "this-is-a-long-development-api-key".to_owned(),
+                ))
+                .unwrap(),
+            };
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, router(state)).await.unwrap();
+            }));
+        }
+        let client = reqwest::Client::new();
+        let admin = "this-is-a-long-development-api-key";
+
+        // Member Feeds attached atomically: orders.all covers both orders
+        // Feeds at Beginning; orders.tail honors its declared NOW start.
+        let described = control
+            .execute("DESCRIBE SUBSCRIPTION orders.all;")
+            .await
+            .unwrap();
+        let members = described.results[0].data["member_feeds"]
+            .as_array()
+            .unwrap();
+        assert_eq!(members.len(), 2);
+        assert!(members
+            .iter()
+            .all(|member| member["state"] == "active" && member["start"]["kind"] == "beginning"));
+        let described = control
+            .execute("DESCRIBE SUBSCRIPTION orders.tail;")
+            .await
+            .unwrap();
+        assert!(described.results[0].data["member_feeds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|member| member["start"]["kind"] == "now"));
+
+        // Every delivered record carries server-owned source Metadata:
+        // last-segment feed_name, Domain-qualified full_feed_name, and the
+        // immutable feed_id — separate from writer metadata.
+        let events = control.active_feed_by_name("orders.events").await.unwrap();
+        for feed_name in ["orders.events", "orders.audit"] {
+            let feed = control.active_feed_by_name(feed_name).await.unwrap();
+            let response = client
+                .get(format!(
+                    "{}/v1/feeds/records?feed={feed_name}&limit=10",
+                    endpoints[&nodes[0]]
+                ))
+                .bearer_auth(admin)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let records = response.json::<serde_json::Value>().await.unwrap();
+            assert_eq!(records.as_array().unwrap().len(), 4);
+            let source = &records[0]["source"];
+            let short = feed_name.rsplit('.').next().unwrap();
+            assert_eq!(source["feed_name"], short);
+            assert_eq!(source["full_feed_name"], feed_name);
+            assert_eq!(source["feed_id"], feed.feed_id.to_string());
+        }
+
+        // A named Reader in flight: open, fetch, then rename the Feed
+        // within the Domain — Cursor stays stable, new deliveries report
+        // the new names, membership is retained by immutable FeedId.
+        let opened = client
+            .post(format!("{}/v1/readers/open", endpoints[&nodes[1]]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "request_id": Uuid::new_v4(),
+                "reader": "orders.reader",
+                "capacity": 8,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(opened.status(), StatusCode::OK);
+        let session_epoch = opened.json::<serde_json::Value>().await.unwrap()["session_epoch"]
+            .as_u64()
+            .unwrap();
+        let fetched = client
+            .post(format!("{}/v1/readers/fetch", endpoints[&nodes[1]]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "request_id": Uuid::new_v4(),
+                "reader": "orders.reader",
+                "session_epoch": session_epoch,
+                "limit": 2,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let records = fetched.json::<serde_json::Value>().await.unwrap()["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["source"]["full_feed_name"], "orders.events");
+
+        control
+            .execute("RENAME FEED orders.events TO orders.renamed;")
+            .await
+            .unwrap();
+        let described = control
+            .execute("DESCRIBE SUBSCRIPTION orders.all;")
+            .await
+            .unwrap();
+        let member = described.results[0].data["member_feeds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["feed_id"] == events.feed_id.to_string())
+            .unwrap();
+        assert_eq!(member["state"], "active");
+
+        // The in-flight Reader keeps working under the new name — same
+        // FeedId in source Metadata, no Cursor reset.
+        let fetched = client
+            .post(format!("{}/v1/readers/fetch", endpoints[&nodes[1]]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "request_id": Uuid::new_v4(),
+                "reader": "orders.reader",
+                "session_epoch": session_epoch,
+                "limit": 4,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(fetched.status(), StatusCode::OK);
+        let records = fetched.json::<serde_json::Value>().await.unwrap()["records"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(!records.is_empty());
+        assert_eq!(records[0]["source"]["full_feed_name"], "orders.renamed");
+        assert_eq!(records[0]["source"]["feed_name"], "renamed");
+        assert_eq!(records[0]["source"]["feed_id"], events.feed_id.to_string());
+
+        // Cross-Domain move: drains orders.all coverage (fenced, not
+        // discarded) and attaches under other.cover as a new discovery.
+        let audit_id = control
+            .active_feed_by_name("orders.audit")
+            .await
+            .unwrap()
+            .feed_id;
+        control
+            .execute("RENAME FEED orders.audit TO other.audit;")
+            .await
+            .unwrap();
+        let described = control
+            .execute("DESCRIBE SUBSCRIPTION orders.all;")
+            .await
+            .unwrap();
+        let member = described.results[0].data["member_feeds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["feed_id"] == audit_id.to_string())
+            .unwrap();
+        assert_eq!(member["state"], "draining");
+        let described = control
+            .execute("DESCRIBE SUBSCRIPTION other.cover;")
+            .await
+            .unwrap();
+        let member = described.results[0].data["member_feeds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["feed_id"] == audit_id.to_string())
+            .unwrap();
+        assert_eq!(member["state"], "active");
+
+        // One replica Node is unavailable: reads on the other Feed still
+        // succeed through the live owner plus a corroborating replica.
+        let events_range = control
+            .active_range_assignment(events.feed_id)
+            .await
+            .unwrap();
+        let kill = nodes
+            .iter()
+            .position(|node| node != &events_range.owner)
+            .unwrap();
+        servers[kill].abort();
+        let survivor = (0..3).find(|index| *index != kill).unwrap();
+        let response = client
+            .get(format!(
+                "{}/v1/feeds/records?feed=orders.renamed&limit=10",
+                endpoints[&nodes[survivor]]
+            ))
+            .bearer_auth(admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+
+        // Fenced drop: a covered Feed cannot be dropped under a Domain
+        // Subscription; an explicit subscription drop is the disposition,
+        // and a same-name replacement gets fresh progress via a new FeedId.
+        assert!(control.execute("DROP FEED orders.renamed;").await.is_err());
+        // Every attached consumer — covering Domain Subscriptions, the
+        // exact-Feed one, and the in-flight Reader — is an explicit
+        // disposition before the Feed may drop.
+        control
+            .execute("DROP SUBSCRIPTION orders.all;")
+            .await
+            .unwrap();
+        assert!(control.execute("DROP FEED orders.renamed;").await.is_err());
+        control
+            .execute("DROP SUBSCRIPTION orders.tail; DROP SUBSCRIPTION orders.pinned; DROP READER orders.reader;")
+            .await
+            .unwrap();
+        control.execute("DROP FEED orders.renamed;").await.unwrap();
+        // Dropped names tombstone — a same-name replacement cannot
+        // silently alias the old Feed's identity or progress.
+        assert!(control
+            .execute("CREATE FEED orders.renamed;")
+            .await
+            .is_err());
+        // A fresh Subscription over the Domain starts with no members (the
+        // only orders Feed is dropped; audit moved away); moving audit back
+        // reattaches it as a fresh Active member under the new
+        // Subscription — the drained row died with the dropped one.
+        control
+            .execute("CREATE SUBSCRIPTION orders.cover2 FROM DOMAIN orders;")
+            .await
+            .unwrap();
+        control
+            .execute("RENAME FEED other.audit TO orders.audit;")
+            .await
+            .unwrap();
+        let described = control
+            .execute("DESCRIBE SUBSCRIPTION orders.cover2;")
+            .await
+            .unwrap();
+        let members = described.results[0].data["member_feeds"]
+            .as_array()
+            .unwrap();
+        assert_eq!(members.len(), 1);
+        assert!(members.iter().any(|member| {
+            member["feed_id"] == audit_id.to_string() && member["state"] == "active"
+        }));
+        // ... while the move drained its coverage under other.cover.
+        let described = control
+            .execute("DESCRIBE SUBSCRIPTION other.cover;")
+            .await
+            .unwrap();
+        let member = described.results[0].data["member_feeds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|member| member["feed_id"] == audit_id.to_string())
+            .unwrap();
+        assert_eq!(member["state"], "draining");
+
+        // Membership state survives catalog restart.
+        let reopened = ControlController::open_with_storage_nodes(
+            directory.path().join("catalog.json"),
+            store.clone(),
+            nodes.clone(),
+        )
+        .unwrap();
+        let described = reopened
+            .execute("DESCRIBE SUBSCRIPTION orders.cover2;")
+            .await
+            .unwrap();
+        assert!(!described.results[0].data["member_feeds"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
 }
