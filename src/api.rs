@@ -1095,11 +1095,10 @@ async fn member_coordinator(
     ),
     ApiError,
 > {
-    let definition = state
-        .control
-        .active_subscription_by_name(subscription)
-        .await
-        .ok_or_else(|| ApiError::bad_request("Subscription does not exist or is not active"))?;
+    let definition =
+        subscription_when_applied(&state.control, subscription, state.control_plane.is_some())
+            .await
+            .ok_or_else(|| ApiError::bad_request("Subscription does not exist or is not active"))?;
     let assignment = state
         .control
         .active_subscription_progress_assignment_by_id(definition.subscription_id)
@@ -2811,11 +2810,13 @@ async fn reader_fetch(
     Json(request): Json<ReaderFetchRequest>,
 ) -> Result<Json<ReaderFetchResponse>, ApiError> {
     authorize_admin(&state, &headers)?;
-    let reader = state
-        .control
-        .active_reader_by_name(&request.reader)
-        .await
-        .ok_or_else(|| ApiError::bad_request("Reader does not exist"))?;
+    let reader = reader_when_applied(
+        &state.control,
+        &request.reader,
+        state.control_plane.is_some(),
+    )
+    .await
+    .ok_or_else(|| ApiError::bad_request("Reader does not exist"))?;
     if !reader.session_active || reader.session_epoch != request.session_epoch {
         return Err(ApiError::bad_request("Reader session is stale or inactive"));
     }
@@ -3059,9 +3060,7 @@ async fn temporary_reader_fetch(
         .map_err(|_| {
             ApiError::bad_request("after_event_time_ns must be signed epoch nanoseconds")
         })?;
-    let feed = state
-        .control
-        .active_feed_by_name(&request.feed)
+    let feed = feed_when_applied(&state.control, &request.feed, state.control_plane.is_some())
         .await
         .ok_or_else(|| ApiError::bad_request("Feed does not exist"))?;
     let limit = request.limit.unwrap_or(100).clamp(1, 10_000);
@@ -5470,6 +5469,42 @@ async fn writer_when_applied(
     writer
 }
 
+async fn reader_when_applied(
+    control: &ControlController,
+    name: &str,
+    wait_for_replication: bool,
+) -> Option<crate::control::ReaderDefinition> {
+    let mut reader = control.active_reader_by_name(name).await;
+    if reader.is_none() && wait_for_replication {
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            reader = control.active_reader_by_name(name).await;
+            if reader.is_some() {
+                break;
+            }
+        }
+    }
+    reader
+}
+
+async fn subscription_when_applied(
+    control: &ControlController,
+    name: &str,
+    wait_for_replication: bool,
+) -> Option<crate::control::SubscriptionDefinition> {
+    let mut subscription = control.active_subscription_by_name(name).await;
+    if subscription.is_none() && wait_for_replication {
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            subscription = control.active_subscription_by_name(name).await;
+            if subscription.is_some() {
+                break;
+            }
+        }
+    }
+    subscription
+}
+
 async fn writer_session_append(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5598,9 +5633,9 @@ async fn client_append(
     Json(request): Json<ClientAppendRequest>,
 ) -> Result<Json<WriterAppendResponse>, ApiError> {
     authorize_admin(&state, &headers)?;
-    let feed = state
-        .control
-        .active_feed_by_name(&request.feed)
+    // A freshly committed CREATE FEED applies on follower replicas a
+    // few ms later; the bounded wait hides that read-after-write gap.
+    let feed = feed_when_applied(&state.control, &request.feed, state.control_plane.is_some())
         .await
         .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", request.feed)))?;
     route_append_to_owner(&state, feed.feed_id, request)
@@ -6835,9 +6870,7 @@ async fn read_feed_records(
     Query(query): Query<FeedReadQuery>,
 ) -> Result<Json<Vec<RecordResponse>>, ApiError> {
     authorize_admin(&state, &headers)?;
-    let feed = state
-        .control
-        .active_feed_by_name(&query.feed)
+    let feed = feed_when_applied(&state.control, &query.feed, state.control_plane.is_some())
         .await
         .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", query.feed)))?;
     let frames = read_complete_feed(
@@ -7676,6 +7709,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(writer.name, "orders.writer");
+        applied.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reader_lookup_waits_for_committed_metadata_to_apply_on_ingress() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store,
+                ["storage-1", "storage-2", "storage-3"]
+                    .into_iter()
+                    .map(|node| StorageNodeId::try_new(node).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        assert!(reader_when_applied(&control, "orders.audit", false)
+            .await
+            .is_none());
+        let delayed = control.clone();
+        let applied = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            delayed
+                .execute_commands(vec![
+                    Command::CreateSpace {
+                        name: "orders".to_owned(),
+                    },
+                    Command::CreateFeed {
+                        name: "orders.events".to_owned(),
+                    },
+                    Command::CreateReader {
+                        name: "orders.audit".to_owned(),
+                        feed: "orders.events".to_owned(),
+                        start: crate::control::ReaderStart::Beginning,
+                    },
+                ])
+                .await
+                .unwrap();
+        });
+        let reader = reader_when_applied(&control, "orders.audit", true)
+            .await
+            .unwrap();
+        assert_eq!(reader.name, "orders.audit");
+        applied.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_lookup_waits_for_committed_metadata_to_apply_on_ingress() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store,
+                ["storage-1", "storage-2", "storage-3"]
+                    .into_iter()
+                    .map(|node| StorageNodeId::try_new(node).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        assert!(subscription_when_applied(&control, "orders.billing", false)
+            .await
+            .is_none());
+        let delayed = control.clone();
+        let applied = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            delayed
+                .execute_commands(vec![
+                    Command::CreateSpace {
+                        name: "orders".to_owned(),
+                    },
+                    Command::CreateFeed {
+                        name: "orders.events".to_owned(),
+                    },
+                    Command::CreateSubscription {
+                        name: "orders.billing".to_owned(),
+                        feed: "orders.events".to_owned(),
+                        start: crate::control::ReaderStart::Beginning,
+                    },
+                ])
+                .await
+                .unwrap();
+        });
+        let subscription = subscription_when_applied(&control, "orders.billing", true)
+            .await
+            .unwrap();
+        assert_eq!(subscription.name, "orders.billing");
         applied.await.unwrap();
     }
 
