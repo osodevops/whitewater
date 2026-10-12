@@ -703,6 +703,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/subscriptions/seek", post(subscription_seek))
         .route("/v1/feeds/records", get(read_feed_records))
         .route("/v1/feeds/records/search", get(search_feed_records))
+        .route("/v1/feeds/records/lookup", get(lookup_feed_record))
         .route("/v1/admin/wcl", post(execute_admin_wcl))
         .route("/v1/admin/commands", post(execute_admin_commands))
         .route("/v1/admin/ranges/split", post(admin_split_range))
@@ -10334,6 +10335,95 @@ async fn search_feed_records(
     })))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeedLookupQuery {
+    feed: String,
+    cursor: String,
+}
+
+/// Single-record investigation: resolve one opaque Cursor to the committed
+/// record it names. The Cursor says which Range holds it only implicitly,
+/// so each committed Range's owner-side index is probed in turn; a
+/// rejection means the Cursor lives elsewhere while an owner failure
+/// propagates rather than masquerading as a miss.
+async fn lookup_feed_record(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FeedLookupQuery>,
+) -> Result<Json<RecordResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let feed = feed_when_applied(&state.control, &query.feed, state.control_plane.is_some())
+        .await
+        .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", query.feed)))?;
+    let assignments = read_placement(&state, feed.feed_id, &feed.name).await?;
+    for assignment in &assignments {
+        let probe = fetch_range_page(
+            &state,
+            ReadRangePageRequest {
+                assignment: assignment.clone(),
+                after: None,
+                expected_commit: None,
+                after_cursor: Some(query.cursor.clone()),
+                tail_count: None,
+                single_range: true,
+                page_limit: Some(1),
+            },
+        )
+        .await;
+        let (committed, position) = match probe {
+            Ok(page) => (Some(page.committed), page.resolved_after),
+            Err(error) if error.status == StatusCode::BAD_REQUEST => continue,
+            Err(error) => return Err(error),
+        };
+        let Some(position) = position else {
+            continue;
+        };
+        // The cursor page resolves positions after the Cursor; read the
+        // single frame at the resolved position itself.
+        let page = fetch_range_page(
+            &state,
+            ReadRangePageRequest {
+                assignment: assignment.clone(),
+                after: Some(RangePosition::new(position.value().saturating_sub(1))),
+                expected_commit: committed,
+                after_cursor: None,
+                tail_count: None,
+                single_range: true,
+                page_limit: Some(1),
+            },
+        )
+        .await?;
+        let Some(frame) = page.frames.into_iter().next() else {
+            return Err(ApiError::unavailable(
+                "resolved Cursor position no longer returns a committed frame",
+            ));
+        };
+        if frame.cursor != query.cursor {
+            return Err(ApiError::unavailable(
+                "resolved Cursor position does not hold the requested frame",
+            ));
+        }
+        let decoded = STANDARD
+            .decode(frame.frame_base64.as_bytes())
+            .map_err(|_| {
+                ApiError::unavailable("current owner returned an invalid frame encoding")
+            })?;
+        let record =
+            decode_record(&decoded).map_err(|error| ApiError::unavailable(error.to_string()))?;
+        return Ok(Json(record_response(
+            CursorRecord {
+                cursor: frame.cursor,
+                record,
+            },
+            RecordSource::of(&feed),
+        )));
+    }
+    Err(ApiError::bad_request(
+        "Cursor is unknown, uncommitted, or belongs to another Feed",
+    ))
+}
+
 async fn read_feed_records(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -15766,6 +15856,31 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) = search(&[("feed", "orders.events"), ("key_base64", "!!!")]).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Single-record investigation: one opaque Cursor resolves to the
+        // record it names regardless of which Range holds it.
+        let right_search_key = routed_key(1, split_at);
+        for (cursor, expected_key) in [("cursor-4", &search_key), ("cursor-3", &right_search_key)] {
+            let response = client
+                .get(format!("{}/v1/feeds/records/lookup", endpoints[&nodes[0]]))
+                .query(&[("feed", "orders.events"), ("cursor", cursor)])
+                .bearer_auth("this-is-a-long-development-api-key")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["cursor"], json!(cursor));
+            assert_eq!(body["key_base64"], json!(STANDARD.encode(expected_key)));
+        }
+        let response = client
+            .get(format!("{}/v1/feeds/records/lookup", endpoints[&nodes[0]]))
+            .query(&[("feed", "orders.events"), ("cursor", "cursor-404")])
+            .bearer_auth("this-is-a-long-development-api-key")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
         let (status, body) = read_feed("orders.deep", None, 12_000).await;
         assert_eq!(status, StatusCode::OK);

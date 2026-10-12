@@ -92,6 +92,17 @@ Each call scans at most 10,000 committed frames in the same merged order the pla
 
 `key_base64` is required and must be valid base64; an unknown `after` Cursor fails closed like the plain read. Event-time and Metadata filters remain planned; exact-Key lookup is the first-class investigation path today.
 
+### Single-record lookup
+
+`GET /v1/feeds/records/lookup` resolves one opaque Cursor to the committed record it names — the smallest investigation unit, for example the frame a search match or a support ticket points at:
+
+```http
+GET /v1/feeds/records/lookup?feed=orders.events&cursor=<cursor>
+Authorization: Bearer <api-key>
+```
+
+The Cursor carries no public Range identity, so each committed Range's owner-side index is probed in turn; a Range that does not hold the Cursor rejects the probe and the next Range is tried, while an unavailable or disagreeing owner fails the whole lookup rather than masquerading as a miss. A Cursor no Range resolves returns the same `Cursor is unknown, uncommitted, or belongs to another Feed` rejection as the plain read. The response is the same committed `RecordResponse` shape the read and search endpoints return.
+
 ## Execute WCL
 
 ```http
