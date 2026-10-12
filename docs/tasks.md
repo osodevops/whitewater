@@ -1184,6 +1184,9 @@ Additional evidence:
 
 
 
+- [x] Add manual StateStore named keys, typed secondary lookups, bounded iteration, journaled clear, and drop lifecycle. `StateStoreDefinition.named_keys` declares up to 10 lowercase secondary keys (`unique` flag) on manual stores (feed-sourced projections remain future work); `put_row` mutations carry typed `IndexValue` named values stamped server-side from the declaration, and `IndexStoreStateApply` commits the primary row plus posting/unique-claim changes in one Fjall batch — non-unique keys map one value to many primary keys (the group/list read), unique claims arbitrate first-committed-wins by journal order so a conflicting put is a deterministic no-op rather than a replication poison. `POST /v1/state-stores/get-by` resolves a named value to its primary rows with `lookup`'s any-ingress routing, strict bounded-wait, and `index_behind` contract; `POST /v1/state-stores/iterate` returns bounded primary-key-ordered pages over the same row set replica transfer serves with `pinned_seq` freshness; `POST /v1/state-stores/clear` empties a manual store as one journaled `ClearAll` mutation applied in bounded 512-row batches (durable, `mutation_id`-idempotent, restart-replayed); `DROP STATESTORE`/`RENAME STATESTORE` tombstone names against recreation, remove the RF3 placement so all data paths refuse, and leave applied rows on replicas until a bounded reclaim pass (documented orphan-row model). Covered by journal/apply unit tests (postings, unique claims, clear, named read), a catalog lifecycle test (tombstone, rename, restart persistence), and a 3-Node in-process HTTP e2e over the full declare-mutate-getby-iterate-clear lifecycle.
+
+
 Definition of Done:
 
 

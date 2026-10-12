@@ -62,10 +62,26 @@ pub enum StateStoreSource {
     Feed { feed_id: Uuid },
 }
 
+/// The maximum named secondary keys one StateStore may declare: bounds the
+/// posting writes one row mutation performs and matches the SDK surface.
+pub const MAX_STATE_STORE_NAMED_KEYS: usize = 10;
+
+/// One named secondary lookup key on a StateStore. `unique` claims each
+/// value for exactly one primary row (writes conflict on contention);
+/// non-unique keys keep a postings list so one value resolves to every
+/// matching row — the "group/list" shape.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NamedStateStoreKey {
+    pub name: String,
+    #[serde(default)]
+    pub unique: bool,
+}
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum StateStoreStage {
     Declared,
+    Dropped,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,6 +91,10 @@ pub struct StateStoreDefinition {
     pub space_id: Uuid,
     pub source: StateStoreSource,
     pub stage: StateStoreStage,
+    /// Declared named secondary keys. Empty for stores defined before the
+    /// named-key surface — they serve primary-key lookups only.
+    #[serde(default)]
+    pub named_keys: Vec<NamedStateStoreKey>,
     pub created_at_ns: i64,
 }
 
@@ -634,6 +654,7 @@ pub enum ResourceKind {
     Role,
     Pipe,
     Index,
+    StateStore,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -667,6 +688,8 @@ pub enum Command {
     DefineStateStore {
         name: String,
         source: StateStoreSourceRequest,
+        #[serde(default)]
+        named_keys: Vec<NamedStateStoreKey>,
     },
     DefineIndex {
         name: String,
@@ -1735,7 +1758,7 @@ impl ControlController {
             .await
             .state_stores
             .values()
-            .find(|store| store.name == name)
+            .find(|store| store.name == name && store.stage != StateStoreStage::Dropped)
             .cloned()
     }
 
@@ -2015,8 +2038,13 @@ impl ControlController {
                 )?;
                 Ok((format!("created Feed {name}"), json!(definition)))
             }
-            Command::DefineStateStore { name, source } => {
+            Command::DefineStateStore {
+                name,
+                source,
+                named_keys,
+            } => {
                 validate_dotted_name(&name)?;
+                validate_named_keys(&named_keys)?;
                 if state.state_stores.values().any(|item| item.name == name) {
                     return Err(ControlError::AlreadyExists(name));
                 }
@@ -2024,6 +2052,12 @@ impl ControlController {
                 let source = match source {
                     StateStoreSourceRequest::Manual => StateStoreSource::Manual,
                     StateStoreSourceRequest::Feed { feed } => {
+                        if !named_keys.is_empty() {
+                            return Err(ControlError::InvalidOperation(
+                                "named keys require a manual StateStore until a declared                                  source-Feed projection exists"
+                                    .to_owned(),
+                            ));
+                        }
                         let definition = active_feed(state, &feed)?;
                         if definition.space_id != space_id {
                             return Err(ControlError::InvalidOperation(
@@ -2056,6 +2090,7 @@ impl ControlController {
                     space_id,
                     source,
                     stage: StateStoreStage::Declared,
+                    named_keys,
                     created_at_ns: issued_at_ns,
                 };
                 state
@@ -3872,6 +3907,24 @@ impl ControlController {
                     serde_json::to_value(item.clone())?,
                 ))
             }
+            ResourceKind::StateStore => {
+                // Renaming relabels the catalog entry only — store_id carries
+                // identity for journals, placements, and named-key postings.
+                // Dropped tombstones still occupy their names.
+                if state.state_stores.values().any(|item| item.name == new) {
+                    return Err(ControlError::AlreadyExists(format!("StateStore {new}")));
+                }
+                let item = state
+                    .state_stores
+                    .values_mut()
+                    .find(|item| item.name == current && item.stage != StateStoreStage::Dropped)
+                    .ok_or_else(|| ControlError::NotFound(format!("StateStore {current}")))?;
+                item.name = new.to_owned();
+                Ok((
+                    format!("renamed StateStore {current} to {new}"),
+                    serde_json::to_value(item.clone())?,
+                ))
+            }
         }
     }
 
@@ -3984,6 +4037,32 @@ impl ControlController {
                 Ok((
                     format!("dropped declared Index {name}; no built data existed"),
                     json!(item),
+                ))
+            }
+            ResourceKind::StateStore => {
+                // Dropping tombstones the definition so the name cannot be
+                // recreated and removes the RF3 placement so mutation, read,
+                // and replay paths refuse. Rows already applied on replicas
+                // remain until a bounded reclaim pass — the same orphan-row
+                // model as dropped Feed history.
+                let store_id = state
+                    .state_stores
+                    .values()
+                    .find(|item| item.name == name && item.stage != StateStoreStage::Dropped)
+                    .map(|item| item.store_id)
+                    .ok_or_else(|| ControlError::NotFound(format!("StateStore {name}")))?;
+                let item = state
+                    .state_stores
+                    .get_mut(&store_id)
+                    .expect("StateStore exists");
+                item.stage = StateStoreStage::Dropped;
+                let dropped = item.clone();
+                state.state_store_assignments.remove(&store_id);
+                Ok((
+                    format!(
+                        "dropped StateStore {name}; applied rows remain on replicas until reclaim"
+                    ),
+                    json!(dropped),
                 ))
             }
             ResourceKind::Role => {
@@ -4538,6 +4617,7 @@ fn parse_resource_kind(token: &str) -> Result<ResourceKind, ControlError> {
         "SUBSCRIPTION" => Ok(ResourceKind::Subscription),
         "PIPE" => Ok(ResourceKind::Pipe),
         "INDEX" => Ok(ResourceKind::Index),
+        "STATESTORE" => Ok(ResourceKind::StateStore),
         "ROLE" => Ok(ResourceKind::Role),
         _ => Err(ControlError::Syntax(format!(
             "unsupported resource type {token}"
@@ -4693,6 +4773,35 @@ fn validate_index_fields(fields: &[IndexFieldSpec]) -> Result<(), ControlError> 
                     "Index Projection extractors and fields must be 1-256 bytes".to_owned(),
                 ));
             }
+        }
+    }
+    Ok(())
+}
+
+/// Named keys are single-segment lowercase identifiers (`passport`,
+/// `dept_code`): `^[a-z][a-z0-9_]*$`, at most 64 bytes, distinct per store.
+fn validate_named_keys(named_keys: &[NamedStateStoreKey]) -> Result<(), ControlError> {
+    if named_keys.len() > MAX_STATE_STORE_NAMED_KEYS {
+        return Err(ControlError::InvalidOperation(format!(
+            "a StateStore supports at most {MAX_STATE_STORE_NAMED_KEYS} named keys"
+        )));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for key in named_keys {
+        let name = &key.name;
+        let valid = !name.is_empty()
+            && name.len() <= 64
+            && name.as_bytes()[0].is_ascii_lowercase()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        if !valid {
+            return Err(ControlError::InvalidName(name.clone()));
+        }
+        if !seen.insert(name.clone()) {
+            return Err(ControlError::AlreadyExists(format!(
+                "duplicate named key {name}"
+            )));
         }
     }
     Ok(())
@@ -5283,6 +5392,12 @@ fn describe_resource(
             .find(|item| item.name == name)
             .map(|item| json!(item))
             .ok_or_else(|| ControlError::NotFound(format!("Index {name}"))),
+        ResourceKind::StateStore => state
+            .state_stores
+            .values()
+            .find(|item| item.name == name && item.stage != StateStoreStage::Dropped)
+            .map(|item| json!(item))
+            .ok_or_else(|| ControlError::NotFound(format!("StateStore {name}"))),
         ResourceKind::Role => Ok(json!(active_role(state, name)?)),
     }
 }
@@ -5574,6 +5689,7 @@ fn resource_name(kind: &ResourceKind) -> &'static str {
         ResourceKind::Subscription => "Subscription",
         ResourceKind::Pipe => "Pipe",
         ResourceKind::Index => "Index",
+        ResourceKind::StateStore => "StateStore",
         ResourceKind::Role => "Role",
     }
 }
@@ -6160,6 +6276,7 @@ mod tests {
             source: StateStoreSourceRequest::Feed {
                 feed: "accounts.users".to_owned(),
             },
+            named_keys: vec![],
         }];
         let first = leader
             .execute_commands_with_request_id(command.clone(), request_id)
@@ -6176,6 +6293,7 @@ mod tests {
             .execute_commands(vec![Command::DefineStateStore {
                 name: "accounts.profiles".to_owned(),
                 source: StateStoreSourceRequest::Manual,
+                named_keys: vec![],
             }])
             .await
             .is_err());
@@ -6192,6 +6310,7 @@ mod tests {
             .execute_commands(vec![Command::DefineStateStore {
                 name: "accounts.manual".to_owned(),
                 source: StateStoreSourceRequest::Manual,
+                named_keys: vec![],
             }])
             .await
             .is_ok());
@@ -6201,6 +6320,7 @@ mod tests {
                 source: StateStoreSourceRequest::Feed {
                     feed: "other.users".to_owned()
                 },
+                named_keys: vec![],
             }])
             .await
             .is_err());
@@ -6210,6 +6330,7 @@ mod tests {
                 source: StateStoreSourceRequest::Feed {
                     feed: "accounts.missing".to_owned()
                 },
+                named_keys: vec![],
             }])
             .await
             .is_err());
@@ -6248,6 +6369,207 @@ mod tests {
                 .source,
             StateStoreSource::Manual,
         );
+    }
+
+    #[tokio::test]
+    async fn state_store_named_keys_validate_and_persist() {
+        let directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader
+            .execute("CREATE SPACE accounts; CREATE FEED accounts.users;")
+            .await
+            .unwrap();
+        let named_keys = vec![
+            NamedStateStoreKey {
+                name: "passport".to_owned(),
+                unique: true,
+            },
+            NamedStateStoreKey {
+                name: "department".to_owned(),
+                unique: false,
+            },
+        ];
+        leader
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.profiles".to_owned(),
+                source: StateStoreSourceRequest::Manual,
+                named_keys: named_keys.clone(),
+            }])
+            .await
+            .unwrap();
+        let store = leader
+            .declared_state_store_by_name("accounts.profiles")
+            .await
+            .unwrap();
+        assert_eq!(store.named_keys, named_keys);
+        // Named keys require a manual source until a declared projection exists.
+        assert!(leader
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.feed_sourced".to_owned(),
+                source: StateStoreSourceRequest::Feed {
+                    feed: "accounts.users".to_owned(),
+                },
+                named_keys: named_keys.clone(),
+            }])
+            .await
+            .is_err());
+        // Duplicate key names are refused.
+        assert!(leader
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.dup".to_owned(),
+                source: StateStoreSourceRequest::Manual,
+                named_keys: vec![
+                    NamedStateStoreKey {
+                        name: "same".to_owned(),
+                        unique: false,
+                    },
+                    NamedStateStoreKey {
+                        name: "same".to_owned(),
+                        unique: true,
+                    },
+                ],
+            }])
+            .await
+            .is_err());
+        // The named-key budget is bounded.
+        assert!(leader
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.toomany".to_owned(),
+                source: StateStoreSourceRequest::Manual,
+                named_keys: (0..=MAX_STATE_STORE_NAMED_KEYS)
+                    .map(|i| NamedStateStoreKey {
+                        name: format!("key_{i}"),
+                        unique: false,
+                    })
+                    .collect(),
+            }])
+            .await
+            .is_err());
+        // Key names are lowercase identifiers; invalid shapes are refused.
+        assert!(leader
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.badname".to_owned(),
+                source: StateStoreSourceRequest::Manual,
+                named_keys: vec![NamedStateStoreKey {
+                    name: "Not-A-Key".to_owned(),
+                    unique: false,
+                }],
+            }])
+            .await
+            .is_err());
+        // Declared keys survive restart.
+        drop(leader);
+        let reopened = new_controller(&directory);
+        assert_eq!(
+            reopened
+                .declared_state_store_by_name("accounts.profiles")
+                .await
+                .unwrap()
+                .named_keys,
+            named_keys
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_state_stores_tombstone_names_and_fence_operations() {
+        let directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader.execute("CREATE SPACE accounts;").await.unwrap();
+        leader
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.profiles".to_owned(),
+                source: StateStoreSourceRequest::Manual,
+                named_keys: vec![],
+            }])
+            .await
+            .unwrap();
+        let store = leader
+            .declared_state_store_by_name("accounts.profiles")
+            .await
+            .unwrap();
+        assert!(leader
+            .active_state_store_assignment_by_id(store.store_id)
+            .await
+            .is_some());
+
+        // Renaming relabels the catalog while store_id stays stable.
+        leader
+            .execute("RENAME STATESTORE accounts.profiles TO accounts.directory;")
+            .await
+            .unwrap();
+        assert!(leader
+            .declared_state_store_by_name("accounts.profiles")
+            .await
+            .is_none());
+        assert_eq!(
+            leader
+                .declared_state_store_by_name("accounts.directory")
+                .await
+                .unwrap()
+                .store_id,
+            store.store_id
+        );
+
+        leader
+            .execute("DROP STATESTORE accounts.directory;")
+            .await
+            .unwrap();
+        // The placement is gone so mutation/read paths refuse, and the name
+        // is tombstoned against recreation.
+        assert!(leader
+            .active_state_store_assignment_by_id(store.store_id)
+            .await
+            .is_none());
+        assert!(leader
+            .declared_state_store_by_name("accounts.directory")
+            .await
+            .is_none());
+        assert!(leader
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.directory".to_owned(),
+                source: StateStoreSourceRequest::Manual,
+                named_keys: vec![],
+            }])
+            .await
+            .is_err());
+        // Renaming onto a tombstoned name is refused too.
+        leader
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.other".to_owned(),
+                source: StateStoreSourceRequest::Manual,
+                named_keys: vec![],
+            }])
+            .await
+            .unwrap();
+        assert!(leader
+            .execute("RENAME STATESTORE accounts.other TO accounts.directory;")
+            .await
+            .is_err());
+        // A second drop reports the store as already gone.
+        assert!(leader
+            .execute("DROP STATESTORE accounts.directory;")
+            .await
+            .is_err());
+
+        // The tombstone survives restart through the catalog snapshot.
+        drop(leader);
+        let reopened = new_controller(&directory);
+        assert!(reopened
+            .declared_state_store_by_name("accounts.directory")
+            .await
+            .is_none());
+        assert!(reopened
+            .active_state_store_assignment_by_id(store.store_id)
+            .await
+            .is_none());
+        assert!(reopened
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.directory".to_owned(),
+                source: StateStoreSourceRequest::Manual,
+                named_keys: vec![],
+            }])
+            .await
+            .is_err());
     }
 
     #[tokio::test]

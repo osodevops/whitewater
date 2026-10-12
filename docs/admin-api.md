@@ -173,7 +173,8 @@ Content-Type: application/json
 The typed Admin API can commit an idempotent Domain-scoped StateStore declaration with either an explicit same-Domain source Feed or a manual source:
 
 ```json
-{ "command": "define_state_store", "name": "accounts.users", "source": { "kind": "manual" } }
+{ "command": "define_state_store", "name": "accounts.users", "source": { "kind": "manual" },
+  "named_keys": [ { "name": "department", "unique": false }, { "name": "passport", "unique": true } ] }
 ```
 
 ```json
@@ -182,9 +183,11 @@ The typed Admin API can commit an idempotent Domain-scoped StateStore declaratio
 
 The response reports `stage: "declared"` and an immutable `store_id`. The catalog rejects unknown source Feeds and Feeds outside the StateStore's Domain. Retry a timed-out declaration with the same request ID.
 
+`named_keys` declares up to 10 secondary lookup keys on a **manual** StateStore (a declared source-Feed projection for named keys is future work — feed-sourced stores must omit them for now). Key names are lowercase identifiers; `unique` claims enforce one primary row per value. Non-unique named keys map one value to many primary keys (a group/list lookup). Unique claims arbitrate by journal order — first-committed-wins: a conflicting `put_row` journals and applies as a deterministic no-op on every replica rather than poisoning replication.
+
 A declared store already has a working RF3 write path:
 
-- **Manual stores** accept `POST /v1/state-stores/mutate` (`{ "store": name, "mutation_id": uuid, "op": "put_row" | "delete_row" }`). `mutation_id` is the caller-owned idempotency identity: retries dedupe, changed contents conflict.
+- **Manual stores** accept `POST /v1/state-stores/mutate` (`{ "store": name, "mutation_id": uuid, "op": "put_row" | "delete_row" }`). `mutation_id` is the caller-owned idempotency identity: retries dedupe, changed contents conflict. `put_row` ops carry the row plus optional named-key values: `{ "kind": "put_row", "key_base64": ..., "payload_base64": ..., "named": [ { "name": "department", "values": [ { "kind": "text", "value": "eng" } ] } ] }`. Values are typed (`null | bool | i64 | text | bytes` — strings and numbers never need manual byte conversion); names must match the store's `named_keys` declaration and the server stamps each entry's `unique` semantics from that declaration.
 - **Feed-derived stores** materialize committed source history: `POST /v1/state-stores/sync` resumes from the durable journaled frontier; `POST /v1/state-stores/rebuild` re-materializes under a caller `token` namespace. Both refuse with 409 when the source Feed or journaled frontier is gone rather than silently producing a partial store. Owning Nodes also drive bounded replay passes automatically.
 
 Primary-key lookups exist: `POST /v1/state-stores/lookup` (`{ "store": name, "key_base64": bytes }` returns the row plus freshness evidence (`applied_seq`, `committed_seq`, `behind`, `served_by`). It is served locally when the ingress Node holds a journal replica and otherwise forwarded internally — no application topology knowledge required. Strict reads are supported: `strict: true` with optional `wait_ms` (default 500, capped at 2000) makes the serving replica wait — bounded — for its applied sequence to reach the committed frontier observed when the read arrived; the ingress tries fresher eligible replicas and, when none catch up in time, fails with HTTP 409 `index_behind` instead of serving a stale snapshot. Non-strict requests always report `behind` honestly rather than claiming freshness. Replicas stay durable and convergent: every applied mutation advances a recorded chain digest (`blake3(previous | sequence | mutation_digest)` per entry), replicas page missing committed entries from the freshest peer through the internal `state-store-journal/entries` route — bounded pages, owner/epoch fenced — and a wiped or replaced replica installs its peers' committed history plus attested checkpoints through `state-store-journal/transfer`, with divergence reported as `state_store.diverged` rather than silently serving different state. Declared secondary Indexes now rebuild through `REBUILD INDEX` /
@@ -194,6 +197,14 @@ shadow-generation posting set from retained committed Feed history
 pass when the source or resume frontier is gone, and commits
 `CompleteIndexBuild` for atomic `building` → `active` activation; prior
 generations retire through a bounded sweep. Active Indexes answer logical queries through `POST /v1/indexes/query` (`{ "index": name, "mode": "exact" | "prefix" | "range", ... }`) — the same semantics as WCL `GET INDEX` — resolving the logical name to the active generation and serving from any ingress Node: a Node that materializes the postings answers locally, a strict read whose local postings lag the activation frontier forwards (bounded) to fresher peers, and failures surface `index_not_found` (404), `index_not_ready` (409 while declared/building), or `index_behind` (409 strict, no Node reached the frontier in the bounded wait). Rows return `key_base64`/`payload_base64` plus freshness evidence (`applied_cursor`, `target_cursor`, `behind`, `truncated`, `served_by`); `limit` defaults to 256 (1..=1000) and results cap at 16 MiB.
+
+StateStore named-key, iteration, and lifecycle operations share the same
+any-ingress routing and freshness contract as primary-key `lookup`:
+
+- `POST /v1/state-stores/get-by` (`{ "store": name, "named_key": name, "values": [typed], "limit": 1..=1000 default 64, "strict": bool, "wait_ms": bounded }`) resolves a declared named-key value to every primary row it points at — the group/list read: one `department = "eng"` value returns all matching rows. Rows return `key_base64`, `payload_base64`, and the `applied_cursor` each row last applied at, plus `applied_seq`/`committed_seq`/`behind`/`served_by` freshness evidence. Undeclared key names and empty `values` are 400s; strict reads honor the same bounded-wait `index_behind` contract as `lookup`.
+- `POST /v1/state-stores/iterate` (`{ "store": name, "after_key_base64": cursor|null, "limit": 1..=1000 default 256 }`) returns a bounded page of applied rows in primary-key order plus `next_key_base64` for continuation and `pinned_seq` — the serving replica's applied journal position the page was pinned to, the same row set replica transfer serves. Iteration reports its freshness honestly through `pinned_seq` rather than waiting; a page reflects everything applied up to that sequence and nothing later.
+- `POST /v1/state-stores/clear` (`{ "store": name, "mutation_id": uuid }`) empties a manual StateStore as one journaled `ClearAll` mutation through the RF3 quorum: replicas sweep rows and named postings in bounded 512-row batches under the mutation's journal cursor, so the clear is durable, idempotent under `mutation_id` retries, replayed on restart, and never one unbounded delete. Feed-derived stores refuse — their contents replay from the source Feed.
+- `DROP STATESTORE <name>` (WCL / typed `drop` command) tombstones the catalog definition — the name cannot be recreated, `RENAME` onto it is refused — and removes the RF3 placement so mutation, lookup, sync, and iterate paths refuse. Rows already applied on replicas remain until a bounded reclaim pass (the same orphan-row model as dropped Feed history); the definition stays visible to operators as `stage: "dropped"`.
 
 Reader start variants:
 

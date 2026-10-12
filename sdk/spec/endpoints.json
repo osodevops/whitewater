@@ -473,7 +473,7 @@
       "request": {
         "store": "name",
         "mutation_id": "uuid (caller idempotency identity)",
-        "op": "put_row{key_base64,payload_base64} | delete_row{key_base64}"
+        "op": "put_row{key_base64,payload_base64,named:[{name,values:[{kind:null|bool|i64|text|bytes,value|value_base64}]}]} | delete_row{key_base64}"
       },
       "response": {
         "store_id": "uuid",
@@ -486,7 +486,80 @@
         "conflict(409) mutation_id reused with different content",
         "unavailable(503) no quorum; retry identical mutation_id"
       ],
-      "notes": "manual StateStores only; RF3 journal quorum commits before ack; sequence is owner-allocated"
+      "notes": "manual StateStores only; RF3 journal quorum commits before ack; sequence is owner-allocated; named values must match the store's declared named_keys and are stamped unique/non-unique server-side — unique claims arbitrate first-committed-wins by journal order"
+    },
+    {
+      "op": "state_store.get_by",
+      "method": "POST",
+      "path": "/v1/state-stores/get-by",
+      "auth": "admin (client-key scoped auth is future work)",
+      "request": {
+        "store": "name",
+        "named_key": "declared named key",
+        "values": "[typed] one entry per lookup ({kind:null|bool|i64|text|bytes, value|value_base64})",
+        "limit": "usize (optional, default 64, bounded 1..=1000)",
+        "strict": "bool (optional; same bounded freshness wait as lookup)",
+        "wait_ms": "u64 (optional, default 500, capped at 2000)"
+      },
+      "response": {
+        "store_id": "uuid",
+        "rows": "[{key_base64, payload_base64, applied_cursor}]",
+        "applied_seq": "u64",
+        "committed_seq": "u64",
+        "behind": "bool",
+        "served_by": "string (Node identity)"
+      },
+      "errors": [
+        "refused(400) missing store / undeclared named_key / empty values",
+        "unavailable(503) no replica could serve",
+        "conflict(409) code=index_behind: strict freshness unreachable"
+      ],
+      "notes": "named-key (secondary) point read: one value resolves to every primary row it points at — the group/list lookup; same any-ingress routing and freshness evidence as state_store.lookup"
+    },
+    {
+      "op": "state_store.iterate",
+      "method": "POST",
+      "path": "/v1/state-stores/iterate",
+      "auth": "admin (client-key scoped auth is future work)",
+      "request": {
+        "store": "name",
+        "after_key_base64": "continuation key from a prior page, or omit for the start",
+        "limit": "usize (optional, default 256, bounded 1..=1000)"
+      },
+      "response": {
+        "store_id": "uuid",
+        "rows": "[{key_base64, payload_base64, applied_seq}] in primary-key order",
+        "next_key_base64": "continuation key|null",
+        "pinned_seq": "u64 (serving replica's applied journal position the page was pinned to)",
+        "served_by": "string (Node identity)"
+      },
+      "errors": [
+        "refused(400) missing store / bad continuation key",
+        "unavailable(503) no replica could serve"
+      ],
+      "notes": "bounded ordered page over applied rows — the same row set replica transfer serves, so pinned_seq is the iteration's freshness evidence; a page reflects everything applied up to that sequence"
+    },
+    {
+      "op": "state_store.clear",
+      "method": "POST",
+      "path": "/v1/state-stores/clear",
+      "auth": "admin (client-key scoped auth is future work)",
+      "request": {
+        "store": "name",
+        "mutation_id": "uuid (caller idempotency identity)"
+      },
+      "response": {
+        "store_id": "uuid",
+        "mutation_id": "uuid",
+        "sequence": "u64",
+        "deduplicated": "bool"
+      },
+      "errors": [
+        "refused(400) feed-sourced store / missing store",
+        "conflict(409) mutation_id reused with different content",
+        "unavailable(503) no quorum; retry identical mutation_id"
+      ],
+      "notes": "manual StateStores only; one journaled ClearAll mutation through the RF3 quorum — replicas sweep rows and named postings in bounded 512-row batches under the mutation's cursor; durable, idempotent, replayed on restart"
     },
     {
       "op": "state_store.sync",

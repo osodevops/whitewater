@@ -57,18 +57,56 @@ fn bounded_keyspace() -> fjall::KeyspaceCreateOptions {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StateStoreMutationOp {
-    /// Create or replace one row.
-    PutRow { key: Vec<u8>, payload: Vec<u8> },
-    /// Remove one row; deleting a missing row is a recorded no-op.
+    /// Create or replace one row. `named` carries the row's values for each
+    /// declared named key; postings and unique claims commit in the same
+    /// atomic batch as the row.
+    PutRow {
+        key: Vec<u8>,
+        payload: Vec<u8>,
+        #[serde(default)]
+        named: Vec<NamedKeyValue>,
+    },
+    /// Remove one row and all of its named-key postings; deleting a missing
+    /// row is a recorded no-op.
     DeleteRow { key: Vec<u8> },
+    /// Delete every row in the store. Journaled like any other mutation:
+    /// replicas apply it as bounded row-delete batches and a restart before
+    /// the applied marker replays the whole clear idempotently.
+    ClearAll,
 }
 
 impl StateStoreMutationOp {
     fn key(&self) -> &[u8] {
         match self {
             Self::PutRow { key, .. } | Self::DeleteRow { key } => key,
+            Self::ClearAll => &[],
         }
     }
+}
+
+/// One named-key value a `PutRow` mutation writes. The mutating service
+/// stamps `unique` from the store's declared `named_keys`, so the journaled
+/// mutation is self-describing and replays identically on every replica.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NamedKeyValue {
+    pub name: String,
+    pub values: Vec<crate::index::IndexValue>,
+    #[serde(default)]
+    pub unique: bool,
+}
+
+/// The posting/claim namespace for one StateStore named key. Derived
+/// deterministically from the store id and key name so every replica writes
+/// identical postings under the same IndexId; scoped per store so named
+/// keys never collide across stores or with declared Feed Indexes.
+pub fn named_key_index_id(store_id: Uuid, name: &str) -> crate::index::IndexId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"ww-state-store-named-key");
+    hasher.update(store_id.as_bytes());
+    hasher.update(name.as_bytes());
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    crate::index::IndexId(Uuid::from_bytes(bytes))
 }
 
 /// One journaled manual StateStore mutation. `mutation_id` is the
@@ -211,6 +249,20 @@ pub struct StateStoreLookupRequest {
     pub ownership_epoch: u64,
 }
 
+/// A named-key read: resolve `values` postings under the store's derived
+/// named-key IndexId to at most `limit` primary rows.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StateStoreNamedRead {
+    pub name: String,
+    pub values: Vec<crate::index::IndexValue>,
+    #[serde(default = "default_named_read_limit")]
+    pub limit: usize,
+}
+
+fn default_named_read_limit() -> usize {
+    64
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StateStoreReadRequest {
@@ -218,6 +270,8 @@ pub struct StateStoreReadRequest {
     pub receiver: StorageNodeId,
     pub store_id: Uuid,
     pub ownership_epoch: u64,
+    /// Primary key for a point read; ignored (may be empty) when `by_named`
+    /// selects a named-key resolution instead.
     pub key: Vec<u8>,
     /// Strict reads wait (bounded by `wait_ms`) for the replica's applied
     /// position to reach the committed frontier observed at entry.
@@ -225,6 +279,8 @@ pub struct StateStoreReadRequest {
     pub strict: bool,
     #[serde(default)]
     pub wait_ms: u64,
+    #[serde(default)]
+    pub by_named: Option<StateStoreNamedRead>,
 }
 
 /// One applied StateStore row returned by a replica read.
@@ -235,11 +291,21 @@ pub struct StateStoreRow {
     pub applied_cursor: String,
 }
 
+/// One row resolved by a named-key read.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StateStoreNamedRow {
+    pub key: Vec<u8>,
+    pub payload: Vec<u8>,
+    pub applied_cursor: String,
+}
+
 /// A replica's row read plus the freshness evidence to interpret it:
 /// `applied_seq` behind `committed_seq` means the replica is lagging.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StateStoreReadOutcome {
     pub row: Option<StateStoreRow>,
+    #[serde(default)]
+    pub named_rows: Vec<StateStoreNamedRow>,
     pub applied_seq: u64,
     pub committed_seq: u64,
 }
@@ -414,7 +480,12 @@ fn validate_mutation_bounds(mutation: &StateStoreMutation) -> Result<(), StateSt
         // Sequence zero requests owner allocation; the owner fills it inside
         // its durable prepare transaction.
     }
-    if mutation.op.key().is_empty() || mutation.op.key().len() > STATE_STORE_MAX_KEY_BYTES {
+    // ClearAll carries no row key — the empty key is its identity.
+    let key_bound = match &mutation.op {
+        StateStoreMutationOp::ClearAll => mutation.op.key().is_empty(),
+        _ => !mutation.op.key().is_empty(),
+    };
+    if !key_bound || mutation.op.key().len() > STATE_STORE_MAX_KEY_BYTES {
         return Err(StateStoreMutationError::TooLarge);
     }
     if let StateStoreMutationOp::PutRow { payload, .. } = &mutation.op {
@@ -1088,6 +1159,28 @@ impl IndexStoreStateApply {
     fn cursor(sequence: u64) -> String {
         format!("{sequence:020}")
     }
+
+    /// Bounded row-delete sweep for `ClearAll`: each pass removes up to 512
+    /// rows plus their postings under the mutation's journal cursor, so the
+    /// clear is journaled once and applied in small transactions rather than
+    /// one unbounded delete.
+    fn clear_store(&self, mutation: &StateStoreMutation) -> Result<(), StateStoreMutationError> {
+        const CLEAR_PAGE: usize = 512;
+        loop {
+            let rows = self
+                .store
+                .scan(mutation.store_id, None, CLEAR_PAGE)
+                .map_err(|_| StateStoreMutationError::ApplyFailed)?;
+            if rows.is_empty() {
+                return Ok(());
+            }
+            for row in rows {
+                self.store
+                    .delete(&row.reference, &Self::cursor(mutation.sequence))
+                    .map_err(|_| StateStoreMutationError::ApplyFailed)?;
+            }
+        }
+    }
 }
 
 impl StateStoreApply for IndexStoreStateApply {
@@ -1096,20 +1189,46 @@ impl StateStoreApply for IndexStoreStateApply {
     }
 
     fn apply(&self, mutation: &StateStoreMutation) -> Result<(), StateStoreMutationError> {
+        if matches!(mutation.op, StateStoreMutationOp::ClearAll) {
+            return self.clear_store(mutation);
+        }
         let reference = crate::index::PrimaryRef {
             feed_id: mutation.store_id,
             application_key: mutation.op.key().to_vec(),
         };
         match &mutation.op {
-            StateStoreMutationOp::PutRow { payload, .. } => self
-                .store
-                .upsert(&reference, payload, &[], &Self::cursor(mutation.sequence))
-                .map_err(|_| StateStoreMutationError::ApplyFailed)?,
+            StateStoreMutationOp::PutRow { payload, named, .. } => {
+                let entries: Vec<crate::index::IndexEntry> = named
+                    .iter()
+                    .map(|entry| crate::index::IndexEntry {
+                        id: named_key_index_id(mutation.store_id, &entry.name),
+                        values: entry.values.clone(),
+                        unique: entry.unique,
+                    })
+                    .collect();
+                match self.store.upsert(
+                    &reference,
+                    payload,
+                    &entries,
+                    &Self::cursor(mutation.sequence),
+                ) {
+                    Ok(()) => {}
+                    // Unique named-key claims arbitrate by journal order:
+                    // first-committed-wins, so a conflicting put is a journaled
+                    // no-op on every replica — identical resolution everywhere
+                    // because every replica shares the same applied prefix.
+                    Err(crate::index::IndexStoreError::Key(
+                        crate::index::IndexKeyError::UniqueConflict,
+                    )) => {}
+                    Err(_) => return Err(StateStoreMutationError::ApplyFailed),
+                }
+            }
             StateStoreMutationOp::DeleteRow { .. } => {
                 self.store
                     .delete(&reference, &Self::cursor(mutation.sequence))
                     .map_err(|_| StateStoreMutationError::ApplyFailed)?;
             }
+            StateStoreMutationOp::ClearAll => unreachable!("handled above"),
         }
         Ok(())
     }
@@ -1917,8 +2036,15 @@ impl StateStoreMutationService {
                 request.ownership_epoch,
             )
             .await?;
-        if request.key.is_empty() || request.key.len() > STATE_STORE_MAX_KEY_BYTES {
+        if request.by_named.is_none()
+            && (request.key.is_empty() || request.key.len() > STATE_STORE_MAX_KEY_BYTES)
+        {
             return Err(StateStoreMutationError::TooLarge);
+        }
+        if let Some(named) = &request.by_named {
+            if named.values.is_empty() || named.limit == 0 || named.limit > 1_000 {
+                return Err(StateStoreMutationError::TooLarge);
+            }
         }
         let journal = self.journal.clone();
         let apply = self.apply.clone();
@@ -1926,42 +2052,68 @@ impl StateStoreMutationService {
         let key = request.key;
         let strict = request.strict;
         let wait = std::time::Duration::from_millis(request.wait_ms.min(MAX_STRICT_READ_WAIT_MS));
-        let (row, applied_seq, committed_seq) = tokio::task::spawn_blocking(move || {
-            // Strict freshness pins to the commit frontier observed at
-            // entry; chasing a moving target under write load could wait
-            // forever.
-            let mut inspection = journal.inspect(store_id)?;
-            let target = inspection
-                .committed
-                .as_ref()
-                .map(|mutation| mutation.sequence)
-                .unwrap_or(0);
-            if strict {
-                let deadline = std::time::Instant::now() + wait;
-                while inspection.applied_seq < target && std::time::Instant::now() < deadline {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                    inspection = journal.inspect(store_id)?;
-                }
-            }
-            let row = apply.get_row(store_id, &key)?;
-            Ok::<_, StateStoreMutationError>((
-                row,
-                inspection.applied_seq,
-                inspection
+        let by_named = request.by_named.clone();
+        let (row, named_rows, applied_seq, committed_seq) =
+            tokio::task::spawn_blocking(move || {
+                // Strict freshness pins to the commit frontier observed at
+                // entry; chasing a moving target under write load could wait
+                // forever.
+                let mut inspection = journal.inspect(store_id)?;
+                let target = inspection
                     .committed
                     .as_ref()
                     .map(|mutation| mutation.sequence)
-                    .unwrap_or(0),
-            ))
-        })
-        .await
-        .map_err(|_| StateStoreMutationError::Unavailable)??;
+                    .unwrap_or(0);
+                if strict {
+                    let deadline = std::time::Instant::now() + wait;
+                    while inspection.applied_seq < target && std::time::Instant::now() < deadline {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        inspection = journal.inspect(store_id)?;
+                    }
+                }
+                let (row, named_rows) = match by_named {
+                    Some(named) => {
+                        let index = apply
+                            .index_store()
+                            .ok_or(StateStoreMutationError::ApplyFailed)?;
+                        let rows = index
+                            .lookup_exact(
+                                named_key_index_id(store_id, &named.name),
+                                &named.values,
+                                named.limit,
+                            )
+                            .map_err(|_| StateStoreMutationError::ApplyFailed)?
+                            .into_iter()
+                            .map(|row| StateStoreNamedRow {
+                                key: row.reference.application_key,
+                                payload: row.payload,
+                                applied_cursor: row.applied_cursor,
+                            })
+                            .collect();
+                        (None, rows)
+                    }
+                    None => (apply.get_row(store_id, &key)?, Vec::new()),
+                };
+                Ok::<_, StateStoreMutationError>((
+                    row,
+                    named_rows,
+                    inspection.applied_seq,
+                    inspection
+                        .committed
+                        .as_ref()
+                        .map(|mutation| mutation.sequence)
+                        .unwrap_or(0),
+                ))
+            })
+            .await
+            .map_err(|_| StateStoreMutationError::Unavailable)??;
         Ok(StateStoreReplicaReply {
             replica: self.local_node.clone(),
             store_id,
             ownership_epoch: assignment.ownership_epoch,
             result: StateStoreReadOutcome {
                 row,
+                named_rows,
                 applied_seq,
                 committed_seq,
             },
@@ -2487,6 +2639,7 @@ impl StateStoreReplayDriver {
                 op: StateStoreMutationOp::PutRow {
                     key: record.key.clone(),
                     payload: record.payload.clone(),
+                    named: Vec::new(),
                 },
                 issued_at_ns: unix_ns(),
                 source: Some(ReplaySource {
@@ -2539,6 +2692,7 @@ mod tests {
             op: StateStoreMutationOp::PutRow {
                 key: key.as_bytes().to_vec(),
                 payload: b"payload".to_vec(),
+                named: Vec::new(),
             },
             issued_at_ns: 1,
             source: None,
@@ -2614,6 +2768,7 @@ mod tests {
         changed.op = StateStoreMutationOp::PutRow {
             key: b"other".to_vec(),
             payload: b"different".to_vec(),
+            named: Vec::new(),
         };
         assert!(matches!(
             journal.prepare(changed),
@@ -2811,6 +2966,7 @@ mod tests {
                 ownership_epoch: request.ownership_epoch,
                 result: StateStoreReadOutcome {
                     row: None,
+                    named_rows: Vec::new(),
                     applied_seq: inspection.applied_seq,
                     committed_seq: inspection
                         .committed
@@ -3063,6 +3219,7 @@ mod tests {
                 source: crate::control::StateStoreSourceRequest::Feed {
                     feed: "orders.events".to_owned(),
                 },
+                named_keys: vec![],
             }])
             .await
             .unwrap();
@@ -3223,6 +3380,7 @@ mod tests {
         let owner = assignment.owner.clone();
         let epoch = assignment.ownership_epoch;
         let read = |key: &[u8], epoch: u64| StateStoreReadRequest {
+            by_named: None,
             owner: owner.clone(),
             receiver: node("storage-1"),
             store_id,
@@ -3529,6 +3687,7 @@ mod tests {
             m.op = StateStoreMutationOp::PutRow {
                 key: key.as_bytes().to_vec(),
                 payload: format!("v-{key}").into_bytes(),
+                named: Vec::new(),
             };
             coordinator.mutate(m).await.unwrap();
         }
@@ -3588,6 +3747,7 @@ mod tests {
         // The caught-up replica serves the applied rows.
         let row = services[lagging_index]
             .read_row(StateStoreReadRequest {
+                by_named: None,
                 owner: owner.clone(),
                 receiver: lagging_node.clone(),
                 store_id,
@@ -3718,6 +3878,7 @@ mod tests {
             m.op = StateStoreMutationOp::PutRow {
                 key: key.as_bytes().to_vec(),
                 payload: format!("payload-{key}").into_bytes(),
+                named: Vec::new(),
             };
             coordinator.mutate(m).await.unwrap();
         }
@@ -3763,6 +3924,244 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(row.payload, b"payload-k2");
+    }
+
+    #[test]
+    fn put_row_writes_named_postings_and_unique_claims() {
+        let dir = TempDir::new().unwrap();
+        let index: Arc<dyn IndexStore> = Arc::new(FjallIndexStore::open(dir.path()).unwrap());
+        let apply = IndexStoreStateApply::new(index.clone());
+        let store_id = Uuid::new_v4();
+
+        let mut first = mutation(store_id, 1, "user-1");
+        first.op = StateStoreMutationOp::PutRow {
+            key: b"user-1".to_vec(),
+            payload: b"profile".to_vec(),
+            named: vec![
+                NamedKeyValue {
+                    name: "passport".to_owned(),
+                    values: vec![crate::index::IndexValue::Text("P123".to_owned())],
+                    unique: true,
+                },
+                NamedKeyValue {
+                    name: "department".to_owned(),
+                    values: vec![crate::index::IndexValue::Text("eng".to_owned())],
+                    unique: false,
+                },
+            ],
+        };
+        apply.apply(&first).unwrap();
+        let rows = index
+            .lookup_exact(
+                named_key_index_id(store_id, "department"),
+                &[crate::index::IndexValue::Text("eng".to_owned())],
+                8,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reference.application_key, b"user-1");
+
+        // A second row with the same non-unique value joins the list.
+        let mut second = mutation(store_id, 2, "user-2");
+        second.op = StateStoreMutationOp::PutRow {
+            key: b"user-2".to_vec(),
+            payload: b"profile-2".to_vec(),
+            named: vec![NamedKeyValue {
+                name: "department".to_owned(),
+                values: vec![crate::index::IndexValue::Text("eng".to_owned())],
+                unique: false,
+            }],
+        };
+        apply.apply(&second).unwrap();
+        let rows = index
+            .lookup_exact(
+                named_key_index_id(store_id, "department"),
+                &[crate::index::IndexValue::Text("eng".to_owned())],
+                8,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // A third row claiming the taken unique value loses by journal
+        // order: the put is a journaled no-op — no row, no postings, and the
+        // earlier claim still points at user-1.
+        let mut conflict = mutation(store_id, 3, "user-3");
+        conflict.op = StateStoreMutationOp::PutRow {
+            key: b"user-3".to_vec(),
+            payload: b"conflict".to_vec(),
+            named: vec![NamedKeyValue {
+                name: "passport".to_owned(),
+                values: vec![crate::index::IndexValue::Text("P123".to_owned())],
+                unique: true,
+            }],
+        };
+        apply.apply(&conflict).unwrap();
+        assert!(index
+            .get(&PrimaryRef {
+                feed_id: store_id,
+                application_key: b"user-3".to_vec(),
+            })
+            .unwrap()
+            .is_none());
+        let winners = index
+            .lookup_exact(
+                named_key_index_id(store_id, "passport"),
+                &[crate::index::IndexValue::Text("P123".to_owned())],
+                8,
+            )
+            .unwrap();
+        assert_eq!(winners.len(), 1);
+        assert_eq!(winners[0].reference.application_key, b"user-1");
+
+        // Deleting a row removes its named-key postings.
+        let mut delete = mutation(store_id, 4, "user-1");
+        delete.op = StateStoreMutationOp::DeleteRow {
+            key: b"user-1".to_vec(),
+        };
+        apply.apply(&delete).unwrap();
+        let rows = index
+            .lookup_exact(
+                named_key_index_id(store_id, "department"),
+                &[crate::index::IndexValue::Text("eng".to_owned())],
+                8,
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].reference.application_key, b"user-2");
+        assert!(index
+            .lookup_exact(
+                named_key_index_id(store_id, "passport"),
+                &[crate::index::IndexValue::Text("P123".to_owned())],
+                8,
+            )
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn clear_all_empties_rows_and_named_postings() {
+        let dir = TempDir::new().unwrap();
+        let index: Arc<dyn IndexStore> = Arc::new(FjallIndexStore::open(dir.path()).unwrap());
+        let apply = IndexStoreStateApply::new(index.clone());
+        let store_id = Uuid::new_v4();
+        for (sequence, key) in ["a", "b", "c"].iter().enumerate() {
+            let mut m = mutation(store_id, sequence as u64 + 1, key);
+            m.op = StateStoreMutationOp::PutRow {
+                key: key.as_bytes().to_vec(),
+                payload: b"v".to_vec(),
+                named: vec![NamedKeyValue {
+                    name: "department".to_owned(),
+                    values: vec![crate::index::IndexValue::Text("eng".to_owned())],
+                    unique: false,
+                }],
+            };
+            apply.apply(&m).unwrap();
+        }
+        let mut clear = mutation(store_id, 4, "");
+        clear.op = StateStoreMutationOp::ClearAll;
+        apply.apply(&clear).unwrap();
+        assert!(index.scan(store_id, None, 64).unwrap().is_empty());
+        assert!(index
+            .lookup_exact(
+                named_key_index_id(store_id, "department"),
+                &[crate::index::IndexValue::Text("eng".to_owned())],
+                8,
+            )
+            .unwrap()
+            .is_empty());
+        // Re-applying the committed clear is a recorded no-op.
+        apply.apply(&clear).unwrap();
+        // A row written after the clear survives.
+        let mut after = mutation(store_id, 5, "z");
+        after.op = StateStoreMutationOp::PutRow {
+            key: b"z".to_vec(),
+            payload: b"new".to_vec(),
+            named: Vec::new(),
+        };
+        apply.apply(&after).unwrap();
+        assert_eq!(index.scan(store_id, None, 64).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn read_row_resolves_by_named_postings() {
+        let catalog_dir = TempDir::new().unwrap();
+        let store: Arc<dyn crate::storage::LogStore> =
+            Arc::new(crate::storage::FileLogStore::open(catalog_dir.path().join("data")).unwrap());
+        let control = Arc::new(
+            crate::control::ControlController::open_with_storage_nodes(
+                catalog_dir.path().join("catalog"),
+                store,
+                ["storage-1", "storage-2", "storage-3"]
+                    .into_iter()
+                    .map(|node| StorageNodeId::try_new(node).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        control.execute("CREATE SPACE orders;").await.unwrap();
+        control
+            .execute_commands(vec![crate::control::Command::DefineStateStore {
+                name: "orders.profiles".to_owned(),
+                source: crate::control::StateStoreSourceRequest::Manual,
+                named_keys: vec![crate::control::NamedStateStoreKey {
+                    name: "department".to_owned(),
+                    unique: false,
+                }],
+            }])
+            .await
+            .unwrap();
+        let definition = control
+            .declared_state_store_by_name("orders.profiles")
+            .await
+            .unwrap();
+        let assignment = control
+            .active_state_store_assignment_by_id(definition.store_id)
+            .await
+            .unwrap();
+
+        let index_dir = TempDir::new().unwrap();
+        let index: Arc<dyn IndexStore> = Arc::new(FjallIndexStore::open(index_dir.path()).unwrap());
+        let apply = IndexStoreStateApply::new(index);
+        let mut m = mutation(definition.store_id, 1, "user-1");
+        m.op = StateStoreMutationOp::PutRow {
+            key: b"user-1".to_vec(),
+            payload: b"profile".to_vec(),
+            named: vec![NamedKeyValue {
+                name: "department".to_owned(),
+                values: vec![crate::index::IndexValue::Text("eng".to_owned())],
+                unique: false,
+            }],
+        };
+        apply.apply(&m).unwrap();
+
+        let journal_dir = TempDir::new().unwrap();
+        let journal = Arc::new(FjallStateStoreMutationJournal::open(journal_dir.path()).unwrap());
+        let service = StateStoreMutationService::new(
+            assignment.owner.clone(),
+            control,
+            journal,
+            Arc::new(apply),
+        );
+        let reply = service
+            .read_row(StateStoreReadRequest {
+                owner: assignment.owner.clone(),
+                receiver: assignment.owner.clone(),
+                store_id: definition.store_id,
+                ownership_epoch: assignment.ownership_epoch,
+                key: Vec::new(),
+                strict: false,
+                wait_ms: 0,
+                by_named: Some(StateStoreNamedRead {
+                    name: "department".to_owned(),
+                    values: vec![crate::index::IndexValue::Text("eng".to_owned())],
+                    limit: 8,
+                }),
+            })
+            .await
+            .unwrap();
+        assert_eq!(reply.result.named_rows.len(), 1);
+        assert_eq!(reply.result.named_rows[0].key, b"user-1");
+        assert_eq!(reply.result.named_rows[0].payload, b"profile");
     }
 
     /// Pending committed count on a service's own journal.

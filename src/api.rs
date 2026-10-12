@@ -636,6 +636,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/state-stores/sync", post(state_store_sync))
         .route("/v1/state-stores/rebuild", post(state_store_rebuild))
         .route("/v1/state-stores/lookup", post(state_store_lookup))
+        .route("/v1/state-stores/get-by", post(state_store_get_by))
+        .route("/v1/state-stores/iterate", post(state_store_iterate))
+        .route("/v1/state-stores/clear", post(state_store_clear))
         .route("/v1/indexes/query", post(index_query))
         .route("/v1/writers/append", post(writer_session_append))
         .route("/v1/writers/append-batch", post(writer_batch_append))
@@ -3314,8 +3317,48 @@ async fn state_store_lookup(
             "key_base64 is empty or exceeds the row-key budget",
         ));
     }
-    // Candidate order: the local replica first (no network hop), then the
-    // owner (freshest application), then the remaining replicas.
+    let outcome = serve_state_store_read(
+        &state,
+        &assignment,
+        store.store_id,
+        key,
+        None,
+        request.strict,
+        request.wait_ms,
+    )
+    .await?;
+    Ok(Json(StateStoreLookupApiResponse {
+        store_id: store.store_id,
+        found: outcome.result.row.is_some(),
+        payload_base64: outcome
+            .result
+            .row
+            .as_ref()
+            .map(|row| STANDARD.encode(&row.payload)),
+        applied_cursor: outcome.result.row.map(|row| row.applied_cursor),
+        applied_seq: outcome.result.applied_seq,
+        committed_seq: outcome.result.committed_seq,
+        behind: outcome.result.applied_seq < outcome.result.committed_seq,
+        served_by: outcome.replica.to_string(),
+    }))
+}
+
+/// Serve one row read against the freshest reachable replica: the local
+/// replica first (no network hop), then the owner (freshest application),
+/// then the remaining replicas. Strict reads skip a replica still applying
+/// its journal; when none catches up in time the caller gets `index_behind`.
+async fn serve_state_store_read(
+    state: &AppState,
+    assignment: &crate::state_store::StateStoreAssignment,
+    store_id: Uuid,
+    key: Vec<u8>,
+    by_named: Option<crate::state_store::StateStoreNamedRead>,
+    strict: bool,
+    wait_ms: Option<u64>,
+) -> Result<
+    crate::state_store::StateStoreReplicaReply<crate::state_store::StateStoreReadOutcome>,
+    ApiError,
+> {
     let mut candidates: Vec<StorageNodeId> = Vec::new();
     if let Some(local) = &state.storage_node_id {
         if assignment.replicas.contains(local) {
@@ -3328,17 +3371,17 @@ async fn state_store_lookup(
             candidates.push(replica.clone());
         }
     }
-    let transport_state = state.clone();
     let mut last_error: Option<ApiError> = None;
     for replica in &candidates {
         let read = crate::state_store::StateStoreReadRequest {
             owner: assignment.owner.clone(),
             receiver: replica.clone(),
-            store_id: store.store_id,
+            store_id,
             ownership_epoch: assignment.ownership_epoch,
             key: key.clone(),
-            strict: request.strict,
-            wait_ms: request.wait_ms.unwrap_or(500),
+            strict,
+            wait_ms: wait_ms.unwrap_or(500),
+            by_named: by_named.clone(),
         };
         let outcome = if Some(replica) == state.storage_node_id.as_ref()
             && state.state_store_journal.is_some()
@@ -3351,30 +3394,7 @@ async fn state_store_lookup(
                 .await
                 .map_err(state_store_api_error)
         } else {
-            let transport: Arc<dyn crate::state_store::StateStoreMutationTransport> =
-                match &transport_state.internal_mtls {
-                    Some(material) => Arc::new(
-                        crate::state_store::HttpStateStoreMutationTransport::new_mtls(
-                            assignment.clone(),
-                            transport_state.control_endpoints.as_ref().clone(),
-                            &material.ca_pem,
-                            &material.identity_pem,
-                            Duration::from_secs(5),
-                        )
-                        .map_err(state_store_api_error)?,
-                    ),
-                    None => Arc::new(
-                        crate::state_store::HttpStateStoreMutationTransport::new(
-                            assignment.clone(),
-                            transport_state.control_endpoints.as_ref().clone(),
-                            transport_state.internal_key.clone().ok_or_else(|| {
-                                ApiError::unavailable("internal credential is not configured")
-                            })?,
-                            Duration::from_secs(5),
-                        )
-                        .map_err(|error| ApiError::unavailable(error.to_string()))?,
-                    ),
-                };
+            let transport = state_store_transport_for(state, assignment)?;
             transport
                 .read(replica, read)
                 .await
@@ -3382,28 +3402,242 @@ async fn state_store_lookup(
         };
         match outcome {
             Ok(reply) => {
-                let result = reply.result;
-                // Strict reads skip a replica still applying its journal —
-                // a fresher replica may serve instead.
-                if request.strict && result.applied_seq < result.committed_seq {
+                if strict && reply.result.applied_seq < reply.result.committed_seq {
                     last_error = Some(ApiError {
                         status: StatusCode::CONFLICT,
                         message: format!(
                             "replica applied sequence {} lags committed sequence {}",
-                            result.applied_seq, result.committed_seq
+                            reply.result.applied_seq, reply.result.committed_seq
                         ),
                         code: Some("index_behind"),
                     });
                     continue;
                 }
-                return Ok(Json(StateStoreLookupApiResponse {
+                return Ok(reply);
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        ApiError::unavailable("no StateStore journal replica could serve the read")
+    }))
+}
+
+/// `POST /v1/state-stores/get-by`: resolve one declared named key's typed
+/// value to the bounded set of primary rows carrying it — the "group/list"
+/// lookup. Serves with the same freshness evidence as `lookup`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateStoreGetByRequest {
+    store: String,
+    named_key: String,
+    values: Vec<IndexValueWire>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    strict: bool,
+    #[serde(default)]
+    wait_ms: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct StateStoreGetByResponse {
+    store_id: Uuid,
+    rows: Vec<StateStoreGetByRow>,
+    applied_seq: u64,
+    committed_seq: u64,
+    behind: bool,
+    served_by: String,
+}
+
+#[derive(Serialize)]
+struct StateStoreGetByRow {
+    key_base64: String,
+    payload_base64: String,
+    applied_cursor: String,
+}
+
+async fn state_store_get_by(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<StateStoreGetByRequest>,
+) -> Result<Json<StateStoreGetByResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let store = state
+        .control
+        .declared_state_store_by_name(&request.store)
+        .await
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
+        })?;
+    if !store
+        .named_keys
+        .iter()
+        .any(|key| key.name == request.named_key)
+    {
+        return Err(ApiError::bad_request(format!(
+            "StateStore {} does not declare named key {}",
+            store.name, request.named_key
+        )));
+    }
+    let assignment = state
+        .control
+        .active_state_store_assignment_by_id(store.store_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("StateStore has no mutation-journal placement"))?;
+    if request.values.is_empty() {
+        return Err(ApiError::bad_request("values must not be empty"));
+    }
+    let values: Vec<crate::index::IndexValue> = request
+        .values
+        .into_iter()
+        .map(IndexValueWire::into_value)
+        .collect::<Result<_, _>>()?;
+    let by_named = crate::state_store::StateStoreNamedRead {
+        name: request.named_key,
+        values,
+        limit: request.limit.unwrap_or(64).clamp(1, 1_000),
+    };
+    let outcome = serve_state_store_read(
+        &state,
+        &assignment,
+        store.store_id,
+        Vec::new(),
+        Some(by_named),
+        request.strict,
+        request.wait_ms,
+    )
+    .await?;
+    Ok(Json(StateStoreGetByResponse {
+        store_id: store.store_id,
+        rows: outcome
+            .result
+            .named_rows
+            .into_iter()
+            .map(|row| StateStoreGetByRow {
+                key_base64: STANDARD.encode(&row.key),
+                payload_base64: STANDARD.encode(&row.payload),
+                applied_cursor: row.applied_cursor,
+            })
+            .collect(),
+        applied_seq: outcome.result.applied_seq,
+        committed_seq: outcome.result.committed_seq,
+        behind: outcome.result.applied_seq < outcome.result.committed_seq,
+        served_by: outcome.replica.to_string(),
+    }))
+}
+
+/// `POST /v1/state-stores/iterate`: bounded ordered page over the store's
+/// applied rows — the same row set checkpoint transfer serves, so iteration
+/// and replica catch-up agree on ordering and freshness (`pinned_seq`).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateStoreIterateRequest {
+    store: String,
+    #[serde(default)]
+    after_key_base64: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct StateStoreIterateResponse {
+    store_id: Uuid,
+    rows: Vec<StateStoreIterateRow>,
+    next_key_base64: Option<String>,
+    /// The serving replica's applied journal position the page was pinned
+    /// to — the iteration's freshness evidence.
+    pinned_seq: u64,
+    served_by: String,
+}
+
+#[derive(Serialize)]
+struct StateStoreIterateRow {
+    key_base64: String,
+    payload_base64: String,
+    applied_seq: u64,
+}
+
+async fn state_store_iterate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<StateStoreIterateRequest>,
+) -> Result<Json<StateStoreIterateResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let store = state
+        .control
+        .declared_state_store_by_name(&request.store)
+        .await
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
+        })?;
+    let assignment = state
+        .control
+        .active_state_store_assignment_by_id(store.store_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("StateStore has no mutation-journal placement"))?;
+    let after_key = request
+        .after_key_base64
+        .as_deref()
+        .map(|value| decode_base64("after_key_base64", value))
+        .transpose()?;
+    let limit = request.limit.unwrap_or(256).clamp(1, 1_000);
+    // Same candidate order as row reads: local, owner, replicas.
+    let mut candidates: Vec<StorageNodeId> = Vec::new();
+    if let Some(local) = &state.storage_node_id {
+        if assignment.replicas.contains(local) {
+            candidates.push(local.clone());
+        }
+    }
+    candidates.push(assignment.owner.clone());
+    for replica in assignment.replicas.iter() {
+        if !candidates.contains(replica) {
+            candidates.push(replica.clone());
+        }
+    }
+    let mut last_error: Option<ApiError> = None;
+    for replica in &candidates {
+        let transfer = crate::state_store::StateStoreTransferRequest {
+            owner: assignment.owner.clone(),
+            receiver: replica.clone(),
+            store_id: store.store_id,
+            ownership_epoch: assignment.ownership_epoch,
+            after_key: after_key.clone(),
+            limit,
+        };
+        let outcome = if Some(replica) == state.storage_node_id.as_ref()
+            && state.state_store_journal.is_some()
+        {
+            state
+                .state_store_journal
+                .as_ref()
+                .unwrap()
+                .transfer(transfer)
+                .await
+                .map_err(state_store_api_error)
+        } else {
+            let transport = state_store_transport_for(&state, &assignment)?;
+            transport
+                .transfer(replica, transfer)
+                .await
+                .map_err(state_store_api_error)
+        };
+        match outcome {
+            Ok(reply) => {
+                return Ok(Json(StateStoreIterateResponse {
                     store_id: store.store_id,
-                    found: result.row.is_some(),
-                    payload_base64: result.row.as_ref().map(|row| STANDARD.encode(&row.payload)),
-                    applied_cursor: result.row.map(|row| row.applied_cursor),
-                    applied_seq: result.applied_seq,
-                    committed_seq: result.committed_seq,
-                    behind: result.applied_seq < result.committed_seq,
+                    rows: reply
+                        .result
+                        .rows
+                        .into_iter()
+                        .map(|row| StateStoreIterateRow {
+                            key_base64: STANDARD.encode(&row.key),
+                            payload_base64: STANDARD.encode(&row.payload),
+                            applied_seq: row.applied_seq,
+                        })
+                        .collect(),
+                    next_key_base64: reply.result.next_key.map(|key| STANDARD.encode(&key)),
+                    pinned_seq: reply.result.pinned_seq,
                     served_by: reply.replica.to_string(),
                 }));
             }
@@ -3411,7 +3645,63 @@ async fn state_store_lookup(
         }
     }
     Err(last_error.unwrap_or_else(|| {
-        ApiError::unavailable("no StateStore journal replica could serve the lookup")
+        ApiError::unavailable("no StateStore journal replica could serve the iteration")
+    }))
+}
+
+/// `POST /v1/state-stores/clear`: journal one `ClearAll` mutation through
+/// the store's RF3 quorum; replicas delete rows in bounded batches under
+/// the mutation's cursor and a restart replays the whole clear idempotently.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateStoreClearRequest {
+    store: String,
+    mutation_id: Uuid,
+}
+
+async fn state_store_clear(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<StateStoreClearRequest>,
+) -> Result<Json<StateStoreMutateResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let store = state
+        .control
+        .declared_state_store_by_name(&request.store)
+        .await
+        .ok_or_else(|| {
+            ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
+        })?;
+    if !matches!(store.source, crate::control::StateStoreSource::Manual) {
+        return Err(ApiError::bad_request(
+            "clear applies only to manual StateStores; Feed-derived stores replay from their source",
+        ));
+    }
+    let assignment = state
+        .control
+        .active_state_store_assignment_by_id(store.store_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("StateStore has no mutation-journal placement"))?;
+    let mutation = crate::state_store::StateStoreMutation {
+        store_id: store.store_id,
+        mutation_id: request.mutation_id,
+        request_id: Uuid::new_v4(),
+        ownership_epoch: assignment.ownership_epoch,
+        sequence: 0,
+        op: crate::state_store::StateStoreMutationOp::ClearAll,
+        issued_at_ns: unix_ns(),
+        source: None,
+    };
+    let coordinator = state_store_coordinator_for(&state, assignment)?;
+    let result = coordinator
+        .mutate(mutation)
+        .await
+        .map_err(state_store_api_error)?;
+    Ok(Json(StateStoreMutateResponse {
+        store_id: result.store_id,
+        mutation_id: result.mutation_id,
+        sequence: result.sequence,
+        deduplicated: result.deduplicated,
     }))
 }
 
@@ -3470,12 +3760,24 @@ struct StateStoreMutateRequest {
     op: StateStoreMutateOpRequest,
 }
 
+/// One named-key value on a `put_row` mutation: the caller names a declared
+/// key and supplies typed values; `unique` is never caller-supplied — the
+/// server stamps it from the store's `named_keys` declaration.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateStoreNamedValueRequest {
+    name: String,
+    values: Vec<IndexValueWire>,
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum StateStoreMutateOpRequest {
     PutRow {
         key_base64: String,
         payload_base64: String,
+        #[serde(default)]
+        named: Vec<StateStoreNamedValueRequest>,
     },
     DeleteRow {
         key_base64: String,
@@ -3517,10 +3819,41 @@ async fn state_store_mutate(
         StateStoreMutateOpRequest::PutRow {
             key_base64,
             payload_base64,
-        } => crate::state_store::StateStoreMutationOp::PutRow {
-            key: decode_base64("key_base64", &key_base64)?,
-            payload: decode_base64("payload_base64", &payload_base64)?,
-        },
+            named,
+        } => {
+            if named.len() > crate::control::MAX_STATE_STORE_NAMED_KEYS {
+                return Err(ApiError::bad_request(
+                    "a row may write at most the store's named-key budget",
+                ));
+            }
+            let mut named_out = Vec::with_capacity(named.len());
+            for entry in named {
+                let declared = store
+                    .named_keys
+                    .iter()
+                    .find(|key| key.name == entry.name)
+                    .ok_or_else(|| {
+                        ApiError::bad_request(format!(
+                            "StateStore {} does not declare named key {}",
+                            store.name, entry.name
+                        ))
+                    })?;
+                named_out.push(crate::state_store::NamedKeyValue {
+                    name: entry.name,
+                    values: entry
+                        .values
+                        .into_iter()
+                        .map(IndexValueWire::into_value)
+                        .collect::<Result<_, _>>()?,
+                    unique: declared.unique,
+                });
+            }
+            crate::state_store::StateStoreMutationOp::PutRow {
+                key: decode_base64("key_base64", &key_base64)?,
+                payload: decode_base64("payload_base64", &payload_base64)?,
+                named: named_out,
+            }
+        }
         StateStoreMutateOpRequest::DeleteRow { key_base64 } => {
             crate::state_store::StateStoreMutationOp::DeleteRow {
                 key: decode_base64("key_base64", &key_base64)?,
@@ -9391,6 +9724,7 @@ mod tests {
             .execute_commands(vec![Command::DefineStateStore {
                 name: "accounts.profiles".to_owned(),
                 source: crate::control::StateStoreSourceRequest::Manual,
+                named_keys: vec![],
             }])
             .await
             .unwrap();
@@ -9578,6 +9912,7 @@ mod tests {
                 source: crate::control::StateStoreSourceRequest::Feed {
                     feed: "orders.events".to_owned(),
                 },
+                named_keys: vec![],
             }])
             .await
             .unwrap();
@@ -9771,6 +10106,7 @@ mod tests {
             .execute_commands(vec![Command::DefineStateStore {
                 name: "orders.manual".to_owned(),
                 source: crate::control::StateStoreSourceRequest::Manual,
+                named_keys: vec![],
             }])
             .await
             .unwrap();
@@ -10335,6 +10671,7 @@ mod tests {
             .execute_commands(vec![Command::DefineStateStore {
                 name: "accounts.profiles".to_owned(),
                 source: crate::control::StateStoreSourceRequest::Manual,
+                named_keys: vec![],
             }])
             .await
             .unwrap();
@@ -10560,6 +10897,7 @@ mod tests {
             op: crate::state_store::StateStoreMutationOp::PutRow {
                 key: b"user-9".to_vec(),
                 payload: b"v2".to_vec(),
+                named: Vec::new(),
             },
             issued_at_ns: 1,
             source: None,
@@ -10605,6 +10943,273 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn state_store_named_key_lifecycle_over_http() {
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let nodes: Vec<crate::active_range::StorageNodeId> =
+            ["storage-1", "storage-2", "storage-3"]
+                .into_iter()
+                .map(|name| crate::active_range::StorageNodeId::try_new(name).unwrap())
+                .collect();
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store.clone(),
+                nodes.clone(),
+            )
+            .unwrap(),
+        );
+        control.execute("CREATE SPACE accounts;").await.unwrap();
+        control
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.profiles".to_owned(),
+                source: crate::control::StateStoreSourceRequest::Manual,
+                named_keys: vec![
+                    crate::control::NamedStateStoreKey {
+                        name: "passport".to_owned(),
+                        unique: true,
+                    },
+                    crate::control::NamedStateStoreKey {
+                        name: "department".to_owned(),
+                        unique: false,
+                    },
+                ],
+            }])
+            .await
+            .unwrap();
+
+        let control_key = "this-is-a-long-control-plane-key".to_owned();
+        let mut listeners = Vec::new();
+        let mut endpoints = BTreeMap::new();
+        for node in &nodes {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            endpoints.insert(
+                node.clone(),
+                format!("http://{}", listener.local_addr().unwrap()),
+            );
+            listeners.push(listener);
+        }
+        for (index, node) in nodes.iter().enumerate() {
+            let listener = listeners.remove(0);
+            listener.set_nonblocking(true).unwrap();
+            let journal = Arc::new(
+                crate::state_store::FjallStateStoreMutationJournal::open(
+                    directory.path().join(format!("journal-{index}")),
+                )
+                .unwrap(),
+            );
+            let index_store: Arc<dyn crate::index::IndexStore> = Arc::new(
+                crate::index::FjallIndexStore::open(
+                    directory.path().join(format!("index-{index}")),
+                )
+                .unwrap(),
+            );
+            let service = crate::state_store::StateStoreMutationService::new(
+                node.clone(),
+                control.clone(),
+                journal,
+                Arc::new(crate::state_store::IndexStoreStateApply::new(index_store)),
+            );
+            let membership = Arc::new(MembershipService::new(
+                MemberAnnouncement {
+                    node_id: format!("test-node-{index}"),
+                    api_url: "http://test-node:7070".to_owned(),
+                    capacity: 100,
+                },
+                vec![],
+                Duration::from_secs(1),
+                Duration::from_secs(5),
+            ));
+            let state = AppState {
+                store: store.clone(),
+                membership,
+                demand: DemandMetrics::default(),
+                autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                control: control.clone(),
+                control_plane: None,
+                progress_authority: control.clone(),
+                replica_append: None,
+                majority_append: None,
+                subscription_progress: None,
+                effect_journal: None,
+                state_store_journal: Some(Arc::new(service)),
+                subscription_mtls_enabled: false,
+                storage_node_id: Some(node.clone()),
+                control_endpoints: Arc::new(endpoints.clone().into()),
+                internal_key: Some(control_key.clone()),
+                internal_http: reqwest::Client::new(),
+                internal_mtls: None,
+                admin_auth: AdminAuthenticator::new(Some(
+                    "this-is-a-long-development-api-key".to_owned(),
+                ))
+                .unwrap(),
+            };
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            tokio::spawn(async move {
+                axum::serve(listener, router(state)).await.unwrap();
+            });
+        }
+
+        let client = reqwest::Client::new();
+        let admin = "this-is-a-long-development-api-key";
+        let ingress = &nodes[0];
+
+        // Two rows land through the quorum path with named-key values.
+        for (key, passport, department) in [("user-1", "P111", "eng"), ("user-2", "P222", "eng")] {
+            let response = client
+                .post(format!("{}/v1/state-stores/mutate", endpoints[ingress]))
+                .bearer_auth(admin)
+                .json(&serde_json::json!({
+                    "store": "accounts.profiles",
+                    "mutation_id": Uuid::new_v4(),
+                    "op": {
+                        "kind": "put_row",
+                        "key_base64": STANDARD.encode(key),
+                        "payload_base64": STANDARD.encode(format!("profile-{key}")),
+                        "named": [
+                            {"name": "passport", "values": [{"kind": "text", "value": passport}]},
+                            {"name": "department", "values": [{"kind": "text", "value": department}]},
+                        ],
+                    }
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+
+        // Mutating a key the store does not declare is refused, not ignored.
+        let response = client
+            .post(format!("{}/v1/state-stores/mutate", endpoints[ingress]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+                "mutation_id": Uuid::new_v4(),
+                "op": {
+                    "kind": "put_row",
+                    "key_base64": STANDARD.encode(b"user-3"),
+                    "payload_base64": STANDARD.encode(b"x"),
+                    "named": [{"name": "undeclared", "values": [{"kind": "text", "value": "v"}]}],
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // The group/list read: one department value resolves both rows.
+        let response = client
+            .post(format!("{}/v1/state-stores/get-by", endpoints[ingress]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+                "named_key": "department",
+                "values": [{"kind": "text", "value": "eng"}],
+                "strict": true,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        let keys: Vec<String> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["key_base64"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(keys.len(), 2, "{body}");
+        assert!(keys.contains(&STANDARD.encode(b"user-1")));
+        assert!(keys.contains(&STANDARD.encode(b"user-2")));
+
+        // The unique key resolves to exactly one row.
+        let response = client
+            .post(format!("{}/v1/state-stores/get-by", endpoints[ingress]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+                "named_key": "passport",
+                "values": [{"kind": "text", "value": "P111"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+
+        // An undeclared named key is a request error.
+        let response = client
+            .post(format!("{}/v1/state-stores/get-by", endpoints[ingress]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+                "named_key": "absent",
+                "values": [{"kind": "text", "value": "eng"}],
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Iterate returns the applied rows in order with freshness evidence.
+        let response = client
+            .post(format!("{}/v1/state-stores/iterate", endpoints[ingress]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+        assert!(body["pinned_seq"].as_u64().unwrap() >= 2);
+
+        // Clear is one journaled mutation; reads then see an empty store.
+        let response = client
+            .post(format!("{}/v1/state-stores/clear", endpoints[ingress]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+                "mutation_id": Uuid::new_v4(),
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = client
+            .post(format!("{}/v1/state-stores/iterate", endpoints[ingress]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["rows"].as_array().unwrap().len(), 0);
+        // The cleared rows' named postings are gone too.
+        let response = client
+            .post(format!("{}/v1/state-stores/get-by", endpoints[ingress]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+                "named_key": "department",
+                "values": [{"kind": "text", "value": "eng"}],
+                "strict": true,
+            }))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["rows"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn state_store_replica_catches_up_over_internal_http() {
         let directory = TempDir::new().unwrap();
         let store: Arc<dyn LogStore> =
@@ -10627,6 +11232,7 @@ mod tests {
             .execute_commands(vec![Command::DefineStateStore {
                 name: "accounts.profiles".to_owned(),
                 source: crate::control::StateStoreSourceRequest::Manual,
+                named_keys: vec![],
             }])
             .await
             .unwrap();
