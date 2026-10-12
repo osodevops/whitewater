@@ -2185,14 +2185,13 @@ async fn drive_pipe(
                     let emissions = match &pipe.operation {
                         crate::control::PipeOperation::Window {
                             window_ns,
-                            key,
                             max_late_ns: Some(bound),
                             ..
-                        } if pipe.output_feed_id.is_some() => resolve_window_emissions(
-                            state, &pipe, key, *window_ns, *bound, &records,
-                        )
-                        .await
-                        .map_err(|_| crate::effect::EffectJournalError::Unavailable)?,
+                        } if pipe.output_feed_id.is_some() => {
+                            resolve_window_emissions(state, &pipe, *window_ns, *bound, &records)
+                                .await
+                                .map_err(|_| crate::effect::EffectJournalError::Unavailable)?
+                        }
                         _ => Vec::new(),
                     };
                     Ok(crate::pipe::FetchedPage {
@@ -3446,12 +3445,21 @@ async fn state_store_lookup(
 /// replica first (no network hop), then the owner (freshest application),
 /// then the remaining replicas. Strict reads skip a replica still applying
 /// its journal; when none catches up in time the caller gets `index_behind`.
+/// One named-read shape: equality on declared values or a bounded range
+/// over the same posting order. The wire request carries both options
+/// for compatibility; this selector makes the mutual exclusivity
+/// unrepresentable inside the service path.
+enum NamedReadSelection {
+    Exact(crate::state_store::StateStoreNamedRead),
+    Range(crate::state_store::StateStoreNamedRangeRead),
+}
+
 async fn serve_state_store_read(
     state: &AppState,
     assignment: &crate::state_store::StateStoreAssignment,
     store_id: Uuid,
     key: Vec<u8>,
-    by_named: Option<crate::state_store::StateStoreNamedRead>,
+    named: Option<NamedReadSelection>,
     strict: bool,
     wait_ms: Option<u64>,
 ) -> Result<
@@ -3480,7 +3488,14 @@ async fn serve_state_store_read(
             key: key.clone(),
             strict,
             wait_ms: wait_ms.unwrap_or(500),
-            by_named: by_named.clone(),
+            by_named: match &named {
+                Some(NamedReadSelection::Exact(read)) => Some(read.clone()),
+                _ => None,
+            },
+            by_named_range: match &named {
+                Some(NamedReadSelection::Range(read)) => Some(read.clone()),
+                _ => None,
+            },
         };
         let outcome = if Some(replica) == state.storage_node_id.as_ref()
             && state.state_store_journal.is_some()
@@ -3530,7 +3545,16 @@ async fn serve_state_store_read(
 struct StateStoreGetByRequest {
     store: String,
     named_key: String,
+    /// Equality values; must be empty when `lower`/`upper` bound a
+    /// range read instead.
+    #[serde(default)]
     values: Vec<IndexValueWire>,
+    /// Optional inclusive/exclusive range bounds over the named key —
+    /// the same vocabulary `POST /v1/indexes/query` `range` uses.
+    #[serde(default)]
+    lower: Option<IndexBoundWire>,
+    #[serde(default)]
+    upper: Option<IndexBoundWire>,
     #[serde(default)]
     limit: Option<usize>,
     #[serde(default)]
@@ -3584,25 +3608,60 @@ async fn state_store_get_by(
         .active_state_store_assignment_by_id(store.store_id)
         .await
         .ok_or_else(|| ApiError::unavailable("StateStore has no mutation-journal placement"))?;
-    if request.values.is_empty() {
+    let is_range = request.lower.is_some() || request.upper.is_some();
+    if is_range && !request.values.is_empty() {
+        return Err(ApiError::bad_request(
+            "values must be empty when range bounds are supplied",
+        ));
+    }
+    if !is_range && request.values.is_empty() {
         return Err(ApiError::bad_request("values must not be empty"));
     }
-    let values: Vec<crate::index::IndexValue> = request
-        .values
-        .into_iter()
-        .map(IndexValueWire::into_value)
-        .collect::<Result<_, _>>()?;
-    let by_named = crate::state_store::StateStoreNamedRead {
-        name: request.named_key,
-        values,
-        limit: request.limit.unwrap_or(64).clamp(1, 1_000),
+    let limit = request.limit.unwrap_or(64).clamp(1, 1_000);
+    let (by_named, by_named_range) = if is_range {
+        let bound = |wire: Option<IndexBoundWire>| {
+            wire.map(|bound| {
+                Ok::<_, ApiError>(crate::control::IndexBound {
+                    value: bound.value.into_value()?,
+                    inclusive: bound.inclusive,
+                })
+            })
+            .transpose()
+        };
+        (
+            None,
+            Some(crate::state_store::StateStoreNamedRangeRead {
+                name: request.named_key,
+                lower: bound(request.lower)?,
+                upper: bound(request.upper)?,
+                limit,
+            }),
+        )
+    } else {
+        let values: Vec<crate::index::IndexValue> = request
+            .values
+            .into_iter()
+            .map(IndexValueWire::into_value)
+            .collect::<Result<_, _>>()?;
+        (
+            Some(crate::state_store::StateStoreNamedRead {
+                name: request.named_key,
+                values,
+                limit,
+            }),
+            None,
+        )
     };
     let outcome = serve_state_store_read(
         &state,
         &assignment,
         store.store_id,
         Vec::new(),
-        Some(by_named),
+        match (by_named, by_named_range) {
+            (Some(read), None) => Some(NamedReadSelection::Exact(read)),
+            (None, Some(read)) => Some(NamedReadSelection::Range(read)),
+            _ => None,
+        },
         request.strict,
         request.wait_ms,
     )
@@ -3921,6 +3980,7 @@ async fn resolve_enrich(
             strict: matches!(freshness, crate::control::EnrichFreshness::Strict),
             wait_ms: 500,
             by_named: by_named.clone(),
+            by_named_range: None,
         };
         let outcome = if Some(replica) == state.storage_node_id.as_ref()
             && state.state_store_journal.is_some()
@@ -3978,16 +4038,15 @@ async fn resolve_enrich(
     }))
 }
 
-/// Resolve closed window panes for emission at fetch time. For every
-/// group touched by this page, read the `key` named posting (the same
-/// contract public row reads use) and keep rows whose pane provably
-/// closed — the ingest clock passed pane_end + MAX_LATE. The sentinel
-/// late pane and foreign `key`-posting rows are filtered out by
-/// `window_emission_from_row`.
+/// Resolve closed window panes for emission at fetch time. A single
+/// bounded range scan over the `pane` posting enumerates every closable
+/// pane across all groups — untouched groups' panes still close on
+/// schedule instead of waiting for traffic to revisit them. Foreign
+/// rows sharing the `pane` name are filtered out by
+/// `window_emission_from_row` and never deleted.
 async fn resolve_window_emissions(
     state: &AppState,
     pipe: &crate::control::PipeDefinition,
-    key: &crate::control::IndexFieldSpec,
     window_ns: u64,
     max_late_ns: u64,
     records: &[crate::pipe::FetchedRecord],
@@ -4006,28 +4065,6 @@ async fn resolve_window_emissions(
     else {
         return Ok(Vec::new());
     };
-    // Deduplicated groups this page touches — only these can have rows
-    // worth emitting this cycle.
-    let mut groups: std::collections::BTreeMap<Vec<u8>, crate::index::IndexValue> =
-        std::collections::BTreeMap::new();
-    for record in records {
-        let Some(source) = crate::pipe::source_record(record) else {
-            continue;
-        };
-        let Ok(values) =
-            crate::index_build::extract_index_values(std::slice::from_ref(key), &source)
-        else {
-            continue;
-        };
-        if let Some(value) = values.into_iter().next() {
-            if let Some(tagged) = crate::pipe::window_group_key_bytes(&value) {
-                groups.entry(tagged).or_insert(value);
-            }
-        }
-    }
-    if groups.is_empty() {
-        return Ok(Vec::new());
-    }
     let assignment = state
         .control
         .active_state_store_assignment_by_id(store_id)
@@ -4047,76 +4084,81 @@ async fn resolve_window_emissions(
             candidates.push(replica.clone());
         }
     }
-    let mut emissions = Vec::new();
-    'groups: for (group_tagged, group_value) in &groups {
-        let mut reply = None;
-        let mut last_error: Option<ApiError> = None;
-        for replica in &candidates {
-            let read = crate::state_store::StateStoreReadRequest {
-                owner: assignment.owner.clone(),
-                receiver: replica.clone(),
-                store_id,
-                ownership_epoch: assignment.ownership_epoch,
-                key: Vec::new(),
-                strict: false,
-                wait_ms: 500,
-                by_named: Some(crate::state_store::StateStoreNamedRead {
-                    name: crate::pipe::WINDOW_KEY_NAME.to_owned(),
-                    values: vec![group_value.clone()],
-                    limit: 64,
+    // Closable panes satisfy (pane + 1) * pane_ns + max_late <= now;
+    // the range bound prefilters, and the per-row check decides.
+    let closed_max =
+        i64::try_from((now_ns.saturating_sub(max_late_ns) / pane_ns).saturating_sub(1))
+            .unwrap_or(i64::MAX);
+    let mut reply = None;
+    let mut last_error: Option<ApiError> = None;
+    for replica in &candidates {
+        let read = crate::state_store::StateStoreReadRequest {
+            owner: assignment.owner.clone(),
+            receiver: replica.clone(),
+            store_id,
+            ownership_epoch: assignment.ownership_epoch,
+            key: Vec::new(),
+            strict: false,
+            wait_ms: 500,
+            by_named: None,
+            by_named_range: Some(crate::state_store::StateStoreNamedRangeRead {
+                name: crate::pipe::WINDOW_PANE_NAME.to_owned(),
+                lower: None,
+                upper: Some(crate::control::IndexBound {
+                    value: crate::index::IndexValue::I64(closed_max),
+                    inclusive: true,
                 }),
-            };
-            let outcome = if Some(replica) == state.storage_node_id.as_ref()
-                && state.state_store_journal.is_some()
-            {
-                state
-                    .state_store_journal
-                    .as_ref()
-                    .unwrap()
-                    .read_row(read)
-                    .await
-                    .map_err(state_store_api_error)
-            } else {
-                match state_store_transport_for(state, &assignment) {
-                    Ok(transport) => transport
-                        .read(replica, read)
-                        .await
-                        .map_err(state_store_api_error),
-                    Err(error) => Err(error),
-                }
-            };
-            match outcome {
-                Ok(result) => {
-                    reply = Some(result);
-                    break;
-                }
-                Err(error) => last_error = Some(error),
-            }
-        }
-        // A group whose posting cannot be read at all fails the whole
-        // resolve — the drive retries rather than emitting a partial
-        // close set. Emission deletes are atomic with their outputs, so
-        // a retry is idempotent.
-        let Some(reply) = reply else {
-            return Err(last_error.unwrap_or_else(|| {
-                ApiError::unavailable("no StateStore replica could serve the emission scan")
-            }));
+                limit: 64,
+            }),
         };
-        for row in reply.result.named_rows {
-            if let Some(emission) = crate::pipe::window_emission_from_row(
-                &row.key,
-                &row.payload,
-                group_tagged,
-                group_value,
-                pane_ns,
-                max_late_ns,
-                now_ns,
-            ) {
-                emissions.push(emission);
+        let outcome = if Some(replica) == state.storage_node_id.as_ref()
+            && state.state_store_journal.is_some()
+        {
+            state
+                .state_store_journal
+                .as_ref()
+                .unwrap()
+                .read_row(read)
+                .await
+                .map_err(state_store_api_error)
+        } else {
+            match state_store_transport_for(state, &assignment) {
+                Ok(transport) => transport
+                    .read(replica, read)
+                    .await
+                    .map_err(state_store_api_error),
+                Err(error) => Err(error),
             }
-            if emissions.len() >= crate::pipe::WINDOW_MAX_EMISSIONS_PER_DRIVE {
-                break 'groups;
+        };
+        match outcome {
+            Ok(result) => {
+                reply = Some(result);
+                break;
             }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    // A scan that cannot complete fails the whole resolve — the drive
+    // retries rather than emitting a partial close set. Emission
+    // deletes are atomic with their outputs, so a retry is idempotent.
+    let Some(reply) = reply else {
+        return Err(last_error.unwrap_or_else(|| {
+            ApiError::unavailable("no StateStore replica could serve the emission scan")
+        }));
+    };
+    let mut emissions = Vec::new();
+    for row in reply.result.named_rows {
+        if let Some(emission) = crate::pipe::window_emission_from_row(
+            &row.key,
+            &row.payload,
+            pane_ns,
+            max_late_ns,
+            now_ns,
+        ) {
+            emissions.push(emission);
+        }
+        if emissions.len() >= crate::pipe::WINDOW_MAX_EMISSIONS_PER_DRIVE {
+            break;
         }
     }
     emissions.sort_by(|a, b| a.row_key.cmp(&b.row_key));
@@ -12105,6 +12147,56 @@ mod tests {
         let body: Value = response.json().await.unwrap();
         assert_eq!(body["rows"].as_array().unwrap().len(), 1);
 
+        // Range reads bound the same named key: text range [a, f)
+        // includes both "eng" rows; an exclusive upper on "eng" empties.
+        let response = client
+            .post(format!("{}/v1/state-stores/get-by", endpoints[ingress]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+                "named_key": "department",
+                "lower": {"value": {"kind": "text", "value": "a"}},
+                "upper": {"value": {"kind": "text", "value": "f"}, "inclusive": false},
+                "strict": true,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["rows"].as_array().unwrap().len(), 2, "{body}");
+
+        let response = client
+            .post(format!("{}/v1/state-stores/get-by", endpoints[ingress]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+                "named_key": "department",
+                "lower": {"value": {"kind": "text", "value": "a"}},
+                "upper": {"value": {"kind": "text", "value": "eng"}, "inclusive": false},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["rows"].as_array().unwrap().len(), 0, "{body}");
+
+        // Mixing equality values with range bounds is a request error.
+        let response = client
+            .post(format!("{}/v1/state-stores/get-by", endpoints[ingress]))
+            .bearer_auth(admin)
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+                "named_key": "department",
+                "values": [{"kind": "text", "value": "eng"}],
+                "lower": {"value": {"kind": "text", "value": "a"}},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
         // An undeclared named key is a request error.
         let response = client
             .post(format!("{}/v1/state-stores/get-by", endpoints[ingress]))
@@ -13926,7 +14018,6 @@ mod tests {
             status: crate::control::ResourceStatus::Active,
             created_at_ns: 0,
         };
-        let key_spec = crate::control::IndexFieldSpec::Key;
         let record = |key: &str, ingest: i64| crate::pipe::FetchedRecord {
             message_id: Uuid::new_v4(),
             key_base64: STANDARD.encode(key),
@@ -13937,29 +14028,21 @@ mod tests {
             resolution: None,
         };
 
-        // A page whose records cannot decode contributes no groups and
-        // resolves to no emissions — never an error, never a partial set.
-        let mut corrupt = record("acct", 1_000);
-        corrupt.key_base64 = "!!!not-base64!!!".to_owned();
-        assert!(resolve_window_emissions(
-            &state,
-            &pipe,
-            &key_spec,
-            60_000_000_000,
-            1_000,
-            &[corrupt],
-        )
-        .await
-        .unwrap()
-        .is_empty());
+        // An empty page carries no ingest clock — nothing resolves, and
+        // it is never an error.
+        assert!(
+            resolve_window_emissions(&state, &pipe, 60_000_000_000, 1_000, &[],)
+                .await
+                .unwrap()
+                .is_empty()
+        );
 
-        // A real group under a store with no journal placement fails the
+        // A real page under a store with no journal placement fails the
         // whole resolve — the drive retries rather than emitting a
         // partial close set.
         assert!(resolve_window_emissions(
             &state,
             &pipe,
-            &key_spec,
             60_000_000_000,
             1_000,
             &[record("acct", 1_000)],

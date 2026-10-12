@@ -683,6 +683,25 @@ pub fn window_pane_row_key(group: &[u8], pane: u64) -> Vec<u8> {
     key
 }
 
+/// Inverse of `window_group_key_bytes`: the typed `IndexValue` behind
+/// tag-prefixed group bytes. `None` for an unknown tag, a malformed Bool
+/// or I64 length, or non-UTF-8 Text — foreign bytes never decode into a
+/// group an emission could claim.
+pub fn window_group_key_value(tagged: &[u8]) -> Option<IndexValue> {
+    let (tag, bytes) = tagged.split_first()?;
+    Some(match tag {
+        0 => IndexValue::Bool(match bytes {
+            [0] => false,
+            [1] => true,
+            _ => return None,
+        }),
+        1 => IndexValue::I64(i64::from_be_bytes(bytes.try_into().ok()?)),
+        2 => IndexValue::Text(std::str::from_utf8(bytes).ok()?.to_owned()),
+        3 => IndexValue::Bytes(bytes.to_vec()),
+        _ => return None,
+    })
+}
+
 /// Inverse of `window_pane_row_key`: `(tagged group bytes, pane index)`.
 /// `None` for a key that is not a well-formed pane row — a foreign row
 /// carrying a `key` posting must never be deleted as a pane.
@@ -697,23 +716,23 @@ pub fn window_pane_row_key_parse(key: &[u8]) -> Option<(Vec<u8>, u64)> {
     Some((group, pane))
 }
 
-/// Decide whether one `key`-posting row is a closed pane worth emitting:
-/// well-formed pane row, belongs to `group_tagged`, real pane (never the
-/// late sentinel), accumulator payload decodes, and the ingest clock has
-/// passed `pane_end + max_late_ns`. Anything else is left alone.
+/// Decide whether one `pane`-posting row is a closed pane worth
+/// emitting: well-formed pane row whose tagged group decodes, real pane
+/// (never the late sentinel), accumulator payload decodes, and the
+/// ingest clock has passed `pane_end + max_late_ns`. Anything else is
+/// left alone — foreign rows sharing the `pane` name never delete.
 pub fn window_emission_from_row(
     row_key: &[u8],
     payload: &[u8],
-    group_tagged: &[u8],
-    group: &IndexValue,
     pane_ns: u64,
     max_late_ns: u64,
     now_ns: u64,
 ) -> Option<WindowEmission> {
     let (row_group, pane) = window_pane_row_key_parse(row_key)?;
-    if row_group != group_tagged || pane == WINDOW_LATE_PANE {
+    if pane == WINDOW_LATE_PANE {
         return None;
     }
+    let group = window_group_key_value(&row_group)?;
     let (count, sum) = crate::index::decode_accumulator(payload)?;
     let pane_end = pane.checked_add(1)?.checked_mul(pane_ns)?;
     if now_ns < pane_end.checked_add(max_late_ns)? {
@@ -721,7 +740,7 @@ pub fn window_emission_from_row(
     }
     Some(WindowEmission {
         row_key: row_key.to_vec(),
-        group: group.clone(),
+        group,
         group_tagged: row_group,
         pane,
         count,
@@ -924,50 +943,42 @@ mod tests {
         // pane 5 closes at ingest-time (5+1)*10 + 20 = 80.
         let key = window_pane_row_key(&group, 5);
         let emission =
-            window_emission_from_row(&key, &payload, &group, &group_value, pane_ns, 20, 80)
-                .expect("closed pane emits");
+            window_emission_from_row(&key, &payload, pane_ns, 20, 80).expect("closed pane emits");
         assert_eq!(emission.pane, 5);
         assert_eq!(emission.count, 3);
         assert_eq!(emission.sum, 42);
         assert_eq!(emission.row_key, key);
+        assert_eq!(emission.group, group_value);
         // One tick earlier the pane is still open.
-        assert!(
-            window_emission_from_row(&key, &payload, &group, &group_value, pane_ns, 20, 79)
-                .is_none()
-        );
+        assert!(window_emission_from_row(&key, &payload, pane_ns, 20, 79).is_none());
         // The late-sentinel pane never emits.
         let late_key = window_pane_row_key(&group, WINDOW_LATE_PANE);
-        assert!(window_emission_from_row(
-            &late_key,
-            &payload,
-            &group,
-            &group_value,
-            pane_ns,
-            20,
-            u64::MAX
-        )
-        .is_none());
-        // A foreign group's row is untouched.
-        let other = window_group_key_bytes(&IndexValue::Text("other".to_owned())).unwrap();
-        assert!(
-            window_emission_from_row(&key, &payload, &other, &group_value, pane_ns, 20, 80)
-                .is_none()
-        );
+        assert!(window_emission_from_row(&late_key, &payload, pane_ns, 20, u64::MAX).is_none());
+        // A group tag that cannot decode never emits or deletes.
+        let mut bad_tag = key.clone();
+        bad_tag[4] = 99;
+        assert!(window_emission_from_row(&bad_tag, &payload, pane_ns, 20, 80).is_none());
         // Malformed payloads and keys never delete anything.
-        assert!(window_emission_from_row(
-            &key,
-            b"not-an-accumulator",
-            &group,
-            &group_value,
-            pane_ns,
-            20,
-            80
-        )
-        .is_none());
-        assert!(
-            window_emission_from_row(b"bad", &payload, &group, &group_value, pane_ns, 20, 80)
-                .is_none()
-        );
+        assert!(window_emission_from_row(&key, b"not-an-accumulator", pane_ns, 20, 80).is_none());
+        assert!(window_emission_from_row(b"bad", &payload, pane_ns, 20, 80).is_none());
+    }
+
+    #[test]
+    fn window_group_key_value_decodes_only_well_formed_tags() {
+        for value in [
+            IndexValue::Bool(true),
+            IndexValue::I64(-7),
+            IndexValue::Text("acct".to_owned()),
+            IndexValue::Bytes(b"\x00\xff".to_vec()),
+        ] {
+            let tagged = window_group_key_bytes(&value).unwrap();
+            assert_eq!(window_group_key_value(&tagged), Some(value));
+        }
+        assert_eq!(window_group_key_value(&[]), None);
+        assert_eq!(window_group_key_value(&[99, 1]), None);
+        assert_eq!(window_group_key_value(&[0, 2]), None);
+        assert_eq!(window_group_key_value(&[1, 0]), None);
+        assert_eq!(window_group_key_value(&[2, 0xff]), None);
     }
 
     #[test]

@@ -286,6 +286,22 @@ pub struct StateStoreNamedRead {
     pub limit: usize,
 }
 
+/// A bounded range read over one named key's values: resolves rows whose
+/// named posting falls inside `[lower, upper]` under typed `IndexValue`
+/// order (absent bound = unbounded; each bound may be inclusive or
+/// exclusive). Mutually exclusive with `by_named` equality and
+/// primary-key point reads.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StateStoreNamedRangeRead {
+    pub name: String,
+    #[serde(default)]
+    pub lower: Option<crate::control::IndexBound>,
+    #[serde(default)]
+    pub upper: Option<crate::control::IndexBound>,
+    #[serde(default = "default_named_read_limit")]
+    pub limit: usize,
+}
+
 fn default_named_read_limit() -> usize {
     64
 }
@@ -308,6 +324,8 @@ pub struct StateStoreReadRequest {
     pub wait_ms: u64,
     #[serde(default)]
     pub by_named: Option<StateStoreNamedRead>,
+    #[serde(default)]
+    pub by_named_range: Option<StateStoreNamedRangeRead>,
 }
 
 /// One applied StateStore row returned by a replica read.
@@ -2105,7 +2123,11 @@ impl StateStoreMutationService {
                 request.ownership_epoch,
             )
             .await?;
+        if request.by_named.is_some() && request.by_named_range.is_some() {
+            return Err(StateStoreMutationError::Conflict);
+        }
         if request.by_named.is_none()
+            && request.by_named_range.is_none()
             && (request.key.is_empty() || request.key.len() > STATE_STORE_MAX_KEY_BYTES)
         {
             return Err(StateStoreMutationError::TooLarge);
@@ -2115,6 +2137,19 @@ impl StateStoreMutationService {
                 return Err(StateStoreMutationError::TooLarge);
             }
         }
+        if let Some(range) = &request.by_named_range {
+            if range.limit == 0 || range.limit > 1_000 {
+                return Err(StateStoreMutationError::TooLarge);
+            }
+            if let (Some(lower), Some(upper)) = (&range.lower, &range.upper) {
+                let order = crate::index::cmp_index_value(&lower.value, &upper.value);
+                if order == std::cmp::Ordering::Greater
+                    || (order == std::cmp::Ordering::Equal && !(lower.inclusive && upper.inclusive))
+                {
+                    return Err(StateStoreMutationError::Conflict);
+                }
+            }
+        }
         let journal = self.journal.clone();
         let apply = self.apply.clone();
         let store_id = request.store_id;
@@ -2122,6 +2157,7 @@ impl StateStoreMutationService {
         let strict = request.strict;
         let wait = std::time::Duration::from_millis(request.wait_ms.min(MAX_STRICT_READ_WAIT_MS));
         let by_named = request.by_named.clone();
+        let by_named_range = request.by_named_range.clone();
         let (row, named_rows, applied_seq, committed_seq) =
             tokio::task::spawn_blocking(move || {
                 // Strict freshness pins to the commit frontier observed at
@@ -2140,8 +2176,8 @@ impl StateStoreMutationService {
                         inspection = journal.inspect(store_id)?;
                     }
                 }
-                let (row, named_rows) = match by_named {
-                    Some(named) => {
+                let (row, named_rows) = match (by_named, by_named_range) {
+                    (Some(named), _) => {
                         let index = apply
                             .index_store()
                             .ok_or(StateStoreMutationError::ApplyFailed)?;
@@ -2161,7 +2197,39 @@ impl StateStoreMutationService {
                             .collect();
                         (None, rows)
                     }
-                    None => (apply.get_row(store_id, &key)?, Vec::new()),
+                    (None, Some(range)) => {
+                        let index = apply
+                            .index_store()
+                            .ok_or(StateStoreMutationError::ApplyFailed)?;
+                        use std::ops::Bound;
+                        let bound = |value: Option<crate::control::IndexBound>| {
+                            value.map_or(Bound::Unbounded, |bound| {
+                                if bound.inclusive {
+                                    Bound::Included(bound.value)
+                                } else {
+                                    Bound::Excluded(bound.value)
+                                }
+                            })
+                        };
+                        let rows = index
+                            .lookup_range(
+                                named_key_index_id(store_id, &range.name),
+                                &[],
+                                bound(range.lower.clone()),
+                                bound(range.upper.clone()),
+                                range.limit,
+                            )
+                            .map_err(|_| StateStoreMutationError::ApplyFailed)?
+                            .into_iter()
+                            .map(|row| StateStoreNamedRow {
+                                key: row.reference.application_key,
+                                payload: row.payload,
+                                applied_cursor: row.applied_cursor,
+                            })
+                            .collect();
+                        (None, rows)
+                    }
+                    (None, None) => (apply.get_row(store_id, &key)?, Vec::new()),
                 };
                 Ok::<_, StateStoreMutationError>((
                     row,
@@ -3554,6 +3622,7 @@ mod tests {
         let epoch = assignment.ownership_epoch;
         let read = |key: &[u8], epoch: u64| StateStoreReadRequest {
             by_named: None,
+            by_named_range: None,
             owner: owner.clone(),
             receiver: node("storage-1"),
             store_id,
@@ -3921,6 +3990,7 @@ mod tests {
         let row = services[lagging_index]
             .read_row(StateStoreReadRequest {
                 by_named: None,
+                by_named_range: None,
                 owner: owner.clone(),
                 receiver: lagging_node.clone(),
                 store_id,
@@ -4330,12 +4400,157 @@ mod tests {
                     values: vec![crate::index::IndexValue::Text("eng".to_owned())],
                     limit: 8,
                 }),
+                by_named_range: None,
             })
             .await
             .unwrap();
         assert_eq!(reply.result.named_rows.len(), 1);
         assert_eq!(reply.result.named_rows[0].key, b"user-1");
         assert_eq!(reply.result.named_rows[0].payload, b"profile");
+    }
+
+    #[tokio::test]
+    async fn read_row_resolves_named_range_postings_in_typed_order() {
+        let catalog_dir = TempDir::new().unwrap();
+        let store: Arc<dyn crate::storage::LogStore> =
+            Arc::new(crate::storage::FileLogStore::open(catalog_dir.path().join("data")).unwrap());
+        let control = Arc::new(
+            crate::control::ControlController::open_with_storage_nodes(
+                catalog_dir.path().join("catalog"),
+                store,
+                ["storage-1", "storage-2", "storage-3"]
+                    .into_iter()
+                    .map(|node| StorageNodeId::try_new(node).unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        );
+        control.execute("CREATE SPACE orders;").await.unwrap();
+        control
+            .execute_commands(vec![crate::control::Command::DefineStateStore {
+                name: "orders.panes".to_owned(),
+                source: crate::control::StateStoreSourceRequest::Manual,
+                named_keys: vec![crate::control::NamedStateStoreKey {
+                    name: "pane".to_owned(),
+                    unique: false,
+                    extractor: None,
+                }],
+            }])
+            .await
+            .unwrap();
+        let definition = control
+            .declared_state_store_by_name("orders.panes")
+            .await
+            .unwrap();
+        let assignment = control
+            .active_state_store_assignment_by_id(definition.store_id)
+            .await
+            .unwrap();
+        let index_dir = TempDir::new().unwrap();
+        let index: Arc<dyn IndexStore> = Arc::new(FjallIndexStore::open(index_dir.path()).unwrap());
+        let apply = IndexStoreStateApply::new(index);
+        for (sequence, key, pane) in [(1u64, "row-a", 2i64), (2, "row-b", 5), (3, "row-c", 9)] {
+            let mut m = mutation(definition.store_id, sequence, key);
+            m.op = StateStoreMutationOp::PutRow {
+                key: key.as_bytes().to_vec(),
+                payload: format!("acc-{pane}").into_bytes(),
+                named: vec![NamedKeyValue {
+                    name: "pane".to_owned(),
+                    values: vec![crate::index::IndexValue::I64(pane)],
+                    unique: false,
+                }],
+            };
+            apply.apply(&m).unwrap();
+        }
+        let journal_dir = TempDir::new().unwrap();
+        let journal = Arc::new(FjallStateStoreMutationJournal::open(journal_dir.path()).unwrap());
+        let service = StateStoreMutationService::new(
+            assignment.owner.clone(),
+            control,
+            journal,
+            Arc::new(apply),
+        );
+        let range = |lower: Option<crate::index::IndexValue>,
+                     upper: Option<crate::index::IndexValue>,
+                     limit| StateStoreReadRequest {
+            owner: assignment.owner.clone(),
+            receiver: assignment.owner.clone(),
+            store_id: definition.store_id,
+            ownership_epoch: assignment.ownership_epoch,
+            key: Vec::new(),
+            strict: false,
+            wait_ms: 0,
+            by_named: None,
+            by_named_range: Some(StateStoreNamedRangeRead {
+                name: "pane".to_owned(),
+                lower: lower.map(|value| crate::control::IndexBound {
+                    value,
+                    inclusive: true,
+                }),
+                upper: upper.map(|value| crate::control::IndexBound {
+                    value,
+                    inclusive: true,
+                }),
+                limit,
+            }),
+        };
+        // Inclusive upper bound collects panes <= 5 in ascending order.
+        let reply = service
+            .read_row(range(None, Some(crate::index::IndexValue::I64(5)), 8))
+            .await
+            .unwrap();
+        let keys: Vec<&[u8]> = reply
+            .result
+            .named_rows
+            .iter()
+            .map(|row| row.key.as_slice())
+            .collect();
+        assert_eq!(keys, vec![b"row-a".as_slice(), b"row-b".as_slice()]);
+        // A bounded window [5, 9] collects exactly its endpoints.
+        let reply = service
+            .read_row(range(
+                Some(crate::index::IndexValue::I64(5)),
+                Some(crate::index::IndexValue::I64(9)),
+                8,
+            ))
+            .await
+            .unwrap();
+        let keys: Vec<&[u8]> = reply
+            .result
+            .named_rows
+            .iter()
+            .map(|row| row.key.as_slice())
+            .collect();
+        assert_eq!(keys, vec![b"row-b".as_slice(), b"row-c".as_slice()]);
+        // The limit bounds the scan.
+        let reply = service.read_row(range(None, None, 1)).await.unwrap();
+        assert_eq!(reply.result.named_rows.len(), 1);
+        // Inverted bounds and mixed read shapes refuse.
+        assert!(service
+            .read_row(range(
+                Some(crate::index::IndexValue::I64(9)),
+                Some(crate::index::IndexValue::I64(5)),
+                8,
+            ))
+            .await
+            .is_err());
+        let mut mixed = range(None, None, 8);
+        mixed.by_named = Some(StateStoreNamedRead {
+            name: "pane".to_owned(),
+            values: vec![crate::index::IndexValue::I64(5)],
+            limit: 8,
+        });
+        assert!(service.read_row(mixed).await.is_err());
+        // A range read on an undeclared named key resolves empty.
+        let mut missing = range(None, None, 8);
+        missing.by_named_range.as_mut().unwrap().name = "nope".to_owned();
+        assert!(service
+            .read_row(missing)
+            .await
+            .unwrap()
+            .result
+            .named_rows
+            .is_empty());
     }
 
     /// Pending committed count on a service's own journal.

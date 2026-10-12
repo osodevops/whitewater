@@ -333,7 +333,7 @@ fn decode_value_at(key: &[u8], offset: usize) -> Result<(IndexValue, usize), Ind
 /// Text, with Bool false < true, I64 numeric, and Bytes/Text bytewise.
 /// Used by bounded range scans to compare a decoded posting field against
 /// caller bounds without re-encoding per key.
-fn cmp_index_value(left: &IndexValue, right: &IndexValue) -> std::cmp::Ordering {
+pub fn cmp_index_value(left: &IndexValue, right: &IndexValue) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     fn tag(value: &IndexValue) -> u8 {
         match value {
