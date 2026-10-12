@@ -129,6 +129,16 @@ pub enum PipeOperation {
         #[serde(default)]
         time: WindowTime,
     },
+    /// Point-lookup enrichment: for each delivered record, resolve one
+    /// StateStore row by the projected `key` and copy its payload into the
+    /// output record's Metadata (`enrich.payload`, plus `enrich.matched`).
+    /// The resolution rides inside the effect's `Declare`, so an applied
+    /// output is byte-identical across replays; concurrent drives over one
+    /// frontier converge on whichever Declare committed first.
+    Enrich {
+        /// Which typed record value addresses the lookup row's primary key.
+        key: IndexFieldSpec,
+    },
 }
 
 /// Which record clock a `Window` Pipe buckets into panes. Both clocks are
@@ -2401,6 +2411,46 @@ impl ControlController {
                         }
                         (None, Some(store.store_id))
                     }
+                    PipeOperation::Enrich { key } => {
+                        let output_feed = output_feed.ok_or_else(|| {
+                            ControlError::InvalidOperation(
+                                "Enrich Pipes require an output Feed".to_owned(),
+                            )
+                        })?;
+                        let output_store = output_store.ok_or_else(|| {
+                            ControlError::InvalidOperation(
+                                "Enrich Pipes require a lookup StateStore".to_owned(),
+                            )
+                        })?;
+                        let output = active_feed(state, &output_feed)?;
+                        if output.space_id != space_id {
+                            return Err(ControlError::InvalidOperation(
+                                "Pipe output Feed must belong to its Domain".to_owned(),
+                            ));
+                        }
+                        if subscription.source.feed_id() == Some(output.feed_id) {
+                            return Err(ControlError::InvalidOperation(
+                                "Pipe output Feed cannot be its own input Feed".to_owned(),
+                            ));
+                        }
+                        let store = state
+                            .state_stores
+                            .values()
+                            .find(|item| {
+                                item.name == output_store
+                                    && item.stage != StateStoreStage::Dropped
+                            })
+                            .ok_or_else(|| {
+                                ControlError::NotFound(format!("StateStore {output_store}"))
+                            })?;
+                        if store.space_id != space_id {
+                            return Err(ControlError::InvalidOperation(
+                                "Pipe lookup StateStore must belong to its Domain".to_owned(),
+                            ));
+                        }
+                        validate_window_field(key)?;
+                        (Some(output.feed_id), Some(store.store_id))
+                    }
                 };
                 let definition = PipeDefinition {
                     pipe_id: derived_resource_id(request_id, "pipe"),
@@ -4336,13 +4386,29 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 expect_keyword(&tokens, 4, "SUBSCRIPTION")?;
                 expect_keyword(&tokens, 6, "TO")?;
                 match token(&tokens, 7)?.to_ascii_uppercase().as_str() {
-                    "FEED" => Ok(Command::DefinePipe {
-                        name: token(&tokens, 2)?.to_owned(),
-                        subscription: token(&tokens, 5)?.to_owned(),
-                        output_feed: Some(token(&tokens, 8)?.to_owned()),
-                        output_store: None,
-                        operation: PipeOperation::Forward,
-                    }),
+                    "FEED" => {
+                        // Optional: `ENRICH STATESTORE <store> BY <spec>`
+                        if tokens.get(9).is_some() {
+                            expect_keyword(&tokens, 9, "ENRICH")?;
+                            expect_keyword(&tokens, 10, "STATESTORE")?;
+                            expect_keyword(&tokens, 12, "BY")?;
+                            let (key, _) = parse_index_field_spec(&tokens, 13, "ENRICH BY")?;
+                            return Ok(Command::DefinePipe {
+                                name: token(&tokens, 2)?.to_owned(),
+                                subscription: token(&tokens, 5)?.to_owned(),
+                                output_feed: Some(token(&tokens, 8)?.to_owned()),
+                                output_store: Some(token(&tokens, 11)?.to_owned()),
+                                operation: PipeOperation::Enrich { key },
+                            });
+                        }
+                        Ok(Command::DefinePipe {
+                            name: token(&tokens, 2)?.to_owned(),
+                            subscription: token(&tokens, 5)?.to_owned(),
+                            output_feed: Some(token(&tokens, 8)?.to_owned()),
+                            output_store: None,
+                            operation: PipeOperation::Forward,
+                        })
+                    }
                     "STATESTORE" => {
                         expect_keyword(&tokens, 9, "WINDOW")?;
                         let window_ns = parse_window_duration(token(&tokens, 10)?)?;
@@ -8452,5 +8518,81 @@ mod tests {
             );
         }
         let _ = parsed;
+
+        // Enrich Pipes need both targets: an output Feed and a lookup
+        // StateStore in the same Domain, plus a valid key projection.
+        let enrich = |output_feed, output_store| Command::DefinePipe {
+            name: "accounts.enrich".to_owned(),
+            subscription: "accounts.flow".to_owned(),
+            output_feed,
+            output_store,
+            operation: PipeOperation::Enrich {
+                key: IndexFieldSpec::Key,
+            },
+        };
+        leader
+            .execute("CREATE FEED accounts.enriched;")
+            .await
+            .unwrap();
+        for command in [
+            enrich(
+                Some("accounts.missing".to_owned()),
+                Some("accounts.panes".to_owned()),
+            ),
+            enrich(
+                Some("accounts.enriched".to_owned()),
+                Some("accounts.missing".to_owned()),
+            ),
+            enrich(
+                Some("accounts.enriched".to_owned()),
+                Some("other.panes".to_owned()),
+            ),
+            // A self-feeding output loop is refused for Enrich too.
+            enrich(
+                Some("accounts.events".to_owned()),
+                Some("accounts.panes".to_owned()),
+            ),
+            enrich(None, Some("accounts.panes".to_owned())),
+            enrich(Some("accounts.enriched".to_owned()), None),
+        ] {
+            assert!(leader.execute_commands(vec![command]).await.is_err());
+        }
+        let result = leader
+            .execute_commands(vec![enrich(
+                Some("accounts.enriched".to_owned()),
+                Some("accounts.panes".to_owned()),
+            )])
+            .await
+            .unwrap();
+        assert!(result.results[0].data["output_feed_id"].is_string());
+        assert!(result.results[0].data["output_store_id"].is_string());
+        assert_eq!(result.results[0].data["operation"]["operation"], "enrich");
+
+        // The WCL form: CREATE PIPE ... TO FEED <f> ENRICH STATESTORE <s> BY <spec>.
+        leader
+            .execute(
+                "CREATE PIPE accounts.enriched2 FROM SUBSCRIPTION accounts.flow                  TO FEED accounts.enriched ENRICH STATESTORE accounts.panes BY JSON 'cust';",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            leader
+                .active_pipe_by_name("accounts.enriched2")
+                .await
+                .unwrap()
+                .operation,
+            PipeOperation::Enrich {
+                key: IndexFieldSpec::Projection { .. }
+            }
+        ));
+        for statement in [
+            "CREATE PIPE accounts.bad5 FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH STATESTORE accounts.panes;",
+            "CREATE PIPE accounts.bad6 FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH accounts.panes BY KEY;",
+        ] {
+            assert!(
+                leader.execute(statement).await.is_err(),
+                "{statement} must fail"
+            );
+        }
     }
 }

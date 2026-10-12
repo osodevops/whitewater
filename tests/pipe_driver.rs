@@ -21,8 +21,8 @@ use finnstream::effect::{
 };
 use finnstream::index::IndexValue;
 use finnstream::pipe::{
-    pipe_declare_request_id, pipe_effect_id, pipe_output_writer_session, FetchedPage,
-    FetchedRecord, PipeDriver,
+    pipe_declare_request_id, pipe_effect_id, pipe_output_writer_session, EnrichResolution,
+    FetchedPage, FetchedRecord, PipeDriver,
 };
 use finnstream::reader::{
     FjallSubscriptionProgressReplica, SubscriptionCommitEvidence, SubscriptionMemberState,
@@ -584,6 +584,7 @@ fn record(byte: u8) -> FetchedRecord {
         metadata_base64: BTreeMap::new(),
         event_time_ns: byte as i64,
         ingest_time_ns: byte as i64,
+        resolution: None,
     }
 }
 
@@ -1049,6 +1050,7 @@ fn json_record(id: u128, key: &[u8], event_time_ns: i64, value: i64) -> FetchedR
         metadata_base64: BTreeMap::new(),
         event_time_ns,
         ingest_time_ns: 0,
+        resolution: None,
     }
 }
 
@@ -1243,5 +1245,133 @@ async fn window_pane_row_keys_order_by_group_then_pane() {
     assert_eq!(
         first[0].key[..first[0].key.len() - 8],
         second[0].key[..second[0].key.len() - 8]
+    );
+}
+
+fn enrich_pipe() -> PipeDefinition {
+    PipeDefinition {
+        pipe_id: Uuid::from_u128(0x93),
+        name: "orders.enrich".to_owned(),
+        space_id: Uuid::from_u128(0xD0),
+        subscription_id: Uuid::from_u128(SUBSCRIPTION),
+        operation: PipeOperation::Enrich {
+            key: IndexFieldSpec::Key,
+        },
+        output_feed_id: Some(Uuid::from_u128(OUTPUT_FEED)),
+        output_store_id: Some(Uuid::from_u128(OUTPUT_STORE)),
+        stage: PipeStage::Declared,
+        status: ResourceStatus::Active,
+        created_at_ns: 0,
+    }
+}
+
+#[tokio::test]
+async fn enrich_pipe_stamps_lookup_outcomes_into_output_metadata() {
+    let harness = harness_for(enrich_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+
+    let mut hit = record(1);
+    hit.resolution = Some(EnrichResolution {
+        matched: true,
+        payload: b"doc-bytes".to_vec(),
+    });
+    let miss = record(2); // unresolved lookups forward as matched=false
+    harness
+        .driver
+        .drive_once(
+            64,
+            |_f, _l| async { Ok(page(vec![hit, miss], "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+
+    let appends = harness.sink.appends.lock().unwrap();
+    assert_eq!(appends.len(), 2);
+    assert_eq!(appends[0].metadata_base64["enrich.matched"], "dHJ1ZQ==");
+    assert_eq!(
+        appends[0].metadata_base64["enrich.payload"],
+        b64(b"doc-bytes")
+    );
+    assert_eq!(appends[1].metadata_base64["enrich.matched"], "ZmFsc2U=");
+    assert!(!appends[1].metadata_base64.contains_key("enrich.payload"));
+    // Input payload and key pass through untouched.
+    assert_eq!(appends[0].payload_base64, "cGF5bG9hZA==");
+}
+
+#[tokio::test]
+async fn enrich_pipe_adopts_a_committed_divergent_declare() {
+    let harness = harness_for(enrich_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+    let effect_id = pipe_effect_id(enrich_pipe().pipe_id, Uuid::from_u128(SUBSCRIPTION), "p0");
+
+    // A raced drive resolved the lookup differently and committed its
+    // Declare first: the committed row is the single source of truth.
+    let committed_output = EffectOutput {
+        feed_id: Uuid::from_u128(OUTPUT_FEED),
+        key_base64: "a2V5".to_owned(),
+        payload_base64: "cGF5bG9hZA==".to_owned(),
+        metadata_base64: BTreeMap::from([
+            ("enrich.matched".to_owned(), "dHJ1ZQ==".to_owned()),
+            ("enrich.payload".to_owned(), b64(b"stale-but-committed")),
+        ]),
+        event_time_ns: 1,
+        writer_session_id: pipe_output_writer_session(enrich_pipe().pipe_id, Uuid::from_u128(2)),
+        writer_epoch: 1,
+        sequence: 1,
+    };
+    let committed_declare = EffectMutation {
+        effect_id,
+        subscription_id: Uuid::from_u128(SUBSCRIPTION),
+        ownership_epoch: 7,
+        sequence: 1,
+        request_id: pipe_declare_request_id(effect_id),
+        transition: EffectTransition::Declare {
+            consume: Some(EffectConsume {
+                feed_id: feed(),
+                expected_cursor: Some("p0".to_owned()),
+                cursor: "p1".to_owned(),
+                positions: BTreeMap::from([(range(), "p1".to_owned())]),
+            }),
+            outputs: vec![committed_output],
+            state_mutations: Vec::new(),
+        },
+    };
+    harness.journal.apply(committed_declare).await.unwrap();
+
+    // Our drive plans a divergent resolution — it must adopt the committed
+    // Declare rather than conflict or double-decide.
+    let mut ours = record(1);
+    ours.resolution = Some(EnrichResolution {
+        matched: true,
+        payload: b"fresher-but-lost".to_vec(),
+    });
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_f, _l| async { Ok(page(vec![ours], "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+
+    let EffectTransition::Applied { outputs, .. } = &applied.transition else {
+        panic!("expected Applied")
+    };
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(
+        outputs[0].metadata_base64["enrich.payload"],
+        b64(b"stale-but-committed")
+    );
+    let appends = harness.sink.appends.lock().unwrap();
+    assert_eq!(appends.len(), 1);
+    assert_eq!(
+        appends[0].metadata_base64["enrich.payload"],
+        b64(b"stale-but-committed")
     );
 }

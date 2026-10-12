@@ -294,6 +294,18 @@ output emission, and ingest-time policy remain follow-on work: this slice
 deliberately establishes only the accumulation primitive inside the atomic
 boundary.
 
+Point-lookup enrichment is the second. An `Enrich` Pipe resolves each
+delivered record's projected key against a declared StateStore at fetch
+time and copies the matched row's payload into the output record's
+Metadata (`enrich.payload`, `enrich.matched`). The resolution travels
+inside the `Declare`, so an applied output is byte-identical across every
+replay and never re-reads a row that may have moved. When two drives race
+one frontier with different resolutions, whichever `Declare` commits first
+is the single source of truth: the loser adopts the committed row and
+applies it rather than emitting a second decision. Missing rows still
+forward (`enrich.matched = false`); an unreachable store fails the drive
+retryably so a fake miss is never journaled.
+
 ## 6. Protocol-level idempotency
 
 Every append carries an identity such as:

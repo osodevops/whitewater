@@ -2004,7 +2004,9 @@ async fn pipe_drive_local(
     }
     if !matches!(
         pipe.operation,
-        crate::control::PipeOperation::Forward | crate::control::PipeOperation::Window { .. }
+        crate::control::PipeOperation::Forward
+            | crate::control::PipeOperation::Window { .. }
+            | crate::control::PipeOperation::Enrich { .. }
     ) {
         return Err(ApiError::conflict("Pipe operation is not driveable yet"));
     }
@@ -2093,32 +2095,51 @@ async fn drive_pipe(
             limit,
             |frontier, limit| {
                 let frontier = frontier.clone();
+                let pipe = pipe.clone();
                 async move {
-                    fetch_frontier_page(state, &frontier, limit)
+                    let (delivered, positions) = fetch_frontier_page(state, &frontier, limit)
                         .await
-                        .map(|(delivered, positions)| crate::pipe::FetchedPage {
-                            cursor: delivered
-                                .last()
-                                .map(|(cursor, _)| cursor.clone())
-                                .unwrap_or_else(|| frontier.cursor.clone()),
-                            records: delivered
+                        .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
+                    let cursor = delivered
+                        .last()
+                        .map(|(cursor, _)| cursor.clone())
+                        .unwrap_or_else(|| frontier.cursor.clone());
+                    let mut records = Vec::with_capacity(delivered.len());
+                    for (_, record) in delivered {
+                        // Enrich lookups resolve at fetch time: the outcome
+                        // rides inside the Declare, so an applied output is
+                        // byte-identical across replays and raced drives
+                        // converge on whichever Declare committed first.
+                        let resolution = if let crate::control::PipeOperation::Enrich { key } =
+                            &pipe.operation
+                        {
+                            Some(
+                                resolve_enrich(state, &pipe, key, &record)
+                                    .await
+                                    .map_err(|_| crate::effect::EffectJournalError::Unavailable)?,
+                            )
+                        } else {
+                            None
+                        };
+                        records.push(crate::pipe::FetchedRecord {
+                            message_id: record.message_id,
+                            key_base64: STANDARD.encode(&record.key),
+                            payload_base64: STANDARD.encode(&record.payload),
+                            metadata_base64: record
+                                .metadata
                                 .into_iter()
-                                .map(|(_, record)| crate::pipe::FetchedRecord {
-                                    message_id: record.message_id,
-                                    key_base64: STANDARD.encode(&record.key),
-                                    payload_base64: STANDARD.encode(&record.payload),
-                                    metadata_base64: record
-                                        .metadata
-                                        .into_iter()
-                                        .map(|(name, value)| (name, STANDARD.encode(value)))
-                                        .collect(),
-                                    event_time_ns: record.event_time_ns,
-                                    ingest_time_ns: record.ingest_time_ns,
-                                })
+                                .map(|(name, value)| (name, STANDARD.encode(value)))
                                 .collect(),
-                            positions,
-                        })
-                        .map_err(|_| crate::effect::EffectJournalError::Unavailable)
+                            event_time_ns: record.event_time_ns,
+                            ingest_time_ns: record.ingest_time_ns,
+                            resolution,
+                        });
+                    }
+                    Ok(crate::pipe::FetchedPage {
+                        cursor,
+                        records,
+                        positions,
+                    })
                 }
             },
             || async move {
@@ -2266,7 +2287,9 @@ pub async fn drive_local_pipes(state: &AppState, limit: usize) -> Vec<PipeDriveO
     for pipe in pipes {
         if !matches!(
             pipe.operation,
-            crate::control::PipeOperation::Forward | crate::control::PipeOperation::Window { .. }
+            crate::control::PipeOperation::Forward
+                | crate::control::PipeOperation::Window { .. }
+                | crate::control::PipeOperation::Enrich { .. }
         ) {
             outcomes.push(PipeDriveOutcome::Failed {
                 pipe_id: pipe.pipe_id,
@@ -3751,6 +3774,106 @@ fn state_store_transport_for(
             .map_err(|error| ApiError::unavailable(error.to_string()))?,
         )),
     }
+}
+
+/// Resolve one Enrich lookup for a drive fetch: extract the record's
+/// projected key, translate it to `PutRow` primary-key bytes, and read the
+/// row through the same placement-fenced replica fan-out public reads use.
+/// `Null`/unprojectable keys resolve as misses; every replica failing is an
+/// error so the drive retries rather than journaling a fake miss.
+async fn resolve_enrich(
+    state: &AppState,
+    pipe: &crate::control::PipeDefinition,
+    spec: &crate::control::IndexFieldSpec,
+    record: &crate::domain::StoredRecord,
+) -> Result<crate::pipe::EnrichResolution, ApiError> {
+    let store_id = pipe
+        .output_store_id
+        .ok_or_else(|| ApiError::conflict("Enrich Pipe has no lookup StateStore"))?;
+    let source = crate::state_store::ReplaySourceRecord {
+        message_id: record.message_id,
+        cursor: String::new(),
+        key: record.key.clone(),
+        metadata: record.metadata.clone(),
+        payload: record.payload.clone(),
+    };
+    let miss = || {
+        Ok(crate::pipe::EnrichResolution {
+            matched: false,
+            payload: Vec::new(),
+        })
+    };
+    let Ok(values) = crate::index_build::extract_index_values(std::slice::from_ref(spec), &source)
+    else {
+        return miss();
+    };
+    let Some(key) = values
+        .into_iter()
+        .next()
+        .and_then(|value| crate::pipe::enrich_lookup_key_bytes(&value))
+    else {
+        return miss();
+    };
+    let assignment = state
+        .control
+        .active_state_store_assignment_by_id(store_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("StateStore has no mutation-journal placement"))?;
+    // Prefer a local replica read, then owner, then any member — the same
+    // candidate order public row reads use.
+    let mut candidates: Vec<StorageNodeId> = Vec::new();
+    if let Some(local) = state.storage_node_id.clone() {
+        if assignment.replicas.iter().any(|node| *node == local) {
+            candidates.push(local);
+        }
+    }
+    candidates.push(assignment.owner.clone());
+    for replica in assignment.replicas.iter() {
+        if !candidates.contains(replica) {
+            candidates.push(replica.clone());
+        }
+    }
+    let mut last_error: Option<ApiError> = None;
+    for replica in &candidates {
+        let read = crate::state_store::StateStoreReadRequest {
+            owner: assignment.owner.clone(),
+            receiver: replica.clone(),
+            store_id,
+            ownership_epoch: assignment.ownership_epoch,
+            key: key.clone(),
+            strict: false,
+            wait_ms: 500,
+            by_named: None,
+        };
+        let outcome = if Some(replica) == state.storage_node_id.as_ref()
+            && state.state_store_journal.is_some()
+        {
+            state
+                .state_store_journal
+                .as_ref()
+                .unwrap()
+                .read_row(read)
+                .await
+                .map_err(state_store_api_error)
+        } else {
+            state_store_transport_for(state, &assignment)?
+                .read(replica, read)
+                .await
+                .map_err(state_store_api_error)
+        };
+        match outcome {
+            Ok(reply) => {
+                return Ok(crate::pipe::EnrichResolution {
+                    matched: reply.result.row.is_some(),
+                    payload: reply.result.row.map(|row| row.payload).unwrap_or_default(),
+                });
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        ApiError::unavailable("no StateStore journal replica could serve the lookup")
+    }))
 }
 
 fn state_store_coordinator_for(

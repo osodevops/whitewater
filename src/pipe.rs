@@ -13,6 +13,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::active_range::RangeId;
@@ -37,6 +38,20 @@ pub struct FetchedRecord {
     pub metadata_base64: BTreeMap<String, String>,
     pub event_time_ns: i64,
     pub ingest_time_ns: i64,
+    /// Enrich Pipes only: the lookup outcome resolved at fetch time. The
+    /// resolution travels inside the Declare so an applied output never
+    /// re-resolves; concurrent drives converge on the committed Declare.
+    pub resolution: Option<EnrichResolution>,
+}
+
+/// The StateStore lookup outcome for one `Enrich` record: `matched` plus
+/// the resolved row's payload (empty on a miss). Deterministic once
+/// fetched — it is journaled inside the effect's outputs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnrichResolution {
+    pub matched: bool,
+    #[serde(default)]
+    pub payload: Vec<u8>,
 }
 
 /// A bounded page fetched after a committed frontier: records in delivery
@@ -251,6 +266,16 @@ impl PipeDriver {
                     self.journal.reconcile_retry(declare).await?;
                 }
             }
+            Err(EffectJournalError::Conflict) => {
+                // Another drive committed a divergent Declare under this
+                // effect identity first (Enrich resolutions may legitimately
+                // differ between raced plans). The committed row is the
+                // single source of truth — adopt it and apply that, so
+                // exactly one Declare ever reaches the frontier CAS.
+                if self.journal.read_committed(effect_id).await?.is_none() {
+                    return Err(EffectJournalError::Conflict);
+                }
+            }
             Err(error) => return Err(error),
         }
         // The apply itself settles transient and ambiguous results in place
@@ -397,6 +422,59 @@ impl PipeDriver {
                     }],
                 ))
             }
+            PipeOperation::Enrich { .. } => {
+                let feed_id = self
+                    .pipe
+                    .output_feed_id
+                    .ok_or(EffectJournalError::Conflict)?;
+                // Resolution was resolved at fetch time and rides inside the
+                // Declare: outputs are the single committed source of truth,
+                // so replays re-append identical bytes rather than re-read a
+                // moved row. `enrich.*` Metadata keeps payloads untouched.
+                Ok((
+                    page.records
+                        .iter()
+                        .map(|record| {
+                            let mut metadata = record.metadata_base64.clone();
+                            let resolution =
+                                record.resolution.clone().unwrap_or(EnrichResolution {
+                                    matched: false,
+                                    payload: Vec::new(),
+                                });
+                            metadata.insert(
+                                "enrich.matched".to_owned(),
+                                if resolution.matched {
+                                    "dHJ1ZQ==".to_owned() // "true"
+                                } else {
+                                    "ZmFsc2U=".to_owned() // "false"
+                                },
+                            );
+                            if !resolution.payload.is_empty() {
+                                use base64::Engine;
+                                metadata.insert(
+                                    "enrich.payload".to_owned(),
+                                    base64::engine::general_purpose::STANDARD
+                                        .encode(&resolution.payload),
+                                );
+                            }
+                            EffectOutput {
+                                feed_id,
+                                key_base64: record.key_base64.clone(),
+                                payload_base64: record.payload_base64.clone(),
+                                metadata_base64: metadata,
+                                event_time_ns: record.event_time_ns,
+                                writer_session_id: pipe_output_writer_session(
+                                    self.pipe.pipe_id,
+                                    record.message_id,
+                                ),
+                                writer_epoch: 1,
+                                sequence: 1,
+                            }
+                        })
+                        .collect(),
+                    Vec::new(),
+                ))
+            }
         }
     }
 }
@@ -439,6 +517,24 @@ fn window_group_key_bytes(value: &IndexValue) -> Option<Vec<u8>> {
     key.push(tag);
     key.extend_from_slice(&bytes);
     Some(key)
+}
+
+/// Primary-key bytes for a point lookup: the byte contract an application
+/// writes `PutRow` rows under — raw bytes, UTF-8 text, decimal integers,
+/// and "true"/"false" booleans. `Null` resolves nothing: the record still
+/// forwards, just unmatched.
+pub fn enrich_lookup_key_bytes(value: &IndexValue) -> Option<Vec<u8>> {
+    match value {
+        IndexValue::Null => None,
+        IndexValue::Bytes(value) => Some(value.clone()),
+        IndexValue::Text(value) => Some(value.as_bytes().to_vec()),
+        IndexValue::I64(value) => Some(value.to_string().into_bytes()),
+        IndexValue::Bool(value) => Some(if *value {
+            b"true".to_vec()
+        } else {
+            b"false".to_vec()
+        }),
+    }
 }
 
 /// Decode a fetched record into the replay-record shape extraction expects.
@@ -492,6 +588,27 @@ mod tests {
             pipe_declare_request_id(first),
             pipe_declare_request_id(first)
         );
+    }
+
+    #[test]
+    fn enrich_lookup_key_bytes_follow_the_putrow_byte_contract() {
+        assert_eq!(
+            enrich_lookup_key_bytes(&IndexValue::Bytes(b"raw".to_vec())),
+            Some(b"raw".to_vec())
+        );
+        assert_eq!(
+            enrich_lookup_key_bytes(&IndexValue::Text("txt".to_owned())),
+            Some(b"txt".to_vec())
+        );
+        assert_eq!(
+            enrich_lookup_key_bytes(&IndexValue::I64(42)),
+            Some(b"42".to_vec())
+        );
+        assert_eq!(
+            enrich_lookup_key_bytes(&IndexValue::Bool(true)),
+            Some(b"true".to_vec())
+        );
+        assert_eq!(enrich_lookup_key_bytes(&IndexValue::Null), None);
     }
 
     #[test]

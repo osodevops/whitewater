@@ -339,6 +339,7 @@ CREATE PIPE orders.enrich
 A Pipe declares a managed consume-process-append binding: the named Subscription's durable frontier drives the input, and every delivered record flows through the declared operation into the declared output. Two operations exist:
 
 - `TO FEED` - `forward`: copy each record to the output Feed unchanged.
+- `TO FEED ... ENRICH` - point-lookup enrichment (below).
 - `TO STATESTORE` - `window`: accumulate each record into event-time panes of a managed StateStore view, grouped by a projection:
 
 ```sql
@@ -346,6 +347,15 @@ CREATE PIPE orders.minute_totals
   FROM SUBSCRIPTION orders.billing
   TO STATESTORE orders.minute_totals
   WINDOW 5m BY JSON 'customer' SUM JSON 'amount';
+```
+
+- `TO FEED ... ENRICH STATESTORE <store> BY <spec>` - `enrich`: resolve one StateStore row per record by the projected key and copy its payload into the output record's Metadata (`enrich.payload`, plus `enrich.matched` = `"true"`/`"false"`). Misses and unprojectable keys still forward; an unreachable store makes the drive retry rather than journal a fake miss. The resolution is journaled inside the effect's `Declare`, so applied outputs never re-resolve and concurrent drives converge on whichever `Declare` committed first.
+
+```sql
+CREATE PIPE orders.customer_enrich
+  FROM SUBSCRIPTION orders.billing
+  TO FEED orders.enriched
+  ENRICH STATESTORE orders.profiles BY JSON 'customer';
 ```
 
 The window clause takes a duration (`<n>ms|s|m|h|d`), an optional clock policy (`EVENT` or `INGEST`, defaulting to `EVENT` - `event_time_ns` vs `ingest_time_ns`), `BY <spec>` for the grouping projection, and an aggregation of `COUNT`, `SUM <spec>`, or `AVG <spec>`; specs use the same `KEY`, `METADATA 'name'`, `JSON 'path'` vocabulary as Index fields. The target StateStore must declare non-unique named keys `key` and `pane`, which is what makes pane rows enumerable by group or pane index without knowing composite row keys. Window state advances exactly once per committed input inside the effect's atomic boundary; watermarks, late-event revisions, and window-close emission are follow-on work.
