@@ -499,6 +499,7 @@ Returns the Subscription's current progress assignment (owner, RF3 replica set, 
   "assignment": {"owner": "control-1", "replicas": ["control-1", "control-2", "control-3"], "ownership_epoch": 2},
   "committed": {"cursor": "...", "positions": {"<range-id>": "..."}, "sequence": 17, "request_id": "...", "ownership_epoch": 2, "tick": 42},
   "members": {"member_count": 3, "lease_count": 2, "last_tick": 42},
+  "lag": {"records_behind": 1402, "ranges": {"<range-id>": {"behind": 1402}}},
   "replicas": [
     {"node": "control-1", "reachable": true, "committed_sequence": 17, "committed_epoch": 2, "prepared_pending": false, "member_count": 3, "lease_count": 2},
     {"node": "control-3", "reachable": false, "error": "unavailable"}
@@ -506,7 +507,7 @@ Returns the Subscription's current progress assignment (owner, RF3 replica set, 
 }
 ```
 
-`committed` is `null` when no quorum-readable frontier exists (never joined, or mid-recovery). `replicas[].committed_epoch` behind `assignment.ownership_epoch` marks a lagging replica that adoption has not yet caught up.
+`committed` is `null` when no quorum-readable frontier exists (never joined, or mid-recovery). `lag.records_behind` is the sum of committed-but-undelivered records across the source Feed's Active Ranges — the committed-tail position minus the position each frontier Cursor resolves to. A range reports `behind: null` with `error` when its read is unavailable or its frontier position no longer resolves; `lag` is `null` when no committed frontier exists yet, and Domain-source Subscriptions report a detail note until per-Feed member delivery lands. `replicas[].committed_epoch` behind `assignment.ownership_epoch` marks a lagging replica that adoption has not yet caught up.
 
 ### Inspect flagged hot Keys
 

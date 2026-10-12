@@ -8122,22 +8122,82 @@ async fn admin_subscription_progress(
     authorize_admin(&state, &headers)?;
     let (coordinator, assignment, definition) =
         member_coordinator(&state, &query.subscription).await?;
-    let committed = coordinator
-        .read_committed()
-        .await
-        .ok()
-        .flatten()
-        .map(|mutation| {
-            json!({
-                "cursor": mutation.cursor,
-                "positions": mutation.positions,
-                "sequence": mutation.sequence,
-                "request_id": mutation.request_id,
-                "ownership_epoch": mutation.ownership_epoch,
-                "tick": mutation.tick,
-            })
-        });
+    let committed_mutation = coordinator.read_committed().await.ok().flatten();
+    let committed = committed_mutation.as_ref().map(|mutation| {
+        json!({
+            "cursor": mutation.cursor,
+            "positions": mutation.positions,
+            "sequence": mutation.sequence,
+            "request_id": mutation.request_id,
+            "ownership_epoch": mutation.ownership_epoch,
+            "tick": mutation.tick,
+        })
+    });
     let member_state = coordinator.member_state().await.ok();
+    // Lag is the operator's first question for shared progress: records
+    // committed at each Active Range tail but still undelivered under the
+    // frontier. The frontier position resolves through the same read path
+    // member fetches use, so lag is evidence rather than a guess; a range
+    // whose position no longer resolves or cannot be read is reported
+    // rather than silently dropped.
+    let lag = match (committed_mutation.as_ref(), definition.source.feed_id()) {
+        (Some(mutation), Some(feed_id)) => {
+            let frontier = mutation.positions.clone();
+            let mut behind_total = 0_u64;
+            let mut ranges = serde_json::Map::new();
+            for range_assignment in state
+                .control
+                .active_range_assignments_for_feed(feed_id)
+                .await
+            {
+                let position = frontier
+                    .get(&range_assignment.range_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let read = fetch_range_page(
+                    &state,
+                    ReadRangePageRequest {
+                        assignment: range_assignment.clone(),
+                        after: None,
+                        expected_commit: None,
+                        after_cursor: if position.is_empty() {
+                            None
+                        } else {
+                            Some(position)
+                        },
+                        // One leading frame is enough: resolved_after names
+                        // the committed position the frontier Cursor resolves
+                        // to, and committed is the tail.
+                        tail_count: None,
+                        single_range: true,
+                        page_limit: Some(1),
+                    },
+                )
+                .await;
+                match read {
+                    Ok(page) => {
+                        let consumed = page.resolved_after.map_or(0, |position| position.value());
+                        let behind = page.committed.value().saturating_sub(consumed);
+                        behind_total = behind_total.saturating_add(behind);
+                        ranges.insert(
+                            range_assignment.range_id.to_string(),
+                            json!({ "behind": behind }),
+                        );
+                    }
+                    Err(error) => {
+                        ranges.insert(
+                            range_assignment.range_id.to_string(),
+                            json!({ "behind": null, "error": error.message }),
+                        );
+                    }
+                }
+            }
+            json!({ "records_behind": behind_total, "ranges": ranges })
+        }
+        (Some(_), None) => json!({ "records_behind": null,
+            "detail": "Domain-source Subscriptions report per-Feed lag when member delivery lands" }),
+        (None, _) => serde_json::Value::Null,
+    };
     let replicas = coordinator
         .replica_states()
         .await
@@ -8175,6 +8235,7 @@ async fn admin_subscription_progress(
             "ownership_epoch": assignment.ownership_epoch,
         },
         "committed": committed,
+        "lag": lag,
         "members": member_state.as_ref().map(|members| json!({
             "member_count": members.member_epochs.len(),
             "lease_count": members.leases.len(),
@@ -16371,6 +16432,13 @@ mod tests {
         assert_eq!(body["assignment"]["replicas"].as_array().unwrap().len(), 3);
         assert!(body["committed"]["cursor"].is_string(), "{body}");
         assert_eq!(body["members"]["member_count"], json!(2));
+        // Lag answers the operator's first question: after the seek to
+        // BEGINNING, all twelve seeded records are committed but undelivered.
+        assert_eq!(body["lag"]["records_behind"], json!(12));
+        assert_eq!(
+            body["lag"]["ranges"][progress_range.to_string()]["behind"],
+            json!(12)
+        );
         assert_eq!(body["replicas"].as_array().unwrap().len(), 3);
         assert!(body["replicas"]
             .as_array()
