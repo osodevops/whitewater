@@ -583,6 +583,7 @@ fn record(byte: u8) -> FetchedRecord {
         payload_base64: "cGF5bG9hZA==".to_owned(),
         metadata_base64: BTreeMap::new(),
         event_time_ns: byte as i64,
+        ingest_time_ns: byte as i64,
     }
 }
 
@@ -1019,6 +1020,7 @@ fn window_pipe() -> PipeDefinition {
         operation: PipeOperation::Window {
             window_ns: 160,
             key: IndexFieldSpec::Key,
+            time: finnstream::control::WindowTime::Event,
             aggregation: WindowAggregation::Sum {
                 value: IndexFieldSpec::Projection {
                     extractor: "json".to_owned(),
@@ -1046,7 +1048,53 @@ fn json_record(id: u128, key: &[u8], event_time_ns: i64, value: i64) -> FetchedR
         payload_base64: b64(format!("{{\"v\":{value}}}").as_bytes()),
         metadata_base64: BTreeMap::new(),
         event_time_ns,
+        ingest_time_ns: 0,
     }
+}
+
+fn ingest_window_pipe() -> PipeDefinition {
+    let mut pipe = window_pipe();
+    pipe.operation = PipeOperation::Window {
+        window_ns: 160,
+        key: IndexFieldSpec::Key,
+        aggregation: WindowAggregation::Count,
+        time: finnstream::control::WindowTime::Ingest,
+    };
+    pipe
+}
+
+#[tokio::test]
+async fn ingest_time_window_panes_on_the_ingest_clock() {
+    let harness = harness_for(ingest_window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+
+    // Same record, two clocks: event_time 0 lands in pane 0 but
+    // ingest_time 15 lands in pane 1 under the 10ns pane size.
+    let mut record = json_record(1, b"k", 0, 1);
+    record.ingest_time_ns = 15;
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async { Ok(page(vec![record], "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
+        panic!("expected AccumulateRows")
+    };
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].count_delta, 1);
+    assert_eq!(entries[0].named[1].values, vec![IndexValue::I64(1)]);
 }
 
 #[tokio::test]

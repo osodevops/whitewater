@@ -348,7 +348,7 @@ CREATE PIPE orders.minute_totals
   WINDOW 5m BY JSON 'customer' SUM JSON 'amount';
 ```
 
-The window clause takes a duration (`<n>ms|s|m|h|d`), `BY <spec>` for the grouping projection, and an aggregation of `COUNT`, `SUM <spec>`, or `AVG <spec>`; specs use the same `KEY`, `METADATA 'name'`, `JSON 'path'` vocabulary as Index fields. The target StateStore must declare non-unique named keys `key` and `pane`, which is what makes pane rows enumerable by group or pane index without knowing composite row keys. Window state advances exactly once per committed input inside the effect's atomic boundary; watermarks, late-event revisions, and window-close emission are follow-on work.
+The window clause takes a duration (`<n>ms|s|m|h|d`), an optional clock policy (`EVENT` or `INGEST`, defaulting to `EVENT` - `event_time_ns` vs `ingest_time_ns`), `BY <spec>` for the grouping projection, and an aggregation of `COUNT`, `SUM <spec>`, or `AVG <spec>`; specs use the same `KEY`, `METADATA 'name'`, `JSON 'path'` vocabulary as Index fields. The target StateStore must declare non-unique named keys `key` and `pane`, which is what makes pane rows enumerable by group or pane index without knowing composite row keys. Window state advances exactly once per committed input inside the effect's atomic boundary; watermarks, late-event revisions, and window-close emission are follow-on work.
 
 A Pipe belongs to the same Domain as its input Subscription and output; `forward` Pipes may not write back to their own input Feed. The consumed Subscription and the output Feed cannot be dropped while the Pipe is active; drop the Pipe first.
 

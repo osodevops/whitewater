@@ -125,7 +125,26 @@ pub enum PipeOperation {
         /// Which typed value groups records into window rows.
         key: IndexFieldSpec,
         aggregation: WindowAggregation,
+        /// Which record clock assigns panes; defaults to event time.
+        #[serde(default)]
+        time: WindowTime,
     },
+}
+
+/// Which record clock a `Window` Pipe buckets into panes. Both clocks are
+/// signed 64-bit Unix epoch nanoseconds on the record itself; neither is a
+/// physical partitioning concept.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WindowTime {
+    /// `event_time_ns` — the application-stamped occurrence clock. This is
+    /// the default: it reflects when things happened, not when they
+    /// arrived.
+    #[default]
+    Event,
+    /// `ingest_time_ns` — the durable-arrival clock, for pipelines whose
+    /// business view genuinely tracks ingest order.
+    Ingest,
 }
 
 /// What a `Window` Pipe adds to each pane's accumulator.
@@ -2332,6 +2351,7 @@ impl ControlController {
                         window_ns,
                         key,
                         aggregation,
+                        time: _,
                     } => {
                         if *window_ns == 0 {
                             return Err(ControlError::InvalidOperation(
@@ -4326,8 +4346,18 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                     "STATESTORE" => {
                         expect_keyword(&tokens, 9, "WINDOW")?;
                         let window_ns = parse_window_duration(token(&tokens, 10)?)?;
-                        expect_keyword(&tokens, 11, "BY")?;
-                        let (key, next) = parse_index_field_spec(&tokens, 12, "BY")?;
+                        // Optional clock policy: `WINDOW 5m INGEST BY ...`;
+                        // absent means the event-time default.
+                        let (time, by) = match token(&tokens, 11)?
+                            .to_ascii_uppercase()
+                            .as_str()
+                        {
+                            "EVENT" => (WindowTime::Event, 12),
+                            "INGEST" => (WindowTime::Ingest, 12),
+                            _ => (WindowTime::Event, 11),
+                        };
+                        expect_keyword(&tokens, by, "BY")?;
+                        let (key, next) = parse_index_field_spec(&tokens, by + 1, "BY")?;
                         let aggregation = match token(&tokens, next)?
                             .to_ascii_uppercase()
                             .as_str()
@@ -4358,6 +4388,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                                 window_ns,
                                 key,
                                 aggregation,
+                                time,
                             },
                         })
                     }
@@ -8306,6 +8337,7 @@ mod tests {
                 window_ns,
                 key: IndexFieldSpec::Key,
                 aggregation: WindowAggregation::Count,
+                time: WindowTime::Event,
             },
         };
         // Missing store, foreign-Domain store, zero window, and a missing
@@ -8366,11 +8398,46 @@ mod tests {
             PipeOperation::Window {
                 window_ns: 300_000_000_000,
                 key: IndexFieldSpec::Key,
-                aggregation: WindowAggregation::Sum { .. }
+                aggregation: WindowAggregation::Sum { .. },
+                time: WindowTime::Event,
             }
         ));
         assert_eq!(relay.output_feed_id, None);
         assert_eq!(relay.output_store_id, Some(store.store_id));
+
+        // `INGEST` selects the durable-arrival clock; absent defaults event.
+        leader
+            .execute(
+                "CREATE PIPE accounts.ingest FROM SUBSCRIPTION accounts.flow                  TO STATESTORE accounts.panes WINDOW 1h INGEST BY KEY COUNT;",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            leader
+                .active_pipe_by_name("accounts.ingest")
+                .await
+                .unwrap()
+                .operation,
+            PipeOperation::Window {
+                time: WindowTime::Ingest,
+                ..
+            }
+        ));
+        // A pre-policy serialized window operation decodes as event time.
+        let legacy: PipeOperation = serde_json::from_value(serde_json::json!({
+            "operation": "window",
+            "window_ns": 1,
+            "key": {"kind": "key"},
+            "aggregation": {"aggregation": "count"}
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            PipeOperation::Window {
+                time: WindowTime::Event,
+                ..
+            }
+        ));
 
         // Malformed window clauses fail at parse, not at validation.
         for statement in [

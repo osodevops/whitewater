@@ -16,7 +16,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::active_range::RangeId;
-use crate::control::{PipeDefinition, PipeOperation, WindowAggregation};
+use crate::control::{PipeDefinition, PipeOperation, WindowAggregation, WindowTime};
 use crate::effect::{
     effect_state_mutation_id, EffectConsume, EffectCoordinator, EffectJournalError, EffectMutation,
     EffectOutput, EffectStateMutation, EffectTransition,
@@ -36,6 +36,7 @@ pub struct FetchedRecord {
     pub payload_base64: String,
     pub metadata_base64: BTreeMap<String, String>,
     pub event_time_ns: i64,
+    pub ingest_time_ns: i64,
 }
 
 /// A bounded page fetched after a committed frontier: records in delivery
@@ -307,6 +308,7 @@ impl PipeDriver {
                 window_ns,
                 key,
                 aggregation,
+                time,
             } => {
                 let store_id = self
                     .pipe
@@ -352,7 +354,11 @@ impl PipeDriver {
                             }
                         }
                     };
-                    let pane = u64::try_from(record.event_time_ns.max(0)).unwrap_or(0) / pane_ns;
+                    let instant = match time {
+                        WindowTime::Event => record.event_time_ns,
+                        WindowTime::Ingest => record.ingest_time_ns,
+                    };
+                    let pane = u64::try_from(instant.max(0)).unwrap_or(0) / pane_ns;
                     let entry = panes.entry((group.0, pane)).or_insert((0, 0, group.1));
                     entry.0 = entry.0.saturating_add(1);
                     entry.1 = entry.1.saturating_add(sum_delta);

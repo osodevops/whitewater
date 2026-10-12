@@ -2113,6 +2113,7 @@ async fn drive_pipe(
                                         .map(|(name, value)| (name, STANDARD.encode(value)))
                                         .collect(),
                                     event_time_ns: record.event_time_ns,
+                                    ingest_time_ns: record.ingest_time_ns,
                                 })
                                 .collect(),
                             positions,
