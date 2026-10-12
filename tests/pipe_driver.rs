@@ -1257,6 +1257,8 @@ fn enrich_pipe() -> PipeDefinition {
         operation: PipeOperation::Enrich {
             key: IndexFieldSpec::Key,
             freshness: finnstream::control::EnrichFreshness::Latest,
+            named: None,
+            on_miss: finnstream::control::EnrichMiss::Forward,
         },
         output_feed_id: Some(Uuid::from_u128(OUTPUT_FEED)),
         output_store_id: Some(Uuid::from_u128(OUTPUT_STORE)),
@@ -1304,6 +1306,52 @@ async fn enrich_pipe_stamps_lookup_outcomes_into_output_metadata() {
     assert!(!appends[1].metadata_base64.contains_key("enrich.payload"));
     // Input payload and key pass through untouched.
     assert_eq!(appends[0].payload_base64, "cGF5bG9hZA==");
+}
+
+#[tokio::test]
+async fn enrich_pipe_drop_miss_consumes_without_emitting() {
+    let mut pipe = enrich_pipe();
+    pipe.operation = PipeOperation::Enrich {
+        key: IndexFieldSpec::Key,
+        freshness: finnstream::control::EnrichFreshness::Latest,
+        named: None,
+        on_miss: finnstream::control::EnrichMiss::Drop,
+    };
+    let harness = harness_for(pipe);
+    seed_frontier(&harness.progress, "p0").await;
+
+    let mut hit = record(1);
+    hit.resolution = Some(EnrichResolution {
+        matched: true,
+        payload: b"doc-bytes".to_vec(),
+        applied_seq: 41,
+    });
+    let miss = record(2); // unresolved — dropped under the declared policy
+    harness
+        .driver
+        .drive_once(
+            64,
+            |_f, _l| async { Ok(page(vec![hit, miss], "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+
+    {
+        let appends = harness.sink.appends.lock().unwrap();
+        // Only the hit emits; the miss consumed with the same frontier.
+        assert_eq!(appends.len(), 1);
+        assert_eq!(appends[0].metadata_base64["enrich.matched"], "dHJ1ZQ==");
+    }
+    let frontier = harness
+        .progress
+        .read_committed()
+        .await
+        .unwrap()
+        .expect("frontier");
+    assert_eq!(frontier.cursor, "p1");
 }
 
 #[tokio::test]

@@ -306,8 +306,14 @@ answer "which version of the row enriched this record" after the fact.
 When two drives race one frontier with different resolutions, whichever
 `Declare` commits first is the single source of truth: the loser adopts
 the committed row and applies it rather than emitting a second decision.
-Missing rows still forward (`enrich.matched = false`); an unreachable
-store fails the drive retryably so a fake miss is never journaled.
+Missing rows still forward (`enrich.matched = false`) unless the
+declaration chooses `MISS DROP`, which consumes the miss without
+emitting — the input frontier commits inside the same effect either way,
+so a dropped miss is an acknowledged decision, not a lost record.
+`NAMED '<key>'` resolves through a declared secondary named key (the same
+`by_named` postings public row reads use) instead of the primary. An
+unreachable store fails the drive retryably so a fake miss is never
+journaled.
 
 Lookup freshness is a declaration choice. The default `Latest` serves a
 replica's currently applied state — whatever the first reachable journal

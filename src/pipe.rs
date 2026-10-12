@@ -427,7 +427,7 @@ impl PipeDriver {
                     }],
                 ))
             }
-            PipeOperation::Enrich { .. } => {
+            PipeOperation::Enrich { on_miss, .. } => {
                 let feed_id = self
                     .pipe
                     .output_feed_id
@@ -439,7 +439,7 @@ impl PipeDriver {
                 Ok((
                     page.records
                         .iter()
-                        .map(|record| {
+                        .filter_map(|record| {
                             let mut metadata = record.metadata_base64.clone();
                             let resolution =
                                 record.resolution.clone().unwrap_or(EnrichResolution {
@@ -447,6 +447,14 @@ impl PipeDriver {
                                     payload: Vec::new(),
                                     applied_seq: 0,
                                 });
+                            // A declared drop policy consumes a miss without
+                            // emitting — the frontier commits regardless, so
+                            // the decision is durable and replay-identical.
+                            if matches!(on_miss, crate::control::EnrichMiss::Drop)
+                                && !resolution.matched
+                            {
+                                return None;
+                            }
                             metadata.insert(
                                 "enrich.matched".to_owned(),
                                 if resolution.matched {
@@ -471,7 +479,7 @@ impl PipeDriver {
                                         .encode(&resolution.payload),
                                 );
                             }
-                            EffectOutput {
+                            Some(EffectOutput {
                                 feed_id,
                                 key_base64: record.key_base64.clone(),
                                 payload_base64: record.payload_base64.clone(),
@@ -483,7 +491,7 @@ impl PipeDriver {
                                 ),
                                 writer_epoch: 1,
                                 sequence: 1,
-                            }
+                            })
                         })
                         .collect(),
                     Vec::new(),

@@ -2110,20 +2110,28 @@ async fn drive_pipe(
                         // rides inside the Declare, so an applied output is
                         // byte-identical across replays and raced drives
                         // converge on whichever Declare committed first.
-                        let resolution =
-                            if let crate::control::PipeOperation::Enrich { key, freshness } =
-                                &pipe.operation
-                            {
-                                Some(
-                                    resolve_enrich(state, &pipe, key, *freshness, &record)
-                                        .await
-                                        .map_err(|_| {
-                                            crate::effect::EffectJournalError::Unavailable
-                                        })?,
+                        let resolution = if let crate::control::PipeOperation::Enrich {
+                            key,
+                            freshness,
+                            named,
+                            ..
+                        } = &pipe.operation
+                        {
+                            Some(
+                                resolve_enrich(
+                                    state,
+                                    &pipe,
+                                    key,
+                                    *freshness,
+                                    named.as_deref(),
+                                    &record,
                                 )
-                            } else {
-                                None
-                            };
+                                .await
+                                .map_err(|_| crate::effect::EffectJournalError::Unavailable)?,
+                            )
+                        } else {
+                            None
+                        };
                         records.push(crate::pipe::FetchedRecord {
                             message_id: record.message_id,
                             key_base64: STANDARD.encode(&record.key),
@@ -3789,6 +3797,7 @@ async fn resolve_enrich(
     pipe: &crate::control::PipeDefinition,
     spec: &crate::control::IndexFieldSpec,
     freshness: crate::control::EnrichFreshness,
+    named: Option<&str>,
     record: &crate::domain::StoredRecord,
 ) -> Result<crate::pipe::EnrichResolution, ApiError> {
     let store_id = pipe
@@ -3812,12 +3821,25 @@ async fn resolve_enrich(
     else {
         return miss();
     };
-    let Some(key) = values
-        .into_iter()
-        .next()
-        .and_then(|value| crate::pipe::enrich_lookup_key_bytes(&value))
-    else {
+    let Some(first_value) = values.into_iter().next() else {
         return miss();
+    };
+    let (key, by_named) = match named {
+        // Named-key resolution reads the same `by_named` postings contract
+        // public row reads use — the extracted value addresses a declared
+        // secondary key rather than the primary.
+        Some(name) => (
+            Vec::new(),
+            Some(crate::state_store::StateStoreNamedRead {
+                name: name.to_owned(),
+                values: vec![first_value],
+                limit: 1,
+            }),
+        ),
+        None => match crate::pipe::enrich_lookup_key_bytes(&first_value) {
+            Some(key) => (key, None),
+            None => return miss(),
+        },
     };
     let assignment = state
         .control
@@ -3848,7 +3870,7 @@ async fn resolve_enrich(
             key: key.clone(),
             strict: matches!(freshness, crate::control::EnrichFreshness::Strict),
             wait_ms: 500,
-            by_named: None,
+            by_named: by_named.clone(),
         };
         let outcome = if Some(replica) == state.storage_node_id.as_ref()
             && state.state_store_journal.is_some()
@@ -3885,9 +3907,16 @@ async fn resolve_enrich(
                     });
                     continue;
                 }
+                let (matched, payload) = match reply.result.named_rows.first() {
+                    Some(row) => (true, row.payload.clone()),
+                    None => (
+                        reply.result.row.is_some(),
+                        reply.result.row.map(|row| row.payload).unwrap_or_default(),
+                    ),
+                };
                 return Ok(crate::pipe::EnrichResolution {
-                    matched: reply.result.row.is_some(),
-                    payload: reply.result.row.map(|row| row.payload).unwrap_or_default(),
+                    matched,
+                    payload,
                     applied_seq: reply.result.applied_seq,
                 });
             }

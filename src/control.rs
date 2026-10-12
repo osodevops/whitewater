@@ -142,7 +142,29 @@ pub enum PipeOperation {
         /// the first reachable replica already serves.
         #[serde(default)]
         freshness: EnrichFreshness,
+        /// Optional named secondary key to resolve through instead of the
+        /// store's primary key — the same `by_named` contract public row
+        /// reads use; the store must declare the named key.
+        #[serde(default)]
+        named: Option<String>,
+        /// What a lookup miss does to the output record.
+        #[serde(default)]
+        on_miss: EnrichMiss,
     },
+}
+
+/// What an `Enrich` lookup miss does to the output record.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrichMiss {
+    /// Forward the record with `enrich.matched = false` — the default:
+    /// enrichment is best-effort and misses stay visible downstream.
+    #[default]
+    Forward,
+    /// Consume the record without emitting an output — the input frontier
+    /// still commits inside the same effect, so a dropped miss is an
+    /// acknowledged, replay-safe decision rather than a lost record.
+    Drop,
 }
 
 /// How fresh an `Enrich` lookup must be before its result is journaled.
@@ -2432,7 +2454,23 @@ impl ControlController {
                         }
                         (None, Some(store.store_id))
                     }
-                    PipeOperation::Enrich { key, freshness: _ } => {
+                    PipeOperation::Enrich {
+                        key,
+                        freshness: _,
+                        named,
+                        on_miss: _,
+                    } => {
+                        if let Some(name) = named {
+                            let valid = !name.is_empty()
+                                && name.len() <= 64
+                                && name.as_bytes()[0].is_ascii_lowercase()
+                                && name.chars().all(|c| {
+                                    c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'
+                                });
+                            if !valid {
+                                return Err(ControlError::InvalidName(name.clone()));
+                            }
+                        }
                         let output_feed = output_feed.ok_or_else(|| {
                             ControlError::InvalidOperation(
                                 "Enrich Pipes require an output Feed".to_owned(),
@@ -4412,23 +4450,45 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                         if tokens.get(9).is_some() {
                             expect_keyword(&tokens, 9, "ENRICH")?;
                             expect_keyword(&tokens, 10, "STATESTORE")?;
-                            // `ENRICH STATESTORE <s> [STRICT] BY <spec>`
-                            let (freshness, by) = match token(&tokens, 12)?
-                                .to_ascii_uppercase()
-                                .as_str()
-                            {
-                                "STRICT" => (EnrichFreshness::Strict, 13),
-                                _ => (EnrichFreshness::Latest, 12),
-                            };
-                            expect_keyword(&tokens, by, "BY")?;
-                            let (key, _) =
-                                parse_index_field_spec(&tokens, by + 1, "ENRICH BY")?;
+                            // `ENRICH STATESTORE <s> [STRICT] [NAMED '<n>']
+                            //  BY <spec> [MISS DROP]`
+                            let mut freshness = EnrichFreshness::Latest;
+                            let mut named = None;
+                            let mut at = 12;
+                            loop {
+                                match token(&tokens, at)?.to_ascii_uppercase().as_str()
+                                {
+                                    "STRICT" => {
+                                        freshness = EnrichFreshness::Strict;
+                                        at += 1;
+                                    }
+                                    "NAMED" => {
+                                        named = Some(token(&tokens, at + 1)?.to_owned());
+                                        at += 2;
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            expect_keyword(&tokens, at, "BY")?;
+                            let (key, end) =
+                                parse_index_field_spec(&tokens, at + 1, "ENRICH BY")?;
+                            let mut on_miss = EnrichMiss::Forward;
+                            if tokens.get(end).is_some() {
+                                expect_keyword(&tokens, end, "MISS")?;
+                                expect_keyword(&tokens, end + 1, "DROP")?;
+                                on_miss = EnrichMiss::Drop;
+                            }
                             return Ok(Command::DefinePipe {
                                 name: token(&tokens, 2)?.to_owned(),
                                 subscription: token(&tokens, 5)?.to_owned(),
                                 output_feed: Some(token(&tokens, 8)?.to_owned()),
                                 output_store: Some(token(&tokens, 11)?.to_owned()),
-                                operation: PipeOperation::Enrich { key, freshness },
+                                operation: PipeOperation::Enrich {
+                                    key,
+                                    freshness,
+                                    named,
+                                    on_miss,
+                                },
                             });
                         }
                         Ok(Command::DefinePipe {
@@ -8559,6 +8619,8 @@ mod tests {
             operation: PipeOperation::Enrich {
                 key: IndexFieldSpec::Key,
                 freshness: EnrichFreshness::Latest,
+                named: None,
+                on_miss: EnrichMiss::Forward,
             },
         };
         leader
@@ -8615,6 +8677,7 @@ mod tests {
             PipeOperation::Enrich {
                 key: IndexFieldSpec::Projection { .. },
                 freshness: EnrichFreshness::Latest,
+                ..
             }
         ));
 
@@ -8634,23 +8697,51 @@ mod tests {
             PipeOperation::Enrich {
                 key: IndexFieldSpec::Projection { .. },
                 freshness: EnrichFreshness::Strict,
+                ..
             }
         ));
 
-        // Freshness defaults to Latest when the serialized form predates it.
+        // Freshness, named, and on_miss all default when the serialized
+        // form predates them.
         let legacy: PipeOperation =
             serde_json::from_str(r#"{"operation":"enrich","key":{"kind":"key"}}"#).unwrap();
         assert!(matches!(
             legacy,
             PipeOperation::Enrich {
                 freshness: EnrichFreshness::Latest,
+                named: None,
+                on_miss: EnrichMiss::Forward,
                 ..
             }
+        ));
+
+        // NAMED routes resolution through a declared secondary key; MISS
+        // DROP consumes lookup misses without emitting.
+        leader
+            .execute(
+                "CREATE PIPE accounts.enriched4 FROM SUBSCRIPTION accounts.flow                  TO FEED accounts.enriched ENRICH STATESTORE accounts.panes NAMED 'email' BY KEY MISS DROP;",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            leader
+                .active_pipe_by_name("accounts.enriched4")
+                .await
+                .unwrap()
+                .operation,
+            PipeOperation::Enrich {
+                key: IndexFieldSpec::Key,
+                named: Some(ref name),
+                on_miss: EnrichMiss::Drop,
+                ..
+            } if name == "email"
         ));
 
         for statement in [
             "CREATE PIPE accounts.bad5 FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH STATESTORE accounts.panes;",
             "CREATE PIPE accounts.bad6 FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH accounts.panes BY KEY;",
+            "CREATE PIPE accounts.bad7 FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH STATESTORE accounts.panes NAMED 'Bad-Name' BY KEY;",
+            "CREATE PIPE accounts.bad8 FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH STATESTORE accounts.panes BY KEY MISS SKIP;",
         ] {
             assert!(
                 leader.execute(statement).await.is_err(),
