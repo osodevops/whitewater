@@ -1685,7 +1685,7 @@ These accepted product requirements need dependency review and explicit mileston
 
 
 
-- [ ] Define first-class Subscription retry, delayed-delivery, quarantine, skip, and final-disposition workflows.
+- [ ] Define first-class Subscription retry, delayed-delivery, quarantine, skip, and final-disposition workflows. First slice shipped: `DELIVERY DELAY <dur>` on CREATE SUBSCRIPTION parks not-yet-eligible head records in the shared `fetch_frontier_page` merge — parked heads never advance the frontier or get overtaken within their own ordering, eligible records from other Active Ranges still deliver, members get a `next_delivery_ns` hint, and Pipes honor the same declared delay. Typed command + WCL parse/validate, serde-compatible catalog field, eligibility unit coverage, and describe visibility landed. Retry budgets, quarantine, skip, and final disposition remain open.
 
 - [ ] Define a Schema Policy milestone covering identity, compatibility, admission validation, evolution, and generated clients.
 

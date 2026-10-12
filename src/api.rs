@@ -1835,6 +1835,9 @@ struct SubscriptionMemberFetchResponse {
     cursor: Option<String>,
     positions: BTreeMap<RangeId, String>,
     ownership_epoch: u64,
+    /// Unix epoch nanoseconds (decimal string) at which the earliest
+    /// delivery-delayed head becomes eligible; `None` when nothing is parked.
+    next_delivery_ns: Option<String>,
 }
 
 /// Delivers the bounded page of records after the shared Subscription frontier
@@ -1850,7 +1853,7 @@ async fn subscription_member_fetch(
         .limit
         .unwrap_or(64)
         .clamp(1, SUBSCRIPTION_MEMBER_FETCH_MAX_LIMIT);
-    let (coordinator, progress_assignment, _definition) =
+    let (coordinator, progress_assignment, definition) =
         member_coordinator(&state, &request.subscription).await?;
     let members = read_member_state(&coordinator).await?;
     let grant = crate::reader::SubscriptionWorkLease {
@@ -1879,7 +1882,19 @@ async fn subscription_member_fetch(
         .ok_or_else(|| {
             ApiError::unavailable("Subscription progress frontier is not established")
         })?;
-    let (delivered, positions) = fetch_frontier_page(&state, &frontier, limit).await?;
+    let eligible_ingest_ns = definition
+        .delivery_delay_ns
+        .map(|delay| unix_ns().saturating_sub(i64::try_from(delay).unwrap_or(i64::MAX)));
+    let (delivered, positions, parked_ingest_ns) =
+        fetch_frontier_page(&state, &frontier, limit, eligible_ingest_ns).await?;
+    let next_delivery_ns =
+        parked_ingest_ns
+            .zip(definition.delivery_delay_ns)
+            .map(|(ingest, delay)| {
+                ingest
+                    .saturating_add(i64::try_from(delay).unwrap_or(i64::MAX))
+                    .to_string()
+            });
     let cursor = delivered.last().map(|(cursor, _)| cursor.clone());
     let source = record_source_by_id(&state, frontier.feed_id).await;
     let records = delivered
@@ -1900,19 +1915,35 @@ async fn subscription_member_fetch(
         cursor,
         positions,
         ownership_epoch: progress_assignment.ownership_epoch,
+        next_delivery_ns,
     }))
 }
 
 /// Merge the committed pages of every Active Range after a committed
 /// Subscription frontier into one bounded page in (ingest_time, message_id)
-/// order. Returns each record with its frame Cursor plus the updated
-/// per-range positions; member fetches and Pipe drives share this core so
+/// order. Returns each record with its frame Cursor, the updated per-range
+/// positions, and the earliest delivery-delayed head's ingest timestamp when
+/// a holdback parked one; member fetches and Pipe drives share this core so
 /// both see identical delivery order and frontier evidence.
+///
+/// `eligible_ingest_ns` is the Subscription's delivery-delay cutoff: a head
+/// whose ingest timestamp is newer than the cutoff stays parked. Parked
+/// heads are simply never selected, so later records in the same Active
+/// Range cannot overtake them and the frontier never skips them; records in
+/// other ranges that are already eligible continue to deliver.
 async fn fetch_frontier_page(
     state: &AppState,
     frontier: &crate::reader::SubscriptionProgressMutation,
     limit: usize,
-) -> Result<(Vec<(String, StoredRecord)>, BTreeMap<RangeId, String>), ApiError> {
+    eligible_ingest_ns: Option<i64>,
+) -> Result<
+    (
+        Vec<(String, StoredRecord)>,
+        BTreeMap<RangeId, String>,
+        Option<i64>,
+    ),
+    ApiError,
+> {
     let range_assignments = state
         .control
         .active_range_assignments_for_feed(frontier.feed_id)
@@ -1963,13 +1994,7 @@ async fn fetch_frontier_page(
                 };
             }
         }
-        let Some(index) = heads
-            .iter()
-            .enumerate()
-            .filter_map(|(index, head)| head.as_ref().map(|(key, _)| (index, *key)))
-            .min_by_key(|(index, key)| (*key, *index))
-            .map(|(index, _)| index)
-        else {
+        let Some(index) = earliest_eligible_head(&heads, eligible_ingest_ns) else {
             break;
         };
         let Some((_, frame)) = heads[index].take() else {
@@ -1993,7 +2018,41 @@ async fn fetch_frontier_page(
         positions.insert(streams[index].0, frame.cursor.clone());
         records.push((frame.cursor, record));
     }
-    Ok((records, positions))
+    // The earliest parked head tells the caller when the next record becomes
+    // eligible; with no cutoff nothing can be parked.
+    let parked_ingest_ns = eligible_ingest_ns.and_then(|cutoff| {
+        heads
+            .iter()
+            .filter_map(|head| head.as_ref().map(|(key, _)| key.0))
+            .filter(|ingest| *ingest > cutoff)
+            .min()
+    });
+    Ok((records, positions, parked_ingest_ns))
+}
+
+/// Pick the globally earliest head that is eligible for delivery under the
+/// Subscription's optional delivery-delay cutoff. A head newer than the
+/// cutoff stays parked: it is never selected, so records behind it in the
+/// same Active Range cannot overtake it and positions only ever advance over
+/// a delivered contiguous prefix.
+fn earliest_eligible_head(
+    heads: &[Option<((i64, Uuid), StoredRangeFrame)>],
+    eligible_ingest_ns: Option<i64>,
+) -> Option<usize> {
+    heads
+        .iter()
+        .enumerate()
+        .filter_map(|(index, head)| {
+            head.as_ref().and_then(|(key, _)| {
+                if eligible_ingest_ns.is_some_and(|cutoff| key.0 > cutoff) {
+                    None
+                } else {
+                    Some((index, *key))
+                }
+            })
+        })
+        .min_by_key(|(index, key)| (*key, *index))
+        .map(|(index, _)| index)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2112,6 +2171,7 @@ async fn drive_pipe(
         .active_subscription_by_id(subscription_id)
         .await
         .ok_or_else(|| ApiError::unavailable("Subscription definition is unavailable"))?;
+    let delivery_delay_ns = definition.delivery_delay_ns;
     let journal = effect_coordinator_for(state, assignment.clone())?;
     let (progress, _) = member_assignment_coordinator(state, assignment.clone())?;
     let (sink_progress, _) = member_assignment_coordinator(state, assignment.clone())?;
@@ -2130,9 +2190,13 @@ async fn drive_pipe(
                 let frontier = frontier.clone();
                 let pipe = pipe.clone();
                 async move {
-                    let (delivered, positions) = fetch_frontier_page(state, &frontier, limit)
-                        .await
-                        .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
+                    let eligible_ingest_ns = delivery_delay_ns.map(|delay| {
+                        unix_ns().saturating_sub(i64::try_from(delay).unwrap_or(i64::MAX))
+                    });
+                    let (delivered, positions, _parked) =
+                        fetch_frontier_page(state, &frontier, limit, eligible_ingest_ns)
+                            .await
+                            .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
                     let cursor = delivered
                         .last()
                         .map(|(cursor, _)| cursor.clone())
@@ -10450,6 +10514,43 @@ mod tests {
         assert!(hot.recommended_batch_bytes <= 64 * 1024);
     }
 
+    fn delayed_head(position: u64, ingest_time_ns: i64) -> Option<((i64, Uuid), StoredRangeFrame)> {
+        Some((
+            (ingest_time_ns, Uuid::from_u128(u128::from(position) + 1)),
+            StoredRangeFrame {
+                position: RangePosition::new(position),
+                identity: AppendIdentity {
+                    writer_session_id: Uuid::from_u128(9),
+                    writer_epoch: 1,
+                    sequence: position,
+                },
+                cursor: format!("cursor-{position}"),
+                frame: Vec::new(),
+            },
+        ))
+    }
+
+    #[test]
+    fn delivery_delay_parks_too_fresh_heads_without_skipping_them() {
+        let heads = vec![delayed_head(1, 1_000), delayed_head(2, 500)];
+        // With no cutoff the globally earliest head wins, as before.
+        assert_eq!(earliest_eligible_head(&heads, None), Some(1));
+        // The range-0 head is still within the delay window: it stays
+        // parked and cannot be overtaken by records behind it in its own
+        // range, while range 1's eligible head still delivers.
+        assert_eq!(earliest_eligible_head(&heads, Some(750)), Some(1));
+        // Both parked -> no eligible head; the page ends with positions
+        // unchanged rather than skipping ahead.
+        assert_eq!(earliest_eligible_head(&heads, Some(250)), None);
+        // A caught-up range (None head) never blocks an eligible head.
+        let heads = vec![None, delayed_head(2, 500)];
+        assert_eq!(earliest_eligible_head(&heads, Some(750)), Some(1));
+        assert_eq!(earliest_eligible_head(&heads, Some(250)), None);
+        // Exactly at the cutoff is eligible.
+        let heads = vec![delayed_head(1, 750)];
+        assert_eq!(earliest_eligible_head(&heads, Some(750)), Some(0));
+    }
+
     #[test]
     fn append_request_uses_metadata_and_accepts_the_prototype_header_alias() {
         let request: AppendRequest = serde_json::from_value(json!({
@@ -12662,6 +12763,7 @@ mod tests {
                         feed: Some("orders.events".to_owned()),
                         domain: None,
                         start: crate::control::ReaderStart::Beginning,
+                        delivery_delay_ns: None,
                     },
                 ])
                 .await
@@ -15269,18 +15371,21 @@ mod tests {
                     feed: Some("orders.events".to_owned()),
                     domain: None,
                     start: crate::control::ReaderStart::Beginning,
+                    delivery_delay_ns: None,
                 },
                 Command::CreateSubscription {
                     name: "orders.fresh".to_owned(),
                     feed: Some("orders.events".to_owned()),
                     domain: None,
                     start: crate::control::ReaderStart::Beginning,
+                    delivery_delay_ns: None,
                 },
                 Command::CreateSubscription {
                     name: "orders.now".to_owned(),
                     feed: Some("orders.events".to_owned()),
                     domain: None,
                     start: crate::control::ReaderStart::Now,
+                    delivery_delay_ns: None,
                 },
             ])
             .await

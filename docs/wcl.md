@@ -316,6 +316,17 @@ CREATE SUBSCRIPTION orders.everything
   START AT BEGINNING;
 ```
 
+An optional `DELIVERY DELAY <n><ms|s|m|h|d>` tail holds delivery back until a record's ingest timestamp is at least the declared duration in the past — the standard delayed-delivery floor, with no client-side polling guesswork:
+
+```sql
+CREATE SUBSCRIPTION orders.delayed
+  FROM orders.created
+  START AT BEGINNING
+  DELIVERY DELAY 30s;
+```
+
+A not-yet-eligible record stays parked: it never advances the frontier early and cannot be overtaken within its own key order, while already-eligible records continue to deliver. Member fetches and declared Pipes honor the same delay, the member fetch response reports `next_delivery_ns` when work is parked, and a zero duration is refused.
+
 Either way the Subscription remains `declared` until member delivery lands: it does not create an internal Feed, permit joining members, or establish shared Cursor progress yet — member Feeds attach in the same catalog commit that creates them (existing Feeds honor the declared start, newly discovered Feeds start at their first retained record), a Feed moved to another Domain drains its fenced membership rather than silently discarding pending work, and `DESCRIBE SUBSCRIPTION` reports per-Feed `member_feeds` states; member join itself stays refused honestly until shared delivery lands. Existing named Readers remain independent and are not silently converted into shared Subscriptions.
 
 

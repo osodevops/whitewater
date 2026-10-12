@@ -273,6 +273,7 @@ impl Fixture {
                 feed: Some("orders.events".to_owned()),
                 domain: None,
                 start: ReaderStart::Beginning,
+                delivery_delay_ns: None,
             }])
             .await
             .unwrap();

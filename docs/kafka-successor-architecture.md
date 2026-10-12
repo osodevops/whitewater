@@ -171,6 +171,8 @@ Reading never removes an event. Every standalone Reader owns a private current C
 
 Delivered position and acknowledged position remain distinct. A crash resumes from acknowledged progress, not from the last bytes sent to a Reader. Durable Subscription Cursors belong in replicated control-plane state; they must not depend on one Node's local process memory.
 
+An optional  on the Subscription holds delivery back until a record's ingest timestamp is at least the declared duration in the past. A not-yet-eligible record stays parked at its position: it is never skipped, never advances the frontier early, and cannot be overtaken by later records in its own key order, while already-eligible records continue to deliver. Every consumer of the Subscription — members and declared Pipes alike — honors the same delay, and the member fetch response reports  so operators can see when parked work becomes deliverable rather than treating an empty page as an error. Standalone Readers keep their own positions and are unaffected; the delay is a declared Subscription contract, not a client-side sleep.
+
 ### Nanosecond record time
 
 Every record stores two signed 64-bit Unix epoch nanosecond values:

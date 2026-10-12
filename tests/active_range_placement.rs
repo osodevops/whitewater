@@ -140,6 +140,7 @@ async fn subscription_progress_uses_the_full_candidate_pool_without_changing_rf3
                         feed: Some("orders.created".to_owned()),
                         domain: None,
                         start: ReaderStart::Beginning,
+                        delivery_delay_ns: None,
                     }],
                     Uuid::from_u128(40_000 + index),
                 )
@@ -203,6 +204,7 @@ async fn follower_uses_leader_subscription_placement_not_local_candidates() {
                 feed: Some("orders.created".to_owned()),
                 domain: None,
                 start: ReaderStart::Beginning,
+                delivery_delay_ns: None,
             },
         )
         .await
@@ -1638,6 +1640,7 @@ async fn drain_plan_explains_ordered_moves_and_unplannable_references() {
             feed: Some("orders.created".to_owned()),
             domain: None,
             start: ReaderStart::Beginning,
+            delivery_delay_ns: None,
         }])
         .await
         .unwrap();

@@ -519,6 +519,11 @@ pub struct SubscriptionDefinition {
     #[serde(flatten)]
     pub source: SubscriptionSource,
     pub start: ReaderStart,
+    /// Records become deliverable only once their ingest timestamp is at
+    /// least this far in the past; `None` delivers immediately. Parked
+    /// records keep their positions and never advance the frontier early.
+    #[serde(default)]
+    pub delivery_delay_ns: Option<u64>,
     pub stage: SubscriptionStage,
     pub status: ResourceStatus,
     pub created_at_ns: i64,
@@ -943,6 +948,11 @@ pub enum Command {
         #[serde(default)]
         domain: Option<String>,
         start: ReaderStart,
+        /// Optional per-Subscription delivery holdback in nanoseconds; a
+        /// record is eligible only `delivery_delay_ns` after its ingest
+        /// timestamp. Legacy commands decode as `None` (immediate).
+        #[serde(default)]
+        delivery_delay_ns: Option<u64>,
     },
     OpenReaderSession {
         reader: String,
@@ -2836,6 +2846,7 @@ impl ControlController {
                 feed,
                 domain,
                 start,
+                delivery_delay_ns,
             } => {
                 validate_dotted_name(&name)?;
                 ensure_name_available(
@@ -2846,6 +2857,18 @@ impl ControlController {
                     &name,
                 )?;
                 let space_id = owning_space(state, &name)?.space_id;
+                if let Some(delay) = delivery_delay_ns {
+                    if delay == 0 {
+                        return Err(ControlError::InvalidOperation(
+                            "Subscription DELIVERY DELAY must be greater than zero".to_owned(),
+                        ));
+                    }
+                    if delay > i64::MAX as u64 {
+                        return Err(ControlError::InvalidOperation(
+                            "Subscription DELIVERY DELAY exceeds the supported bound".to_owned(),
+                        ));
+                    }
+                }
                 let source = match (feed, domain) {
                     (Some(feed), None) => {
                         let source = active_feed(state, &feed)?;
@@ -2925,6 +2948,7 @@ impl ControlController {
                     space_id,
                     source,
                     start,
+                    delivery_delay_ns,
                     stage: SubscriptionStage::Declared,
                     status: ResourceStatus::Active,
                     created_at_ns: issued_at_ns,
@@ -4724,7 +4748,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                     }
                     "STATESTORE" => {
                         expect_keyword(&tokens, 9, "WINDOW")?;
-                        let window_ns = parse_window_duration(token(&tokens, 10)?)?;
+                        let window_ns = parse_duration_ns(token(&tokens, 10)?)?;
                         // Optional clock policy: `WINDOW 5m INGEST BY ...`;
                         // absent means the event-time default.
                         let (time, mut at) = match token(&tokens, 11)?
@@ -4744,7 +4768,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             .unwrap_or(false)
                         {
                             max_late_ns =
-                                Some(parse_window_duration(token(&tokens, at + 1)?)?);
+                                Some(parse_duration_ns(token(&tokens, at + 1)?)?);
                             at += 2;
                         }
                         let mut expire_ns = None;
@@ -4752,7 +4776,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             .map(|value| value.eq_ignore_ascii_case("EXPIRE"))
                             .unwrap_or(false)
                         {
-                            expire_ns = Some(parse_window_duration(token(&tokens, at + 1)?)?);
+                            expire_ns = Some(parse_duration_ns(token(&tokens, at + 1)?)?);
                             at += 2;
                         }
                         let by = at;
@@ -4816,21 +4840,53 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 // `FROM <feed>` keeps the exact-Feed form.
                 let domain_source = keyword(4).as_deref() == Some("DOMAIN");
                 let source_index = if domain_source { 5 } else { 4 };
-                let start = if tokens.len() == source_index + 1 {
-                    ReaderStart::Beginning
+                let (start, tail) = if tokens.len() == source_index + 1
+                    || keyword(source_index + 1).as_deref() == Some("DELIVERY")
+                {
+                    (ReaderStart::Beginning, source_index + 1)
                 } else {
                     expect_keyword(&tokens, source_index + 1, "START")?;
                     expect_keyword(&tokens, source_index + 2, "AT")?;
-                    parse_reader_start(&tokens, source_index + 3)?
+                    let start = parse_reader_start(&tokens, source_index + 3)?;
+                    // CURSOR/TIMESTAMP consume a second token; the fixed
+                    // keywords consume one. `tail` is where an optional
+                    // DELIVERY DELAY clause may begin.
+                    let consumed = match token(&tokens, source_index + 3)?
+                        .to_ascii_uppercase()
+                        .as_str()
+                    {
+                        "CURSOR" | "TIMESTAMP" => 2,
+                        _ => 1,
+                    };
+                    (start, source_index + 3 + consumed)
                 };
                 let name = token(&tokens, 2)?.to_owned();
                 let source = token(&tokens, source_index)?.to_owned();
                 if keyword(1).as_deref() == Some("SUBSCRIPTION") {
+                    let delivery_delay_ns = if tail < tokens.len() {
+                        expect_keyword(&tokens, tail, "DELIVERY")?;
+                        expect_keyword(&tokens, tail + 1, "DELAY")?;
+                        if tail + 2 >= tokens.len() {
+                            return Err(ControlError::Syntax(
+                                "DELIVERY DELAY expects a <n><ms|s|m|h|d> duration".to_owned(),
+                            ));
+                        }
+                        let delay = parse_duration_ns(token(&tokens, tail + 2)?)?;
+                        if tail + 3 != tokens.len() {
+                            return Err(ControlError::Syntax(
+                                "unexpected tokens after DELIVERY DELAY <duration>".to_owned(),
+                            ));
+                        }
+                        Some(delay)
+                    } else {
+                        None
+                    };
                     Ok(Command::CreateSubscription {
                         name,
                         feed: (!domain_source).then_some(source.clone()),
                         domain: domain_source.then_some(source),
                         start,
+                        delivery_delay_ns,
                     })
                 } else {
                     if domain_source {
@@ -5349,16 +5405,16 @@ fn parse_index_field_spec(
     }
 }
 
-/// `<n><ms|s|m|h|d>` window duration in nanoseconds. Windows are internal
-/// accumulation detail, never a user-visible partition concept.
-fn parse_window_duration(token: &str) -> Result<u64, ControlError> {
+/// `<n><ms|s|m|h|d>` duration in nanoseconds, shared by WINDOW, EXPIRE,
+/// and DELIVERY DELAY clauses.
+fn parse_duration_ns(token: &str) -> Result<u64, ControlError> {
     let split = token
         .find(|character: char| !character.is_ascii_digit())
         .unwrap_or(token.len());
     let (number, unit) = token.split_at(split);
     let number: u64 = number
         .parse()
-        .map_err(|_| ControlError::Syntax(format!("WINDOW duration '{token}' is invalid")))?;
+        .map_err(|_| ControlError::Syntax(format!("duration '{token}' is invalid")))?;
     let factor: u64 = match unit.to_ascii_lowercase().as_str() {
         "ms" => 1_000_000,
         "s" => 1_000_000_000,
@@ -5367,7 +5423,7 @@ fn parse_window_duration(token: &str) -> Result<u64, ControlError> {
         "d" => 86_400 * 1_000_000_000,
         _ => {
             return Err(ControlError::Syntax(format!(
-                "WINDOW duration '{token}' must end in ms, s, m, h, or d"
+                "duration '{token}' must end in ms, s, m, h, or d"
             )))
         }
     };
@@ -8076,6 +8132,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscription_delivery_delay_parses_validates_and_persists() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute("CREATE SPACE orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        // DELIVERY DELAY parses with and without an explicit start policy.
+        let commands =
+            parse_wcl("CREATE SUBSCRIPTION orders.d FROM orders.events DELIVERY DELAY 5s;")
+                .unwrap();
+        match &commands[0] {
+            Command::CreateSubscription {
+                delivery_delay_ns, ..
+            } => assert_eq!(*delivery_delay_ns, Some(5_000_000_000)),
+            other => panic!("unexpected command {other:?}"),
+        }
+        let commands = parse_wcl(
+            "CREATE SUBSCRIPTION orders.d2 FROM orders.events START AT NOW DELIVERY DELAY 250ms;",
+        )
+        .unwrap();
+        match &commands[0] {
+            Command::CreateSubscription {
+                start,
+                delivery_delay_ns,
+                ..
+            } => {
+                assert_eq!(*start, ReaderStart::Now);
+                assert_eq!(*delivery_delay_ns, Some(250_000_000));
+            }
+            other => panic!("unexpected command {other:?}"),
+        }
+        // The declared delay persists on the definition and stays internal
+        // to the public describe payload (no placement detail leaks).
+        controller
+            .execute("CREATE SUBSCRIPTION orders.d FROM orders.events DELIVERY DELAY 5s;")
+            .await
+            .unwrap();
+        let definition = controller
+            .active_subscription_by_name("orders.d")
+            .await
+            .unwrap();
+        assert_eq!(definition.delivery_delay_ns, Some(5_000_000_000));
+        let described = controller
+            .execute("DESCRIBE SUBSCRIPTION orders.d;")
+            .await
+            .unwrap();
+        assert_eq!(
+            described.results[0].data["delivery_delay_ns"],
+            json!(5_000_000_000_u64)
+        );
+        // A zero delay is meaningless and refuses at apply time.
+        let refused = controller
+            .execute("CREATE SUBSCRIPTION orders.z FROM orders.events DELIVERY DELAY 0s;")
+            .await;
+        assert!(refused.is_err());
+        for bad in [
+            "CREATE SUBSCRIPTION orders.b FROM orders.events DELIVERY DELAY;",
+            "CREATE SUBSCRIPTION orders.b FROM orders.events DELIVERY FOO 5s;",
+            "CREATE SUBSCRIPTION orders.b FROM orders.events DELIVERY DELAY 5x;",
+            "CREATE SUBSCRIPTION orders.b FROM orders.events DELIVERY DELAY 5s EXTRA;",
+            "CREATE SUBSCRIPTION orders.b FROM orders.events START AT NOW DELIVERY DELAY;",
+        ] {
+            assert!(parse_wcl(bad).is_err(), "{bad} should refuse");
+        }
+        // A legacy serialized command without the field decodes with no
+        // delay so older journals replay unchanged.
+        let legacy: Command = serde_json::from_value(json!({
+            "command": "create_subscription",
+            "name": "orders.legacy",
+            "feed": "orders.events",
+            "start": { "kind": "beginning" }
+        }))
+        .unwrap();
+        match legacy {
+            Command::CreateSubscription {
+                delivery_delay_ns, ..
+            } => assert_eq!(delivery_delay_ns, None),
+            other => panic!("unexpected command {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn subscription_definitions_are_scoped_idempotent_and_keep_feeds_unchanged() {
         let directory = TempDir::new().unwrap();
         let controller = new_controller(&directory);
@@ -8086,6 +8225,7 @@ mod tests {
             feed: Some("accounts.users".to_owned()),
             domain: None,
             start: ReaderStart::Beginning,
+            delivery_delay_ns: None,
         };
         let first = controller
             .execute_commands_with_request_id(vec![command.clone()], request_id)
@@ -8135,6 +8275,7 @@ mod tests {
                 feed: Some("accounts.users".to_owned()),
                 domain: None,
                 start: ReaderStart::Beginning,
+                delivery_delay_ns: None,
             }])
             .await
             .is_err());
@@ -8144,6 +8285,7 @@ mod tests {
                 feed: Some("other.events".to_owned()),
                 domain: None,
                 start: ReaderStart::Beginning,
+                delivery_delay_ns: None,
             }])
             .await
             .is_err());
@@ -8613,6 +8755,7 @@ mod tests {
                 feed: Some("orders.events".to_owned()),
                 domain: None,
                 start: ReaderStart::Beginning,
+                delivery_delay_ns: None,
             }])
             .await
             .unwrap();
@@ -8630,6 +8773,7 @@ mod tests {
                 feed: Some("orders.events".to_owned()),
                 domain: Some("orders".to_owned()),
                 start: ReaderStart::Beginning,
+                delivery_delay_ns: None,
             }])
             .await
             .is_err());
@@ -8639,6 +8783,7 @@ mod tests {
                 feed: None,
                 domain: None,
                 start: ReaderStart::Beginning,
+                delivery_delay_ns: None,
             }])
             .await
             .is_err());
@@ -8649,6 +8794,7 @@ mod tests {
                 feed: None,
                 domain: Some("orders".to_owned()),
                 start: ReaderStart::Beginning,
+                delivery_delay_ns: None,
             }])
             .await
             .is_err());
