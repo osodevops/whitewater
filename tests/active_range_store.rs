@@ -735,9 +735,11 @@ async fn truncate_uncommitted_discards_the_pending_tail_and_its_marker() {
     assert_eq!(store.pending_effect().await.unwrap(), None);
     assert_eq!(store.read_committed(None, 10).await.unwrap().len(), 1);
 
-    // The freed tail accepts a different effect or a plain append again.
+    // The freed tail accepts a different effect or a plain append again;
+    // truncation rewound deduplication, so the writer's sequence resumes
+    // at the first truncated position.
     store
-        .append(pending_append(4, b"other", Uuid::from_u128(54)))
+        .append(pending_append(2, b"other", Uuid::from_u128(54)))
         .await
         .unwrap();
 }

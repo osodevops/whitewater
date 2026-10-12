@@ -1017,8 +1017,19 @@ fn truncate_uncommitted(
             entry.segment == loaded.persisted.active_segment && entry.position.value() <= committed
         })
         .map_or(0, |entry| entry.entry_end);
-    loaded.active_file.set_len(active_length)?;
-    loaded.active_file.sync_all()?;
+    // `active_file` is opened append-only (FILE_APPEND_DATA on Windows),
+    // which the platform refuses to truncate; a read/write handle performs
+    // the resize instead. Appends keep landing at the new EOF because
+    // FILE_APPEND_DATA ignores the stale handle's position.
+    let truncate = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(segment_path(
+            &inner.directory,
+            loaded.persisted.active_segment,
+        ))?;
+    truncate.set_len(active_length)?;
+    truncate.sync_all()?;
     let previous = loaded.persisted.appended;
     loaded
         .entries
