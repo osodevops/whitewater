@@ -223,6 +223,7 @@ impl Fixture {
             },
             cursor: "cursor-1".to_owned(),
             frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            pending_effect: None,
         };
         Self {
             _catalog: catalog,
@@ -1028,4 +1029,240 @@ async fn retry_after_commit_returns_the_original_logical_result() {
     assert_eq!(retry.cursor, first.cursor);
     assert_eq!(retry.position, first.position);
     assert!(retry.deduplicated);
+}
+
+fn pending_request(request: &mut ReplicaAppendRequest, effect_id: Uuid, subscription_id: Uuid) {
+    request.pending_effect = Some(finnstream::active_range::PendingEffectRef {
+        effect_id,
+        subscription_id,
+    });
+}
+
+/// Re-encode `request` at a new writer sequence and position so the frame
+/// identity matches the record bytes.
+fn resequence(request: &mut ReplicaAppendRequest, sequence: u64, position: u64) {
+    let record = StoredRecord {
+        message_id: Uuid::from_u128(1_000 + sequence as u128),
+        producer_id: request.identity.writer_session_id,
+        producer_sequence: sequence,
+        event_time_ns: sequence as i64,
+        ingest_time_ns: sequence as i64 + 1,
+        key: b"customer-1".to_vec(),
+        payload: format!("payload-{sequence}").into_bytes(),
+        metadata: BTreeMap::new(),
+    };
+    request.identity.sequence = sequence;
+    request.expected_position = RangePosition::new(position);
+    request.cursor = format!("cursor-{sequence}");
+    request.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+}
+
+#[tokio::test]
+async fn pending_appends_replicate_durably_without_becoming_committed() {
+    let fixture = Fixture::new().await;
+    let coordinator = fixture.coordinator(&[], &[], None);
+    let mut request = fixture.request.clone();
+    pending_request(&mut request, Uuid::from_u128(800), Uuid::from_u128(801));
+
+    let result = coordinator.append(request.clone()).await.unwrap();
+    assert_eq!(result.position, RangePosition::new(1));
+    // No commit evidence: the release phase commits the tail later.
+    assert!(result.commit_evidence.is_empty());
+    assert!(!result.durable_replicas.is_empty());
+
+    // Every replica holds the frame durably but uncommitted.
+    let assignment = fixture
+        .control
+        .active_range_assignment(fixture.request.feed_id)
+        .await
+        .unwrap();
+    for service in fixture.services.values() {
+        let status = service
+            .recovery_status_for_assignment(&assignment)
+            .await
+            .unwrap();
+        assert_eq!(status.appended, RangePosition::new(1));
+        assert_eq!(status.committed, CommitPosition::new(0));
+        assert_eq!(
+            service
+                .pending_effect(&assignment)
+                .await
+                .unwrap()
+                .unwrap()
+                .effect_id,
+            Uuid::from_u128(800)
+        );
+        assert!(service
+            .read_staged_committed(&assignment, None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn pending_gate_refuses_a_foreign_effect_and_reports_the_occupant() {
+    let fixture = Fixture::new().await;
+    let coordinator = fixture.coordinator(&[], &[], None);
+
+    let mut first = fixture.request.clone();
+    pending_request(&mut first, Uuid::from_u128(810), Uuid::from_u128(811));
+    coordinator.append(first).await.unwrap();
+
+    let mut second = fixture.request.clone();
+    resequence(&mut second, 2, 2);
+    pending_request(&mut second, Uuid::from_u128(812), Uuid::from_u128(811));
+    let error = coordinator.append(second).await.unwrap_err();
+    assert_eq!(error.code, MajorityAppendErrorCode::PendingEffectOccupied);
+    assert_eq!(
+        error.pending_effect.unwrap().effect_id,
+        Uuid::from_u128(810)
+    );
+
+    // A plain append is fenced behind the held tail the same way.
+    let mut plain = fixture.request.clone();
+    resequence(&mut plain, 2, 2);
+    let error = coordinator.append(plain).await.unwrap_err();
+    assert_eq!(error.code, MajorityAppendErrorCode::PendingEffectOccupied);
+}
+
+#[tokio::test]
+async fn commit_pending_effect_releases_the_tail_across_replicas() {
+    let fixture = Fixture::new().await;
+    let coordinator = fixture.coordinator(&[], &[], None);
+    let effect = Uuid::from_u128(820);
+    let subscription = Uuid::from_u128(821);
+
+    let mut request = fixture.request.clone();
+    pending_request(&mut request, effect, subscription);
+    coordinator.append(request.clone()).await.unwrap();
+
+    let assignment = fixture
+        .control
+        .active_range_assignment(fixture.request.feed_id)
+        .await
+        .unwrap();
+    let released = coordinator
+        .commit_pending_effect(finnstream::active_range::PendingReleaseRequest {
+            feed_id: request.feed_id,
+            range_id: request.range_id,
+            generation: request.generation,
+            ownership_epoch: request.ownership_epoch,
+            append_owner: fixture.owner.clone(),
+            effect_id: effect,
+            subscription_id: subscription,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        released,
+        finnstream::active_range::PendingReleaseOutcome::Released {
+            commit_position: CommitPosition::new(1),
+        }
+    );
+
+    // The released tail is committed on the quorum and readable; markers
+    // are gone everywhere.
+    for service in fixture.services.values() {
+        let status = service
+            .recovery_status_for_assignment(&assignment)
+            .await
+            .unwrap();
+        assert_eq!(status.committed, CommitPosition::new(1));
+        assert_eq!(service.pending_effect(&assignment).await.unwrap(), None);
+        assert_eq!(
+            service
+                .read_staged_committed(&assignment, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn commit_pending_effect_is_idempotent_and_fences_wrong_effects() {
+    let fixture = Fixture::new().await;
+    let coordinator = fixture.coordinator(&[], &[], None);
+    let effect = Uuid::from_u128(830);
+    let subscription = Uuid::from_u128(831);
+
+    let mut request = fixture.request.clone();
+    pending_request(&mut request, effect, subscription);
+    coordinator.append(request.clone()).await.unwrap();
+
+    let release = |effect_id: Uuid| finnstream::active_range::PendingReleaseRequest {
+        feed_id: request.feed_id,
+        range_id: request.range_id,
+        generation: request.generation,
+        ownership_epoch: request.ownership_epoch,
+        append_owner: fixture.owner.clone(),
+        effect_id,
+        subscription_id: subscription,
+    };
+
+    // A different effect cannot release a tail it does not own.
+    let outcome = coordinator
+        .commit_pending_effect(release(Uuid::from_u128(832)))
+        .await
+        .unwrap();
+    match outcome {
+        finnstream::active_range::PendingReleaseOutcome::Occupied { occupant } => {
+            assert_eq!(occupant.effect_id, effect);
+        }
+        other => panic!("expected Occupied, got {other:?}"),
+    }
+
+    // The owning effect releases; a retried release then reports the tail
+    // already resolved rather than erroring.
+    coordinator
+        .commit_pending_effect(release(effect))
+        .await
+        .unwrap();
+    let outcome = coordinator
+        .commit_pending_effect(release(effect))
+        .await
+        .unwrap();
+    match outcome {
+        finnstream::active_range::PendingReleaseOutcome::NotPending { committed } => {
+            assert_eq!(committed, 1);
+        }
+        other => panic!("expected NotPending, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn release_is_unambiguous_when_one_follower_is_down() {
+    let fixture = Fixture::new().await;
+    // One follower cannot take the deferred commit; the release still
+    // reaches quorum through the other follower.
+    let down = fixture.non_owner_names();
+    let down_refs = down.iter().take(1).map(String::as_str).collect::<Vec<_>>();
+    let coordinator = fixture.coordinator(&[], &down_refs, None);
+    let effect = Uuid::from_u128(840);
+    let subscription = Uuid::from_u128(841);
+
+    let mut request = fixture.request.clone();
+    pending_request(&mut request, effect, subscription);
+    coordinator.append(request.clone()).await.unwrap();
+
+    let outcome = coordinator
+        .commit_pending_effect(finnstream::active_range::PendingReleaseRequest {
+            feed_id: request.feed_id,
+            range_id: request.range_id,
+            generation: request.generation,
+            ownership_epoch: request.ownership_epoch,
+            append_owner: fixture.owner.clone(),
+            effect_id: effect,
+            subscription_id: subscription,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        finnstream::active_range::PendingReleaseOutcome::Released {
+            commit_position: CommitPosition::new(1),
+        }
+    );
 }

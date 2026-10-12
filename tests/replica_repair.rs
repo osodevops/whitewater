@@ -184,6 +184,7 @@ async fn missing_committed_frames_are_verified_transferred_and_dedup_rebuilt() {
             },
             cursor: format!("cursor-{sequence}"),
             frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            pending_effect: None,
         };
         let accepted = source.append(request.clone()).await.unwrap();
         source
@@ -292,6 +293,7 @@ async fn corrupt_replica_directory_is_quarantined_before_rebuild() {
         },
         cursor: "cursor-1".to_owned(),
         frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+        pending_effect: None,
     };
     for service in [&source, &target] {
         let accepted = service.append(request.clone()).await.unwrap();
@@ -399,6 +401,7 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
             },
             cursor: format!("cursor-{sequence}"),
             frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            pending_effect: None,
         };
         for node in original.replicas.iter() {
             let accepted = services[node].append(request.clone()).await.unwrap();
@@ -477,6 +480,7 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
         },
         cursor: "cursor-4".to_owned(),
         frame_base64: STANDARD.encode(encode_record(&delta).unwrap()),
+        pending_effect: None,
     };
     for node in original.replicas.iter() {
         let accepted = services[node].append(delta_request.clone()).await.unwrap();
@@ -606,6 +610,7 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
         },
         cursor: "cursor-5".to_owned(),
         frame_base64: STANDARD.encode(encode_record(&next_record).unwrap()),
+        pending_effect: None,
     };
     assert!(services[&removed]
         .append(next_request.clone())
@@ -743,6 +748,7 @@ async fn follower_move_copy_resumes_staged_prefix_after_target_restart() {
             },
             cursor: format!("cursor-{sequence}"),
             frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            pending_effect: None,
         };
         for replica in original.replicas.iter() {
             let accepted = services[replica].append(request.clone()).await.unwrap();
@@ -894,6 +900,7 @@ async fn follower_move_stages_the_prefix_before_freezing_the_tail() {
             },
             cursor: format!("cursor-{sequence}"),
             frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            pending_effect: None,
         };
         for replica in original.replicas.iter() {
             let accepted = services[replica].append(request.clone()).await.unwrap();

@@ -668,6 +668,7 @@ pub async fn repair_replica(
                     identity: item.identity,
                     cursor: item.cursor,
                     frame_base64: STANDARD.encode(&item.frame),
+                    pending_effect: None,
                 })
                 .await
                 .map_err(|error| ReplicaRepairError::Target(error.to_string()))?;
@@ -872,6 +873,7 @@ impl LocalRepairSupervisor {
                         identity: item.identity,
                         cursor: item.cursor,
                         frame_base64: item.frame_base64,
+                        pending_effect: None,
                     })
                     .await
                     .map_err(|error| ReplicaRepairError::Target(error.to_string()))?;

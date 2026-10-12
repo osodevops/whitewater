@@ -49,6 +49,7 @@ fn append(sequence: u64, payload: &[u8]) -> ActiveRangeAppend {
         },
         cursor: format!("cursor-{sequence}"),
         frame: encode_record(&record).unwrap(),
+        pending_effect: None,
     }
 }
 
@@ -516,6 +517,7 @@ fn staged(sequence: u64, payload: &[u8], cursor: &str, position: u64) -> ActiveR
         },
         cursor: cursor.to_owned(),
         frame: encode_record(&record).unwrap(),
+        pending_effect: None,
     }
 }
 
@@ -590,4 +592,195 @@ async fn imported_merge_branches_deduplicate_colliding_sequences_by_frame_digest
         reopened.append(append(3, b"another")).await,
         Err(ActiveRangeStoreError::WriterSequenceConflict)
     ));
+}
+
+fn pending_append(sequence: u64, payload: &[u8], effect_id: Uuid) -> ActiveRangeAppend {
+    let mut request = append(sequence, payload);
+    request.pending_effect = Some(finnstream::active_range::PendingEffectRef {
+        effect_id,
+        subscription_id: Uuid::from_u128(77),
+    });
+    request
+}
+
+#[tokio::test]
+async fn pending_appends_stay_invisible_until_the_marker_commits() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let effect = Uuid::from_u128(50);
+
+    // A committed prefix exists below the pending tail.
+    store.append(append(1, b"committed")).await.unwrap();
+    store
+        .commit(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            CommitPosition::new(1),
+        )
+        .await
+        .unwrap();
+
+    let held = store
+        .append(pending_append(2, b"held", effect))
+        .await
+        .unwrap();
+    assert_eq!(held.position, RangePosition::new(2));
+    let marker = store.pending_effect().await.unwrap().expect("marker");
+    assert_eq!(marker.effect_id, effect);
+    assert_eq!(marker.subscription_id, Uuid::from_u128(77));
+    assert_eq!(marker.last_position, 2);
+    assert_eq!(marker.last_frame_digest, held.frame_digest);
+    // The frame is durable but fenced: committed reads stop at 1.
+    let frames = store.read_committed(None, 10).await.unwrap();
+    assert_eq!(frames.len(), 1);
+
+    // Same-effect appends extend the held tail.
+    store
+        .append(pending_append(3, b"held-2", effect))
+        .await
+        .unwrap();
+    let marker = store.pending_effect().await.unwrap().expect("marker");
+    assert_eq!(marker.last_position, 3);
+    assert_eq!(store.read_committed(None, 10).await.unwrap().len(), 1);
+
+    // Committing to the marker's last position releases the tail.
+    store
+        .commit(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            CommitPosition::new(3),
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.pending_effect().await.unwrap(), None);
+    assert_eq!(store.read_committed(None, 10).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn pending_gate_rejects_foreign_appends_and_reports_the_occupant() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let effect = Uuid::from_u128(51);
+    let intruder = Uuid::from_u128(52);
+
+    store
+        .append(pending_append(1, b"held", effect))
+        .await
+        .unwrap();
+
+    // A different effect cannot join the held tail.
+    let error = store
+        .append(pending_append(2, b"intruder", intruder))
+        .await
+        .unwrap_err();
+    match error {
+        ActiveRangeStoreError::PendingEffectOccupied(occupant) => {
+            assert_eq!(occupant.effect_id, effect);
+            assert_eq!(occupant.last_position, 1);
+        }
+        other => panic!("expected PendingEffectOccupied, got {other:?}"),
+    }
+
+    // An ordinary (non-pending) append is fenced too: the tail belongs to
+    // the effect until release or truncation resolves it.
+    let error = store.append(append(2, b"plain")).await.unwrap_err();
+    assert!(matches!(
+        error,
+        ActiveRangeStoreError::PendingEffectOccupied(_)
+    ));
+
+    // The same effect retries idempotently instead of duplicating.
+    let retry = store
+        .append(pending_append(1, b"held", effect))
+        .await
+        .unwrap();
+    assert!(retry.deduplicated);
+    assert_eq!(retry.position, RangePosition::new(1));
+    let snapshot = store.snapshot().await.unwrap();
+    assert_eq!(snapshot.progress.appended(), RangePosition::new(1));
+    assert_eq!(snapshot.pending_effect.unwrap().effect_id, effect);
+}
+
+#[tokio::test]
+async fn truncate_uncommitted_discards_the_pending_tail_and_its_marker() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let effect = Uuid::from_u128(53);
+
+    store.append(append(1, b"committed")).await.unwrap();
+    store
+        .commit(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            CommitPosition::new(1),
+        )
+        .await
+        .unwrap();
+    store
+        .append(pending_append(2, b"held", effect))
+        .await
+        .unwrap();
+    store
+        .append(pending_append(3, b"held-2", effect))
+        .await
+        .unwrap();
+
+    // Owner-loss recovery truncates the uncommitted tail; the held frames
+    // never became visible and the marker dies with them.
+    let removed = store
+        .truncate_uncommitted(RangeGeneration::new(1), OwnershipEpoch::new(1))
+        .await
+        .unwrap();
+    assert_eq!(removed, 2);
+    assert_eq!(store.pending_effect().await.unwrap(), None);
+    assert_eq!(store.read_committed(None, 10).await.unwrap().len(), 1);
+
+    // The freed tail accepts a different effect or a plain append again.
+    store
+        .append(pending_append(4, b"other", Uuid::from_u128(54)))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn pending_marker_survives_restart_and_still_fences_reads() {
+    let directory = TempDir::new().unwrap();
+    let effect = Uuid::from_u128(55);
+    {
+        let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+        store.append(append(1, b"committed")).await.unwrap();
+        store
+            .commit(
+                RangeGeneration::new(1),
+                OwnershipEpoch::new(1),
+                CommitPosition::new(1),
+            )
+            .await
+            .unwrap();
+        store
+            .append(pending_append(2, b"held", effect))
+            .await
+            .unwrap();
+    }
+
+    let reopened = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let marker = reopened.pending_effect().await.unwrap().expect("marker");
+    assert_eq!(marker.effect_id, effect);
+    assert_eq!(marker.last_position, 2);
+    assert_eq!(reopened.read_committed(None, 10).await.unwrap().len(), 1);
+    assert!(matches!(
+        reopened.append(append(3, b"plain")).await,
+        Err(ActiveRangeStoreError::PendingEffectOccupied(_))
+    ));
+    // Release after restart commits the durable tail normally.
+    reopened
+        .commit(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            CommitPosition::new(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reopened.pending_effect().await.unwrap(), None);
+    assert_eq!(reopened.read_committed(None, 10).await.unwrap().len(), 2);
 }

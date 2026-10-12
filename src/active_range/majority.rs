@@ -8,9 +8,9 @@ use uuid::Uuid;
 use crate::control::ControlController;
 
 use super::{
-    CommitPosition, ReplicaAppendAccepted, ReplicaAppendRequest, ReplicaAppendResponse,
-    ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest, ReplicaCommitResponse,
-    StorageNodeId, ACTIVE_RANGE_COMMIT_QUORUM,
+    CommitPosition, ReplicaAppendAccepted, ReplicaAppendErrorCode, ReplicaAppendRequest,
+    ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest,
+    ReplicaCommitResponse, StorageNodeId, ACTIVE_RANGE_COMMIT_QUORUM,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -32,6 +32,7 @@ pub enum MajorityAppendErrorCode {
     FrameConflict,
     NoDurableMajority,
     NoCommitMajority,
+    PendingEffectOccupied,
     LocalStorageFailure,
 }
 
@@ -42,6 +43,9 @@ pub struct MajorityAppendError {
     pub retryable: bool,
     pub durable_replicas: Vec<StorageNodeId>,
     pub commit_evidence: Vec<StorageNodeId>,
+    /// The effect holding the tail when `code` is `PendingEffectOccupied`.
+    #[serde(default)]
+    pub pending_effect: Option<super::store::PendingEffect>,
 }
 
 impl fmt::Display for MajorityAppendError {
@@ -217,6 +221,9 @@ impl MajorityAppendCoordinator {
             ));
         }
         let local = self.local.append(request.clone()).await.map_err(|error| {
+            if error.code == ReplicaAppendErrorCode::PendingEffectOccupied {
+                return self.occupied_error(error.pending_effect);
+            }
             self.error(
                 MajorityAppendErrorCode::LocalStorageFailure,
                 error.to_string(),
@@ -265,6 +272,23 @@ impl MajorityAppendCoordinator {
                 durable,
                 vec![],
             ));
+        }
+        if request.pending_effect.is_some() {
+            // Deferred commit: the frame is durable on a quorum of replicas
+            // but stays fenced behind the committed boundary. The effect
+            // journal's terminal marker releases it through
+            // commit_pending_effect, and owner loss or abort clears it via
+            // the uncommitted-tail truncation path.
+            durable.sort();
+            return Ok(MajorityAppendResult {
+                message_id: local.message_id,
+                cursor: local.cursor,
+                position: local.position,
+                frame_digest: local.frame_digest,
+                durable_replicas: durable,
+                commit_evidence: vec![],
+                deduplicated: local.deduplicated,
+            });
         }
         let commit_request = ReplicaCommitRequest {
             feed_id: request.feed_id,
@@ -332,6 +356,159 @@ impl MajorityAppendCoordinator {
         })
     }
 
+    /// The pending marker currently holding a range's uncommitted tail.
+    pub async fn pending_effect(
+        &self,
+        assignment: &super::ActiveRangeAssignment,
+    ) -> Result<Option<super::store::PendingEffect>, MajorityAppendError> {
+        self.local
+            .pending_effect(assignment)
+            .await
+            .map_err(|error| {
+                self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    error.to_string(),
+                    error.retryable,
+                    vec![],
+                    vec![],
+                )
+            })
+    }
+
+    /// Release one effect's pending tail: broadcast the deferred commit
+    /// position (the marker's last frame) to the replica quorum and commit it
+    /// locally once a follower persists matching evidence. `NotPending` means
+    /// the marker already resolved (released or truncated); `Occupied` means a
+    /// different effect holds the tail and must be swept first.
+    pub async fn commit_pending_effect(
+        &self,
+        request: PendingReleaseRequest,
+    ) -> Result<PendingReleaseOutcome, MajorityAppendError> {
+        let _append_guard = self.append_lock.lock().await;
+        let assignment = self
+            .control
+            .active_range_assignment_by_id(request.range_id)
+            .await
+            .ok_or_else(|| {
+                self.error(
+                    MajorityAppendErrorCode::AssignmentNotFound,
+                    "Active Range assignment is not available",
+                    true,
+                    vec![],
+                    vec![],
+                )
+            })?;
+        if assignment.feed_id != request.feed_id
+            || assignment.generation != request.generation
+            || assignment.ownership_epoch != request.ownership_epoch
+            || assignment.owner != *self.local.local_node()
+            || request.append_owner != assignment.owner
+        {
+            return Err(self.error(
+                MajorityAppendErrorCode::NotCurrentOwner,
+                format!(
+                    "Node {} is not the current Append Owner for this release",
+                    self.local.local_node()
+                ),
+                false,
+                vec![],
+                vec![],
+            ));
+        }
+        let committed = self
+            .local
+            .recovery_status_for_assignment(&assignment)
+            .await
+            .map(|status| status.committed)
+            .map_err(|error| {
+                self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    error.to_string(),
+                    error.retryable,
+                    vec![],
+                    vec![],
+                )
+            })?;
+        let marker = self.pending_effect(&assignment).await?;
+        let Some(marker) = marker else {
+            return Ok(PendingReleaseOutcome::NotPending {
+                committed: committed.value(),
+            });
+        };
+        if marker.effect_id != request.effect_id
+            || marker.subscription_id != request.subscription_id
+        {
+            return Ok(PendingReleaseOutcome::Occupied { occupant: marker });
+        }
+        if marker.last_position <= committed.value() {
+            // Defensive: a marker at or behind the committed boundary is
+            // residue; the records are already released.
+            return Ok(PendingReleaseOutcome::Released {
+                commit_position: committed,
+            });
+        }
+        let commit_request = ReplicaCommitRequest {
+            feed_id: request.feed_id,
+            range_id: request.range_id,
+            generation: request.generation,
+            ownership_epoch: request.ownership_epoch,
+            append_owner: assignment.owner.clone(),
+            commit_position: super::CommitPosition::new(marker.last_position),
+            frame_digest: marker.last_frame_digest,
+        };
+        let followers = assignment
+            .replicas
+            .iter()
+            .filter(|node| *node != self.local.local_node())
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut evidence = Vec::new();
+        let first = self.transport.commit(&followers[0], commit_request.clone());
+        let second = self.transport.commit(&followers[1], commit_request.clone());
+        let (first_result, second_result) = tokio::join!(first, second);
+        if first_result.is_ok() {
+            evidence.push(followers[0].clone());
+        }
+        if second_result.is_ok() {
+            evidence.push(followers[1].clone());
+        }
+        if evidence.is_empty() {
+            return Err(self.error(
+                MajorityAppendErrorCode::NoCommitMajority,
+                "pending effect release reached no follower; retry with the same effect identity",
+                true,
+                vec![],
+                vec![],
+            ));
+        }
+        let released = commit_request.commit_position;
+        self.local.commit(commit_request).await.map_err(|error| {
+            self.error(
+                MajorityAppendErrorCode::LocalStorageFailure,
+                error.to_string(),
+                error.retryable,
+                vec![],
+                evidence.clone(),
+            )
+        })?;
+        evidence.sort();
+        Ok(PendingReleaseOutcome::Released {
+            commit_position: released,
+        })
+    }
+
+    fn occupied_error(&self, occupant: Option<super::store::PendingEffect>) -> MajorityAppendError {
+        let mut error = self.error(
+            MajorityAppendErrorCode::PendingEffectOccupied,
+            "Active Range tail is held by another pending effect; resolve it before appending",
+            true,
+            vec![],
+            vec![],
+        );
+        error.pending_effect = occupant;
+        error
+    }
+
     fn error(
         &self,
         code: MajorityAppendErrorCode,
@@ -346,8 +523,39 @@ impl MajorityAppendCoordinator {
             retryable,
             durable_replicas,
             commit_evidence,
+            pending_effect: None,
         }
     }
+}
+
+/// Owner-side request to release (commit) one effect's pending tail.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PendingReleaseRequest {
+    pub feed_id: Uuid,
+    pub range_id: super::RangeId,
+    pub generation: super::RangeGeneration,
+    pub ownership_epoch: super::OwnershipEpoch,
+    pub append_owner: StorageNodeId,
+    pub effect_id: Uuid,
+    pub subscription_id: Uuid,
+}
+
+/// The result of a pending release attempt.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingReleaseOutcome {
+    /// The marker's last position committed on the owner and a follower.
+    Released {
+        commit_position: super::CommitPosition,
+    },
+    /// No marker holds the tail; `committed` is the current boundary so the
+    /// caller can tell released-apart from truncated.
+    NotPending { committed: u64 },
+    /// A different effect holds the tail; resolve the occupant first.
+    Occupied {
+        occupant: super::store::PendingEffect,
+    },
 }
 
 #[derive(Clone)]

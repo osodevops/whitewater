@@ -340,6 +340,9 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
         state.clone(),
         authorize_replica_append,
     ));
+    let owner_release_pending_route = post(owner_release_pending).layer(
+        middleware::from_fn_with_state(state.clone(), authorize_replica_append),
+    );
     let recovery_progress_route = post(recovery_progress).layer(middleware::from_fn_with_state(
         state.clone(),
         authorize_replica_append,
@@ -473,6 +476,10 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             replica_commit_route,
         )
         .route("/internal/active-range/owner/append", owner_append_route)
+        .route(
+            "/internal/active-range/owner/release-pending",
+            owner_release_pending_route,
+        )
         .route(
             "/internal/active-range/recovery/progress",
             recovery_progress_route,
@@ -2075,6 +2082,7 @@ async fn drive_pipe(
         progress: sink_progress,
         subscription_id,
         ownership_epoch,
+        sweep_depth: 0,
     };
     let driver = crate::pipe::PipeDriver::new(pipe.clone(), Arc::new(journal), Arc::new(progress));
     driver
@@ -4388,6 +4396,7 @@ async fn effect_journal_apply_local(
         progress,
         subscription_id: request.subscription_id,
         ownership_epoch: request.ownership_epoch,
+        sweep_depth: 0,
     };
     journal
         .apply_committed(request.effect_id, &sink)
@@ -4396,13 +4405,32 @@ async fn effect_journal_apply_local(
         .map_err(effect_journal_api_error)
 }
 
-/// Wires committed effect side effects to the real Feed append path and the
-/// Subscription progress journal.
+/// Wires committed effect side effects to the real Feed append path, the
+/// Subscription progress journal, and the pending-tail release that makes
+/// outputs visible after the terminal journal marker is durable.
 struct LiveEffectApply<'a> {
     state: &'a AppState,
     progress: crate::reader::SubscriptionProgressCoordinator,
     subscription_id: Uuid,
     ownership_epoch: u64,
+    /// How many nested occupant sweeps built this sink. Occupant resolution
+    /// constructs a fresh sink for the occupant's own journal at depth+1 and
+    /// refuses beyond one level so a wedged chain fails closed instead of
+    /// recursing across Subscription scopes.
+    sweep_depth: u8,
+}
+
+/// The owner-side result of a pending (effect-owned) append.
+enum EffectAppendOutcome {
+    Appended {
+        range_id: crate::active_range::RangeId,
+        position: crate::active_range::RangePosition,
+    },
+    /// A different effect holds the tail; its identity travels back so the
+    /// apply can sweep the occupant through its own journal.
+    Occupied {
+        occupant: crate::active_range::PendingEffect,
+    },
 }
 
 fn progress_apply_error(
@@ -4425,7 +4453,8 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
     async fn append_output(
         &self,
         output: &crate::effect::EffectOutput,
-    ) -> Result<(), crate::effect::EffectJournalError> {
+        effect_id: Uuid,
+    ) -> Result<crate::effect::EffectOutputReceipt, crate::effect::EffectJournalError> {
         let feed = self
             .state
             .control
@@ -4442,17 +4471,92 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
             key_base64: output.key_base64.clone(),
             payload_base64: output.payload_base64.clone(),
             metadata_base64: output.metadata_base64.clone(),
+            pending_effect: Some(crate::active_range::PendingEffectRef {
+                effect_id,
+                subscription_id: self.subscription_id,
+            }),
         };
-        route_append_to_owner(self.state, feed.feed_id, request)
+        match route_effect_append_to_owner(self.state, feed.feed_id, request).await {
+            Ok(EffectAppendOutcome::Appended { range_id, position }) => {
+                Ok(crate::effect::EffectOutputReceipt {
+                    feed_id: feed.feed_id,
+                    range_id,
+                    position,
+                })
+            }
+            Ok(EffectAppendOutcome::Occupied { occupant }) => {
+                Err(crate::effect::EffectJournalError::PendingOccupied {
+                    effect_id: occupant.effect_id,
+                    subscription_id: occupant.subscription_id,
+                })
+            }
+            Err(error) => Err(if error.status.is_server_error() {
+                crate::effect::EffectJournalError::Unavailable
+            } else {
+                crate::effect::EffectJournalError::Conflict
+            }),
+        }
+    }
+
+    async fn release_output(
+        &self,
+        target: &crate::effect::EffectReleaseTarget,
+    ) -> Result<crate::effect::EffectReleaseOutcome, crate::effect::EffectJournalError> {
+        match route_pending_release_to_owner(self.state, target).await {
+            Ok(crate::active_range::PendingReleaseOutcome::Released { commit_position }) => {
+                Ok(crate::effect::EffectReleaseOutcome::Released {
+                    committed: commit_position.value(),
+                })
+            }
+            Ok(crate::active_range::PendingReleaseOutcome::NotPending { committed }) => {
+                Ok(crate::effect::EffectReleaseOutcome::NotPending { committed })
+            }
+            Ok(crate::active_range::PendingReleaseOutcome::Occupied { occupant }) => {
+                Ok(crate::effect::EffectReleaseOutcome::Occupied {
+                    occupant: crate::effect::EffectOccupant {
+                        effect_id: occupant.effect_id,
+                        subscription_id: occupant.subscription_id,
+                    },
+                })
+            }
+            Err(error) => Err(if error.status.is_server_error() {
+                crate::effect::EffectJournalError::Unavailable
+            } else {
+                crate::effect::EffectJournalError::Conflict
+            }),
+        }
+    }
+
+    async fn resolve_pending(
+        &self,
+        occupant: crate::effect::EffectOccupant,
+    ) -> Result<(), crate::effect::EffectJournalError> {
+        if self.sweep_depth >= 1 {
+            // Nested sweeps would recurse across Subscription scopes; the
+            // occupant resolves on its own drive instead.
+            return Err(crate::effect::EffectJournalError::Unavailable);
+        }
+        let assignment = self
+            .state
+            .control
+            .active_subscription_progress_assignment_by_id(occupant.subscription_id)
+            .await
+            .ok_or(crate::effect::EffectJournalError::Unavailable)?;
+        let journal = effect_coordinator_for(self.state, assignment.clone())
+            .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
+        let (progress, _) = member_assignment_coordinator(self.state, assignment.clone())
+            .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
+        let sink = LiveEffectApply {
+            state: self.state,
+            progress,
+            subscription_id: occupant.subscription_id,
+            ownership_epoch: assignment.ownership_epoch,
+            sweep_depth: self.sweep_depth + 1,
+        };
+        journal
+            .apply_committed(occupant.effect_id, &sink)
             .await
             .map(|_| ())
-            .map_err(|error| {
-                if error.status.is_server_error() {
-                    crate::effect::EffectJournalError::Unavailable
-                } else {
-                    crate::effect::EffectJournalError::Conflict
-                }
-            })
     }
 
     async fn commit_frontier(
@@ -7298,6 +7402,11 @@ struct ClientAppendRequest {
     payload_base64: String,
     #[serde(default)]
     metadata_base64: BTreeMap<String, String>,
+    /// Effect-journal appends only: the frame joins the effect's pending
+    /// tail (durable on the output quorum but invisible until the effect's
+    /// terminal marker releases it). Public append paths refuse it.
+    #[serde(default)]
+    pending_effect: Option<crate::active_range::PendingEffectRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -7329,6 +7438,16 @@ struct InternalOwnerAppendResponse {
     /// ingress Nodes can distinguish retryable classes (e.g. sequence healing).
     #[serde(default)]
     code: Option<String>,
+    /// The Range the append landed on, so pending callers can target the
+    /// release that makes it visible.
+    #[serde(default)]
+    range_id: Option<crate::active_range::RangeId>,
+    /// The appended position inside that Range.
+    #[serde(default)]
+    position: Option<u64>,
+    /// The effect holding the tail when the refusal is `PendingOccupied`.
+    #[serde(default)]
+    pending_effect: Option<crate::active_range::PendingEffect>,
 }
 
 /// `GET /v1/admin/demand/hot-keys`
@@ -7620,6 +7739,7 @@ async fn session_append_with_sequence(
             key_base64: request.key_base64.clone(),
             payload_base64: request.payload_base64.clone(),
             metadata_base64: request.metadata_base64.clone(),
+            pending_effect: None,
         }),
     )
     .await
@@ -7632,6 +7752,11 @@ async fn client_append(
     Json(request): Json<ClientAppendRequest>,
 ) -> Result<Json<WriterAppendResponse>, ApiError> {
     authorize_admin(&state, &headers)?;
+    if request.pending_effect.is_some() {
+        return Err(ApiError::bad_request(
+            "pending_effect is reserved for effect-journal appends; public Writers commit on success",
+        ));
+    }
     // A freshly committed CREATE FEED applies on follower replicas a
     // few ms later; the bounded wait hides that read-after-write gap.
     let feed = feed_when_applied(&state.control, &request.feed, state.control_plane.is_some())
@@ -7666,7 +7791,10 @@ async fn route_append_to_owner(
         ApiError::unavailable("this Node is not configured for Active Range routing")
     })?;
     if &assignment.owner == local {
-        return owner_append_local(state, request).await;
+        return owner_append_local(state, request)
+            .await
+            .map(|outcome| outcome.response)
+            .map_err(|error| error.api);
     }
     let endpoint = state
         .control_endpoints
@@ -7719,30 +7847,280 @@ async fn route_append_to_owner(
     })
 }
 
+/// Forward a pending (effect-owned) append to the current Append Owner.
+/// Unlike `route_append_to_owner` the caller needs the Range placement back
+/// for the later release, and an occupied tail surfaces the occupant's
+/// identity rather than a bare refusal.
+async fn route_effect_append_to_owner(
+    state: &AppState,
+    feed_id: Uuid,
+    request: ClientAppendRequest,
+) -> Result<EffectAppendOutcome, ApiError> {
+    let routing_key = decode_base64("key_base64", &request.key_base64)?;
+    if routing_key.is_empty() {
+        return Err(ApiError::bad_request(
+            "key_base64 must contain a non-empty key",
+        ));
+    }
+    let (_, assignment) = state
+        .control
+        .active_range_for_key(feed_id, &routing_key)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
+    let local = state.storage_node_id.as_ref().ok_or_else(|| {
+        ApiError::unavailable("this Node is not configured for Active Range routing")
+    })?;
+    if &assignment.owner == local {
+        return match owner_append_local(state, request).await {
+            Ok(outcome) => Ok(EffectAppendOutcome::Appended {
+                range_id: outcome.range_id,
+                position: outcome.position,
+            }),
+            Err(error) => match error.occupant {
+                Some(occupant) => Ok(EffectAppendOutcome::Occupied { occupant }),
+                None => Err(error.api),
+            },
+        };
+    }
+    let endpoint = state
+        .control_endpoints
+        .resolve(&assignment.owner)
+        .await
+        .ok_or_else(|| {
+            ApiError::unavailable(format!(
+                "current Append Owner {} has no endpoint",
+                assignment.owner
+            ))
+        })?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("internal forwarding credential is unavailable"))?;
+    let response = state
+        .internal_http
+        .post(format!(
+            "{}/internal/active-range/owner/append",
+            endpoint.trim_end_matches('/')
+        ))
+        .header("x-whitewater-control-key", key)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::unavailable(format!(
+            "Append Owner returned HTTP {}",
+            response.status()
+        )));
+    }
+    let response: InternalOwnerAppendResponse = response
+        .json()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    if let Some(occupant) = response.pending_effect {
+        return Ok(EffectAppendOutcome::Occupied { occupant });
+    }
+    match (response.result, response.range_id, response.position) {
+        (Some(_), Some(range_id), Some(position)) => Ok(EffectAppendOutcome::Appended {
+            range_id,
+            position: crate::active_range::RangePosition::new(position),
+        }),
+        _ => Err(ApiError {
+            status: if response.retryable {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::CONFLICT
+            },
+            message: response
+                .error
+                .unwrap_or_else(|| "Append Owner returned no result".to_owned()),
+            code: None,
+        }),
+    }
+}
+
+/// Forward a pending-tail release to the Range's current Append Owner. The
+/// owner broadcasts the deferred commit position - the marker's last frame -
+/// to the replica quorum and commits locally once a follower persists the
+/// same evidence.
+async fn route_pending_release_to_owner(
+    state: &AppState,
+    target: &crate::effect::EffectReleaseTarget,
+) -> Result<crate::active_range::PendingReleaseOutcome, ApiError> {
+    let assignment = state
+        .control
+        .active_range_assignment_by_id(target.range_id)
+        .await
+        .filter(|assignment| assignment.feed_id == target.feed_id)
+        .ok_or_else(|| ApiError::unavailable("Active Range assignment is unavailable"))?;
+    let request = crate::active_range::PendingReleaseRequest {
+        feed_id: target.feed_id,
+        range_id: target.range_id,
+        generation: assignment.generation,
+        ownership_epoch: assignment.ownership_epoch,
+        append_owner: assignment.owner.clone(),
+        effect_id: target.effect_id,
+        subscription_id: target.subscription_id,
+    };
+    let local = state.storage_node_id.as_ref().ok_or_else(|| {
+        ApiError::unavailable("this Node is not configured for Active Range routing")
+    })?;
+    if &assignment.owner == local {
+        return state
+            .majority_append
+            .as_ref()
+            .ok_or_else(|| ApiError::unavailable("majority append coordinator is unavailable"))?
+            .commit_pending_effect(request)
+            .await
+            .map_err(majority_api_error);
+    }
+    let endpoint = state
+        .control_endpoints
+        .resolve(&assignment.owner)
+        .await
+        .ok_or_else(|| {
+            ApiError::unavailable(format!(
+                "current Append Owner {} has no endpoint",
+                assignment.owner
+            ))
+        })?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("internal forwarding credential is unavailable"))?;
+    let response = state
+        .internal_http
+        .post(format!(
+            "{}/internal/active-range/owner/release-pending",
+            endpoint.trim_end_matches('/')
+        ))
+        .header("x-whitewater-control-key", key)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::unavailable(format!(
+            "Append Owner returned HTTP {}",
+            response.status()
+        )));
+    }
+    let response: OwnerReleaseResponse = response
+        .json()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    response.outcome.ok_or_else(|| ApiError {
+        status: if response.retryable {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::CONFLICT
+        },
+        message: response
+            .error
+            .unwrap_or_else(|| "Append Owner returned no release outcome".to_owned()),
+        code: None,
+    })
+}
+
+/// `POST /internal/active-range/owner/release-pending` response body.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OwnerReleaseResponse {
+    #[serde(default)]
+    outcome: Option<crate::active_range::PendingReleaseOutcome>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    retryable: bool,
+}
+
+/// `POST /internal/active-range/owner/release-pending`
+///
+/// Owner-side endpoint that commits one effect's pending tail on an output
+/// Range. The apply path calls it after the effect's terminal journal
+/// marker is durable; `NotPending` means the tail already resolved and
+/// `Occupied` reports the effect holding it instead.
+async fn owner_release_pending(
+    State(state): State<AppState>,
+    Json(request): Json<crate::active_range::PendingReleaseRequest>,
+) -> Json<OwnerReleaseResponse> {
+    Json(match state.majority_append.as_ref() {
+        Some(coordinator) => match coordinator.commit_pending_effect(request).await {
+            Ok(outcome) => OwnerReleaseResponse {
+                outcome: Some(outcome),
+                error: None,
+                retryable: false,
+            },
+            Err(error) => OwnerReleaseResponse {
+                outcome: None,
+                error: Some(error.to_string()),
+                retryable: error.retryable,
+            },
+        },
+        None => OwnerReleaseResponse {
+            outcome: None,
+            error: Some("majority append coordinator is unavailable".to_owned()),
+            retryable: true,
+        },
+    })
+}
+
 async fn owner_append(
     State(state): State<AppState>,
     Json(request): Json<ClientAppendRequest>,
 ) -> Json<InternalOwnerAppendResponse> {
     Json(match owner_append_local(&state, request).await {
-        Ok(result) => InternalOwnerAppendResponse {
-            result: Some(result),
+        Ok(outcome) => InternalOwnerAppendResponse {
+            result: Some(outcome.response),
             error: None,
             retryable: false,
             code: None,
+            range_id: Some(outcome.range_id),
+            position: Some(outcome.position.value()),
+            pending_effect: None,
         },
-        Err(error) => InternalOwnerAppendResponse {
-            result: None,
-            retryable: error.status == StatusCode::SERVICE_UNAVAILABLE,
-            error: Some(error.message),
-            code: error.code.map(str::to_owned),
-        },
+        Err(error) => {
+            let occupant = error.occupant.clone();
+            InternalOwnerAppendResponse {
+                result: None,
+                retryable: error.api.status == StatusCode::SERVICE_UNAVAILABLE,
+                error: Some(error.api.message),
+                code: error.api.code.map(str::to_owned),
+                range_id: None,
+                position: None,
+                pending_effect: occupant,
+            }
+        }
     })
+}
+
+/// The owner-side outcome of an append: the public response plus the Range
+/// placement pending callers need to target the release with.
+struct OwnerAppendOutcome {
+    response: WriterAppendResponse,
+    range_id: crate::active_range::RangeId,
+    position: crate::active_range::RangePosition,
+}
+
+/// An owner-side append refusal that can carry the effect holding the tail
+/// when the cause is `PendingEffectOccupied`.
+struct OwnerAppendError {
+    api: ApiError,
+    occupant: Option<crate::active_range::PendingEffect>,
+}
+
+impl From<ApiError> for OwnerAppendError {
+    fn from(api: ApiError) -> Self {
+        Self {
+            api,
+            occupant: None,
+        }
+    }
 }
 
 async fn owner_append_local(
     state: &AppState,
     request: ClientAppendRequest,
-) -> Result<WriterAppendResponse, ApiError> {
+) -> Result<OwnerAppendOutcome, OwnerAppendError> {
     let feed = feed_when_applied(&state.control, &request.feed, state.control_plane.is_some())
         .await
         .ok_or_else(|| {
@@ -7757,9 +8135,7 @@ async fn owner_append_local(
         })?;
     let routing_key = decode_base64("key_base64", &request.key_base64)?;
     if routing_key.is_empty() {
-        return Err(ApiError::bad_request(
-            "key_base64 must contain a non-empty key",
-        ));
+        return Err(ApiError::bad_request("key_base64 must contain a non-empty key").into());
     }
     let (_, assignment) = state
         .control
@@ -7770,7 +8146,8 @@ async fn owner_append_local(
         return Err(ApiError::unavailable(format!(
             "Node is not current Append Owner {}; refresh assignment and retry",
             assignment.owner
-        )));
+        ))
+        .into());
     }
     let key = routing_key;
     let pressure_key = key.clone();
@@ -7821,14 +8198,17 @@ async fn owner_append_local(
             },
             cursor,
             frame_base64: STANDARD.encode(frame),
+            pending_effect: request.pending_effect,
         })
         .await
         .map_err(|error| {
+            let occupant = error.pending_effect.clone();
             // A refused append leaves its allocated Writer sequence
             // unconsumed; once later appends advance the stream, the
             // deduped allocation can never fill the hole. Tag it so the
             // session append path can re-allocate and heal the retry.
-            if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
+            let api = if error.code
+                == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
                 && error.message.contains("is stale; latest accepted sequence")
             {
                 ApiError {
@@ -7838,18 +8218,23 @@ async fn owner_append_local(
                 }
             } else {
                 majority_api_error(error)
-            }
+            };
+            OwnerAppendError { api, occupant }
         })?;
     state
         .demand
         .record_range_append(assignment.range_id, &pressure_key, pressure_bytes);
     let hot_key = state.demand.is_hot_key(assignment.range_id, &pressure_key);
-    Ok(WriterAppendResponse {
-        message_id: result.message_id,
-        cursor: result.cursor,
-        deduplicated: result.deduplicated,
-        durability: "majority_committed".to_owned(),
-        feedback: writer_feedback(&state.demand, hot_key),
+    Ok(OwnerAppendOutcome {
+        response: WriterAppendResponse {
+            message_id: result.message_id,
+            cursor: result.cursor,
+            deduplicated: result.deduplicated,
+            durability: "majority_committed".to_owned(),
+            feedback: writer_feedback(&state.demand, hot_key),
+        },
+        range_id: assignment.range_id,
+        position: result.position,
     })
 }
 
@@ -15317,5 +15702,257 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+    }
+
+    struct LoopbackReplicaTransport {
+        services: Arc<
+            BTreeMap<
+                crate::active_range::StorageNodeId,
+                Arc<crate::active_range::ReplicaAppendService>,
+            >,
+        >,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::active_range::ReplicaTransport for LoopbackReplicaTransport {
+        async fn append(
+            &self,
+            replica: &crate::active_range::StorageNodeId,
+            request: crate::active_range::ReplicaAppendRequest,
+        ) -> Result<
+            crate::active_range::ReplicaAppendAccepted,
+            crate::active_range::ReplicaTransportError,
+        > {
+            self.services[replica]
+                .append(request)
+                .await
+                .map_err(|error| crate::active_range::ReplicaTransportError {
+                    message: error.message,
+                    retryable: error.retryable,
+                })
+        }
+
+        async fn commit(
+            &self,
+            replica: &crate::active_range::StorageNodeId,
+            request: crate::active_range::ReplicaCommitRequest,
+        ) -> Result<
+            crate::active_range::ReplicaCommitAccepted,
+            crate::active_range::ReplicaTransportError,
+        > {
+            self.services[replica]
+                .commit(request)
+                .await
+                .map_err(|error| crate::active_range::ReplicaTransportError {
+                    message: error.message,
+                    retryable: error.retryable,
+                })
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_outputs_hold_and_release_through_the_owner_endpoints() {
+        let directory = TempDir::new().unwrap();
+        let (mut state, plane, control, _replica) = internal_replica_test_state(&directory).await;
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        let assignment = control.active_range_assignment(feed.feed_id).await.unwrap();
+        let services: BTreeMap<_, _> = assignment
+            .replicas
+            .iter()
+            .map(|node| {
+                (
+                    node.clone(),
+                    Arc::new(crate::active_range::ReplicaAppendService::new(
+                        directory.path().join("owner-ranges").join(node.as_str()),
+                        node.clone(),
+                        control.clone(),
+                    )),
+                )
+            })
+            .collect();
+        let owner = assignment.owner.clone();
+        let services = Arc::new(services);
+        state.storage_node_id = Some(owner.clone());
+        state.replica_append = Some(services[&owner].clone());
+        state.majority_append = Some(Arc::new(
+            crate::active_range::MajorityAppendCoordinator::new(
+                services[&owner].clone(),
+                control.clone(),
+                Arc::new(LoopbackReplicaTransport {
+                    services: services.clone(),
+                }),
+            ),
+        ));
+        let app = router(state);
+
+        let effect = Uuid::from_u128(910);
+        let subscription = Uuid::from_u128(911);
+        let append_body = |writer: u128, sequence: u64, pending: Option<serde_json::Value>| {
+            let mut body = serde_json::json!({
+                "request_id": Uuid::from_u128(912 + writer),
+                "feed": "orders.events",
+                "writer_session_id": Uuid::from_u128(writer),
+                "writer_epoch": 1,
+                "sequence": sequence,
+                "key_base64": base64::engine::general_purpose::STANDARD.encode(b"customer-1"),
+                "payload_base64": base64::engine::general_purpose::STANDARD.encode(b"held"),
+            });
+            if let Some(pending) = pending {
+                body["pending_effect"] = pending;
+            }
+            body
+        };
+
+        // The pending append commits durably on the quorum but stays
+        // fenced: the owner reports its placement, committed reads hide it.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/active-range/owner/append")
+            .header("content-type", "application/json")
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key",
+            )
+            .body(Body::from(
+                serde_json::to_vec(&append_body(
+                    913,
+                    1,
+                    Some(serde_json::json!({
+                        "effect_id": effect,
+                        "subscription_id": subscription,
+                    })),
+                ))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: InternalOwnerAppendResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(reply.result.is_some());
+        assert_eq!(reply.range_id, Some(assignment.range_id));
+        assert_eq!(reply.position, Some(1));
+        assert_eq!(
+            services[&owner]
+                .pending_effect(&assignment)
+                .await
+                .unwrap()
+                .unwrap()
+                .effect_id,
+            effect
+        );
+        assert!(services[&owner]
+            .read_staged_committed(&assignment, None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // A foreign effect is refused and the reply carries the occupant.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/active-range/owner/append")
+            .header("content-type", "application/json")
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key",
+            )
+            .body(Body::from(
+                serde_json::to_vec(&append_body(
+                    915,
+                    1,
+                    Some(serde_json::json!({
+                        "effect_id": Uuid::from_u128(914),
+                        "subscription_id": subscription,
+                    })),
+                ))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: InternalOwnerAppendResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(reply.result.is_none());
+        assert_eq!(reply.pending_effect.unwrap().effect_id, effect);
+
+        // The public append path refuses the internal pending flag.
+        let public = Request::builder()
+            .method("POST")
+            .uri("/v1/feeds/append")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer this-is-a-long-development-api-key")
+            .body(Body::from(
+                serde_json::to_vec(&append_body(
+                    917,
+                    1,
+                    Some(serde_json::json!({
+                        "effect_id": effect,
+                        "subscription_id": subscription,
+                    })),
+                ))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(public).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // The release commits the held tail across the quorum.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/active-range/owner/release-pending")
+            .header("content-type", "application/json")
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key",
+            )
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "feed_id": feed.feed_id,
+                    "range_id": assignment.range_id,
+                    "generation": assignment.generation,
+                    "ownership_epoch": assignment.ownership_epoch,
+                    "append_owner": owner,
+                    "effect_id": effect,
+                    "subscription_id": subscription,
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: OwnerReleaseResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            reply.outcome,
+            Some(crate::active_range::PendingReleaseOutcome::Released {
+                commit_position: crate::active_range::CommitPosition::new(1),
+            })
+        );
+        for service in services.values() {
+            let status = service
+                .recovery_status_for_assignment(&assignment)
+                .await
+                .unwrap();
+            assert_eq!(
+                status.committed,
+                crate::active_range::CommitPosition::new(1)
+            );
+            assert_eq!(service.pending_effect(&assignment).await.unwrap(), None);
+            assert_eq!(
+                service
+                    .read_staged_committed(&assignment, None, 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        plane.raft().shutdown().await.unwrap();
     }
 }

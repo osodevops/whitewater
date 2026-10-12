@@ -189,6 +189,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
                 },
                 cursor: format!("cursor-{sequence}"),
                 frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+                pending_effect: None,
             })
             .await
             .unwrap();
@@ -322,6 +323,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             },
             cursor: "cursor-5".to_owned(),
             frame_base64: STANDARD.encode(encode_record(&fifth).unwrap()),
+            pending_effect: None,
         })
         .await
         .unwrap_err();
@@ -658,6 +660,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
                     &format!("value-{sequence}"),
                     1_000 + sequence as u128,
                 ),
+                pending_effect: None,
             })
             .await
             .unwrap();
@@ -729,6 +732,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
                 },
                 cursor: format!("branched-cursor-{index}"),
                 frame_base64: frame.clone(),
+                pending_effect: None,
             })
             .await
             .unwrap();
@@ -824,6 +828,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
                 },
                 cursor: format!("branched-cursor-{index}"),
                 frame_base64: frame.clone(),
+                pending_effect: None,
             })
             .await
             .unwrap();
@@ -849,6 +854,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
             },
             cursor: "conflicting-cursor".to_owned(),
             frame_base64: build_frame(5, &left_key, "tampered", 9_999),
+            pending_effect: None,
         })
         .await
         .unwrap_err();
@@ -871,6 +877,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
             },
             cursor: "stale-cursor".to_owned(),
             frame_base64: build_frame(4, &left_key, "tampered", 9_998),
+            pending_effect: None,
         })
         .await
         .unwrap_err();
@@ -892,6 +899,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
             },
             cursor: "cursor-6".to_owned(),
             frame_base64: build_frame(6, &left_key, "value-6", 1_006),
+            pending_effect: None,
         })
         .await
         .unwrap();
@@ -929,6 +937,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
             },
             cursor: "branched-cursor-1".to_owned(),
             frame_base64: frame.clone(),
+            pending_effect: None,
         })
         .await
         .unwrap();

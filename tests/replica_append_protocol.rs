@@ -99,6 +99,7 @@ impl Fixture {
             },
             cursor: format!("cursor-{sequence}"),
             frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            pending_effect: None,
         }
     }
 }
@@ -285,4 +286,100 @@ async fn replica_rejects_unknown_feed_and_oversized_or_invalid_base64() {
         service.append(oversized).await.unwrap_err().code,
         ReplicaAppendErrorCode::FrameTooLarge
     );
+}
+
+fn pending_request(request: &mut ReplicaAppendRequest, effect_id: Uuid, subscription_id: Uuid) {
+    request.pending_effect = Some(finnstream::active_range::PendingEffectRef {
+        effect_id,
+        subscription_id,
+    });
+}
+
+#[tokio::test]
+async fn pending_appends_mark_the_replica_tail_and_occupants_report_the_holder() {
+    let fixture = Fixture::new().await;
+    let service = fixture.service("storage-2");
+    let effect = Uuid::from_u128(600);
+    let subscription = Uuid::from_u128(601);
+
+    let mut held = fixture.request(1, 1, b"held");
+    pending_request(&mut held, effect, subscription);
+    let accepted = service.append(held.clone()).await.unwrap();
+    assert_eq!(accepted.position, RangePosition::new(1));
+
+    // The replica exposes the marker and the occupant it reports.
+    let assignment = fixture
+        .controller
+        .active_range_assignment_by_id(fixture.range_id)
+        .await
+        .unwrap();
+    let marker = service
+        .pending_effect(&assignment)
+        .await
+        .unwrap()
+        .expect("marker");
+    assert_eq!(marker.effect_id, effect);
+    assert_eq!(marker.last_position, 1);
+    assert_eq!(marker.last_frame_digest, accepted.frame_digest);
+
+    // A foreign pending append is refused with the occupant identity.
+    let mut intruder = fixture.request(2, 2, b"intruder");
+    pending_request(&mut intruder, Uuid::from_u128(602), subscription);
+    let error = service.append(intruder).await.unwrap_err();
+    assert_eq!(error.code, ReplicaAppendErrorCode::PendingEffectOccupied);
+    assert!(error.retryable);
+    assert_eq!(error.pending_effect.unwrap().effect_id, effect);
+
+    // A plain append behind a held tail is fenced the same way.
+    let plain = fixture.request(2, 2, b"plain");
+    let error = service.append(plain).await.unwrap_err();
+    assert_eq!(error.code, ReplicaAppendErrorCode::PendingEffectOccupied);
+
+    // The same effect extends its own tail.
+    let mut second = fixture.request(2, 2, b"held-2");
+    pending_request(&mut second, effect, subscription);
+    service.append(second).await.unwrap();
+    assert_eq!(
+        service
+            .pending_effect(&assignment)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_position,
+        2
+    );
+}
+
+#[tokio::test]
+async fn commit_at_the_marker_position_releases_the_pending_tail() {
+    let fixture = Fixture::new().await;
+    let service = fixture.service("storage-2");
+    let effect = Uuid::from_u128(610);
+    let subscription = Uuid::from_u128(611);
+
+    let mut held = fixture.request(1, 1, b"held");
+    pending_request(&mut held, effect, subscription);
+    let accepted = service.append(held).await.unwrap();
+
+    // The deferred commit that releases the tail is the ordinary commit
+    // path targeted at the marker's last frame digest.
+    service
+        .commit(finnstream::active_range::ReplicaCommitRequest {
+            feed_id: fixture.feed_id,
+            range_id: fixture.range_id,
+            generation: RangeGeneration::new(1),
+            ownership_epoch: finnstream::active_range::OwnershipEpoch::new(1),
+            append_owner: fixture.owner.clone(),
+            commit_position: finnstream::active_range::CommitPosition::new(1),
+            frame_digest: accepted.frame_digest,
+        })
+        .await
+        .unwrap();
+
+    let assignment = fixture
+        .controller
+        .active_range_assignment_by_id(fixture.range_id)
+        .await
+        .unwrap();
+    assert_eq!(service.pending_effect(&assignment).await.unwrap(), None);
 }

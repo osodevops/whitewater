@@ -208,6 +208,53 @@ Full multi-stream or multi-resource transactions may exist, but they are an expl
 - Epoch fencing against stale lease holders
 - Deterministic retry following an ambiguous network result
 
+### Implementation: pending-effect deferred commit
+
+The committed `Declare` row in the Subscription-scoped Effect Journal is the
+single decision record. Side effects execute in four ordered phases, each of
+which is idempotent so a retried apply converges to one outcome:
+
+1. **Pending outputs.** Each declared output appends to its output Active
+   Range under a *pending-effect fence*: the frame replicates to the replica
+   quorum through the normal append path, but the owner withholds the commit
+   broadcast. Committed reads cannot observe it; the Range's persisted state
+   carries the marker (`effect_id`, `subscription_id`, last position, last
+   frame digest) that makes the fence durable and inspectable.
+2. **Frontier.** The consumed Subscription frontier moves through the
+   progress journal's ordinary CAS/commit path.
+3. **Terminal marker.** An `Applied` transition - carrying the declared
+   outputs - commits on the Effect Journal quorum. From here the decision is
+   final; replay reads this row alone.
+4. **Release.** For each output Range the append touched, the owner
+   broadcasts a deferred commit to the marker's last position and frame
+   digest. One commit per Range makes every output of the effect visible in
+   a single step.
+
+While a marker holds a Range's tail, the append gate refuses *every* other
+append - ordinary or pending - with `PendingEffectOccupied` carrying the
+occupant identity. The apply resolves an occupant by driving its own
+committed journal row to release (`resolve_pending`), bounded at four sweeps
+before failing closed.
+
+Failure semantics fall out of the mechanism rather than a separate protocol:
+
+- **Crash before the frontier commit** - replay re-appends outputs (writer
+  dedup makes it idempotent), re-commits the frontier, writes the marker,
+  releases the tails.
+- **Crash after `Applied` but before release** - the row replays the ensure
+  and release phases; `Applied` carries the outputs precisely so the replay
+  needs no other state.
+- **Owner loss while a tail is held** - the uncommitted-tail truncation that
+  already runs on ownership transfer discards the held frames and the marker
+  with them; the apply's release reports `NotPending` and re-appends under a
+  fresh marker if the committed boundary did not cover the receipts.
+- **Ambiguous release** - `commit_pending_effect` is identity-checked and
+  idempotent: `NotPending` plus a covered committed boundary means the tail
+  already resolved.
+
+The boundary deliberately does not span Index/StateStore mutations; those
+join the atomic unit in a later milestone.
+
 ## 6. Protocol-level idempotency
 
 Every append carries an identity such as:

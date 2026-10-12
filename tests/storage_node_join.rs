@@ -121,6 +121,7 @@ fn replica_request(
         },
         cursor: format!("cursor-{position}"),
         frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+        pending_effect: None,
     }
 }
 

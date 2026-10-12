@@ -70,7 +70,13 @@ pub enum EffectTransition {
     },
     /// Every declared output durably appended and the consume frontier
     /// committed; `declares` identifies the committed `Declare` request.
-    Applied { declares: Uuid },
+    /// `outputs` restates the declared outputs so a terminal row alone can
+    /// still drive release of the pending output tail after any crash.
+    Applied {
+        declares: Uuid,
+        #[serde(default)]
+        outputs: Vec<EffectOutput>,
+    },
     /// The decision was abandoned by policy (for example a poison input was
     /// quarantined); `declares` identifies the committed `Declare` request.
     Aborted { declares: Uuid, reason: String },
@@ -202,6 +208,11 @@ pub enum EffectJournalError {
     Unavailable,
     #[error("effect journal commit result is ambiguous; retry the same request identity")]
     AmbiguousCommit,
+    #[error("an output Active Range tail is held by another pending effect")]
+    PendingOccupied {
+        effect_id: Uuid,
+        subscription_id: Uuid,
+    },
 }
 
 impl EffectJournalError {
@@ -215,6 +226,7 @@ impl EffectJournalError {
             Self::InvalidAssignment => "invalid_assignment",
             Self::Unavailable => "unavailable",
             Self::AmbiguousCommit => "ambiguous_commit",
+            Self::PendingOccupied { .. } => "pending_occupied",
             Self::Engine(_) => "engine",
             Self::Serialization(_) => "serialization",
         }
@@ -564,7 +576,18 @@ fn validate_effect_bounds(mutation: &EffectMutation) -> Result<(), EffectJournal
                 }
             }
         }
-        EffectTransition::Applied { .. } => {}
+        EffectTransition::Applied { outputs, .. } => {
+            if outputs.len() > EFFECT_MAX_OUTPUTS
+                || outputs.iter().any(|output| {
+                    output.key_base64.is_empty()
+                        || output.key_base64.len() > EFFECT_MAX_OUTPUT_FIELD
+                        || output.payload_base64.len() > EFFECT_MAX_OUTPUT_FIELD
+                        || output.sequence == 0
+                })
+            {
+                return Err(EffectJournalError::TooLarge);
+            }
+        }
         EffectTransition::Aborted { reason, .. } => {
             if reason.is_empty() || reason.len() > 256 {
                 return Err(EffectJournalError::TooLarge);
@@ -584,7 +607,7 @@ fn validate_transition(
         (EffectTransition::Declare { .. }, None) => Ok(()),
         (EffectTransition::Declare { .. }, Some(_)) => Err(EffectJournalError::Conflict),
         (
-            EffectTransition::Applied { declares } | EffectTransition::Aborted { declares, .. },
+            EffectTransition::Applied { declares, .. } | EffectTransition::Aborted { declares, .. },
             Some(prior),
         ) => {
             if prior.transition.is_terminal() {
@@ -894,17 +917,29 @@ impl EffectCoordinator {
         }
     }
 
-    /// Drive a committed `Declare` to its terminal `Applied` marker: append
-    /// every declared output idempotently, commit the consumed frontier,
-    /// then commit `Applied` on the journal quorum. A crash anywhere replays
-    /// safely because output appends dedupe on deterministic writer identity,
-    /// the frontier move replays by request identity, and an already-terminal
-    /// journal row short-circuits the whole call.
+    /// Drive a committed `Declare` to its terminal `Applied` marker and then
+    /// release the pending output tail. The phases are idempotent and ordered
+    /// so a crash anywhere converges on retry:
+    ///
+    /// 1. **Ensure outputs**: every declared output appends under the pending
+    ///    fence - durable on the output Range quorum but fenced behind the
+    ///    committed boundary, so no reader can observe it yet.
+    /// 2. **Frontier**: the consumed Subscription frontier commits.
+    /// 3. **`Applied`**: the terminal journal marker commits - the effect's
+    ///    decision is final and replayable from this row alone.
+    /// 4. **Release**: each touched output Range's pending tail commits,
+    ///    making every output visible in one step per Range.
+    ///
+    /// An already-`Applied` row still re-runs the ensure and release phases:
+    /// replay re-appends outputs idempotently and releases any tail the
+    /// earlier attempt left pending. A `PendingOccupied` refusal defers to
+    /// `resolve_pending` so the occupant's own apply can settle the tail.
     pub async fn apply_committed<A: EffectApply + ?Sized>(
         &self,
         effect_id: Uuid,
         apply: &A,
     ) -> Result<EffectMutation, EffectJournalError> {
+        const MAX_PENDING_SWEEPS: usize = 4;
         let committed = self
             .read_committed(effect_id)
             .await?
@@ -912,11 +947,37 @@ impl EffectCoordinator {
         if committed.subscription_id != self.assignment.subscription_id {
             return Err(EffectJournalError::InvalidAssignment);
         }
-        let EffectTransition::Declare { consume, outputs } = &committed.transition else {
-            return Ok(committed);
+        let (consume, outputs) = match &committed.transition {
+            EffectTransition::Declare { consume, outputs } => {
+                (consume.as_ref(), outputs.as_slice())
+            }
+            EffectTransition::Applied { outputs, .. } => (None, outputs.as_slice()),
+            EffectTransition::Aborted { .. } => return Ok(committed),
         };
+        let mut receipts = Vec::with_capacity(outputs.len());
         for output in outputs {
-            apply.append_output(output).await?;
+            let mut sweeps = 0;
+            loop {
+                match apply.append_output(output, effect_id).await {
+                    Ok(receipt) => {
+                        receipts.push(receipt);
+                        break;
+                    }
+                    Err(EffectJournalError::PendingOccupied {
+                        effect_id: occupant_effect,
+                        subscription_id: occupant_subscription,
+                    }) if sweeps < MAX_PENDING_SWEEPS => {
+                        sweeps += 1;
+                        apply
+                            .resolve_pending(EffectOccupant {
+                                effect_id: occupant_effect,
+                                subscription_id: occupant_subscription,
+                            })
+                            .await?;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
         if let Some(consume) = consume {
             apply
@@ -926,34 +987,133 @@ impl EffectCoordinator {
                 )
                 .await?;
         }
-        let applied = EffectMutation {
-            effect_id,
-            subscription_id: committed.subscription_id,
-            ownership_epoch: committed.ownership_epoch,
-            sequence: committed.sequence + 1,
-            request_id: effect_apply_request_id(committed.request_id, b"applied"),
-            transition: EffectTransition::Applied {
-                declares: committed.request_id,
-            },
-        };
-        match self.apply(applied.clone()).await {
-            Ok(committed) => Ok(committed),
-            Err(EffectJournalError::AmbiguousCommit | EffectJournalError::NoQuorum) => {
-                self.reconcile_retry(applied).await
+        let terminal = if matches!(committed.transition, EffectTransition::Declare { .. }) {
+            let applied = EffectMutation {
+                effect_id,
+                subscription_id: committed.subscription_id,
+                ownership_epoch: committed.ownership_epoch,
+                sequence: committed.sequence + 1,
+                request_id: effect_apply_request_id(committed.request_id, b"applied"),
+                transition: EffectTransition::Applied {
+                    declares: committed.request_id,
+                    outputs: outputs.to_vec(),
+                },
+            };
+            match self.apply(applied.clone()).await {
+                Ok(committed) => committed,
+                Err(EffectJournalError::AmbiguousCommit | EffectJournalError::NoQuorum) => {
+                    self.reconcile_retry(applied).await?
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => Err(error),
+        } else {
+            committed.clone()
+        };
+        let mut ranges: BTreeMap<(Uuid, crate::active_range::RangeId), ()> = BTreeMap::new();
+        for receipt in &receipts {
+            ranges.insert((receipt.feed_id, receipt.range_id), ());
         }
+        for (feed_id, range_id) in ranges.into_keys() {
+            let mut sweeps = 0;
+            let mut attempts = 0;
+            loop {
+                let outcome = apply
+                    .release_output(&EffectReleaseTarget {
+                        feed_id,
+                        range_id,
+                        effect_id,
+                        subscription_id: terminal.subscription_id,
+                    })
+                    .await?;
+                match outcome {
+                    EffectReleaseOutcome::Released { .. } => break,
+                    EffectReleaseOutcome::NotPending { committed } => {
+                        // The tail resolved already; every receipt for this
+                        // Range must sit at or below the committed boundary,
+                        // otherwise its frames were truncated and the outputs
+                        // have to append again under a fresh marker.
+                        let settled = receipts
+                            .iter()
+                            .filter(|receipt| {
+                                receipt.feed_id == feed_id && receipt.range_id == range_id
+                            })
+                            .all(|receipt| receipt.position.value() <= committed);
+                        if settled {
+                            break;
+                        }
+                        attempts += 1;
+                        if attempts > MAX_PENDING_SWEEPS {
+                            return Err(EffectJournalError::Conflict);
+                        }
+                        for output in outputs {
+                            apply.append_output(output, effect_id).await?;
+                        }
+                    }
+                    EffectReleaseOutcome::Occupied { occupant } => {
+                        sweeps += 1;
+                        if sweeps > MAX_PENDING_SWEEPS {
+                            return Err(EffectJournalError::Unavailable);
+                        }
+                        apply.resolve_pending(occupant).await?;
+                    }
+                }
+            }
+        }
+        Ok(terminal)
     }
 }
 
-/// Executes the side effects of a committed `Declare`: idempotent output
-/// appends, then the consumed frontier move. Implementations wire these to
-/// the real Feed append path and the Subscription progress journal.
+/// Where one appended output landed; the release phase commits each touched
+/// Range's pending tail once, not per record.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectOutputReceipt {
+    pub feed_id: Uuid,
+    pub range_id: crate::active_range::RangeId,
+    pub position: crate::active_range::RangePosition,
+}
+
+/// The Range whose pending tail a release targets.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EffectReleaseTarget {
+    pub feed_id: Uuid,
+    pub range_id: crate::active_range::RangeId,
+    pub effect_id: Uuid,
+    pub subscription_id: Uuid,
+}
+
+/// The outcome of one pending-tail release on an output Range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EffectReleaseOutcome {
+    /// The effect's marker committed; its outputs are now visible.
+    Released { committed: u64 },
+    /// No marker holds the tail; `committed` is the Range's current boundary
+    /// so the caller can tell released-apart from truncated-and-lost.
+    NotPending { committed: u64 },
+    /// A different effect holds the tail; its journal decides the outcome.
+    Occupied { occupant: EffectOccupant },
+}
+
+/// An effect whose pending tail occupies an output Range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EffectOccupant {
+    pub effect_id: Uuid,
+    pub subscription_id: Uuid,
+}
+
+/// Executes the side effects of a committed `Declare`: idempotent pending
+/// output appends, the consumed frontier move, and the release that makes
+/// outputs visible once the terminal journal marker is durable.
 #[async_trait::async_trait]
 pub trait EffectApply: Send + Sync {
-    /// Idempotently append one declared output. A retry of the same writer
-    /// identity and sequence must dedupe rather than duplicate.
-    async fn append_output(&self, output: &EffectOutput) -> Result<(), EffectJournalError>;
+    /// Idempotently append one declared output under the effect's pending
+    /// fence. A retry of the same writer identity and sequence must dedupe
+    /// rather than duplicate; the record must not become visible before the
+    /// release phase commits it.
+    async fn append_output(
+        &self,
+        output: &EffectOutput,
+        effect_id: Uuid,
+    ) -> Result<EffectOutputReceipt, EffectJournalError>;
 
     /// Idempotently commit the declared frontier move on the consumed
     /// Subscription's replicated progress journal.
@@ -962,6 +1122,22 @@ pub trait EffectApply: Send + Sync {
         consume: &EffectConsume,
         request_id: Uuid,
     ) -> Result<(), EffectJournalError>;
+
+    /// Release the pending tail one of this effect's outputs occupies on the
+    /// target Range so the outputs become visible atomically with the
+    /// effect's terminal journal marker.
+    async fn release_output(
+        &self,
+        target: &EffectReleaseTarget,
+    ) -> Result<EffectReleaseOutcome, EffectJournalError>;
+
+    /// Resolve another effect holding an output Range's tail: drive its own
+    /// committed journal entry to release so this effect can proceed. The
+    /// default refuses, which turns `PendingOccupied` into a retryable
+    /// `Unavailable` for callers that cannot reach the occupant's journal.
+    async fn resolve_pending(&self, _occupant: EffectOccupant) -> Result<(), EffectJournalError> {
+        Err(EffectJournalError::Unavailable)
+    }
 }
 
 /// A deterministic request identity derived from the committed Declare so a
@@ -1538,6 +1714,7 @@ mod tests {
             request_id: Uuid::new_v4(),
             transition: EffectTransition::Applied {
                 declares: mutation.request_id,
+                outputs: vec![],
             },
             ..mutation.clone()
         };
@@ -1551,6 +1728,7 @@ mod tests {
                 request_id: Uuid::new_v4(),
                 transition: EffectTransition::Applied {
                     declares: applied.request_id,
+                    outputs: vec![],
                 },
                 ..applied.clone()
             }),
@@ -1568,6 +1746,7 @@ mod tests {
             request_id: Uuid::new_v4(),
             transition: EffectTransition::Applied {
                 declares: mutation.request_id,
+                outputs: vec![],
             },
             ..mutation.clone()
         };
@@ -1602,6 +1781,7 @@ mod tests {
             request_id: Uuid::new_v4(),
             transition: EffectTransition::Applied {
                 declares: Uuid::new_v4(),
+                outputs: vec![],
             },
             ..mutation.clone()
         };
@@ -1835,12 +2015,20 @@ mod tests {
     struct RecordingApply {
         appended: std::sync::Mutex<Vec<EffectOutput>>,
         frontier_requests: std::sync::Mutex<Vec<Uuid>>,
+        released: std::sync::Mutex<Vec<(Uuid, crate::active_range::RangeId)>>,
         fail_outputs: std::sync::Mutex<std::collections::BTreeSet<Uuid>>,
+        occupied: std::sync::Mutex<Option<EffectOccupant>>,
+        resolved: std::sync::Mutex<Vec<EffectOccupant>>,
+        not_pending: std::sync::Mutex<Option<u64>>,
     }
 
     #[async_trait::async_trait]
     impl EffectApply for RecordingApply {
-        async fn append_output(&self, output: &EffectOutput) -> Result<(), EffectJournalError> {
+        async fn append_output(
+            &self,
+            output: &EffectOutput,
+            _effect_id: Uuid,
+        ) -> Result<EffectOutputReceipt, EffectJournalError> {
             if self
                 .fail_outputs
                 .lock()
@@ -1849,6 +2037,12 @@ mod tests {
             {
                 return Err(EffectJournalError::Unavailable);
             }
+            if let Some(occupant) = *self.occupied.lock().unwrap() {
+                return Err(EffectJournalError::PendingOccupied {
+                    effect_id: occupant.effect_id,
+                    subscription_id: occupant.subscription_id,
+                });
+            }
             let mut appended = self.appended.lock().unwrap();
             if !appended
                 .iter()
@@ -1856,7 +2050,11 @@ mod tests {
             {
                 appended.push(output.clone());
             }
-            Ok(())
+            Ok(EffectOutputReceipt {
+                feed_id: output.feed_id,
+                range_id: crate::active_range::RangeId::from_uuid(Uuid::from_u128(7)),
+                position: crate::active_range::RangePosition::new(1),
+            })
         }
 
         async fn commit_frontier(
@@ -1865,6 +2063,29 @@ mod tests {
             request_id: Uuid,
         ) -> Result<(), EffectJournalError> {
             self.frontier_requests.lock().unwrap().push(request_id);
+            Ok(())
+        }
+
+        async fn release_output(
+            &self,
+            target: &EffectReleaseTarget,
+        ) -> Result<EffectReleaseOutcome, EffectJournalError> {
+            if let Some(committed) = *self.not_pending.lock().unwrap() {
+                return Ok(EffectReleaseOutcome::NotPending { committed });
+            }
+            self.released
+                .lock()
+                .unwrap()
+                .push((target.feed_id, target.range_id));
+            Ok(EffectReleaseOutcome::Released { committed: 1 })
+        }
+
+        async fn resolve_pending(
+            &self,
+            occupant: EffectOccupant,
+        ) -> Result<(), EffectJournalError> {
+            self.resolved.lock().unwrap().push(occupant);
+            *self.occupied.lock().unwrap() = None;
             Ok(())
         }
     }
@@ -1925,12 +2146,11 @@ mod tests {
             .apply_committed(mutation.effect_id, &sink)
             .await
             .unwrap();
-        assert_eq!(
-            applied.transition,
-            EffectTransition::Applied {
-                declares: mutation.request_id
-            }
-        );
+        let EffectTransition::Applied { declares, outputs } = &applied.transition else {
+            panic!("expected applied")
+        };
+        assert_eq!(*declares, mutation.request_id);
+        assert_eq!(outputs.len(), 1);
         assert_eq!(applied.sequence, 2);
         assert_eq!(
             applied.request_id,

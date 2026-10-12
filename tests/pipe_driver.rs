@@ -9,13 +9,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use finnstream::active_range::{RangeId, ReplicaSet, StorageNodeId};
+use finnstream::active_range::{RangeId, RangePosition, ReplicaSet, StorageNodeId};
 use finnstream::control::{PipeDefinition, PipeOperation, PipeStage, ResourceStatus};
 use finnstream::effect::{
     effect_apply_request_id, EffectApply, EffectCommitEvidence, EffectConsume, EffectCoordinator,
     EffectJournalError, EffectJournalInspection, EffectJournalTransport, EffectMutation,
-    EffectOutput, EffectPrepareVote, EffectReplicaReply, EffectTransition,
-    FjallEffectJournalReplica,
+    EffectOutput, EffectOutputReceipt, EffectPrepareVote, EffectReleaseOutcome,
+    EffectReleaseTarget, EffectReplicaReply, EffectTransition, FjallEffectJournalReplica,
 };
 use finnstream::pipe::{
     pipe_declare_request_id, pipe_effect_id, pipe_output_writer_session, FetchedPage,
@@ -423,9 +423,24 @@ struct RecordingApply {
 
 #[async_trait::async_trait]
 impl EffectApply for RecordingApply {
-    async fn append_output(&self, output: &EffectOutput) -> Result<(), EffectJournalError> {
+    async fn append_output(
+        &self,
+        output: &EffectOutput,
+        _effect_id: Uuid,
+    ) -> Result<EffectOutputReceipt, EffectJournalError> {
         self.appends.lock().unwrap().push(output.clone());
-        Ok(())
+        Ok(EffectOutputReceipt {
+            feed_id: output.feed_id,
+            range_id: RangeId::from_uuid(Uuid::from_u128(9)),
+            position: RangePosition::new(1),
+        })
+    }
+
+    async fn release_output(
+        &self,
+        _target: &EffectReleaseTarget,
+    ) -> Result<EffectReleaseOutcome, EffectJournalError> {
+        Ok(EffectReleaseOutcome::Released { committed: 1 })
     }
 
     async fn commit_frontier(

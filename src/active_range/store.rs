@@ -43,6 +43,38 @@ pub struct ActiveRangeAppend {
     pub identity: AppendIdentity,
     pub cursor: String,
     pub frame: Vec<u8>,
+    /// When set, the appended record joins the named effect's pending tail:
+    /// durable on the replica quorum but fenced behind the committed
+    /// boundary until the effect's terminal journal marker releases it.
+    pub pending_effect: Option<PendingEffectRef>,
+}
+
+/// The effect an append is pending under. Only records carrying the same
+/// identity may join a pending tail already held by that effect.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PendingEffectRef {
+    pub effect_id: Uuid,
+    pub subscription_id: Uuid,
+}
+
+/// One range's persisted pending tail: the effect holding the uncommitted
+/// records at the tail plus the position and digest of its latest frame so
+/// the release commit can broadcast exactly the evidence the append quorum
+/// already accepted.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct PendingEffect {
+    pub effect_id: Uuid,
+    pub subscription_id: Uuid,
+    pub last_position: u64,
+    pub last_frame_digest: [u8; 32],
+}
+
+impl PendingEffect {
+    fn covers(&self, identity: PendingEffectRef) -> bool {
+        self.effect_id == identity.effect_id && self.subscription_id == identity.subscription_id
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -72,6 +104,8 @@ pub struct ActiveRangeSnapshot {
     pub progress: RangeProgress,
     pub segment_count: u64,
     pub writer_count: usize,
+    /// The effect whose uncommitted records currently hold the tail, if any.
+    pub pending_effect: Option<PendingEffect>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -140,6 +174,8 @@ pub enum ActiveRangeStoreError {
     CorruptSegment { path: PathBuf, reason: String },
     #[error("an immutable segment contains uncommitted records")]
     UncommittedSealedSegment,
+    #[error("Active Range tail is held by pending effect {0:?}")]
+    PendingEffectOccupied(PendingEffect),
     #[error("storage worker failed: {0}")]
     Worker(String),
     #[error(transparent)]
@@ -191,6 +227,8 @@ pub trait ActiveRangeStore: Send + Sync {
         generation: RangeGeneration,
         ownership_epoch: OwnershipEpoch,
     ) -> Result<u64, ActiveRangeStoreError>;
+    /// The effect whose records currently hold the uncommitted tail, if any.
+    async fn pending_effect(&self) -> Result<Option<PendingEffect>, ActiveRangeStoreError>;
     async fn update_ownership_epoch(
         &self,
         generation: RangeGeneration,
@@ -231,6 +269,8 @@ struct PersistedRangeState {
     committed: u64,
     active_segment: u64,
     deduplication: Vec<PersistedDeduplicationState>,
+    #[serde(default)]
+    pending_effect: Option<PendingEffect>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -341,6 +381,16 @@ impl FileActiveRangeStore {
         persisted.appended = recovered_position;
         persisted.flushed = recovered_position;
         persisted.deduplication = persisted_deduplication(&recovered_deduplication);
+        if persisted
+            .pending_effect
+            .as_ref()
+            .is_some_and(|pending| pending.last_position > recovered_position)
+        {
+            // A pending marker that reaches beyond the recovered tail can
+            // never be released honestly; the frames it named are gone, so
+            // the effect journal's replay decides the outcome instead.
+            persisted.pending_effect = None;
+        }
         persist_state(&directory, &persisted)?;
         let active_file = open_segment(&directory, persisted.active_segment)?;
         Ok(Self {
@@ -475,6 +525,17 @@ impl ActiveRangeStore for FileActiveRangeStore {
             .await
     }
 
+    async fn pending_effect(&self) -> Result<Option<PendingEffect>, ActiveRangeStoreError> {
+        self.blocking(|inner| {
+            let loaded = inner
+                .loaded
+                .lock()
+                .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+            Ok(loaded.persisted.pending_effect.clone())
+        })
+        .await
+    }
+
     async fn update_ownership_epoch(
         &self,
         generation: RangeGeneration,
@@ -513,6 +574,7 @@ impl PersistedRangeState {
             committed: 0,
             active_segment: 0,
             deduplication: Vec::new(),
+            pending_effect: None,
         }
     }
 }
@@ -614,6 +676,7 @@ fn snapshot(loaded: &LoadedRange) -> Result<ActiveRangeSnapshot, ActiveRangeStor
         progress,
         segment_count: loaded.persisted.active_segment + 1,
         writer_count: loaded.deduplication.len(),
+        pending_effect: loaded.persisted.pending_effect.clone(),
     })
 }
 
@@ -740,6 +803,15 @@ fn append(
             "Cursor already belongs to another position".to_owned(),
         ));
     }
+    match (&loaded.persisted.pending_effect, request.pending_effect) {
+        (Some(pending), Some(requested)) if pending.covers(requested) => {}
+        (Some(pending), _) => {
+            return Err(ActiveRangeStoreError::PendingEffectOccupied(
+                pending.clone(),
+            ));
+        }
+        (None, _) => {}
+    }
     let position = next_position;
     let decoded = DecodedEntry {
         position,
@@ -800,6 +872,14 @@ fn append(
     next.appended = position.value();
     next.flushed = position.value();
     next.deduplication = persisted_deduplication(&loaded.deduplication);
+    if let Some(requested) = request.pending_effect {
+        next.pending_effect = Some(PendingEffect {
+            effect_id: requested.effect_id,
+            subscription_id: requested.subscription_id,
+            last_position: position.value(),
+            last_frame_digest: frame_digest,
+        });
+    }
     let persistence = persist_state(&inner.directory, &next);
     loaded.persisted = next;
     persistence?;
@@ -838,6 +918,13 @@ fn commit(
     }
     let mut next = loaded.persisted.clone();
     next.committed = position.value();
+    if next
+        .pending_effect
+        .as_ref()
+        .is_some_and(|pending| pending.last_position <= position.value())
+    {
+        next.pending_effect = None;
+    }
     persist_state(&inner.directory, &next)?;
     loaded.persisted = next;
     Ok(())
@@ -947,6 +1034,7 @@ fn truncate_uncommitted(
     next.appended = committed;
     next.flushed = committed;
     next.deduplication = persisted_deduplication(&loaded.deduplication);
+    next.pending_effect = None;
     persist_state(&inner.directory, &next)?;
     loaded.persisted = next;
     Ok(previous.saturating_sub(committed))

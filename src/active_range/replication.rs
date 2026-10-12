@@ -36,6 +36,11 @@ pub struct ReplicaAppendRequest {
     pub identity: AppendIdentity,
     pub cursor: String,
     pub frame_base64: String,
+    /// When set, the frame joins the named effect's pending tail: durable on
+    /// the replica quorum but fenced behind the committed boundary until the
+    /// effect's terminal journal marker releases it.
+    #[serde(default)]
+    pub pending_effect: Option<super::store::PendingEffectRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +69,7 @@ pub enum ReplicaAppendErrorCode {
     PositionConflict,
     WriterSequenceConflict,
     RangeFrozen,
+    PendingEffectOccupied,
     StorageFailure,
 }
 
@@ -72,6 +78,9 @@ pub struct ReplicaAppendError {
     pub code: ReplicaAppendErrorCode,
     pub message: String,
     pub retryable: bool,
+    /// The effect holding the tail when `code` is `PendingEffectOccupied`.
+    #[serde(default)]
+    pub pending_effect: Option<super::store::PendingEffect>,
 }
 
 impl ReplicaAppendError {
@@ -80,6 +89,7 @@ impl ReplicaAppendError {
             code,
             message: message.into(),
             retryable: false,
+            pending_effect: None,
         }
     }
 
@@ -88,11 +98,24 @@ impl ReplicaAppendError {
             code,
             message: message.into(),
             retryable: true,
+            pending_effect: None,
         }
     }
 
     fn storage(message: impl Into<String>) -> Self {
         Self::temporary(ReplicaAppendErrorCode::StorageFailure, message)
+    }
+
+    fn pending_occupied(occupant: super::store::PendingEffect) -> Self {
+        Self {
+            code: ReplicaAppendErrorCode::PendingEffectOccupied,
+            message: format!(
+                "Active Range tail is held by pending effect {}",
+                occupant.effect_id
+            ),
+            retryable: true,
+            pending_effect: Some(occupant),
+        }
     }
 }
 
@@ -250,6 +273,7 @@ impl ReplicaAppendService {
                 identity,
                 cursor,
                 frame,
+                pending_effect: None,
             })
             .await
             .map_err(map_store_error)
@@ -307,6 +331,15 @@ impl ReplicaAppendService {
             appended: snapshot.progress.appended(),
             committed: snapshot.progress.commit_position(),
         })
+    }
+
+    /// The pending marker currently holding a range's uncommitted tail.
+    pub async fn pending_effect(
+        &self,
+        assignment: &ActiveRangeAssignment,
+    ) -> Result<Option<super::store::PendingEffect>, ReplicaAppendError> {
+        let store = self.store_for(assignment).await?;
+        store.pending_effect().await.map_err(map_store_error)
     }
 
     pub async fn recovery_status(
@@ -781,6 +814,7 @@ impl ReplicaAppendService {
                 identity: request.identity,
                 cursor: request.cursor,
                 frame,
+                pending_effect: request.pending_effect,
             })
             .await
             .map_err(map_store_error)?;
@@ -1043,6 +1077,9 @@ fn map_store_error(error: ActiveRangeStoreError) -> ReplicaAppendError {
             ReplicaAppendErrorCode::StaleOwnershipEpoch,
             error.to_string(),
         ),
+        ActiveRangeStoreError::PendingEffectOccupied(occupant) => {
+            ReplicaAppendError::pending_occupied(occupant)
+        }
         other => ReplicaAppendError::storage(other.to_string()),
     }
 }

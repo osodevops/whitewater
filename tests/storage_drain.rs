@@ -293,6 +293,7 @@ impl Fixture {
                 },
                 cursor: format!("cursor-{sequence}"),
                 frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+                pending_effect: None,
             };
             for replica in assignment.replicas.iter() {
                 let service = self.services[replica].clone();

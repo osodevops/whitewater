@@ -215,6 +215,7 @@ async fn recovered_replicas_advance_epoch_preserve_commit_and_truncate_tail() {
             },
             cursor: format!("cursor-{sequence}"),
             frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            pending_effect: None,
         }
     };
     let first = request(1, 1);
