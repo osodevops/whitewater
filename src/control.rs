@@ -354,8 +354,12 @@ pub struct StoredIndexDefinition {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PipeStage {
-    /// Persisted in the catalog; no runtime drives it yet.
+    /// Persisted in the catalog and driven by the progress owner.
     Declared,
+    /// Operator-paused: durable, visible, and skipped by every drive
+    /// until resumed — in-flight effects finish first because pause is
+    /// cooperative between drives, never a mid-effect cancellation.
+    Paused,
 }
 
 /// A declared Pipe: consume one Subscription's deliveries and write one
@@ -870,6 +874,16 @@ pub enum Command {
         strict: bool,
         #[serde(default)]
         wait_ms: Option<u64>,
+    },
+    /// Operator pause: the Pipe stays declared and durable but every
+    /// drive skips it until `ResumePipe`. Idempotent — pausing a paused
+    /// Pipe is a no-op success.
+    PausePipe {
+        name: String,
+    },
+    /// Resume a paused Pipe; resuming a running Pipe is a no-op success.
+    ResumePipe {
+        name: String,
     },
     DefinePipe {
         name: String,
@@ -3081,6 +3095,12 @@ impl ControlController {
                 state.roles.insert(definition.role_id, definition.clone());
                 Ok((format!("created Role {name}"), json!(definition)))
             }
+            Command::PausePipe { name } => {
+                self.set_pipe_stage(state, &name, PipeStage::Paused)
+            }
+            Command::ResumePipe { name } => {
+                self.set_pipe_stage(state, &name, PipeStage::Declared)
+            }
             Command::Rename { kind, current, new } => self.rename(state, kind, &current, &new),
             Command::Drop { kind, name } => self.drop_resource(state, kind, &name),
             Command::Show { kind } => Ok((
@@ -4340,6 +4360,25 @@ impl ControlController {
         }
     }
 
+    fn set_pipe_stage(
+        &self,
+        state: &mut CatalogState,
+        name: &str,
+        stage: PipeStage,
+    ) -> Result<(String, Value), ControlError> {
+        let pipe = state
+            .pipes
+            .values_mut()
+            .find(|pipe| pipe.name == name && pipe.status == ResourceStatus::Active)
+            .ok_or_else(|| ControlError::NotFound(format!("Pipe {name}")))?;
+        pipe.stage = stage;
+        let verb = match stage {
+            PipeStage::Paused => "paused",
+            PipeStage::Declared => "resumed",
+        };
+        Ok((format!("{verb} Pipe {name}"), json!(pipe.clone())))
+    }
+
     fn drop_resource(
         &self,
         state: &mut CatalogState,
@@ -5057,6 +5096,18 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 kind,
                 current: token(&tokens, 2)?.to_owned(),
                 new: token(&tokens, 4)?.to_owned(),
+            })
+        }
+        Some("PAUSE") => {
+            expect_keyword(&tokens, 1, "PIPE")?;
+            Ok(Command::PausePipe {
+                name: token(&tokens, 2)?.to_owned(),
+            })
+        }
+        Some("RESUME") => {
+            expect_keyword(&tokens, 1, "PIPE")?;
+            Ok(Command::ResumePipe {
+                name: token(&tokens, 2)?.to_owned(),
             })
         }
         Some("DROP") => Ok(Command::Drop {
@@ -6339,6 +6390,8 @@ fn command_label(command: &Command) -> String {
         Command::GetIndex { .. } => "GET INDEX",
         Command::RebuildIndexesInDomain { .. } => "REBUILD INDEXES IN DOMAIN",
         Command::CompleteIndexBuild { .. } => "COMPLETE INDEX BUILD",
+        Command::PausePipe { .. } => "PAUSE PIPE",
+        Command::ResumePipe { .. } => "RESUME PIPE",
         Command::DefinePipe { .. } => "DEFINE PIPE",
         Command::CreateWriter { .. } => "CREATE WRITER",
         Command::OpenWriterSession { .. } => "OPEN WRITER SESSION",
@@ -7865,6 +7918,57 @@ mod tests {
                 "{subscription} -> {output_feed} must fail"
             );
         }
+        // PAUSE halts driving without losing the declaration; RESUME
+        // returns it. Both are idempotent and refuse unknown Pipes.
+        assert!(leader
+            .execute("PAUSE PIPE accounts.missing;")
+            .await
+            .is_err());
+        assert!(leader
+            .execute("RESUME PIPE accounts.missing;")
+            .await
+            .is_err());
+        leader
+            .execute("PAUSE PIPE accounts.forward;")
+            .await
+            .unwrap();
+        assert_eq!(
+            leader
+                .active_pipe_by_name("accounts.forward")
+                .await
+                .unwrap()
+                .stage,
+            PipeStage::Paused
+        );
+        // Idempotent re-pause.
+        leader
+            .execute("PAUSE PIPE accounts.forward;")
+            .await
+            .unwrap();
+        // The stage shows through DESCRIBE.
+        let described = leader
+            .execute("DESCRIBE PIPE accounts.forward;")
+            .await
+            .unwrap();
+        assert_eq!(described.results[0].data["stage"], "paused");
+        // Idempotent resume restores driving.
+        leader
+            .execute("RESUME PIPE accounts.forward;")
+            .await
+            .unwrap();
+        leader
+            .execute("RESUME PIPE accounts.forward;")
+            .await
+            .unwrap();
+        assert_eq!(
+            leader
+                .active_pipe_by_name("accounts.forward")
+                .await
+                .unwrap()
+                .stage,
+            PipeStage::Declared
+        );
+
         // The consumed Subscription and output Feed cannot drop while the
         // Pipe is active.
         assert!(leader

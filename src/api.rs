@@ -2354,6 +2354,11 @@ pub async fn drive_local_pipes(state: &AppState, limit: usize) -> Vec<PipeDriveO
     let pipes = state.control.active_pipes().await;
     let mut outcomes = Vec::with_capacity(pipes.len());
     for pipe in pipes {
+        // A paused Pipe keeps its durable declaration but yields no
+        // drive — the frontier stays put so redelivery stays replay-safe.
+        if pipe.stage == crate::control::PipeStage::Paused {
+            continue;
+        }
         if !matches!(
             pipe.operation,
             crate::control::PipeOperation::Forward
@@ -14446,6 +14451,14 @@ mod tests {
         } else {
             assert!(matches!(outcomes[0], PipeDriveOutcome::NotOwner));
         }
+        // A paused Pipe keeps its frontier but yields no drive.
+        control.execute("PAUSE PIPE orders.forward;").await.unwrap();
+        assert!(drive_local_pipes(&state, 4).await.is_empty());
+        control
+            .execute("RESUME PIPE orders.forward;")
+            .await
+            .unwrap();
+        assert_eq!(drive_local_pipes(&state, 4).await.len(), 1);
         // A Node with no storage identity drives nothing.
         let mut stateless = state;
         stateless.storage_node_id = None;

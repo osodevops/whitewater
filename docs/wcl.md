@@ -375,6 +375,17 @@ Two Pipes consuming the same Subscription share its frontier and split deliverie
 
 DROP PIPE orders.enrich;
 
+Pause a Pipe without losing its declaration, then resume it:
+
+```wcl
+PAUSE PIPE orders.enrich;
+RESUME PIPE orders.enrich;
+```
+
+`PAUSE` is cooperative between drives: an in-flight effect finishes, the
+consumed frontier stays put, and every later drive skips the Pipe until
+`RESUME`. Both are idempotent.
+
 ```
 
 
