@@ -254,6 +254,14 @@ Failure semantics fall out of the mechanism rather than a separate protocol:
 - **Ambiguous release** - `commit_pending_effect` is identity-checked and
   idempotent: `NotPending` plus a covered committed boundary means the tail
   already resolved.
+- **Transient or ambiguous sink results** - every apply step replays an
+  identical deterministic identity (writer session, journal request ids,
+  store `mutation_id`), so an `Unavailable`, `NoQuorum`, or
+  `AmbiguousCommit` settles by bounded in-place repetition: up to three
+  attempts per step inside `apply_committed`, then one bounded re-drive
+  from `drive_once`. Nothing invents a new decision on retry; a dependency
+  that stays ambiguous past the bound fails the apply as retryable
+  `Unavailable` and a later drive converges the same committed Declare.
 
 Co-located StateStore mutations join the boundary through that same
 release phase rather than a separate transaction protocol. A `Declare` may

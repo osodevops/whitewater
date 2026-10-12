@@ -978,12 +978,21 @@ impl EffectCoordinator {
     /// replay re-appends outputs idempotently and releases any tail the
     /// earlier attempt left pending. A `PendingOccupied` refusal defers to
     /// `resolve_pending` so the occupant's own apply can settle the tail.
+    /// Transient or ambiguous sink results (`Unavailable`, `NoQuorum`,
+    /// `AmbiguousCommit`) retry in place a bounded number of times: every
+    /// step replays an identical deterministic identity, so settling an
+    /// ambiguous result is repetition, not a new decision.
     pub async fn apply_committed<A: EffectApply + ?Sized>(
         &self,
         effect_id: Uuid,
         apply: &A,
     ) -> Result<EffectMutation, EffectJournalError> {
         const MAX_PENDING_SWEEPS: usize = 4;
+        // Bounded per-step retries settle transient or ambiguous sink
+        // results in place: each retry replays the identical deterministic
+        // identity, so the outcome converges to exactly one result and a
+        // genuinely stuck dependency still fails the apply closed.
+        const MAX_APPLY_ATTEMPTS: usize = 3;
         let committed = self
             .read_committed(effect_id)
             .await?
@@ -1011,6 +1020,7 @@ impl EffectCoordinator {
         let mut receipts = Vec::with_capacity(outputs.len());
         for output in outputs {
             let mut sweeps = 0;
+            let mut attempts = 0;
             loop {
                 match apply.append_output(output, effect_id).await {
                     Ok(receipt) => {
@@ -1022,24 +1032,53 @@ impl EffectCoordinator {
                         subscription_id: occupant_subscription,
                     }) if sweeps < MAX_PENDING_SWEEPS => {
                         sweeps += 1;
-                        apply
+                        match apply
                             .resolve_pending(EffectOccupant {
                                 effect_id: occupant_effect,
                                 subscription_id: occupant_subscription,
                             })
-                            .await?;
+                            .await
+                        {
+                            Ok(()) => {}
+                            Err(error) if effect_retryable(&error) => {
+                                attempts += 1;
+                                if attempts >= MAX_APPLY_ATTEMPTS {
+                                    return Err(error);
+                                }
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(error) if effect_retryable(&error) => {
+                        attempts += 1;
+                        if attempts >= MAX_APPLY_ATTEMPTS {
+                            return Err(error);
+                        }
                     }
                     Err(error) => return Err(error),
                 }
             }
         }
         if let Some(consume) = consume {
-            apply
-                .commit_frontier(
-                    consume,
-                    effect_apply_request_id(committed.request_id, b"frontier"),
-                )
-                .await?;
+            let mut attempts = 0;
+            loop {
+                match apply
+                    .commit_frontier(
+                        consume,
+                        effect_apply_request_id(committed.request_id, b"frontier"),
+                    )
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(error) if effect_retryable(&error) => {
+                        attempts += 1;
+                        if attempts >= MAX_APPLY_ATTEMPTS {
+                            return Err(error);
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
         let terminal = if matches!(committed.transition, EffectTransition::Declare { .. }) {
             let applied = EffectMutation {
@@ -1071,15 +1110,27 @@ impl EffectCoordinator {
         for (feed_id, range_id) in ranges.into_keys() {
             let mut sweeps = 0;
             let mut attempts = 0;
+            let mut transient = 0;
             loop {
-                let outcome = apply
+                let outcome = match apply
                     .release_output(&EffectReleaseTarget {
                         feed_id,
                         range_id,
                         effect_id,
                         subscription_id: terminal.subscription_id,
                     })
-                    .await?;
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) if effect_retryable(&error) => {
+                        transient += 1;
+                        if transient >= MAX_APPLY_ATTEMPTS {
+                            return Err(error);
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
                 match outcome {
                     EffectReleaseOutcome::Released { .. } => break,
                     EffectReleaseOutcome::NotPending { committed } => {
@@ -1109,7 +1160,16 @@ impl EffectCoordinator {
                         if sweeps > MAX_PENDING_SWEEPS {
                             return Err(EffectJournalError::Unavailable);
                         }
-                        apply.resolve_pending(occupant).await?;
+                        match apply.resolve_pending(occupant).await {
+                            Ok(()) => {}
+                            Err(error) if effect_retryable(&error) => {
+                                transient += 1;
+                                if transient >= MAX_APPLY_ATTEMPTS {
+                                    return Err(error);
+                                }
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                 }
             }
@@ -1118,7 +1178,19 @@ impl EffectCoordinator {
         // through the store's own RF3 journal under its declared dedupe
         // identity, so a replayed apply converges to one row per mutation.
         for state_mutation in state_mutations {
-            apply.mutate_state(state_mutation).await?;
+            let mut attempts = 0;
+            loop {
+                match apply.mutate_state(state_mutation).await {
+                    Ok(()) => break,
+                    Err(error) if effect_retryable(&error) => {
+                        attempts += 1;
+                        if attempts >= MAX_APPLY_ATTEMPTS {
+                            return Err(error);
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
         Ok(terminal)
     }
@@ -1214,6 +1286,20 @@ pub trait EffectApply: Send + Sync {
 /// replay commits the same row.
 pub fn effect_state_mutation_id(effect_id: Uuid, index: usize) -> Uuid {
     effect_apply_request_id(effect_id, format!("state-mutation-{index}").as_bytes())
+}
+
+/// Errors that may reflect a transient or ambiguous quorum result rather
+/// than a final refusal. Every step in `apply_committed` replays an
+/// identical deterministic identity, so repeating the step is the defined
+/// way to settle them; any other error fails the apply immediately.
+pub fn effect_retryable(error: &EffectJournalError) -> bool {
+    matches!(
+        error,
+        EffectJournalError::Unavailable
+            | EffectJournalError::AmbiguousCommit
+            | EffectJournalError::NoQuorum
+            | EffectJournalError::PendingOccupied { .. }
+    )
 }
 
 /// A deterministic request identity derived from the committed Declare so a

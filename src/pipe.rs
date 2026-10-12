@@ -260,10 +260,20 @@ impl PipeDriver {
             }
             Err(error) => return Err(error),
         }
-        self.journal
-            .apply_committed(effect_id, apply)
-            .await
-            .map(Some)
+        // The apply itself settles transient and ambiguous results in place
+        // under the same committed Declare; one bounded re-drive covers the
+        // failure classes that legitimately escape it (for example a sweep
+        // waiting on an occupant whose own apply is mid-flight). A re-drive
+        // replays the identical effect identity, so repeating is safe.
+        let mut attempts = 0;
+        loop {
+            match self.journal.apply_committed(effect_id, apply).await {
+                Err(error) if crate::effect::effect_retryable(&error) && attempts < 1 => {
+                    attempts += 1;
+                }
+                result => return result.map(Some),
+            }
+        }
     }
 }
 

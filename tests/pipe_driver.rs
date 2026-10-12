@@ -419,6 +419,7 @@ impl EffectJournalTransport for PipeEffectTransport {
 struct RecordingApply {
     progress: SubscriptionProgressCoordinator,
     appends: Mutex<Vec<EffectOutput>>,
+    fail_releases: Mutex<u8>,
 }
 
 #[async_trait::async_trait]
@@ -428,7 +429,13 @@ impl EffectApply for RecordingApply {
         output: &EffectOutput,
         _effect_id: Uuid,
     ) -> Result<EffectOutputReceipt, EffectJournalError> {
-        self.appends.lock().unwrap().push(output.clone());
+        let mut appends = self.appends.lock().unwrap();
+        if !appends
+            .iter()
+            .any(|seen| seen.writer_session_id == output.writer_session_id)
+        {
+            appends.push(output.clone());
+        }
         Ok(EffectOutputReceipt {
             feed_id: output.feed_id,
             range_id: RangeId::from_uuid(Uuid::from_u128(9)),
@@ -440,6 +447,11 @@ impl EffectApply for RecordingApply {
         &self,
         _target: &EffectReleaseTarget,
     ) -> Result<EffectReleaseOutcome, EffectJournalError> {
+        let mut remaining = self.fail_releases.lock().unwrap();
+        if *remaining > 0 {
+            *remaining -= 1;
+            return Err(EffectJournalError::Unavailable);
+        }
         Ok(EffectReleaseOutcome::Released { committed: 1 })
     }
 
@@ -538,6 +550,7 @@ fn harness() -> Harness {
     let sink = RecordingApply {
         progress: SubscriptionProgressCoordinator::new(assignment(), progress_transport.clone()),
         appends: Mutex::new(Vec::new()),
+        fail_releases: Mutex::new(0),
     };
     Harness {
         _progress_dirs: progress_dirs,
@@ -770,7 +783,9 @@ async fn pipe_driver_replays_outputs_identically_when_applied_commit_is_ambiguou
     assert!(applied.is_none());
 
     // The stranded effect still applies exactly once via apply_committed:
-    // output replays carry identical deterministic writer identities.
+    // output replays carry identical deterministic writer identities, so
+    // the sink's dedupe records each output exactly once across both
+    // attempts and the explicit completion.
     let completed = harness
         .journal
         .apply_committed(effect_id, &harness.sink)
@@ -781,9 +796,15 @@ async fn pipe_driver_replays_outputs_identically_when_applied_commit_is_ambiguou
         EffectTransition::Applied { .. }
     ));
     let appends = harness.sink.appends.lock().unwrap();
-    assert_eq!(appends.len(), 4);
-    assert_eq!(appends[0].writer_session_id, appends[2].writer_session_id);
-    assert_eq!(appends[1].writer_session_id, appends[3].writer_session_id);
+    assert_eq!(appends.len(), 2);
+    assert_eq!(
+        appends
+            .iter()
+            .map(|output| output.writer_session_id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -900,4 +921,77 @@ async fn pipe_driver_surfaces_a_failing_bootstrap() {
         .await
         .unwrap_err();
     assert!(matches!(error, EffectJournalError::Unavailable));
+}
+
+#[tokio::test]
+async fn pipe_driver_re_drives_once_after_a_transient_apply_failure() {
+    let harness = harness();
+    seed_frontier(&harness.progress, "p0").await;
+    // The first apply exhausts its bounded release retry; the drive's own
+    // bounded re-drive replays the identical effect identity and converges.
+    *harness.sink.fail_releases.lock().unwrap() = 3;
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async move { Ok(page(vec![record(1)], "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    assert!(matches!(
+        applied.transition,
+        EffectTransition::Applied { .. }
+    ));
+    // The frontier moved exactly once and each output committed once
+    // despite the re-driven apply.
+    let frontier = harness
+        .progress
+        .read_committed()
+        .await
+        .unwrap()
+        .expect("frontier");
+    assert_eq!(frontier.cursor, "p1");
+    assert_eq!(frontier.sequence, 2);
+    assert_eq!(harness.sink.appends.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn pipe_driver_fails_closed_when_apply_stays_transient() {
+    let harness = harness();
+    seed_frontier(&harness.progress, "p0").await;
+    // Both the per-step retries and the bounded re-drive exhaust; the
+    // effect stays non-terminal so a later drive can still converge it.
+    *harness.sink.fail_releases.lock().unwrap() = 12;
+    assert!(matches!(
+        harness
+            .driver
+            .drive_once(
+                64,
+                |_f, _l| async { Ok(page(vec![record(1)], "p1")) },
+                || async { Ok(bootstrap_with("p0")) },
+                &harness.sink,
+            )
+            .await,
+        Err(EffectJournalError::Unavailable)
+    ));
+    *harness.sink.fail_releases.lock().unwrap() = 0;
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async move { Ok(page(vec![record(1)], "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    assert!(matches!(
+        applied.transition,
+        EffectTransition::Applied { .. }
+    ));
+    assert_eq!(harness.sink.appends.lock().unwrap().len(), 1);
 }

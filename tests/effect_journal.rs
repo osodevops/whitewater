@@ -389,6 +389,8 @@ struct RecordingApply {
     fail_frontier: Mutex<u8>,
     fail_releases: Mutex<u8>,
     fail_state_mutations: Mutex<u8>,
+    transient_appends: Mutex<u8>,
+    fail_resolves: Mutex<u8>,
     occupied_appends: Mutex<u8>,
     occupied_releases: Mutex<u8>,
     not_pending_releases: Mutex<u8>,
@@ -401,6 +403,13 @@ impl EffectApply for RecordingApply {
         output: &EffectOutput,
         _effect_id: Uuid,
     ) -> Result<EffectOutputReceipt, EffectJournalError> {
+        {
+            let mut remaining = self.transient_appends.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(EffectJournalError::Unavailable);
+            }
+        }
         if self
             .fail_once
             .lock()
@@ -494,6 +503,13 @@ impl EffectApply for RecordingApply {
         &self,
         occupant: finnstream::effect::EffectOccupant,
     ) -> Result<(), EffectJournalError> {
+        {
+            let mut remaining = self.fail_resolves.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(EffectJournalError::Unavailable);
+            }
+        }
         self.resolved.lock().unwrap().push(occupant);
         Ok(())
     }
@@ -576,10 +592,10 @@ async fn apply_committed_replays_deterministically_after_sink_failure() {
     let EffectTransition::Declare { outputs, .. } = &mutation.transition else {
         panic!("expected declare")
     };
-    sink.fail_once
-        .lock()
-        .unwrap()
-        .insert(outputs[0].writer_session_id);
+    // Fail past the bounded per-step retry: the apply reports a retryable
+    // failure before the frontier commits, so replay re-runs everything
+    // idempotently once the dependency recovers.
+    *sink.transient_appends.lock().unwrap() = 3;
     assert!(matches!(
         coordinator.apply_committed(mutation.effect_id, &sink).await,
         Err(EffectJournalError::Unavailable)
@@ -776,7 +792,7 @@ async fn apply_committed_converges_when_the_frontier_commit_crashes() {
     let sink = RecordingApply::default();
     // Crash after outputs replicated but before the frontier commits: no
     // terminal marker was written, so replay re-runs everything idempotently.
-    *sink.fail_frontier.lock().unwrap() = 1;
+    *sink.fail_frontier.lock().unwrap() = 3;
     assert!(matches!(
         coordinator.apply_committed(mutation.effect_id, &sink).await,
         Err(EffectJournalError::Unavailable)
@@ -821,7 +837,7 @@ async fn apply_committed_rereleases_a_tail_the_terminal_marker_left_pending() {
     let sink = RecordingApply::default();
     // The Applied marker commits but the release fails: replay finds the
     // terminal row, re-runs ensure idempotently, and releases the tail.
-    *sink.fail_releases.lock().unwrap() = 1;
+    *sink.fail_releases.lock().unwrap() = 3;
     assert!(matches!(
         coordinator.apply_committed(mutation.effect_id, &sink).await,
         Err(EffectJournalError::Unavailable)
@@ -849,7 +865,7 @@ async fn apply_committed_rereleases_a_tail_the_terminal_marker_left_pending() {
     // Applied row no longer carries consume evidence.
     assert_eq!(sink.appended.lock().unwrap().len(), 1);
     assert_eq!(sink.frontier_request_log.lock().unwrap().len(), 1);
-    assert_eq!(sink.releases.lock().unwrap().len(), 2);
+    assert_eq!(sink.releases.lock().unwrap().len(), 4);
 }
 
 fn state_mutation(index: usize) -> finnstream::effect::EffectStateMutation {
@@ -948,7 +964,7 @@ async fn apply_committed_replays_state_mutations_after_a_mutation_failure() {
     // The first attempt applies the marker and the first mutation, then
     // fails partway through the release phase.
     let sink = RecordingApply::default();
-    *sink.fail_state_mutations.lock().unwrap() = 1;
+    *sink.fail_state_mutations.lock().unwrap() = 3;
     assert!(matches!(
         coordinator.apply_committed(mutation.effect_id, &sink).await,
         Err(EffectJournalError::Unavailable)
@@ -1052,4 +1068,91 @@ async fn oversized_state_mutations_are_refused_before_durability() {
         coordinator.apply(mutation).await,
         Err(EffectJournalError::TooLarge)
     ));
+}
+
+#[tokio::test]
+async fn apply_committed_settles_transient_failures_by_bounded_retry() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare_with_state(Uuid::new_v4(), 1, 1, vec![state_mutation(0)]);
+    let coordinator = effect_coordinator(transport, &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    // Every phase absorbs transient ambiguity below the retry bound by
+    // replaying the identical deterministic identity.
+    let sink = RecordingApply::default();
+    *sink.transient_appends.lock().unwrap() = 2;
+    *sink.fail_frontier.lock().unwrap() = 2;
+    *sink.fail_releases.lock().unwrap() = 2;
+    *sink.fail_state_mutations.lock().unwrap() = 2;
+    coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    assert_eq!(sink.appended.lock().unwrap().len(), 1);
+    assert_eq!(sink.frontier_request_log.lock().unwrap().len(), 1);
+    assert_eq!(sink.state_mutated.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn apply_committed_fails_closed_after_bounded_transient_retries() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare(Uuid::new_v4(), 1, 1);
+    let coordinator = effect_coordinator(transport, &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    // A dependency that stays ambiguous past the bounded retry count fails
+    // the apply as retryable Unavailable rather than wedging or inventing
+    // an outcome.
+    let sink = RecordingApply::default();
+    *sink.transient_appends.lock().unwrap() = 8;
+    assert!(matches!(
+        coordinator.apply_committed(mutation.effect_id, &sink).await,
+        Err(EffectJournalError::Unavailable)
+    ));
+    // The bounded apply attempted the append exactly three times, then a
+    // later re-drive still converges once the dependency recovers.
+    *sink.transient_appends.lock().unwrap() = 0;
+    coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn apply_committed_retries_a_failing_occupant_sweep() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare(Uuid::new_v4(), 1, 1);
+    let coordinator = effect_coordinator(transport, &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    // A transient sweep failure retries the occupied append; the second
+    // occupancy resolves through the occupant's own apply and the output
+    // commits exactly once.
+    let sink = RecordingApply::default();
+    *sink.occupied_appends.lock().unwrap() = 2;
+    *sink.fail_resolves.lock().unwrap() = 1;
+    coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    assert_eq!(sink.resolved.lock().unwrap().len(), 1);
+    assert_eq!(sink.appended.lock().unwrap().len(), 1);
 }
