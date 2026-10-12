@@ -1021,6 +1021,13 @@ pub enum Command {
         reader: String,
         start: ReaderStart,
     },
+    /// Reposition a Subscription's shared frontier. The catalog cannot
+    /// resolve Active Range positions, so this command is answered by the
+    /// data-plane Subscription seek endpoint, not the catalog handler.
+    SeekSubscription {
+        name: String,
+        start: ReaderStart,
+    },
     InspectPlacement {
         feed: String,
     },
@@ -3205,6 +3212,10 @@ impl ControlController {
                 state.reader_frontiers.remove(&updated.reader_id);
                 Ok((format!("moved Reader {reader} position"), json!(updated)))
             }
+            Command::SeekSubscription { .. } => Err(ControlError::InvalidOperation(
+                "SEEK SUBSCRIPTION is answered by the data-plane Subscription seek endpoint;                  repositioning resolves real Active Range positions, which the catalog cannot read"
+                    .to_owned(),
+            )),
             Command::GetIndex { .. } => Err(ControlError::InvalidOperation(
                 "GET INDEX is answered by the data-plane Index query endpoint;                  the catalog does not materialize postings"
                     .to_owned(),
@@ -5260,6 +5271,20 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             })
         }
         Some("SEEK") => {
+            if keyword(1).as_deref() == Some("SUBSCRIPTION") {
+                expect_keyword(&tokens, 3, "TO")?;
+                let start = parse_reader_start(&tokens, 4)?;
+                if matches!(start, ReaderStart::Cursor(_)) {
+                    return Err(ControlError::Syntax(
+                        "Subscription seeks are BEGINNING, NOW, or TIMESTAMP <ns>; one Cursor cannot describe every Active Range position"
+                            .to_owned(),
+                    ));
+                }
+                return Ok(Command::SeekSubscription {
+                    name: token(&tokens, 2)?.to_owned(),
+                    start,
+                });
+            }
             expect_keyword(&tokens, 1, "READER")?;
             expect_keyword(&tokens, 3, "TO")?;
             Ok(Command::SeekReader {
@@ -6469,6 +6494,7 @@ fn command_label(command: &Command) -> String {
         Command::Grant { .. } => "GRANT",
         Command::ExplainAccess { .. } => "EXPLAIN ACCESS",
         Command::SeekReader { .. } => "SEEK READER",
+        Command::SeekSubscription { .. } => "SEEK SUBSCRIPTION",
         Command::InspectPlacement { .. } => "INSPECT PLACEMENT",
         Command::TransferActiveRangeOwnership { .. } => "TRANSFER ACTIVE RANGE OWNERSHIP",
         Command::RecoverActiveRangeOwnership { .. } => "RECOVER ACTIVE RANGE OWNERSHIP",
@@ -8197,6 +8223,36 @@ mod tests {
         ] {
             assert!(parse_wcl(bad).is_err(), "{bad} should refuse");
         }
+        // SEEK SUBSCRIPTION parses for boundary and timestamp targets; a
+        // single Cursor cannot describe a multi-range frontier and refuses
+        // at parse time.
+        let commands =
+            parse_wcl("SEEK SUBSCRIPTION orders.d TO TIMESTAMP 1700000000000000000;").unwrap();
+        match &commands[0] {
+            Command::SeekSubscription { name, start } => {
+                assert_eq!(name, "orders.d");
+                assert_eq!(*start, ReaderStart::Timestamp(1_700_000_000_000_000_000));
+            }
+            other => panic!("unexpected command {other:?}"),
+        }
+        for statement in [
+            "SEEK SUBSCRIPTION orders.d TO BEGINNING;",
+            "SEEK SUBSCRIPTION orders.d TO NOW;",
+        ] {
+            assert!(parse_wcl(statement).is_ok(), "{statement} should parse");
+        }
+        for bad in [
+            "SEEK SUBSCRIPTION orders.d TO CURSOR 'cursor-4';",
+            "SEEK SUBSCRIPTION orders.d;",
+        ] {
+            assert!(parse_wcl(bad).is_err(), "{bad} should refuse");
+        }
+        // The catalog cannot resolve Active Range positions, so it refuses
+        // with data-plane guidance rather than guessing.
+        let refused = controller
+            .execute("SEEK SUBSCRIPTION orders.d TO BEGINNING;")
+            .await;
+        assert!(refused.is_err());
         // A legacy serialized command without the field decodes with no
         // delay so older journals replay unchanged.
         let legacy: Command = serde_json::from_value(json!({

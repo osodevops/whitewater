@@ -700,6 +700,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/subscriptions/members/state",
             get(subscription_member_state),
         )
+        .route("/v1/subscriptions/seek", post(subscription_seek))
         .route("/v1/feeds/records", get(read_feed_records))
         .route("/v1/admin/wcl", post(execute_admin_wcl))
         .route("/v1/admin/commands", post(execute_admin_commands))
@@ -1919,6 +1920,243 @@ async fn subscription_member_fetch(
     }))
 }
 
+/// Resolve the last committed frame Cursor in every Active Range plus the
+/// globally newest (ingest_time, message_id) head, shared by Subscription
+/// `now` starts and `now` seeks.
+async fn resolve_tail_positions(
+    state: &AppState,
+    range_assignments: &[ActiveRangeAssignment],
+) -> Result<(Option<((i64, Uuid), String)>, BTreeMap<RangeId, String>), ApiError> {
+    let mut positions = BTreeMap::new();
+    let mut tail: Option<((i64, Uuid), String)> = None;
+    for range_assignment in range_assignments {
+        let page = fetch_range_page(
+            state,
+            ReadRangePageRequest {
+                assignment: range_assignment.clone(),
+                after: None,
+                expected_commit: None,
+                after_cursor: None,
+                tail_count: Some(1),
+                single_range: true,
+                page_limit: Some(1),
+            },
+        )
+        .await?;
+        let frame = page.frames.last();
+        positions.insert(
+            range_assignment.range_id,
+            frame.map(|frame| frame.cursor.clone()).unwrap_or_default(),
+        );
+        if let Some(frame) = frame {
+            let decoded = STANDARD
+                .decode(frame.frame_base64.as_bytes())
+                .map_err(|_| {
+                    ApiError::unavailable("current owner returned an invalid frame encoding")
+                })?;
+            let record = decode_record(&decoded)
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            let key = (record.ingest_time_ns, record.message_id);
+            if tail.as_ref().is_none_or(|(current, _)| key > *current) {
+                tail = Some((key, frame.cursor.clone()));
+            }
+        }
+    }
+    Ok((tail, positions))
+}
+
+/// Resolve per-Range positions so the next delivered record in each Active
+/// Range is the first one accepted at-or-after `threshold` on the ingest
+/// clock. Ingest time is monotonic within a Range, so the scan stops at the
+/// first eligible frame; the position itself is the Cursor of the last
+/// earlier frame (empty when the Range starts eligible).
+async fn resolve_timestamp_positions(
+    state: &AppState,
+    range_assignments: &[ActiveRangeAssignment],
+    threshold: i64,
+) -> Result<BTreeMap<RangeId, String>, ApiError> {
+    let mut positions = BTreeMap::new();
+    for range_assignment in range_assignments {
+        let mut stream = RangeFrameStream::new(state, range_assignment);
+        let mut last_before = String::new();
+        while let Some(frame) = stream.next_frame().await? {
+            let record = decode_record(&frame.frame)
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            if record.ingest_time_ns >= threshold {
+                break;
+            }
+            last_before = frame.cursor;
+        }
+        positions.insert(range_assignment.range_id, last_before);
+    }
+    Ok(positions)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SubscriptionSeekRequest {
+    subscription: String,
+    request_id: Uuid,
+    /// `beginning`, `now`, or `timestamp`.
+    position: String,
+    /// Decimal-string epoch nanoseconds on the ingest clock; required for
+    /// `timestamp` seeks.
+    timestamp_ns: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SubscriptionSeekResponse {
+    request_id: Uuid,
+    cursor: String,
+    positions: BTreeMap<RangeId, String>,
+    ownership_epoch: u64,
+}
+
+/// Reposition a Subscription's shared frontier under one committed progress
+/// mutation. A seek is an operator action, not a member operation: it is
+/// refused while any member work lease is active, and the commit CAS-fences
+/// on the current frontier Cursor so a racing acknowledgement cannot
+/// silently overwrite the reposition. `request_id` replays idempotently.
+async fn subscription_seek(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<SubscriptionSeekRequest>,
+) -> Result<Json<SubscriptionSeekResponse>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let (coordinator, assignment, definition) =
+        member_coordinator_recovering(&state, &request.subscription).await?;
+    let source_feed = definition.source.feed_id().ok_or_else(|| ApiError {
+        status: StatusCode::CONFLICT,
+        message:
+            "Subscription has a Domain source; per-Feed seeking arrives with Domain member delivery"
+                .to_owned(),
+        code: None,
+    })?;
+    let frontier = coordinator
+        .read_committed()
+        .await
+        .map_err(subscription_progress_api_error)?
+        .ok_or_else(|| ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Subscription has no committed frontier; the first member join establishes it"
+                .to_owned(),
+            code: None,
+        })?;
+    // The committed Cursor marker carries the request identity AND the
+    // requested position so a replayed request_id with a different seek
+    // conflicts instead of impersonating the earlier one.
+    let seek_cursor = format!(
+        "seek:{}:{}:{}",
+        request.request_id,
+        request.position.to_ascii_lowercase(),
+        request.timestamp_ns.as_deref().unwrap_or("")
+    );
+    if frontier.request_id == request.request_id {
+        if frontier.cursor != seek_cursor {
+            return Err(ApiError {
+                status: StatusCode::CONFLICT,
+                message: "request_id was already used with a different Subscription operation"
+                    .to_owned(),
+                code: None,
+            });
+        }
+        return Ok(Json(SubscriptionSeekResponse {
+            request_id: request.request_id,
+            cursor: frontier.cursor,
+            positions: frontier.positions,
+            ownership_epoch: frontier.ownership_epoch,
+        }));
+    }
+    // Validate the request shape before checking leases so malformed seeks
+    // are BAD_REQUEST rather than masked by the in-flight-work conflict.
+    enum SeekPosition {
+        Beginning,
+        Now,
+        Timestamp(i64),
+    }
+    let position = match request.position.to_ascii_lowercase().as_str() {
+        "beginning" => SeekPosition::Beginning,
+        "now" => SeekPosition::Now,
+        "timestamp" => SeekPosition::Timestamp(
+            request
+                .timestamp_ns
+                .as_deref()
+                .ok_or_else(|| ApiError::bad_request("timestamp seeks require timestamp_ns"))?
+                .parse::<i64>()
+                .map_err(|_| {
+                    ApiError::bad_request(
+                        "timestamp_ns must be signed epoch nanoseconds as a decimal string",
+                    )
+                })?,
+        ),
+        "cursor" => {
+            return Err(ApiError::bad_request(
+                "one Cursor cannot describe every Active Range position; seek by beginning, now, or timestamp",
+            ))
+        }
+        _ => {
+            return Err(ApiError::bad_request(
+                "position must be beginning, now, or timestamp",
+            ))
+        }
+    };
+    let members = read_member_state(&coordinator).await?;
+    if !members.leases.is_empty() {
+        return Err(ApiError {
+            status: StatusCode::CONFLICT,
+            message: format!(
+                "Subscription members hold {} active work leases; release them or let them expire before seeking",
+                members.leases.len()
+            ),
+            code: None,
+        });
+    }
+    let range_assignments = state
+        .control
+        .active_range_assignments_for_feed(source_feed)
+        .await;
+    if range_assignments.is_empty() {
+        return Err(ApiError::unavailable(
+            "Subscription source Feed has no Active Range placement",
+        ));
+    }
+    let positions = match position {
+        SeekPosition::Beginning => range_assignments
+            .iter()
+            .map(|assignment| (assignment.range_id, String::new()))
+            .collect(),
+        SeekPosition::Now => resolve_tail_positions(&state, &range_assignments).await?.1,
+        SeekPosition::Timestamp(threshold) => {
+            resolve_timestamp_positions(&state, &range_assignments, threshold).await?
+        }
+    };
+    let mutation = crate::reader::SubscriptionProgressMutation {
+        subscription_id: assignment.subscription_id,
+        feed_id: source_feed,
+        ownership_epoch: assignment.ownership_epoch,
+        sequence: frontier
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| ApiError::unavailable("Subscription frontier sequence overflowed"))?,
+        request_id: request.request_id,
+        expected_cursor: Some(frontier.cursor.clone()),
+        cursor: seek_cursor.clone(),
+        positions: positions.clone(),
+        tick: frontier.tick,
+        lease_ops: Vec::new(),
+    };
+    coordinator
+        .apply(mutation)
+        .await
+        .map_err(subscription_progress_api_error)?;
+    Ok(Json(SubscriptionSeekResponse {
+        request_id: request.request_id,
+        cursor: seek_cursor,
+        positions,
+        ownership_epoch: assignment.ownership_epoch,
+    }))
+}
+
 /// Merge the committed pages of every Active Range after a committed
 /// Subscription frontier into one bounded page in (ingest_time, message_id)
 /// order. Returns each record with its frame Cursor, the updated per-range
@@ -2319,43 +2557,7 @@ async fn bootstrap_pipe_frontier(
                 .collect::<BTreeMap<_, _>>(),
         ),
         crate::control::ReaderStart::Now => {
-            let mut positions = BTreeMap::new();
-            let mut tail: Option<((i64, Uuid), String)> = None;
-            for range_assignment in &range_assignments {
-                let page = fetch_range_page(
-                    state,
-                    ReadRangePageRequest {
-                        assignment: range_assignment.clone(),
-                        after: None,
-                        expected_commit: None,
-                        after_cursor: None,
-                        tail_count: Some(1),
-                        single_range: true,
-                        page_limit: Some(1),
-                    },
-                )
-                .await?;
-                let frame = page.frames.last();
-                positions.insert(
-                    range_assignment.range_id,
-                    frame.map(|frame| frame.cursor.clone()).unwrap_or_default(),
-                );
-                if let Some(frame) = frame {
-                    let decoded = STANDARD
-                        .decode(frame.frame_base64.as_bytes())
-                        .map_err(|_| {
-                            ApiError::unavailable(
-                                "current owner returned an invalid frame encoding",
-                            )
-                        })?;
-                    let record = decode_record(&decoded)
-                        .map_err(|error| ApiError::unavailable(error.to_string()))?;
-                    let key = (record.ingest_time_ns, record.message_id);
-                    if tail.as_ref().is_none_or(|(current, _)| key > *current) {
-                        tail = Some((key, frame.cursor.clone()));
-                    }
-                }
-            }
+            let (tail, positions) = resolve_tail_positions(state, &range_assignments).await?;
             (
                 tail.map(|(_, cursor)| cursor)
                     .unwrap_or_else(|| "now".to_owned()),
@@ -15922,6 +16124,117 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+
+        // SEEK SUBSCRIPTION is an operator reposition through the data
+        // plane; it needs the admin credential and refuses while a member
+        // holds an active work lease so in-flight grants cannot be
+        // clobbered.
+        let seek = |body: Value| {
+            let client = client.clone();
+            let url = format!("{}/v1/subscriptions/seek", endpoints[&nodes[0]]);
+            async move {
+                let response = client
+                    .post(url)
+                    .bearer_auth("this-is-a-long-development-api-key")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body: Value = response.json().await.unwrap_or_default();
+                (status, body)
+            }
+        };
+        let (status, _) = seek(json!({"subscription": "orders.billing",
+            "request_id": Uuid::from_u128(40), "position": "timestamp",
+            "timestamp_ns": "5"}))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = seek(json!({"subscription": "orders.billing",
+            "request_id": Uuid::from_u128(40), "position": "cursor"}))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = seek(json!({"subscription": "orders.billing",
+            "request_id": Uuid::from_u128(40), "position": "timestamp"}))
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = seek(json!({"subscription": "orders.missing",
+            "request_id": Uuid::from_u128(40), "position": "beginning"}))
+        .await;
+        assert!(status.is_client_error());
+        // Releasing the moved lease unblocks the operator action.
+        let (status, body) = post(
+            "release",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(41),
+                "work_id": work, "member_id": other, "member_epoch": 1,
+                "lease_epoch": moved["lease_epoch"]}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        // The timestamp seek repositions the committed frontier so the next
+        // delivery is the first record accepted at-or-after ingest time 5.
+        let (status, body) = seek(json!({"subscription": "orders.billing",
+            "request_id": Uuid::from_u128(42), "position": "timestamp",
+            "timestamp_ns": "5"}))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["positions"][progress_range.to_string()],
+            json!("cursor-4")
+        );
+        // Replaying the same request identity returns the committed
+        // reposition instead of seeking again.
+        let (status, replay) = seek(json!({"subscription": "orders.billing",
+            "request_id": Uuid::from_u128(42), "position": "timestamp",
+            "timestamp_ns": "5"}))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay["cursor"], body["cursor"]);
+        assert_eq!(replay["positions"], body["positions"]);
+        // The same identity with a different seek conflicts.
+        let (status, _) = seek(json!({"subscription": "orders.billing",
+            "request_id": Uuid::from_u128(42), "position": "beginning"}))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // The next member fetch delivers from the repositioned frontier.
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(43),
+                "member_id": other, "member_epoch": 1, "work_id": work}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let sought_epoch = body["lease"]["lease_epoch"].as_u64().unwrap();
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(44),
+                "member_id": other, "member_epoch": 1, "work_id": work,
+                "lease_epoch": sought_epoch, "limit": 4}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["cursor"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["cursor-5", "cursor-6", "cursor-7", "cursor-8"]
+        );
+        // Release, then a beginning seek replays the whole history.
+        let (status, _) = post(
+            "release",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(45),
+                "work_id": work, "member_id": other, "member_epoch": 1,
+                "lease_epoch": sought_epoch}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{status}");
+        let (status, _) = seek(json!({"subscription": "orders.billing",
+            "request_id": Uuid::from_u128(46), "position": "beginning"}))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{status}");
 
         // A Subscription with no committed frontier bootstraps its declared
         // start atomically with the first member join.

@@ -173,6 +173,8 @@ Delivered position and acknowledged position remain distinct. A crash resumes fr
 
 An optional  on the Subscription holds delivery back until a record's ingest timestamp is at least the declared duration in the past. A not-yet-eligible record stays parked at its position: it is never skipped, never advances the frontier early, and cannot be overtaken by later records in its own key order, while already-eligible records continue to deliver. Every consumer of the Subscription — members and declared Pipes alike — honors the same delay, and the member fetch response reports  so operators can see when parked work becomes deliverable rather than treating an empty page as an error. Standalone Readers keep their own positions and are unaffected; the delay is a declared Subscription contract, not a client-side sleep.
 
+Operators reposition a Subscription's shared frontier with `SEEK SUBSCRIPTION ... TO BEGINNING|NOW|TIMESTAMP <ns>` — the durable reprocessing primitive, committed through the progress journal as one fenced mutation rather than a client-side offset reset. Timestamp seeks target ingest time (delivery order); the reposition is refused while member work leases are active so in-flight grants cannot be silently clobbered, and the commit CAS-fences on the current frontier so a racing acknowledgement cannot overwrite it. Seeking is deliberately an explicit operator action: consumers do not accidentally rewind shared progress.
+
 ### Nanosecond record time
 
 Every record stores two signed 64-bit Unix epoch nanosecond values:
