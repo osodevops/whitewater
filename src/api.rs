@@ -702,6 +702,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/subscriptions/seek", post(subscription_seek))
         .route("/v1/feeds/records", get(read_feed_records))
+        .route("/v1/feeds/records/search", get(search_feed_records))
         .route("/v1/admin/wcl", post(execute_admin_wcl))
         .route("/v1/admin/commands", post(execute_admin_commands))
         .route("/v1/admin/ranges/split", post(admin_split_range))
@@ -10234,6 +10235,105 @@ struct FeedReadQuery {
     limit: Option<usize>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FeedSearchQuery {
+    feed: String,
+    /// Exact record Key bytes, base64; other filter kinds land later.
+    key_base64: Option<String>,
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+/// Committed frames one search call may scan before handing back a
+/// continuation Cursor. Keeps a miss deterministic-cost instead of an
+/// unbounded history walk per request.
+const FEED_SEARCH_SCAN_FRAMES: usize = MAX_LOGICAL_READ_FRAMES;
+
+/// Bounded exact-Key search over the Feed's committed history. Each call
+/// scans at most `FEED_SEARCH_SCAN_FRAMES` frames in merged order and
+/// returns `next_after` — the last scanned frame's Cursor — when the budget
+/// ran out before the history did, so callers continue deterministically
+/// rather than the server holding an open scan.
+async fn search_feed_records(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FeedSearchQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let key = decode_base64(
+        "key_base64",
+        query
+            .key_base64
+            .as_deref()
+            .ok_or_else(|| ApiError::bad_request("key_base64 is required"))?,
+    )?;
+    let limit = query.limit.unwrap_or(64).clamp(1, 256);
+    let feed = feed_when_applied(&state.control, &query.feed, state.control_plane.is_some())
+        .await
+        .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", query.feed)))?;
+    let source = RecordSource::of(&feed);
+    let mut records: Vec<RecordResponse> = Vec::new();
+    let mut scanned = 0_usize;
+    let mut exhausted = false;
+    let mut next_after: Option<String> = None;
+    let mut after = query.after.clone();
+    const SCAN_PAGE: usize = 256;
+    while records.len() < limit && !exhausted {
+        let budget = FEED_SEARCH_SCAN_FRAMES.saturating_sub(scanned);
+        if budget == 0 {
+            break;
+        }
+        let page = read_paginated_feed(
+            &state,
+            feed.feed_id,
+            &feed.name,
+            after.as_deref(),
+            budget.min(SCAN_PAGE),
+        )
+        .await?;
+        let page_len = page.len();
+        let mut consumed = 0_usize;
+        for frame in page {
+            consumed = consumed.saturating_add(1);
+            scanned = scanned.saturating_add(1);
+            let record = decode_record(&frame.frame)
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            let cursor = frame.cursor;
+            next_after = Some(cursor.clone());
+            if record.key == key {
+                records.push(record_response(
+                    CursorRecord {
+                        cursor: cursor.clone(),
+                        record,
+                    },
+                    source.clone(),
+                ));
+            }
+            // Stop at the limit so the continuation Cursor resumes exactly
+            // where the scan halted; draining the rest of the page would
+            // strand the remaining matches behind a fabricated exhausted
+            // marker.
+            if records.len() == limit {
+                break;
+            }
+        }
+        // A fully consumed short page proves history drained. An unconsumed
+        // page tail is still searchable history even when the page was
+        // short, so the continuation must remain available.
+        if consumed == page_len && page_len < budget.min(SCAN_PAGE) {
+            exhausted = true;
+        }
+        after = next_after.clone();
+    }
+    Ok(Json(json!({
+        "records": records,
+        "scanned": scanned,
+        "exhausted": exhausted,
+        "next_after": if exhausted { None } else { next_after },
+    })))
+}
+
 async fn read_feed_records(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -15572,6 +15672,99 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.as_array().unwrap().is_empty());
         let (status, _) = read_feed("orders.events", Some("cursor-404"), 5).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Bounded exact-Key search: the seeded keys alternate between the
+        // two deterministic routing keys, so an exact match set is
+        // deterministic and a miss is provable.
+        let search_key = routed_key(0, split_at);
+        let search = |query: &[(&str, &str)]| {
+            let client = client.clone();
+            let url = format!("{}/v1/feeds/records/search", endpoints[&nodes[0]]);
+            let query: Vec<(String, String)> = query
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            async move {
+                let response = client
+                    .get(url)
+                    .query(&query)
+                    .bearer_auth("this-is-a-long-development-api-key")
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body: Value = response.json().await.unwrap_or_default();
+                (status, body)
+            }
+        };
+        let (status, body) = search(&[
+            ("feed", "orders.events"),
+            ("key_base64", &STANDARD.encode(&search_key)),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["cursor"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec![
+                "cursor-2",
+                "cursor-4",
+                "cursor-6",
+                "cursor-8",
+                "cursor-10",
+                "cursor-12"
+            ]
+        );
+        assert_eq!(body["exhausted"], json!(true));
+        assert_eq!(body["scanned"], json!(12));
+        // A bounded page reports the continuation Cursor so the caller
+        // resumes exactly where the scan budget stopped.
+        let (status, body) = search(&[
+            ("feed", "orders.events"),
+            ("key_base64", &STANDARD.encode(&search_key)),
+            ("limit", "3"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["records"].as_array().unwrap().len(), 3);
+        assert_eq!(body["exhausted"], json!(false));
+        let next_after = body["next_after"].as_str().unwrap().to_owned();
+        let (status, body) = search(&[
+            ("feed", "orders.events"),
+            ("key_base64", &STANDARD.encode(&search_key)),
+            ("after", &next_after),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["cursor"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["cursor-8", "cursor-10", "cursor-12"]
+        );
+        assert_eq!(body["exhausted"], json!(true));
+        // A miss scans the committed history, reports its cost, and returns
+        // no fabricated continuation.
+        let (status, body) = search(&[
+            ("feed", "orders.events"),
+            ("key_base64", &STANDARD.encode(b"absent")),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["records"].as_array().unwrap().is_empty());
+        assert_eq!(body["scanned"], json!(12));
+        assert_eq!(body["exhausted"], json!(true));
+        let (status, _) = search(&[("feed", "orders.events")]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = search(&[("feed", "orders.events"), ("key_base64", "!!!")]).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
 
         let (status, body) = read_feed("orders.deep", None, 12_000).await;

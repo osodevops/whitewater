@@ -70,6 +70,28 @@ Authorization: Bearer <api-key>
 
 The ingress retrieves each current range from its Append Owner over authenticated internal HTTP, merges committed frames, and checks placement again before returning. On Control Plane Riverbeds, the first range page requires another current RF3 replica to confirm the owner's committed boundary and frame digest; an owner behind another replica, disagreement, missing corroboration, unavailable owner, or incomplete placement fails as retryable rather than returning a partial Feed. This per-read evidence is not yet a durable committed-frontier proof after multiple replica losses. New Cursors are derived from stable FeedId and request identity; older persisted tokens remain usable. An unknown, uncommitted, or wrong-Feed Cursor is rejected when it cannot resolve in that Feed. Single-range Feeds now seek an opaque committed Cursor through a rebuilt owner-side index and stream up to 32 records per byte-bounded internal page; the same path supports tail/new-only reads past record 10,000. Responses remain limited to 10,000 records and 16 MiB. Multi-range reads still scan bounded committed prefixes (at most 10,000 records per range and Feed, 16 MiB total, 128 ranges) and fail closed when the bound is exceeded. A full-history timestamp scan past the bound also fails rather than presenting an incomplete answer. Durable global multi-range ordering, checkpointed Cursor-index recovery, and production inter-Node mTLS remain planned. Every delivered record carries a server-owned `source` block — `source.feed_name` (last dotted segment, `created`), `source.full_feed_name` (Domain-qualified, `orders.created`), and `source.feed_id` (immutable identity) — separate from writer-provided `metadata_base64` so applications cannot spoof it. The same block rides Reader-session, temporary-Reader, and Subscription-member deliveries; names resolve at delivery time, so deliveries after a rename carry the new names while Cursor and FeedId stay stable.
 
+### Bounded Key search
+
+`GET /v1/feeds/records/search` finds committed records by exact Key without a consumer or a full-history read:
+
+```http
+GET /v1/feeds/records/search?feed=orders.events&key_base64=a2V5&limit=64
+Authorization: Bearer <api-key>
+```
+
+Each call scans at most 10,000 committed frames in the same merged order the plain read serves, so a miss has a bounded, visible cost (`scanned`) instead of an open-ended history walk. When the record `limit` or the scan budget stops the call before history does, the response carries `next_after` — the last scanned frame's opaque Cursor — and `exhausted: false`; pass `next_after` back as `after` to resume exactly where the scan halted. `exhausted: true` means the committed history drained and no continuation is needed. Matching records are the same committed `RecordResponse` objects the plain read returns, including the server-owned `source` block.
+
+```json
+{
+  "records": [ /* RecordResponse[] */ ],
+  "scanned": 842,
+  "exhausted": false,
+  "next_after": "cursor-..."
+}
+```
+
+`key_base64` is required and must be valid base64; an unknown `after` Cursor fails closed like the plain read. Event-time and Metadata filters remain planned; exact-Key lookup is the first-class investigation path today.
+
 ## Execute WCL
 
 ```http
