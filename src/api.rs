@@ -4056,15 +4056,16 @@ async fn resolve_window_emissions(
         .ok_or_else(|| ApiError::conflict("Window Pipe has no output StateStore"))?;
     let pane_ns = crate::pipe::window_pane_ns(window_ns);
     // The deterministic "now" for close decisions: the newest ingest
-    // timestamp this page observed. Emission replays never re-resolve,
-    // so wall clock would only undermine determinism.
-    let Some(now_ns) = records
+    // timestamp this page observed, floored by the driver's own clock so
+    // panes still close while input idles. The resolved set journals
+    // inside the Declare, so a replay never re-resolves.
+    let wall_now = u64::try_from(unix_ns().max(0)).unwrap_or(0);
+    let now_ns = records
         .iter()
         .map(|record| u64::try_from(record.ingest_time_ns).unwrap_or(0))
         .max()
-    else {
-        return Ok(Vec::new());
-    };
+        .unwrap_or(0)
+        .max(wall_now);
     let assignment = state
         .control
         .active_state_store_assignment_by_id(store_id)
@@ -14028,13 +14029,13 @@ mod tests {
             resolution: None,
         };
 
-        // An empty page carries no ingest clock — nothing resolves, and
-        // it is never an error.
+        // An empty page resolves "now" on the driver's own clock, so it
+        // still scans the store — and fails closed when that store has
+        // no reachable placement rather than skipping idle panes.
         assert!(
             resolve_window_emissions(&state, &pipe, 60_000_000_000, 1_000, &[],)
                 .await
-                .unwrap()
-                .is_empty()
+                .is_err()
         );
 
         // A real page under a store with no journal placement fails the

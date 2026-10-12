@@ -315,12 +315,17 @@ per-group row under sentinel pane `-1` rather than revising a closed pane
 or vanishing. A Pipe that declares `MAX_LATE` may also declare `EMIT TO
 FEED <feed>`: once the ingest clock passes `pane_end + MAX_LATE` a pane
 provably closed (any later event for it quarantines), so each drive runs
-one bounded range scan over the `pane` named posting (typed order -
-idle groups' panes close on schedule without waiting for traffic),
+one bounded range scan over the `pane` named posting (typed order),
 emits one JSON result record per closed pane to the declared Feed, and
 deletes the pane row inside the same effect - a missed or duplicated
 drive emits idempotently because the output and its row delete commit or
-abort together. Emission rides the effect mutation budget (at most 15
+abort together. The close bound is the newest ingest timestamp the page
+observed, floored by the driver's own wall clock: panes still close
+while input idles because an emission-only cycle declares its own effect
+keyed on the sorted closed-pane row-key set, riding a no-op frontier
+move, and racing a real page's frontier move aborts the emission cycle
+through the normal `Aborted` path. Emission rides the effect mutation
+budget (at most 15
 closed panes per drive alongside the accumulation); a larger backlog
 drains oldest-first across subsequent drives. The same bounded range
 shape is exposed to readers: `POST /v1/state-stores/get-by` accepts

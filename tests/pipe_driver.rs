@@ -1696,6 +1696,110 @@ async fn window_pipe_emits_a_closed_pane_and_deletes_its_row_atomically() {
 }
 
 #[tokio::test]
+async fn idle_pages_close_panes_with_an_emission_only_effect() {
+    let harness = harness_for(emit_window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+    let emission = pane_emission(IndexValue::Bytes(b"key-a".to_vec()), 3, 4, 30);
+
+    // Nothing fetched and one closed pane: the drive applies an effect
+    // over a no-op frontier move, keyed on the emission set itself so a
+    // partially drained scan can never collide with this one.
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async {
+                Ok(page_with_emissions(vec![], vec![emission.clone()], "p0"))
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    assert_eq!(
+        applied.effect_id,
+        finnstream::pipe::pipe_emission_effect_id(
+            emit_window_pipe().pipe_id,
+            Uuid::from_u128(SUBSCRIPTION),
+            "p0",
+            std::slice::from_ref(&emission),
+        )
+    );
+    let EffectTransition::Applied {
+        outputs,
+        state_mutations,
+        ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    // One emitted output + one DeleteRow; no accumulate on an idle page.
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(state_mutations.len(), 1);
+    assert_eq!(harness.sink.appends.lock().unwrap().len(), 1);
+    assert_eq!(harness.sink.mutations.lock().unwrap().len(), 1);
+    // The frontier never moved.
+    let committed = harness.progress.read_committed().await.unwrap().unwrap();
+    assert_eq!(committed.cursor, "p0");
+
+    // Replaying the identical scan replays the committed effect: no new
+    // append, no new mutation.
+    let replayed = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async {
+                Ok(page_with_emissions(vec![], vec![emission.clone()], "p0"))
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    assert_eq!(replayed.effect_id, applied.effect_id);
+    assert_eq!(harness.sink.appends.lock().unwrap().len(), 1);
+    // The replay re-drives an identical mutation — the store journal
+    // dedupes on mutation_id, so the second call is a no-op there.
+    {
+        let mutations = harness.sink.mutations.lock().unwrap();
+        assert_eq!(mutations.len(), 2);
+        assert_eq!(mutations[1], mutations[0]);
+    }
+
+    // A different closed set over the same frontier is a distinct effect.
+    let other = pane_emission(IndexValue::Bytes(b"key-a".to_vec()), 5, 2, 7);
+    let second = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async {
+                Ok(page_with_emissions(vec![], vec![other.clone()], "p0"))
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    assert_ne!(second.effect_id, applied.effect_id);
+
+    // Truly idle pages still take the fast path with no effect at all.
+    assert!(harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async { Ok(page(vec![], "p0")) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn window_emissions_cap_at_the_mutation_budget_per_drive() {
     let harness = harness_for(emit_window_pipe());
     seed_frontier(&harness.progress, "p0").await;

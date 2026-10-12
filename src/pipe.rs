@@ -127,6 +127,40 @@ pub fn pipe_emission_writer_session(pipe_id: Uuid, pane_row_key: &[u8]) -> Uuid 
     )
 }
 
+/// The Declare effect identity for an emission-only cycle: an idle
+/// input still shares the frontier's cursor, so the closed-pane set
+/// itself distinguishes this effect from any other over the same
+/// frontier. Identical scans replay identically; a partially drained
+/// set produces a different effect and the Aborted/Applied journals
+/// arbitrate races.
+pub fn pipe_emission_effect_id(
+    pipe_id: Uuid,
+    subscription_id: Uuid,
+    expected_cursor: &str,
+    emissions: &[WindowEmission],
+) -> Uuid {
+    let mut material = Vec::new();
+    let mut keys: Vec<&[u8]> = emissions
+        .iter()
+        .map(|emission| emission.row_key.as_slice())
+        .collect();
+    keys.sort_unstable();
+    for key in keys {
+        material.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        material.extend_from_slice(key);
+    }
+    let digest = blake3::hash(&material);
+    derived_uuid(
+        b"pipe-emission-effect",
+        &[
+            pipe_id.as_bytes().as_slice(),
+            subscription_id.as_bytes().as_slice(),
+            expected_cursor.as_bytes(),
+            digest.as_bytes().as_slice(),
+        ],
+    )
+}
+
 /// The Declare request identity for one effect.
 pub fn pipe_declare_request_id(effect_id: Uuid) -> Uuid {
     derived_uuid(b"pipe-declare", &[effect_id.as_bytes().as_slice()])
@@ -261,7 +295,7 @@ impl PipeDriver {
         };
         let limit = limit.clamp(1, crate::effect::EFFECT_MAX_OUTPUTS);
         let page = fetch(&frontier, limit).await?;
-        if page.records.is_empty() {
+        if page.records.is_empty() && page.emissions.is_empty() {
             return Ok(None);
         }
         if page.records.len() > crate::effect::EFFECT_MAX_OUTPUTS
@@ -272,11 +306,24 @@ impl PipeDriver {
         if page.cursor.is_empty() || page.positions.is_empty() {
             return Err(EffectJournalError::Conflict);
         }
-        let effect_id = pipe_effect_id(
-            self.pipe.pipe_id,
-            frontier.subscription_id,
-            &frontier.cursor,
-        );
+        // An emission-only cycle consumes nothing: the frontier CAS is a
+        // no-op move onto its own cursor, and the effect keys on the
+        // closed-pane set rather than the shared frontier so a later
+        // drain can never be confused with this one.
+        let effect_id = if page.records.is_empty() {
+            pipe_emission_effect_id(
+                self.pipe.pipe_id,
+                frontier.subscription_id,
+                &frontier.cursor,
+                &page.emissions,
+            )
+        } else {
+            pipe_effect_id(
+                self.pipe.pipe_id,
+                frontier.subscription_id,
+                &frontier.cursor,
+            )
+        };
         let (outputs, state_mutations) = self.effect_plan(effect_id, &page)?;
         let declare = EffectMutation {
             effect_id,
