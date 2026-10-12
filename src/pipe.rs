@@ -339,6 +339,7 @@ impl PipeDriver {
                 key,
                 aggregation,
                 time,
+                max_late_ns,
             } => {
                 let store_id = self
                     .pipe
@@ -350,6 +351,11 @@ impl PipeDriver {
                 // across replays and replicas — mutation-equality dedupe
                 // depends on it.
                 let mut panes: BTreeMap<(Vec<u8>, u64), (u64, i64, IndexValue)> = BTreeMap::new();
+                // Bounded lateness policy (event clock only): records
+                // arriving more than `max_late_ns` behind their own event
+                // time quarantine into a countable per-group `late` row
+                // rather than revising closed panes or vanishing.
+                let mut late: BTreeMap<Vec<u8>, (u64, IndexValue)> = BTreeMap::new();
                 for record in &page.records {
                     let Some(source) = source_record(record) else {
                         continue;
@@ -368,6 +374,16 @@ impl PipeDriver {
                     else {
                         continue;
                     };
+                    let lateness = record.ingest_time_ns.saturating_sub(record.event_time_ns);
+                    if matches!(time, WindowTime::Event)
+                        && max_late_ns
+                            .map(|bound| lateness > bound as i64)
+                            .unwrap_or(false)
+                    {
+                        let entry = late.entry(group.0).or_insert((0, group.1));
+                        entry.0 = entry.0.saturating_add(1);
+                        continue;
+                    }
                     let sum_delta = match aggregation {
                         WindowAggregation::Count => 0i64,
                         WindowAggregation::Sum { value } | WindowAggregation::Average { value } => {
@@ -393,10 +409,10 @@ impl PipeDriver {
                     entry.0 = entry.0.saturating_add(1);
                     entry.1 = entry.1.saturating_add(sum_delta);
                 }
-                if panes.is_empty() {
+                if panes.is_empty() && late.is_empty() {
                     return Ok((Vec::new(), Vec::new()));
                 }
-                let entries: Vec<AccumulateRowEntry> = panes
+                let mut entries: Vec<AccumulateRowEntry> = panes
                     .into_iter()
                     .map(
                         |((group, pane), (count, sum, group_value))| AccumulateRowEntry {
@@ -418,6 +434,28 @@ impl PipeDriver {
                         },
                     )
                     .collect();
+                // Quarantined late events accumulate a count under the
+                // sentinel pane `u64::MAX` (posting value -1) — enumerable
+                // per group without revising real pane rows.
+                entries.extend(late.into_iter().map(|(group, (count, group_value))| {
+                    AccumulateRowEntry {
+                        key: window_pane_row_key(&group, WINDOW_LATE_PANE),
+                        count_delta: count,
+                        sum_delta: 0,
+                        named: vec![
+                            NamedKeyValue {
+                                name: WINDOW_KEY_NAME.to_owned(),
+                                values: vec![group_value],
+                                unique: false,
+                            },
+                            NamedKeyValue {
+                                name: WINDOW_PANE_NAME.to_owned(),
+                                values: vec![IndexValue::I64(-1)],
+                                unique: false,
+                            },
+                        ],
+                    }
+                }));
                 Ok((
                     Vec::new(),
                     vec![EffectStateMutation {
@@ -533,6 +571,10 @@ pub const WINDOW_PANE_COUNT: u64 = 16;
 /// enumerable by group key or pane index without knowing composite row keys.
 pub const WINDOW_KEY_NAME: &str = "key";
 pub const WINDOW_PANE_NAME: &str = "pane";
+/// Sentinel pane index for quarantined late events: sorts after every
+/// real pane so row scans find it last, and it can never collide with a
+/// genuine pane (only 16 exist).
+pub const WINDOW_LATE_PANE: u64 = u64::MAX;
 
 /// Pane length in nanoseconds for a window; never zero even for sub-pane
 /// windows.

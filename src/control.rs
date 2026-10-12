@@ -128,6 +128,13 @@ pub enum PipeOperation {
         /// Which record clock assigns panes; defaults to event time.
         #[serde(default)]
         time: WindowTime,
+        /// Optional lateness bound in nanoseconds: a record arriving more
+        /// than this far behind its own `event_time_ns` quarantines into a
+        /// countable `late` row instead of a pane — bounded, explicit
+        /// late-event policy rather than silent revision of closed panes.
+        /// Meaningful only under the event-time clock.
+        #[serde(default)]
+        max_late_ns: Option<u64>,
     },
     /// Point-lookup enrichment: for each delivered record, resolve one
     /// StateStore row by the projected `key` and copy its payload into the
@@ -2420,12 +2427,25 @@ impl ControlController {
                         window_ns,
                         key,
                         aggregation,
-                        time: _,
+                        time,
+                        max_late_ns,
                     } => {
                         if *window_ns == 0 {
                             return Err(ControlError::InvalidOperation(
                                 "Window Pipes require a non-zero window".to_owned(),
                             ));
+                        }
+                        if let Some(bound) = max_late_ns {
+                            if *bound == 0 {
+                                return Err(ControlError::InvalidOperation(
+                                    "MAX_LATE requires a non-zero duration".to_owned(),
+                                ));
+                            }
+                            if matches!(time, WindowTime::Ingest) {
+                                return Err(ControlError::InvalidOperation(
+                                    "MAX_LATE is meaningless under the ingest clock — records can never arrive late to their own ingest time".to_owned(),
+                                ));
+                            }
                         }
                         let output_store = output_store.ok_or_else(|| {
                             ControlError::InvalidOperation(
@@ -4574,7 +4594,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                         let window_ns = parse_window_duration(token(&tokens, 10)?)?;
                         // Optional clock policy: `WINDOW 5m INGEST BY ...`;
                         // absent means the event-time default.
-                        let (time, by) = match token(&tokens, 11)?
+                        let (time, mut at) = match token(&tokens, 11)?
                             .to_ascii_uppercase()
                             .as_str()
                         {
@@ -4582,6 +4602,19 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             "INGEST" => (WindowTime::Ingest, 12),
                             _ => (WindowTime::Event, 11),
                         };
+                        // Optional `MAX_LATE <dur>` bounds how far behind
+                        // its own event time a record may arrive before it
+                        // quarantines out of pane accumulation.
+                        let mut max_late_ns = None;
+                        if token(&tokens, at)
+                            .map(|value| value.eq_ignore_ascii_case("MAX_LATE"))
+                            .unwrap_or(false)
+                        {
+                            max_late_ns =
+                                Some(parse_window_duration(token(&tokens, at + 1)?)?);
+                            at += 2;
+                        }
+                        let by = at;
                         expect_keyword(&tokens, by, "BY")?;
                         let (key, next) = parse_index_field_spec(&tokens, by + 1, "BY")?;
                         let aggregation = match token(&tokens, next)?
@@ -4613,6 +4646,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             quarantine_feed: None,
                             operation: PipeOperation::Window {
                                 window_ns,
+                                max_late_ns,
                                 key,
                                 aggregation,
                                 time,
@@ -8570,6 +8604,7 @@ mod tests {
                 key: IndexFieldSpec::Key,
                 aggregation: WindowAggregation::Count,
                 time: WindowTime::Event,
+                max_late_ns: None,
             },
         };
         // Missing store, foreign-Domain store, zero window, and a missing
@@ -8632,6 +8667,7 @@ mod tests {
                 key: IndexFieldSpec::Key,
                 aggregation: WindowAggregation::Sum { .. },
                 time: WindowTime::Event,
+                ..
             }
         ));
         assert_eq!(relay.output_feed_id, None);
@@ -8655,7 +8691,8 @@ mod tests {
                 ..
             }
         ));
-        // A pre-policy serialized window operation decodes as event time.
+        // A pre-policy serialized window operation decodes as event time
+        // with no lateness bound.
         let legacy: PipeOperation = serde_json::from_value(serde_json::json!({
             "operation": "window",
             "window_ns": 1,
@@ -8667,8 +8704,30 @@ mod tests {
             legacy,
             PipeOperation::Window {
                 time: WindowTime::Event,
+                max_late_ns: None,
                 ..
             }
+        ));
+
+        // MAX_LATE bounds how far behind its event time a record may
+        // arrive before quarantining out of pane accumulation.
+        leader
+            .execute(
+                "CREATE PIPE accounts.bounded FROM SUBSCRIPTION accounts.flow                  TO STATESTORE accounts.panes WINDOW 1h EVENT MAX_LATE 5m BY KEY COUNT;",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            leader
+                .active_pipe_by_name("accounts.bounded")
+                .await
+                .unwrap()
+                .operation,
+            PipeOperation::Window {
+                time: WindowTime::Event,
+                max_late_ns: Some(bound),
+                ..
+            } if bound == 300_000_000_000
         ));
 
         // Malformed window clauses fail at parse, not at validation.
@@ -8677,6 +8736,9 @@ mod tests {
             "CREATE PIPE accounts.bad2 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 5x BY KEY COUNT;",
             "CREATE PIPE accounts.bad3 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 5m COUNT;",
             "CREATE PIPE accounts.bad4 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 5m BY KEY MEDIAN;",
+            // MAX_LATE under the ingest clock and a zero bound both refuse.
+            "CREATE PIPE accounts.bad5w FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 5m INGEST MAX_LATE 1m BY KEY COUNT;",
+            "CREATE PIPE accounts.bad6w FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 5m MAX_LATE 0s BY KEY COUNT;",
         ] {
             assert!(
                 leader.execute(statement).await.is_err(),

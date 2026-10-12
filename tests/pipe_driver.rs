@@ -1022,6 +1022,7 @@ fn window_pipe() -> PipeDefinition {
             window_ns: 160,
             key: IndexFieldSpec::Key,
             time: finnstream::control::WindowTime::Event,
+            max_late_ns: None,
             aggregation: WindowAggregation::Sum {
                 value: IndexFieldSpec::Projection {
                     extractor: "json".to_owned(),
@@ -1054,6 +1055,65 @@ fn json_record(id: u128, key: &[u8], event_time_ns: i64, value: i64) -> FetchedR
     }
 }
 
+#[tokio::test]
+async fn window_pipe_quarantines_late_events_into_a_countable_row() {
+    let mut pipe = window_pipe();
+    pipe.operation = PipeOperation::Window {
+        window_ns: 160,
+        key: IndexFieldSpec::Key,
+        aggregation: WindowAggregation::Count,
+        time: finnstream::control::WindowTime::Event,
+        max_late_ns: Some(500),
+    };
+    let harness = harness_for(pipe);
+    seed_frontier(&harness.progress, "p0").await;
+
+    // event_time 0 with ingest 1000 is 1000ns late (> 500 bound);
+    // event_time 990 with ingest 1000 is 10ns late (inside the bound).
+    let mut late_record = json_record(1, b"key-a", 0, 0);
+    late_record.ingest_time_ns = 1000;
+    let mut on_time = json_record(2, b"key-a", 990, 0);
+    on_time.ingest_time_ns = 1000;
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_f, _l| async { Ok(page(vec![late_record, on_time], "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
+        panic!("expected AccumulateRows")
+    };
+    assert_eq!(entries.len(), 2);
+    // On-time record lands on pane 99 (990 / 10ns panes); the late record
+    // lands on the sentinel late pane with a count-only contribution.
+    assert_eq!(entries[0].named[1].values, vec![IndexValue::I64(99)]);
+    // Same group bytes, sentinel pane — the late row sorts after every
+    // real pane for the group and can never collide with one.
+    assert_eq!(
+        entries[0].key[..entries[0].key.len() - 8],
+        entries[1].key[..entries[1].key.len() - 8]
+    );
+    assert_eq!(
+        entries[1].key[entries[1].key.len() - 8..],
+        u64::MAX.to_be_bytes()
+    );
+    assert_eq!(entries[1].named[1].values, vec![IndexValue::I64(-1)]);
+    assert_eq!(entries[1].count_delta, 1);
+    assert_eq!(entries[1].sum_delta, 0);
+}
+
 fn ingest_window_pipe() -> PipeDefinition {
     let mut pipe = window_pipe();
     pipe.operation = PipeOperation::Window {
@@ -1061,6 +1121,7 @@ fn ingest_window_pipe() -> PipeDefinition {
         key: IndexFieldSpec::Key,
         aggregation: WindowAggregation::Count,
         time: finnstream::control::WindowTime::Ingest,
+        max_late_ns: None,
     };
     pipe
 }

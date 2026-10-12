@@ -289,10 +289,13 @@ advances exactly once even across crashes and ownership moves. Panes are
 24-byte `(count, sum)` accumulator rows that merge additively under the
 store's sequence cursor; a replayed mutation skips rows already stamped
 with its sequence, which is what makes crash-mid-apply a no-op rather than
-a double count. Watermarks, late-event revision or quarantine, window-close
-output emission, and ingest-time policy remain follow-on work: this slice
-deliberately establishes only the accumulation primitive inside the atomic
-boundary.
+a double count. The pane clock is selectable per Pipe — `event_time_ns` by
+default, `ingest_time_ns` on request — and a bounded lateness policy
+exists today (`MAX_LATE <dur>`, event clock only): an event arriving more
+than the bound behind its own event time quarantines into a countable
+per-group row under sentinel pane `-1` rather than revising a closed pane
+or vanishing. Watermarks/grace, in-place late-event revision, and
+window-close output emission remain follow-on work.
 
 Point-lookup enrichment is the second. An `Enrich` Pipe resolves each
 delivered record's projected key against a declared StateStore at fetch
