@@ -2110,17 +2110,20 @@ async fn drive_pipe(
                         // rides inside the Declare, so an applied output is
                         // byte-identical across replays and raced drives
                         // converge on whichever Declare committed first.
-                        let resolution = if let crate::control::PipeOperation::Enrich { key } =
-                            &pipe.operation
-                        {
-                            Some(
-                                resolve_enrich(state, &pipe, key, &record)
-                                    .await
-                                    .map_err(|_| crate::effect::EffectJournalError::Unavailable)?,
-                            )
-                        } else {
-                            None
-                        };
+                        let resolution =
+                            if let crate::control::PipeOperation::Enrich { key, freshness } =
+                                &pipe.operation
+                            {
+                                Some(
+                                    resolve_enrich(state, &pipe, key, *freshness, &record)
+                                        .await
+                                        .map_err(|_| {
+                                            crate::effect::EffectJournalError::Unavailable
+                                        })?,
+                                )
+                            } else {
+                                None
+                            };
                         records.push(crate::pipe::FetchedRecord {
                             message_id: record.message_id,
                             key_base64: STANDARD.encode(&record.key),
@@ -3785,6 +3788,7 @@ async fn resolve_enrich(
     state: &AppState,
     pipe: &crate::control::PipeDefinition,
     spec: &crate::control::IndexFieldSpec,
+    freshness: crate::control::EnrichFreshness,
     record: &crate::domain::StoredRecord,
 ) -> Result<crate::pipe::EnrichResolution, ApiError> {
     let store_id = pipe
@@ -3801,6 +3805,7 @@ async fn resolve_enrich(
         Ok(crate::pipe::EnrichResolution {
             matched: false,
             payload: Vec::new(),
+            applied_seq: 0,
         })
     };
     let Ok(values) = crate::index_build::extract_index_values(std::slice::from_ref(spec), &source)
@@ -3841,7 +3846,7 @@ async fn resolve_enrich(
             store_id,
             ownership_epoch: assignment.ownership_epoch,
             key: key.clone(),
-            strict: false,
+            strict: matches!(freshness, crate::control::EnrichFreshness::Strict),
             wait_ms: 500,
             by_named: None,
         };
@@ -3863,9 +3868,27 @@ async fn resolve_enrich(
         };
         match outcome {
             Ok(reply) => {
+                // Strict freshness: a replica still behind its committed
+                // sequence is skipped like a failure — the drive retries
+                // rather than journaling a row older than the quorum's
+                // committed frontier.
+                if matches!(freshness, crate::control::EnrichFreshness::Strict)
+                    && reply.result.applied_seq < reply.result.committed_seq
+                {
+                    last_error = Some(ApiError {
+                        status: StatusCode::CONFLICT,
+                        message: format!(
+                            "replica applied sequence {} lags committed sequence {}",
+                            reply.result.applied_seq, reply.result.committed_seq
+                        ),
+                        code: Some("index_behind"),
+                    });
+                    continue;
+                }
                 return Ok(crate::pipe::EnrichResolution {
                     matched: reply.result.row.is_some(),
                     payload: reply.result.row.map(|row| row.payload).unwrap_or_default(),
+                    applied_seq: reply.result.applied_seq,
                 });
             }
             Err(error) => last_error = Some(error),

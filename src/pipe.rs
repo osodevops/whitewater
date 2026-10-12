@@ -52,6 +52,11 @@ pub struct EnrichResolution {
     pub matched: bool,
     #[serde(default)]
     pub payload: Vec<u8>,
+    /// The serving replica's applied journal sequence at read time — the
+    /// versioned evidence behind `enrich.seq`, so an operator can answer
+    /// "which version of the row enriched this record".
+    #[serde(default)]
+    pub applied_seq: u64,
 }
 
 /// A bounded page fetched after a committed frontier: records in delivery
@@ -440,6 +445,7 @@ impl PipeDriver {
                                 record.resolution.clone().unwrap_or(EnrichResolution {
                                     matched: false,
                                     payload: Vec::new(),
+                                    applied_seq: 0,
                                 });
                             metadata.insert(
                                 "enrich.matched".to_owned(),
@@ -449,6 +455,14 @@ impl PipeDriver {
                                     "ZmFsc2U=".to_owned() // "false"
                                 },
                             );
+                            {
+                                use base64::Engine;
+                                metadata.insert(
+                                    "enrich.seq".to_owned(),
+                                    base64::engine::general_purpose::STANDARD
+                                        .encode(resolution.applied_seq.to_string()),
+                                );
+                            }
                             if !resolution.payload.is_empty() {
                                 use base64::Engine;
                                 metadata.insert(

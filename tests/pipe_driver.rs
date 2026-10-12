@@ -1256,6 +1256,7 @@ fn enrich_pipe() -> PipeDefinition {
         subscription_id: Uuid::from_u128(SUBSCRIPTION),
         operation: PipeOperation::Enrich {
             key: IndexFieldSpec::Key,
+            freshness: finnstream::control::EnrichFreshness::Latest,
         },
         output_feed_id: Some(Uuid::from_u128(OUTPUT_FEED)),
         output_store_id: Some(Uuid::from_u128(OUTPUT_STORE)),
@@ -1274,6 +1275,7 @@ async fn enrich_pipe_stamps_lookup_outcomes_into_output_metadata() {
     hit.resolution = Some(EnrichResolution {
         matched: true,
         payload: b"doc-bytes".to_vec(),
+        applied_seq: 41,
     });
     let miss = record(2); // unresolved lookups forward as matched=false
     harness
@@ -1295,6 +1297,9 @@ async fn enrich_pipe_stamps_lookup_outcomes_into_output_metadata() {
         appends[0].metadata_base64["enrich.payload"],
         b64(b"doc-bytes")
     );
+    // Versioned evidence: the serving replica's applied sequence travels
+    // with the output so "which version enriched this record" is answerable.
+    assert_eq!(appends[0].metadata_base64["enrich.seq"], b64(b"41"));
     assert_eq!(appends[1].metadata_base64["enrich.matched"], "ZmFsc2U=");
     assert!(!appends[1].metadata_base64.contains_key("enrich.payload"));
     // Input payload and key pass through untouched.
@@ -1347,6 +1352,7 @@ async fn enrich_pipe_adopts_a_committed_divergent_declare() {
     ours.resolution = Some(EnrichResolution {
         matched: true,
         payload: b"fresher-but-lost".to_vec(),
+        applied_seq: 42,
     });
     let applied = harness
         .driver

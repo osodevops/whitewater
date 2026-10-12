@@ -138,7 +138,28 @@ pub enum PipeOperation {
     Enrich {
         /// Which typed record value addresses the lookup row's primary key.
         key: IndexFieldSpec,
+        /// How fresh the lookup row must be; defaults to the applied state
+        /// the first reachable replica already serves.
+        #[serde(default)]
+        freshness: EnrichFreshness,
     },
+}
+
+/// How fresh an `Enrich` lookup must be before its result is journaled.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrichFreshness {
+    /// Serve the replica's currently applied state — a reachable lagging
+    /// replica may answer an older row. This is the safe default: the
+    /// resolution is journaled either way, never re-read on replay.
+    #[default]
+    Latest,
+    /// Require the replica's applied sequence to cover its committed
+    /// sequence at read entry (the same strict contract public strict
+    /// reads use). A replica that lags is skipped; when every replica lags
+    /// or is unreachable the drive fails retryably — lagging state yields
+    /// an explicit retry, never a journaled stale row.
+    Strict,
 }
 
 /// Which record clock a `Window` Pipe buckets into panes. Both clocks are
@@ -2411,7 +2432,7 @@ impl ControlController {
                         }
                         (None, Some(store.store_id))
                     }
-                    PipeOperation::Enrich { key } => {
+                    PipeOperation::Enrich { key, freshness: _ } => {
                         let output_feed = output_feed.ok_or_else(|| {
                             ControlError::InvalidOperation(
                                 "Enrich Pipes require an output Feed".to_owned(),
@@ -4391,14 +4412,23 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                         if tokens.get(9).is_some() {
                             expect_keyword(&tokens, 9, "ENRICH")?;
                             expect_keyword(&tokens, 10, "STATESTORE")?;
-                            expect_keyword(&tokens, 12, "BY")?;
-                            let (key, _) = parse_index_field_spec(&tokens, 13, "ENRICH BY")?;
+                            // `ENRICH STATESTORE <s> [STRICT] BY <spec>`
+                            let (freshness, by) = match token(&tokens, 12)?
+                                .to_ascii_uppercase()
+                                .as_str()
+                            {
+                                "STRICT" => (EnrichFreshness::Strict, 13),
+                                _ => (EnrichFreshness::Latest, 12),
+                            };
+                            expect_keyword(&tokens, by, "BY")?;
+                            let (key, _) =
+                                parse_index_field_spec(&tokens, by + 1, "ENRICH BY")?;
                             return Ok(Command::DefinePipe {
                                 name: token(&tokens, 2)?.to_owned(),
                                 subscription: token(&tokens, 5)?.to_owned(),
                                 output_feed: Some(token(&tokens, 8)?.to_owned()),
                                 output_store: Some(token(&tokens, 11)?.to_owned()),
-                                operation: PipeOperation::Enrich { key },
+                                operation: PipeOperation::Enrich { key, freshness },
                             });
                         }
                         Ok(Command::DefinePipe {
@@ -8528,6 +8558,7 @@ mod tests {
             output_store,
             operation: PipeOperation::Enrich {
                 key: IndexFieldSpec::Key,
+                freshness: EnrichFreshness::Latest,
             },
         };
         leader
@@ -8582,9 +8613,41 @@ mod tests {
                 .unwrap()
                 .operation,
             PipeOperation::Enrich {
-                key: IndexFieldSpec::Projection { .. }
+                key: IndexFieldSpec::Projection { .. },
+                freshness: EnrichFreshness::Latest,
             }
         ));
+
+        // STRICT makes lagging-state reads retryable instead of journaled.
+        leader
+            .execute(
+                "CREATE PIPE accounts.enriched3 FROM SUBSCRIPTION accounts.flow                  TO FEED accounts.enriched ENRICH STATESTORE accounts.panes STRICT BY JSON 'cust';",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            leader
+                .active_pipe_by_name("accounts.enriched3")
+                .await
+                .unwrap()
+                .operation,
+            PipeOperation::Enrich {
+                key: IndexFieldSpec::Projection { .. },
+                freshness: EnrichFreshness::Strict,
+            }
+        ));
+
+        // Freshness defaults to Latest when the serialized form predates it.
+        let legacy: PipeOperation =
+            serde_json::from_str(r#"{"operation":"enrich","key":{"kind":"key"}}"#).unwrap();
+        assert!(matches!(
+            legacy,
+            PipeOperation::Enrich {
+                freshness: EnrichFreshness::Latest,
+                ..
+            }
+        ));
+
         for statement in [
             "CREATE PIPE accounts.bad5 FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH STATESTORE accounts.panes;",
             "CREATE PIPE accounts.bad6 FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH accounts.panes BY KEY;",

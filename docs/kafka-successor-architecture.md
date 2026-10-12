@@ -297,14 +297,28 @@ boundary.
 Point-lookup enrichment is the second. An `Enrich` Pipe resolves each
 delivered record's projected key against a declared StateStore at fetch
 time and copies the matched row's payload into the output record's
-Metadata (`enrich.payload`, `enrich.matched`). The resolution travels
-inside the `Declare`, so an applied output is byte-identical across every
-replay and never re-reads a row that may have moved. When two drives race
-one frontier with different resolutions, whichever `Declare` commits first
-is the single source of truth: the loser adopts the committed row and
-applies it rather than emitting a second decision. Missing rows still
-forward (`enrich.matched = false`); an unreachable store fails the drive
-retryably so a fake miss is never journaled.
+Metadata (`enrich.payload`, `enrich.matched`, `enrich.seq`). The
+resolution travels inside the `Declare`, so an applied output is
+byte-identical across every replay and never re-reads a row that may have
+moved. `enrich.seq` records the serving replica's applied journal
+sequence — the versioned evidence behind the row — so an operator can
+answer "which version of the row enriched this record" after the fact.
+When two drives race one frontier with different resolutions, whichever
+`Declare` commits first is the single source of truth: the loser adopts
+the committed row and applies it rather than emitting a second decision.
+Missing rows still forward (`enrich.matched = false`); an unreachable
+store fails the drive retryably so a fake miss is never journaled.
+
+Lookup freshness is a declaration choice. The default `Latest` serves a
+replica's currently applied state — whatever the first reachable journal
+member already serves — matching the safe common case where slightly
+stale enrichment is acceptable and availability dominates. `STRICT`
+requires the replica's applied sequence to cover its committed sequence
+at read entry (the same contract public strict row reads use): a replica
+that lags is skipped, and when every replica lags or is unreachable the
+drive fails retryably rather than journaling a stale row. Lagging state
+is therefore an explicit retry, never a silent decision — the next drive
+repeats the identical effect identity until a fresh read lands.
 
 ## 6. Protocol-level idempotency
 
