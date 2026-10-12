@@ -786,3 +786,133 @@ async fn pending_marker_survives_restart_and_still_fences_reads() {
     assert_eq!(reopened.pending_effect().await.unwrap(), None);
     assert_eq!(reopened.read_committed(None, 10).await.unwrap().len(), 2);
 }
+
+fn pending_identity(effect_id: Uuid) -> finnstream::active_range::PendingEffectRef {
+    finnstream::active_range::PendingEffectRef {
+        effect_id,
+        subscription_id: Uuid::from_u128(77),
+    }
+}
+
+#[tokio::test]
+async fn discard_pending_effect_reports_not_pending_on_an_empty_tail() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    store.append(append(1, b"committed")).await.unwrap();
+    store
+        .commit(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            CommitPosition::new(1),
+        )
+        .await
+        .unwrap();
+
+    let outcome = store
+        .discard_pending_effect(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            pending_identity(Uuid::from_u128(60)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        finnstream::active_range::PendingDiscardOutcome::NotPending
+    );
+}
+
+#[tokio::test]
+async fn discard_pending_effect_refuses_a_foreign_occupant() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let effect = Uuid::from_u128(61);
+    store
+        .append(pending_append(1, b"held", effect))
+        .await
+        .unwrap();
+
+    // A different effect cannot discard the tail it does not own.
+    let outcome = store
+        .discard_pending_effect(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            pending_identity(Uuid::from_u128(62)),
+        )
+        .await
+        .unwrap();
+    let finnstream::active_range::PendingDiscardOutcome::Occupied(marker) = outcome else {
+        panic!("expected occupied")
+    };
+    assert_eq!(marker.effect_id, effect);
+    assert!(store.pending_effect().await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn discard_pending_effect_truncates_the_matching_tail_and_frees_the_range() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let effect = Uuid::from_u128(63);
+
+    store.append(append(1, b"committed")).await.unwrap();
+    store
+        .commit(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            CommitPosition::new(1),
+        )
+        .await
+        .unwrap();
+    store
+        .append(pending_append(2, b"held", effect))
+        .await
+        .unwrap();
+    store
+        .append(pending_append(3, b"held-2", effect))
+        .await
+        .unwrap();
+
+    let outcome = store
+        .discard_pending_effect(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            pending_identity(effect),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        finnstream::active_range::PendingDiscardOutcome::Discarded { dropped_frames: 2 }
+    );
+    assert_eq!(store.pending_effect().await.unwrap(), None);
+    // Only the uncommitted tail went; the committed prefix survives.
+    let frames = store.read_committed(None, 10).await.unwrap();
+    assert_eq!(frames.len(), 1);
+
+    // The freed Range accepts the next effect's appends again.
+    store
+        .append(pending_append(2, b"next", Uuid::from_u128(64)))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn discard_pending_effect_fences_a_stale_ownership_epoch() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let effect = Uuid::from_u128(65);
+    store
+        .append(pending_append(1, b"held", effect))
+        .await
+        .unwrap();
+
+    let error = store
+        .discard_pending_effect(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(0),
+            pending_identity(effect),
+        )
+        .await;
+    assert!(error.is_err());
+    assert!(store.pending_effect().await.unwrap().is_some());
+}

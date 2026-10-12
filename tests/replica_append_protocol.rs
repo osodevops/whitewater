@@ -383,3 +383,110 @@ async fn commit_at_the_marker_position_releases_the_pending_tail() {
         .unwrap();
     assert_eq!(service.pending_effect(&assignment).await.unwrap(), None);
 }
+
+fn discard_request(
+    fixture: &Fixture,
+    effect_id: Uuid,
+    subscription_id: Uuid,
+) -> finnstream::active_range::ReplicaDiscardPendingRequest {
+    finnstream::active_range::ReplicaDiscardPendingRequest {
+        feed_id: fixture.feed_id,
+        range_id: fixture.range_id,
+        generation: RangeGeneration::new(1),
+        ownership_epoch: finnstream::active_range::OwnershipEpoch::new(1),
+        append_owner: fixture.owner.clone(),
+        effect_id,
+        subscription_id,
+    }
+}
+
+#[tokio::test]
+async fn discard_pending_truncates_only_the_matching_marker_on_the_replica() {
+    let fixture = Fixture::new().await;
+    let service = fixture.service("storage-2");
+    let effect = Uuid::from_u128(700);
+    let subscription = Uuid::from_u128(701);
+
+    // A replica with no held tail reports NotPending.
+    let outcome = service
+        .discard_pending(discard_request(&fixture, effect, subscription))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.outcome,
+        Some(finnstream::active_range::ReplicaDiscardOutcome::NotPending)
+    );
+
+    let mut held = fixture.request(1, 1, b"held");
+    pending_request(&mut held, effect, subscription);
+    service.append(held).await.unwrap();
+
+    // A different effect's discard reports the occupant and keeps the
+    // tail intact.
+    let outcome = service
+        .discard_pending(discard_request(
+            &fixture,
+            Uuid::from_u128(702),
+            subscription,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.outcome,
+        Some(finnstream::active_range::ReplicaDiscardOutcome::Occupied)
+    );
+    assert_eq!(outcome.occupant.unwrap().effect_id, effect);
+
+    // The owning effect discards; the marker and the uncommitted frame
+    // leave together.
+    let outcome = service
+        .discard_pending(discard_request(&fixture, effect, subscription))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.outcome,
+        Some(finnstream::active_range::ReplicaDiscardOutcome::Discarded { dropped_frames: 1 })
+    );
+    let assignment = fixture
+        .controller
+        .active_range_assignment_by_id(fixture.range_id)
+        .await
+        .unwrap();
+    assert_eq!(service.pending_effect(&assignment).await.unwrap(), None);
+}
+
+#[tokio::test]
+async fn discard_pending_fences_stale_epochs_and_non_members() {
+    let fixture = Fixture::new().await;
+    let service = fixture.service("storage-2");
+    let effect = Uuid::from_u128(710);
+    let subscription = Uuid::from_u128(711);
+
+    let mut held = fixture.request(1, 1, b"held");
+    pending_request(&mut held, effect, subscription);
+    service.append(held).await.unwrap();
+
+    // A stale ownership epoch refuses before touching the tail.
+    let mut stale = discard_request(&fixture, effect, subscription);
+    stale.ownership_epoch = finnstream::active_range::OwnershipEpoch::new(9);
+    let error = service.discard_pending(stale).await.unwrap_err();
+    assert_eq!(error.code, ReplicaAppendErrorCode::StaleOwnershipEpoch);
+    let assignment = fixture
+        .controller
+        .active_range_assignment_by_id(fixture.range_id)
+        .await
+        .unwrap();
+    assert!(service.pending_effect(&assignment).await.unwrap().is_some());
+
+    // A Node outside the replica set cannot discard anything.
+    let outsider = ReplicaAppendService::new(
+        fixture.replica_directory.path().join("outsider"),
+        StorageNodeId::try_new("outsider").unwrap(),
+        fixture.controller.clone(),
+    );
+    let error = outsider
+        .discard_pending(discard_request(&fixture, effect, subscription))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ReplicaAppendErrorCode::ReceiverNotReplica);
+}

@@ -11,7 +11,8 @@ use finnstream::{
         MajorityAppendErrorCode, OwnerMoveControl, OwnerMoveError, OwnerMoveEvidence,
         OwnerMoveExecutor, OwnershipEpoch, RangeGeneration, RangePosition, ReplicaAppendAccepted,
         ReplicaAppendErrorCode, ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitAccepted,
-        ReplicaCommitRequest, ReplicaTransport, ReplicaTransportError, StorageNodeId,
+        ReplicaCommitRequest, ReplicaDiscardPendingRequest, ReplicaDiscardPendingResponse,
+        ReplicaTransport, ReplicaTransportError, StorageNodeId,
     },
     codec::encode_record,
     control::{Command, ControlController, RangeOwnerMovePlan},
@@ -84,6 +85,20 @@ impl ReplicaTransport for DirectTransport {
         }
         self.services[replica]
             .commit(request)
+            .await
+            .map_err(|error| ReplicaTransportError {
+                message: error.message,
+                retryable: error.retryable,
+            })
+    }
+
+    async fn discard_pending(
+        &self,
+        replica: &StorageNodeId,
+        request: ReplicaDiscardPendingRequest,
+    ) -> Result<ReplicaDiscardPendingResponse, ReplicaTransportError> {
+        self.services[replica]
+            .discard_pending(request)
             .await
             .map_err(|error| ReplicaTransportError {
                 message: error.message,
@@ -1265,4 +1280,200 @@ async fn release_is_unambiguous_when_one_follower_is_down() {
             commit_position: CommitPosition::new(1),
         }
     );
+}
+
+fn discard_release(
+    request: &ReplicaAppendRequest,
+    owner: &StorageNodeId,
+    effect_id: Uuid,
+    subscription_id: Uuid,
+) -> finnstream::active_range::PendingReleaseRequest {
+    finnstream::active_range::PendingReleaseRequest {
+        feed_id: request.feed_id,
+        range_id: request.range_id,
+        generation: request.generation,
+        ownership_epoch: request.ownership_epoch,
+        append_owner: owner.clone(),
+        effect_id,
+        subscription_id,
+    }
+}
+
+#[tokio::test]
+async fn discard_pending_effect_truncates_the_tail_across_replicas() {
+    let fixture = Fixture::new().await;
+    let coordinator = fixture.coordinator(&[], &[], None);
+    let effect = Uuid::from_u128(850);
+    let subscription = Uuid::from_u128(851);
+
+    let mut request = fixture.request.clone();
+    pending_request(&mut request, effect, subscription);
+    coordinator.append(request.clone()).await.unwrap();
+
+    let assignment = fixture
+        .control
+        .active_range_assignment(request.feed_id)
+        .await
+        .unwrap();
+    let outcome = coordinator
+        .discard_pending_effect(discard_release(
+            &request,
+            &fixture.owner,
+            effect,
+            subscription,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        finnstream::active_range::PendingDiscardOutcome::Discarded { dropped_frames: 1 }
+    );
+
+    // Owner and both followers dropped the marker and the uncommitted
+    // frame; nothing became visible anywhere.
+    for service in fixture.services.values() {
+        assert_eq!(service.pending_effect(&assignment).await.unwrap(), None);
+        assert_eq!(
+            service
+                .read_staged_committed(&assignment, None, 10)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+    }
+}
+
+#[tokio::test]
+async fn discard_pending_effect_is_idempotent_and_fences_wrong_effects() {
+    let fixture = Fixture::new().await;
+    let coordinator = fixture.coordinator(&[], &[], None);
+    let effect = Uuid::from_u128(860);
+    let subscription = Uuid::from_u128(861);
+
+    let mut request = fixture.request.clone();
+    pending_request(&mut request, effect, subscription);
+    coordinator.append(request.clone()).await.unwrap();
+
+    // A different effect cannot discard a tail it does not own.
+    let outcome = coordinator
+        .discard_pending_effect(discard_release(
+            &request,
+            &fixture.owner,
+            Uuid::from_u128(862),
+            subscription,
+        ))
+        .await
+        .unwrap();
+    match outcome {
+        finnstream::active_range::PendingDiscardOutcome::Occupied(marker) => {
+            assert_eq!(marker.effect_id, effect);
+        }
+        other => panic!("expected Occupied, got {other:?}"),
+    }
+
+    // The owning effect discards; a retried discard reports the tail
+    // already resolved rather than erroring.
+    coordinator
+        .discard_pending_effect(discard_release(
+            &request,
+            &fixture.owner,
+            effect,
+            subscription,
+        ))
+        .await
+        .unwrap();
+    let outcome = coordinator
+        .discard_pending_effect(discard_release(
+            &request,
+            &fixture.owner,
+            effect,
+            subscription,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        finnstream::active_range::PendingDiscardOutcome::NotPending
+    );
+}
+
+#[tokio::test]
+async fn discard_pending_effect_heals_a_follower_that_missed_the_first_discard() {
+    let fixture = Fixture::new().await;
+    let coordinator = fixture.coordinator(&[], &[], None);
+    let effect = Uuid::from_u128(870);
+    let subscription = Uuid::from_u128(871);
+    let assignment = fixture
+        .control
+        .active_range_assignment(fixture.request.feed_id)
+        .await
+        .unwrap();
+    let follower = fixture
+        .non_owner_nodes()
+        .into_iter()
+        .next()
+        .expect("follower");
+
+    // The follower accepted a pending frame whose discard broadcast it
+    // then missed: the owner never held the marker at all.
+    let mut request = fixture.request.clone();
+    pending_request(&mut request, effect, subscription);
+    fixture.services[&follower]
+        .append(request.clone())
+        .await
+        .unwrap();
+    assert!(fixture.services[&follower]
+        .pending_effect(&assignment)
+        .await
+        .unwrap()
+        .is_some());
+
+    // The owner's local marker is absent, but the broadcast still reaches
+    // the follower and heals its stale tail.
+    let outcome = coordinator
+        .discard_pending_effect(discard_release(
+            &request,
+            &fixture.owner,
+            effect,
+            subscription,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        finnstream::active_range::PendingDiscardOutcome::NotPending
+    );
+    assert_eq!(
+        fixture.services[&follower]
+            .pending_effect(&assignment)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        fixture.services[&follower]
+            .read_staged_committed(&assignment, None, 10)
+            .await
+            .unwrap()
+            .len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn discard_pending_effect_fences_a_stale_ownership_epoch() {
+    let fixture = Fixture::new().await;
+    let coordinator = fixture.coordinator(&[], &[], None);
+    let effect = Uuid::from_u128(880);
+    let subscription = Uuid::from_u128(881);
+
+    let mut request = fixture.request.clone();
+    pending_request(&mut request, effect, subscription);
+    coordinator.append(request.clone()).await.unwrap();
+
+    let mut stale = discard_release(&request, &fixture.owner, effect, subscription);
+    stale.ownership_epoch = OwnershipEpoch::new(9);
+    let error = coordinator.discard_pending_effect(stale).await.unwrap_err();
+    assert_eq!(error.code, MajorityAppendErrorCode::NotCurrentOwner);
 }

@@ -14,7 +14,8 @@ use finnstream::{
         DrainProgressDriver, FollowerMoveControl, FollowerMoveCopyResult, FollowerMoveExecutor,
         LocalDrainDriver, MajorityAppendCoordinator, OwnerMoveControl, OwnerMoveEvidence,
         RangeGeneration, RangeId, RangePosition, ReplicaAppendAccepted, ReplicaAppendRequest,
-        ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest, ReplicaTransport,
+        ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest,
+        ReplicaDiscardPendingRequest, ReplicaDiscardPendingResponse, ReplicaTransport,
         ReplicaTransportError, StorageDrainExecutor, StorageDrainStatus, StorageDrainSupervisor,
         StorageNodeId,
     },
@@ -56,6 +57,17 @@ impl ReplicaTransport for UnusedTransport {
         _replica: &StorageNodeId,
         _request: ReplicaCommitRequest,
     ) -> Result<ReplicaCommitAccepted, ReplicaTransportError> {
+        Err(ReplicaTransportError {
+            message: "transport is not used during drain".to_owned(),
+            retryable: false,
+        })
+    }
+
+    async fn discard_pending(
+        &self,
+        _replica: &StorageNodeId,
+        _request: ReplicaDiscardPendingRequest,
+    ) -> Result<ReplicaDiscardPendingResponse, ReplicaTransportError> {
         Err(ReplicaTransportError {
             message: "transport is not used during drain".to_owned(),
             retryable: false,

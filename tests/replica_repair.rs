@@ -7,7 +7,8 @@ use finnstream::{
         copy_follower_move, repair_replica, AppendIdentity, CommitPosition, FollowerMoveControl,
         FollowerMoveCopyResult, FollowerMoveExecutor, MajorityAppendCoordinator, OwnershipEpoch,
         RangeGeneration, RangePosition, ReplicaAppendAccepted, ReplicaAppendRequest,
-        ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest, ReplicaTransport,
+        ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest,
+        ReplicaDiscardPendingRequest, ReplicaDiscardPendingResponse, ReplicaTransport,
         ReplicaTransportError, StorageNodeId,
     },
     codec::encode_record,
@@ -42,6 +43,17 @@ impl ReplicaTransport for UnusedTransport {
         _replica: &StorageNodeId,
         _request: ReplicaCommitRequest,
     ) -> Result<ReplicaCommitAccepted, ReplicaTransportError> {
+        Err(ReplicaTransportError {
+            message: "transport is not used during follower movement".to_owned(),
+            retryable: false,
+        })
+    }
+
+    async fn discard_pending(
+        &self,
+        _replica: &StorageNodeId,
+        _request: ReplicaDiscardPendingRequest,
+    ) -> Result<ReplicaDiscardPendingResponse, ReplicaTransportError> {
         Err(ReplicaTransportError {
             message: "transport is not used during follower movement".to_owned(),
             retryable: false,

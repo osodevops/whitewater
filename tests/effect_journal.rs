@@ -394,6 +394,13 @@ struct RecordingApply {
     occupied_appends: Mutex<u8>,
     occupied_releases: Mutex<u8>,
     not_pending_releases: Mutex<u8>,
+    permanent_appends: Mutex<BTreeSet<Uuid>>,
+    permanent_frontier: Mutex<bool>,
+    permanent_releases: Mutex<u8>,
+    discards: Mutex<Vec<(Uuid, Uuid, Uuid)>>,
+    fail_discards: Mutex<u8>,
+    occupied_discards: Mutex<u8>,
+    not_pending_discards: Mutex<u8>,
 }
 
 #[async_trait::async_trait]
@@ -417,6 +424,14 @@ impl EffectApply for RecordingApply {
             .remove(&output.writer_session_id)
         {
             return Err(EffectJournalError::Unavailable);
+        }
+        if self
+            .permanent_appends
+            .lock()
+            .unwrap()
+            .contains(&output.writer_session_id)
+        {
+            return Err(EffectJournalError::Conflict);
         }
         let mut appended = self.appended.lock().unwrap();
         if !appended
@@ -474,6 +489,13 @@ impl EffectApply for RecordingApply {
                 return Ok(EffectReleaseOutcome::NotPending { committed: 0 });
             }
         }
+        {
+            let mut remaining = self.permanent_releases.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(EffectJournalError::Conflict);
+            }
+        }
         Ok(EffectReleaseOutcome::Released { committed: 1 })
     }
 
@@ -519,6 +541,9 @@ impl EffectApply for RecordingApply {
         _consume: &EffectConsume,
         request_id: Uuid,
     ) -> Result<(), EffectJournalError> {
+        if *self.permanent_frontier.lock().unwrap() {
+            return Err(EffectJournalError::Conflict);
+        }
         {
             let mut remaining = self.fail_frontier.lock().unwrap();
             if *remaining > 0 {
@@ -528,6 +553,45 @@ impl EffectApply for RecordingApply {
         }
         self.frontier_request_log.lock().unwrap().push(request_id);
         Ok(())
+    }
+
+    async fn discard_output(
+        &self,
+        output: &EffectOutput,
+        effect_id: Uuid,
+        subscription_id: Uuid,
+    ) -> Result<finnstream::effect::EffectDiscardOutcome, EffectJournalError> {
+        self.discards
+            .lock()
+            .unwrap()
+            .push((output.feed_id, effect_id, subscription_id));
+        {
+            let mut remaining = self.fail_discards.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(EffectJournalError::Unavailable);
+            }
+        }
+        {
+            let mut remaining = self.occupied_discards.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Ok(finnstream::effect::EffectDiscardOutcome::Occupied {
+                    occupant: finnstream::effect::EffectOccupant {
+                        effect_id: Uuid::from_u128(6262),
+                        subscription_id: Uuid::from_u128(6363),
+                    },
+                });
+            }
+        }
+        {
+            let mut remaining = self.not_pending_discards.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Ok(finnstream::effect::EffectDiscardOutcome::NotPending);
+            }
+        }
+        Ok(finnstream::effect::EffectDiscardOutcome::Discarded { dropped_frames: 1 })
     }
 }
 
@@ -1155,4 +1219,359 @@ async fn apply_committed_retries_a_failing_occupant_sweep() {
         .unwrap();
     assert_eq!(sink.resolved.lock().unwrap().len(), 1);
     assert_eq!(sink.appended.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn apply_committed_aborts_a_permanent_output_failure_and_discards_declared_ranges() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mut mutation = declare_with_state(Uuid::new_v4(), 1, 1, vec![state_mutation(0)]);
+    let second = output(2);
+    let EffectTransition::Declare { outputs, .. } = &mut mutation.transition else {
+        panic!("expected declare")
+    };
+    outputs.push(second.clone());
+    let coordinator = effect_coordinator(transport, &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    let sink = RecordingApply::default();
+    sink.permanent_appends
+        .lock()
+        .unwrap()
+        .insert(second.writer_session_id);
+    let terminal = coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+
+    let EffectTransition::Aborted {
+        declares,
+        reason,
+        outputs,
+    } = &terminal.transition
+    else {
+        panic!("expected aborted, got {:?}", terminal.transition)
+    };
+    assert_eq!(*declares, mutation.request_id);
+    assert!(!reason.is_empty() && reason.len() <= 256);
+    // The terminal row restates the declared outputs so replay can
+    // discard any tail the first attempt left pending.
+    assert_eq!(outputs.len(), 2);
+    // Both declared outputs' Ranges were told to discard this effect's
+    // tail; the frontier never moved and no state mutation ran.
+    let discards = sink.discards.lock().unwrap();
+    assert_eq!(discards.len(), 2);
+    assert!(discards
+        .iter()
+        .all(|(_, effect, sub)| *effect == mutation.effect_id && *sub == scope()));
+    drop(discards);
+    assert!(sink.state_mutated.lock().unwrap().is_empty());
+    assert!(sink.frontier_request_log.lock().unwrap().is_empty());
+    // The first output did append under the pending marker before the
+    // second's permanent refusal.
+    assert_eq!(sink.appended.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn apply_committed_aborts_before_any_output_append() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare(Uuid::new_v4(), 1, 1);
+    let coordinator = effect_coordinator(transport, &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    let sink = RecordingApply::default();
+    let first = output(1);
+    sink.permanent_appends
+        .lock()
+        .unwrap()
+        .insert(first.writer_session_id);
+    let EffectTransition::Declare { outputs, .. } = &mutation.transition else {
+        panic!("expected declare")
+    };
+    sink.permanent_appends
+        .lock()
+        .unwrap()
+        .insert(outputs[0].writer_session_id);
+    let terminal = coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    assert!(matches!(
+        terminal.transition,
+        EffectTransition::Aborted { .. }
+    ));
+    assert!(sink.appended.lock().unwrap().is_empty());
+    assert_eq!(sink.discards.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn apply_committed_aborts_a_permanent_frontier_failure_after_outputs_appended() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare(Uuid::new_v4(), 1, 1);
+    let coordinator = effect_coordinator(transport, &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    let sink = RecordingApply::default();
+    *sink.permanent_frontier.lock().unwrap() = true;
+    let terminal = coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    assert!(matches!(
+        terminal.transition,
+        EffectTransition::Aborted { .. }
+    ));
+    // The appended output's tail was discarded and the frontier stayed
+    // uncommitted so the input redelivers to a later effect.
+    assert_eq!(sink.discards.lock().unwrap().len(), 1);
+    assert!(sink.frontier_request_log.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn apply_committed_aborted_replay_is_idempotent_and_never_reapplies() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare(Uuid::new_v4(), 1, 1);
+    let coordinator = effect_coordinator(transport, &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    let sink = RecordingApply::default();
+    let EffectTransition::Declare { outputs, .. } = &mutation.transition else {
+        panic!("expected declare")
+    };
+    let session = outputs[0].writer_session_id;
+    sink.permanent_appends.lock().unwrap().insert(session);
+    coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    assert_eq!(sink.discards.lock().unwrap().len(), 1);
+
+    // Replaying the terminal row drives the discard again (idempotent
+    // cleanup) but never re-appends outputs or moves the frontier.
+    sink.permanent_appends.lock().unwrap().clear();
+    let replayed = coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    assert!(matches!(
+        replayed.transition,
+        EffectTransition::Aborted { .. }
+    ));
+    assert!(sink.appended.lock().unwrap().is_empty());
+    assert!(sink.frontier_request_log.lock().unwrap().is_empty());
+    assert_eq!(sink.discards.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn apply_committed_abort_sweeps_a_foreign_discard_occupant() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare(Uuid::new_v4(), 1, 1);
+    let coordinator = effect_coordinator(transport, &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    let sink = RecordingApply::default();
+    let EffectTransition::Declare { outputs, .. } = &mutation.transition else {
+        panic!("expected declare")
+    };
+    sink.permanent_appends
+        .lock()
+        .unwrap()
+        .insert(outputs[0].writer_session_id);
+    *sink.occupied_discards.lock().unwrap() = 1;
+    let terminal = coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    assert!(matches!(
+        terminal.transition,
+        EffectTransition::Aborted { .. }
+    ));
+    assert_eq!(
+        sink.resolved.lock().unwrap().as_slice(),
+        &[finnstream::effect::EffectOccupant {
+            effect_id: Uuid::from_u128(6262),
+            subscription_id: Uuid::from_u128(6363),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn apply_committed_does_not_abort_once_applied_is_durable() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare(Uuid::new_v4(), 1, 1);
+    let coordinator = effect_coordinator(transport, &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    let sink = RecordingApply::default();
+    coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+
+    // A permanent release failure on the replayed Applied row cannot
+    // rewrite the committed decision: the error propagates and the row
+    // stays Applied.
+    *sink.permanent_releases.lock().unwrap() = 1;
+    let error = coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, EffectJournalError::Conflict));
+    let committed = coordinator
+        .read_committed(mutation.effect_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        committed.transition,
+        EffectTransition::Applied { .. }
+    ));
+}
+
+#[tokio::test]
+async fn apply_committed_aborts_through_an_ambiguous_terminal_commit() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare(Uuid::new_v4(), 1, 1);
+    let coordinator = effect_coordinator(transport.clone(), &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    let sink = RecordingApply::default();
+    let EffectTransition::Declare { outputs, .. } = &mutation.transition else {
+        panic!("expected declare")
+    };
+    sink.permanent_appends
+        .lock()
+        .unwrap()
+        .insert(outputs[0].writer_session_id);
+    // A lost commit reply on the terminal row reconciles to the same
+    // Aborted mutation instead of leaving the effect non-terminal.
+    transport
+        .commit_down
+        .lock()
+        .unwrap()
+        .insert(nodes[2].clone());
+    let terminal = coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    assert!(matches!(
+        terminal.transition,
+        EffectTransition::Aborted { .. }
+    ));
+}
+
+#[tokio::test]
+async fn apply_committed_next_effect_applies_after_an_aborted_tail_frees() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let coordinator = effect_coordinator(transport, &nodes);
+    let aborted = declare(Uuid::new_v4(), 1, 1);
+    coordinator.apply(aborted.clone()).await.unwrap();
+
+    let sink = RecordingApply::default();
+    let EffectTransition::Declare { outputs, .. } = &aborted.transition else {
+        panic!("expected declare")
+    };
+    sink.permanent_appends
+        .lock()
+        .unwrap()
+        .insert(outputs[0].writer_session_id);
+    coordinator
+        .apply_committed(aborted.effect_id, &sink)
+        .await
+        .unwrap();
+
+    let next = declare(Uuid::new_v4(), 1, 1);
+    coordinator.apply(next.clone()).await.unwrap();
+    let applied = coordinator
+        .apply_committed(next.effect_id, &sink)
+        .await
+        .unwrap();
+    assert!(matches!(
+        applied.transition,
+        EffectTransition::Applied { .. }
+    ));
+    assert_eq!(sink.appended.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn aborted_rows_obey_the_reason_and_output_bounds() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let declared = declare(Uuid::new_v4(), 1, 1);
+    let coordinator = effect_coordinator(transport, &nodes);
+    coordinator.apply(declared.clone()).await.unwrap();
+
+    let aborted = |reason: String| EffectMutation {
+        effect_id: declared.effect_id,
+        subscription_id: scope(),
+        ownership_epoch: 1,
+        sequence: 2,
+        request_id: Uuid::new_v4(),
+        transition: EffectTransition::Aborted {
+            declares: declared.request_id,
+            reason,
+            outputs: Vec::new(),
+        },
+    };
+    for reason in [String::new(), "x".repeat(257)] {
+        let error = coordinator.apply(aborted(reason)).await.unwrap_err();
+        assert!(matches!(error, EffectJournalError::TooLarge));
+    }
+    // In-bound reasons commit as the terminal row.
+    coordinator
+        .apply(aborted("sink refused the output".to_owned()))
+        .await
+        .unwrap();
 }

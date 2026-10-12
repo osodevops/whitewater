@@ -309,6 +309,9 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
         state.clone(),
         authorize_replica_append,
     ));
+    let replica_discard_pending_route = post(replica_discard_pending).layer(
+        middleware::from_fn_with_state(state.clone(), authorize_replica_append),
+    );
     // On the mTLS plane the pinned peer certificate is the credential; the
     // shared Control Plane key stays required on the plain internal plane.
     let subscription_key_layer = |route: axum::routing::MethodRouter<AppState>| {
@@ -341,6 +344,9 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
         authorize_replica_append,
     ));
     let owner_release_pending_route = post(owner_release_pending).layer(
+        middleware::from_fn_with_state(state.clone(), authorize_replica_append),
+    );
+    let owner_discard_pending_route = post(owner_discard_pending).layer(
         middleware::from_fn_with_state(state.clone(), authorize_replica_append),
     );
     let recovery_progress_route = post(recovery_progress).layer(middleware::from_fn_with_state(
@@ -475,10 +481,18 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             "/internal/active-range/replica/commit",
             replica_commit_route,
         )
+        .route(
+            "/internal/active-range/replica/discard-pending",
+            replica_discard_pending_route,
+        )
         .route("/internal/active-range/owner/append", owner_append_route)
         .route(
             "/internal/active-range/owner/release-pending",
             owner_release_pending_route,
+        )
+        .route(
+            "/internal/active-range/owner/discard-pending",
+            owner_discard_pending_route,
         )
         .route(
             "/internal/active-range/recovery/progress",
@@ -1074,6 +1088,25 @@ async fn replica_commit(
         },
         Err(error) => ReplicaCommitResponse {
             result: None,
+            error: Some(error),
+        },
+    }))
+}
+
+async fn replica_discard_pending(
+    State(state): State<AppState>,
+    Json(request): Json<crate::active_range::ReplicaDiscardPendingRequest>,
+) -> Result<Json<crate::active_range::ReplicaDiscardPendingResponse>, ApiError> {
+    let service = state.replica_append.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "Active Range replica storage is not configured on this Node".to_owned(),
+        code: None,
+    })?;
+    Ok(Json(match service.discard_pending(request).await {
+        Ok(response) => response,
+        Err(error) => crate::active_range::ReplicaDiscardPendingResponse {
+            outcome: None,
+            occupant: None,
             error: Some(error),
         },
     }))
@@ -4709,6 +4742,35 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
         }
     }
 
+    async fn discard_output(
+        &self,
+        output: &crate::effect::EffectOutput,
+        effect_id: uuid::Uuid,
+        subscription_id: uuid::Uuid,
+    ) -> Result<crate::effect::EffectDiscardOutcome, crate::effect::EffectJournalError> {
+        match route_pending_discard_to_owner(self.state, output, effect_id, subscription_id).await {
+            Ok(crate::active_range::PendingDiscardOutcome::Discarded { dropped_frames }) => {
+                Ok(crate::effect::EffectDiscardOutcome::Discarded { dropped_frames })
+            }
+            Ok(crate::active_range::PendingDiscardOutcome::NotPending) => {
+                Ok(crate::effect::EffectDiscardOutcome::NotPending)
+            }
+            Ok(crate::active_range::PendingDiscardOutcome::Occupied(occupant)) => {
+                Ok(crate::effect::EffectDiscardOutcome::Occupied {
+                    occupant: crate::effect::EffectOccupant {
+                        effect_id: occupant.effect_id,
+                        subscription_id: occupant.subscription_id,
+                    },
+                })
+            }
+            Err(error) => Err(if error.status.is_server_error() {
+                crate::effect::EffectJournalError::Unavailable
+            } else {
+                crate::effect::EffectJournalError::Conflict
+            }),
+        }
+    }
+
     async fn mutate_state(
         &self,
         mutation: &crate::effect::EffectStateMutation,
@@ -8245,6 +8307,106 @@ async fn route_pending_release_to_owner(
     })
 }
 
+/// Route one declared output's pending-tail discard to its Range's
+/// current Append Owner. Range resolution happens per call so a replayed
+/// abort tracks a Range that split or moved after the append.
+async fn route_pending_discard_to_owner(
+    state: &AppState,
+    output: &crate::effect::EffectOutput,
+    effect_id: uuid::Uuid,
+    subscription_id: uuid::Uuid,
+) -> Result<crate::active_range::PendingDiscardOutcome, ApiError> {
+    let routing_key = decode_base64("key_base64", &output.key_base64)?;
+    if routing_key.is_empty() {
+        return Err(ApiError::bad_request(
+            "key_base64 must contain a non-empty key",
+        ));
+    }
+    let (_, assignment) = state
+        .control
+        .active_range_for_key(output.feed_id, &routing_key)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
+    let request = crate::active_range::PendingReleaseRequest {
+        feed_id: output.feed_id,
+        range_id: assignment.range_id,
+        generation: assignment.generation,
+        ownership_epoch: assignment.ownership_epoch,
+        append_owner: assignment.owner.clone(),
+        effect_id,
+        subscription_id,
+    };
+    let local = state.storage_node_id.as_ref().ok_or_else(|| {
+        ApiError::unavailable("this Node is not configured for Active Range routing")
+    })?;
+    if &assignment.owner == local {
+        return state
+            .majority_append
+            .as_ref()
+            .ok_or_else(|| ApiError::unavailable("majority append coordinator is unavailable"))?
+            .discard_pending_effect(request)
+            .await
+            .map_err(majority_api_error);
+    }
+    let endpoint = state
+        .control_endpoints
+        .resolve(&assignment.owner)
+        .await
+        .ok_or_else(|| {
+            ApiError::unavailable(format!(
+                "current Append Owner {} has no endpoint",
+                assignment.owner
+            ))
+        })?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("internal forwarding credential is unavailable"))?;
+    let response = state
+        .internal_http
+        .post(format!(
+            "{}/internal/active-range/owner/discard-pending",
+            endpoint.trim_end_matches('/')
+        ))
+        .header("x-whitewater-control-key", key)
+        .json(&request)
+        .send()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::unavailable(format!(
+            "Append Owner returned HTTP {}",
+            response.status()
+        )));
+    }
+    let response: OwnerDiscardResponse = response
+        .json()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    response.outcome.ok_or_else(|| ApiError {
+        status: if response.retryable {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::CONFLICT
+        },
+        message: response
+            .error
+            .unwrap_or_else(|| "Append Owner returned no discard outcome".to_owned()),
+        code: None,
+    })
+}
+
+/// `POST /internal/active-range/owner/discard-pending` response body.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct OwnerDiscardResponse {
+    #[serde(default)]
+    outcome: Option<crate::active_range::PendingDiscardOutcome>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    retryable: bool,
+}
+
 /// `POST /internal/active-range/owner/release-pending` response body.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct OwnerReleaseResponse {
@@ -8280,6 +8442,37 @@ async fn owner_release_pending(
             },
         },
         None => OwnerReleaseResponse {
+            outcome: None,
+            error: Some("majority append coordinator is unavailable".to_owned()),
+            retryable: true,
+        },
+    })
+}
+
+/// `POST /internal/active-range/owner/discard-pending`
+///
+/// Owner-side endpoint that discards one effect's pending tail on an
+/// output Range after its `Aborted` marker is durable. `NotPending`
+/// means the tail already resolved; `Occupied` reports the effect
+/// holding it instead.
+async fn owner_discard_pending(
+    State(state): State<AppState>,
+    Json(request): Json<crate::active_range::PendingReleaseRequest>,
+) -> Json<OwnerDiscardResponse> {
+    Json(match state.majority_append.as_ref() {
+        Some(coordinator) => match coordinator.discard_pending_effect(request).await {
+            Ok(outcome) => OwnerDiscardResponse {
+                outcome: Some(outcome),
+                error: None,
+                retryable: false,
+            },
+            Err(error) => OwnerDiscardResponse {
+                outcome: None,
+                error: Some(error.to_string()),
+                retryable: error.retryable,
+            },
+        },
+        None => OwnerDiscardResponse {
             outcome: None,
             error: Some("majority append coordinator is unavailable".to_owned()),
             retryable: true,
@@ -16029,6 +16222,23 @@ mod tests {
                     retryable: error.retryable,
                 })
         }
+
+        async fn discard_pending(
+            &self,
+            replica: &crate::active_range::StorageNodeId,
+            request: crate::active_range::ReplicaDiscardPendingRequest,
+        ) -> Result<
+            crate::active_range::ReplicaDiscardPendingResponse,
+            crate::active_range::ReplicaTransportError,
+        > {
+            self.services[replica]
+                .discard_pending(request)
+                .await
+                .map_err(|error| crate::active_range::ReplicaTransportError {
+                    message: error.message,
+                    retryable: error.retryable,
+                })
+        }
     }
 
     #[tokio::test]
@@ -16234,6 +16444,195 @@ mod tests {
                 1
             );
         }
+        plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_outputs_discard_through_the_owner_endpoint() {
+        let directory = TempDir::new().unwrap();
+        let (mut state, plane, control, _replica) = internal_replica_test_state(&directory).await;
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        let assignment = control.active_range_assignment(feed.feed_id).await.unwrap();
+        let services: BTreeMap<_, _> = assignment
+            .replicas
+            .iter()
+            .map(|node| {
+                (
+                    node.clone(),
+                    Arc::new(crate::active_range::ReplicaAppendService::new(
+                        directory.path().join("owner-ranges").join(node.as_str()),
+                        node.clone(),
+                        control.clone(),
+                    )),
+                )
+            })
+            .collect();
+        let owner = assignment.owner.clone();
+        let services = Arc::new(services);
+        state.storage_node_id = Some(owner.clone());
+        state.replica_append = Some(services[&owner].clone());
+        state.majority_append = Some(Arc::new(
+            crate::active_range::MajorityAppendCoordinator::new(
+                services[&owner].clone(),
+                control.clone(),
+                Arc::new(LoopbackReplicaTransport {
+                    services: services.clone(),
+                }),
+            ),
+        ));
+        let app = router(state);
+
+        let effect = Uuid::from_u128(920);
+        let subscription = Uuid::from_u128(921);
+        let append_body = serde_json::json!({
+            "request_id": Uuid::from_u128(922),
+            "feed": "orders.events",
+            "writer_session_id": Uuid::from_u128(923),
+            "writer_epoch": 1,
+            "sequence": 1,
+            "key_base64": base64::engine::general_purpose::STANDARD.encode(b"customer-1"),
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(b"held"),
+            "pending_effect": {
+                "effect_id": effect,
+                "subscription_id": subscription,
+            },
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/active-range/owner/append")
+            .header("content-type", "application/json")
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key",
+            )
+            .body(Body::from(serde_json::to_vec(&append_body).unwrap()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(services[&owner]
+            .pending_effect(&assignment)
+            .await
+            .unwrap()
+            .is_some());
+
+        // A discard naming a different effect reports the occupant and
+        // leaves the held tail untouched.
+        let discard = |effect_id: Uuid| {
+            serde_json::json!({
+                "feed_id": feed.feed_id,
+                "range_id": assignment.range_id,
+                "generation": assignment.generation,
+                "ownership_epoch": assignment.ownership_epoch,
+                "append_owner": owner,
+                "effect_id": effect_id,
+                "subscription_id": subscription,
+            })
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/active-range/owner/discard-pending")
+            .header("content-type", "application/json")
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key",
+            )
+            .body(Body::from(
+                serde_json::to_vec(&discard(Uuid::from_u128(924))).unwrap(),
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: OwnerDiscardResponse = serde_json::from_slice(&bytes).unwrap();
+        match reply.outcome {
+            Some(crate::active_range::PendingDiscardOutcome::Occupied(marker)) => {
+                assert_eq!(marker.effect_id, effect);
+            }
+            other => panic!("expected Occupied, got {other:?}"),
+        }
+
+        // The owning effect's discard truncates the tail across the
+        // quorum; nothing became visible and markers are gone.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/active-range/owner/discard-pending")
+            .header("content-type", "application/json")
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key",
+            )
+            .body(Body::from(serde_json::to_vec(&discard(effect)).unwrap()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: OwnerDiscardResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            reply.outcome,
+            Some(crate::active_range::PendingDiscardOutcome::Discarded { dropped_frames: 1 })
+        );
+        for service in services.values() {
+            assert_eq!(service.pending_effect(&assignment).await.unwrap(), None);
+            assert!(service
+                .read_staged_committed(&assignment, None, 10)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+
+        // A retried discard reports the tail already resolved.
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/active-range/owner/discard-pending")
+            .header("content-type", "application/json")
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key",
+            )
+            .body(Body::from(serde_json::to_vec(&discard(effect)).unwrap()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: OwnerDiscardResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            reply.outcome,
+            Some(crate::active_range::PendingDiscardOutcome::NotPending)
+        );
+
+        // The freed Range accepts ordinary appends at the next position.
+        let next = serde_json::json!({
+            "request_id": Uuid::from_u128(925),
+            "feed": "orders.events",
+            "writer_session_id": Uuid::from_u128(926),
+            "writer_epoch": 1,
+            "sequence": 1,
+            "key_base64": base64::engine::general_purpose::STANDARD.encode(b"customer-1"),
+            "payload_base64": base64::engine::general_purpose::STANDARD.encode(b"next"),
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/internal/active-range/owner/append")
+            .header("content-type", "application/json")
+            .header(
+                "x-whitewater-control-key",
+                "this-is-a-long-control-plane-key",
+            )
+            .body(Body::from(serde_json::to_vec(&next).unwrap()))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: InternalOwnerAppendResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(reply.result.is_some());
+        assert_eq!(reply.position, Some(1));
         plane.raft().shutdown().await.unwrap();
     }
 }

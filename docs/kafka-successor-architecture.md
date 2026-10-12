@@ -262,6 +262,24 @@ Failure semantics fall out of the mechanism rather than a separate protocol:
   from `drive_once`. Nothing invents a new decision on retry; a dependency
   that stays ambiguous past the bound fails the apply as retryable
   `Unavailable` and a later drive converges the same committed Declare.
+- **Permanent sink failure** - a non-retryable refusal on a non-terminal
+  `Declare` can no longer wedge the output Ranges: `apply_committed`
+  journals a terminal `Aborted` row (bounded reason, the committed
+  Declare's request id, and the declared outputs restated so replay is
+  self-contained) under a deterministic request identity, then runs the
+  discard phase. Each declared output's Range receives a marker-verified
+  discard - the Range truncates the uncommitted tail only when the marker
+  names the aborting effect, reports `Occupied` for a foreign holder so
+  the sweep machinery resolves it instead, and reports `NotPending` when
+  the tail already resolved. The owner broadcasts the discard to both
+  followers best-effort, including when its local marker already resolved,
+  so a follower that missed the first discard heals on the re-drive; a
+  permanently unreachable follower still drops the tail through the
+  uncommitted-truncation path on ownership change. A crash between the
+  `Aborted` commit and the discard replays the discard from the terminal
+  row alone, and once `Applied` is durable a permanent failure propagates
+  instead of rewriting the decision - the consumed frontier never moves on
+  an abort, so the input redelivers to a later effect.
 
 Co-located StateStore mutations join the boundary through that same
 release phase rather than a separate transaction protocol. A `Declare` may

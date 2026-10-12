@@ -104,7 +104,15 @@ pub enum EffectTransition {
     },
     /// The decision was abandoned by policy (for example a poison input was
     /// quarantined); `declares` identifies the committed `Declare` request.
-    Aborted { declares: Uuid, reason: String },
+    Aborted {
+        declares: Uuid,
+        reason: String,
+        /// The declared outputs whose pending tails must be discarded on
+        /// apply replay; restated on the terminal row like `Applied` so a
+        /// post-crash replay is self-contained.
+        #[serde(default)]
+        outputs: Vec<EffectOutput>,
+    },
 }
 
 /// One bounded mutation against an effect journal row.
@@ -120,6 +128,15 @@ pub struct EffectMutation {
     pub request_id: Uuid,
     pub transition: EffectTransition,
 }
+
+/// Bounded per-step retries settle transient or ambiguous sink results in
+/// place: each retry replays the identical deterministic identity, so the
+/// outcome converges to exactly one result and a genuinely stuck
+/// dependency still fails the apply closed.
+const MAX_APPLY_ATTEMPTS: usize = 3;
+
+/// Bounded occupant sweeps per output Range before failing closed.
+const MAX_PENDING_SWEEPS: usize = 4;
 
 /// Digest evidence that a replica durably prepared a mutation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -632,8 +649,19 @@ fn validate_effect_bounds(mutation: &EffectMutation) -> Result<(), EffectJournal
                 return Err(EffectJournalError::TooLarge);
             }
         }
-        EffectTransition::Aborted { reason, .. } => {
-            if reason.is_empty() || reason.len() > 256 {
+        EffectTransition::Aborted {
+            reason, outputs, ..
+        } => {
+            if reason.is_empty()
+                || reason.len() > 256
+                || outputs.len() > EFFECT_MAX_OUTPUTS
+                || outputs.iter().any(|output| {
+                    output.key_base64.is_empty()
+                        || output.key_base64.len() > EFFECT_MAX_OUTPUT_FIELD
+                        || output.payload_base64.len() > EFFECT_MAX_OUTPUT_FIELD
+                        || output.sequence == 0
+                })
+            {
                 return Err(EffectJournalError::TooLarge);
             }
         }
@@ -987,12 +1015,6 @@ impl EffectCoordinator {
         effect_id: Uuid,
         apply: &A,
     ) -> Result<EffectMutation, EffectJournalError> {
-        const MAX_PENDING_SWEEPS: usize = 4;
-        // Bounded per-step retries settle transient or ambiguous sink
-        // results in place: each retry replays the identical deterministic
-        // identity, so the outcome converges to exactly one result and a
-        // genuinely stuck dependency still fails the apply closed.
-        const MAX_APPLY_ATTEMPTS: usize = 3;
         let committed = self
             .read_committed(effect_id)
             .await?
@@ -1015,8 +1037,51 @@ impl EffectCoordinator {
                 state_mutations,
                 ..
             } => (None, outputs.as_slice(), state_mutations.as_slice()),
-            EffectTransition::Aborted { .. } => return Ok(committed),
+            EffectTransition::Aborted { outputs, .. } => {
+                // Terminal replay: the abort decision is durable; discard
+                // any pending tail that survived the first pass so the
+                // output Ranges unwedge, then settle.
+                self.discard_declared_outputs(outputs, effect_id, committed.subscription_id, apply)
+                    .await?;
+                return Ok(committed);
+            }
         };
+        let is_declare = matches!(committed.transition, EffectTransition::Declare { .. });
+        match self
+            .apply_phases(
+                &committed,
+                effect_id,
+                consume,
+                outputs,
+                state_mutations,
+                apply,
+            )
+            .await
+        {
+            Ok(terminal) => Ok(terminal),
+            // A non-retryable failure before the terminal marker must not
+            // wedge the output Ranges: journal `Aborted`, then discard
+            // this effect's pending tails so the Range frees for the next
+            // effect.
+            Err(error) if is_declare && !effect_retryable(&error) => {
+                self.abort_declared(&committed, outputs, error, apply).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The append, frontier, terminal-marker, release, and state-mutation
+    /// phases for a non-terminal row — and the replay of those phases for
+    /// an already-`Applied` row.
+    async fn apply_phases<A: EffectApply + ?Sized>(
+        &self,
+        committed: &EffectMutation,
+        effect_id: Uuid,
+        consume: Option<&EffectConsume>,
+        outputs: &[EffectOutput],
+        state_mutations: &[EffectStateMutation],
+        apply: &A,
+    ) -> Result<EffectMutation, EffectJournalError> {
         let mut receipts = Vec::with_capacity(outputs.len());
         for output in outputs {
             let mut sweeps = 0;
@@ -1194,6 +1259,115 @@ impl EffectCoordinator {
         }
         Ok(terminal)
     }
+
+    /// Terminalize a committed `Declare` whose apply hit a permanent
+    /// failure: journal `Aborted` under a deterministic request identity,
+    /// then discard this effect's pending tails. The terminal row is
+    /// journaled first so a crash before the discard replays it from the
+    /// `Aborted` arm instead of leaving the marker wedged.
+    async fn abort_declared<A: EffectApply + ?Sized>(
+        &self,
+        committed: &EffectMutation,
+        outputs: &[EffectOutput],
+        cause: EffectJournalError,
+        apply: &A,
+    ) -> Result<EffectMutation, EffectJournalError> {
+        let aborted = EffectMutation {
+            effect_id: committed.effect_id,
+            subscription_id: committed.subscription_id,
+            ownership_epoch: committed.ownership_epoch,
+            sequence: committed.sequence + 1,
+            request_id: effect_apply_request_id(committed.request_id, b"aborted"),
+            transition: EffectTransition::Aborted {
+                declares: committed.request_id,
+                reason: abort_reason(&cause),
+                outputs: outputs.to_vec(),
+            },
+        };
+        let terminal = match self.apply(aborted.clone()).await {
+            Ok(row) => row,
+            Err(EffectJournalError::AmbiguousCommit | EffectJournalError::NoQuorum) => {
+                self.reconcile_retry(aborted).await?
+            }
+            Err(error) => return Err(error),
+        };
+        self.discard_declared_outputs(
+            outputs,
+            committed.effect_id,
+            committed.subscription_id,
+            apply,
+        )
+        .await?;
+        Ok(terminal)
+    }
+
+    /// Discard this effect's pending tail on every declared output's
+    /// Range. Marker verification inside the Range store guarantees only
+    /// tails owned by this effect are truncated; a foreign occupant is
+    /// swept through its own journal, bounded, before failing closed.
+    async fn discard_declared_outputs<A: EffectApply + ?Sized>(
+        &self,
+        outputs: &[EffectOutput],
+        effect_id: Uuid,
+        subscription_id: Uuid,
+        apply: &A,
+    ) -> Result<(), EffectJournalError> {
+        for output in outputs {
+            let mut sweeps = 0;
+            let mut attempts = 0;
+            loop {
+                let outcome = match apply
+                    .discard_output(output, effect_id, subscription_id)
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(error) if effect_retryable(&error) => {
+                        attempts += 1;
+                        if attempts >= MAX_APPLY_ATTEMPTS {
+                            return Err(error);
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                };
+                match outcome {
+                    EffectDiscardOutcome::Discarded { .. } | EffectDiscardOutcome::NotPending => {
+                        break
+                    }
+                    EffectDiscardOutcome::Occupied { occupant } => {
+                        sweeps += 1;
+                        if sweeps > MAX_PENDING_SWEEPS {
+                            return Err(EffectJournalError::Unavailable);
+                        }
+                        match apply.resolve_pending(occupant).await {
+                            Ok(()) => {}
+                            Err(error) if effect_retryable(&error) => {
+                                attempts += 1;
+                                if attempts >= MAX_APPLY_ATTEMPTS {
+                                    return Err(error);
+                                }
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A bounded, non-empty abort reason for the terminal journal row.
+fn abort_reason(cause: &EffectJournalError) -> String {
+    let mut reason = cause.to_string();
+    while reason.len() > 256 {
+        reason.pop();
+    }
+    if reason.is_empty() {
+        "permanent apply failure".to_owned()
+    } else {
+        reason
+    }
 }
 
 /// Where one appended output landed; the release phase commits each touched
@@ -1222,6 +1396,17 @@ pub enum EffectReleaseOutcome {
     /// No marker holds the tail; `committed` is the Range's current boundary
     /// so the caller can tell released-apart from truncated-and-lost.
     NotPending { committed: u64 },
+    /// A different effect holds the tail; its journal decides the outcome.
+    Occupied { occupant: EffectOccupant },
+}
+
+/// The outcome of discarding an effect's pending tail on one Range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EffectDiscardOutcome {
+    /// The marker's uncommitted tail was truncated and cleared.
+    Discarded { dropped_frames: u64 },
+    /// No tail holds the Range — already resolved or never appended.
+    NotPending,
     /// A different effect holds the tail; its journal decides the outcome.
     Occupied { occupant: EffectOccupant },
 }
@@ -1276,6 +1461,21 @@ pub trait EffectApply: Send + Sync {
     /// default refuses, which turns `PendingOccupied` into a retryable
     /// `Unavailable` for callers that cannot reach the occupant's journal.
     async fn resolve_pending(&self, _occupant: EffectOccupant) -> Result<(), EffectJournalError> {
+        Err(EffectJournalError::Unavailable)
+    }
+
+    /// Discard this effect's pending tail on `output`'s Range: truncate the
+    /// uncommitted frames and clear the marker when the occupant is this
+    /// effect. Called after the terminal `Aborted` row is durable, and
+    /// again on replay so a crash between terminal commit and tail cleanup
+    /// still converges. The default refuses, which turns the discard into
+    /// a retryable `Unavailable` for callers without Range routing.
+    async fn discard_output(
+        &self,
+        _output: &EffectOutput,
+        _effect_id: Uuid,
+        _subscription_id: Uuid,
+    ) -> Result<EffectDiscardOutcome, EffectJournalError> {
         Err(EffectJournalError::Unavailable)
     }
 }

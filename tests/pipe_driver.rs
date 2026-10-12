@@ -426,6 +426,7 @@ struct RecordingApply {
     appends: Mutex<Vec<EffectOutput>>,
     mutations: Mutex<Vec<finnstream::effect::EffectStateMutation>>,
     fail_releases: Mutex<u8>,
+    discards: Mutex<Vec<(Uuid, Uuid, Uuid)>>,
 }
 
 #[async_trait::async_trait]
@@ -509,6 +510,19 @@ impl EffectApply for RecordingApply {
         self.mutations.lock().unwrap().push(mutation.clone());
         Ok(())
     }
+
+    async fn discard_output(
+        &self,
+        output: &EffectOutput,
+        effect_id: Uuid,
+        subscription_id: Uuid,
+    ) -> Result<finnstream::effect::EffectDiscardOutcome, EffectJournalError> {
+        self.discards
+            .lock()
+            .unwrap()
+            .push((output.feed_id, effect_id, subscription_id));
+        Ok(finnstream::effect::EffectDiscardOutcome::Discarded { dropped_frames: 1 })
+    }
 }
 
 fn progress_to_effect(error: SubscriptionProgressError) -> EffectJournalError {
@@ -563,6 +577,7 @@ fn harness_for(pipe: PipeDefinition) -> Harness {
         appends: Mutex::new(Vec::new()),
         mutations: Mutex::new(Vec::new()),
         fail_releases: Mutex::new(0),
+        discards: Mutex::new(Vec::new()),
     };
     Harness {
         _progress_dirs: progress_dirs,
@@ -822,7 +837,7 @@ async fn pipe_driver_replays_outputs_identically_when_applied_commit_is_ambiguou
 }
 
 #[tokio::test]
-async fn pipe_driver_fences_a_frontier_that_moved_mid_apply() {
+async fn pipe_driver_aborts_a_declare_whose_frontier_moved_mid_apply() {
     let harness = harness();
     seed_frontier(&harness.progress, "p0").await;
 
@@ -845,7 +860,7 @@ async fn pipe_driver_fences_a_frontier_that_moved_mid_apply() {
     // Move it inside the fetch so the driver has already read "p0".
     let moved = Mutex::new(Some(moved));
     let mover = Mutex::new(Some(mover));
-    let error = harness
+    let terminal = harness
         .driver
         .drive_once(
             64,
@@ -861,11 +876,13 @@ async fn pipe_driver_fences_a_frontier_that_moved_mid_apply() {
             &harness.sink,
         )
         .await
-        .unwrap_err();
-    assert!(matches!(error, EffectJournalError::Conflict));
+        .unwrap()
+        .expect("terminal row");
 
-    // The Declare stays committed but un-applied; the frontier is the
-    // competing consumer's "pX", not the stale "p1".
+    // The stale-frontier refusal terminalizes the Declare as Aborted
+    // rather than leaving the output tail fenced forever: the row names
+    // the committed Declare, the discard freed the Range, and the
+    // competing consumer's "pX" frontier is untouched.
     let effect_id = pipe_effect_id(pipe().pipe_id, Uuid::from_u128(SUBSCRIPTION), "p0");
     let row = harness
         .journal
@@ -873,7 +890,15 @@ async fn pipe_driver_fences_a_frontier_that_moved_mid_apply() {
         .await
         .unwrap()
         .expect("declare committed");
-    assert!(matches!(row.transition, EffectTransition::Declare { .. }));
+    let EffectTransition::Aborted { declares, .. } = &row.transition else {
+        panic!("expected aborted, got {:?}", row.transition)
+    };
+    assert_eq!(*declares, pipe_declare_request_id(effect_id));
+    assert!(matches!(
+        terminal.transition,
+        EffectTransition::Aborted { .. }
+    ));
+    assert_eq!(harness.sink.discards.lock().unwrap().len(), 1);
     let frontier = harness
         .progress
         .read_committed()

@@ -10,7 +10,8 @@ use crate::control::ControlController;
 use super::{
     CommitPosition, ReplicaAppendAccepted, ReplicaAppendErrorCode, ReplicaAppendRequest,
     ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest,
-    ReplicaCommitResponse, StorageNodeId, ACTIVE_RANGE_COMMIT_QUORUM,
+    ReplicaCommitResponse, ReplicaDiscardPendingRequest, ReplicaDiscardPendingResponse,
+    StorageNodeId, ACTIVE_RANGE_COMMIT_QUORUM,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +84,14 @@ pub trait ReplicaTransport: Send + Sync {
         replica: &StorageNodeId,
         request: ReplicaCommitRequest,
     ) -> Result<ReplicaCommitAccepted, ReplicaTransportError>;
+
+    /// Discard one effect's pending tail on `replica`; marker verification
+    /// inside the replica store truncates only the matching occupant.
+    async fn discard_pending(
+        &self,
+        replica: &StorageNodeId,
+        request: ReplicaDiscardPendingRequest,
+    ) -> Result<ReplicaDiscardPendingResponse, ReplicaTransportError>;
 }
 
 #[derive(Clone)]
@@ -497,6 +506,109 @@ impl MajorityAppendCoordinator {
         })
     }
 
+    /// Discard one effect's pending tail on this Range: the local replica
+    /// truncates the marker's uncommitted frames and the discard then
+    /// broadcasts to both followers best-effort — including when the local
+    /// marker already resolved, so a follower that missed the first
+    /// discard still heals when the request reaches it. `Occupied`
+    /// reports the local marker's foreign owner and discards nothing
+    /// locally.
+    pub async fn discard_pending_effect(
+        &self,
+        request: PendingReleaseRequest,
+    ) -> Result<super::store::PendingDiscardOutcome, MajorityAppendError> {
+        let _append_guard = self.append_lock.lock().await;
+        let assignment = self
+            .control
+            .active_range_assignment_by_id(request.range_id)
+            .await
+            .ok_or_else(|| {
+                self.error(
+                    MajorityAppendErrorCode::AssignmentNotFound,
+                    "Active Range assignment is not available",
+                    true,
+                    vec![],
+                    vec![],
+                )
+            })?;
+        if assignment.feed_id != request.feed_id
+            || assignment.generation != request.generation
+            || assignment.ownership_epoch != request.ownership_epoch
+            || assignment.owner != *self.local.local_node()
+            || request.append_owner != assignment.owner
+        {
+            return Err(self.error(
+                MajorityAppendErrorCode::NotCurrentOwner,
+                format!(
+                    "Node {} is not the current Append Owner for this discard",
+                    self.local.local_node()
+                ),
+                false,
+                vec![],
+                vec![],
+            ));
+        }
+        let discard = ReplicaDiscardPendingRequest {
+            feed_id: request.feed_id,
+            range_id: request.range_id,
+            generation: request.generation,
+            ownership_epoch: request.ownership_epoch,
+            append_owner: assignment.owner.clone(),
+            effect_id: request.effect_id,
+            subscription_id: request.subscription_id,
+        };
+        let local_reply = self
+            .local
+            .discard_pending(discard.clone())
+            .await
+            .map_err(|error| {
+                self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    error.to_string(),
+                    error.retryable,
+                    vec![],
+                    vec![],
+                )
+            })?;
+        let followers = assignment
+            .replicas
+            .iter()
+            .filter(|node| *node != self.local.local_node())
+            .cloned()
+            .collect::<Vec<_>>();
+        if followers.len() >= 2 {
+            // Best-effort: an unreachable follower keeps its copy of the
+            // uncommitted tail until the discard is re-driven (abort
+            // replay or occupant sweep) or owner recovery truncates it.
+            let first = self
+                .transport
+                .discard_pending(&followers[0], discard.clone());
+            let second = self.transport.discard_pending(&followers[1], discard);
+            let _ = tokio::join!(first, second);
+        }
+        let outcome = match (local_reply.outcome, local_reply.occupant) {
+            (Some(super::replication::ReplicaDiscardOutcome::NotPending), _) => {
+                super::store::PendingDiscardOutcome::NotPending
+            }
+            (Some(super::replication::ReplicaDiscardOutcome::Occupied), Some(marker)) => {
+                super::store::PendingDiscardOutcome::Occupied(marker)
+            }
+            (Some(super::replication::ReplicaDiscardOutcome::Discarded { dropped_frames }), _) => {
+                super::store::PendingDiscardOutcome::Discarded { dropped_frames }
+            }
+            _ => {
+                return Err(self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    "local replica returned no discard outcome",
+                    true,
+                    vec![],
+                    vec![],
+                ))
+            }
+        };
+        Ok(outcome)
+    }
+
     fn occupied_error(&self, occupant: Option<super::store::PendingEffect>) -> MajorityAppendError {
         let mut error = self.error(
             MajorityAppendErrorCode::PendingEffectOccupied,
@@ -677,6 +789,31 @@ impl ReplicaTransport for HttpReplicaTransport {
             }),
             (None, None) => Err(ReplicaTransportError {
                 message: "replica returned no commit result".to_owned(),
+                retryable: true,
+            }),
+        }
+    }
+
+    async fn discard_pending(
+        &self,
+        replica: &StorageNodeId,
+        request: ReplicaDiscardPendingRequest,
+    ) -> Result<ReplicaDiscardPendingResponse, ReplicaTransportError> {
+        let response: ReplicaDiscardPendingResponse = self
+            .post(
+                replica,
+                "/internal/active-range/replica/discard-pending",
+                &request,
+            )
+            .await?;
+        match (response.outcome.as_ref(), response.error.as_ref()) {
+            (Some(_), _) => Ok(response),
+            (None, Some(error)) => Err(ReplicaTransportError {
+                message: error.message.clone(),
+                retryable: error.retryable,
+            }),
+            (None, None) => Err(ReplicaTransportError {
+                message: "replica returned no discard outcome".to_owned(),
                 retryable: true,
             }),
         }

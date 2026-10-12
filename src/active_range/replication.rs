@@ -157,6 +157,48 @@ pub struct ReplicaCommitResponse {
     pub error: Option<ReplicaAppendError>,
 }
 
+/// Discard one effect's pending tail on a member replica: the uncommitted
+/// frames are truncated and the marker cleared when the occupant matches.
+/// Members the owner lost contact with still resolve their tail through
+/// the uncommitted-truncation path on ownership change.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaDiscardPendingRequest {
+    pub feed_id: Uuid,
+    pub range_id: RangeId,
+    pub generation: RangeGeneration,
+    pub ownership_epoch: OwnershipEpoch,
+    pub append_owner: StorageNodeId,
+    pub effect_id: Uuid,
+    pub subscription_id: Uuid,
+}
+
+/// The replica-level outcome of a discard request.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub enum ReplicaDiscardOutcome {
+    /// No effect holds the tail on this replica.
+    NotPending,
+    /// A different effect holds the tail; `occupant` carries its identity.
+    Occupied,
+    /// The matching marker's uncommitted tail was truncated and cleared.
+    Discarded { dropped_frames: u64 },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaDiscardPendingResponse {
+    /// `None` means a store-level discard outcome could not be produced
+    /// (the error field carries the reason).
+    #[serde(default)]
+    pub outcome: Option<ReplicaDiscardOutcome>,
+    /// The occupant identity when the tail is held by a different effect.
+    #[serde(default)]
+    pub occupant: Option<super::store::PendingEffect>,
+    #[serde(default)]
+    pub error: Option<ReplicaAppendError>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReadReplicaEvidence {
     pub node: StorageNodeId,
@@ -340,6 +382,75 @@ impl ReplicaAppendService {
     ) -> Result<Option<super::store::PendingEffect>, ReplicaAppendError> {
         let store = self.store_for(assignment).await?;
         store.pending_effect().await.map_err(map_store_error)
+    }
+
+    /// Discard one effect's pending tail on this replica. Fencing matches
+    /// the commit path: assignment, generation, epoch, and member checks
+    /// all run before the store truncates anything.
+    pub async fn discard_pending(
+        &self,
+        request: ReplicaDiscardPendingRequest,
+    ) -> Result<ReplicaDiscardPendingResponse, ReplicaAppendError> {
+        let assignment = self
+            .control
+            .active_range_assignment_by_id(request.range_id)
+            .await
+            .filter(|assignment| assignment.feed_id == request.feed_id)
+            .ok_or_else(|| {
+                ReplicaAppendError::temporary(
+                    ReplicaAppendErrorCode::AssignmentNotFound,
+                    format!(
+                        "no committed Active Range assignment exists for Feed {}",
+                        request.feed_id
+                    ),
+                )
+            })?;
+        assignment
+            .validate_request(
+                request.generation,
+                request.ownership_epoch,
+                &request.append_owner,
+            )
+            .map_err(map_assignment_error)?;
+        if !assignment.replicas.contains(&self.local_node) {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::ReceiverNotReplica,
+                format!("Node {} is not a current replica", self.local_node),
+            ));
+        }
+        let store = self.store_for(&assignment).await?;
+        match store
+            .discard_pending_effect(
+                assignment.generation,
+                assignment.ownership_epoch,
+                super::store::PendingEffectRef {
+                    effect_id: request.effect_id,
+                    subscription_id: request.subscription_id,
+                },
+            )
+            .await
+            .map_err(map_store_error)?
+        {
+            super::store::PendingDiscardOutcome::NotPending => Ok(ReplicaDiscardPendingResponse {
+                outcome: Some(ReplicaDiscardOutcome::NotPending),
+                occupant: None,
+                error: None,
+            }),
+            super::store::PendingDiscardOutcome::Occupied(marker) => {
+                Ok(ReplicaDiscardPendingResponse {
+                    outcome: Some(ReplicaDiscardOutcome::Occupied),
+                    occupant: Some(marker),
+                    error: None,
+                })
+            }
+            super::store::PendingDiscardOutcome::Discarded { dropped_frames } => {
+                Ok(ReplicaDiscardPendingResponse {
+                    outcome: Some(ReplicaDiscardOutcome::Discarded { dropped_frames }),
+                    occupant: None,
+                    error: None,
+                })
+            }
+        }
     }
 
     pub async fn recovery_status(

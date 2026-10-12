@@ -77,6 +77,17 @@ impl PendingEffect {
     }
 }
 
+/// The result of discarding one effect's pending tail.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PendingDiscardOutcome {
+    /// No effect holds the tail — nothing to discard.
+    NotPending,
+    /// A different effect holds the tail; its journal decides the outcome.
+    Occupied(PendingEffect),
+    /// The marker's uncommitted tail was truncated and cleared.
+    Discarded { dropped_frames: u64 },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveRangeAppendResult {
     pub position: RangePosition,
@@ -229,6 +240,16 @@ pub trait ActiveRangeStore: Send + Sync {
     ) -> Result<u64, ActiveRangeStoreError>;
     /// The effect whose records currently hold the uncommitted tail, if any.
     async fn pending_effect(&self) -> Result<Option<PendingEffect>, ActiveRangeStoreError>;
+    /// Discard one effect's pending tail when `identity` names the
+    /// occupant: the uncommitted frames are truncated and the marker
+    /// cleared. `NotPending` means the tail already resolved;
+    /// `Occupied` means a different effect holds it and must be swept.
+    async fn discard_pending_effect(
+        &self,
+        generation: RangeGeneration,
+        ownership_epoch: OwnershipEpoch,
+        identity: PendingEffectRef,
+    ) -> Result<PendingDiscardOutcome, ActiveRangeStoreError>;
     async fn update_ownership_epoch(
         &self,
         generation: RangeGeneration,
@@ -532,6 +553,37 @@ impl ActiveRangeStore for FileActiveRangeStore {
                 .lock()
                 .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
             Ok(loaded.persisted.pending_effect.clone())
+        })
+        .await
+    }
+
+    async fn discard_pending_effect(
+        &self,
+        generation: RangeGeneration,
+        ownership_epoch: OwnershipEpoch,
+        identity: PendingEffectRef,
+    ) -> Result<PendingDiscardOutcome, ActiveRangeStoreError> {
+        self.blocking(move |inner| {
+            {
+                let loaded = inner
+                    .loaded
+                    .lock()
+                    .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+                match &loaded.persisted.pending_effect {
+                    None => return Ok(PendingDiscardOutcome::NotPending),
+                    Some(marker) if !marker.covers(identity) => {
+                        return Ok(PendingDiscardOutcome::Occupied(marker.clone()))
+                    }
+                    _ => {}
+                }
+            }
+            // Held frames are uncommitted by construction, so the shared
+            // truncation path removes exactly the pending tail and clears
+            // the marker atomically with the persisted range state.
+            let dropped = truncate_uncommitted(inner, generation, ownership_epoch)?;
+            Ok(PendingDiscardOutcome::Discarded {
+                dropped_frames: dropped,
+            })
         })
         .await
     }
