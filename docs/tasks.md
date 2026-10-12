@@ -1229,7 +1229,7 @@ Definition of Done:
 
 - [x] Add bounded exponential reconnect/backoff for stateless Reader fetches and pressure-aware capacity feedback for persistent sessions.
 
-- [~] Fence concurrent named Reader deliveries and ambiguous duplicate fetch request IDs rather than returning a different page under the same progress token; the prototype now fails closed but does not replay an identical prior fetch response.
+- [~] Fence concurrent named Reader deliveries and ambiguous duplicate fetch request IDs rather than returning a different page under the same progress token; duplicate-request replay now shipped — `ReaderFrontier` persists the pre-delivery `previous` positions and `last_fetch_limit` (serde-defaulted), `RecordReaderFrontier` carries `fetch_limit`, and a repeated `fetch_request_id` re-reads under the identical bound and serves the page only when the positions match the committed frontier exactly — identical bytes and token when provable, the same fail-closed refusal otherwise (moved ranges or extended pages refuse rather than return a different page under one identity). Coverage: `reader_frontier_persists_replay_evidence_for_duplicate_fetches` (persist + restart) and the existing same-request fencing tests.
 
 - [~] Move per-Reader delivered/acknowledged progress and bounded fetch-result deduplication to a ReaderId-sharded RF3 data-plane journal/checkpoint, leaving only Reader definitions and shard placement in the Control Plane. A local transactional Fjall prototype keyed by ReaderId now proves fencing, one bounded retry receipt, independent ack, and restart; it is not replicated, selected as the production engine, or wired to Reader HTTP requests. RF3 ownership, journal/checkpoint recovery, fault-tested cutover, and scale-in drain remain.
 

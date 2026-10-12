@@ -229,6 +229,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             expected_cursor: None,
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(8001)),
+            fetch_limit: None,
         }])
         .await
         .unwrap();
@@ -249,6 +250,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             expected_cursor: Some("ack-token".to_owned()),
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(8002)),
+            fetch_limit: None,
         }])
         .await
         .unwrap();
@@ -553,6 +555,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             expected_cursor: Some("ack-token".to_owned()),
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(8003)),
+            fetch_limit: None,
         }])
         .await
         .unwrap();

@@ -5240,6 +5240,7 @@ async fn reader_fetch(
                 expected_cursor: reader.delivered_cursor.clone(),
                 fence_delivery: true,
                 fetch_request_id: Some(request.request_id),
+                fetch_limit: Some(limit),
             }
         } else {
             crate::control::Command::RecordReaderDelivery {
@@ -10241,6 +10242,7 @@ mod tests {
             expected_cursor: None,
             fence_delivery: true,
             fetch_request_id: Some(request_id),
+            fetch_limit: None,
         };
         let applied = control
             .execute_commands_with_request_id(vec![delivery(first.clone())], request_id)
@@ -14273,6 +14275,7 @@ mod tests {
                         expected_cursor: None,
                         fence_delivery: true,
                         fetch_request_id: Some(Uuid::new_v4()),
+                        fetch_limit: None,
                     }],
                 })
                 .unwrap(),

@@ -1234,6 +1234,7 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
             expected_cursor: None,
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(90_002)),
+            fetch_limit: None,
         }])
         .await
         .unwrap();
@@ -1255,6 +1256,7 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
             expected_cursor: Some("ack-token-1".to_owned()),
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(90_003)),
+            fetch_limit: None,
         }])
         .await
         .unwrap();
@@ -1389,6 +1391,7 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
             expected_cursor: Some("ack-token-1".to_owned()),
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(90_004)),
+            fetch_limit: None,
         }])
         .await
         .is_err());
@@ -1470,6 +1473,7 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
             expected_cursor: Some("ack-token-1".to_owned()),
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(90_005)),
+            fetch_limit: None,
         }])
         .await
         .is_err());

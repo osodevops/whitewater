@@ -517,6 +517,15 @@ pub struct SubscriptionDefinition {
 pub(crate) struct ReaderFrontier {
     pub acknowledged: BTreeMap<RangeId, String>,
     pub delivered: BTreeMap<RangeId, String>,
+    /// The per-range positions the last delivered page started from —
+    /// persisted so a duplicate `fetch_request_id` can re-read and prove
+    /// an identical page rather than blindly refusing.
+    #[serde(default)]
+    pub previous: BTreeMap<RangeId, String>,
+    /// The record bound the last delivered page used; replay is only
+    /// provable under the identical bound.
+    #[serde(default)]
+    pub last_fetch_limit: usize,
     #[serde(default)]
     pub last_fetch_request_id: Option<Uuid>,
 }
@@ -928,6 +937,10 @@ pub enum Command {
         fence_delivery: bool,
         #[serde(default)]
         fetch_request_id: Option<Uuid>,
+        /// The record bound the fetch used — persisted in the frontier so
+        /// a duplicate request can replay provably identical records.
+        #[serde(default)]
+        fetch_limit: Option<usize>,
     },
     AcknowledgeReader {
         reader: String,
@@ -2902,6 +2915,7 @@ impl ControlController {
                 expected_cursor,
                 fence_delivery,
                 fetch_request_id,
+                fetch_limit,
             } => {
                 let (reader_id, feed_id) = {
                     let definition = active_reader_mut(state, &reader)?;
@@ -2933,7 +2947,11 @@ impl ControlController {
                 {
                     return Err(ControlError::InvalidOperation("Reader fetch request ID was already delivered; reopen the session to redeliver from acknowledged progress".to_owned()));
                 }
-                frontier.delivered = positions.clone();
+                frontier.previous = std::mem::replace(
+                    &mut frontier.delivered,
+                    positions.clone(),
+                );
+                frontier.last_fetch_limit = fetch_limit.unwrap_or(0);
                 frontier.last_fetch_request_id = fetch_request_id;
                 let definition = active_reader_mut(state, &reader)?;
                 definition.delivered_cursor = Some(cursor);
@@ -5540,6 +5558,8 @@ fn install_reader_translations(
                     ReaderFrontier {
                         acknowledged: translation.acknowledged.clone(),
                         delivered: translation.acknowledged,
+                        previous: BTreeMap::new(),
+                        last_fetch_limit: 0,
                         last_fetch_request_id: None,
                     },
                 );
@@ -6573,6 +6593,7 @@ mod tests {
             expected_cursor: None,
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(8_001)),
+            fetch_limit: None,
         };
         let request_id = Uuid::from_u128(7_001);
         assert!(delivery.requires_internal_replica_authority());
@@ -6634,6 +6655,7 @@ mod tests {
                 expected_cursor: Some("opaque-reader-progress-1".to_owned()),
                 fence_delivery: true,
                 fetch_request_id: Some(Uuid::from_u128(8_002)),
+                fetch_limit: None,
             }])
             .await
             .is_err());
@@ -6649,6 +6671,7 @@ mod tests {
                 expected_cursor: Some("opaque-reader-progress-1".to_owned()),
                 fence_delivery: true,
                 fetch_request_id: Some(Uuid::from_u128(8_003)),
+                fetch_limit: None,
             }])
             .await
             .is_err());
@@ -6663,6 +6686,64 @@ mod tests {
             .active_reader_frontier(reader.reader_id)
             .await
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn reader_frontier_persists_replay_evidence_for_duplicate_fetches() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE READER audit FROM orders.events START AT BEGINNING;").await.unwrap();
+        let audit = controller.active_reader_by_name("audit").await.unwrap();
+        let range_id = controller
+            .active_range_assignment(audit.feed_id)
+            .await
+            .unwrap()
+            .range_id;
+        controller
+            .execute_commands(vec![Command::OpenReaderSession {
+                reader: "audit".to_owned(),
+                capacity: 2,
+            }])
+            .await
+            .unwrap();
+        let deliver =
+            |event: &str, fetch_id: u128, limit: Option<usize>| Command::RecordReaderFrontier {
+                reader: "audit".to_owned(),
+                session_epoch: 1,
+                cursor: format!("rf_{fetch_id}"),
+                positions: BTreeMap::from([(range_id, event.to_owned())]),
+                expected_cursor: None,
+                fence_delivery: false,
+                fetch_request_id: Some(Uuid::from_u128(fetch_id)),
+                fetch_limit: limit,
+            };
+        controller
+            .execute_commands(vec![deliver("event-1", 7, Some(64))])
+            .await
+            .unwrap();
+        controller
+            .execute_commands(vec![deliver("event-2", 8, Some(64))])
+            .await
+            .unwrap();
+        let frontier = controller
+            .active_reader_frontier(audit.reader_id)
+            .await
+            .unwrap();
+        // The replay evidence is exactly what re-reading must reproduce:
+        // the pre-delivery positions and the bound the fetch used.
+        assert_eq!(frontier.delivered[&range_id], "event-2");
+        assert_eq!(frontier.previous[&range_id], "event-1");
+        assert_eq!(frontier.last_fetch_limit, 64);
+        assert_eq!(frontier.last_fetch_request_id, Some(Uuid::from_u128(8)));
+
+        drop(controller);
+        let reopened = new_controller(&directory);
+        let frontier = reopened
+            .active_reader_frontier(audit.reader_id)
+            .await
+            .unwrap();
+        assert_eq!(frontier.previous[&range_id], "event-1");
+        assert_eq!(frontier.last_fetch_limit, 64);
     }
 
     #[tokio::test]
@@ -6699,6 +6780,7 @@ mod tests {
                 expected_cursor: expected_cursor.map(str::to_owned),
                 fence_delivery: true,
                 fetch_request_id: Some(Uuid::from_u128(fetch_id)),
+                fetch_limit: None,
             };
         controller
             .execute_commands(vec![deliver("audit", "rf1_a", "event-a", 1, None)])
