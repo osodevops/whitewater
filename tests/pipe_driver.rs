@@ -21,8 +21,9 @@ use finnstream::effect::{
 };
 use finnstream::index::IndexValue;
 use finnstream::pipe::{
-    pipe_declare_request_id, pipe_effect_id, pipe_output_writer_session, EnrichResolution,
-    FetchedPage, FetchedRecord, PipeDriver,
+    pipe_declare_request_id, pipe_effect_id, pipe_emission_writer_session,
+    pipe_output_writer_session, window_pane_row_key, EnrichResolution, FetchedPage, FetchedRecord,
+    PipeDriver, WindowEmission,
 };
 use finnstream::reader::{
     FjallSubscriptionProgressReplica, SubscriptionCommitEvidence, SubscriptionMemberState,
@@ -604,10 +605,19 @@ fn record(byte: u8) -> FetchedRecord {
 }
 
 fn page(records: Vec<FetchedRecord>, cursor: &str) -> FetchedPage {
+    page_with_emissions(records, Vec::new(), cursor)
+}
+
+fn page_with_emissions(
+    records: Vec<FetchedRecord>,
+    emissions: Vec<WindowEmission>,
+    cursor: &str,
+) -> FetchedPage {
     FetchedPage {
         records,
         cursor: cursor.to_owned(),
         positions: BTreeMap::from([(range(), cursor.to_owned())]),
+        emissions,
     }
 }
 
@@ -1559,4 +1569,210 @@ async fn enrich_pipe_adopts_a_committed_divergent_declare() {
         appends[0].metadata_base64["enrich.payload"],
         b64(b"stale-but-committed")
     );
+}
+fn emit_window_pipe() -> PipeDefinition {
+    let mut pipe = window_pipe();
+    pipe.operation = PipeOperation::Window {
+        window_ns: 160,
+        key: IndexFieldSpec::Key,
+        aggregation: WindowAggregation::Sum {
+            value: IndexFieldSpec::Projection {
+                extractor: "json".to_owned(),
+                version: 1,
+                field: "v".to_owned(),
+            },
+        },
+        time: finnstream::control::WindowTime::Event,
+        max_late_ns: Some(20),
+    };
+    pipe.output_feed_id = Some(Uuid::from_u128(OUTPUT_FEED));
+    pipe
+}
+
+fn pane_emission(group: IndexValue, pane: u64, count: u64, sum: i128) -> WindowEmission {
+    let tagged = finnstream::pipe::window_group_key_bytes(&group).unwrap();
+    WindowEmission {
+        row_key: window_pane_row_key(&tagged, pane),
+        group,
+        group_tagged: tagged,
+        pane,
+        count,
+        sum,
+    }
+}
+
+#[tokio::test]
+async fn window_pipe_emits_a_closed_pane_and_deletes_its_row_atomically() {
+    let harness = harness_for(emit_window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+
+    let emission = pane_emission(IndexValue::Bytes(b"key-a".to_vec()), 3, 4, 30);
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async {
+                Ok(page_with_emissions(
+                    vec![json_record(1, b"key-a", 0, 5)],
+                    vec![emission.clone()],
+                    "p1",
+                ))
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+
+    let EffectTransition::Applied {
+        outputs,
+        state_mutations,
+        ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    // One emitted output + [accumulate, delete] inside one boundary.
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(state_mutations.len(), 2);
+    let output = &outputs[0];
+    assert_eq!(output.feed_id, Uuid::from_u128(OUTPUT_FEED));
+    // The emitted record keys on the tag-prefixed group bytes.
+    assert_eq!(
+        output.key_base64,
+        b64(
+            &finnstream::pipe::window_group_key_bytes(&IndexValue::Bytes(b"key-a".to_vec()))
+                .unwrap()
+        )
+    );
+    let payload: serde_json::Value = serde_json::from_slice(
+        &base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &output.payload_base64,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    // pane 3 under a 10ns pane span (window 160ns / 16 panes).
+    // Bytes groups encode base64 (b"key-a" -> a2V5LWE=).
+    assert_eq!(payload["group"], "a2V5LWE=");
+    assert_eq!(payload["pane"], 3);
+    assert_eq!(payload["pane_start_ns"], "30");
+    assert_eq!(payload["pane_end_ns"], "40");
+    assert_eq!(payload["count"], 4);
+    assert_eq!(payload["sum"], "30");
+    assert_eq!(
+        output
+            .metadata_base64
+            .get("window.emitted")
+            .map(String::as_str),
+        Some("dHJ1ZQ==")
+    );
+    // Emission dedupe identity is the pane row itself.
+    assert_eq!(
+        output.writer_session_id,
+        pipe_emission_writer_session(emit_window_pipe().pipe_id, &emission.row_key)
+    );
+    assert_eq!(output.sequence, 1);
+    // pane_end - 1 is the output's event-time edge.
+    assert_eq!(output.event_time_ns, 39);
+    // The pane row deletes inside the same effect.
+    let StateStoreMutationOp::DeleteRow { key } = &state_mutations[1].op else {
+        panic!("expected DeleteRow")
+    };
+    assert_eq!(*key, emission.row_key);
+    assert_eq!(
+        state_mutations[1].mutation_id,
+        finnstream::effect::effect_state_mutation_id(applied.effect_id, 1)
+    );
+    let StateStoreMutationOp::AccumulateRows { .. } = &state_mutations[0].op else {
+        panic!("expected AccumulateRows first")
+    };
+    // The append sink saw the emitted record.
+    assert_eq!(harness.sink.appends.lock().unwrap().len(), 1);
+    // Both mutations applied post-release.
+    assert_eq!(harness.sink.mutations.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn window_emissions_cap_at_the_mutation_budget_per_drive() {
+    let harness = harness_for(emit_window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+    let emissions = (0..20)
+        .map(|pane| pane_emission(IndexValue::Bytes(b"key-a".to_vec()), pane, 1, 1))
+        .collect();
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async {
+                Ok(page_with_emissions(
+                    vec![json_record(1, b"key-a", 0, 5)],
+                    emissions,
+                    "p1",
+                ))
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    let EffectTransition::Applied {
+        outputs,
+        state_mutations,
+        ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    // 15 emissions fit the 16-mutation budget alongside the accumulate.
+    assert_eq!(outputs.len(), 15);
+    assert_eq!(state_mutations.len(), 16);
+    // Row-key order is deterministic regardless of input order.
+    let mut sorted: Vec<u64> = outputs
+        .iter()
+        .map(|output| {
+            let payload: serde_json::Value = serde_json::from_slice(
+                &base64::Engine::decode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &output.payload_base64,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            payload["pane"].as_u64().unwrap()
+        })
+        .collect();
+    let observed = sorted.clone();
+    sorted.sort_unstable();
+    assert_eq!(observed, sorted);
+}
+
+#[tokio::test]
+async fn window_emissions_without_an_emit_feed_fail_closed() {
+    // A page carrying emissions under a pipe that never declared EMIT TO
+    // FEED refuses the whole drive — silently dropping closed panes
+    // would wedge the store.
+    let harness = harness_for(window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+    let result = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async {
+                Ok(page_with_emissions(
+                    vec![json_record(1, b"key-a", 0, 5)],
+                    vec![pane_emission(IndexValue::Bytes(b"key-a".to_vec()), 1, 2, 8)],
+                    "p1",
+                ))
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await;
+    assert!(matches!(result, Err(EffectJournalError::Conflict)));
+    assert!(harness.sink.appends.lock().unwrap().is_empty());
+    assert!(harness.sink.mutations.lock().unwrap().is_empty());
 }

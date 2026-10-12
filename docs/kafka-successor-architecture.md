@@ -312,8 +312,19 @@ default, `ingest_time_ns` on request — and a bounded lateness policy
 exists today (`MAX_LATE <dur>`, event clock only): an event arriving more
 than the bound behind its own event time quarantines into a countable
 per-group row under sentinel pane `-1` rather than revising a closed pane
-or vanishing. Watermarks/grace, in-place late-event revision, and
-window-close output emission remain follow-on work.
+or vanishing. A Pipe that declares `MAX_LATE` may also declare `EMIT TO
+FEED <feed>`: once the ingest clock passes `pane_end + MAX_LATE` a pane
+provably closed (any later event for it quarantines), so each drive scans
+the touched groups' `key` postings, emits one JSON result record per
+closed pane to the declared Feed, and deletes the pane row inside the
+same effect - a missed or duplicated drive emits idempotently because the
+output and its row delete commit or abort together. Emission rides the
+effect mutation budget (at most 15 closed panes per drive alongside the
+accumulation); a larger backlog drains across subsequent drives, and
+panes belonging to groups a page never touched close lazily on the next
+drive that touches them. Watermarks/grace, in-place late-event revision,
+idle-group expiry, and pane-close triggers independent of input traffic
+remain follow-on work.
 
 Point-lookup enrichment is the second. An `Enrich` Pipe resolves each
 delivered record's projected key against a declared StateStore at fetch

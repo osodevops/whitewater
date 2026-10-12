@@ -878,6 +878,12 @@ pub enum Command {
         /// `quarantine_feed_id` at define time.
         #[serde(default)]
         quarantine_feed: Option<String>,
+        /// Closed-pane emission Feed name for `Window` Pipes
+        /// (`EMIT TO FEED <feed>`); resolved to `output_feed_id` at
+        /// define time. Requires `MAX_LATE` — a pane only provably
+        /// closes once the ingest clock passes pane_end + bound.
+        #[serde(default)]
+        emit_feed: Option<String>,
         operation: PipeOperation,
     },
     CreateWriter {
@@ -2401,6 +2407,7 @@ impl ControlController {
                 output_feed,
                 output_store,
                 quarantine_feed,
+                emit_feed,
                 operation,
             } => {
                 validate_dotted_name(&name)?;
@@ -2418,6 +2425,11 @@ impl ControlController {
                 let mut operation = operation;
                 let (output_feed_id, output_store_id) = match &mut operation {
                     PipeOperation::Forward => {
+                        if emit_feed.is_some() {
+                            return Err(ControlError::InvalidOperation(
+                                "EMIT TO FEED is only valid on Window Pipes".to_owned(),
+                            ));
+                        }
                         let output_feed = output_feed.ok_or_else(|| {
                             ControlError::InvalidOperation(
                                 "Forward Pipes require an output Feed".to_owned(),
@@ -2501,7 +2513,42 @@ impl ControlController {
                         {
                             validate_window_field(value)?;
                         }
-                        (None, Some(store.store_id))
+                        // `EMIT TO FEED` declares where closed panes
+                        // publish. Without `MAX_LATE` no pane ever
+                        // provably closes (a record could always arrive
+                        // legally), so emission requires the bound.
+                        let emit_feed_id = match &emit_feed {
+                            Some(name) => {
+                                if max_late_ns.is_none() {
+                                    return Err(ControlError::InvalidOperation(
+                                        "EMIT TO FEED requires MAX_LATE — without a lateness bound no pane ever provably closes".to_owned(),
+                                    ));
+                                }
+                                let feed = active_feed(state, name)?;
+                                if feed.space_id != space_id {
+                                    return Err(ControlError::InvalidOperation(
+                                        "Pipe emission Feed must belong to its Domain"
+                                            .to_owned(),
+                                    ));
+                                }
+                                if subscription.source.feed_id() == Some(feed.feed_id) {
+                                    return Err(ControlError::InvalidOperation(
+                                        "Pipe emission Feed cannot be its own input Feed"
+                                            .to_owned(),
+                                    ));
+                                }
+                                Some(feed.feed_id)
+                            }
+                            None => {
+                                if output_feed.is_some() {
+                                    return Err(ControlError::InvalidOperation(
+                                        "Window Pipes emit through EMIT TO FEED, not TO FEED".to_owned(),
+                                    ));
+                                }
+                                None
+                            }
+                        };
+                        (emit_feed_id, Some(store.store_id))
                     }
                     PipeOperation::Enrich {
                         key,
@@ -2510,6 +2557,11 @@ impl ControlController {
                         on_miss,
                         quarantine_feed_id,
                     } => {
+                        if emit_feed.is_some() {
+                            return Err(ControlError::InvalidOperation(
+                                "EMIT TO FEED is only valid on Window Pipes".to_owned(),
+                            ));
+                        }
                         if let Some(name) = named {
                             let valid = !name.is_empty()
                                 && name.len() <= 64
@@ -4589,6 +4641,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                                 output_feed: Some(token(&tokens, 8)?.to_owned()),
                                 output_store: Some(token(&tokens, 11)?.to_owned()),
                                 quarantine_feed,
+                                emit_feed: None,
                                 operation: PipeOperation::Enrich {
                                     key,
                                     freshness,
@@ -4604,6 +4657,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             output_feed: Some(token(&tokens, 8)?.to_owned()),
                             output_store: None,
                             quarantine_feed: None,
+                            emit_feed: None,
                             operation: PipeOperation::Forward,
                         })
                     }
@@ -4635,20 +4689,20 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                         let by = at;
                         expect_keyword(&tokens, by, "BY")?;
                         let (key, next) = parse_index_field_spec(&tokens, by + 1, "BY")?;
-                        let aggregation = match token(&tokens, next)?
+                        let (aggregation, after_agg) = match token(&tokens, next)?
                             .to_ascii_uppercase()
                             .as_str()
                         {
-                            "COUNT" => WindowAggregation::Count,
+                            "COUNT" => (WindowAggregation::Count, next + 1),
                             "SUM" => {
-                                let (value, _) =
+                                let (value, end) =
                                     parse_index_field_spec(&tokens, next + 1, "SUM")?;
-                                WindowAggregation::Sum { value }
+                                (WindowAggregation::Sum { value }, end)
                             }
                             "AVG" => {
-                                let (value, _) =
+                                let (value, end) =
                                     parse_index_field_spec(&tokens, next + 1, "AVG")?;
-                                WindowAggregation::Average { value }
+                                (WindowAggregation::Average { value }, end)
                             }
                             other => {
                                 return Err(ControlError::Syntax(format!(
@@ -4656,12 +4710,22 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                                 )))
                             }
                         };
+                        // Optional tail: `EMIT TO FEED <feed>` declares
+                        // the Feed closed panes publish into.
+                        let mut emit_feed = None;
+                        if tokens.get(after_agg).is_some() {
+                            expect_keyword(&tokens, after_agg, "EMIT")?;
+                            expect_keyword(&tokens, after_agg + 1, "TO")?;
+                            expect_keyword(&tokens, after_agg + 2, "FEED")?;
+                            emit_feed = Some(token(&tokens, after_agg + 3)?.to_owned());
+                        }
                         Ok(Command::DefinePipe {
                             name: token(&tokens, 2)?.to_owned(),
                             subscription: token(&tokens, 5)?.to_owned(),
                             output_feed: None,
                             output_store: Some(token(&tokens, 8)?.to_owned()),
                             quarantine_feed: None,
+                            emit_feed,
                             operation: PipeOperation::Window {
                                 window_ns,
                                 max_late_ns,
@@ -7702,6 +7766,7 @@ mod tests {
             output_feed: Some("accounts.enriched".to_owned()),
             output_store: None,
             quarantine_feed: None,
+            emit_feed: None,
             operation: PipeOperation::Forward,
         }];
         let first = leader
@@ -7739,6 +7804,7 @@ mod tests {
                 output_feed: Some("accounts.enriched".to_owned()),
                 output_store: None,
                 quarantine_feed: None,
+                emit_feed: None,
                 operation: PipeOperation::Forward,
             }])
             .await
@@ -7760,6 +7826,7 @@ mod tests {
                         output_feed: Some(output_feed.to_owned()),
                         output_store: None,
                         quarantine_feed: None,
+                        emit_feed: None,
                         operation: PipeOperation::Forward,
                     }])
                     .await
@@ -7790,6 +7857,7 @@ mod tests {
                 output_feed: Some("other.enriched".to_owned()),
                 output_store: None,
                 quarantine_feed: None,
+                emit_feed: None,
                 operation: PipeOperation::Forward,
             }])
             .await
@@ -8681,6 +8749,7 @@ mod tests {
             output_feed: None,
             output_store,
             quarantine_feed: None,
+            emit_feed: None,
             operation: PipeOperation::Window {
                 window_ns,
                 key: IndexFieldSpec::Key,
@@ -8829,6 +8898,46 @@ mod tests {
         }
         let _ = parsed;
 
+        // EMIT TO FEED declares where closed panes publish; it requires
+        // MAX_LATE (a pane only provably closes inside a lateness bound)
+        // and resolves like any other pipe output Feed.
+        leader
+            .execute("CREATE FEED accounts.results;")
+            .await
+            .unwrap();
+        leader
+            .execute(
+                "CREATE PIPE accounts.emitter FROM SUBSCRIPTION accounts.flow                  TO STATESTORE accounts.panes WINDOW 1h EVENT MAX_LATE 5m BY KEY COUNT EMIT TO FEED accounts.results;",
+            )
+            .await
+            .unwrap();
+        let emitter = leader
+            .active_pipe_by_name("accounts.emitter")
+            .await
+            .unwrap();
+        let results_feed = leader
+            .active_feed_by_name("accounts.results")
+            .await
+            .unwrap();
+        assert_eq!(emitter.output_feed_id, Some(results_feed.feed_id));
+        assert_eq!(emitter.output_store_id, Some(store.store_id));
+
+        for statement in [
+            // No MAX_LATE — no pane ever provably closes.
+            "CREATE PIPE accounts.emit1 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h BY KEY COUNT EMIT TO FEED accounts.results;",
+            // Emission target must not be the pipe's own input Feed.
+            "CREATE PIPE accounts.emit2 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h MAX_LATE 5m BY KEY COUNT EMIT TO FEED accounts.events;",
+            // Missing or foreign-Domain emission Feeds refuse.
+            "CREATE PIPE accounts.emit3 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h MAX_LATE 5m BY KEY COUNT EMIT TO FEED accounts.missing;",
+            // A malformed tail fails at parse.
+            "CREATE PIPE accounts.emit4 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h MAX_LATE 5m BY KEY COUNT EMIT accounts.results;",
+        ] {
+            assert!(
+                leader.execute(statement).await.is_err(),
+                "{statement} must fail"
+            );
+        }
+
         // Enrich Pipes need both targets: an output Feed and a lookup
         // StateStore in the same Domain, plus a valid key projection.
         let enrich = |output_feed, output_store| Command::DefinePipe {
@@ -8837,6 +8946,7 @@ mod tests {
             output_feed,
             output_store,
             quarantine_feed: None,
+            emit_feed: None,
             operation: PipeOperation::Enrich {
                 key: IndexFieldSpec::Key,
                 freshness: EnrichFreshness::Latest,

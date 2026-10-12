@@ -66,6 +66,29 @@ pub struct FetchedPage {
     pub records: Vec<FetchedRecord>,
     pub cursor: String,
     pub positions: BTreeMap<RangeId, String>,
+    /// Window Pipes only: closed panes resolved at fetch time. Emission
+    /// travels inside the same Declare/Applied boundary as the pane
+    /// accumulation, so a replayed effect never re-scans the store.
+    pub emissions: Vec<WindowEmission>,
+}
+
+/// One closed window pane resolved for emission: the StateStore pane row
+/// to delete and its decoded accumulator. Deterministic once fetched —
+/// emitted outputs journal inside the effect's Declare.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowEmission {
+    /// Full pane row key (`len|group|pane`) — the `DeleteRow` target.
+    pub row_key: Vec<u8>,
+    /// The group's typed value (for the result payload).
+    pub group: IndexValue,
+    /// Tag-prefixed group bytes — also the emitted record's key.
+    pub group_tagged: Vec<u8>,
+    /// Pane index; `pane_end = (pane + 1) * pane_ns` is the close bound.
+    pub pane: u64,
+    /// Decoded accumulator count for the pane.
+    pub count: u64,
+    /// Decoded accumulator sum for the pane.
+    pub sum: i128,
 }
 
 /// Deterministic identity for the effect one Pipe cycle declares over a
@@ -91,6 +114,16 @@ pub fn pipe_output_writer_session(pipe_id: Uuid, message_id: Uuid) -> Uuid {
             pipe_id.as_bytes().as_slice(),
             message_id.as_bytes().as_slice(),
         ],
+    )
+}
+
+/// The writer identity for one emitted pane: keyed by the pane row so a
+/// retried append dedupes on the emission's own identity rather than
+/// sharing the effect's session.
+pub fn pipe_emission_writer_session(pipe_id: Uuid, pane_row_key: &[u8]) -> Uuid {
+    derived_uuid(
+        b"pipe-emission",
+        &[pipe_id.as_bytes().as_slice(), pane_row_key],
     )
 }
 
@@ -409,7 +442,10 @@ impl PipeDriver {
                     entry.0 = entry.0.saturating_add(1);
                     entry.1 = entry.1.saturating_add(sum_delta);
                 }
-                if panes.is_empty() && late.is_empty() {
+                // Closed-pane emissions resolved at fetch time emit even
+                // when this page accumulated nothing (all-late or empty
+                // groups still release their aged panes).
+                if panes.is_empty() && late.is_empty() && page.emissions.is_empty() {
                     return Ok((Vec::new(), Vec::new()));
                 }
                 let mut entries: Vec<AccumulateRowEntry> = panes
@@ -456,14 +492,63 @@ impl PipeDriver {
                         ],
                     }
                 }));
-                Ok((
-                    Vec::new(),
-                    vec![EffectStateMutation {
+                let mut outputs = Vec::new();
+                let mut mutations = Vec::new();
+                if !entries.is_empty() {
+                    mutations.push(EffectStateMutation {
                         store_id,
                         mutation_id: effect_state_mutation_id(effect_id, 0),
                         op: StateStoreMutationOp::AccumulateRows { entries },
-                    }],
-                ))
+                    });
+                }
+                // Emissions without a declared emit Feed fail closed —
+                // silently dropping closed panes would wedge the store.
+                if !page.emissions.is_empty() && self.pipe.output_feed_id.is_none() {
+                    return Err(EffectJournalError::Conflict);
+                }
+                if let Some(feed_id) = self.pipe.output_feed_id {
+                    // Row-key order is byte-identical across replays —
+                    // mutation and writer identities depend on it.
+                    let mut emissions = page.emissions.clone();
+                    emissions.sort_by(|a, b| a.row_key.cmp(&b.row_key));
+                    use base64::Engine;
+                    for emission in emissions.iter().take(WINDOW_MAX_EMISSIONS_PER_DRIVE) {
+                        let mut metadata = BTreeMap::new();
+                        metadata.insert(
+                            "window.emitted".to_owned(),
+                            base64::engine::general_purpose::STANDARD.encode(b"true"),
+                        );
+                        outputs.push(EffectOutput {
+                            feed_id,
+                            key_base64: base64::engine::general_purpose::STANDARD
+                                .encode(&emission.group_tagged),
+                            payload_base64: base64::engine::general_purpose::STANDARD
+                                .encode(window_emission_payload(emission, pane_ns, aggregation)),
+                            metadata_base64: metadata,
+                            event_time_ns: emission
+                                .pane
+                                .saturating_add(1)
+                                .saturating_mul(pane_ns)
+                                .saturating_sub(1)
+                                .min(i64::MAX as u64)
+                                as i64,
+                            writer_session_id: pipe_emission_writer_session(
+                                self.pipe.pipe_id,
+                                &emission.row_key,
+                            ),
+                            writer_epoch: 1,
+                            sequence: 1,
+                        });
+                        mutations.push(EffectStateMutation {
+                            store_id,
+                            mutation_id: effect_state_mutation_id(effect_id, mutations.len()),
+                            op: StateStoreMutationOp::DeleteRow {
+                                key: emission.row_key.clone(),
+                            },
+                        });
+                    }
+                }
+                Ok((outputs, mutations))
             }
             PipeOperation::Enrich {
                 on_miss,
@@ -576,15 +661,21 @@ pub const WINDOW_PANE_NAME: &str = "pane";
 /// genuine pane (only 16 exist).
 pub const WINDOW_LATE_PANE: u64 = u64::MAX;
 
+/// Closed-pane emissions ride the same effect mutation budget as the pane
+/// accumulation itself: `EFFECT_MAX_STATE_MUTATIONS` minus the one
+/// `AccumulateRows` leaves this many `DeleteRow`s per drive. A backlog
+/// beyond the bound simply emits across subsequent drives.
+pub const WINDOW_MAX_EMISSIONS_PER_DRIVE: usize = 15;
+
 /// Pane length in nanoseconds for a window; never zero even for sub-pane
 /// windows.
-fn window_pane_ns(window_ns: u64) -> u64 {
+pub fn window_pane_ns(window_ns: u64) -> u64 {
     (window_ns / WINDOW_PANE_COUNT).max(1)
 }
 
 /// The StateStore row key for one (group, pane): length-prefixed so binary
 /// group bytes stay unambiguous, big-endian pane so row keys order by time.
-fn window_pane_row_key(group: &[u8], pane: u64) -> Vec<u8> {
+pub fn window_pane_row_key(group: &[u8], pane: u64) -> Vec<u8> {
     let mut key = Vec::with_capacity(4 + group.len() + 8);
     key.extend_from_slice(&(group.len() as u32).to_be_bytes());
     key.extend_from_slice(group);
@@ -592,9 +683,100 @@ fn window_pane_row_key(group: &[u8], pane: u64) -> Vec<u8> {
     key
 }
 
+/// Inverse of `window_pane_row_key`: `(tagged group bytes, pane index)`.
+/// `None` for a key that is not a well-formed pane row — a foreign row
+/// carrying a `key` posting must never be deleted as a pane.
+pub fn window_pane_row_key_parse(key: &[u8]) -> Option<(Vec<u8>, u64)> {
+    let (head, pane_bytes) = key.split_at_checked(key.len().checked_sub(8)?)?;
+    let pane = u64::from_be_bytes(pane_bytes.try_into().ok()?);
+    let group_len = u32::from_be_bytes(head.get(..4)?.try_into().ok()?) as usize;
+    let group = head.get(4..)?.to_vec();
+    if group.len() != group_len || group.is_empty() {
+        return None;
+    }
+    Some((group, pane))
+}
+
+/// Decide whether one `key`-posting row is a closed pane worth emitting:
+/// well-formed pane row, belongs to `group_tagged`, real pane (never the
+/// late sentinel), accumulator payload decodes, and the ingest clock has
+/// passed `pane_end + max_late_ns`. Anything else is left alone.
+pub fn window_emission_from_row(
+    row_key: &[u8],
+    payload: &[u8],
+    group_tagged: &[u8],
+    group: &IndexValue,
+    pane_ns: u64,
+    max_late_ns: u64,
+    now_ns: u64,
+) -> Option<WindowEmission> {
+    let (row_group, pane) = window_pane_row_key_parse(row_key)?;
+    if row_group != group_tagged || pane == WINDOW_LATE_PANE {
+        return None;
+    }
+    let (count, sum) = crate::index::decode_accumulator(payload)?;
+    let pane_end = pane.checked_add(1)?.checked_mul(pane_ns)?;
+    if now_ns < pane_end.checked_add(max_late_ns)? {
+        return None;
+    }
+    Some(WindowEmission {
+        row_key: row_key.to_vec(),
+        group: group.clone(),
+        group_tagged: row_group,
+        pane,
+        count,
+        sum,
+    })
+}
+
+/// The emitted window result record: one JSON document per closed pane.
+/// Timestamps carry as decimal strings (nanosecond precision survives
+/// JavaScript), `sum` as a decimal string for i128 headroom, `average`
+/// only for the Average aggregation.
+fn window_emission_payload(
+    emission: &WindowEmission,
+    pane_ns: u64,
+    aggregation: &WindowAggregation,
+) -> Vec<u8> {
+    let group = match &emission.group {
+        IndexValue::Null => serde_json::Value::Null,
+        IndexValue::Bool(value) => serde_json::Value::from(*value),
+        IndexValue::I64(value) => serde_json::Value::from(*value),
+        IndexValue::Text(value) => serde_json::Value::from(value.as_str()),
+        IndexValue::Bytes(value) => {
+            use base64::Engine;
+            serde_json::Value::from(base64::engine::general_purpose::STANDARD.encode(value))
+        }
+    };
+    let pane_start = emission.pane.saturating_mul(pane_ns);
+    let pane_end = pane_start.saturating_add(pane_ns);
+    let mut body = serde_json::json!({
+        "group": group,
+        "pane": emission.pane,
+        "pane_start_ns": pane_start.to_string(),
+        "pane_end_ns": pane_end.to_string(),
+        "count": emission.count,
+        "sum": serde_json::Value::Null,
+        "average": serde_json::Value::Null,
+    });
+    match aggregation {
+        WindowAggregation::Count => {}
+        WindowAggregation::Sum { .. } => {
+            body["sum"] = serde_json::Value::from(emission.sum.to_string());
+        }
+        WindowAggregation::Average { .. } => {
+            body["sum"] = serde_json::Value::from(emission.sum.to_string());
+            body["average"] = serde_json::Value::from(
+                (emission.sum as f64 / emission.count.max(1) as f64).to_string(),
+            );
+        }
+    }
+    body.to_string().into_bytes()
+}
+
 /// Tag-prefixed group bytes keep typed values distinct (Text "1" never
 /// merges with I64 1); `Null` keys group nothing.
-fn window_group_key_bytes(value: &IndexValue) -> Option<Vec<u8>> {
+pub fn window_group_key_bytes(value: &IndexValue) -> Option<Vec<u8>> {
     let (tag, bytes): (u8, Vec<u8>) = match value {
         IndexValue::Null => return None,
         IndexValue::Bool(value) => (0, vec![u8::from(*value)]),
@@ -628,7 +810,7 @@ pub fn enrich_lookup_key_bytes(value: &IndexValue) -> Option<Vec<u8>> {
 
 /// Decode a fetched record into the replay-record shape extraction expects.
 /// Corrupt wire fields contribute nothing rather than failing the cycle.
-fn source_record(record: &FetchedRecord) -> Option<ReplaySourceRecord> {
+pub fn source_record(record: &FetchedRecord) -> Option<ReplaySourceRecord> {
     use base64::Engine;
     let decode = |value: &str| base64::engine::general_purpose::STANDARD.decode(value).ok();
     Some(ReplaySourceRecord {
@@ -717,5 +899,107 @@ mod tests {
             created_at_ns: 0,
         };
         assert_eq!(pipe.operation, PipeOperation::Forward);
+    }
+
+    #[test]
+    fn window_pane_row_key_round_trips_and_rejects_malformed_keys() {
+        let group = window_group_key_bytes(&IndexValue::Text("acct".to_owned())).unwrap();
+        let key = window_pane_row_key(&group, 42);
+        assert_eq!(window_pane_row_key_parse(&key), Some((group.clone(), 42)));
+        // Truncations and length lies are foreign rows, never panes.
+        assert_eq!(window_pane_row_key_parse(&key[..key.len() - 1]), None);
+        assert_eq!(window_pane_row_key_parse(&key[..8]), None);
+        let mut lying = key.clone();
+        lying[3] = lying[3].wrapping_add(1);
+        assert_eq!(window_pane_row_key_parse(&lying), None);
+        assert_eq!(window_pane_row_key_parse(&[]), None);
+    }
+
+    #[test]
+    fn window_emission_from_row_emits_only_closed_real_panes() {
+        let group_value = IndexValue::Text("acct".to_owned());
+        let group = window_group_key_bytes(&group_value).unwrap();
+        let pane_ns = 10u64;
+        let payload = crate::index::encode_accumulator(3, 42);
+        // pane 5 closes at ingest-time (5+1)*10 + 20 = 80.
+        let key = window_pane_row_key(&group, 5);
+        let emission =
+            window_emission_from_row(&key, &payload, &group, &group_value, pane_ns, 20, 80)
+                .expect("closed pane emits");
+        assert_eq!(emission.pane, 5);
+        assert_eq!(emission.count, 3);
+        assert_eq!(emission.sum, 42);
+        assert_eq!(emission.row_key, key);
+        // One tick earlier the pane is still open.
+        assert!(
+            window_emission_from_row(&key, &payload, &group, &group_value, pane_ns, 20, 79)
+                .is_none()
+        );
+        // The late-sentinel pane never emits.
+        let late_key = window_pane_row_key(&group, WINDOW_LATE_PANE);
+        assert!(window_emission_from_row(
+            &late_key,
+            &payload,
+            &group,
+            &group_value,
+            pane_ns,
+            20,
+            u64::MAX
+        )
+        .is_none());
+        // A foreign group's row is untouched.
+        let other = window_group_key_bytes(&IndexValue::Text("other".to_owned())).unwrap();
+        assert!(
+            window_emission_from_row(&key, &payload, &other, &group_value, pane_ns, 20, 80)
+                .is_none()
+        );
+        // Malformed payloads and keys never delete anything.
+        assert!(window_emission_from_row(
+            &key,
+            b"not-an-accumulator",
+            &group,
+            &group_value,
+            pane_ns,
+            20,
+            80
+        )
+        .is_none());
+        assert!(
+            window_emission_from_row(b"bad", &payload, &group, &group_value, pane_ns, 20, 80)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn window_emission_payload_carries_the_result_document() {
+        let group = window_group_key_bytes(&IndexValue::Text("acct".to_owned())).unwrap();
+        let emission = WindowEmission {
+            row_key: window_pane_row_key(&group, 7),
+            group: IndexValue::Text("acct".to_owned()),
+            group_tagged: group,
+            pane: 7,
+            count: 4,
+            sum: 30,
+        };
+        let payload = window_emission_payload(
+            &emission,
+            10,
+            &WindowAggregation::Average {
+                value: crate::control::IndexFieldSpec::Key,
+            },
+        );
+        let body: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(body["group"], "acct");
+        assert_eq!(body["pane"], 7);
+        assert_eq!(body["pane_start_ns"], "70");
+        assert_eq!(body["pane_end_ns"], "80");
+        assert_eq!(body["count"], 4);
+        assert_eq!(body["sum"], "30");
+        assert_eq!(body["average"], "7.5");
+        // Count aggregations carry no sum/average fields.
+        let payload = window_emission_payload(&emission, 10, &WindowAggregation::Count);
+        let body: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(body["sum"], serde_json::Value::Null);
+        assert_eq!(body["average"], serde_json::Value::Null);
     }
 }

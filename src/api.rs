@@ -2179,10 +2179,27 @@ async fn drive_pipe(
                             resolution,
                         });
                     }
+                    // Window emission: closed panes resolve at fetch time
+                    // alongside the page; the outcome rides inside the
+                    // Declare so a replayed effect never re-scans.
+                    let emissions = match &pipe.operation {
+                        crate::control::PipeOperation::Window {
+                            window_ns,
+                            key,
+                            max_late_ns: Some(bound),
+                            ..
+                        } if pipe.output_feed_id.is_some() => resolve_window_emissions(
+                            state, &pipe, key, *window_ns, *bound, &records,
+                        )
+                        .await
+                        .map_err(|_| crate::effect::EffectJournalError::Unavailable)?,
+                        _ => Vec::new(),
+                    };
                     Ok(crate::pipe::FetchedPage {
                         cursor,
                         records,
                         positions,
+                        emissions,
                     })
                 }
             },
@@ -3959,6 +3976,151 @@ async fn resolve_enrich(
     Err(last_error.unwrap_or_else(|| {
         ApiError::unavailable("no StateStore journal replica could serve the lookup")
     }))
+}
+
+/// Resolve closed window panes for emission at fetch time. For every
+/// group touched by this page, read the `key` named posting (the same
+/// contract public row reads use) and keep rows whose pane provably
+/// closed — the ingest clock passed pane_end + MAX_LATE. The sentinel
+/// late pane and foreign `key`-posting rows are filtered out by
+/// `window_emission_from_row`.
+async fn resolve_window_emissions(
+    state: &AppState,
+    pipe: &crate::control::PipeDefinition,
+    key: &crate::control::IndexFieldSpec,
+    window_ns: u64,
+    max_late_ns: u64,
+    records: &[crate::pipe::FetchedRecord],
+) -> Result<Vec<crate::pipe::WindowEmission>, ApiError> {
+    let store_id = pipe
+        .output_store_id
+        .ok_or_else(|| ApiError::conflict("Window Pipe has no output StateStore"))?;
+    let pane_ns = crate::pipe::window_pane_ns(window_ns);
+    // The deterministic "now" for close decisions: the newest ingest
+    // timestamp this page observed. Emission replays never re-resolve,
+    // so wall clock would only undermine determinism.
+    let Some(now_ns) = records
+        .iter()
+        .map(|record| u64::try_from(record.ingest_time_ns).unwrap_or(0))
+        .max()
+    else {
+        return Ok(Vec::new());
+    };
+    // Deduplicated groups this page touches — only these can have rows
+    // worth emitting this cycle.
+    let mut groups: std::collections::BTreeMap<Vec<u8>, crate::index::IndexValue> =
+        std::collections::BTreeMap::new();
+    for record in records {
+        let Some(source) = crate::pipe::source_record(record) else {
+            continue;
+        };
+        let Ok(values) =
+            crate::index_build::extract_index_values(std::slice::from_ref(key), &source)
+        else {
+            continue;
+        };
+        if let Some(value) = values.into_iter().next() {
+            if let Some(tagged) = crate::pipe::window_group_key_bytes(&value) {
+                groups.entry(tagged).or_insert(value);
+            }
+        }
+    }
+    if groups.is_empty() {
+        return Ok(Vec::new());
+    }
+    let assignment = state
+        .control
+        .active_state_store_assignment_by_id(store_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("StateStore has no mutation-journal placement"))?;
+    // Local replica first, then owner, then any member — the same
+    // candidate order public row reads use.
+    let mut candidates: Vec<StorageNodeId> = Vec::new();
+    if let Some(local) = state.storage_node_id.clone() {
+        if assignment.replicas.iter().any(|node| *node == local) {
+            candidates.push(local);
+        }
+    }
+    candidates.push(assignment.owner.clone());
+    for replica in assignment.replicas.iter() {
+        if !candidates.contains(replica) {
+            candidates.push(replica.clone());
+        }
+    }
+    let mut emissions = Vec::new();
+    'groups: for (group_tagged, group_value) in &groups {
+        let mut reply = None;
+        let mut last_error: Option<ApiError> = None;
+        for replica in &candidates {
+            let read = crate::state_store::StateStoreReadRequest {
+                owner: assignment.owner.clone(),
+                receiver: replica.clone(),
+                store_id,
+                ownership_epoch: assignment.ownership_epoch,
+                key: Vec::new(),
+                strict: false,
+                wait_ms: 500,
+                by_named: Some(crate::state_store::StateStoreNamedRead {
+                    name: crate::pipe::WINDOW_KEY_NAME.to_owned(),
+                    values: vec![group_value.clone()],
+                    limit: 64,
+                }),
+            };
+            let outcome = if Some(replica) == state.storage_node_id.as_ref()
+                && state.state_store_journal.is_some()
+            {
+                state
+                    .state_store_journal
+                    .as_ref()
+                    .unwrap()
+                    .read_row(read)
+                    .await
+                    .map_err(state_store_api_error)
+            } else {
+                match state_store_transport_for(state, &assignment) {
+                    Ok(transport) => transport
+                        .read(replica, read)
+                        .await
+                        .map_err(state_store_api_error),
+                    Err(error) => Err(error),
+                }
+            };
+            match outcome {
+                Ok(result) => {
+                    reply = Some(result);
+                    break;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        // A group whose posting cannot be read at all fails the whole
+        // resolve — the drive retries rather than emitting a partial
+        // close set. Emission deletes are atomic with their outputs, so
+        // a retry is idempotent.
+        let Some(reply) = reply else {
+            return Err(last_error.unwrap_or_else(|| {
+                ApiError::unavailable("no StateStore replica could serve the emission scan")
+            }));
+        };
+        for row in reply.result.named_rows {
+            if let Some(emission) = crate::pipe::window_emission_from_row(
+                &row.key,
+                &row.payload,
+                group_tagged,
+                group_value,
+                pane_ns,
+                max_late_ns,
+                now_ns,
+            ) {
+                emissions.push(emission);
+            }
+            if emissions.len() >= crate::pipe::WINDOW_MAX_EMISSIONS_PER_DRIVE {
+                break 'groups;
+            }
+        }
+    }
+    emissions.sort_by(|a, b| a.row_key.cmp(&b.row_key));
+    Ok(emissions)
 }
 
 fn state_store_coordinator_for(
@@ -13738,6 +13900,72 @@ mod tests {
                 .await
                 .is_err()
         );
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn window_emission_scan_fails_closed_and_skips_unprojectable_pages() {
+        let directory = TempDir::new().unwrap();
+        let (state, control_plane, _control, _replica) =
+            internal_replica_test_state(&directory).await;
+        let pipe = crate::control::PipeDefinition {
+            pipe_id: Uuid::new_v4(),
+            name: "orders.window".to_owned(),
+            space_id: Uuid::new_v4(),
+            subscription_id: Uuid::new_v4(),
+            operation: crate::control::PipeOperation::Window {
+                window_ns: 60_000_000_000,
+                key: crate::control::IndexFieldSpec::Key,
+                aggregation: crate::control::WindowAggregation::Count,
+                time: crate::control::WindowTime::Event,
+                max_late_ns: Some(1_000),
+            },
+            output_feed_id: Some(Uuid::new_v4()),
+            output_store_id: Some(Uuid::new_v4()),
+            stage: crate::control::PipeStage::Declared,
+            status: crate::control::ResourceStatus::Active,
+            created_at_ns: 0,
+        };
+        let key_spec = crate::control::IndexFieldSpec::Key;
+        let record = |key: &str, ingest: i64| crate::pipe::FetchedRecord {
+            message_id: Uuid::new_v4(),
+            key_base64: STANDARD.encode(key),
+            payload_base64: STANDARD.encode(b"{}"),
+            metadata_base64: Default::default(),
+            event_time_ns: ingest,
+            ingest_time_ns: ingest,
+            resolution: None,
+        };
+
+        // A page whose records cannot decode contributes no groups and
+        // resolves to no emissions — never an error, never a partial set.
+        let mut corrupt = record("acct", 1_000);
+        corrupt.key_base64 = "!!!not-base64!!!".to_owned();
+        assert!(resolve_window_emissions(
+            &state,
+            &pipe,
+            &key_spec,
+            60_000_000_000,
+            1_000,
+            &[corrupt],
+        )
+        .await
+        .unwrap()
+        .is_empty());
+
+        // A real group under a store with no journal placement fails the
+        // whole resolve — the drive retries rather than emitting a
+        // partial close set.
+        assert!(resolve_window_emissions(
+            &state,
+            &pipe,
+            &key_spec,
+            60_000_000_000,
+            1_000,
+            &[record("acct", 1_000)],
+        )
+        .await
+        .is_err());
         control_plane.raft().shutdown().await.unwrap();
     }
 
