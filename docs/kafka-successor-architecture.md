@@ -330,9 +330,14 @@ closed panes per drive alongside the accumulation); a larger backlog
 drains oldest-first across subsequent drives. The same bounded range
 shape is exposed to readers: `POST /v1/state-stores/get-by` accepts
 `lower`/`upper` inclusive-or-exclusive bounds over any declared named
-key, reusing the index query's bound vocabulary. Watermarks/grace,
-in-place late-event revision, and idle-group state expiry (reclaiming a
-group's last pane row) remain follow-on work.
+key, reusing the index query's bound vocabulary. Retention is a declared bound too: `EXPIRE <dur>` deletes a pane row
+once `pane_end + EXPIRE` is behind the close clock — emitted or not —
+so a window store's state stays bounded without an operator-managed
+cleanup pass (the bound must exceed `MAX_LATE`, so a pane always
+provably closes before it may expire; expired rows delete inside the
+same effect as emissions, sharing its 15-deletion budget). Watermarks/grace
+beyond `MAX_LATE` and in-place late-event revision remain follow-on
+work.
 
 Point-lookup enrichment is the second. An `Enrich` Pipe resolves each
 delivered record's projected key against a declared StateStore at fetch

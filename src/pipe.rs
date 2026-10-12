@@ -70,6 +70,10 @@ pub struct FetchedPage {
     /// travels inside the same Declare/Applied boundary as the pane
     /// accumulation, so a replayed effect never re-scans the store.
     pub emissions: Vec<WindowEmission>,
+    /// Window Pipes only: pane row keys past their declared `EXPIRE`
+    /// retention bound. They delete inside the same effect without
+    /// emitting — expiry is a retention contract, not a close signal.
+    pub expired: Vec<Vec<u8>>,
 }
 
 /// One closed window pane resolved for emission: the StateStore pane row
@@ -138,12 +142,16 @@ pub fn pipe_emission_effect_id(
     subscription_id: Uuid,
     expected_cursor: &str,
     emissions: &[WindowEmission],
+    expired: &[Vec<u8>],
 ) -> Uuid {
     let mut material = Vec::new();
     let mut keys: Vec<&[u8]> = emissions
         .iter()
         .map(|emission| emission.row_key.as_slice())
         .collect();
+    // The digest covers the whole delete set — emitted and expired rows
+    // alike — so a differently drained cycle can never alias this one.
+    keys.extend(expired.iter().map(|key| key.as_slice()));
     keys.sort_unstable();
     for key in keys {
         material.extend_from_slice(&(key.len() as u64).to_le_bytes());
@@ -295,7 +303,7 @@ impl PipeDriver {
         };
         let limit = limit.clamp(1, crate::effect::EFFECT_MAX_OUTPUTS);
         let page = fetch(&frontier, limit).await?;
-        if page.records.is_empty() && page.emissions.is_empty() {
+        if page.records.is_empty() && page.emissions.is_empty() && page.expired.is_empty() {
             return Ok(None);
         }
         if page.records.len() > crate::effect::EFFECT_MAX_OUTPUTS
@@ -316,6 +324,7 @@ impl PipeDriver {
                 frontier.subscription_id,
                 &frontier.cursor,
                 &page.emissions,
+                &page.expired,
             )
         } else {
             pipe_effect_id(
@@ -420,6 +429,7 @@ impl PipeDriver {
                 aggregation,
                 time,
                 max_late_ns,
+                expire_ns: _,
             } => {
                 let store_id = self
                     .pipe
@@ -491,8 +501,13 @@ impl PipeDriver {
                 }
                 // Closed-pane emissions resolved at fetch time emit even
                 // when this page accumulated nothing (all-late or empty
-                // groups still release their aged panes).
-                if panes.is_empty() && late.is_empty() && page.emissions.is_empty() {
+                // groups still release their aged panes) — and expired
+                // rows still delete.
+                if panes.is_empty()
+                    && late.is_empty()
+                    && page.emissions.is_empty()
+                    && page.expired.is_empty()
+                {
                     return Ok((Vec::new(), Vec::new()));
                 }
                 let mut entries: Vec<AccumulateRowEntry> = panes
@@ -553,6 +568,7 @@ impl PipeDriver {
                 if !page.emissions.is_empty() && self.pipe.output_feed_id.is_none() {
                     return Err(EffectJournalError::Conflict);
                 }
+                let mut emission_deletes = 0usize;
                 if let Some(feed_id) = self.pipe.output_feed_id {
                     // Row-key order is byte-identical across replays —
                     // mutation and writer identities depend on it.
@@ -593,7 +609,26 @@ impl PipeDriver {
                                 key: emission.row_key.clone(),
                             },
                         });
+                        emission_deletes += 1;
                     }
+                }
+                // Expired pane rows fill whatever delete budget the
+                // emissions left — row-key order keeps replay identities
+                // deterministic, and rows left over wait for a later
+                // drive rather than escaping the mutation bound.
+                let mut expired = page.expired.clone();
+                expired.sort();
+                for row_key in expired
+                    .iter()
+                    .take(WINDOW_MAX_EMISSIONS_PER_DRIVE.saturating_sub(emission_deletes))
+                {
+                    mutations.push(EffectStateMutation {
+                        store_id,
+                        mutation_id: effect_state_mutation_id(effect_id, mutations.len()),
+                        op: StateStoreMutationOp::DeleteRow {
+                            key: row_key.clone(),
+                        },
+                    });
                 }
                 Ok((outputs, mutations))
             }
@@ -793,6 +828,50 @@ pub fn window_emission_from_row(
         count,
         sum,
     })
+}
+
+/// What one fetched pane row should do this drive: stay, emit+delete,
+/// or delete past its declared retention bound. Expiry is checked first
+/// — `EXPIRE` is a true retention contract, so an un-emitted closed pane
+/// past expiry drops rather than lingering forever.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WindowPaneDisposition {
+    Keep,
+    Emit(WindowEmission),
+    /// Delete the row key without emitting.
+    Expire,
+}
+
+pub fn window_row_disposition(
+    row_key: &[u8],
+    payload: &[u8],
+    pane_ns: u64,
+    max_late_ns: Option<u64>,
+    expire_ns: Option<u64>,
+    now_ns: u64,
+) -> WindowPaneDisposition {
+    let Some((_row_group, pane)) = window_pane_row_key_parse(row_key) else {
+        return WindowPaneDisposition::Keep;
+    };
+    // The sentinel late-events row is evidence, not a pane — it neither
+    // emits nor expires.
+    if pane == WINDOW_LATE_PANE {
+        return WindowPaneDisposition::Keep;
+    }
+    let Some(pane_end) = pane.checked_add(1).and_then(|end| end.checked_mul(pane_ns)) else {
+        return WindowPaneDisposition::Keep;
+    };
+    if let Some(bound) = expire_ns.and_then(|expire| pane_end.checked_add(expire)) {
+        if now_ns >= bound {
+            return WindowPaneDisposition::Expire;
+        }
+    }
+    if let Some(bound) = max_late_ns {
+        if let Some(emission) = window_emission_from_row(row_key, payload, pane_ns, bound, now_ns) {
+            return WindowPaneDisposition::Emit(emission);
+        }
+    }
+    WindowPaneDisposition::Keep
 }
 
 /// The emitted window result record: one JSON document per closed pane.
@@ -1008,6 +1087,54 @@ mod tests {
         // Malformed payloads and keys never delete anything.
         assert!(window_emission_from_row(&key, b"not-an-accumulator", pane_ns, 20, 80).is_none());
         assert!(window_emission_from_row(b"bad", &payload, pane_ns, 20, 80).is_none());
+    }
+
+    #[test]
+    fn window_row_disposition_orders_expire_emit_and_keep() {
+        let group = window_group_key_bytes(&IndexValue::Text("acct".to_owned())).unwrap();
+        let pane_ns = 10u64;
+        let payload = crate::index::encode_accumulator(3, 42);
+        // pane 5 closes at (5+1)*10 + 20 = 80; expires at (5+1)*10 + 100 = 160.
+        let key = window_pane_row_key(&group, 5);
+
+        // Open panes keep — whatever policies are declared.
+        assert_eq!(
+            window_row_disposition(&key, &payload, pane_ns, Some(20), Some(100), 79),
+            WindowPaneDisposition::Keep
+        );
+        // A closed, unexpired pane emits when a bound is declared.
+        let WindowPaneDisposition::Emit(emission) =
+            window_row_disposition(&key, &payload, pane_ns, Some(20), Some(100), 80)
+        else {
+            panic!("closed pane emits")
+        };
+        assert_eq!(emission.pane, 5);
+        // Without an emit bound the same closed-age pane just keeps.
+        assert_eq!(
+            window_row_disposition(&key, &payload, pane_ns, None, Some(100), 80),
+            WindowPaneDisposition::Keep
+        );
+        // Past expiry the row deletes — emitted or not, and regardless of
+        // whether the payload still decodes.
+        assert_eq!(
+            window_row_disposition(&key, &payload, pane_ns, Some(20), Some(100), 160),
+            WindowPaneDisposition::Expire
+        );
+        assert_eq!(
+            window_row_disposition(&key, b"garbage", pane_ns, Some(20), Some(100), 160),
+            WindowPaneDisposition::Expire
+        );
+        // The late-sentinel row never expires or emits.
+        let late_key = window_pane_row_key(&group, WINDOW_LATE_PANE);
+        assert_eq!(
+            window_row_disposition(&late_key, &payload, pane_ns, Some(20), Some(100), u64::MAX),
+            WindowPaneDisposition::Keep
+        );
+        // Malformed keys and overflowed bounds keep rather than guessing.
+        assert_eq!(
+            window_row_disposition(b"bad", &payload, pane_ns, Some(20), Some(100), u64::MAX),
+            WindowPaneDisposition::Keep
+        );
     }
 
     #[test]

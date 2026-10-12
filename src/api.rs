@@ -2179,26 +2179,35 @@ async fn drive_pipe(
                             resolution,
                         });
                     }
-                    // Window emission: closed panes resolve at fetch time
+                    // Window pane-close and expiry resolve at fetch time
                     // alongside the page; the outcome rides inside the
                     // Declare so a replayed effect never re-scans.
-                    let emissions = match &pipe.operation {
+                    let (emissions, expired) = match &pipe.operation {
                         crate::control::PipeOperation::Window {
                             window_ns,
-                            max_late_ns: Some(bound),
+                            max_late_ns,
+                            expire_ns,
                             ..
-                        } if pipe.output_feed_id.is_some() => {
-                            resolve_window_emissions(state, &pipe, *window_ns, *bound, &records)
-                                .await
-                                .map_err(|_| crate::effect::EffectJournalError::Unavailable)?
+                        } if pipe.output_feed_id.is_some() || expire_ns.is_some() => {
+                            resolve_window_emissions(
+                                state,
+                                &pipe,
+                                *window_ns,
+                                *max_late_ns,
+                                *expire_ns,
+                                &records,
+                            )
+                            .await
+                            .map_err(|_| crate::effect::EffectJournalError::Unavailable)?
                         }
-                        _ => Vec::new(),
+                        _ => (Vec::new(), Vec::new()),
                     };
                     Ok(crate::pipe::FetchedPage {
                         cursor,
                         records,
                         positions,
                         emissions,
+                        expired,
                     })
                 }
             },
@@ -4048,13 +4057,16 @@ async fn resolve_window_emissions(
     state: &AppState,
     pipe: &crate::control::PipeDefinition,
     window_ns: u64,
-    max_late_ns: u64,
+    max_late_ns: Option<u64>,
+    expire_ns: Option<u64>,
     records: &[crate::pipe::FetchedRecord],
-) -> Result<Vec<crate::pipe::WindowEmission>, ApiError> {
+) -> Result<(Vec<crate::pipe::WindowEmission>, Vec<Vec<u8>>), ApiError> {
     let store_id = pipe
         .output_store_id
         .ok_or_else(|| ApiError::conflict("Window Pipe has no output StateStore"))?;
     let pane_ns = crate::pipe::window_pane_ns(window_ns);
+    // Closed panes publish only when the Pipe declared an emission Feed.
+    let emit_enabled = max_late_ns.is_some() && pipe.output_feed_id.is_some();
     // The deterministic "now" for close decisions: the newest ingest
     // timestamp this page observed, floored by the driver's own clock so
     // panes still close while input idles. The resolved set journals
@@ -4085,11 +4097,22 @@ async fn resolve_window_emissions(
             candidates.push(replica.clone());
         }
     }
-    // Closable panes satisfy (pane + 1) * pane_ns + max_late <= now;
-    // the range bound prefilters, and the per-row check decides.
-    let closed_max =
-        i64::try_from((now_ns.saturating_sub(max_late_ns) / pane_ns).saturating_sub(1))
-            .unwrap_or(i64::MAX);
+    // Closable panes satisfy (pane + 1) * pane_ns + max_late <= now and
+    // expired panes satisfy pane_end + expire <= now; the range bound
+    // prefilters whichever reaches furthest, and the per-row check
+    // decides.
+    let bound_max = |bound_ns: u64| {
+        i64::try_from((now_ns.saturating_sub(bound_ns) / pane_ns).saturating_sub(1))
+            .unwrap_or(i64::MAX)
+    };
+    let scan_max = [
+        emit_enabled.then(|| bound_max(max_late_ns.unwrap_or(0))),
+        expire_ns.map(bound_max),
+    ]
+    .into_iter()
+    .flatten()
+    .max()
+    .unwrap_or(-1);
     let mut reply = None;
     let mut last_error: Option<ApiError> = None;
     for replica in &candidates {
@@ -4106,7 +4129,7 @@ async fn resolve_window_emissions(
                 name: crate::pipe::WINDOW_PANE_NAME.to_owned(),
                 lower: None,
                 upper: Some(crate::control::IndexBound {
-                    value: crate::index::IndexValue::I64(closed_max),
+                    value: crate::index::IndexValue::I64(scan_max),
                     inclusive: true,
                 }),
                 limit: 64,
@@ -4148,22 +4171,27 @@ async fn resolve_window_emissions(
         }));
     };
     let mut emissions = Vec::new();
+    let mut expired = Vec::new();
     for row in reply.result.named_rows {
-        if let Some(emission) = crate::pipe::window_emission_from_row(
+        match crate::pipe::window_row_disposition(
             &row.key,
             &row.payload,
             pane_ns,
-            max_late_ns,
+            if emit_enabled { max_late_ns } else { None },
+            expire_ns,
             now_ns,
         ) {
-            emissions.push(emission);
+            crate::pipe::WindowPaneDisposition::Emit(emission) => emissions.push(emission),
+            crate::pipe::WindowPaneDisposition::Expire => expired.push(row.key.clone()),
+            crate::pipe::WindowPaneDisposition::Keep => {}
         }
-        if emissions.len() >= crate::pipe::WINDOW_MAX_EMISSIONS_PER_DRIVE {
+        if emissions.len() + expired.len() >= crate::pipe::WINDOW_MAX_EMISSIONS_PER_DRIVE {
             break;
         }
     }
     emissions.sort_by(|a, b| a.row_key.cmp(&b.row_key));
-    Ok(emissions)
+    expired.sort();
+    Ok((emissions, expired))
 }
 
 fn state_store_coordinator_for(
@@ -14012,6 +14040,7 @@ mod tests {
                 aggregation: crate::control::WindowAggregation::Count,
                 time: crate::control::WindowTime::Event,
                 max_late_ns: Some(1_000),
+                expire_ns: None,
             },
             output_feed_id: Some(Uuid::new_v4()),
             output_store_id: Some(Uuid::new_v4()),
@@ -14033,7 +14062,7 @@ mod tests {
         // still scans the store — and fails closed when that store has
         // no reachable placement rather than skipping idle panes.
         assert!(
-            resolve_window_emissions(&state, &pipe, 60_000_000_000, 1_000, &[],)
+            resolve_window_emissions(&state, &pipe, 60_000_000_000, Some(1_000), None, &[],)
                 .await
                 .is_err()
         );
@@ -14045,7 +14074,8 @@ mod tests {
             &state,
             &pipe,
             60_000_000_000,
-            1_000,
+            Some(1_000),
+            None,
             &[record("acct", 1_000)],
         )
         .await

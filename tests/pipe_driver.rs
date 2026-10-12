@@ -618,6 +618,7 @@ fn page_with_emissions(
         cursor: cursor.to_owned(),
         positions: BTreeMap::from([(range(), cursor.to_owned())]),
         emissions,
+        expired: Vec::new(),
     }
 }
 
@@ -1058,6 +1059,7 @@ fn window_pipe() -> PipeDefinition {
             key: IndexFieldSpec::Key,
             time: finnstream::control::WindowTime::Event,
             max_late_ns: None,
+            expire_ns: None,
             aggregation: WindowAggregation::Sum {
                 value: IndexFieldSpec::Projection {
                     extractor: "json".to_owned(),
@@ -1099,6 +1101,7 @@ async fn window_pipe_quarantines_late_events_into_a_countable_row() {
         aggregation: WindowAggregation::Count,
         time: finnstream::control::WindowTime::Event,
         max_late_ns: Some(500),
+        expire_ns: None,
     };
     let harness = harness_for(pipe);
     seed_frontier(&harness.progress, "p0").await;
@@ -1157,6 +1160,7 @@ fn ingest_window_pipe() -> PipeDefinition {
         aggregation: WindowAggregation::Count,
         time: finnstream::control::WindowTime::Ingest,
         max_late_ns: None,
+        expire_ns: None,
     };
     pipe
 }
@@ -1584,8 +1588,24 @@ fn emit_window_pipe() -> PipeDefinition {
         },
         time: finnstream::control::WindowTime::Event,
         max_late_ns: Some(20),
+        expire_ns: None,
     };
     pipe.output_feed_id = Some(Uuid::from_u128(OUTPUT_FEED));
+    pipe
+}
+
+/// A window Pipe that retains pane rows only up to its declared
+/// `EXPIRE` bound and never emits to a Feed.
+fn expire_window_pipe() -> PipeDefinition {
+    let mut pipe = window_pipe();
+    pipe.operation = PipeOperation::Window {
+        window_ns: 160,
+        key: IndexFieldSpec::Key,
+        aggregation: WindowAggregation::Count,
+        time: finnstream::control::WindowTime::Event,
+        max_late_ns: None,
+        expire_ns: Some(30),
+    };
     pipe
 }
 
@@ -1724,6 +1744,7 @@ async fn idle_pages_close_panes_with_an_emission_only_effect() {
             Uuid::from_u128(SUBSCRIPTION),
             "p0",
             std::slice::from_ref(&emission),
+            &[],
         )
     );
     let EffectTransition::Applied {
@@ -1797,6 +1818,156 @@ async fn idle_pages_close_panes_with_an_emission_only_effect() {
         .await
         .unwrap()
         .is_none());
+}
+
+#[tokio::test]
+async fn window_pipe_expires_pane_rows_without_emitting() {
+    let harness = harness_for(expire_window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+    let tagged =
+        finnstream::pipe::window_group_key_bytes(&IndexValue::Bytes(b"key-a".to_vec())).unwrap();
+    let expired_key = window_pane_row_key(&tagged, 2);
+
+    let mut page = page(vec![json_record(1, b"key-a", 0, 5)], "p1");
+    page.expired = vec![expired_key.clone()];
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| {
+                let page = page.clone();
+                async move { Ok(page) }
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    let EffectTransition::Applied {
+        outputs,
+        state_mutations,
+        ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    // No emit Feed: expiry produces no output, just the delete.
+    assert!(outputs.is_empty());
+    assert_eq!(state_mutations.len(), 2);
+    let StateStoreMutationOp::DeleteRow { key } = &state_mutations[1].op else {
+        panic!("expected DeleteRow")
+    };
+    assert_eq!(*key, expired_key);
+    assert_eq!(harness.sink.mutations.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn expired_panes_delete_on_an_idle_page() {
+    let harness = harness_for(expire_window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+    let tagged =
+        finnstream::pipe::window_group_key_bytes(&IndexValue::Bytes(b"key-a".to_vec())).unwrap();
+    let expired_key = window_pane_row_key(&tagged, 2);
+
+    let mut page = page(vec![], "p0");
+    page.expired = vec![expired_key.clone()];
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| {
+                let page = page.clone();
+                async move { Ok(page) }
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    // Expiry rides the emission-effect identity keyed on the delete set.
+    assert_eq!(
+        applied.effect_id,
+        finnstream::pipe::pipe_emission_effect_id(
+            expire_window_pipe().pipe_id,
+            Uuid::from_u128(SUBSCRIPTION),
+            "p0",
+            &[],
+            std::slice::from_ref(&expired_key),
+        )
+    );
+    let EffectTransition::Applied {
+        outputs,
+        state_mutations,
+        ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    assert!(outputs.is_empty());
+    // Delete-only: no accumulate mutation on an empty page.
+    assert_eq!(state_mutations.len(), 1);
+    let StateStoreMutationOp::DeleteRow { key } = &state_mutations[0].op else {
+        panic!("expected DeleteRow")
+    };
+    assert_eq!(*key, expired_key);
+    let committed = harness.progress.read_committed().await.unwrap().unwrap();
+    assert_eq!(committed.cursor, "p0");
+}
+
+#[tokio::test]
+async fn emitted_panes_fill_the_delete_budget_before_expired_ones() {
+    let harness = harness_for(emit_window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+    let emissions: Vec<WindowEmission> = (0..15)
+        .map(|pane| pane_emission(IndexValue::Bytes(b"key-a".to_vec()), pane, 1, 1))
+        .collect();
+    let tagged =
+        finnstream::pipe::window_group_key_bytes(&IndexValue::Bytes(b"key-b".to_vec())).unwrap();
+    let expired: Vec<Vec<u8>> = (20..23)
+        .map(|pane| window_pane_row_key(&tagged, pane))
+        .collect();
+
+    let mut page = page_with_emissions(vec![json_record(1, b"key-a", 0, 5)], emissions, "p1");
+    page.expired = expired.clone();
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| {
+                let page = page.clone();
+                async move { Ok(page) }
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    let EffectTransition::Applied {
+        outputs,
+        state_mutations,
+        ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    assert_eq!(outputs.len(), 15);
+    // 1 accumulate + 15 deletes exhaust the 16-mutation budget; the
+    // expired rows wait for a later drive rather than escape the bound.
+    assert_eq!(state_mutations.len(), 16);
+    let deleted: Vec<&Vec<u8>> = state_mutations[1..]
+        .iter()
+        .filter_map(|mutation| match &mutation.op {
+            StateStoreMutationOp::DeleteRow { key } => Some(key),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(deleted.len(), 15);
+    for key in &expired {
+        assert!(!deleted.contains(&key));
+    }
 }
 
 #[tokio::test]

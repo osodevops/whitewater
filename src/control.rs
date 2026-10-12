@@ -135,6 +135,13 @@ pub enum PipeOperation {
         /// Meaningful only under the event-time clock.
         #[serde(default)]
         max_late_ns: Option<u64>,
+        /// Optional pane-row retention bound in nanoseconds: a pane row
+        /// deletes once `pane_end + expire_ns` is behind the close clock,
+        /// emitted or not — the declared bound on how much window state
+        /// the store retains. Must exceed `max_late_ns` when both are
+        /// declared so a pane provably closes before it may expire.
+        #[serde(default)]
+        expire_ns: Option<u64>,
     },
     /// Point-lookup enrichment: for each delivered record, resolve one
     /// StateStore row by the projected `key` and copy its payload into the
@@ -2454,6 +2461,7 @@ impl ControlController {
                         aggregation,
                         time,
                         max_late_ns,
+                        expire_ns,
                     } => {
                         if *window_ns == 0 {
                             return Err(ControlError::InvalidOperation(
@@ -2470,6 +2478,20 @@ impl ControlController {
                                 return Err(ControlError::InvalidOperation(
                                     "MAX_LATE is meaningless under the ingest clock — records can never arrive late to their own ingest time".to_owned(),
                                 ));
+                            }
+                        }
+                        if let Some(expire) = expire_ns {
+                            if *expire == 0 {
+                                return Err(ControlError::InvalidOperation(
+                                    "EXPIRE requires a non-zero duration".to_owned(),
+                                ));
+                            }
+                            if let Some(bound) = max_late_ns {
+                                if *expire <= *bound {
+                                    return Err(ControlError::InvalidOperation(
+                                        "EXPIRE must exceed MAX_LATE — a pane must provably close before it may expire".to_owned(),
+                                    ));
+                                }
                             }
                         }
                         let output_store = output_store.ok_or_else(|| {
@@ -4686,6 +4708,14 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                                 Some(parse_window_duration(token(&tokens, at + 1)?)?);
                             at += 2;
                         }
+                        let mut expire_ns = None;
+                        if token(&tokens, at)
+                            .map(|value| value.eq_ignore_ascii_case("EXPIRE"))
+                            .unwrap_or(false)
+                        {
+                            expire_ns = Some(parse_window_duration(token(&tokens, at + 1)?)?);
+                            at += 2;
+                        }
                         let by = at;
                         expect_keyword(&tokens, by, "BY")?;
                         let (key, next) = parse_index_field_spec(&tokens, by + 1, "BY")?;
@@ -4729,6 +4759,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             operation: PipeOperation::Window {
                                 window_ns,
                                 max_late_ns,
+                                expire_ns,
                                 key,
                                 aggregation,
                                 time,
@@ -8756,6 +8787,7 @@ mod tests {
                 aggregation: WindowAggregation::Count,
                 time: WindowTime::Event,
                 max_late_ns: None,
+                expire_ns: None,
             },
         };
         // Missing store, foreign-Domain store, zero window, and a missing
@@ -8856,6 +8888,7 @@ mod tests {
             PipeOperation::Window {
                 time: WindowTime::Event,
                 max_late_ns: None,
+                expire_ns: None,
                 ..
             }
         ));
@@ -8877,6 +8910,7 @@ mod tests {
             PipeOperation::Window {
                 time: WindowTime::Event,
                 max_late_ns: Some(bound),
+                expire_ns: None,
                 ..
             } if bound == 300_000_000_000
         ));
@@ -8931,6 +8965,56 @@ mod tests {
             "CREATE PIPE accounts.emit3 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h MAX_LATE 5m BY KEY COUNT EMIT TO FEED accounts.missing;",
             // A malformed tail fails at parse.
             "CREATE PIPE accounts.emit4 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h MAX_LATE 5m BY KEY COUNT EMIT accounts.results;",
+        ] {
+            assert!(
+                leader.execute(statement).await.is_err(),
+                "{statement} must fail"
+            );
+        }
+
+        // EXPIRE declares a pane-row retention bound independent of
+        // emission — the store keeps no pane past pane_end + expire.
+        leader
+            .execute(
+                "CREATE PIPE accounts.expiring FROM SUBSCRIPTION accounts.flow                  TO STATESTORE accounts.panes WINDOW 1h EVENT MAX_LATE 5m EXPIRE 2h BY KEY COUNT;",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            leader
+                .active_pipe_by_name("accounts.expiring")
+                .await
+                .unwrap()
+                .operation,
+            PipeOperation::Window {
+                max_late_ns: Some(300_000_000_000),
+                expire_ns: Some(7_200_000_000_000),
+                ..
+            }
+        ));
+        // EXPIRE stands alone — retention without lateness or emission.
+        leader
+            .execute(
+                "CREATE PIPE accounts.expiring2 FROM SUBSCRIPTION accounts.flow                  TO STATESTORE accounts.panes WINDOW 1h EXPIRE 2h BY KEY COUNT;",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            leader
+                .active_pipe_by_name("accounts.expiring2")
+                .await
+                .unwrap()
+                .operation,
+            PipeOperation::Window {
+                expire_ns: Some(7_200_000_000_000),
+                ..
+            }
+        ));
+        for statement in [
+            // A pane must provably close before it may expire.
+            "CREATE PIPE accounts.exp1 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h MAX_LATE 5m EXPIRE 1m BY KEY COUNT;",
+            // Zero retention refuses.
+            "CREATE PIPE accounts.exp2 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h EXPIRE 0s BY KEY COUNT;",
         ] {
             assert!(
                 leader.execute(statement).await.is_err(),
