@@ -90,7 +90,7 @@ Each call scans at most 10,000 committed frames in the same merged order the pla
 }
 ```
 
-`key_base64` is required and must be valid base64; an unknown `after` Cursor fails closed like the plain read. Event-time and Metadata filters remain planned; exact-Key lookup is the first-class investigation path today.
+Predicates combine with AND semantics: `key_base64` selects the exact Key, while `from_event_time_ns` / `to_event_time_ns` bound the record's `event_time_ns` inclusively as signed epoch-nanosecond decimals — together or alone, but at least one predicate is required because the plain read is the contract for unfiltered history. Inverted ranges and non-decimal bounds are refused; an unknown `after` Cursor fails closed like the plain read. Metadata filters remain planned.
 
 ### Single-record lookup
 

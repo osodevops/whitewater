@@ -10240,8 +10240,12 @@ struct FeedReadQuery {
 #[serde(deny_unknown_fields)]
 struct FeedSearchQuery {
     feed: String,
-    /// Exact record Key bytes, base64; other filter kinds land later.
+    /// Exact record Key bytes, base64.
     key_base64: Option<String>,
+    /// Inclusive event-time bounds as signed epoch-nanosecond decimals,
+    /// matching the client timestamp convention.
+    from_event_time_ns: Option<String>,
+    to_event_time_ns: Option<String>,
     after: Option<String>,
     limit: Option<usize>,
 }
@@ -10262,13 +10266,40 @@ async fn search_feed_records(
     Query(query): Query<FeedSearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_admin(&state, &headers)?;
-    let key = decode_base64(
-        "key_base64",
-        query
-            .key_base64
-            .as_deref()
-            .ok_or_else(|| ApiError::bad_request("key_base64 is required"))?,
-    )?;
+    let parse_bound = |field: &str, value: Option<&str>| -> Result<Option<i64>, ApiError> {
+        value
+            .map(|bound| {
+                bound.parse::<i64>().map_err(|_| {
+                    ApiError::bad_request(format!(
+                        "{field} must be a signed epoch-nanosecond decimal"
+                    ))
+                })
+            })
+            .transpose()
+    };
+    let key = query
+        .key_base64
+        .as_deref()
+        .map(|value| decode_base64("key_base64", value))
+        .transpose()?;
+    let from_event_time_ns =
+        parse_bound("from_event_time_ns", query.from_event_time_ns.as_deref())?;
+    let to_event_time_ns = parse_bound("to_event_time_ns", query.to_event_time_ns.as_deref())?;
+    if key.is_none() && from_event_time_ns.is_none() && to_event_time_ns.is_none() {
+        return Err(ApiError::bad_request(
+            "search requires key_base64 or an event-time bound",
+        ));
+    }
+    if from_event_time_ns.is_some_and(|from| to_event_time_ns.is_some_and(|to| from > to)) {
+        return Err(ApiError::bad_request(
+            "from_event_time_ns must not exceed to_event_time_ns",
+        ));
+    }
+    let matches = |record: &crate::domain::StoredRecord| -> bool {
+        key.as_ref().is_none_or(|key| record.key == *key)
+            && from_event_time_ns.is_none_or(|from| record.event_time_ns >= from)
+            && to_event_time_ns.is_none_or(|to| record.event_time_ns <= to)
+    };
     let limit = query.limit.unwrap_or(64).clamp(1, 256);
     let feed = feed_when_applied(&state.control, &query.feed, state.control_plane.is_some())
         .await
@@ -10302,7 +10333,7 @@ async fn search_feed_records(
                 .map_err(|error| ApiError::unavailable(error.to_string()))?;
             let cursor = frame.cursor;
             next_after = Some(cursor.clone());
-            if record.key == key {
+            if matches(&record) {
                 records.push(record_response(
                     CursorRecord {
                         cursor: cursor.clone(),
@@ -15852,6 +15883,57 @@ mod tests {
         assert!(body["records"].as_array().unwrap().is_empty());
         assert_eq!(body["scanned"], json!(12));
         assert_eq!(body["exhausted"], json!(true));
+        // Inclusive event-time bounds answer "what was written in this
+        // window" without exposing ingest order; bounds combine with the
+        // Key predicate.
+        let (status, body) = search(&[
+            ("feed", "orders.events"),
+            ("from_event_time_ns", "3"),
+            ("to_event_time_ns", "6"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["cursor"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["cursor-3", "cursor-4", "cursor-5", "cursor-6"]
+        );
+        let (status, body) = search(&[
+            ("feed", "orders.events"),
+            ("key_base64", &STANDARD.encode(&search_key)),
+            ("from_event_time_ns", "4"),
+            ("to_event_time_ns", "8"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["cursor"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["cursor-4", "cursor-6", "cursor-8"]
+        );
+        let (status, _) = search(&[
+            ("feed", "orders.events"),
+            ("from_event_time_ns", "9"),
+            ("to_event_time_ns", "2"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = search(&[
+            ("feed", "orders.events"),
+            ("from_event_time_ns", "not-a-number"),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // A bare scan without any predicate is refused: the plain read is
+        // the contract for unfiltered history.
         let (status, _) = search(&[("feed", "orders.events")]).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         let (status, _) = search(&[("feed", "orders.events"), ("key_base64", "!!!")]).await;
