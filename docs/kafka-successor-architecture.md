@@ -277,6 +277,23 @@ Feed-sourced Index and StateStore replay remain naturally inside the
 boundary as well: pending output frames are fenced behind the committed
 boundary, so replay projections can never consume an uncommitted record.
 
+Rolling-window accumulation is the first consumer of co-located mutations.
+A `Window` Pipe declares only the business duration, a grouping projection,
+and an aggregation (`count`, `sum`, `average`); Whitewater shards each
+window into sixteen event-time accumulation panes internally - pane layout
+is an implementation detail, never a user-visible partition. Each drive
+cycle folds its fetched page by (group, `event_time_ns` pane) into a single
+`AccumulateRows` mutation that rides the same `Declare -> Applied ->
+release -> mutate` boundary as the consumed frontier, so every pane
+advances exactly once even across crashes and ownership moves. Panes are
+24-byte `(count, sum)` accumulator rows that merge additively under the
+store's sequence cursor; a replayed mutation skips rows already stamped
+with its sequence, which is what makes crash-mid-apply a no-op rather than
+a double count. Watermarks, late-event revision or quarantine, window-close
+output emission, and ingest-time policy remain follow-on work: this slice
+deliberately establishes only the accumulation primitive inside the atomic
+boundary.
+
 ## 6. Protocol-level idempotency
 
 Every append carries an identity such as:

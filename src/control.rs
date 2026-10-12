@@ -103,15 +103,41 @@ pub struct StateStoreDefinition {
     pub created_at_ns: i64,
 }
 
-/// The processing step a Pipe applies to each delivered input record. Only
-/// `Forward` exists today; enrichment and rolling-window operations land with
-/// their runtimes.
+/// The processing step a Pipe applies to each delivered input record.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum PipeOperation {
     /// Copy each delivered record to the output Feed unchanged; the effect
     /// journal replays dedupe on deterministic writer identity.
     Forward,
+    /// Accumulate each delivered record into fixed event-time panes of a
+    /// managed StateStore view. The driver groups each page by the
+    /// extracted `key` and the record's `event_time_ns` pane, then commits
+    /// one `AccumulateRows` StateStore mutation inside the same effect as
+    /// the consumed frontier — so a pane advances exactly once per
+    /// committed input, even across crashes and ownership moves. Panes are
+    /// immutable once written; this slice deliberately leaves watermarks,
+    /// late-event revision, and window-close output as follow-on work.
+    Window {
+        /// Window length in nanoseconds; the driver shards it into 16
+        /// equal accumulation panes.
+        window_ns: u64,
+        /// Which typed value groups records into window rows.
+        key: IndexFieldSpec,
+        aggregation: WindowAggregation,
+    },
+}
+
+/// What a `Window` Pipe adds to each pane's accumulator.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "aggregation", rename_all = "snake_case")]
+pub enum WindowAggregation {
+    /// Count records per (group key, pane); `sum` stays zero.
+    Count,
+    /// Sum one extracted integer value per pane.
+    Sum { value: IndexFieldSpec },
+    /// Track both count and integer sum per pane; readers divide.
+    Average { value: IndexFieldSpec },
 }
 
 /// One typed field of an application-owned secondary Index — the catalog and
@@ -249,7 +275,11 @@ pub struct PipeDefinition {
     /// The Subscription whose durable frontier drives this Pipe.
     pub subscription_id: Uuid,
     pub operation: PipeOperation,
-    pub output_feed_id: Uuid,
+    /// Present when the operation writes an output Feed (`Forward`).
+    pub output_feed_id: Option<Uuid>,
+    /// Present when the operation accumulates into a StateStore (`Window`).
+    #[serde(default)]
+    pub output_store_id: Option<Uuid>,
     pub stage: PipeStage,
     pub status: ResourceStatus,
     pub created_at_ns: i64,
@@ -740,7 +770,12 @@ pub enum Command {
     DefinePipe {
         name: String,
         subscription: String,
-        output_feed: String,
+        /// `Forward` target; absent for `Window` Pipes.
+        #[serde(default)]
+        output_feed: Option<String>,
+        /// `Window` target; absent for `Forward` Pipes.
+        #[serde(default)]
+        output_store: Option<String>,
         operation: PipeOperation,
     },
     CreateWriter {
@@ -2258,6 +2293,7 @@ impl ControlController {
                 name,
                 subscription,
                 output_feed,
+                output_store,
                 operation,
             } => {
                 validate_dotted_name(&name)?;
@@ -2272,24 +2308,88 @@ impl ControlController {
                         "Pipe input Subscription must belong to its Domain".to_owned(),
                     ));
                 }
-                let output = active_feed(state, &output_feed)?;
-                if output.space_id != space_id {
-                    return Err(ControlError::InvalidOperation(
-                        "Pipe output Feed must belong to its Domain".to_owned(),
-                    ));
-                }
-                if subscription.source.feed_id() == Some(output.feed_id) {
-                    return Err(ControlError::InvalidOperation(
-                        "Pipe output Feed cannot be its own input Feed".to_owned(),
-                    ));
-                }
+                let (output_feed_id, output_store_id) = match &operation {
+                    PipeOperation::Forward => {
+                        let output_feed = output_feed.ok_or_else(|| {
+                            ControlError::InvalidOperation(
+                                "Forward Pipes require an output Feed".to_owned(),
+                            )
+                        })?;
+                        let output = active_feed(state, &output_feed)?;
+                        if output.space_id != space_id {
+                            return Err(ControlError::InvalidOperation(
+                                "Pipe output Feed must belong to its Domain".to_owned(),
+                            ));
+                        }
+                        if subscription.source.feed_id() == Some(output.feed_id) {
+                            return Err(ControlError::InvalidOperation(
+                                "Pipe output Feed cannot be its own input Feed".to_owned(),
+                            ));
+                        }
+                        (Some(output.feed_id), None)
+                    }
+                    PipeOperation::Window {
+                        window_ns,
+                        key,
+                        aggregation,
+                    } => {
+                        if *window_ns == 0 {
+                            return Err(ControlError::InvalidOperation(
+                                "Window Pipes require a non-zero window".to_owned(),
+                            ));
+                        }
+                        let output_store = output_store.ok_or_else(|| {
+                            ControlError::InvalidOperation(
+                                "Window Pipes require an output StateStore".to_owned(),
+                            )
+                        })?;
+                        let store = state
+                            .state_stores
+                            .values()
+                            .find(|item| {
+                                item.name == output_store
+                                    && item.stage != StateStoreStage::Dropped
+                            })
+                            .ok_or_else(|| {
+                                ControlError::NotFound(format!(
+                                    "StateStore {output_store}"
+                                ))
+                            })?;
+                        if store.space_id != space_id {
+                            return Err(ControlError::InvalidOperation(
+                                "Pipe output StateStore must belong to its Domain"
+                                    .to_owned(),
+                            ));
+                        }
+                        // Pane rows post their group key and pane index under
+                        // two reserved named keys so the view is enumerable
+                        // without knowing composite row keys.
+                        for required in ["key", "pane"] {
+                            if !store.named_keys.iter().any(|item| {
+                                item.name == required && !item.unique
+                            }) {
+                                return Err(ControlError::InvalidOperation(format!(
+                                    "Pipe output StateStore must declare non-unique named keys 'key' and 'pane' (missing '{required}')"
+                                )));
+                            }
+                        }
+                        validate_window_field(key)?;
+                        if let WindowAggregation::Sum { value }
+                        | WindowAggregation::Average { value } = aggregation
+                        {
+                            validate_window_field(value)?;
+                        }
+                        (None, Some(store.store_id))
+                    }
+                };
                 let definition = PipeDefinition {
                     pipe_id: derived_resource_id(request_id, "pipe"),
                     name: name.clone(),
                     space_id,
                     subscription_id: subscription.subscription_id,
                     operation,
-                    output_feed_id: output.feed_id,
+                    output_feed_id,
+                    output_store_id,
                     stage: PipeStage::Declared,
                     status: ResourceStatus::Active,
                     created_at_ns: issued_at_ns,
@@ -3976,7 +4076,8 @@ impl ControlController {
                                             .unwrap_or_default()))
                     })
                     || state.pipes.values().any(|item| {
-                        item.status == ResourceStatus::Active && item.output_feed_id == feed_id
+                        item.status == ResourceStatus::Active
+                            && item.output_feed_id == Some(feed_id)
                     })
                 {
                     return Err(ControlError::InvalidOperation(
@@ -4206,18 +4307,64 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             }
             Some("PIPE") => {
                 // CREATE PIPE <name> FROM SUBSCRIPTION <sub> TO FEED <feed>
-                // declares a forward Pipe; richer operations arrive with
-                // their runtimes.
+                // declares a forward Pipe. The window form declares a
+                // managed per-Key pane accumulator:
+                //   CREATE PIPE <name> FROM SUBSCRIPTION <sub>
+                //     TO STATESTORE <store> WINDOW <n><ms|s|m|h> BY <spec>
+                //     (COUNT | SUM <spec> | AVG <spec>)
                 expect_keyword(&tokens, 3, "FROM")?;
                 expect_keyword(&tokens, 4, "SUBSCRIPTION")?;
                 expect_keyword(&tokens, 6, "TO")?;
-                expect_keyword(&tokens, 7, "FEED")?;
-                Ok(Command::DefinePipe {
-                    name: token(&tokens, 2)?.to_owned(),
-                    subscription: token(&tokens, 5)?.to_owned(),
-                    output_feed: token(&tokens, 8)?.to_owned(),
-                    operation: PipeOperation::Forward,
-                })
+                match token(&tokens, 7)?.to_ascii_uppercase().as_str() {
+                    "FEED" => Ok(Command::DefinePipe {
+                        name: token(&tokens, 2)?.to_owned(),
+                        subscription: token(&tokens, 5)?.to_owned(),
+                        output_feed: Some(token(&tokens, 8)?.to_owned()),
+                        output_store: None,
+                        operation: PipeOperation::Forward,
+                    }),
+                    "STATESTORE" => {
+                        expect_keyword(&tokens, 9, "WINDOW")?;
+                        let window_ns = parse_window_duration(token(&tokens, 10)?)?;
+                        expect_keyword(&tokens, 11, "BY")?;
+                        let (key, next) = parse_index_field_spec(&tokens, 12, "BY")?;
+                        let aggregation = match token(&tokens, next)?
+                            .to_ascii_uppercase()
+                            .as_str()
+                        {
+                            "COUNT" => WindowAggregation::Count,
+                            "SUM" => {
+                                let (value, _) =
+                                    parse_index_field_spec(&tokens, next + 1, "SUM")?;
+                                WindowAggregation::Sum { value }
+                            }
+                            "AVG" => {
+                                let (value, _) =
+                                    parse_index_field_spec(&tokens, next + 1, "AVG")?;
+                                WindowAggregation::Average { value }
+                            }
+                            other => {
+                                return Err(ControlError::Syntax(format!(
+                                    "window aggregation accepts COUNT, SUM <spec>, or AVG <spec>; got {other}"
+                                )))
+                            }
+                        };
+                        Ok(Command::DefinePipe {
+                            name: token(&tokens, 2)?.to_owned(),
+                            subscription: token(&tokens, 5)?.to_owned(),
+                            output_feed: None,
+                            output_store: Some(token(&tokens, 8)?.to_owned()),
+                            operation: PipeOperation::Window {
+                                window_ns,
+                                key,
+                                aggregation,
+                            },
+                        })
+                    }
+                    other => Err(ControlError::Syntax(format!(
+                        "CREATE PIPE target accepts FEED or STATESTORE; got {other}"
+                    ))),
+                }
             }
             Some("READER") | Some("SUBSCRIPTION") => {
                 expect_keyword(&tokens, 3, "FROM")?;
@@ -4743,6 +4890,55 @@ fn parse_index_field_spec(
             "{clause} accepts KEY, METADATA 'name', or JSON 'path' at position {}",
             position + 1
         ))),
+    }
+}
+
+/// `<n><ms|s|m|h|d>` window duration in nanoseconds. Windows are internal
+/// accumulation detail, never a user-visible partition concept.
+fn parse_window_duration(token: &str) -> Result<u64, ControlError> {
+    let split = token
+        .find(|character: char| !character.is_ascii_digit())
+        .unwrap_or(token.len());
+    let (number, unit) = token.split_at(split);
+    let number: u64 = number
+        .parse()
+        .map_err(|_| ControlError::Syntax(format!("WINDOW duration '{token}' is invalid")))?;
+    let factor: u64 = match unit.to_ascii_lowercase().as_str() {
+        "ms" => 1_000_000,
+        "s" => 1_000_000_000,
+        "m" => 60 * 1_000_000_000,
+        "h" => 3_600 * 1_000_000_000,
+        "d" => 86_400 * 1_000_000_000,
+        _ => {
+            return Err(ControlError::Syntax(format!(
+                "WINDOW duration '{token}' must end in ms, s, m, h, or d"
+            )))
+        }
+    };
+    number
+        .checked_mul(factor)
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            ControlError::Syntax(format!("WINDOW duration '{token}' overflows or is zero"))
+        })
+}
+
+/// Window keys and aggregated values come only from deterministic record
+/// projections — the same spec vocabulary Index fields use.
+fn validate_window_field(spec: &IndexFieldSpec) -> Result<(), ControlError> {
+    match spec {
+        IndexFieldSpec::Key => Ok(()),
+        IndexFieldSpec::Metadata { name } if !name.is_empty() && name.len() <= 256 => Ok(()),
+        IndexFieldSpec::Projection {
+            extractor,
+            version,
+            field,
+        } if extractor == "json" && *version == 1 && !field.is_empty() && field.len() <= 512 => {
+            Ok(())
+        }
+        _ => Err(ControlError::InvalidOperation(
+            "Window fields accept KEY, METADATA 'name', or JSON 'path'".to_owned(),
+        )),
     }
 }
 
@@ -7129,7 +7325,8 @@ mod tests {
         let command = vec![Command::DefinePipe {
             name: "accounts.forward".to_owned(),
             subscription: "accounts.flow".to_owned(),
-            output_feed: "accounts.enriched".to_owned(),
+            output_feed: Some("accounts.enriched".to_owned()),
+            output_store: None,
             operation: PipeOperation::Forward,
         }];
         let first = leader
@@ -7164,7 +7361,8 @@ mod tests {
             .execute_commands(vec![Command::DefinePipe {
                 name: "accounts.forward".to_owned(),
                 subscription: "accounts.flow".to_owned(),
-                output_feed: "accounts.enriched".to_owned(),
+                output_feed: Some("accounts.enriched".to_owned()),
+                output_store: None,
                 operation: PipeOperation::Forward,
             }])
             .await
@@ -7183,7 +7381,8 @@ mod tests {
                     .execute_commands(vec![Command::DefinePipe {
                         name: "accounts.invalid".to_owned(),
                         subscription: subscription.to_owned(),
-                        output_feed: output_feed.to_owned(),
+                        output_feed: Some(output_feed.to_owned()),
+                        output_store: None,
                         operation: PipeOperation::Forward,
                     }])
                     .await
@@ -7211,7 +7410,8 @@ mod tests {
             .execute_commands(vec![Command::DefinePipe {
                 name: "accounts.forward".to_owned(),
                 subscription: "other.flow".to_owned(),
-                output_feed: "other.enriched".to_owned(),
+                output_feed: Some("other.enriched".to_owned()),
+                output_store: None,
                 operation: PipeOperation::Forward,
             }])
             .await
@@ -8085,5 +8285,105 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("member-Feed bound"));
+    }
+    #[tokio::test]
+    async fn window_pipes_validate_their_output_statestore() {
+        let directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader
+            .execute(
+                "CREATE SPACE accounts; CREATE FEED accounts.events;                  CREATE SUBSCRIPTION accounts.flow FROM accounts.events;                  CREATE SPACE other; DEFINE STATESTORE other.panes KEYS key, pane;",
+            )
+            .await
+            .unwrap();
+
+        let define = |output_store: Option<String>, window_ns: u64| Command::DefinePipe {
+            name: "accounts.rollup".to_owned(),
+            subscription: "accounts.flow".to_owned(),
+            output_feed: None,
+            output_store,
+            operation: PipeOperation::Window {
+                window_ns,
+                key: IndexFieldSpec::Key,
+                aggregation: WindowAggregation::Count,
+            },
+        };
+        // Missing store, foreign-Domain store, zero window, and a missing
+        // output target are all refused.
+        for command in [
+            define(Some("accounts.missing".to_owned()), 60),
+            define(Some("other.panes".to_owned()), 60),
+            define(None, 60),
+            define(Some("accounts.panes".to_owned()), 0),
+        ] {
+            assert!(leader.execute_commands(vec![command]).await.is_err());
+        }
+        // A store without the enumerable pane postings is refused.
+        leader
+            .execute("DEFINE STATESTORE accounts.plain KEYS dept;")
+            .await
+            .unwrap();
+        assert!(leader
+            .execute_commands(vec![define(Some("accounts.plain".to_owned()), 60)])
+            .await
+            .is_err());
+
+        leader
+            .execute("DEFINE STATESTORE accounts.panes KEYS key, pane;")
+            .await
+            .unwrap();
+        let result = leader
+            .execute_commands(vec![define(
+                Some("accounts.panes".to_owned()),
+                60_000_000_000,
+            )])
+            .await
+            .unwrap();
+        let store = leader
+            .declared_state_store_by_name("accounts.panes")
+            .await
+            .unwrap();
+        assert_eq!(
+            result.results[0].data["output_store_id"],
+            store.store_id.to_string()
+        );
+        assert!(result.results[0].data["output_feed_id"].is_null());
+        assert_eq!(result.results[0].data["operation"]["operation"], "window");
+
+        // The WCL form parses to the same typed command.
+        let parsed = leader
+            .execute(
+                "CREATE PIPE accounts.minute.sum FROM SUBSCRIPTION accounts.flow                  TO STATESTORE accounts.panes WINDOW 5m BY KEY SUM JSON 'v';",
+            )
+            .await
+            .unwrap();
+        let relay = leader
+            .active_pipe_by_name("accounts.minute.sum")
+            .await
+            .unwrap();
+        assert!(matches!(
+            relay.operation,
+            PipeOperation::Window {
+                window_ns: 300_000_000_000,
+                key: IndexFieldSpec::Key,
+                aggregation: WindowAggregation::Sum { .. }
+            }
+        ));
+        assert_eq!(relay.output_feed_id, None);
+        assert_eq!(relay.output_store_id, Some(store.store_id));
+
+        // Malformed window clauses fail at parse, not at validation.
+        for statement in [
+            "CREATE PIPE accounts.bad1 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 0s BY KEY COUNT;",
+            "CREATE PIPE accounts.bad2 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 5x BY KEY COUNT;",
+            "CREATE PIPE accounts.bad3 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 5m COUNT;",
+            "CREATE PIPE accounts.bad4 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 5m BY KEY MEDIAN;",
+        ] {
+            assert!(
+                leader.execute(statement).await.is_err(),
+                "{statement} must fail"
+            );
+        }
+        let _ = parsed;
     }
 }

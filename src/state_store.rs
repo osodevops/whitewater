@@ -73,12 +73,39 @@ pub enum StateStoreMutationOp {
     /// replicas apply it as bounded row-delete batches and a restart before
     /// the applied marker replays the whole clear idempotently.
     ClearAll,
+    /// Atomically merge up to 64 additive accumulator rows: each entry adds
+    /// `count_delta`/`sum_delta` onto its row's 24-byte accumulator payload
+    /// and replaces that row's named-key postings, all inside one durable
+    /// transaction on every replica. Rows already stamped with this
+    /// mutation's sequence cursor are skipped, which makes replay of a
+    /// committed-but-unmarked mutation a no-op rather than a double count.
+    /// This is the primitive managed Pipes (rolling windows) write through;
+    /// it is journaled and fenced exactly like every other mutation.
+    AccumulateRows { entries: Vec<AccumulateRowEntry> },
+}
+
+/// One additive merge inside an `AccumulateRows` mutation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccumulateRowEntry {
+    pub key: Vec<u8>,
+    #[serde(default)]
+    pub count_delta: u64,
+    /// One entry's value delta (an extracted i64); the row's stored
+    /// accumulator widens to i128 so sums cannot overflow.
+    #[serde(default)]
+    pub sum_delta: i64,
+    #[serde(default)]
+    pub named: Vec<NamedKeyValue>,
 }
 
 impl StateStoreMutationOp {
     fn key(&self) -> &[u8] {
         match self {
             Self::PutRow { key, .. } | Self::DeleteRow { key } => key,
+            Self::AccumulateRows { entries } => entries
+                .first()
+                .map(|entry| entry.key.as_slice())
+                .unwrap_or(&[]),
             Self::ClearAll => &[],
         }
     }
@@ -488,10 +515,27 @@ fn validate_mutation_bounds(mutation: &StateStoreMutation) -> Result<(), StateSt
     if !key_bound || mutation.op.key().len() > STATE_STORE_MAX_KEY_BYTES {
         return Err(StateStoreMutationError::TooLarge);
     }
-    if let StateStoreMutationOp::PutRow { payload, .. } = &mutation.op {
-        if payload.len() > STATE_STORE_MAX_PAYLOAD_BYTES {
-            return Err(StateStoreMutationError::TooLarge);
+    match &mutation.op {
+        StateStoreMutationOp::PutRow { payload, .. } => {
+            if payload.len() > STATE_STORE_MAX_PAYLOAD_BYTES {
+                return Err(StateStoreMutationError::TooLarge);
+            }
         }
+        StateStoreMutationOp::AccumulateRows { entries } => {
+            // One mutation spans at most one driver page of accumulator
+            // rows; every row key honours the same bound as a single-row op.
+            if entries.is_empty()
+                || entries.len() > 64
+                || entries.iter().any(|entry| {
+                    entry.key.is_empty()
+                        || entry.key.len() > STATE_STORE_MAX_KEY_BYTES
+                        || entry.named.len() > 64
+                })
+            {
+                return Err(StateStoreMutationError::TooLarge);
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -1226,6 +1270,31 @@ impl StateStoreApply for IndexStoreStateApply {
             StateStoreMutationOp::DeleteRow { .. } => {
                 self.store
                     .delete(&reference, &Self::cursor(mutation.sequence))
+                    .map_err(|_| StateStoreMutationError::ApplyFailed)?;
+            }
+            StateStoreMutationOp::AccumulateRows { entries } => {
+                let rows: Vec<crate::index::AccumulateRowWrite> = entries
+                    .iter()
+                    .map(|entry| crate::index::AccumulateRowWrite {
+                        reference: crate::index::PrimaryRef {
+                            feed_id: mutation.store_id,
+                            application_key: entry.key.clone(),
+                        },
+                        count_delta: entry.count_delta,
+                        sum_delta: entry.sum_delta,
+                        entries: entry
+                            .named
+                            .iter()
+                            .map(|named| crate::index::IndexEntry {
+                                id: named_key_index_id(mutation.store_id, &named.name),
+                                values: named.values.clone(),
+                                unique: named.unique,
+                            })
+                            .collect(),
+                    })
+                    .collect();
+                self.store
+                    .accumulate_rows(&rows, &Self::cursor(mutation.sequence))
                     .map_err(|_| StateStoreMutationError::ApplyFailed)?;
             }
             StateStoreMutationOp::ClearAll => unreachable!("handled above"),
@@ -4277,5 +4346,122 @@ mod tests {
             .unwrap()
             .unwrap()
             .len()
+    }
+    #[test]
+    fn accumulate_rows_apply_merges_and_replays_idempotently() {
+        let dir = TempDir::new().unwrap();
+        let index: Arc<dyn IndexStore> = Arc::new(FjallIndexStore::open(dir.path()).unwrap());
+        let apply = IndexStoreStateApply::new(index.clone());
+        let store_id = Uuid::new_v4();
+
+        let mut first = mutation(store_id, 1, "pane");
+        first.op = StateStoreMutationOp::AccumulateRows {
+            entries: vec![
+                AccumulateRowEntry {
+                    key: b"pane-a".to_vec(),
+                    count_delta: 2,
+                    sum_delta: 12,
+                    named: vec![NamedKeyValue {
+                        name: "pane".to_owned(),
+                        values: vec![crate::index::IndexValue::I64(0)],
+                        unique: false,
+                    }],
+                },
+                AccumulateRowEntry {
+                    key: b"pane-b".to_vec(),
+                    count_delta: 1,
+                    sum_delta: -3,
+                    named: Vec::new(),
+                },
+            ],
+        };
+        apply.apply(&first).unwrap();
+        let reference = |key: &[u8]| PrimaryRef {
+            feed_id: store_id,
+            application_key: key.to_vec(),
+        };
+        let row_a = index.get(&reference(b"pane-a")).unwrap().unwrap();
+        assert_eq!(
+            crate::index::decode_accumulator(&row_a.payload),
+            Some((2, 12))
+        );
+        // Named postings rode the same atomic batch as the merge.
+        assert_eq!(
+            index
+                .lookup_exact(
+                    named_key_index_id(store_id, "pane"),
+                    &[crate::index::IndexValue::I64(0)],
+                    8,
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // A restart before the applied marker replays the committed
+        // mutation: the row's sequence cursor makes the re-apply a no-op,
+        // never a double count.
+        apply.apply(&first).unwrap();
+        let row_a = index.get(&reference(b"pane-a")).unwrap().unwrap();
+        assert_eq!(
+            crate::index::decode_accumulator(&row_a.payload),
+            Some((2, 12))
+        );
+
+        // The next committed sequence merges again — multi-page windows
+        // accumulate across mutations.
+        let mut second = mutation(store_id, 2, "pane");
+        second.op = StateStoreMutationOp::AccumulateRows {
+            entries: vec![AccumulateRowEntry {
+                key: b"pane-a".to_vec(),
+                count_delta: 1,
+                sum_delta: 5,
+                named: Vec::new(),
+            }],
+        };
+        apply.apply(&second).unwrap();
+        let row_a = index.get(&reference(b"pane-a")).unwrap().unwrap();
+        assert_eq!(
+            crate::index::decode_accumulator(&row_a.payload),
+            Some((3, 17))
+        );
+    }
+
+    #[test]
+    fn accumulate_rows_bounds_refuse_unbounded_mutations() {
+        let store_id = Uuid::new_v4();
+        let entry = |key: &[u8]| AccumulateRowEntry {
+            key: key.to_vec(),
+            count_delta: 1,
+            sum_delta: 1,
+            named: Vec::new(),
+        };
+        let mut empty = mutation(store_id, 1, "x");
+        empty.op = StateStoreMutationOp::AccumulateRows { entries: vec![] };
+        assert!(matches!(
+            validate_mutation_bounds(&empty),
+            Err(StateStoreMutationError::TooLarge)
+        ));
+        let mut too_many = mutation(store_id, 1, "x");
+        too_many.op = StateStoreMutationOp::AccumulateRows {
+            entries: vec![entry(b"k"); 65],
+        };
+        assert!(matches!(
+            validate_mutation_bounds(&too_many),
+            Err(StateStoreMutationError::TooLarge)
+        ));
+        let mut empty_key = mutation(store_id, 1, "x");
+        empty_key.op = StateStoreMutationOp::AccumulateRows {
+            entries: vec![entry(b"")],
+        };
+        assert!(matches!(
+            validate_mutation_bounds(&empty_key),
+            Err(StateStoreMutationError::TooLarge)
+        ));
+        let mut fine = mutation(store_id, 1, "x");
+        fine.op = StateStoreMutationOp::AccumulateRows {
+            entries: vec![entry(b"k1"), entry(b"k2")],
+        };
+        validate_mutation_bounds(&fine).unwrap();
     }
 }

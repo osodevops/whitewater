@@ -336,7 +336,21 @@ CREATE PIPE orders.enrich
 
 
 
-A Pipe declares a managed consume-process-append binding: the named Subscription's durable frontier drives the input, and every delivered record flows through the declared operation into the output Feed. Today `forward` is the only operation; enrichment and rolling-window operations arrive with their runtimes. A Pipe belongs to the same Domain as its input Subscription and output Feed and may not write back to its own input Feed. The consumed Subscription and the output Feed cannot be dropped while the Pipe is active; drop the Pipe first.
+A Pipe declares a managed consume-process-append binding: the named Subscription's durable frontier drives the input, and every delivered record flows through the declared operation into the declared output. Two operations exist:
+
+- `TO FEED` - `forward`: copy each record to the output Feed unchanged.
+- `TO STATESTORE` - `window`: accumulate each record into event-time panes of a managed StateStore view, grouped by a projection:
+
+```sql
+CREATE PIPE orders.minute_totals
+  FROM SUBSCRIPTION orders.billing
+  TO STATESTORE orders.minute_totals
+  WINDOW 5m BY JSON 'customer' SUM JSON 'amount';
+```
+
+The window clause takes a duration (`<n>ms|s|m|h|d`), `BY <spec>` for the grouping projection, and an aggregation of `COUNT`, `SUM <spec>`, or `AVG <spec>`; specs use the same `KEY`, `METADATA 'name'`, `JSON 'path'` vocabulary as Index fields. The target StateStore must declare non-unique named keys `key` and `pane`, which is what makes pane rows enumerable by group or pane index without knowing composite row keys. Window state advances exactly once per committed input inside the effect's atomic boundary; watermarks, late-event revisions, and window-close emission are follow-on work.
+
+A Pipe belongs to the same Domain as its input Subscription and output; `forward` Pipes may not write back to their own input Feed. The consumed Subscription and the output Feed cannot be dropped while the Pipe is active; drop the Pipe first.
 
 Each Node runs a Pipe supervisor loop (`WHITEWATER_PIPE_DRIVE_INTERVAL_MS`, default 1000ms, minimum 100ms) that drives every active Pipe whose consumed Subscription's progress owner is that Node; ownership moves simply move the drive to the new owner. The internal `POST /internal/pipe/drive` route runs one bounded consume-declare-apply cycle on the progress owner for explicit drives and diagnostics.
 

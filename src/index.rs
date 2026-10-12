@@ -402,6 +402,42 @@ pub enum IndexStoreError {
 /// returns. Reads are snapshot-consistent and bounded by caller limits and
 /// fixed byte budgets. The interface is intentionally engine-agnostic so the
 /// selected engine remains an implementation detail of replica code.
+/// The fixed little-endian payload of an additive-accumulator row:
+/// `count u64 | sum i128` totalling 24 bytes.
+pub const ACCUMULATOR_ROW_BYTES: usize = 24;
+
+/// Encode an additive-accumulator payload.
+pub fn encode_accumulator(count: u64, sum: i128) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(ACCUMULATOR_ROW_BYTES);
+    payload.extend_from_slice(&count.to_le_bytes());
+    payload.extend_from_slice(&sum.to_le_bytes());
+    payload
+}
+
+/// Decode an additive-accumulator payload; `None` when the bytes are not a
+/// well-formed accumulator.
+pub fn decode_accumulator(payload: &[u8]) -> Option<(u64, i128)> {
+    if payload.len() != ACCUMULATOR_ROW_BYTES {
+        return None;
+    }
+    let count = u64::from_le_bytes(payload[..8].try_into().ok()?);
+    let sum = i128::from_le_bytes(payload[8..].try_into().ok()?);
+    Some((count, sum))
+}
+
+/// One additive merge inside an `accumulate_rows` batch: `count_delta` and
+/// `sum_delta` add onto the row's accumulator payload and `entries` replace
+/// the row's postings exactly like `upsert`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccumulateRowWrite {
+    pub reference: PrimaryRef,
+    pub count_delta: u64,
+    /// One entry's value delta; the stored accumulator keeps i128 headroom
+    /// so many i64 deltas cannot overflow the running sum.
+    pub sum_delta: i64,
+    pub entries: Vec<IndexEntry>,
+}
+
 pub trait IndexStore: Send + Sync {
     /// Apply one projected row mutation under `cursor`. Refuses a reused
     /// `cursor` that would change an existing row, unowned unique claims,
@@ -411,6 +447,20 @@ pub trait IndexStore: Send + Sync {
         reference: &PrimaryRef,
         payload: &[u8],
         entries: &[IndexEntry],
+        cursor: &str,
+    ) -> Result<(), IndexStoreError>;
+
+    /// Atomically merge a batch of additive accumulator rows under `cursor`:
+    /// each item reads its current row, adds its deltas to the 24-byte
+    /// accumulator payload, replaces its postings, and commits inside one
+    /// durable transaction so the batch lands whole or not at all. A row
+    /// already stamped with `cursor` is skipped, which makes a replayed
+    /// batch a no-op per row instead of a double count. A unique claim
+    /// already held by another row drops only that item's postings; the
+    /// accumulator still merges, deterministically on every replica.
+    fn accumulate_rows(
+        &self,
+        rows: &[AccumulateRowWrite],
         cursor: &str,
     ) -> Result<(), IndexStoreError>;
 
@@ -609,6 +659,106 @@ impl IndexStore for FjallIndexStore {
                 .is_some_and(|applied| applied >= cursor.as_bytes());
             if !dominated {
                 tx.insert(&self.checkpoints, entry.id.0.as_bytes(), cursor.as_bytes());
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn accumulate_rows(
+        &self,
+        rows: &[AccumulateRowWrite],
+        cursor: &str,
+    ) -> Result<(), IndexStoreError> {
+        if cursor.is_empty() || cursor.len() > 512 {
+            return Err(IndexStoreError::InvalidCursor);
+        }
+        if rows.is_empty() || rows.len() > 64 {
+            return Err(IndexStoreError::RowTooLarge);
+        }
+        let mut tx = self
+            .db
+            .write_tx()
+            .durability(Some(fjall::PersistMode::SyncAll));
+        for row in rows {
+            let key = primary_key(&row.reference)?;
+            if row.entries.len() > 64 {
+                return Err(IndexStoreError::RowTooLarge);
+            }
+            let previous = tx
+                .get(&self.primary, &key)?
+                .map(|bytes| serde_json::from_slice::<IndexRow>(&bytes))
+                .transpose()?;
+            if let Some(previous) = &previous {
+                if previous.reference != row.reference {
+                    return Err(IndexStoreError::CorruptPrimary);
+                }
+                if previous.applied_cursor == cursor {
+                    // This batch already landed on the row: replaying the
+                    // same cursor is an idempotent no-op, not a re-merge.
+                    continue;
+                }
+            }
+            let (count, sum) = previous
+                .as_ref()
+                .and_then(|row| decode_accumulator(&row.payload))
+                .unwrap_or((0, 0));
+            let payload = encode_accumulator(
+                count.saturating_add(row.count_delta),
+                sum.saturating_add(i128::from(row.sum_delta)),
+            );
+            let previous_entries = previous
+                .as_ref()
+                .map_or(&[][..], |row| row.entries.as_slice());
+            // Unique claims the row cannot hold drop its postings rather
+            // than the merge itself: the accumulator still advances and
+            // every replica resolves the conflict identically.
+            let conflicted = {
+                let plan = plan_projection_change(&row.reference, previous_entries, &row.entries)?;
+                let mut conflicted = false;
+                for (claim, _) in &plan.unique_claims {
+                    let existing = tx.get(&self.entries, claim)?;
+                    if validate_unique_claim(existing.as_deref(), &row.reference).is_err() {
+                        conflicted = true;
+                        break;
+                    }
+                }
+                conflicted
+            };
+            let target_entries: &[IndexEntry] = if conflicted { &[] } else { &row.entries };
+            let index_row = IndexRow {
+                reference: row.reference.clone(),
+                payload,
+                entries: target_entries.to_vec(),
+                applied_cursor: cursor.to_owned(),
+            };
+            let encoded = serde_json::to_vec(&index_row)?;
+            if encoded.len() > 4 * 1024 * 1024 {
+                return Err(IndexStoreError::RowTooLarge);
+            }
+            let plan = plan_projection_change(&row.reference, previous_entries, target_entries)?;
+            for (claim, _) in &plan.unique_claims {
+                let existing = tx.get(&self.entries, claim)?;
+                validate_unique_claim(existing.as_deref(), &row.reference)?;
+            }
+            for key in plan.removals.into_iter().chain(plan.unique_releases) {
+                tx.remove(&self.entries, key);
+            }
+            for (key, _) in plan.insertions {
+                tx.insert(&self.entries, key, plan.primary_key.clone());
+            }
+            for (key, value) in plan.unique_claims {
+                tx.insert(&self.entries, key, value);
+            }
+            tx.insert(&self.primary, key, encoded);
+            for entry in target_entries {
+                let existing = tx.get(&self.checkpoints, entry.id.0.as_bytes())?;
+                let dominated = existing
+                    .as_deref()
+                    .is_some_and(|applied| applied >= cursor.as_bytes());
+                if !dominated {
+                    tx.insert(&self.checkpoints, entry.id.0.as_bytes(), cursor.as_bytes());
+                }
             }
         }
         tx.commit()?;
@@ -1576,6 +1726,124 @@ mod tests {
                 )
                 .unwrap_err(),
             IndexStoreError::InvalidLimit
+        ));
+    }
+    fn accumulate_row(key: &[u8], count: u64, sum: i64) -> AccumulateRowWrite {
+        AccumulateRowWrite {
+            reference: reference(key),
+            count_delta: count,
+            sum_delta: sum,
+            entries: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn accumulator_payload_round_trips_and_rejects_wrong_lengths() {
+        let payload = encode_accumulator(7, -13);
+        assert_eq!(decode_accumulator(&payload), Some((7, -13)));
+        assert_eq!(decode_accumulator(&payload[..20]), None);
+        assert_eq!(decode_accumulator(&[]), None);
+    }
+
+    #[test]
+    fn accumulate_rows_merges_each_row_and_skips_replayed_cursors() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+
+        store
+            .accumulate_rows(
+                &[accumulate_row(b"a", 1, 10), accumulate_row(b"b", 2, -4)],
+                "c1",
+            )
+            .unwrap();
+        let a = store.get(&reference(b"a")).unwrap().unwrap();
+        let b = store.get(&reference(b"b")).unwrap().unwrap();
+        assert_eq!(decode_accumulator(&a.payload), Some((1, 10)));
+        assert_eq!(decode_accumulator(&b.payload), Some((2, -4)));
+
+        // Replaying the same cursor (post-commit crash window before the
+        // mutation journal's applied sequence lands) is a no-op, never a
+        // double count.
+        store
+            .accumulate_rows(
+                &[accumulate_row(b"a", 1, 10), accumulate_row(b"b", 2, -4)],
+                "c1",
+            )
+            .unwrap();
+        let a = store.get(&reference(b"a")).unwrap().unwrap();
+        assert_eq!(decode_accumulator(&a.payload), Some((1, 10)));
+
+        // A later cursor merges again while a skipped row keeps its postings.
+        store
+            .accumulate_rows(&[accumulate_row(b"a", 1, 5)], "c2")
+            .unwrap();
+        let a = store.get(&reference(b"a")).unwrap().unwrap();
+        assert_eq!(decode_accumulator(&a.payload), Some((2, 15)));
+        assert_eq!(a.applied_cursor, "c2");
+    }
+
+    #[test]
+    fn accumulate_rows_replaces_postings_and_drops_only_conflicted_claims() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+        let index = IndexId(Uuid::from_u128(9));
+
+        let mut holder = accumulate_row(b"holder", 1, 1);
+        holder.entries = vec![IndexEntry {
+            id: index,
+            values: vec![IndexValue::Text("taken".to_owned())],
+            unique: true,
+        }];
+        store.accumulate_rows(&[holder], "c1").unwrap();
+
+        let mut loser = accumulate_row(b"loser", 3, 30);
+        loser.entries = vec![IndexEntry {
+            id: index,
+            values: vec![IndexValue::Text("taken".to_owned())],
+            unique: true,
+        }];
+        let mut winner = accumulate_row(b"winner", 4, 40);
+        winner.entries = vec![IndexEntry {
+            id: index,
+            values: vec![IndexValue::Text("free".to_owned())],
+            unique: true,
+        }];
+        store.accumulate_rows(&[loser, winner], "c2").unwrap();
+
+        // The accumulator merges even when the unique claim is refused; only
+        // the postings are dropped, deterministically on every replica.
+        let loser = store.get(&reference(b"loser")).unwrap().unwrap();
+        assert_eq!(decode_accumulator(&loser.payload), Some((3, 30)));
+        assert!(loser.entries.is_empty());
+        assert!(store
+            .lookup_exact(index, &[IndexValue::Text("taken".to_owned())], 10)
+            .unwrap()
+            .iter()
+            .all(|row| row.reference == reference(b"holder")));
+        assert_eq!(
+            store
+                .lookup_exact(index, &[IndexValue::Text("free".to_owned())], 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn accumulate_rows_refuses_unbounded_batches_and_cursors() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+        assert!(matches!(
+            store.accumulate_rows(&[], "c1"),
+            Err(IndexStoreError::RowTooLarge)
+        ));
+        assert!(matches!(
+            store.accumulate_rows(&vec![accumulate_row(b"a", 1, 1); 65], "c1"),
+            Err(IndexStoreError::RowTooLarge)
+        ));
+        assert!(matches!(
+            store.accumulate_rows(&[accumulate_row(b"a", 1, 1)], ""),
+            Err(IndexStoreError::InvalidCursor)
         ));
     }
 }

@@ -10,13 +10,16 @@ use std::{
 };
 
 use finnstream::active_range::{RangeId, RangePosition, ReplicaSet, StorageNodeId};
-use finnstream::control::{PipeDefinition, PipeOperation, PipeStage, ResourceStatus};
+use finnstream::control::{
+    IndexFieldSpec, PipeDefinition, PipeOperation, PipeStage, ResourceStatus, WindowAggregation,
+};
 use finnstream::effect::{
     effect_apply_request_id, EffectApply, EffectCommitEvidence, EffectConsume, EffectCoordinator,
     EffectJournalError, EffectJournalInspection, EffectJournalTransport, EffectMutation,
     EffectOutput, EffectOutputReceipt, EffectPrepareVote, EffectReleaseOutcome,
     EffectReleaseTarget, EffectReplicaReply, EffectTransition, FjallEffectJournalReplica,
 };
+use finnstream::index::IndexValue;
 use finnstream::pipe::{
     pipe_declare_request_id, pipe_effect_id, pipe_output_writer_session, FetchedPage,
     FetchedRecord, PipeDriver,
@@ -27,6 +30,7 @@ use finnstream::reader::{
     SubscriptionProgressError, SubscriptionProgressInspection, SubscriptionProgressMutation,
     SubscriptionProgressTransport, SubscriptionReplicaReply,
 };
+use finnstream::state_store::StateStoreMutationOp;
 use tempfile::TempDir;
 use uuid::Uuid;
 
@@ -62,7 +66,8 @@ fn pipe() -> PipeDefinition {
         space_id: Uuid::from_u128(0xD0),
         subscription_id: Uuid::from_u128(SUBSCRIPTION),
         operation: PipeOperation::Forward,
-        output_feed_id: Uuid::from_u128(OUTPUT_FEED),
+        output_feed_id: Some(Uuid::from_u128(OUTPUT_FEED)),
+        output_store_id: None,
         stage: PipeStage::Declared,
         status: ResourceStatus::Active,
         created_at_ns: 0,
@@ -419,6 +424,7 @@ impl EffectJournalTransport for PipeEffectTransport {
 struct RecordingApply {
     progress: SubscriptionProgressCoordinator,
     appends: Mutex<Vec<EffectOutput>>,
+    mutations: Mutex<Vec<finnstream::effect::EffectStateMutation>>,
     fail_releases: Mutex<u8>,
 }
 
@@ -498,8 +504,9 @@ impl EffectApply for RecordingApply {
 
     async fn mutate_state(
         &self,
-        _mutation: &finnstream::effect::EffectStateMutation,
+        mutation: &finnstream::effect::EffectStateMutation,
     ) -> Result<(), EffectJournalError> {
+        self.mutations.lock().unwrap().push(mutation.clone());
         Ok(())
     }
 }
@@ -527,6 +534,10 @@ struct Harness {
 }
 
 fn harness() -> Harness {
+    harness_for(pipe())
+}
+
+fn harness_for(pipe: PipeDefinition) -> Harness {
     let progress_dirs = [
         TempDir::new().unwrap(),
         TempDir::new().unwrap(),
@@ -550,12 +561,13 @@ fn harness() -> Harness {
     let sink = RecordingApply {
         progress: SubscriptionProgressCoordinator::new(assignment(), progress_transport.clone()),
         appends: Mutex::new(Vec::new()),
+        mutations: Mutex::new(Vec::new()),
         fail_releases: Mutex::new(0),
     };
     Harness {
         _progress_dirs: progress_dirs,
         _effect_dirs: effect_dirs,
-        driver: PipeDriver::new(pipe(), journal.clone(), progress.clone()),
+        driver: PipeDriver::new(pipe, journal.clone(), progress.clone()),
         journal,
         progress,
         sink,
@@ -994,4 +1006,194 @@ async fn pipe_driver_fails_closed_when_apply_stays_transient() {
         EffectTransition::Applied { .. }
     ));
     assert_eq!(harness.sink.appends.lock().unwrap().len(), 1);
+}
+
+const OUTPUT_STORE: u128 = 0x57E;
+
+fn window_pipe() -> PipeDefinition {
+    PipeDefinition {
+        pipe_id: Uuid::from_u128(0x92),
+        name: "orders.window".to_owned(),
+        space_id: Uuid::from_u128(0xD0),
+        subscription_id: Uuid::from_u128(SUBSCRIPTION),
+        operation: PipeOperation::Window {
+            window_ns: 160,
+            key: IndexFieldSpec::Key,
+            aggregation: WindowAggregation::Sum {
+                value: IndexFieldSpec::Projection {
+                    extractor: "json".to_owned(),
+                    version: 1,
+                    field: "v".to_owned(),
+                },
+            },
+        },
+        output_feed_id: None,
+        output_store_id: Some(Uuid::from_u128(OUTPUT_STORE)),
+        stage: PipeStage::Declared,
+        status: ResourceStatus::Active,
+        created_at_ns: 0,
+    }
+}
+
+fn b64(bytes: &[u8]) -> String {
+    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes)
+}
+
+fn json_record(id: u128, key: &[u8], event_time_ns: i64, value: i64) -> FetchedRecord {
+    FetchedRecord {
+        message_id: Uuid::from_u128(id),
+        key_base64: b64(key),
+        payload_base64: b64(format!("{{\"v\":{value}}}").as_bytes()),
+        metadata_base64: BTreeMap::new(),
+        event_time_ns,
+    }
+}
+
+#[tokio::test]
+async fn window_pipe_folds_a_page_into_one_accumulate_mutation() {
+    let harness = harness_for(window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+
+    // window 160ns -> 10ns panes: pane 0 covers event_time 0..10,
+    // pane 1 covers 10..20. Two records share (key-a, pane 0).
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async {
+                Ok(page(
+                    vec![
+                        json_record(1, b"key-a", 0, 5),
+                        json_record(2, b"key-a", 9, 7),
+                        json_record(3, b"key-b", 12, -3),
+                    ],
+                    "p1",
+                ))
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+
+    assert_eq!(
+        applied.effect_id,
+        pipe_effect_id(window_pipe().pipe_id, Uuid::from_u128(SUBSCRIPTION), "p0")
+    );
+    // The terminal row restates the mutation so post-marker crashes replay it.
+    let EffectTransition::Applied {
+        outputs,
+        state_mutations,
+        ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    assert!(outputs.is_empty());
+    assert_eq!(state_mutations.len(), 1);
+    assert_eq!(
+        state_mutations[0].mutation_id,
+        finnstream::effect::effect_state_mutation_id(applied.effect_id, 0)
+    );
+    assert_eq!(state_mutations[0].store_id, Uuid::from_u128(OUTPUT_STORE));
+
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
+        panic!("expected AccumulateRows")
+    };
+    assert_eq!(entries.len(), 2);
+    // Deterministic order: (group bytes, pane) sorted.
+    assert_eq!(entries[0].count_delta, 2);
+    assert_eq!(entries[0].sum_delta, 12);
+    assert_eq!(entries[1].count_delta, 1);
+    assert_eq!(entries[1].sum_delta, -3);
+    // Pane postings make the view enumerable by group key and pane index.
+    assert_eq!(
+        entries[0].named[0].values,
+        vec![IndexValue::Bytes(b"key-a".to_vec())]
+    );
+    assert_eq!(entries[0].named[1].values, vec![IndexValue::I64(0)]);
+    assert_eq!(entries[1].named[1].values, vec![IndexValue::I64(1)]);
+    // Distinct (key, pane) composite row keys.
+    assert_ne!(entries[0].key, entries[1].key);
+
+    // The mutation reached the apply sink exactly once with the same shape.
+    let recorded = harness.sink.mutations.lock().unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0], state_mutations[0]);
+    // No feed outputs were declared.
+    assert!(harness.sink.appends.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn window_pipe_skips_unprojectable_records_and_empty_pages_mutate_nothing() {
+    let harness = harness_for(window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+
+    // A non-JSON payload cannot project "v"; a null-key record groups
+    // nothing. Both contribute zero panes but the frontier still advances.
+    let mut bad = json_record(1, b"key-a", 0, 5);
+    bad.payload_base64 = b64(b"not json");
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async { Ok(page(vec![bad], "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    assert!(state_mutations.is_empty());
+    assert!(harness.sink.mutations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn window_pane_row_keys_order_by_group_then_pane() {
+    // Two sequential pages accumulate separate mutations whose row keys
+    // agree on the same (group, pane) composite encoding.
+    let harness = harness_for(window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+    harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async { Ok(page(vec![json_record(1, b"k", 0, 1)], "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap();
+    harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async { Ok(page(vec![json_record(2, b"k", 20, 2)], "p2")) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap();
+    let recorded = harness.sink.mutations.lock().unwrap();
+    assert_eq!(recorded.len(), 2);
+    let StateStoreMutationOp::AccumulateRows { entries: first } = &recorded[0].op else {
+        panic!()
+    };
+    let StateStoreMutationOp::AccumulateRows { entries: second } = &recorded[1].op else {
+        panic!()
+    };
+    // Same group -> shared key prefix; bigger pane -> bigger row key.
+    assert!(first[0].key.starts_with(&first[0].key[..4]));
+    assert!(first[0].key < second[0].key);
+    assert_eq!(
+        first[0].key[..first[0].key.len() - 8],
+        second[0].key[..second[0].key.len() - 8]
+    );
 }

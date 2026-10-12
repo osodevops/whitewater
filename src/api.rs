@@ -2002,7 +2002,10 @@ async fn pipe_drive_local(
             "Pipe does not consume the requested Subscription",
         ));
     }
-    if pipe.operation != crate::control::PipeOperation::Forward {
+    if !matches!(
+        pipe.operation,
+        crate::control::PipeOperation::Forward | crate::control::PipeOperation::Window { .. }
+    ) {
         return Err(ApiError::conflict("Pipe operation is not driveable yet"));
     }
     let assignment = state
@@ -2260,7 +2263,10 @@ pub async fn drive_local_pipes(state: &AppState, limit: usize) -> Vec<PipeDriveO
     let pipes = state.control.active_pipes().await;
     let mut outcomes = Vec::with_capacity(pipes.len());
     for pipe in pipes {
-        if pipe.operation != crate::control::PipeOperation::Forward {
+        if !matches!(
+            pipe.operation,
+            crate::control::PipeOperation::Forward | crate::control::PipeOperation::Window { .. }
+        ) {
             outcomes.push(PipeDriveOutcome::Failed {
                 pipe_id: pipe.pipe_id,
                 message: "Pipe operation is not driveable yet".to_owned(),

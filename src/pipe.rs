@@ -16,12 +16,17 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::active_range::RangeId;
-use crate::control::PipeDefinition;
+use crate::control::{PipeDefinition, PipeOperation, WindowAggregation};
 use crate::effect::{
-    EffectConsume, EffectCoordinator, EffectJournalError, EffectMutation, EffectOutput,
-    EffectTransition,
+    effect_state_mutation_id, EffectConsume, EffectCoordinator, EffectJournalError, EffectMutation,
+    EffectOutput, EffectStateMutation, EffectTransition,
 };
+use crate::index::IndexValue;
+use crate::index_build::extract_index_values;
 use crate::reader::{SubscriptionProgressCoordinator, SubscriptionProgressMutation};
+use crate::state_store::{
+    AccumulateRowEntry, NamedKeyValue, ReplaySourceRecord, StateStoreMutationOp,
+};
 
 /// One input record fetched after the Subscription frontier.
 #[derive(Clone, Debug)]
@@ -218,20 +223,7 @@ impl PipeDriver {
             frontier.subscription_id,
             &frontier.cursor,
         );
-        let outputs = page
-            .records
-            .iter()
-            .map(|record| EffectOutput {
-                feed_id: self.pipe.output_feed_id,
-                key_base64: record.key_base64.clone(),
-                payload_base64: record.payload_base64.clone(),
-                metadata_base64: record.metadata_base64.clone(),
-                event_time_ns: record.event_time_ns,
-                writer_session_id: pipe_output_writer_session(self.pipe.pipe_id, record.message_id),
-                writer_epoch: 1,
-                sequence: 1,
-            })
-            .collect();
+        let (outputs, state_mutations) = self.effect_plan(effect_id, &page)?;
         let declare = EffectMutation {
             effect_id,
             subscription_id: frontier.subscription_id,
@@ -246,7 +238,7 @@ impl PipeDriver {
                     positions: page.positions,
                 }),
                 outputs,
-                state_mutations: Vec::new(),
+                state_mutations,
             },
         };
         match self.journal.apply(declare.clone()).await {
@@ -275,6 +267,190 @@ impl PipeDriver {
             }
         }
     }
+
+    /// Plan one cycle's effect payload. `Forward` maps each record 1:1 to a
+    /// deterministic output append; `Window` folds the page into a single
+    /// `AccumulateRows` mutation so every touched pane advances exactly
+    /// once inside the same atomic boundary as the consumed frontier.
+    fn effect_plan(
+        &self,
+        effect_id: Uuid,
+        page: &FetchedPage,
+    ) -> Result<(Vec<EffectOutput>, Vec<EffectStateMutation>), EffectJournalError> {
+        match &self.pipe.operation {
+            PipeOperation::Forward => {
+                let feed_id = self
+                    .pipe
+                    .output_feed_id
+                    .ok_or(EffectJournalError::Conflict)?;
+                Ok((
+                    page.records
+                        .iter()
+                        .map(|record| EffectOutput {
+                            feed_id,
+                            key_base64: record.key_base64.clone(),
+                            payload_base64: record.payload_base64.clone(),
+                            metadata_base64: record.metadata_base64.clone(),
+                            event_time_ns: record.event_time_ns,
+                            writer_session_id: pipe_output_writer_session(
+                                self.pipe.pipe_id,
+                                record.message_id,
+                            ),
+                            writer_epoch: 1,
+                            sequence: 1,
+                        })
+                        .collect(),
+                    Vec::new(),
+                ))
+            }
+            PipeOperation::Window {
+                window_ns,
+                key,
+                aggregation,
+            } => {
+                let store_id = self
+                    .pipe
+                    .output_store_id
+                    .ok_or(EffectJournalError::Conflict)?;
+                let pane_ns = window_pane_ns(*window_ns);
+                // (group key bytes, pane index) -> (count, sum, typed key).
+                // BTreeMap order makes the emitted mutation byte-identical
+                // across replays and replicas — mutation-equality dedupe
+                // depends on it.
+                let mut panes: BTreeMap<(Vec<u8>, u64), (u64, i64, IndexValue)> = BTreeMap::new();
+                for record in &page.records {
+                    let Some(source) = source_record(record) else {
+                        continue;
+                    };
+                    let Ok(extracted) = extract_index_values(std::slice::from_ref(key), &source)
+                    else {
+                        // An unprojectable record contributes nothing rather
+                        // than wedging the Pipe; late/malformed-event policy
+                        // (quarantine, revisions) is follow-on work.
+                        continue;
+                    };
+                    let Some(group) = extracted
+                        .into_iter()
+                        .next()
+                        .and_then(|value| window_group_key_bytes(&value).map(|key| (key, value)))
+                    else {
+                        continue;
+                    };
+                    let sum_delta = match aggregation {
+                        WindowAggregation::Count => 0i64,
+                        WindowAggregation::Sum { value } | WindowAggregation::Average { value } => {
+                            let Ok(extracted) =
+                                extract_index_values(std::slice::from_ref(value), &source)
+                            else {
+                                continue;
+                            };
+                            match extracted.into_iter().next() {
+                                Some(IndexValue::I64(value)) => value,
+                                // Non-numeric contributions are skipped
+                                // whole so an Average never dilutes.
+                                _ => continue,
+                            }
+                        }
+                    };
+                    let pane = u64::try_from(record.event_time_ns.max(0)).unwrap_or(0) / pane_ns;
+                    let entry = panes.entry((group.0, pane)).or_insert((0, 0, group.1));
+                    entry.0 = entry.0.saturating_add(1);
+                    entry.1 = entry.1.saturating_add(sum_delta);
+                }
+                if panes.is_empty() {
+                    return Ok((Vec::new(), Vec::new()));
+                }
+                let entries: Vec<AccumulateRowEntry> = panes
+                    .into_iter()
+                    .map(
+                        |((group, pane), (count, sum, group_value))| AccumulateRowEntry {
+                            key: window_pane_row_key(&group, pane),
+                            count_delta: count,
+                            sum_delta: sum,
+                            named: vec![
+                                NamedKeyValue {
+                                    name: WINDOW_KEY_NAME.to_owned(),
+                                    values: vec![group_value],
+                                    unique: false,
+                                },
+                                NamedKeyValue {
+                                    name: WINDOW_PANE_NAME.to_owned(),
+                                    values: vec![IndexValue::I64(pane as i64)],
+                                    unique: false,
+                                },
+                            ],
+                        },
+                    )
+                    .collect();
+                Ok((
+                    Vec::new(),
+                    vec![EffectStateMutation {
+                        store_id,
+                        mutation_id: effect_state_mutation_id(effect_id, 0),
+                        op: StateStoreMutationOp::AccumulateRows { entries },
+                    }],
+                ))
+            }
+        }
+    }
+}
+
+/// A window shards into 16 equal accumulation panes: coarse enough that one
+/// page touches few rows, fine enough that pane rows stay small.
+pub const WINDOW_PANE_COUNT: u64 = 16;
+/// Named-key postings every window pane row carries so the managed view is
+/// enumerable by group key or pane index without knowing composite row keys.
+pub const WINDOW_KEY_NAME: &str = "key";
+pub const WINDOW_PANE_NAME: &str = "pane";
+
+/// Pane length in nanoseconds for a window; never zero even for sub-pane
+/// windows.
+fn window_pane_ns(window_ns: u64) -> u64 {
+    (window_ns / WINDOW_PANE_COUNT).max(1)
+}
+
+/// The StateStore row key for one (group, pane): length-prefixed so binary
+/// group bytes stay unambiguous, big-endian pane so row keys order by time.
+fn window_pane_row_key(group: &[u8], pane: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + group.len() + 8);
+    key.extend_from_slice(&(group.len() as u32).to_be_bytes());
+    key.extend_from_slice(group);
+    key.extend_from_slice(&pane.to_be_bytes());
+    key
+}
+
+/// Tag-prefixed group bytes keep typed values distinct (Text "1" never
+/// merges with I64 1); `Null` keys group nothing.
+fn window_group_key_bytes(value: &IndexValue) -> Option<Vec<u8>> {
+    let (tag, bytes): (u8, Vec<u8>) = match value {
+        IndexValue::Null => return None,
+        IndexValue::Bool(value) => (0, vec![u8::from(*value)]),
+        IndexValue::I64(value) => (1, value.to_be_bytes().to_vec()),
+        IndexValue::Text(value) => (2, value.as_bytes().to_vec()),
+        IndexValue::Bytes(value) => (3, value.clone()),
+    };
+    let mut key = Vec::with_capacity(1 + bytes.len());
+    key.push(tag);
+    key.extend_from_slice(&bytes);
+    Some(key)
+}
+
+/// Decode a fetched record into the replay-record shape extraction expects.
+/// Corrupt wire fields contribute nothing rather than failing the cycle.
+fn source_record(record: &FetchedRecord) -> Option<ReplaySourceRecord> {
+    use base64::Engine;
+    let decode = |value: &str| base64::engine::general_purpose::STANDARD.decode(value).ok();
+    Some(ReplaySourceRecord {
+        message_id: record.message_id,
+        cursor: String::new(),
+        key: decode(&record.key_base64)?,
+        metadata: record
+            .metadata_base64
+            .iter()
+            .map(|(name, value)| Some((name.clone(), decode(value)?)))
+            .collect::<Option<BTreeMap<_, _>>>()?,
+        payload: decode(&record.payload_base64)?,
+    })
 }
 
 #[cfg(test)]
@@ -322,7 +498,8 @@ mod tests {
             space_id: Uuid::from_u128(8),
             subscription_id: Uuid::from_u128(9),
             operation: PipeOperation::Forward,
-            output_feed_id: Uuid::from_u128(10),
+            output_feed_id: Some(Uuid::from_u128(10)),
+            output_store_id: None,
             stage: PipeStage::Declared,
             status: ResourceStatus::Active,
             created_at_ns: 0,
