@@ -307,9 +307,10 @@ When two drives race one frontier with different resolutions, whichever
 `Declare` commits first is the single source of truth: the loser adopts
 the committed row and applies it rather than emitting a second decision.
 Missing rows still forward (`enrich.matched = false`) unless the
-declaration chooses `MISS DROP`, which consumes the miss without
-emitting — the input frontier commits inside the same effect either way,
-so a dropped miss is an acknowledged decision, not a lost record.
+declaration chooses `MISS DROP` (consume without emitting) or `MISS
+QUARANTINE <feed>` (route to a declared quarantine Feed stamped
+`enrich.quarantine`) — the input frontier commits inside the same effect
+either way, so a miss is an acknowledged decision, not a lost record.
 `NAMED '<key>'` resolves through a declared secondary named key (the same
 `by_named` postings public row reads use) instead of the primary. An
 unreachable store fails the drive retryably so a fake miss is never

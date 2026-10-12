@@ -427,11 +427,24 @@ impl PipeDriver {
                     }],
                 ))
             }
-            PipeOperation::Enrich { on_miss, .. } => {
+            PipeOperation::Enrich {
+                on_miss,
+                quarantine_feed_id,
+                ..
+            } => {
                 let feed_id = self
                     .pipe
                     .output_feed_id
                     .ok_or(EffectJournalError::Conflict)?;
+                // A quarantine declaration without a resolved Feed fails
+                // closed — silently dropping or forwarding would corrupt the
+                // declared miss contract.
+                let quarantine_feed_id =
+                    if matches!(on_miss, crate::control::EnrichMiss::Quarantine) {
+                        Some(quarantine_feed_id.ok_or(EffectJournalError::Conflict)?)
+                    } else {
+                        None
+                    };
                 // Resolution was resolved at fetch time and rides inside the
                 // Declare: outputs are the single committed source of truth,
                 // so replays re-append identical bytes rather than re-read a
@@ -455,6 +468,18 @@ impl PipeDriver {
                             {
                                 return None;
                             }
+                            // A declared quarantine routes the miss to its
+                            // own Feed.
+                            let output_feed_id = match quarantine_feed_id {
+                                Some(feed) if !resolution.matched => {
+                                    metadata.insert(
+                                        "enrich.quarantine".to_owned(),
+                                        "dHJ1ZQ==".to_owned(), // "true"
+                                    );
+                                    feed
+                                }
+                                _ => feed_id,
+                            };
                             metadata.insert(
                                 "enrich.matched".to_owned(),
                                 if resolution.matched {
@@ -480,7 +505,7 @@ impl PipeDriver {
                                 );
                             }
                             Some(EffectOutput {
-                                feed_id,
+                                feed_id: output_feed_id,
                                 key_base64: record.key_base64.clone(),
                                 payload_base64: record.payload_base64.clone(),
                                 metadata_base64: metadata,

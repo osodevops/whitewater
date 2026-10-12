@@ -150,6 +150,11 @@ pub enum PipeOperation {
         /// What a lookup miss does to the output record.
         #[serde(default)]
         on_miss: EnrichMiss,
+        /// Resolved at define time when `on_miss` is `Quarantine`; the
+        /// declared name resolves to a same-Domain Feed that is neither
+        /// the input nor the output.
+        #[serde(default)]
+        quarantine_feed_id: Option<Uuid>,
     },
 }
 
@@ -165,6 +170,10 @@ pub enum EnrichMiss {
     /// still commits inside the same effect, so a dropped miss is an
     /// acknowledged, replay-safe decision rather than a lost record.
     Drop,
+    /// Route the miss to a declared quarantine Feed (`quarantine_feed_id`)
+    /// instead of the output — bad keys stay inspectable without
+    /// contaminating the enriched stream.
+    Quarantine,
 }
 
 /// How fresh an `Enrich` lookup must be before its result is journaled.
@@ -848,6 +857,11 @@ pub enum Command {
         /// `Window` target; absent for `Forward` Pipes.
         #[serde(default)]
         output_store: Option<String>,
+        /// Miss-quarantine Feed name for `Enrich` Pipes
+        /// (`MISS QUARANTINE <feed>`); resolved to
+        /// `quarantine_feed_id` at define time.
+        #[serde(default)]
+        quarantine_feed: Option<String>,
         operation: PipeOperation,
     },
     CreateWriter {
@@ -2366,6 +2380,7 @@ impl ControlController {
                 subscription,
                 output_feed,
                 output_store,
+                quarantine_feed,
                 operation,
             } => {
                 validate_dotted_name(&name)?;
@@ -2380,7 +2395,8 @@ impl ControlController {
                         "Pipe input Subscription must belong to its Domain".to_owned(),
                     ));
                 }
-                let (output_feed_id, output_store_id) = match &operation {
+                let mut operation = operation;
+                let (output_feed_id, output_store_id) = match &mut operation {
                     PipeOperation::Forward => {
                         let output_feed = output_feed.ok_or_else(|| {
                             ControlError::InvalidOperation(
@@ -2458,7 +2474,8 @@ impl ControlController {
                         key,
                         freshness: _,
                         named,
-                        on_miss: _,
+                        on_miss,
+                        quarantine_feed_id,
                     } => {
                         if let Some(name) = named {
                             let valid = !name.is_empty()
@@ -2508,6 +2525,41 @@ impl ControlController {
                             ));
                         }
                         validate_window_field(key)?;
+                        // A declared quarantine routes misses to a resolved
+                        // same-Domain Feed — never the input (re-processing
+                        // loop) or the output (contamination).
+                        *quarantine_feed_id = match (on_miss, &quarantine_feed) {
+                            (EnrichMiss::Quarantine, Some(name)) => {
+                                let quarantine = active_feed(state, name)?;
+                                if quarantine.space_id != space_id {
+                                    return Err(ControlError::InvalidOperation(
+                                        "Pipe quarantine Feed must belong to its Domain"
+                                            .to_owned(),
+                                    ));
+                                }
+                                if subscription.source.feed_id()
+                                    == Some(quarantine.feed_id)
+                                    || quarantine.feed_id == output.feed_id
+                                {
+                                    return Err(ControlError::InvalidOperation(
+                                        "Pipe quarantine Feed must differ from its input and output Feeds".to_owned(),
+                                    ));
+                                }
+                                Some(quarantine.feed_id)
+                            }
+                            (EnrichMiss::Quarantine, None) => {
+                                return Err(ControlError::InvalidOperation(
+                                    "MISS QUARANTINE requires a quarantine Feed".to_owned(),
+                                ));
+                            }
+                            (_, Some(_)) => {
+                                return Err(ControlError::InvalidOperation(
+                                    "a quarantine Feed is only valid with MISS QUARANTINE"
+                                        .to_owned(),
+                                ));
+                            }
+                            _ => None,
+                        };
                         (Some(output.feed_id), Some(store.store_id))
                     }
                 };
@@ -4472,22 +4524,39 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             expect_keyword(&tokens, at, "BY")?;
                             let (key, end) =
                                 parse_index_field_spec(&tokens, at + 1, "ENRICH BY")?;
-                            let mut on_miss = EnrichMiss::Forward;
+                            let (mut on_miss, mut quarantine_feed) =
+                                (EnrichMiss::Forward, None);
                             if tokens.get(end).is_some() {
                                 expect_keyword(&tokens, end, "MISS")?;
-                                expect_keyword(&tokens, end + 1, "DROP")?;
-                                on_miss = EnrichMiss::Drop;
+                                match token(&tokens, end + 1)?
+                                    .to_ascii_uppercase()
+                                    .as_str()
+                                {
+                                    "DROP" => on_miss = EnrichMiss::Drop,
+                                    "QUARANTINE" => {
+                                        on_miss = EnrichMiss::Quarantine;
+                                        quarantine_feed =
+                                            Some(token(&tokens, end + 2)?.to_owned());
+                                    }
+                                    other => {
+                                        return Err(ControlError::Syntax(format!(
+                                            "MISS accepts DROP or QUARANTINE <feed>, not {other}"
+                                        )))
+                                    }
+                                }
                             }
                             return Ok(Command::DefinePipe {
                                 name: token(&tokens, 2)?.to_owned(),
                                 subscription: token(&tokens, 5)?.to_owned(),
                                 output_feed: Some(token(&tokens, 8)?.to_owned()),
                                 output_store: Some(token(&tokens, 11)?.to_owned()),
+                                quarantine_feed,
                                 operation: PipeOperation::Enrich {
                                     key,
                                     freshness,
                                     named,
                                     on_miss,
+                                    quarantine_feed_id: None,
                                 },
                             });
                         }
@@ -4496,6 +4565,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             subscription: token(&tokens, 5)?.to_owned(),
                             output_feed: Some(token(&tokens, 8)?.to_owned()),
                             output_store: None,
+                            quarantine_feed: None,
                             operation: PipeOperation::Forward,
                         })
                     }
@@ -4540,6 +4610,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             subscription: token(&tokens, 5)?.to_owned(),
                             output_feed: None,
                             output_store: Some(token(&tokens, 8)?.to_owned()),
+                            quarantine_feed: None,
                             operation: PipeOperation::Window {
                                 window_ns,
                                 key,
@@ -7514,6 +7585,7 @@ mod tests {
             subscription: "accounts.flow".to_owned(),
             output_feed: Some("accounts.enriched".to_owned()),
             output_store: None,
+            quarantine_feed: None,
             operation: PipeOperation::Forward,
         }];
         let first = leader
@@ -7550,6 +7622,7 @@ mod tests {
                 subscription: "accounts.flow".to_owned(),
                 output_feed: Some("accounts.enriched".to_owned()),
                 output_store: None,
+                quarantine_feed: None,
                 operation: PipeOperation::Forward,
             }])
             .await
@@ -7570,6 +7643,7 @@ mod tests {
                         subscription: subscription.to_owned(),
                         output_feed: Some(output_feed.to_owned()),
                         output_store: None,
+                        quarantine_feed: None,
                         operation: PipeOperation::Forward,
                     }])
                     .await
@@ -7599,6 +7673,7 @@ mod tests {
                 subscription: "other.flow".to_owned(),
                 output_feed: Some("other.enriched".to_owned()),
                 output_store: None,
+                quarantine_feed: None,
                 operation: PipeOperation::Forward,
             }])
             .await
@@ -8489,6 +8564,7 @@ mod tests {
             subscription: "accounts.flow".to_owned(),
             output_feed: None,
             output_store,
+            quarantine_feed: None,
             operation: PipeOperation::Window {
                 window_ns,
                 key: IndexFieldSpec::Key,
@@ -8616,15 +8692,17 @@ mod tests {
             subscription: "accounts.flow".to_owned(),
             output_feed,
             output_store,
+            quarantine_feed: None,
             operation: PipeOperation::Enrich {
                 key: IndexFieldSpec::Key,
                 freshness: EnrichFreshness::Latest,
                 named: None,
                 on_miss: EnrichMiss::Forward,
+                quarantine_feed_id: None,
             },
         };
         leader
-            .execute("CREATE FEED accounts.enriched;")
+            .execute("CREATE FEED accounts.enriched; CREATE FEED accounts.dead;")
             .await
             .unwrap();
         for command in [
@@ -8737,11 +8815,45 @@ mod tests {
             } if name == "email"
         ));
 
+        // MISS QUARANTINE <feed> resolves the declared Feed at define time.
+        leader
+            .execute(
+                "CREATE PIPE accounts.enriched5 FROM SUBSCRIPTION accounts.flow                  TO FEED accounts.enriched ENRICH STATESTORE accounts.panes BY KEY MISS QUARANTINE accounts.dead;",
+            )
+            .await
+            .unwrap();
+        match leader
+            .active_pipe_by_name("accounts.enriched5")
+            .await
+            .unwrap()
+            .operation
+        {
+            PipeOperation::Enrich {
+                on_miss: EnrichMiss::Quarantine,
+                quarantine_feed_id: Some(id),
+                ..
+            } => {
+                assert_eq!(
+                    Some(id),
+                    leader
+                        .active_feed_by_name("accounts.dead")
+                        .await
+                        .map(|feed| feed.feed_id)
+                );
+            }
+            other => panic!("expected quarantine enrich, got {other:?}"),
+        }
+
         for statement in [
             "CREATE PIPE accounts.bad5 FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH STATESTORE accounts.panes;",
             "CREATE PIPE accounts.bad6 FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH accounts.panes BY KEY;",
             "CREATE PIPE accounts.bad7 FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH STATESTORE accounts.panes NAMED 'Bad-Name' BY KEY;",
             "CREATE PIPE accounts.bad8 FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH STATESTORE accounts.panes BY KEY MISS SKIP;",
+            // Quarantine to the input Feed (loop), the output Feed
+            // (contamination), and a missing Feed all refuse.
+            "CREATE PIPE accounts.bad9 FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH STATESTORE accounts.panes BY KEY MISS QUARANTINE accounts.events;",
+            "CREATE PIPE accounts.bada FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH STATESTORE accounts.panes BY KEY MISS QUARANTINE accounts.enriched;",
+            "CREATE PIPE accounts.badb FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched ENRICH STATESTORE accounts.panes BY KEY MISS QUARANTINE accounts.missing;",
         ] {
             assert!(
                 leader.execute(statement).await.is_err(),

@@ -1259,6 +1259,7 @@ fn enrich_pipe() -> PipeDefinition {
             freshness: finnstream::control::EnrichFreshness::Latest,
             named: None,
             on_miss: finnstream::control::EnrichMiss::Forward,
+            quarantine_feed_id: None,
         },
         output_feed_id: Some(Uuid::from_u128(OUTPUT_FEED)),
         output_store_id: Some(Uuid::from_u128(OUTPUT_STORE)),
@@ -1316,6 +1317,7 @@ async fn enrich_pipe_drop_miss_consumes_without_emitting() {
         freshness: finnstream::control::EnrichFreshness::Latest,
         named: None,
         on_miss: finnstream::control::EnrichMiss::Drop,
+        quarantine_feed_id: None,
     };
     let harness = harness_for(pipe);
     seed_frontier(&harness.progress, "p0").await;
@@ -1352,6 +1354,49 @@ async fn enrich_pipe_drop_miss_consumes_without_emitting() {
         .unwrap()
         .expect("frontier");
     assert_eq!(frontier.cursor, "p1");
+}
+
+#[tokio::test]
+async fn enrich_pipe_quarantines_misses_to_the_declared_feed() {
+    let quarantine = Uuid::from_u128(0x77);
+    let mut pipe = enrich_pipe();
+    pipe.operation = PipeOperation::Enrich {
+        key: IndexFieldSpec::Key,
+        freshness: finnstream::control::EnrichFreshness::Latest,
+        named: None,
+        on_miss: finnstream::control::EnrichMiss::Quarantine,
+        quarantine_feed_id: Some(quarantine),
+    };
+    let harness = harness_for(pipe);
+    seed_frontier(&harness.progress, "p0").await;
+
+    let mut hit = record(1);
+    hit.resolution = Some(EnrichResolution {
+        matched: true,
+        payload: b"doc-bytes".to_vec(),
+        applied_seq: 41,
+    });
+    let miss = record(2);
+    harness
+        .driver
+        .drive_once(
+            64,
+            |_f, _l| async { Ok(page(vec![hit, miss], "p1")) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+
+    let appends = harness.sink.appends.lock().unwrap();
+    // Hit lands on the output Feed; the miss lands on quarantine with
+    // evidence — nothing is lost and nothing contaminates the output.
+    assert_eq!(appends.len(), 2);
+    assert_eq!(appends[0].feed_id, Uuid::from_u128(OUTPUT_FEED));
+    assert_eq!(appends[1].feed_id, quarantine);
+    assert_eq!(appends[1].metadata_base64["enrich.matched"], "ZmFsc2U=");
+    assert_eq!(appends[1].metadata_base64["enrich.quarantine"], "dHJ1ZQ==");
 }
 
 #[tokio::test]
