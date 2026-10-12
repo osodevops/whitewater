@@ -483,6 +483,13 @@ impl EffectApply for RecordingApply {
             Err(error) => Err(progress_to_effect(error)),
         }
     }
+
+    async fn mutate_state(
+        &self,
+        _mutation: &finnstream::effect::EffectStateMutation,
+    ) -> Result<(), EffectJournalError> {
+        Ok(())
+    }
 }
 
 fn progress_to_effect(error: SubscriptionProgressError) -> EffectJournalError {

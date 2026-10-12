@@ -23,6 +23,8 @@ use crate::active_range::RangeId;
 
 /// Maximum output records one effect may declare.
 pub const EFFECT_MAX_OUTPUTS: usize = 64;
+/// Maximum declared co-located StateStore mutations one effect may carry.
+pub const EFFECT_MAX_STATE_MUTATIONS: usize = 16;
 /// Maximum serialized bytes for one effect mutation or journal row.
 pub const EFFECT_MAX_MUTATION_BYTES: usize = 256 * 1024;
 /// Maximum base64-encoded bytes for a single output Key or payload.
@@ -59,6 +61,22 @@ pub struct EffectConsume {
     pub positions: BTreeMap<RangeId, String>,
 }
 
+/// One declared co-located StateStore mutation inside the effect's atomic
+/// boundary. The mutation commits through the store's own RF3 journal only
+/// after the effect's terminal marker is durable, and `mutation_id` is a
+/// deterministic dedupe identity so a replayed apply commits exactly one
+/// row.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EffectStateMutation {
+    pub store_id: Uuid,
+    /// Client-dedupe identity on the store journal. Producers derive it
+    /// with `effect_state_mutation_id(effect_id, index)` so every replay
+    /// targets the same row.
+    pub mutation_id: Uuid,
+    pub op: crate::state_store::StateStoreMutationOp,
+}
+
 /// The lifecycle transition a journal mutation commits.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -67,6 +85,9 @@ pub enum EffectTransition {
     Declare {
         consume: Option<EffectConsume>,
         outputs: Vec<EffectOutput>,
+        /// Co-located StateStore mutations released with the effect.
+        #[serde(default)]
+        state_mutations: Vec<EffectStateMutation>,
     },
     /// Every declared output durably appended and the consume frontier
     /// committed; `declares` identifies the committed `Declare` request.
@@ -76,6 +97,10 @@ pub enum EffectTransition {
         declares: Uuid,
         #[serde(default)]
         outputs: Vec<EffectOutput>,
+        /// The declared store mutations, restated so a terminal row alone
+        /// replays them after a crash between marker and mutation commits.
+        #[serde(default)]
+        state_mutations: Vec<EffectStateMutation>,
     },
     /// The decision was abandoned by policy (for example a poison input was
     /// quarantined); `declares` identifies the committed `Declare` request.
@@ -544,9 +569,22 @@ fn validate_effect_bounds(mutation: &EffectMutation) -> Result<(), EffectJournal
     if mutation.ownership_epoch == 0 || mutation.sequence == 0 {
         return Err(EffectJournalError::TooLarge);
     }
+    let state_mutation_bounded = |mutation: &EffectStateMutation| {
+        mutation.mutation_id != Uuid::nil()
+            && serde_json::to_vec(&mutation.op)
+                .map(|encoded| encoded.len() <= EFFECT_MAX_OUTPUT_FIELD)
+                .unwrap_or(false)
+    };
     match &mutation.transition {
-        EffectTransition::Declare { consume, outputs } => {
-            if outputs.len() > EFFECT_MAX_OUTPUTS {
+        EffectTransition::Declare {
+            consume,
+            outputs,
+            state_mutations,
+        } => {
+            if outputs.len() > EFFECT_MAX_OUTPUTS
+                || state_mutations.len() > EFFECT_MAX_STATE_MUTATIONS
+                || !state_mutations.iter().all(state_mutation_bounded)
+            {
                 return Err(EffectJournalError::TooLarge);
             }
             if outputs.iter().any(|output| {
@@ -576,8 +614,14 @@ fn validate_effect_bounds(mutation: &EffectMutation) -> Result<(), EffectJournal
                 }
             }
         }
-        EffectTransition::Applied { outputs, .. } => {
+        EffectTransition::Applied {
+            outputs,
+            state_mutations,
+            ..
+        } => {
             if outputs.len() > EFFECT_MAX_OUTPUTS
+                || state_mutations.len() > EFFECT_MAX_STATE_MUTATIONS
+                || !state_mutations.iter().all(state_mutation_bounded)
                 || outputs.iter().any(|output| {
                     output.key_base64.is_empty()
                         || output.key_base64.len() > EFFECT_MAX_OUTPUT_FIELD
@@ -947,11 +991,21 @@ impl EffectCoordinator {
         if committed.subscription_id != self.assignment.subscription_id {
             return Err(EffectJournalError::InvalidAssignment);
         }
-        let (consume, outputs) = match &committed.transition {
-            EffectTransition::Declare { consume, outputs } => {
-                (consume.as_ref(), outputs.as_slice())
-            }
-            EffectTransition::Applied { outputs, .. } => (None, outputs.as_slice()),
+        let (consume, outputs, state_mutations) = match &committed.transition {
+            EffectTransition::Declare {
+                consume,
+                outputs,
+                state_mutations,
+            } => (
+                consume.as_ref(),
+                outputs.as_slice(),
+                state_mutations.as_slice(),
+            ),
+            EffectTransition::Applied {
+                outputs,
+                state_mutations,
+                ..
+            } => (None, outputs.as_slice(), state_mutations.as_slice()),
             EffectTransition::Aborted { .. } => return Ok(committed),
         };
         let mut receipts = Vec::with_capacity(outputs.len());
@@ -997,6 +1051,7 @@ impl EffectCoordinator {
                 transition: EffectTransition::Applied {
                     declares: committed.request_id,
                     outputs: outputs.to_vec(),
+                    state_mutations: state_mutations.to_vec(),
                 },
             };
             match self.apply(applied.clone()).await {
@@ -1058,6 +1113,12 @@ impl EffectCoordinator {
                     }
                 }
             }
+        }
+        // Co-located store mutations join the boundary last: each commits
+        // through the store's own RF3 journal under its declared dedupe
+        // identity, so a replayed apply converges to one row per mutation.
+        for state_mutation in state_mutations {
+            apply.mutate_state(state_mutation).await?;
         }
         Ok(terminal)
     }
@@ -1131,6 +1192,13 @@ pub trait EffectApply: Send + Sync {
         target: &EffectReleaseTarget,
     ) -> Result<EffectReleaseOutcome, EffectJournalError>;
 
+    /// Commit one declared co-located StateStore mutation through the
+    /// store's RF3 journal under the mutation's declared dedupe identity.
+    /// Runs in the release phase, after the terminal journal marker is
+    /// durable; an ambiguous result must settle by retrying the same
+    /// `mutation_id`.
+    async fn mutate_state(&self, mutation: &EffectStateMutation) -> Result<(), EffectJournalError>;
+
     /// Resolve another effect holding an output Range's tail: drive its own
     /// committed journal entry to release so this effect can proceed. The
     /// default refuses, which turns `PendingOccupied` into a retryable
@@ -1138,6 +1206,14 @@ pub trait EffectApply: Send + Sync {
     async fn resolve_pending(&self, _occupant: EffectOccupant) -> Result<(), EffectJournalError> {
         Err(EffectJournalError::Unavailable)
     }
+}
+
+/// The deterministic store-journal dedupe identity of the `index`th
+/// declared co-located mutation in `effect_id`'s decision. Producers stamp
+/// it on `EffectStateMutation.mutation_id` at Declare time so every apply
+/// replay commits the same row.
+pub fn effect_state_mutation_id(effect_id: Uuid, index: usize) -> Uuid {
+    effect_apply_request_id(effect_id, format!("state-mutation-{index}").as_bytes())
 }
 
 /// A deterministic request identity derived from the committed Declare so a
@@ -1631,6 +1707,7 @@ mod tests {
             transition: EffectTransition::Declare {
                 consume: Some(consume()),
                 outputs: vec![output(1)],
+                state_mutations: Vec::new(),
             },
         }
     }
@@ -1715,6 +1792,7 @@ mod tests {
             transition: EffectTransition::Applied {
                 declares: mutation.request_id,
                 outputs: vec![],
+                state_mutations: Vec::new(),
             },
             ..mutation.clone()
         };
@@ -1729,6 +1807,7 @@ mod tests {
                 transition: EffectTransition::Applied {
                     declares: applied.request_id,
                     outputs: vec![],
+                    state_mutations: Vec::new(),
                 },
                 ..applied.clone()
             }),
@@ -1747,6 +1826,7 @@ mod tests {
             transition: EffectTransition::Applied {
                 declares: mutation.request_id,
                 outputs: vec![],
+                state_mutations: Vec::new(),
             },
             ..mutation.clone()
         };
@@ -1782,6 +1862,7 @@ mod tests {
             transition: EffectTransition::Applied {
                 declares: Uuid::new_v4(),
                 outputs: vec![],
+                state_mutations: Vec::new(),
             },
             ..mutation.clone()
         };
@@ -1801,6 +1882,7 @@ mod tests {
             outputs: (0..=EFFECT_MAX_OUTPUTS as u64)
                 .map(output)
                 .collect::<Vec<_>>(),
+            state_mutations: Vec::new(),
         };
         assert!(matches!(
             replica.prepare(mutation),
@@ -1813,6 +1895,7 @@ mod tests {
                 payload_base64: "x".repeat(EFFECT_MAX_OUTPUT_FIELD + 1),
                 ..output(1)
             }],
+            state_mutations: Vec::new(),
         };
         assert!(matches!(
             replica.prepare(mutation),
@@ -2080,6 +2163,13 @@ mod tests {
             Ok(EffectReleaseOutcome::Released { committed: 1 })
         }
 
+        async fn mutate_state(
+            &self,
+            _mutation: &EffectStateMutation,
+        ) -> Result<(), EffectJournalError> {
+            Ok(())
+        }
+
         async fn resolve_pending(
             &self,
             occupant: EffectOccupant,
@@ -2146,7 +2236,10 @@ mod tests {
             .apply_committed(mutation.effect_id, &sink)
             .await
             .unwrap();
-        let EffectTransition::Applied { declares, outputs } = &applied.transition else {
+        let EffectTransition::Applied {
+            declares, outputs, ..
+        } = &applied.transition
+        else {
             panic!("expected applied")
         };
         assert_eq!(*declares, mutation.request_id);

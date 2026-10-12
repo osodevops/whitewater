@@ -228,7 +228,10 @@ which is idempotent so a retried apply converges to one outcome:
 4. **Release.** For each output Range the append touched, the owner
    broadcasts a deferred commit to the marker's last position and frame
    digest. One commit per Range makes every output of the effect visible in
-   a single step.
+   a single step. Declared co-located StateStore mutations then commit
+   through the store's own RF3 mutation journal, each under a deterministic
+   `mutation_id` derived from the effect identity, so a replayed apply
+   converges to exactly one journaled row per mutation.
 
 While a marker holds a Range's tail, the append gate refuses *every* other
 append - ordinary or pending - with `PendingEffectOccupied` carrying the
@@ -252,8 +255,19 @@ Failure semantics fall out of the mechanism rather than a separate protocol:
   idempotent: `NotPending` plus a covered committed boundary means the tail
   already resolved.
 
-The boundary deliberately does not span Index/StateStore mutations; those
-join the atomic unit in a later milestone.
+Co-located StateStore mutations join the boundary through that same
+release phase rather than a separate transaction protocol. A `Declare` may
+carry up to 16 `EffectStateMutation` entries - store identity, a
+deterministic dedupe `mutation_id`, and the mutation op - and the terminal
+`Applied` row restates them so a crash after the marker still replays them.
+Each mutation commits through the StateStore's existing bounded RF3 journal
+after output visibility, under the same fencing and quorum evidence as a
+public `mutate` call; nothing becomes visible in the store before the
+effect's terminal marker is durable, and the dedupe identity means an
+ambiguous commit settles by retrying the same row instead of double-writing.
+Feed-sourced Index and StateStore replay remain naturally inside the
+boundary as well: pending output frames are fenced behind the committed
+boundary, so replay projections can never consume an uncommitted record.
 
 ## 6. Protocol-level idempotency
 

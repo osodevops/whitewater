@@ -246,6 +246,7 @@ impl PipeDriver {
                     positions: page.positions,
                 }),
                 outputs,
+                state_mutations: Vec::new(),
             },
         };
         match self.journal.apply(declare.clone()).await {

@@ -4527,6 +4527,46 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
         }
     }
 
+    async fn mutate_state(
+        &self,
+        mutation: &crate::effect::EffectStateMutation,
+    ) -> Result<(), crate::effect::EffectJournalError> {
+        let assignment = self
+            .state
+            .control
+            .active_state_store_assignment_by_id(mutation.store_id)
+            .await
+            .ok_or(crate::effect::EffectJournalError::Unavailable)?;
+        let coordinator = state_store_coordinator_for(self.state, assignment.clone())
+            .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
+        coordinator
+            .mutate(crate::state_store::StateStoreMutation {
+                store_id: mutation.store_id,
+                mutation_id: mutation.mutation_id,
+                request_id: crate::effect::effect_apply_request_id(
+                    mutation.mutation_id,
+                    b"state-request",
+                ),
+                ownership_epoch: assignment.ownership_epoch,
+                sequence: 0,
+                op: mutation.op.clone(),
+                issued_at_ns: unix_ns(),
+                source: None,
+            })
+            .await
+            .map(|_| ())
+            .map_err(|error| match error {
+                crate::state_store::StateStoreMutationError::NoQuorum
+                | crate::state_store::StateStoreMutationError::Unavailable
+                | crate::state_store::StateStoreMutationError::AmbiguousCommit
+                | crate::state_store::StateStoreMutationError::ApplyFailed
+                | crate::state_store::StateStoreMutationError::Diverged => {
+                    crate::effect::EffectJournalError::Unavailable
+                }
+                _ => crate::effect::EffectJournalError::Conflict,
+            })
+    }
+
     async fn resolve_pending(
         &self,
         occupant: crate::effect::EffectOccupant,
@@ -13270,6 +13310,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn live_effect_apply_mutate_state_fails_closed_without_a_reachable_store() {
+        let directory = TempDir::new().unwrap();
+        let (state, control_plane, control, _replica) =
+            internal_replica_test_state(&directory).await;
+        let nodes = ["control-1", "control-2", "control-3"]
+            .map(|name| crate::active_range::StorageNodeId::try_new(name).unwrap());
+        let assignment = crate::reader::SubscriptionProgressAssignment::try_new(
+            Uuid::new_v4(),
+            nodes[0].clone(),
+            ReplicaSet::try_new(nodes).unwrap(),
+            1,
+        )
+        .unwrap();
+        let (progress, _) = member_assignment_coordinator(&state, assignment).unwrap();
+        let sink = LiveEffectApply {
+            state: &state,
+            progress,
+            subscription_id: Uuid::new_v4(),
+            ownership_epoch: 1,
+            sweep_depth: 0,
+        };
+        let mutation = |store_id: Uuid| crate::effect::EffectStateMutation {
+            store_id,
+            mutation_id: Uuid::new_v4(),
+            op: crate::state_store::StateStoreMutationOp::ClearAll,
+        };
+
+        // A mutation declared against a store with no journal placement
+        // fails closed rather than fabricating a commit.
+        assert!(matches!(
+            crate::effect::EffectApply::mutate_state(&sink, &mutation(Uuid::new_v4())).await,
+            Err(crate::effect::EffectJournalError::Unavailable)
+                | Err(crate::effect::EffectJournalError::Conflict)
+        ));
+
+        // A defined store whose mutation-journal replicas are unreachable
+        // also fails closed; the retry settles through the mutation's
+        // declared dedupe identity.
+        control
+            .execute("DEFINE STATESTORE orders.ledger;")
+            .await
+            .unwrap();
+        let store = control
+            .declared_state_store_by_name("orders.ledger")
+            .await
+            .unwrap();
+        assert!(
+            crate::effect::EffectApply::mutate_state(&sink, &mutation(store.store_id))
+                .await
+                .is_err()
+        );
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn effect_journal_internal_routes_authenticate_and_fence_placement() {
         let directory = TempDir::new().unwrap();
         let (app, control_plane, control, _replica) =
@@ -13310,6 +13405,7 @@ mod tests {
                     writer_epoch: 1,
                     sequence: 1,
                 }],
+                state_mutations: Vec::new(),
             },
         };
         let prepare = crate::effect::EffectPrepareRequest {

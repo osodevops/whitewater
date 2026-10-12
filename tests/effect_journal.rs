@@ -53,6 +53,7 @@ fn declare(effect_id: Uuid, sequence: u64, epoch: u64) -> EffectMutation {
                 )]),
             }),
             outputs: vec![output(1)],
+            state_mutations: Vec::new(),
         },
     }
 }
@@ -363,6 +364,7 @@ async fn applied_transition_commits_as_a_second_sequenced_mutation() {
         transition: EffectTransition::Applied {
             declares: mutation.request_id,
             outputs: vec![],
+            state_mutations: Vec::new(),
         },
     };
     coordinator.apply(applied.clone()).await.unwrap();
@@ -380,10 +382,13 @@ struct RecordingApply {
     appended: Mutex<Vec<EffectOutput>>,
     frontier_request_log: Mutex<Vec<Uuid>>,
     releases: Mutex<Vec<EffectReleaseTarget>>,
+    state_mutated: Mutex<Vec<finnstream::effect::EffectStateMutation>>,
+    call_log: Mutex<Vec<&'static str>>,
     resolved: Mutex<Vec<finnstream::effect::EffectOccupant>>,
     fail_once: Mutex<BTreeSet<Uuid>>,
     fail_frontier: Mutex<u8>,
     fail_releases: Mutex<u8>,
+    fail_state_mutations: Mutex<u8>,
     occupied_appends: Mutex<u8>,
     occupied_releases: Mutex<u8>,
     not_pending_releases: Mutex<u8>,
@@ -433,6 +438,7 @@ impl EffectApply for RecordingApply {
         target: &EffectReleaseTarget,
     ) -> Result<EffectReleaseOutcome, EffectJournalError> {
         self.releases.lock().unwrap().push(target.clone());
+        self.call_log.lock().unwrap().push("release");
         {
             let mut remaining = self.fail_releases.lock().unwrap();
             if *remaining > 0 {
@@ -460,6 +466,28 @@ impl EffectApply for RecordingApply {
             }
         }
         Ok(EffectReleaseOutcome::Released { committed: 1 })
+    }
+
+    async fn mutate_state(
+        &self,
+        mutation: &finnstream::effect::EffectStateMutation,
+    ) -> Result<(), EffectJournalError> {
+        {
+            let mut remaining = self.fail_state_mutations.lock().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(EffectJournalError::Unavailable);
+            }
+        }
+        self.call_log.lock().unwrap().push("state");
+        let mut mutated = self.state_mutated.lock().unwrap();
+        if !mutated
+            .iter()
+            .any(|seen| seen.mutation_id == mutation.mutation_id)
+        {
+            mutated.push(mutation.clone());
+        }
+        Ok(())
     }
 
     async fn resolve_pending(
@@ -513,6 +541,7 @@ async fn apply_committed_replicates_the_applied_marker_on_the_journal_quorum() {
         EffectTransition::Applied {
             declares: mutation.request_id,
             outputs: outputs.clone(),
+            state_mutations: Vec::new(),
         }
     );
     // The Applied marker is quorum-visible through the normal committed read.
@@ -821,4 +850,206 @@ async fn apply_committed_rereleases_a_tail_the_terminal_marker_left_pending() {
     assert_eq!(sink.appended.lock().unwrap().len(), 1);
     assert_eq!(sink.frontier_request_log.lock().unwrap().len(), 1);
     assert_eq!(sink.releases.lock().unwrap().len(), 2);
+}
+
+fn state_mutation(index: usize) -> finnstream::effect::EffectStateMutation {
+    finnstream::effect::EffectStateMutation {
+        store_id: Uuid::from_u128(700 + index as u128),
+        mutation_id: finnstream::effect::effect_state_mutation_id(Uuid::from_u128(1), index),
+        op: finnstream::state_store::StateStoreMutationOp::PutRow {
+            key: format!("row-{index}").into_bytes(),
+            payload: b"payload".to_vec(),
+            named: Vec::new(),
+        },
+    }
+}
+
+fn declare_with_state(
+    effect_id: Uuid,
+    sequence: u64,
+    epoch: u64,
+    mutations: Vec<finnstream::effect::EffectStateMutation>,
+) -> EffectMutation {
+    let mut mutation = declare(effect_id, sequence, epoch);
+    let EffectTransition::Declare {
+        state_mutations, ..
+    } = &mut mutation.transition
+    else {
+        panic!("expected declare")
+    };
+    *state_mutations = mutations;
+    mutation
+}
+
+#[tokio::test]
+async fn apply_committed_applies_state_mutations_after_output_release() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare_with_state(
+        Uuid::new_v4(),
+        1,
+        1,
+        vec![state_mutation(0), state_mutation(1)],
+    );
+    let coordinator = effect_coordinator(transport, &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    let sink = RecordingApply::default();
+    let applied = coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+
+    // The Applied row restates the declared mutations so a terminal row
+    // alone still drives them after a crash.
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected applied")
+    };
+    assert_eq!(state_mutations.len(), 2);
+
+    // Every declared mutation committed exactly once, strictly after the
+    // pending output tail released.
+    let mutated = sink.state_mutated.lock().unwrap();
+    assert_eq!(mutated.len(), 2);
+    assert_eq!(mutated[0].mutation_id, state_mutation(0).mutation_id);
+    assert_eq!(mutated[1].mutation_id, state_mutation(1).mutation_id);
+    let log = sink.call_log.lock().unwrap();
+    let first_state = log.iter().position(|call| *call == "state").unwrap();
+    assert!(log[..first_state].iter().all(|call| *call == "release"));
+    assert_eq!(log.len(), 3);
+}
+
+#[tokio::test]
+async fn apply_committed_replays_state_mutations_after_a_mutation_failure() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare_with_state(
+        Uuid::new_v4(),
+        1,
+        1,
+        vec![state_mutation(0), state_mutation(1)],
+    );
+    let coordinator = effect_coordinator(transport, &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    // The first attempt applies the marker and the first mutation, then
+    // fails partway through the release phase.
+    let sink = RecordingApply::default();
+    *sink.fail_state_mutations.lock().unwrap() = 1;
+    assert!(matches!(
+        coordinator.apply_committed(mutation.effect_id, &sink).await,
+        Err(EffectJournalError::Unavailable)
+    ));
+
+    // The retried apply converges: each mutation commits exactly once
+    // under its declared dedupe identity.
+    coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    let mutated = sink.state_mutated.lock().unwrap();
+    assert_eq!(mutated.len(), 2);
+    assert_eq!(
+        mutated
+            .iter()
+            .map(|mutation| mutation.mutation_id)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn terminal_applied_row_replays_state_mutations_after_a_marker_crash() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let mutation = declare_with_state(Uuid::new_v4(), 1, 1, vec![state_mutation(0)]);
+    let coordinator = effect_coordinator(transport, &nodes);
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    // The marker committed but the apply crashed before the mutation
+    // reached the store journal.
+    let applied = EffectMutation {
+        effect_id: mutation.effect_id,
+        subscription_id: scope(),
+        ownership_epoch: 1,
+        sequence: 2,
+        request_id: Uuid::new_v4(),
+        transition: EffectTransition::Applied {
+            declares: mutation.request_id,
+            outputs: Vec::new(),
+            state_mutations: vec![state_mutation(0)],
+        },
+    };
+    coordinator.apply(applied).await.unwrap();
+
+    // Replaying the terminal row alone still commits the declared
+    // mutation under its dedupe identity.
+    let sink = RecordingApply::default();
+    coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    assert_eq!(sink.appended.lock().unwrap().len(), 0);
+    assert_eq!(sink.state_mutated.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn oversized_state_mutations_are_refused_before_durability() {
+    let directories = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = nodes();
+    let transport = Arc::new(TestEffectTransport::new(&directories, &nodes));
+    let coordinator = effect_coordinator(transport, &nodes);
+
+    // More declared mutations than the journal bound refuses at prepare.
+    let mutation = declare_with_state(
+        Uuid::new_v4(),
+        1,
+        1,
+        (0..=finnstream::effect::EFFECT_MAX_STATE_MUTATIONS)
+            .map(state_mutation)
+            .collect(),
+    );
+    assert!(matches!(
+        coordinator.apply(mutation).await,
+        Err(EffectJournalError::TooLarge)
+    ));
+
+    // A mutation whose serialized op exceeds the field bound is refused.
+    let oversized = finnstream::effect::EffectStateMutation {
+        store_id: Uuid::new_v4(),
+        mutation_id: Uuid::new_v4(),
+        op: finnstream::state_store::StateStoreMutationOp::PutRow {
+            key: b"row".to_vec(),
+            payload: vec![b'x'; finnstream::effect::EFFECT_MAX_OUTPUT_FIELD],
+            named: Vec::new(),
+        },
+    };
+    let mutation = declare_with_state(Uuid::new_v4(), 1, 1, vec![oversized]);
+    assert!(matches!(
+        coordinator.apply(mutation).await,
+        Err(EffectJournalError::TooLarge)
+    ));
 }
