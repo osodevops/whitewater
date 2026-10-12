@@ -4181,7 +4181,12 @@ async fn resolve_window_emissions(
             expire_ns,
             now_ns,
         ) {
-            crate::pipe::WindowPaneDisposition::Emit(emission) => emissions.push(emission),
+            crate::pipe::WindowPaneDisposition::Emit(mut emission) => {
+                // The serving replica's applied journal sequence is the
+                // version evidence for every result this scan produced.
+                emission.store_seq = reply.result.applied_seq;
+                emissions.push(emission)
+            }
             crate::pipe::WindowPaneDisposition::Expire => expired.push(row.key.clone()),
             crate::pipe::WindowPaneDisposition::Keep => {}
         }

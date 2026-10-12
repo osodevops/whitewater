@@ -93,6 +93,11 @@ pub struct WindowEmission {
     pub count: u64,
     /// Decoded accumulator sum for the pane.
     pub sum: i128,
+    /// The StateStore journal's applied sequence the row was scanned
+    /// against — the versioned evidence for this result, stamped into
+    /// the emitted payload so an operator can answer "which store
+    /// version produced this window result".
+    pub store_seq: u64,
 }
 
 /// Deterministic identity for the effect one Pipe cycle declares over a
@@ -827,6 +832,8 @@ pub fn window_emission_from_row(
         pane,
         count,
         sum,
+        // The scanner stamps the serving replica's applied sequence.
+        store_seq: 0,
     })
 }
 
@@ -903,6 +910,9 @@ fn window_emission_payload(
         "count": emission.count,
         "sum": serde_json::Value::Null,
         "average": serde_json::Value::Null,
+        // Decimal string: the sequence is version evidence, not a value
+        // — keep it opaque to JavaScript-precision loss like the bounds.
+        "store_seq": emission.store_seq.to_string(),
     });
     match aggregation {
         WindowAggregation::Count => {}
@@ -1165,6 +1175,7 @@ mod tests {
             pane: 7,
             count: 4,
             sum: 30,
+            store_seq: 41,
         };
         let payload = window_emission_payload(
             &emission,
@@ -1181,6 +1192,9 @@ mod tests {
         assert_eq!(body["count"], 4);
         assert_eq!(body["sum"], "30");
         assert_eq!(body["average"], "7.5");
+        // The serving replica's applied journal sequence rides as the
+        // version evidence for this result.
+        assert_eq!(body["store_seq"], "41");
         // Count aggregations carry no sum/average fields.
         let payload = window_emission_payload(&emission, 10, &WindowAggregation::Count);
         let body: serde_json::Value = serde_json::from_slice(&payload).unwrap();

@@ -1618,6 +1618,7 @@ fn pane_emission(group: IndexValue, pane: u64, count: u64, sum: i128) -> WindowE
         pane,
         count,
         sum,
+        store_seq: 7,
     }
 }
 
