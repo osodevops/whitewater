@@ -75,6 +75,11 @@ pub struct NamedStateStoreKey {
     pub name: String,
     #[serde(default)]
     pub unique: bool,
+    /// Feed-sourced stores only: how one committed source record projects
+    /// to this key's typed lookup values. Manual stores carry values on
+    /// each `put_row` mutation instead and must leave this unset.
+    #[serde(default)]
+    pub extractor: Option<IndexFieldSpec>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -671,6 +676,7 @@ pub enum ShowKind {
     StorageNodes,
     Pipes,
     Indexes,
+    StateStores,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -2050,13 +2056,26 @@ impl ControlController {
                 }
                 let space_id = owning_space(state, &name)?.space_id;
                 let source = match source {
-                    StateStoreSourceRequest::Manual => StateStoreSource::Manual,
-                    StateStoreSourceRequest::Feed { feed } => {
-                        if !named_keys.is_empty() {
+                    StateStoreSourceRequest::Manual => {
+                        if named_keys.iter().any(|key| key.extractor.is_some()) {
                             return Err(ControlError::InvalidOperation(
-                                "named keys require a manual StateStore until a declared                                  source-Feed projection exists"
+                                "named-key extractors apply to feed-sourced StateStores;                                  manual stores take named values on each put_row mutation"
                                     .to_owned(),
                             ));
+                        }
+                        StateStoreSource::Manual
+                    }
+                    StateStoreSourceRequest::Feed { feed } => {
+                        for key in &named_keys {
+                            match &key.extractor {
+                                Some(spec) => validate_index_fields(std::slice::from_ref(spec))?,
+                                None => {
+                                    return Err(ControlError::InvalidOperation(
+                                        "feed-sourced named keys require an extractor                                          (KEY, METADATA 'name', or JSON 'path') so replay                                          can project typed values"
+                                            .to_owned(),
+                                    ));
+                                }
+                            }
                         }
                         let definition = active_feed(state, &feed)?;
                         if definition.space_id != space_id {
@@ -4136,11 +4155,11 @@ fn tokenize(statement: &str) -> Result<Vec<String>, ControlError> {
                 chars.next();
             }
             '\'' => quoted = !quoted,
-            ',' if !quoted => {
+            ',' | '=' if !quoted => {
                 if !current.is_empty() {
                     tokens.push(std::mem::take(&mut current));
                 }
-                tokens.push(",".to_owned());
+                tokens.push(character.to_owned().to_string());
             }
             character if character.is_whitespace() && !quoted => {
                 if !current.is_empty() {
@@ -4243,32 +4262,8 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 let mut position = 6;
                 let mut fields = Vec::new();
                 while position < tokens.len() {
-                    let field = match keyword(position).as_deref() {
-                        Some("KEY") => {
-                            position += 1;
-                            IndexFieldSpec::Key
-                        }
-                        Some("METADATA") => {
-                            let name = token(&tokens, position + 1)?.to_owned();
-                            position += 2;
-                            IndexFieldSpec::Metadata { name }
-                        }
-                        Some("JSON") => {
-                            let field = token(&tokens, position + 1)?.to_owned();
-                            position += 2;
-                            IndexFieldSpec::Projection {
-                                extractor: "json".to_owned(),
-                                version: 1,
-                                field,
-                            }
-                        }
-                        _ => {
-                            return Err(ControlError::Syntax(format!(
-                                "CREATE INDEX FIELDS accepts KEY, METADATA 'name', or JSON 'path' at position {}",
-                                position + 1
-                            )))
-                        }
-                    };
+                    let (field, next) = parse_index_field_spec(&tokens, position, "CREATE INDEX FIELDS")?;
+                    position = next;
                     fields.push(field);
                     if position < tokens.len() {
                         expect_keyword(&tokens, position, ",")?;
@@ -4288,6 +4283,77 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 "CREATE supports DOMAIN, FEED, WRITER, READER, SUBSCRIPTION, PIPE, ROLE, and INDEX (SPACE is a compatibility alias)".to_owned(),
             )),
         },
+        Some("DEFINE") => {
+            // DEFINE STATESTORE <name> [FROM FEED <feed>]
+            //          [KEYS <name>[ UNIQUE][, <name>[ UNIQUE]]*]
+            expect_keyword(&tokens, 1, "STATESTORE")?;
+            let name = token(&tokens, 2)?.to_owned();
+            let mut source = StateStoreSourceRequest::Manual;
+            let mut named_keys = Vec::new();
+            let mut position = 3;
+            // FROM FEED and KEYS are both optional, in either present/absent
+            // combination — check the actual keyword rather than position.
+            if position < tokens.len() && keyword(position).as_deref() == Some("FROM") {
+                expect_keyword(&tokens, position + 1, "FEED")?;
+                source = StateStoreSourceRequest::Feed {
+                    feed: token(&tokens, position + 2)?.to_owned(),
+                };
+                position += 3;
+            }
+            if position < tokens.len() {
+                expect_keyword(&tokens, position, "KEYS")?;
+                position += 1;
+                while position < tokens.len() {
+                    let key_name = token(&tokens, position)?.to_owned();
+                    position += 1;
+                    // `name = <extractor>` declares the source-Feed
+                    // projection; `name` alone keeps the manual-store
+                    // form where mutations carry the typed values.
+                    let mut extractor = None;
+                    if position < tokens.len() && keyword(position).as_deref() == Some("=") {
+                        let (spec, next) = parse_index_field_spec(
+                            &tokens,
+                            position + 1,
+                            "DEFINE STATESTORE KEYS",
+                        )?;
+                        extractor = Some(spec);
+                        position = next;
+                    }
+                    let mut unique = false;
+                    if position < tokens.len()
+                        && keyword(position).as_deref() == Some("UNIQUE")
+                    {
+                        unique = true;
+                        position += 1;
+                    }
+                    named_keys.push(NamedStateStoreKey {
+                        name: key_name,
+                        unique,
+                        extractor,
+                    });
+                    if position < tokens.len() {
+                        expect_keyword(&tokens, position, ",")?;
+                        position += 1;
+                    }
+                }
+            }
+            if named_keys.is_empty() {
+                // An empty trailing KEYS clause is a parse error; absence is fine.
+                if tokens
+                    .iter()
+                    .any(|token| token.eq_ignore_ascii_case("KEYS"))
+                {
+                    return Err(ControlError::Syntax(
+                        "DEFINE STATESTORE KEYS requires at least one key name".to_owned(),
+                    ));
+                }
+            }
+            Ok(Command::DefineStateStore {
+                name,
+                source,
+                named_keys,
+            })
+        }
         Some("OPEN") => {
             expect_keyword(&tokens, 1, "WRITER")?;
             expect_keyword(&tokens, 2, "SESSION")?;
@@ -4635,6 +4701,7 @@ fn parse_show_kind(token: &str) -> Result<ShowKind, ControlError> {
         "SUBSCRIPTIONS" => Ok(ShowKind::Subscriptions),
         "PIPES" => Ok(ShowKind::Pipes),
         "INDEXES" => Ok(ShowKind::Indexes),
+        "STATESTORES" => Ok(ShowKind::StateStores),
         "ROLES" => Ok(ShowKind::Roles),
         "GRANTS" => Ok(ShowKind::Grants),
         _ => Err(ControlError::Syntax(format!(
@@ -4646,6 +4713,39 @@ fn parse_show_kind(token: &str) -> Result<ShowKind, ControlError> {
 /// One WCL literal inside a `GET INDEX` predicate: bare integers are
 /// `I64`, `TRUE`/`FALSE`/`NULL` map to their typed values, `B64 'data'`
 /// decodes base64 `Bytes`, and any other token is `Text`.
+/// One `IndexFieldSpec` at `position` — `KEY`, `METADATA 'name'`, or
+/// `JSON 'path'` — shared by `CREATE INDEX FIELDS` and
+/// `DEFINE STATESTORE ... KEYS name = <spec>` projections. Returns the
+/// spec and the next token position.
+fn parse_index_field_spec(
+    tokens: &[String],
+    position: usize,
+    clause: &str,
+) -> Result<(IndexFieldSpec, usize), ControlError> {
+    let keyword = |index: usize| tokens.get(index).map(|token| token.to_ascii_uppercase());
+    match keyword(position).as_deref() {
+        Some("KEY") => Ok((IndexFieldSpec::Key, position + 1)),
+        Some("METADATA") => Ok((
+            IndexFieldSpec::Metadata {
+                name: token(tokens, position + 1)?.to_owned(),
+            },
+            position + 2,
+        )),
+        Some("JSON") => Ok((
+            IndexFieldSpec::Projection {
+                extractor: "json".to_owned(),
+                version: 1,
+                field: token(tokens, position + 1)?.to_owned(),
+            },
+            position + 2,
+        )),
+        _ => Err(ControlError::Syntax(format!(
+            "{clause} accepts KEY, METADATA 'name', or JSON 'path' at position {}",
+            position + 1
+        ))),
+    }
+}
+
 fn parse_index_literal(
     tokens: &[String],
     position: usize,
@@ -5301,6 +5401,11 @@ fn show_resources(
             .filter(|item| item.status == ResourceStatus::Active)
             .collect::<Vec<_>>()),
         ShowKind::Indexes => json!(state.indexes.values().collect::<Vec<_>>()),
+        ShowKind::StateStores => json!(state
+            .state_stores
+            .values()
+            .filter(|item| item.stage != StateStoreStage::Dropped)
+            .collect::<Vec<_>>()),
         ShowKind::Roles => json!(state
             .roles
             .values()
@@ -5703,6 +5808,7 @@ fn show_name(kind: &ShowKind) -> &'static str {
         ShowKind::Subscriptions => "Subscriptions",
         ShowKind::Pipes => "Pipes",
         ShowKind::Indexes => "Indexes",
+        ShowKind::StateStores => "StateStores",
         ShowKind::Roles => "Roles",
         ShowKind::Grants => "Grants",
         ShowKind::StorageNodes => "Storage Nodes",
@@ -6383,10 +6489,12 @@ mod tests {
             NamedStateStoreKey {
                 name: "passport".to_owned(),
                 unique: true,
+                extractor: None,
             },
             NamedStateStoreKey {
                 name: "department".to_owned(),
                 unique: false,
+                extractor: None,
             },
         ];
         leader
@@ -6422,10 +6530,12 @@ mod tests {
                     NamedStateStoreKey {
                         name: "same".to_owned(),
                         unique: false,
+                        extractor: None,
                     },
                     NamedStateStoreKey {
                         name: "same".to_owned(),
                         unique: true,
+                        extractor: None,
                     },
                 ],
             }])
@@ -6440,6 +6550,7 @@ mod tests {
                     .map(|i| NamedStateStoreKey {
                         name: format!("key_{i}"),
                         unique: false,
+                        extractor: None,
                     })
                     .collect(),
             }])
@@ -6453,6 +6564,7 @@ mod tests {
                 named_keys: vec![NamedStateStoreKey {
                     name: "Not-A-Key".to_owned(),
                     unique: false,
+                    extractor: None,
                 }],
             }])
             .await
@@ -6468,6 +6580,108 @@ mod tests {
                 .named_keys,
             named_keys
         );
+    }
+
+    #[tokio::test]
+    async fn wcl_define_statestore_parses_source_and_named_keys() {
+        let directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader
+            .execute("CREATE SPACE accounts; CREATE FEED accounts.events;")
+            .await
+            .unwrap();
+        // Manual store with named keys, declared through one WCL statement.
+        leader
+            .execute("DEFINE STATESTORE accounts.profiles KEYS department, passport UNIQUE;")
+            .await
+            .unwrap();
+        let store = leader
+            .declared_state_store_by_name("accounts.profiles")
+            .await
+            .unwrap();
+        assert_eq!(store.source, StateStoreSource::Manual);
+        assert_eq!(
+            store.named_keys,
+            vec![
+                NamedStateStoreKey {
+                    name: "department".to_owned(),
+                    unique: false,
+                    extractor: None,
+                },
+                NamedStateStoreKey {
+                    name: "passport".to_owned(),
+                    unique: true,
+                    extractor: None,
+                },
+            ]
+        );
+        // Feed source without keys works; bare KEYS on it is refused —
+        // feed-sourced named keys must declare a projection extractor.
+        leader
+            .execute("DEFINE STATESTORE accounts.tail FROM FEED accounts.events;")
+            .await
+            .unwrap();
+        assert_eq!(
+            leader
+                .declared_state_store_by_name("accounts.tail")
+                .await
+                .unwrap()
+                .source,
+            StateStoreSource::Feed {
+                feed_id: leader
+                    .active_feed_by_name("accounts.events")
+                    .await
+                    .map(|feed| feed.feed_id)
+                    .unwrap_or_default()
+            }
+        );
+        assert!(leader
+            .execute("DEFINE STATESTORE accounts.tail2 FROM FEED accounts.events KEYS dept;")
+            .await
+            .is_err());
+        // `<name> = <extractor>` declares the projection replay applies.
+        leader
+            .execute(
+                "DEFINE STATESTORE accounts.tagged FROM FEED accounts.events                  KEYS email = JSON 'mail', pp = METADATA 'id' UNIQUE;",
+            )
+            .await
+            .unwrap();
+        let tagged = leader
+            .declared_state_store_by_name("accounts.tagged")
+            .await
+            .unwrap();
+        assert_eq!(
+            tagged.named_keys,
+            vec![
+                NamedStateStoreKey {
+                    name: "email".to_owned(),
+                    unique: false,
+                    extractor: Some(IndexFieldSpec::Projection {
+                        extractor: "json".to_owned(),
+                        version: 1,
+                        field: "mail".to_owned(),
+                    }),
+                },
+                NamedStateStoreKey {
+                    name: "pp".to_owned(),
+                    unique: true,
+                    extractor: Some(IndexFieldSpec::Metadata {
+                        name: "id".to_owned(),
+                    }),
+                },
+            ]
+        );
+        // Extractors on manual stores are refused — mutations carry the
+        // typed values themselves.
+        assert!(leader
+            .execute("DEFINE STATESTORE accounts.wrong KEYS dept = JSON 'x';")
+            .await
+            .is_err());
+        // Malformed spellings are syntax errors, not silent manual stores.
+        assert!(leader
+            .execute("DEFINE STATESTORE accounts.keys_only KEYS;")
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -6497,6 +6711,14 @@ mod tests {
             .execute("RENAME STATESTORE accounts.profiles TO accounts.directory;")
             .await
             .unwrap();
+        let shown = leader.execute("SHOW STATESTORES;").await.unwrap();
+        assert_eq!(shown.results.len(), 1);
+        let stores = shown.results[0]
+            .data
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(stores.len(), 1, "SHOW STATESTORES lists the live store");
         assert!(leader
             .declared_state_store_by_name("accounts.profiles")
             .await
@@ -6550,6 +6772,21 @@ mod tests {
             .execute("DROP STATESTORE accounts.directory;")
             .await
             .is_err());
+        // Dropped stores are excluded from SHOW, like other resources.
+        let shown = leader.execute("SHOW STATESTORES;").await.unwrap();
+        let stores = shown.results[0]
+            .data
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            stores
+                .iter()
+                .filter(|v| v["name"] == "accounts.other")
+                .count(),
+            1,
+            "only accounts.other remains"
+        );
 
         // The tombstone survives restart through the catalog snapshot.
         drop(leader);

@@ -183,7 +183,21 @@ The typed Admin API can commit an idempotent Domain-scoped StateStore declaratio
 
 The response reports `stage: "declared"` and an immutable `store_id`. The catalog rejects unknown source Feeds and Feeds outside the StateStore's Domain. Retry a timed-out declaration with the same request ID.
 
-`named_keys` declares up to 10 secondary lookup keys on a **manual** StateStore (a declared source-Feed projection for named keys is future work — feed-sourced stores must omit them for now). Key names are lowercase identifiers; `unique` claims enforce one primary row per value. Non-unique named keys map one value to many primary keys (a group/list lookup). Unique claims arbitrate by journal order — first-committed-wins: a conflicting `put_row` journals and applies as a deterministic no-op on every replica rather than poisoning replication.
+`named_keys` declares up to 10 secondary lookup keys. Key names are lowercase identifiers; `unique` claims enforce one primary row per value. Non-unique named keys map one value to many primary keys (a group/list lookup). Unique claims arbitrate by journal order — first-committed-wins: a conflicting `put_row` journals and applies as a deterministic no-op on every replica rather than poisoning replication.
+
+Named-key population differs by source. **Manual** stores carry each key's typed values on the `put_row` mutation (below). **Feed-sourced** stores declare one `extractor` per named key — the same `IndexFieldSpec` spelling `CREATE INDEX FIELDS` uses — and replay projects values from every committed source record:
+
+```json
+{ "command": "define_state_store", "name": "accounts.tagged",
+  "source": { "kind": "feed", "feed": "accounts.events" },
+  "named_keys": [
+    { "name": "passport", "unique": true,
+      "extractor": { "kind": "metadata", "name": "pp" } },
+    { "name": "department", "unique": false,
+      "extractor": { "kind": "projection", "extractor": "json", "version": 1, "field": "dept" } } ] }
+```
+
+Extractor kinds: `{ "kind": "key" }` reads the record's application Key; `{ "kind": "metadata", "name": ... }` a Metadata entry; `{ "kind": "projection", "extractor": "json", "version": 1, "field": "dotted.path" }` a JSON-path over the payload. Missing fields and unparseable payloads project `Null` postings rather than stalling replay. Declarations are checked at define time: feed-sourced named keys without an extractor are refused, as are extractors on a manual store.
 
 A declared store already has a working RF3 write path:
 

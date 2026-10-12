@@ -492,6 +492,8 @@ SHOW GRANTS;
 
 SHOW INDEXES;
 
+SHOW STATESTORES;
+
 ```
 
 
@@ -611,6 +613,50 @@ result.
 `{"building":{"generation":N}}`, or `{"active":{"generation":N}}`) and
 `applied_cursor`. `RENAME INDEX` and `DROP INDEX` work on declared
 definitions.
+
+## Declare a StateStore
+
+StateStores are declared via WCL `DEFINE STATESTORE` or the typed
+command surface (`POST /v1/admin/commands` with `define_state_store`),
+then inspected via `SHOW STATESTORES;` and `DESCRIBE STATESTORE <name>;`.
+WCL form:
+
+```sql
+DEFINE STATESTORE accounts.employees;
+DEFINE STATESTORE accounts.employees KEYS department, passport UNIQUE;
+DEFINE STATESTORE accounts.tagged FROM FEED accounts.events
+    KEYS passport = METADATA 'pp' UNIQUE, department = JSON 'dept';
+```
+
+`KEYS` lists up to 10 named secondary lookup keys; `UNIQUE` enforces
+one primary row per value (first-committed-wins by journal order),
+while non-unique keys map one value to many primaries. On a `FROM FEED`
+store every named key needs an `= <extractor>` projection telling replay
+how to derive its typed values — `KEY` (the record's Key), `METADATA
+'name'`, or `JSON 'dotted.path'`, the same extractor spellings `CREATE
+INDEX FIELDS` accepts. Extractors on a manual store are refused: `put`
+mutations carry named values directly.
+
+```json
+{"command": "define_state_store", "name": "accounts.tagged",
+ "source": {"kind": "feed", "feed": "accounts.events"},
+ "named_keys": [
+   {"name": "passport", "unique": true,
+    "extractor": {"kind": "metadata", "name": "pp"}},
+   {"name": "department", "unique": false,
+    "extractor": {"kind": "projection", "extractor": "json",
+                  "version": 1, "field": "dept"}}]}
+```
+
+Declared stores commit through the Control Plane majority, persist in
+the replicated catalog, and carry an immutable `store_id`; the source
+Feed must live in the same Domain. Manual stores take journaled
+`put_row`/`delete_row`/`clear` mutations over
+`POST /v1/state-stores/*`; feed-sourced stores materialize committed
+history and refuse direct mutation. `DESCRIBE STATESTORE` reports
+`stage` (`declared` or `dropped`); `DROP STATESTORE` tombstones the
+definition so the name cannot be recreated, and `SHOW STATESTORES`
+excludes dropped definitions.
 
 ## Inspect Active Range placement
 

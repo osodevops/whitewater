@@ -10969,10 +10969,12 @@ mod tests {
                     crate::control::NamedStateStoreKey {
                         name: "passport".to_owned(),
                         unique: true,
+                        extractor: None,
                     },
                     crate::control::NamedStateStoreKey {
                         name: "department".to_owned(),
                         unique: false,
+                        extractor: None,
                     },
                 ],
             }])

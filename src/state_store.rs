@@ -2625,6 +2625,30 @@ impl StateStoreReplayDriver {
         let mut applied = 0_u64;
         let mut frontier = after;
         for record in records {
+            // Declared projections turn the committed source record into
+            // typed named-key values; extraction failures resolve to a Null
+            // posting (the same absent-value position a missing JSON field
+            // or Metadata entry takes) so one malformed record cannot wedge
+            // the replay frontier.
+            let named: Vec<NamedKeyValue> = store
+                .named_keys
+                .iter()
+                .map(|key| NamedKeyValue {
+                    name: key.name.clone(),
+                    unique: key.unique,
+                    values: key
+                        .extractor
+                        .as_ref()
+                        .map(|spec| {
+                            crate::index_build::extract_index_values(
+                                std::slice::from_ref(spec),
+                                &record,
+                            )
+                            .unwrap_or_else(|_| vec![crate::index::IndexValue::Null])
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect();
             let mutation = StateStoreMutation {
                 store_id: store.store_id,
                 mutation_id: replay_mutation_id(
@@ -2639,7 +2663,7 @@ impl StateStoreReplayDriver {
                 op: StateStoreMutationOp::PutRow {
                     key: record.key.clone(),
                     payload: record.payload.clone(),
-                    named: Vec::new(),
+                    named,
                 },
                 issued_at_ns: unix_ns(),
                 source: Some(ReplaySource {
@@ -3299,6 +3323,86 @@ mod tests {
         assert_eq!(second.applied, 0);
         assert!(second.complete);
         assert_eq!(second.frontier.as_deref(), Some("cursor-3"));
+    }
+
+    #[tokio::test]
+    async fn replay_projects_named_key_values_from_source_records() {
+        let fixture = replay_fixture().await;
+        fixture
+            .control
+            .execute_commands(vec![crate::control::Command::DefineStateStore {
+                name: "orders.tagged".to_owned(),
+                source: crate::control::StateStoreSourceRequest::Feed {
+                    feed: "orders.events".to_owned(),
+                },
+                named_keys: vec![
+                    crate::control::NamedStateStoreKey {
+                        name: "passport".to_owned(),
+                        unique: true,
+                        extractor: Some(crate::control::IndexFieldSpec::Metadata {
+                            name: "pp".to_owned(),
+                        }),
+                    },
+                    crate::control::NamedStateStoreKey {
+                        name: "department".to_owned(),
+                        unique: false,
+                        extractor: Some(crate::control::IndexFieldSpec::Projection {
+                            extractor: "json".to_owned(),
+                            version: 1,
+                            field: "dept".to_owned(),
+                        }),
+                    },
+                ],
+            }])
+            .await
+            .unwrap();
+        let store = fixture
+            .control
+            .declared_state_store_by_name("orders.tagged")
+            .await
+            .unwrap();
+
+        let mut first = replay_record(1, "user-1");
+        first.metadata.insert("pp".to_owned(), b"P111".to_vec());
+        first.payload = br#"{"dept":"eng","extra":1}"#.to_vec();
+        // Missing metadata + a non-JSON payload project Null postings
+        // rather than wedging replay at the frontier.
+        let second = replay_record(2, "user-2");
+        let driver = fixture.driver(Arc::new(StubFeedSource {
+            feed_id: fixture.feed_id,
+            exists: true,
+            records: vec![first, second],
+        }));
+
+        let outcome = driver.pass(&store, None, 8).await.unwrap();
+        assert_eq!(outcome.applied, 2);
+
+        let entries = fixture.journals[0]
+            .entries_after(store.store_id, 0, 8, 1 << 20)
+            .unwrap();
+        assert_eq!(entries.len(), 2);
+        let StateStoreMutationOp::PutRow { named, .. } = &entries[0].mutation.op else {
+            panic!("replay writes put_row mutations")
+        };
+        assert!(named.iter().any(|value| {
+            value.name == "passport"
+                && value.unique
+                && value.values == vec![crate::index::IndexValue::Bytes(b"P111".to_vec())]
+        }));
+        assert!(named.iter().any(|value| {
+            value.name == "department"
+                && value.values == vec![crate::index::IndexValue::Text("eng".to_owned())]
+        }));
+        let StateStoreMutationOp::PutRow {
+            named: second_named,
+            ..
+        } = &entries[1].mutation.op
+        else {
+            panic!("replay writes put_row mutations")
+        };
+        assert!(second_named
+            .iter()
+            .all(|value| { value.values == vec![crate::index::IndexValue::Null] }));
     }
 
     #[tokio::test]
@@ -4106,6 +4210,7 @@ mod tests {
                 named_keys: vec![crate::control::NamedStateStoreKey {
                     name: "department".to_owned(),
                     unique: false,
+                    extractor: None,
                 }],
             }])
             .await
