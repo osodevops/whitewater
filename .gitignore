@@ -11,3 +11,4 @@ Thumbs.db
 /.cargo-home/
 /.cargo-cache/
 /.cargo-target/
+.tmp_*.py
