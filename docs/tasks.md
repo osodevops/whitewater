@@ -1543,13 +1543,13 @@ Definition of Done:
 
 
 
-- [ ] Membership change does not globally pause processing.
+- [x] Membership change does not globally pause processing. `scripts/test-m7-subscription-member.py` stops each voter in turn while member joins, lease claims, fetches, acknowledgements, and member-state reads keep succeeding on survivors (join calls ride out re-election 503s); `test-m19-owner-recovery.py`, `test-m4-owner-movement.py`, and `test-m4-storage-drain.py` keep appends/reads flowing while range/progress ownership moves, and `test-enrich-pipe.py`/`test-window-pipe.py` keep Pipes driving across drained progress-owner moves and hard owner restarts.
 
-- [ ] Stale Reader cannot acknowledge after lease transfer.
+- [x] Stale Reader cannot acknowledge after lease transfer. `scripts/test-m7-subscription-member.py` transfers a claimed work grant between members live: the source holder's fetch and ack under its stale lease epoch both refuse 409, the transfer target re-delivers the same unacknowledged page and commits it, and the released transferred lease cannot fetch again. `subscription_lease_transfer_moves_work_incrementally_and_fences_the_source` covers the journal-level fencing.
 
-- [ ] Input progress and Whitewater output effects commit together.
+- [x] Input progress and Whitewater output effects commit together. Every Pipe drive commits a single `Declare` effect mutation carrying the consumed Subscription frontier evidence plus the declared output records/mutations (Feed appends, StateStore AccumulateRows/DeleteRow, quarantine routing) before the `Applied` transition; `tests/pipe_driver.rs` proves declare-apply-frontier ordering, identical output identity on mid-apply replay, and frontier-moved fencing, while `test-enrich-pipe.py` and `test-window-pipe.py` observe no partial or duplicated effects across reposts, owner moves, and restarts. The apply phase lands outputs, frontier move, and the `Applied` marker sequentially against separate stores - a crash between them is repaired by deterministic replay under the committed `Declare`, not by a cross-store transaction.
 
-- [ ] Enrichment and rolling windows never require a user-defined partition count, co-partition plan, window slide/pane configuration, topology callback, or application-maintained Fjall/changelog copy.
+- [x] Enrichment and rolling windows never require a user-defined partition count, co-partition plan, window slide/pane configuration, topology callback, or application-maintained Fjall/changelog copy. The WCL grammar accepts none of these terms (`ENRICH STATESTORE <s> BY <spec>` / `WINDOW <dur> [EVENT|INGEST] [MAX_LATE <dur>] [EXPIRE <dur>] BY <spec> <agg>`), and `test-enrich-pipe.py`/`test-window-pipe.py` run the full lifecycles on a three-Node Riverbed declaring only Domain, Feeds, StateStores, Subscriptions, Writers, and Pipes.
 
 
 

@@ -37,9 +37,12 @@ def get(endpoint, path):
 
 def wait_ready():
     for _ in range(60):
-        status, _ = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": "SHOW DOMAINS;"})
-        if status == 200:
-            return
+        try:
+            status, _ = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": "SHOW DOMAINS;"})
+            if status == 200:
+                return
+        except (ConnectionError, urllib.error.URLError, TimeoutError):
+            pass
         time.sleep(1)
     raise AssertionError("verification Riverbed did not answer WCL")
 
@@ -62,8 +65,13 @@ def member_ready(endpoint, path, body):
     raise AssertionError(f"member call still failing after re-election window: {response}")
 
 
+def phase(name):
+    print(f"[m7] {name}", file=sys.stderr, flush=True)
+
+
 def main():
     wait_ready()
+    phase("fixture ready")
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:6]}"
     domain, feed, writer = f"m7{suffix}", f"m7{suffix}.events", f"writer{suffix}"
     subscription = f"{domain}.billing"
@@ -112,21 +120,44 @@ def main():
     status, acked = post(ENDPOINTS[2], f"{members}/ack", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work, "lease_epoch": lease_epoch, "cursor": page["cursor"], "positions": page["positions"]})
     if status != 200: raise AssertionError(acked)
 
-    # The next fetch continues from the acknowledged frontier.
-    status, reclaimed = post(ENDPOINTS[0], f"{members}/claim", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work})
-    if status != 200: raise AssertionError(reclaimed)
-    status, rest = post(ENDPOINTS[1], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work, "lease_epoch": reclaimed["lease"]["lease_epoch"]})
-    if status != 200 or len(rest["records"]) != 2: raise AssertionError(rest)
-    status, acked = post(ENDPOINTS[0], f"{members}/ack", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work, "lease_epoch": reclaimed["lease"]["lease_epoch"], "cursor": rest["cursor"], "positions": rest["positions"]})
+    phase("join/claim/fetch/ack verified")
+
+    # A lease transfer hands claimed work to another member and fences the
+    # source holder for both fetch and acknowledge. The remaining two
+    # records are delivered under the source lease, then acknowledged only
+    # by the transfer target.
+    member_b = str(uuid.uuid4())
+    status, joined_b = post(ENDPOINTS[1], f"{members}/join", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member_b})
+    if status != 200 or joined_b["member_epoch"] != 1: raise AssertionError(joined_b)
+    work_b = str(uuid.uuid4())
+    status, claimed_b = post(ENDPOINTS[0], f"{members}/claim", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work_b, "lease_ticks": 60})
+    if status != 200 or not claimed_b["lease"]: raise AssertionError(claimed_b)
+    lease_b = claimed_b["lease"]["lease_epoch"]
+    status, page_b = post(ENDPOINTS[2], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work_b, "lease_epoch": lease_b})
+    if status != 200 or len(page_b["records"]) != 2: raise AssertionError(page_b)
+    status, moved = post(ENDPOINTS[1], f"{members}/transfer", {"subscription": subscription, "request_id": str(uuid.uuid4()), "work_id": work_b, "member_id": member, "lease_epoch": lease_b, "to_member_id": member_b, "to_member_epoch": joined_b["member_epoch"], "lease_ticks": 60})
+    if status != 200 or not moved["lease"]: raise AssertionError(moved)
+    # The fenced holder can neither fetch nor acknowledge with the stale lease.
+    status, refused = post(ENDPOINTS[0], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work_b, "lease_epoch": lease_b})
+    if status != 409: raise AssertionError(refused)
+    status, refused = post(ENDPOINTS[1], f"{members}/ack", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work_b, "lease_epoch": lease_b, "cursor": page_b["cursor"], "positions": page_b["positions"]})
+    if status != 409: raise AssertionError(refused)
+    # The new holder re-delivers and acknowledges the same unacked page; the
+    # released transferred lease cannot fetch again.
+    new_lease_b = moved["lease"]["lease_epoch"]
+    status, redelivered = post(ENDPOINTS[2], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member_b, "member_epoch": joined_b["member_epoch"], "work_id": work_b, "lease_epoch": new_lease_b})
+    if status != 200 or len(redelivered["records"]) != 2: raise AssertionError(redelivered)
+    status, acked = post(ENDPOINTS[0], f"{members}/ack", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member_b, "member_epoch": joined_b["member_epoch"], "work_id": work_b, "lease_epoch": new_lease_b, "cursor": redelivered["cursor"], "positions": redelivered["positions"]})
     if status != 200: raise AssertionError(acked)
-    # A released lease cannot fetch again.
-    status, released = post(ENDPOINTS[2], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work, "lease_epoch": reclaimed["lease"]["lease_epoch"]})
+    status, released = post(ENDPOINTS[2], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member_b, "member_epoch": joined_b["member_epoch"], "work_id": work_b, "lease_epoch": new_lease_b})
     if status != 409: raise AssertionError(released)
     # A fresh claim reaches the acknowledged end of the Feed.
     status, tailclaim = post(ENDPOINTS[0], f"{members}/claim", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": str(uuid.uuid4())})
     if status != 200: raise AssertionError(tailclaim)
     status, tail = post(ENDPOINTS[2], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": tailclaim["lease"]["work_id"], "lease_epoch": tailclaim["lease"]["lease_epoch"]})
     if status != 200 or tail["records"]: raise AssertionError(tail)
+
+    phase("lease transfer fencing verified")
 
     # A `now` Subscription pins the committed tail at first join: earlier
     # records are skipped and only post-join appends are delivered.
@@ -155,6 +186,7 @@ def main():
     recovered = False
     for index in range(3):
         service = f"node{index + 1}"
+        phase(f"stopping {service}")
         subprocess.run(["docker", "compose", "stop", service], check=True)
         survivor = ENDPOINTS[(index + 1) % 3]
         try:
@@ -169,6 +201,7 @@ def main():
             if after["ownership_epoch"] > epoch:
                 epoch, recovered = after["ownership_epoch"], True
         finally:
+            phase(f"starting {service}")
             subprocess.run(["docker", "compose", "start", service], check=True)
             for _ in range(60):
                 try:
@@ -179,8 +212,11 @@ def main():
             else: raise AssertionError(f"{service} did not come back after restart")
     if not recovered: raise AssertionError("member mutations never recovered a lost progress owner")
 
-    print(json.dumps({"status": "ok", "subscription": subscription, "member_epoch": 2, "first_page": 3, "resumed_page": 2, "final_fetch": len(tail["records"])}, indent=2))
+    print(json.dumps({"status": "ok", "subscription": subscription, "member_epoch": 2, "first_page": 3, "transferred_page": len(redelivered["records"]), "final_fetch": len(tail["records"])}, indent=2))
 
 if __name__ == "__main__":
     try: main()
-    except Exception as error: print(f"M7 Subscription member acceptance failed: {error}", file=sys.stderr); sys.exit(1)
+    except Exception as error:
+        import traceback
+        traceback.print_exc()
+        print(f"M7 Subscription member acceptance failed: {error}", file=sys.stderr); sys.exit(1)
