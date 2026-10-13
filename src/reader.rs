@@ -2007,8 +2007,9 @@ impl HttpSubscriptionProgressTransport {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.bytes().await.unwrap_or_default();
-            tracing::warn!(node = %node, path, %status, "Subscription progress replica refused");
-            return Err(refusal_error(status, &body));
+            let error = refusal_error(status, &body);
+            tracing::warn!(node = %node, path, %status, code = error.code(), "Subscription progress replica refused");
+            return Err(error);
         }
         let mut bytes = Vec::new();
         while let Some(chunk) = response
@@ -2402,16 +2403,48 @@ impl SubscriptionProgressCoordinator {
             return Err(SubscriptionProgressError::InvalidAssignment);
         }
         let digest = *blake3::hash(&serde_json::to_vec(&mutation)?).as_bytes();
-        let mut prepared = Vec::with_capacity(3);
+        let owner = &self.assignment.owner;
+        let owner_reply = match self.transport.prepare(owner, mutation.clone()).await {
+            Ok(reply) => reply,
+            Err(SubscriptionProgressError::Unavailable) => {
+                // An unreachable owner cannot arbitrate this request. Read the
+                // committed trail so a stale assignment still surfaces the
+                // fencing signal (e.g. a newer epoch) instead of a bare
+                // quorum shortage.
+                return Err(match self.read_committed().await {
+                    Err(error) => error,
+                    Ok(_) => SubscriptionProgressError::NoQuorum,
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        if owner_reply.replica != *owner
+            || owner_reply.subscription_id != self.assignment.subscription_id
+            || owner_reply.ownership_epoch != self.assignment.ownership_epoch
+        {
+            return Err(SubscriptionProgressError::InvalidAssignment);
+        }
+        if owner_reply.result.subscription_id != mutation.subscription_id
+            || owner_reply.result.request_id != mutation.request_id
+            || owner_reply.result.digest != digest
+        {
+            return Err(SubscriptionProgressError::Conflict);
+        }
+        let mut prepared = vec![(owner.clone(), digest)];
         let mut first_refusal: Option<SubscriptionProgressError> = None;
+        let followers: Vec<_> = self
+            .assignment
+            .replicas
+            .iter()
+            .filter(|node| *node != owner)
+            .collect();
         let replies = futures_util::future::join_all(
-            self.assignment
-                .replicas
+            followers
                 .iter()
                 .map(|node| self.transport.prepare(node, mutation.clone())),
         )
         .await;
-        for (node, reply) in self.assignment.replicas.iter().zip(replies) {
+        for (node, reply) in followers.into_iter().zip(replies) {
             match reply {
                 Ok(reply) => {
                     if reply.replica != *node

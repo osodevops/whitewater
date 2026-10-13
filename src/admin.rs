@@ -367,6 +367,7 @@ impl AdminClient {
             admin: self.clone(),
             writer: writer.into(),
             session_epoch,
+            use_compression: false,
         }
     }
 
@@ -556,9 +557,15 @@ pub struct WriterSessionClient {
     admin: AdminClient,
     writer: String,
     session_epoch: u64,
+    use_compression: bool,
 }
 
 impl WriterSessionClient {
+    pub fn use_compression(mut self, enabled: bool) -> Self {
+        self.use_compression = enabled;
+        self
+    }
+
     pub async fn append(
         &self,
         request_id: Uuid,
@@ -572,6 +579,7 @@ impl WriterSessionClient {
                 request_id,
                 writer: self.writer.clone(),
                 session_epoch: self.session_epoch,
+                use_compression: self.use_compression,
                 event_time_ns: event_time_ns.map(|value| value.to_string()),
                 key_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key),
                 payload_base64: base64::Engine::encode(
@@ -604,6 +612,7 @@ impl WriterSessionClient {
                 request_id: record.request_id,
                 writer: self.writer.clone(),
                 session_epoch: self.session_epoch,
+                use_compression: self.use_compression,
                 event_time_ns: record.event_time_ns.map(|value| value.to_string()),
                 key_base64: base64::Engine::encode(
                     &base64::engine::general_purpose::STANDARD,
@@ -638,6 +647,87 @@ mod tests {
 
     use super::*;
     use crate::control::PermissionAction;
+
+    #[test]
+    fn writer_compression_is_opt_in_and_configured_views_are_independent() {
+        let writer = AdminClient::new("http://localhost:7070", "test-key")
+            .writer_session("orders.writer", 7);
+        assert!(!writer.use_compression);
+        let compressed = writer.clone().use_compression(true);
+        assert!(compressed.use_compression);
+        assert!(!writer.use_compression);
+        let plain = compressed.clone().use_compression(false);
+        assert!(!plain.use_compression);
+        assert!(compressed.use_compression);
+        assert_eq!(plain.writer, writer.writer);
+        assert_eq!(plain.session_epoch, writer.session_epoch);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable three-Node Riverbed and WHITEWATER_ENDPOINTS"]
+    async fn optional_compression_conforms_against_live_nodes() {
+        let endpoints = std::env::var("WHITEWATER_ENDPOINTS").unwrap();
+        let endpoints: Vec<_> = endpoints.split(',').collect();
+        assert_eq!(endpoints.len(), 3);
+        let key = std::env::var("WHITEWATER_API_KEY")
+            .unwrap_or_else(|_| "whitewater-local-development-admin-key".to_owned());
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../sdk/spec/conformance/optional-compression.json"
+        ))
+        .unwrap();
+        let suffix = Uuid::new_v4().simple().to_string();
+        let script = corpus["steps"][0]["args"]["script"]
+            .as_str()
+            .unwrap()
+            .replace("{{uniq}}", &suffix);
+        let feed = format!("sdk{suffix}.events");
+        let writer = format!("wr{suffix}");
+        let payload = corpus["steps"][2]["args"]["payload"]["utf8"]
+            .as_str()
+            .unwrap()
+            .as_bytes();
+        let clients: Vec<_> = endpoints
+            .iter()
+            .map(|endpoint| AdminClient::new(*endpoint, key.clone()))
+            .collect();
+        let setup = clients[0].execute_wcl(script).await.unwrap();
+        let epoch = setup.results[3].data["session_epoch"].as_u64().unwrap();
+        for (index, enabled) in [false, true, false, true].into_iter().enumerate() {
+            clients[index % 3]
+                .writer_session(&writer, epoch)
+                .use_compression(enabled)
+                .append(
+                    Uuid::new_v4(),
+                    Some(index as i64 + 1),
+                    b"meter",
+                    payload,
+                    &Default::default(),
+                )
+                .await
+                .unwrap();
+        }
+        let expected = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, payload);
+        for client in clients {
+            let records: serde_json::Value = client
+                .http
+                .get(format!("{}/v1/feeds/records", client.endpoint))
+                .bearer_auth(&client.api_key)
+                .query(&[("feed", &feed)])
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            let records = records.as_array().unwrap();
+            assert_eq!(records.len(), 4);
+            assert!(records
+                .iter()
+                .all(|record| record["payload_base64"] == expected));
+        }
+    }
 
     #[test]
     fn bearer_authentication_requires_the_configured_key() {

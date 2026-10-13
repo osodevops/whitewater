@@ -1,0 +1,54 @@
+{
+  "scenario": "optional-compression",
+  "requires": ["admin.wcl", "feed.append", "writer.append", "writer.append_batch", "feed.records"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {"script": "CREATE DOMAIN sdk{{uniq}}; CREATE FEED sdk{{uniq}}.events; CREATE WRITER wr{{uniq}} TO sdk{{uniq}}.events; OPEN WRITER SESSION wr{{uniq}};"},
+      "bind": "setup"
+    },
+    {
+      "op": "feed.append",
+      "args": {"request_id": "{{uuid:plain}}", "feed": "sdk{{uniq}}.events", "writer_session_id": "{{uuid:raw}}", "writer_epoch": 1, "sequence": 1, "key": {"utf8": "meter"}, "payload": {"utf8": "plain-before"}, "event_time_ns": "1700000000000000001"},
+      "expect": {"deduplicated": false}
+    },
+    {
+      "op": "writer.append",
+      "args": {
+        "request_id": "{{uuid:compressed}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "use_compression": true,
+        "key": {"utf8": "meter"}, "event_time_ns": "1700000000000000002",
+        "payload": {"utf8": "network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter-network-trace-device-meter"}
+      },
+      "bind": "compressed",
+      "expect": {"deduplicated": false, "cursor": "!=null"}
+    },
+    {
+      "op": "writer.append_batch",
+      "args": {"use_compression": true, "records": [
+        {"request_id": "{{uuid:batch1}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "meter"}, "payload": {"utf8": "batch-one"}, "event_time_ns": "1700000000000000003"},
+        {"request_id": "{{uuid:batch2}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "meter"}, "payload": {"utf8": "batch-two"}, "event_time_ns": "1700000000000000004"}
+      ]},
+      "expect": {"results": "len>=2"}
+    },
+    {
+      "op": "writer.append",
+      "args": {"request_id": "{{uuid:after}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "use_compression": false, "key": {"utf8": "meter"}, "payload": {"utf8": "plain-after"}, "event_time_ns": "1700000000000000005"},
+      "expect": {"deduplicated": false}
+    },
+    {
+      "op": "feed.append",
+      "args": {"request_id": "{{uuid:feedcompressed}}", "feed": "sdk{{uniq}}.events", "writer_session_id": "{{uuid:raw}}", "writer_epoch": 1, "sequence": 2, "use_compression": true, "key": {"utf8": "meter"}, "payload": {"utf8": "feed-compressed"}, "event_time_ns": "1700000000000000006"},
+      "expect": {"deduplicated": false}
+    },
+    {
+      "op": "feed.append",
+      "args": {"request_id": "{{uuid:feedafter}}", "feed": "sdk{{uniq}}.events", "writer_session_id": "{{uuid:raw}}", "writer_epoch": 1, "sequence": 3, "use_compression": false, "key": {"utf8": "meter"}, "payload": {"utf8": "feed-after"}, "event_time_ns": "1700000000000000007"},
+      "expect": {"deduplicated": false}
+    },
+    {
+      "op": "feed.records",
+      "args": {"feed": "sdk{{uniq}}.events", "limit": 20},
+      "expect": {"records": "len>=7", "records[0].payload_base64": "cGxhaW4tYmVmb3Jl", "records[1].message_id": "==compressed.message_id", "records[4].payload_base64": "cGxhaW4tYWZ0ZXI=", "records[6].payload_base64": "ZmVlZC1hZnRlcg=="}
+    }
+  ]
+}

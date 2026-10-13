@@ -36,6 +36,28 @@ is non-conformant even if every call succeeds.
 Names (Domain, Feed, Writer, Reader, Subscription) match
 `^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*)*$`, maximum 512 bytes.
 
+## Optional record compression
+
+Writer and ad-hoc Feed append requests accept `use_compression: true`. SDK Feed
+and Writer clients expose a fluent `useCompression()` / `UseCompression()` /
+`use_compression(true)` option (Go takes an explicit boolean). The option returns
+a configured client; retain that client to use the setting. Compression is off
+by default and can be disabled with `false` at any time, including on a Feed
+that already contains records. Batch Writers apply the option to each record.
+
+The Node uses fast pure-Rust LZ4 for stored and replicated record frames. Records
+below 1 KiB or whose compressed envelope is not smaller retain their original
+format. SDK HTTP bodies and application payload bytes are unchanged. This is a
+per-append preference, not a persisted Feed policy; it never rewrites history.
+Readers transparently decode mixed legacy, uncompressed and compressed frames.
+Checksums are verified before decoding and decompressed size is bounded by the
+existing 64 MiB record-body limit. Corrupt or unsupported frames fail closed.
+
+Upgrade all Nodes before opting in: compressed frames use the internal `FSR3`
+format and old binaries cannot read them. Switching the option off does not
+make already-compressed history readable by old Nodes, so downgrading after an
+opt-in write requires a separately verified migration rather than a toggle.
+
 ## Error envelope
 
 Failures return a non-2xx status with a JSON body:

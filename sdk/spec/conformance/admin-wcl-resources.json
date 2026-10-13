@@ -36,7 +36,8 @@
     "results[0].data.name": "sdk{{uniq}}.profiles",
     "results[1].data.name": "sdk{{uniq}}.profiles",
     "results[1].data.stage": "declared",
-    "results[2].statement": "SHOW STATESTORES"
+    "results[2].statement": "SHOW",
+    "results[2].data": "len>=1"
    }
   }
  ]

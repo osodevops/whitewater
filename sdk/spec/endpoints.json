@@ -109,7 +109,8 @@
         "event_time_ns": "i64ns?",
         "key_base64": "bytes",
         "payload_base64": "bytes",
-        "metadata_base64": "metadata"
+        "metadata_base64": "metadata",
+        "use_compression": "bool? (default false; Node-side storage/replication LZ4)"
       },
       "response": "WriterAppendResponse",
       "errors": [
@@ -258,7 +259,8 @@
         "payload_base64": "base64",
         "metadata_base64": {
           "name": "base64"
-        }
+        },
+        "use_compression": "bool? (default false; Node-side storage/replication LZ4)"
       },
       "response": "WriterAppendResponse",
       "errors": [

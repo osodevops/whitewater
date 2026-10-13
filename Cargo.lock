@@ -530,6 +530,7 @@ dependencies = [
  "fjall",
  "futures-util",
  "hyper-util",
+ "lz4_flex",
  "openraft",
  "rcgen",
  "reqwest",

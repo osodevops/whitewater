@@ -45,7 +45,7 @@ use crate::{
     },
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
-    codec::{decode_record, encode_record, MAX_FRAME_BYTES},
+    codec::{decode_record, MAX_FRAME_BYTES},
     config::SubscriptionMtlsConfig,
     control::{
         ControlController, ControlError, RangeMergePlan, RangeMovePlan, RangeMoveStage,
@@ -1311,6 +1311,24 @@ async fn member_coordinator_recovering(
         // frontier under the new epoch, which heals lagging replicas.
         return member_coordinator_recovered(state, &coordinator, definition).await;
     }
+    if evidence.iter().any(|(_, inspection)| {
+        [&inspection.committed, &inspection.prepared]
+            .into_iter()
+            .flatten()
+            .any(|mutation| mutation.ownership_epoch != assignment.ownership_epoch)
+    }) {
+        // A placement CAS landed while adoption missed at least one replica:
+        // its rows still carry an older epoch, so every committed read fences
+        // them as stale and quorum never forms. Re-adopt the recovered
+        // frontier at the live epoch; committing another ownership move here
+        // would only ratchet the epoch while the same rows stay behind.
+        let outcome = coordinator
+            .synchronize_placement()
+            .await
+            .map_err(subscription_progress_api_error)?;
+        let (coordinator, assignment) = member_assignment_coordinator(state, outcome.assignment)?;
+        return Ok((coordinator, assignment, definition));
+    }
     Ok((coordinator, assignment, definition))
 }
 
@@ -2274,7 +2292,7 @@ async fn fetch_frontier_page(
         if records.len() >= limit {
             break;
         }
-        let frame_bytes = frame.frame.len() + frame.cursor.len();
+        let frame_bytes = logical_frame_bytes(&frame.frame)?.saturating_add(frame.cursor.len());
         if bytes.saturating_add(frame_bytes) > MAX_LOGICAL_READ_BYTES {
             if records.is_empty() {
                 return Err(ApiError::unavailable(
@@ -5231,6 +5249,7 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
             key_base64: output.key_base64.clone(),
             payload_base64: output.payload_base64.clone(),
             metadata_base64: output.metadata_base64.clone(),
+            use_compression: false,
             pending_effect: Some(crate::active_range::PendingEffectRef {
                 effect_id,
                 subscription_id: self.subscription_id,
@@ -6074,6 +6093,8 @@ pub struct WriterSessionAppendRequest {
     pub payload_base64: String,
     #[serde(default)]
     pub metadata_base64: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub use_compression: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -6354,7 +6375,7 @@ async fn read_cutover_lineage(
                 .decode(&frame.frame_base64)
                 .map_err(|error| ApiError::unavailable(error.to_string()))?;
             bytes = bytes
-                .checked_add(decoded.len() + frame.cursor.len())
+                .checked_add(logical_frame_bytes(&decoded)?.saturating_add(frame.cursor.len()))
                 .ok_or_else(|| ApiError::unavailable("Reader transition size overflow"))?;
             if bytes > MAX_LOGICAL_READ_BYTES {
                 return Err(ApiError::unavailable(
@@ -8299,6 +8320,8 @@ struct ClientAppendRequest {
     payload_base64: String,
     #[serde(default)]
     metadata_base64: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    use_compression: bool,
     /// Effect-journal appends only: the frame joins the effect's pending
     /// tail (durable on the output quorum but invisible until the effect's
     /// terminal marker releases it). Public append paths refuse it.
@@ -8636,6 +8659,7 @@ async fn session_append_with_sequence(
             key_base64: request.key_base64.clone(),
             payload_base64: request.payload_base64.clone(),
             metadata_base64: request.metadata_base64.clone(),
+            use_compression: request.use_compression,
             pending_effect: None,
         }),
     )
@@ -9196,16 +9220,19 @@ async fn owner_append_local(
         .unwrap_or(ingest_time_ns);
     let message_id = deterministic_uuid(request.request_id, "message");
     let cursor = feed_cursor(feed.feed_id, request.request_id);
-    let frame = encode_record(&StoredRecord {
-        message_id,
-        producer_id: request.writer_session_id,
-        producer_sequence: request.sequence,
-        event_time_ns,
-        ingest_time_ns,
-        key,
-        payload,
-        metadata,
-    })
+    let frame = crate::codec::encode_record_with_compression(
+        &StoredRecord {
+            message_id,
+            producer_id: request.writer_session_id,
+            producer_sequence: request.sequence,
+            event_time_ns,
+            ingest_time_ns,
+            key,
+            payload,
+            metadata,
+        },
+        request.use_compression,
+    )
     .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let coordinator = state
         .majority_append
@@ -9331,6 +9358,11 @@ fn majority_api_error(error: MajorityAppendError) -> ApiError {
         message: error.to_string(),
         code: None,
     }
+}
+
+fn logical_frame_bytes(frame: &[u8]) -> Result<usize, ApiError> {
+    crate::codec::logical_frame_size(frame)
+        .map_err(|error| ApiError::unavailable(error.to_string()))
 }
 
 const MAX_LOGICAL_READ_BYTES: usize = MAX_COMMITTED_READ_BYTES;
@@ -9527,13 +9559,12 @@ async fn read_owned_range_page(
 
         code: None,
     })?;
-    if frames
-        .iter()
-        .any(|frame| frame.frame.len() > MAX_LOGICAL_READ_BYTES)
-    {
-        return Err(ApiError::unavailable(
-            "record exceeds the bounded Feed read byte budget",
-        ));
+    for frame in &frames {
+        if logical_frame_bytes(&frame.frame)? > MAX_LOGICAL_READ_BYTES {
+            return Err(ApiError::unavailable(
+                "record exceeds the bounded Feed read byte budget",
+            ));
+        }
     }
     Ok(Json(ReadRangePageResponse {
         committed,
@@ -9765,8 +9796,11 @@ async fn read_single_range(
                 .map_err(|_| {
                     ApiError::unavailable("current owner returned an invalid frame encoding")
                 })?;
-            bytes = bytes.saturating_add(decoded.len() + frame.cursor.len());
-            if decoded.len() > MAX_LOGICAL_READ_BYTES || bytes > MAX_LOGICAL_READ_BYTES {
+            bytes = bytes
+                .saturating_add(logical_frame_bytes(&decoded)?.saturating_add(frame.cursor.len()));
+            if logical_frame_bytes(&decoded)? > MAX_LOGICAL_READ_BYTES
+                || bytes > MAX_LOGICAL_READ_BYTES
+            {
                 return Err(ApiError::unavailable(
                     "Feed page exceeds the bounded read byte budget",
                 ));
@@ -9909,7 +9943,9 @@ async fn read_reader_frontier(
         let (committed, next) =
             reader_range_head(state, assignment, cursor.map(String::as_str), None, None).await?;
         if let Some((frame, _)) = &next {
-            bytes = bytes.saturating_add(frame.frame.len() + frame.cursor.len());
+            bytes = bytes.saturating_add(
+                logical_frame_bytes(&frame.frame)?.saturating_add(frame.cursor.len()),
+            );
             if bytes > MAX_LOGICAL_READ_BYTES {
                 return Err(ApiError::unavailable(
                     "Reader range heads exceed the bounded read byte budget",
@@ -9953,7 +9989,9 @@ async fn read_reader_frontier(
         )
         .await?;
         if let Some((frame, _)) = &next {
-            bytes = bytes.saturating_add(frame.frame.len() + frame.cursor.len());
+            bytes = bytes.saturating_add(
+                logical_frame_bytes(&frame.frame)?.saturating_add(frame.cursor.len()),
+            );
             if bytes > MAX_LOGICAL_READ_BYTES {
                 return Err(ApiError::unavailable(
                     "Reader page exceeds the bounded read byte budget",
@@ -10040,7 +10078,7 @@ impl RangeFrameStream<'_> {
                     .map_err(|_| {
                         ApiError::unavailable("current owner returned an invalid frame encoding")
                     })?;
-                if decoded.len() > MAX_LOGICAL_READ_BYTES {
+                if logical_frame_bytes(&decoded)? > MAX_LOGICAL_READ_BYTES {
                     return Err(ApiError::unavailable(
                         "record exceeds the bounded Feed read byte budget",
                     ));
@@ -10135,7 +10173,7 @@ async fn read_paginated_feed(
         if emitted.len() >= limit {
             break;
         }
-        let frame_bytes = frame.frame.len() + frame.cursor.len();
+        let frame_bytes = logical_frame_bytes(&frame.frame)?.saturating_add(frame.cursor.len());
         if bytes.saturating_add(frame_bytes) > MAX_LOGICAL_READ_BYTES {
             if emitted.is_empty() {
                 return Err(ApiError::unavailable(
@@ -10231,8 +10269,10 @@ async fn read_complete_feed(
                     .map_err(|_| {
                         ApiError::unavailable("current owner returned an invalid frame encoding")
                     })?;
-                bytes = bytes.saturating_add(decoded.len() + frame.cursor.len());
-                if decoded.len() > MAX_LOGICAL_READ_BYTES
+                bytes = bytes.saturating_add(
+                    logical_frame_bytes(&decoded)?.saturating_add(frame.cursor.len()),
+                );
+                if logical_frame_bytes(&decoded)? > MAX_LOGICAL_READ_BYTES
                     || bytes > MAX_LOGICAL_READ_BYTES
                     || merged.len() >= MAX_LOGICAL_READ_FRAMES
                 {
@@ -11104,6 +11144,42 @@ mod tests {
     }
 
     #[test]
+    fn writer_and_feed_compression_defaults_off_and_round_trips_opt_in() {
+        let writer_body = json!({
+            "request_id": Uuid::from_u128(1), "writer": "orders.writer", "session_epoch": 7,
+            "key_base64": "aw==", "payload_base64": "dg==", "metadata_base64": {}
+        });
+        let mut writer: WriterSessionAppendRequest = serde_json::from_value(writer_body).unwrap();
+        assert!(!writer.use_compression);
+        assert!(serde_json::to_value(&writer)
+            .unwrap()
+            .get("use_compression")
+            .is_none());
+        writer.use_compression = true;
+        let encoded = serde_json::to_value(&writer).unwrap();
+        assert_eq!(encoded["use_compression"], true);
+        assert!(
+            serde_json::from_value::<WriterSessionAppendRequest>(encoded)
+                .unwrap()
+                .use_compression
+        );
+        let mut feed_body = json!({
+            "request_id": Uuid::from_u128(1), "feed": "orders.events",
+            "writer_session_id": Uuid::from_u128(2), "writer_epoch": 1, "sequence": 1,
+            "key_base64": "aw==", "payload_base64": "dg==", "metadata_base64": {}
+        });
+        assert!(
+            !serde_json::from_value::<ClientAppendRequest>(feed_body.clone())
+                .unwrap()
+                .use_compression
+        );
+        feed_body["use_compression"] = json!(true);
+        let feed: ClientAppendRequest = serde_json::from_value(feed_body).unwrap();
+        assert!(feed.use_compression);
+        assert_eq!(serde_json::to_value(feed).unwrap()["use_compression"], true);
+    }
+
+    #[test]
     fn append_request_uses_metadata_and_accepts_the_prototype_header_alias() {
         let request: AppendRequest = serde_json::from_value(json!({
             "stream": "/orders/eu",
@@ -11370,7 +11446,7 @@ mod tests {
                 sequence: index,
             },
             cursor: format!("cursor-{index}"),
-            frame: encode_record(&StoredRecord {
+            frame: crate::codec::encode_record(&StoredRecord {
                 message_id: Uuid::from_u128(index as u128),
                 producer_id: Uuid::from_u128(1),
                 producer_sequence: index,

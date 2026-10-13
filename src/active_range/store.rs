@@ -1028,8 +1028,8 @@ fn read_committed_bounded(
         .take_while(|entry| entry.position.value() <= loaded.persisted.committed)
         .take(limit.clamp(1, 128))
     {
-        let size = usize::try_from(entry.frame_length)
-            .map_err(|_| ActiveRangeStoreError::ReadBudgetExceeded)?;
+        let frame = read_indexed_frame(&inner.directory, entry)?;
+        let size = crate::codec::logical_frame_size(&frame.frame)?;
         let next = bytes
             .checked_add(size)
             .ok_or(ActiveRangeStoreError::ReadBudgetExceeded)?;
@@ -1039,7 +1039,7 @@ fn read_committed_bounded(
             }
             break;
         }
-        frames.push(read_indexed_frame(&inner.directory, entry)?);
+        frames.push(frame);
         bytes = next;
     }
     Ok(frames)

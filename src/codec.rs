@@ -7,6 +7,8 @@ use crate::domain::StoredRecord;
 
 const MAGIC_V1: &[u8; 4] = b"FSR1";
 const MAGIC_V2: &[u8; 4] = b"FSR2";
+const MAGIC_LZ4: &[u8; 4] = b"FSR3";
+const MIN_COMPRESSION_BYTES: usize = 1024;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -27,9 +29,18 @@ pub enum CodecError {
     InvalidUuid,
     #[error("record metadata key is not UTF-8")]
     InvalidMetadataKey,
+    #[error("record frame compression is invalid")]
+    InvalidCompression,
 }
 
 pub fn encode_record(record: &StoredRecord) -> Result<Vec<u8>, CodecError> {
+    encode_record_with_compression(record, false)
+}
+
+pub fn encode_record_with_compression(
+    record: &StoredRecord,
+    use_compression: bool,
+) -> Result<Vec<u8>, CodecError> {
     let mut body = Vec::new();
     body.extend_from_slice(MAGIC_V2);
     body.extend_from_slice(record.message_id.as_bytes());
@@ -60,6 +71,16 @@ pub fn encode_record(record: &StoredRecord) -> Result<Vec<u8>, CodecError> {
     if body.len() > MAX_FRAME_BYTES {
         return Err(CodecError::FrameTooLarge);
     }
+    if use_compression && body.len() >= MIN_COMPRESSION_BYTES {
+        let compressed = lz4_flex::block::compress(&body);
+        if compressed.len() + 8 < body.len() {
+            let mut envelope = Vec::with_capacity(compressed.len() + 8);
+            envelope.extend_from_slice(MAGIC_LZ4);
+            put_u32(&mut envelope, body.len())?;
+            envelope.extend_from_slice(&compressed);
+            body = envelope;
+        }
+    }
     let mut frame = Vec::with_capacity(body.len() + 8);
     frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
     frame.extend_from_slice(&body);
@@ -67,7 +88,7 @@ pub fn encode_record(record: &StoredRecord) -> Result<Vec<u8>, CodecError> {
     Ok(frame)
 }
 
-pub fn decode_record(frame: &[u8]) -> Result<StoredRecord, CodecError> {
+fn checked_body(frame: &[u8]) -> Result<&[u8], CodecError> {
     if frame.len() < 8 {
         return Err(CodecError::Truncated);
     }
@@ -89,6 +110,45 @@ pub fn decode_record(frame: &[u8]) -> Result<StoredRecord, CodecError> {
     if crc32fast::hash(body) != checksum {
         return Err(CodecError::InvalidChecksum);
     }
+    Ok(body)
+}
+
+pub fn logical_frame_size(frame: &[u8]) -> Result<usize, CodecError> {
+    let body = checked_body(frame)?;
+    let size = if body.starts_with(MAGIC_LZ4) {
+        let mut envelope = Reader::new(body);
+        envelope.take(4)?;
+        envelope.u32()? as usize
+    } else {
+        body.len()
+    };
+    if size > MAX_FRAME_BYTES {
+        return Err(CodecError::FrameTooLarge);
+    }
+    size.checked_add(8).ok_or(CodecError::FrameTooLarge)
+}
+
+pub fn decode_record(frame: &[u8]) -> Result<StoredRecord, CodecError> {
+    let body = checked_body(frame)?;
+    if body.starts_with(MAGIC_LZ4) {
+        let mut envelope = Reader::new(body);
+        envelope.take(4)?;
+        let decoded_len = envelope.u32()? as usize;
+        if decoded_len > MAX_FRAME_BYTES {
+            return Err(CodecError::FrameTooLarge);
+        }
+        let mut decoded = vec![0; decoded_len];
+        let actual = lz4_flex::block::decompress_into(&body[8..], &mut decoded)
+            .map_err(|_| CodecError::InvalidCompression)?;
+        if actual != decoded_len || !decoded.starts_with(MAGIC_V2) {
+            return Err(CodecError::InvalidCompression);
+        }
+        return decode_body(&decoded);
+    }
+    decode_body(body)
+}
+
+fn decode_body(body: &[u8]) -> Result<StoredRecord, CodecError> {
     let mut reader = Reader::new(body);
     let magic = reader.take(4)?;
     if magic != MAGIC_V1 && magic != MAGIC_V2 {
@@ -197,6 +257,115 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_record(payload: Vec<u8>) -> StoredRecord {
+        StoredRecord {
+            message_id: Uuid::from_u128(1),
+            producer_id: Uuid::from_u128(2),
+            producer_sequence: 9,
+            event_time_ns: i64::MIN,
+            ingest_time_ns: i64::MAX,
+            key: b"customer-7".to_vec(),
+            payload,
+            metadata: BTreeMap::from([("source".to_owned(), vec![0, 255, 1])]),
+        }
+    }
+
+    fn frame_with_body(body: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(body);
+        frame.extend_from_slice(&crc32fast::hash(body).to_be_bytes());
+        frame
+    }
+
+    #[test]
+    fn compression_is_opt_in_and_preserves_record_bytes() {
+        let record = sample_record(b"{\"device\":\"meter\",\"bytesUp\":12345}".repeat(1000));
+        let plain = encode_record(&record).unwrap();
+        let compressed = encode_record_with_compression(&record, true).unwrap();
+        assert_eq!(&plain[4..8], MAGIC_V2);
+        assert_eq!(&compressed[4..8], MAGIC_LZ4);
+        assert!(compressed.len() < plain.len() / 10);
+        assert_eq!(logical_frame_size(&compressed).unwrap(), plain.len());
+        assert_eq!(logical_frame_size(&plain).unwrap(), plain.len());
+        assert_eq!(decode_record(&plain).unwrap(), record);
+        assert_eq!(decode_record(&compressed).unwrap(), record);
+        assert_eq!(
+            encode_record_with_compression(&record, false).unwrap(),
+            plain
+        );
+    }
+
+    #[test]
+    fn small_and_incompressible_records_keep_the_original_format() {
+        let small = sample_record(vec![0, 1, 255]);
+        assert_eq!(
+            encode_record_with_compression(&small, true).unwrap(),
+            encode_record(&small).unwrap()
+        );
+        let mut seed = 19_u64;
+        let payload = (0..16384)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        let random = sample_record(payload);
+        assert_eq!(
+            encode_record_with_compression(&random, true).unwrap(),
+            encode_record(&random).unwrap()
+        );
+    }
+
+    #[test]
+    fn compressed_frames_reject_corruption_before_decompression() {
+        let mut frame =
+            encode_record_with_compression(&sample_record(vec![42; 4096]), true).unwrap();
+        frame[12] ^= 1;
+        assert!(matches!(
+            decode_record(&frame),
+            Err(CodecError::InvalidChecksum)
+        ));
+    }
+
+    #[test]
+    fn compressed_frames_bound_decoded_size_and_reject_invalid_blocks() {
+        let mut body = MAGIC_LZ4.to_vec();
+        body.extend_from_slice(&((MAX_FRAME_BYTES + 1) as u32).to_be_bytes());
+        assert!(matches!(
+            decode_record(&frame_with_body(&body)),
+            Err(CodecError::FrameTooLarge)
+        ));
+        body[4..8].copy_from_slice(&100_u32.to_be_bytes());
+        body.push(255);
+        assert!(matches!(
+            decode_record(&frame_with_body(&body)),
+            Err(CodecError::InvalidCompression)
+        ));
+        let record = sample_record(vec![42; 4096]);
+        let frame = encode_record_with_compression(&record, true).unwrap();
+        let mut body = frame[4..frame.len() - 4].to_vec();
+        let declared = u32::from_be_bytes(body[4..8].try_into().unwrap());
+        body[4..8].copy_from_slice(&(declared + 1).to_be_bytes());
+        assert!(matches!(
+            decode_record(&frame_with_body(&body)),
+            Err(CodecError::InvalidCompression)
+        ));
+    }
+
+    #[test]
+    fn compressed_frames_do_not_allow_nested_envelopes() {
+        let mut body = MAGIC_LZ4.to_vec();
+        body.extend_from_slice(&4_u32.to_be_bytes());
+        body.extend_from_slice(&lz4_flex::block::compress(MAGIC_LZ4));
+        assert!(matches!(
+            decode_record(&frame_with_body(&body)),
+            Err(CodecError::InvalidCompression)
+        ));
+    }
 
     #[test]
     fn binary_record_round_trips() {

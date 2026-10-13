@@ -11,7 +11,7 @@ use finnstream::{
         AppendIdentity, CommitPosition, FileActiveRangeStore, FileActiveRangeStoreOptions,
         OwnershipEpoch, RangeGeneration, RangeId, RangePosition,
     },
-    codec::encode_record,
+    codec::{decode_record, encode_record, encode_record_with_compression},
     domain::StoredRecord,
 };
 use tempfile::TempDir;
@@ -57,6 +57,99 @@ fn range_directory(root: &Path) -> PathBuf {
     root.join(Uuid::from_u128(1).to_string())
         .join(Uuid::from_u128(2).to_string())
         .join("generation-1")
+}
+
+#[tokio::test]
+async fn compression_can_be_enabled_and_disabled_on_existing_history_and_after_restart() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let payload = b"{\"device\":\"meter\",\"usage\":123456}".repeat(500);
+    for (index, compressed) in [false, true, false, true].into_iter().enumerate() {
+        let sequence = index as u64 + 1;
+        let mut request = append(sequence, &payload);
+        let record = decode_record(&request.frame).unwrap();
+        request.frame = encode_record_with_compression(&record, compressed).unwrap();
+        assert_eq!(
+            &request.frame[4..8],
+            if compressed { b"FSR3" } else { b"FSR2" }
+        );
+        store.append(request).await.unwrap();
+        store
+            .commit(
+                RangeGeneration::new(1),
+                OwnershipEpoch::new(1),
+                CommitPosition::new(sequence),
+            )
+            .await
+            .unwrap();
+    }
+    drop(store);
+    let reopened = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let frames = reopened.read_committed(None, 10).await.unwrap();
+    assert_eq!(frames.len(), 4);
+    for (index, frame) in frames.iter().enumerate() {
+        let record = decode_record(&frame.frame).unwrap();
+        assert_eq!(record.payload, payload);
+        assert_eq!(record.key, b"account-1");
+        assert_eq!(record.producer_sequence, index as u64 + 1);
+        assert_eq!(frame.cursor, format!("cursor-{}", index + 1));
+    }
+    let duplicate = reopened.append(append(4, &payload)).await.unwrap();
+    assert!(duplicate.deduplicated);
+    assert_eq!(duplicate.position, RangePosition::new(4));
+    assert_eq!(reopened.read_committed(None, 10).await.unwrap().len(), 4);
+    for (sequence, compressed) in [(5, true), (6, false)] {
+        let mut request = append(sequence, &payload);
+        request.frame =
+            encode_record_with_compression(&decode_record(&request.frame).unwrap(), compressed)
+                .unwrap();
+        reopened.append(request).await.unwrap();
+        reopened
+            .commit(
+                RangeGeneration::new(1),
+                OwnershipEpoch::new(1),
+                CommitPosition::new(sequence),
+            )
+            .await
+            .unwrap();
+    }
+    assert_eq!(reopened.read_committed(None, 10).await.unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn compressed_pages_enforce_logical_byte_budgets_and_resume_without_skipping() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let payload = vec![42; 4096];
+    for sequence in 1..=2 {
+        let mut request = append(sequence, &payload);
+        request.frame =
+            encode_record_with_compression(&decode_record(&request.frame).unwrap(), true).unwrap();
+        assert!(request.frame.len() < 1000);
+        store.append(request).await.unwrap();
+        store
+            .commit(
+                RangeGeneration::new(1),
+                OwnershipEpoch::new(1),
+                CommitPosition::new(sequence),
+            )
+            .await
+            .unwrap();
+    }
+    assert!(matches!(
+        store.read_committed_bounded(None, 10, 1000).await,
+        Err(ActiveRangeStoreError::ReadBudgetExceeded)
+    ));
+    let first = store.read_committed_bounded(None, 10, 5000).await.unwrap();
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].position, RangePosition::new(1));
+    let second = store
+        .read_committed_bounded(Some(first[0].position), 10, 5000)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].position, RangePosition::new(2));
+    assert_eq!(decode_record(&second[0].frame).unwrap().payload, payload);
 }
 
 #[tokio::test]

@@ -1146,6 +1146,10 @@ Autoscaling must never apply one generic removal procedure to all three cases.
 
 - [x] Add adaptive `auto` batching policy and bounded multi-record Writer API, tuning count, bytes, and linger from message sizes, target latency, server pressure, retries, and bounded memory.
 
+- [x] Add SDK-controlled optional LZ4 record compression for storage and replication; preserve mixed compressed/uncompressed Feed history, restart, and retry semantics. Evidence: `src/codec.rs` tests, `tests/active_range_store.rs` mixed-history/restart test, `sdk/spec/conformance/optional-compression.json` across Java/Python/Node.js/C#/Go, the Rust live SDK compression check, and `scripts/test-m2-writer-session.py`.
+
+- [x] Harden Subscription progress recovery under concurrent member-driven moves: prepare requests serialize through the owner before followers so rejected candidates never reserve follower slots; a dead owner surfaces the fencing error from the committed trail instead of a bare quorum loss; and replicas whose rows fall behind a committed placement move are re-adopted at the live epoch rather than ratcheting another CAS. Evidence: `tests/reader_progress.rs` owner-first/stranded-replica regression tests, `python -m unittest discover -s tests -p "test_*acceptance.py"`, and a green 18-script `scripts/run-acceptance.py` including `test-many-readers.py` draining through an owner stop plus replica restart.
+
 - [x] Add server feedback fields for recommended batch bytes/count, pressure, retry delay, and maximum accepted frame size without exposing physical topology.
 
 - [~] Add Writer CLI frontends: `wwctl write` is complete; the standalone PowerShell `wcl-cli write` wrapper remains.

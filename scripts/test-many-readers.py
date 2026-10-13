@@ -141,7 +141,14 @@ class Stats:
         self.conflicts = 0
         self.busy = 0
         self.errors = 0
+        self.error_samples = set()
         self.done = set()
+
+    def record_error(self, path, status, body):
+        with self.lock:
+            self.errors += 1
+            if len(self.error_samples) < 10:
+                self.error_samples.add(f"{path}: HTTP {status} {body.get('code')} {str(body.get('error', ''))[:300]}")
 
     def record_fetch(self, records):
         with self.lock:
@@ -150,16 +157,39 @@ class Stats:
                 self.delivered.add(record["cursor"])
 
 
+def member_post(endpoint, path, body, stats, stop):
+    delay = 0.1
+    result = (0, {"error": "worker stopped before the response was known"})
+    while not stop.is_set():
+        try:
+            result = post(endpoint, path, body)
+        except (ConnectionError, urllib.error.URLError, TimeoutError) as error:
+            result = (0, {"error": str(error)})
+        status, response = result
+        if status != 0 and status < 500 and not (status == 409 and response.get("code") == "no_quorum"):
+            return result
+        stats.record_error(path, status, response)
+        if stop.wait(delay):
+            break
+        endpoint = ENDPOINTS[(ENDPOINTS.index(endpoint) + 1) % len(ENDPOINTS)]
+        delay = min(delay * 2, 1.0)
+    return result
+
+
 def member_worker(index, subscription, member_id, work_id, stats, stop):
     """Claim -> fetch -> ack loop until the frontier is drained."""
     endpoint = ENDPOINTS[index % len(ENDPOINTS)]
     members = "/v1/subscriptions/members"
+
+    def request(endpoint, path, body):
+        return member_post(endpoint, path, body, stats, stop)
+
     lease_epoch = None
     empties = 0
     while not stop.is_set() and empties < 3:
         try:
             if lease_epoch is None:
-                status, body = post(
+                status, body = request(
                     endpoint,
                     f"{members}/claim",
                     {
@@ -178,7 +208,7 @@ def member_worker(index, subscription, member_id, work_id, stats, stop):
                         stats.errors += 1
                     time.sleep(0.3)
                     continue
-            status, body = post(
+            status, body = request(
                 endpoint,
                 f"{members}/fetch",
                 {
@@ -209,7 +239,7 @@ def member_worker(index, subscription, member_id, work_id, stats, stop):
                 time.sleep(0.2)
                 continue
             empties = 0
-            status, acked = post(
+            status, acked = request(
                 endpoint,
                 f"{members}/ack",
                 {
@@ -226,6 +256,7 @@ def member_worker(index, subscription, member_id, work_id, stats, stop):
             with stats.lock:
                 if status == 200:
                     stats.acks += 1
+                    lease_epoch = None
                 elif acked.get("code") == "lease.stale_lease":
                     lease_epoch = None
                     stats.conflicts += 1
@@ -239,11 +270,13 @@ def member_worker(index, subscription, member_id, work_id, stats, stop):
             with stats.lock:
                 stats.errors += 1
             time.sleep(0.3)
-    with stats.lock:
-        stats.done.add(index)
+    if empties >= 3:
+        with stats.lock:
+            stats.done.add(index)
 
 
 def main():
+    stats = None
     compose("down", "-v")
     returncode, output = compose("up", "--build", "-d")
     assert returncode == 0, output
@@ -550,6 +583,12 @@ def main():
         }
         print(json.dumps(report, indent=2))
         return 0
+    except Exception:
+        if stats is not None:
+            print(json.dumps(sorted(stats.error_samples)), file=sys.stderr)
+        _, logs = compose("logs", "--no-color", "--tail", "2000")
+        print(logs, file=sys.stderr)
+        raise
     finally:
         compose("down", "-v")
 

@@ -16,6 +16,7 @@ crc32fast = "1.4.2"
 fjall = "=3.1.10"
 futures-util = "0.3.31"
 hyper-util = { version = "=0.1.20", features = ["server-auto", "http1", "http2", "tokio", "service"] }
+lz4_flex = "=0.13.1"
 openraft = { version = "=0.9.21", features = ["serde"] }
 reqwest = { version = "0.12.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }

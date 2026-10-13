@@ -1,4 +1,4 @@
-import json, os, sys, time, urllib.error, urllib.request, uuid
+import base64, json, os, sys, time, urllib.error, urllib.request, uuid
 
 BASE_PORT = int(os.environ.get("WHITEWATER_TEST_BASE_PORT", "7071"))
 ENDPOINTS = [f"http://localhost:{BASE_PORT + offset}" for offset in range(3)]
@@ -52,6 +52,17 @@ def main():
     status, batch_result = post(ENDPOINTS[0], "/v1/writers/append-batch", batch)
     if status != 200 or len(batch_result["results"]) != 3: raise AssertionError("Writer batch did not commit all records")
     if batch_result["feedback"]["recommended_batch_count"] <= 0: raise AssertionError("batch feedback missing")
+    payload = base64.b64encode(b'{"device":"meter","bytesUp":123456}' * 1000).decode()
+    for index, enabled in enumerate([False, True, False, True]):
+        record = dict(append, request_id=str(uuid.uuid4()), payload_base64=payload, use_compression=enabled)
+        status, written = post(ENDPOINTS[index % 3], "/v1/writers/append", record)
+        if status != 200: raise AssertionError(written)
+        retry = dict(record, use_compression=not enabled)
+        status, replay = post(ENDPOINTS[(index + 1) % 3], "/v1/writers/append", retry)
+        if status != 200 or not replay["deduplicated"] or replay["cursor"] != written["cursor"]: raise AssertionError(replay)
+    status, page = post(ENDPOINTS[2], "/v1/readers/temporary/fetch", {"feed": feed, "limit": 20})
+    if status != 200 or len(page["records"]) != 8: raise AssertionError(page)
+    if [record["payload_base64"] for record in page["records"]][-4:] != [payload] * 4: raise AssertionError("compression changed application payloads")
     status, opened = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"OPEN WRITER SESSION {writer};"})
     new_epoch = opened["results"][0]["data"]["session_epoch"]
     stale = dict(append); stale["request_id"] = str(uuid.uuid4())

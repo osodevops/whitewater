@@ -82,6 +82,22 @@ def compose(file: str, *args: str, env: dict, check: bool = True) -> subprocess.
     )
 
 
+def collect_diagnostics(label: str, env: dict) -> None:
+    directory = ROOT / "acceptance-logs"
+    directory.mkdir(exist_ok=True)
+    label = re.sub(r"[^a-zA-Z0-9_.-]", "_", label)
+    for file, project in compose_file_projects():
+        for kind, args in (("ps", ["ps", "--all"]), ("logs", ["logs", "--no-color", "--tail", "300"])):
+            command = ["docker", "compose", "-p", project, "-f", file, *args]
+            try:
+                result = subprocess.run(command, cwd=ROOT, env=env, check=False, capture_output=True, text=True, timeout=15)
+                output = result.stdout + result.stderr
+            except (OSError, subprocess.TimeoutExpired) as error:
+                output = f"Diagnostic collection failed: {error}\n"
+            (directory / f"{label}-{project}-{kind}.log").write_text(output, encoding="utf-8")
+    print(f"--- diagnostics saved to {directory}", flush=True)
+
+
 def sweep(env: dict) -> None:
     """Remove every test project's containers and volumes, ignoring errors —
     teardown must be best-effort so one wedged project cannot mask others."""
@@ -189,6 +205,7 @@ def main() -> int:
             except AssertionError as error:
                 results[script] = f"fixture not ready: {error}"
                 print(f"--- {script}: {results[script]}")
+                collect_diagnostics(script, env)
                 continue
             try:
                 subprocess.run(
@@ -204,6 +221,11 @@ def main() -> int:
             except subprocess.CalledProcessError as error:
                 results[script] = f"exit {error.returncode}"
             print(f"--- {script}: {results[script]} ({time.monotonic() - started:.0f}s)")
+            if results[script] != "ok":
+                collect_diagnostics(script, env)
+    except Exception:
+        collect_diagnostics("runner", env)
+        raise
     finally:
         sweep(env)
 

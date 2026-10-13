@@ -49,13 +49,16 @@ def member_ready(endpoint, path, body):
     # finish re-electing before member mutations succeed again. Ride out the
     # election window — every retry replays the same request_id, so repeats
     # are idempotent.
-    for _ in range(45):
+    delay = 0.25
+    for attempt in range(45):
         status, response = post(endpoint, path, body)
         if status == 200:
             return response
-        if not (isinstance(response, dict) and "leader election" in str(response.get("error", ""))):
-            raise AssertionError(response)
-        time.sleep(1)
+        if status != 503:
+            raise AssertionError(f"{path} returned HTTP {status}: {response}")
+        if attempt < 44:
+            time.sleep(delay)
+            delay = min(delay * 2, 1.0)
     raise AssertionError(f"member call still failing after re-election window: {response}")
 
 

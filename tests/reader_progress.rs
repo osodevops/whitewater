@@ -397,6 +397,103 @@ impl SubscriptionProgressTransport for TestProgressTransport {
     }
 }
 
+#[tokio::test]
+async fn owner_rejected_prepare_does_not_reserve_follower_slots() {
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = progress_nodes();
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let subscription_id = Uuid::from_u128(9100);
+    let assignment = SubscriptionProgressAssignment::try_new(
+        subscription_id,
+        nodes[0].clone(),
+        ReplicaSet::try_new(nodes.clone()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let coordinator = SubscriptionProgressCoordinator::new(assignment, transport.clone());
+    let accepted = progress_mutation(subscription_id, Uuid::from_u128(9101), 1, 1);
+    transport.stores[&nodes[0]]
+        .prepare(accepted.clone())
+        .unwrap();
+    let mut rejected = accepted.clone();
+    rejected.request_id = Uuid::from_u128(9102);
+    rejected.cursor = "rf1_rejected".to_owned();
+    assert!(matches!(
+        coordinator.apply(rejected).await,
+        Err(SubscriptionProgressError::Sequence)
+    ));
+    for node in &nodes[1..] {
+        assert!(
+            transport.stores[node]
+                .local_state(subscription_id)
+                .unwrap()
+                .prepared
+                .is_none(),
+            "an owner-rejected request reserved a follower slot"
+        );
+    }
+    coordinator.apply(accepted.clone()).await.unwrap();
+    for node in &nodes {
+        assert_eq!(
+            transport.stores[node]
+                .local_committed(subscription_id)
+                .unwrap(),
+            Some(accepted.clone())
+        );
+    }
+}
+
+#[tokio::test]
+async fn unavailable_or_invalid_owner_vote_never_prepares_followers() {
+    for corrupt in [false, true] {
+        let dirs = [
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+            TempDir::new().unwrap(),
+        ];
+        let nodes = progress_nodes();
+        let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+        let subscription_id = Uuid::from_u128(9200);
+        let assignment = SubscriptionProgressAssignment::try_new(
+            subscription_id,
+            nodes[0].clone(),
+            ReplicaSet::try_new(nodes.clone()).unwrap(),
+            1,
+        )
+        .unwrap();
+        let coordinator = SubscriptionProgressCoordinator::new(assignment, transport.clone());
+        if corrupt {
+            *transport.corrupt_vote.lock().unwrap() = Some(nodes[0].clone());
+        } else {
+            transport
+                .prepare_down
+                .lock()
+                .unwrap()
+                .insert(nodes[0].clone());
+        }
+        assert!(coordinator
+            .apply(progress_mutation(
+                subscription_id,
+                Uuid::from_u128(9201),
+                1,
+                1
+            ))
+            .await
+            .is_err());
+        for node in &nodes[1..] {
+            assert!(transport.stores[node]
+                .local_state(subscription_id)
+                .unwrap()
+                .prepared
+                .is_none());
+        }
+    }
+}
+
 fn progress_nodes() -> [StorageNodeId; 3] {
     ["storage-a", "storage-b", "storage-c"].map(|name| StorageNodeId::try_new(name).unwrap())
 }
@@ -1350,11 +1447,57 @@ async fn subscription_progress_recovery_moves_owner_preserves_committed_and_fenc
         2,
     );
     stale_write.request_id = Uuid::from_u128(5_500);
-    assert!(matches!(
-        coordinator.apply(stale_write).await,
-        Err(SubscriptionProgressError::StaleEpoch)
-            | Err(SubscriptionProgressError::InvalidAssignment)
-    ));
+    let direct_read = coordinator.read_committed().await;
+    let replica_states = coordinator
+        .replica_states()
+        .await
+        .into_iter()
+        .map(|(node, state)| {
+            (
+                node,
+                state.map(|inspection| {
+                    (
+                        inspection
+                            .committed
+                            .map(|mutation| (mutation.sequence, mutation.ownership_epoch)),
+                        inspection
+                            .prepared
+                            .map(|mutation| (mutation.sequence, mutation.ownership_epoch)),
+                    )
+                }),
+            )
+        })
+        .collect::<Vec<_>>();
+    let stale_result = coordinator.apply(stale_write).await;
+    let replica_rows = nodes
+        .iter()
+        .map(|node| {
+            (
+                node.clone(),
+                transport.stores[node]
+                    .local_state(subscription.subscription_id)
+                    .map(|state| {
+                        (
+                            state
+                                .committed
+                                .map(|mutation| (mutation.sequence, mutation.ownership_epoch)),
+                            state
+                                .prepared
+                                .map(|mutation| (mutation.sequence, mutation.ownership_epoch)),
+                        )
+                    }),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        matches!(
+            stale_result,
+            Err(SubscriptionProgressError::StaleEpoch)
+                | Err(SubscriptionProgressError::InvalidAssignment)
+        ),
+        "stale write must be fenced, got {stale_result:?} (direct read {direct_read:?}) \
+         with replica rows {replica_rows:?} and states {replica_states:?}"
+    );
     assert!(matches!(
         coordinator.read_committed().await,
         Err(SubscriptionProgressError::StaleEpoch)
@@ -2494,6 +2637,78 @@ async fn epoch_stale_replica_rows_are_lagging_witnesses_for_reads_and_writes() {
         .unwrap();
     assert_eq!(stale.sequence, 2);
     assert_eq!(stale.ownership_epoch, 1);
+}
+
+#[tokio::test]
+async fn synchronize_placement_heals_replicas_stranded_behind_a_committed_move() {
+    // Live-fault regression: a placement CAS commits before adoption runs.
+    // When adoption misses replicas their rows stay stamped at the prior
+    // epoch and every committed read fences them as stale, so quorum never
+    // forms and member operations wedge permanently. Re-adopting the
+    // recovered frontier at the live epoch must heal without committing
+    // another ownership move.
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let mutation = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        1,
+    );
+    coordinator.apply(mutation.clone()).await.unwrap();
+
+    for node in &nodes {
+        transport.adopt_down.lock().unwrap().insert(node.clone());
+    }
+    assert!(matches!(
+        coordinator.recover_lost_owner(&controller).await,
+        Err(SubscriptionProgressError::NoQuorum)
+    ));
+    let moved = controller
+        .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+        .await
+        .unwrap();
+    assert_eq!(moved.ownership_epoch, 2);
+    let stranded = SubscriptionProgressCoordinator::new(moved.clone(), transport.clone());
+    assert!(matches!(
+        stranded.read_committed().await,
+        Err(SubscriptionProgressError::NoQuorum)
+    ));
+
+    transport.adopt_down.lock().unwrap().clear();
+    let outcome = stranded.synchronize_placement().await.unwrap();
+    assert_eq!(outcome.assignment.ownership_epoch, 2);
+    let committed = stranded.read_committed().await.unwrap().unwrap();
+    assert_eq!(committed.sequence, 1);
+    assert_eq!(committed.ownership_epoch, 2);
+    for node in &nodes {
+        assert_eq!(
+            transport.stores[node]
+                .local_committed(subscription.subscription_id)
+                .unwrap()
+                .map(|mutation| mutation.ownership_epoch),
+            Some(2)
+        );
+    }
 }
 
 #[tokio::test]

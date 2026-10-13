@@ -12,3 +12,4 @@ Thumbs.db
 /.cargo-cache/
 /.cargo-target/
 .tmp_*.py
+__pycache__/
