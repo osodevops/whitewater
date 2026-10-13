@@ -264,6 +264,18 @@ pub struct SubscriptionLeaseTransfer {
 pub const SUBSCRIPTION_LEASE_MAX_WORK: usize = 256;
 pub const SUBSCRIPTION_LEASE_MAX_MEMBER_WORK: usize = 32;
 pub const SUBSCRIPTION_LEASE_MAX_OPS: usize = 16;
+/// Cumulative quarantined positions a Subscription frontier may carry;
+/// evidence stays explainable instead of growing an unbounded audit row.
+pub const SUBSCRIPTION_QUARANTINE_MAX_POSITIONS: usize = 1024;
+
+/// The quarantine deltas one acknowledgement applies to the cumulative
+/// frontier set: positions newly declared delivered-but-not-processed, and
+/// positions released once resolved.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptionQuarantineDelta {
+    pub add: BTreeMap<RangeId, Vec<String>>,
+    pub remove: BTreeMap<RangeId, Vec<String>>,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -956,6 +968,18 @@ pub struct SubscriptionProgressMutation {
     pub tick: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub lease_ops: Vec<SubscriptionLeaseOp>,
+    /// Cumulative positions members acknowledged as delivered but
+    /// explicitly not processed — durable poison/quarantine evidence a
+    /// later SEEK can reprocess.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quarantined: BTreeMap<RangeId, Vec<String>>,
+    /// The acknowledgement deltas that produced `quarantined`; kept so an
+    /// identical request replays and a changed one conflicts rather than
+    /// silently restating a different intent.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quarantine_add: BTreeMap<RangeId, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quarantine_remove: BTreeMap<RangeId, Vec<String>>,
 }
 
 /// A replica answering with one of these errors is behind the current
@@ -1023,6 +1047,9 @@ fn same_progress_identity(
         && left.positions == right.positions
         && left.tick == right.tick
         && left.lease_ops == right.lease_ops
+        && left.quarantined == right.quarantined
+        && left.quarantine_add == right.quarantine_add
+        && left.quarantine_remove == right.quarantine_remove
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1273,6 +1300,18 @@ impl FjallSubscriptionProgressReplica {
                 || mutation.positions.is_empty()
                 || mutation.positions.len() > 128
                 || mutation.positions.values().any(|value| value.len() > 256)
+                || mutation.quarantined.len() > 128
+                || mutation
+                    .quarantined
+                    .values()
+                    .flatten()
+                    .any(|value| value.is_empty() || value.len() > 256)
+                || mutation.quarantined.values().map(Vec::len).sum::<usize>()
+                    > SUBSCRIPTION_QUARANTINE_MAX_POSITIONS
+                || !mutation
+                    .quarantined
+                    .keys()
+                    .all(|range| mutation.positions.contains_key(range))
                 || mutation.expected_cursor.as_ref().is_some_and(|expected| {
                     expected.is_empty()
                         || expected.len() > 256
@@ -1350,6 +1389,18 @@ impl FjallSubscriptionProgressReplica {
             || mutation.positions.is_empty()
             || mutation.positions.len() > 128
             || mutation.positions.values().any(|value| value.len() > 256)
+            || mutation.quarantined.len() > 128
+            || mutation
+                .quarantined
+                .values()
+                .flatten()
+                .any(|value| value.is_empty() || value.len() > 256)
+            || mutation.quarantined.values().map(Vec::len).sum::<usize>()
+                > SUBSCRIPTION_QUARANTINE_MAX_POSITIONS
+            || !mutation
+                .quarantined
+                .keys()
+                .all(|range| mutation.positions.contains_key(range))
             || mutation.lease_ops.len() > SUBSCRIPTION_LEASE_MAX_OPS
             || mutation.expected_cursor.as_ref().is_some_and(|expected| {
                 expected.is_empty()
@@ -2933,11 +2984,47 @@ impl SubscriptionProgressCoordinator {
         request_id: Uuid,
         cursor: String,
         positions: BTreeMap<RangeId, String>,
+        quarantine: SubscriptionQuarantineDelta,
     ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
+        let SubscriptionQuarantineDelta {
+            add: quarantine_add,
+            remove: quarantine_remove,
+        } = quarantine;
         let current = self
             .read_committed()
             .await?
             .ok_or(SubscriptionProgressError::Conflict)?;
+        // Quarantine deltas fold into the cumulative set carried forward
+        // from the committed frontier; only positions in ranges this ack
+        // covers may be quarantined, so evidence cannot name progress the
+        // member did not commit.
+        if !quarantine_add
+            .keys()
+            .all(|range| positions.contains_key(range))
+        {
+            return Err(SubscriptionProgressError::Conflict);
+        }
+        let mut quarantined = current.quarantined.clone();
+        for (range, cursors) in &quarantine_remove {
+            if let Some(held) = quarantined.get_mut(range) {
+                held.retain(|cursor| !cursors.contains(cursor));
+                if held.is_empty() {
+                    quarantined.remove(range);
+                }
+            }
+        }
+        for (range, cursors) in &quarantine_add {
+            let held = quarantined.entry(*range).or_default();
+            for cursor in cursors {
+                if !held.contains(cursor) {
+                    held.push(cursor.clone());
+                }
+            }
+        }
+        if quarantined.values().map(Vec::len).sum::<usize>() > SUBSCRIPTION_QUARANTINE_MAX_POSITIONS
+        {
+            return Err(SubscriptionProgressError::TooLarge);
+        }
         let mutation = SubscriptionProgressMutation {
             subscription_id: current.subscription_id,
             feed_id: current.feed_id,
@@ -2950,6 +3037,9 @@ impl SubscriptionProgressCoordinator {
             expected_cursor: Some(current.cursor.clone()),
             cursor,
             positions,
+            quarantined,
+            quarantine_add,
+            quarantine_remove,
             tick,
             lease_ops: vec![SubscriptionLeaseOp::Release {
                 work_id: grant.work_id,
@@ -3074,6 +3164,9 @@ mod tests {
                 "event".to_owned(),
             )]),
 
+            quarantined: BTreeMap::new(),
+            quarantine_add: BTreeMap::new(),
+            quarantine_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -3191,6 +3284,9 @@ mod tests {
                 "record-one".to_owned(),
             )]),
 
+            quarantined: BTreeMap::new(),
+            quarantine_add: BTreeMap::new(),
+            quarantine_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -3533,6 +3629,9 @@ mod tests {
                 RangeId::from_uuid(Uuid::from_u128(7_000 + sequence as u128)),
                 format!("position-{sequence}"),
             )]),
+            quarantined: BTreeMap::new(),
+            quarantine_add: BTreeMap::new(),
+            quarantine_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         }
@@ -4164,6 +4263,9 @@ mod tests {
                 "position".to_owned(),
             )]),
 
+            quarantined: BTreeMap::new(),
+            quarantine_add: BTreeMap::new(),
+            quarantine_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };

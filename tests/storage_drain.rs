@@ -682,6 +682,9 @@ async fn drain_executor_vacates_subscription_progress_references() {
                 RangeId::from_uuid(Uuid::from_u128(0xD0A1)),
                 "".to_owned(),
             )]),
+            quarantined: BTreeMap::new(),
+            quarantine_add: BTreeMap::new(),
+            quarantine_remove: BTreeMap::new(),
             tick: 1,
             lease_ops: Vec::new(),
         })

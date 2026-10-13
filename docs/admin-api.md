@@ -363,7 +363,9 @@ POST /v1/subscriptions/members/fetch
 
 POST /v1/subscriptions/members/ack
 { "...": "...", "work_id": "...", "lease_epoch": 1,
-  "cursor": "...", "positions": { "<range-id>": "<position>" } }
+  "cursor": "...", "positions": { "<range-id>": "<position>" },
+  "quarantine": { "<range-id>": ["<cursor>", "..."] },
+  "release_quarantine": { "<range-id>": ["<cursor>", "..."] } }
 
 GET /v1/subscriptions/members/state?subscription=orders.billing
 ```
@@ -373,7 +375,13 @@ atomically establishes the shared frontier and member epoch 1; rejoining fences 
 epoch. `claim` grants a bounded expiring work lease, `fetch` returns a bounded
 page of records after the shared frontier plus the per-range `positions` and
 `cursor` to pass back to `ack`, and `ack` atomically advances the frontier and
-releases the lease. Concurrent members may fetch overlapping windows — progress
+releases the lease. An ack may also carry `quarantine` — positions the member
+declares delivered-but-not-processed — and `release_quarantine` — positions a
+later ack removes once resolved. The cumulative set rides the committed
+frontier mutation durably and bounded (1024 positions, addable only from the
+ranges the ack commits), is reported on the admin progress view as
+`committed.quarantined`, and carries forward through `SEEK SUBSCRIPTION`
+repositions so reprocessing the same window still shows its poison evidence. Concurrent members may fetch overlapping windows — progress
 is fenced by the committed Cursor at `ack`, not by delivery, so failover is
 at-least-once until per-Key work windows arrive. Explicit-Cursor and timestamp
 Subscription starts and per-Key work subdivision are not yet implemented.

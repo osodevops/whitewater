@@ -87,6 +87,9 @@ fn frontier_mutation(cursor: &str) -> SubscriptionProgressMutation {
         expected_cursor: None,
         cursor: cursor.to_owned(),
         positions: BTreeMap::from([(range(), "root".to_owned())]),
+        quarantined: BTreeMap::new(),
+        quarantine_add: BTreeMap::new(),
+        quarantine_remove: BTreeMap::new(),
         tick: 1,
         lease_ops: Vec::new(),
     }
@@ -488,6 +491,9 @@ impl EffectApply for RecordingApply {
             expected_cursor: consume.expected_cursor.clone(),
             cursor: consume.cursor.clone(),
             positions: consume.positions.clone(),
+            quarantined: BTreeMap::new(),
+            quarantine_add: BTreeMap::new(),
+            quarantine_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -865,6 +871,9 @@ async fn pipe_driver_aborts_a_declare_whose_frontier_moved_mid_apply() {
         expected_cursor: Some("p0".to_owned()),
         cursor: "pX".to_owned(),
         positions: BTreeMap::from([(range(), "other".to_owned())]),
+        quarantined: BTreeMap::new(),
+        quarantine_add: BTreeMap::new(),
+        quarantine_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };

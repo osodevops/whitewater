@@ -1190,6 +1190,13 @@ struct SubscriptionMemberAckRequest {
     lease_epoch: u64,
     cursor: Option<String>,
     positions: Option<BTreeMap<RangeId, String>>,
+    /// Positions this acknowledgement declares delivered-but-not-processed
+    /// (quarantine) or resolved-and-removable (release_quarantine); the
+    /// cumulative set is durable poison evidence a later SEEK can revisit.
+    #[serde(default)]
+    quarantine: Option<BTreeMap<RangeId, Vec<String>>>,
+    #[serde(default)]
+    release_quarantine: Option<BTreeMap<RangeId, Vec<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -1596,6 +1603,9 @@ async fn subscription_member_join(
                 expected_cursor: None,
                 cursor: start_cursor,
                 positions,
+                quarantined: BTreeMap::new(),
+                quarantine_add: BTreeMap::new(),
+                quarantine_remove: BTreeMap::new(),
                 tick: 1,
                 lease_ops: vec![crate::reader::SubscriptionLeaseOp::Join {
                     member_id: request.member_id,
@@ -1750,7 +1760,12 @@ async fn subscription_member_ack(
                 .map_err(subscription_progress_api_error)?
                 .filter(|latest| latest.request_id == request.request_id)
             {
-                if latest.cursor != cursor || latest.positions != positions {
+                if latest.cursor != cursor
+                    || latest.positions != positions
+                    || latest.quarantine_add != request.quarantine.clone().unwrap_or_default()
+                    || latest.quarantine_remove
+                        != request.release_quarantine.clone().unwrap_or_default()
+                {
                     return Err(ApiError {
                         status: StatusCode::CONFLICT,
                         message: "request_id was already used with a different Subscription acknowledgement"
@@ -1780,7 +1795,17 @@ async fn subscription_member_ack(
                 .last_tick
                 .saturating_add(1);
             coordinator
-                .acknowledge(&grant, tick, request.request_id, cursor, positions)
+                .acknowledge(
+                    &grant,
+                    tick,
+                    request.request_id,
+                    cursor,
+                    positions,
+                    crate::reader::SubscriptionQuarantineDelta {
+                        add: request.quarantine.unwrap_or_default(),
+                        remove: request.release_quarantine.unwrap_or_default(),
+                    },
+                )
                 .await
                 .map_err(subscription_progress_api_error)?;
             let member_state = read_member_state(&coordinator).await?;
@@ -2144,6 +2169,12 @@ async fn subscription_seek(
         expected_cursor: Some(frontier.cursor.clone()),
         cursor: seek_cursor.clone(),
         positions: positions.clone(),
+        // A seek repositions delivery; quarantine evidence belongs to the
+        // Subscription's processing history and carries forward so a
+        // replay through the same positions can see it again.
+        quarantined: frontier.quarantined.clone(),
+        quarantine_add: BTreeMap::new(),
+        quarantine_remove: BTreeMap::new(),
         tick: frontier.tick,
         lease_ops: Vec::new(),
     };
@@ -2584,6 +2615,9 @@ async fn bootstrap_pipe_frontier(
         expected_cursor: None,
         cursor: start_cursor,
         positions,
+        quarantined: BTreeMap::new(),
+        quarantine_add: BTreeMap::new(),
+        quarantine_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     })
@@ -5378,6 +5412,11 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
             expected_cursor: consume.expected_cursor.clone(),
             cursor: consume.cursor.clone(),
             positions: consume.positions.clone(),
+            quarantined: committed
+                .as_ref()
+                .map_or_else(BTreeMap::new, |prior| prior.quarantined.clone()),
+            quarantine_add: BTreeMap::new(),
+            quarantine_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -8133,6 +8172,7 @@ async fn admin_subscription_progress(
             "request_id": mutation.request_id,
             "ownership_epoch": mutation.ownership_epoch,
             "tick": mutation.tick,
+            "quarantined": mutation.quarantined,
         })
     });
     let member_state = coordinator.member_state().await.ok();
@@ -13680,6 +13720,9 @@ mod tests {
                 "event-1".to_owned(),
             )]),
 
+            quarantined: BTreeMap::new(),
+            quarantine_add: BTreeMap::new(),
+            quarantine_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -13810,6 +13853,9 @@ mod tests {
                 "record".to_owned(),
             )]),
 
+            quarantined: BTreeMap::new(),
+            quarantine_add: BTreeMap::new(),
+            quarantine_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -14021,6 +14067,9 @@ mod tests {
                 "record".to_owned(),
             )]),
 
+            quarantined: BTreeMap::new(),
+            quarantine_add: BTreeMap::new(),
+            quarantine_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -16315,6 +16364,9 @@ mod tests {
                 expected_cursor: None,
                 cursor: "cursor-2".to_owned(),
                 positions: BTreeMap::from([(progress_range, "cursor-2".to_owned())]),
+                quarantined: BTreeMap::new(),
+                quarantine_add: BTreeMap::new(),
+                quarantine_remove: BTreeMap::new(),
                 tick: 0,
                 lease_ops: Vec::new(),
             })
@@ -16580,13 +16632,17 @@ mod tests {
             body["positions"][progress_range.to_string()],
             json!("cursor-10")
         );
-        // The member acknowledges the delivered page atomically.
+        // The member acknowledges the delivered page atomically, marking
+        // one delivered record as delivered-but-not-processed — durable
+        // poison/quarantine evidence the operator can inspect and a later
+        // reposition can reprocess.
         let (status, body) = post(
             "ack",
             json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(13),
                 "member_id": member, "member_epoch": 2, "work_id": work,
                 "lease_epoch": claimed_epoch,
-                "cursor": body["cursor"], "positions": body["positions"]}),
+                "cursor": body["cursor"], "positions": body["positions"],
+                "quarantine": {progress_range.to_string(): ["cursor-9"]}}),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -16915,6 +16971,13 @@ mod tests {
         assert_eq!(body["assignment"]["replicas"].as_array().unwrap().len(), 3);
         assert!(body["committed"]["cursor"].is_string(), "{body}");
         assert_eq!(body["members"]["member_count"], json!(2));
+        // Quarantine evidence carries forward through seeks: the member
+        // ack marked cursor-9 as delivered-but-not-processed, and the
+        // operator can see it while repositioning for reprocessing.
+        assert_eq!(
+            body["committed"]["quarantined"][progress_range.to_string()],
+            json!(["cursor-9"])
+        );
         // Lag answers the operator's first question: after the seek to
         // BEGINNING, all twelve seeded records are committed but undelivered.
         assert_eq!(body["lag"]["records_behind"], json!(12));
@@ -17043,6 +17106,9 @@ mod tests {
                     RangeId::from_uuid(Uuid::from_u128(9_103)),
                     "position".to_owned(),
                 )]),
+                quarantined: BTreeMap::new(),
+                quarantine_add: BTreeMap::new(),
+                quarantine_remove: BTreeMap::new(),
                 tick: 0,
                 lease_ops: Vec::new(),
             };

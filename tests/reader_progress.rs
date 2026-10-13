@@ -445,6 +445,9 @@ async fn subscription_coordinator_uses_private_catalog_placement_and_refuses_leg
             "record".to_owned(),
         )]),
 
+        quarantined: BTreeMap::new(),
+        quarantine_add: BTreeMap::new(),
+        quarantine_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -519,6 +522,9 @@ async fn quorum_subscription_read_fails_closed_on_loss_disagreement_and_ambiguou
             "event-a".to_owned(),
         )]),
 
+        quarantined: BTreeMap::new(),
+        quarantine_add: BTreeMap::new(),
+        quarantine_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -632,6 +638,9 @@ async fn ambiguous_subscription_retry_reconciles_after_restart_without_guessing(
             "cursor-1".to_owned(),
         )]),
 
+        quarantined: BTreeMap::new(),
+        quarantine_add: BTreeMap::new(),
+        quarantine_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -732,6 +741,9 @@ async fn progress_coordinator_refuses_replies_claiming_another_replica() {
             "event-a".to_owned(),
         )]),
 
+        quarantined: BTreeMap::new(),
+        quarantine_add: BTreeMap::new(),
+        quarantine_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -798,6 +810,9 @@ async fn subscription_progress_coordinator_requires_matching_prepare_and_commit_
             "event-a".to_owned(),
         )]),
 
+        quarantined: BTreeMap::new(),
+        quarantine_add: BTreeMap::new(),
+        quarantine_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -899,6 +914,9 @@ async fn subscription_progress_coordinator_refuses_contradictory_replica_evidenc
             "event-a".to_owned(),
         )]),
 
+        quarantined: BTreeMap::new(),
+        quarantine_add: BTreeMap::new(),
+        quarantine_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -943,6 +961,9 @@ fn prepared_subscription_progress_remains_invisible_after_replica_restart() {
             "event-1".to_owned(),
         )]),
 
+        quarantined: BTreeMap::new(),
+        quarantine_add: BTreeMap::new(),
+        quarantine_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -1220,6 +1241,9 @@ fn progress_mutation(
             RangeId::from_uuid(Uuid::from_u128(6_000 + sequence as u128)),
             format!("position-{sequence}"),
         )]),
+        quarantined: BTreeMap::new(),
+        quarantine_add: BTreeMap::new(),
+        quarantine_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     }
@@ -2144,7 +2168,9 @@ async fn subscription_member_leases_replicate_survive_restart_and_recover() {
 
 #[tokio::test]
 async fn subscription_member_api_fences_acks_by_quorum_leases() {
-    use finnstream::reader::{SubscriptionLeaseOp, SubscriptionWorkLease};
+    use finnstream::reader::{
+        SubscriptionLeaseOp, SubscriptionQuarantineDelta, SubscriptionWorkLease,
+    };
 
     let directory = TempDir::new().unwrap();
     let nodes = progress_nodes();
@@ -2242,7 +2268,8 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
                 20,
                 Uuid::from_u128(22_004),
                 "rf1_acked".to_owned(),
-                frontier.positions.clone()
+                frontier.positions.clone(),
+                SubscriptionQuarantineDelta::default()
             )
             .await,
         Err(SubscriptionProgressError::Lease(
@@ -2260,7 +2287,8 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
                 20,
                 Uuid::from_u128(22_005),
                 "rf1_acked".to_owned(),
-                frontier.positions.clone()
+                frontier.positions.clone(),
+                SubscriptionQuarantineDelta::default()
             )
             .await,
         Err(SubscriptionProgressError::Lease(
@@ -2280,6 +2308,7 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
                 RangeId::from_uuid(Uuid::from_u128(23_001)),
                 "ack-pos".to_owned(),
             )]),
+            SubscriptionQuarantineDelta::default(),
         )
         .await
         .unwrap();
@@ -2543,4 +2572,164 @@ async fn recovery_then_member_ops_when_a_survivor_lags_one_sequence() {
         .await
         .unwrap();
     assert_eq!(applied.sequence, 3);
+}
+
+#[tokio::test]
+async fn subscription_acks_carry_a_bounded_quarantine_set() {
+    use finnstream::reader::{
+        SubscriptionLeaseOp, SubscriptionQuarantineDelta, SubscriptionWorkLease,
+    };
+
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let member = Uuid::from_u128(31_001);
+    let work = Uuid::from_u128(31_002);
+
+    let frontier = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        1,
+    );
+    coordinator.apply(frontier.clone()).await.unwrap();
+    let range = *frontier.positions.keys().next().unwrap();
+    coordinator
+        .apply_member_ops(
+            Uuid::from_u128(32_001),
+            10,
+            vec![SubscriptionLeaseOp::Join {
+                member_id: member,
+                member_epoch: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    coordinator
+        .apply_member_ops(
+            Uuid::from_u128(32_002),
+            10,
+            vec![SubscriptionLeaseOp::Claim {
+                work_id: work,
+                member_id: member,
+                member_epoch: 1,
+                lease_ticks: 30,
+            }],
+        )
+        .await
+        .unwrap();
+    let members = coordinator.member_state().await.unwrap();
+    let lease = members.leases.get(&work).unwrap();
+    let grant = SubscriptionWorkLease {
+        work_id: work,
+        member_id: member,
+        member_epoch: 1,
+        lease_epoch: lease.lease_epoch,
+        expires_at_tick: lease.expires_at_tick,
+    };
+
+    // An ack may only quarantine positions inside the ranges it commits;
+    // naming a foreign range conflicts rather than writing false evidence.
+    let foreign = RangeId::from_uuid(Uuid::from_u128(33_999));
+    assert!(matches!(
+        coordinator
+            .acknowledge(
+                &grant,
+                20,
+                Uuid::from_u128(32_003),
+                "rf1_q".to_owned(),
+                frontier.positions.clone(),
+                SubscriptionQuarantineDelta {
+                    add: BTreeMap::from([(foreign, vec!["poison-1".to_owned()])]),
+                    remove: BTreeMap::new(),
+                }
+            )
+            .await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+
+    // Quarantined positions ride the committed mutation on every replica.
+    let acked = coordinator
+        .acknowledge(
+            &grant,
+            20,
+            Uuid::from_u128(32_004),
+            "rf1_q".to_owned(),
+            frontier.positions.clone(),
+            SubscriptionQuarantineDelta {
+                add: BTreeMap::from([(range, vec!["poison-1".to_owned(), "poison-2".to_owned()])]),
+                remove: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        acked.quarantined[&range],
+        vec!["poison-1".to_owned(), "poison-2".to_owned()]
+    );
+    for node in &nodes {
+        let state = transport.stores[node]
+            .local_state(subscription.subscription_id)
+            .unwrap();
+        assert_eq!(
+            state.committed.as_ref().unwrap().quarantined[&range].len(),
+            2
+        );
+    }
+
+    // A later ack releases one quarantined position while the frontier
+    // keeps moving; the cumulative set shrinks but stays durable.
+    coordinator
+        .apply_member_ops(
+            Uuid::from_u128(32_005),
+            30,
+            vec![SubscriptionLeaseOp::Claim {
+                work_id: work,
+                member_id: member,
+                member_epoch: 1,
+                lease_ticks: 30,
+            }],
+        )
+        .await
+        .unwrap();
+    let members = coordinator.member_state().await.unwrap();
+    let lease = members.leases.get(&work).unwrap();
+    let grant = SubscriptionWorkLease {
+        lease_epoch: lease.lease_epoch,
+        expires_at_tick: lease.expires_at_tick,
+        ..grant
+    };
+    let acked = coordinator
+        .acknowledge(
+            &grant,
+            40,
+            Uuid::from_u128(32_006),
+            "rf1_q2".to_owned(),
+            frontier.positions.clone(),
+            SubscriptionQuarantineDelta {
+                add: BTreeMap::new(),
+                remove: BTreeMap::from([(range, vec!["poison-1".to_owned()])]),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(acked.quarantined[&range], vec!["poison-2".to_owned()]);
 }
