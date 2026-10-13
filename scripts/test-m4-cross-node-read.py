@@ -58,6 +58,7 @@ def wait_for_fabric():
 
 
 def main():
+    subprocess.run([*COMPOSE, "down", "-v"], check=True)
     subprocess.run([*COMPOSE, "up", "--build", "-d"], check=True)
     stopped = None
     try:
@@ -211,9 +212,7 @@ def main():
         print(json.dumps({"status": "ok", "feed": feed, "partial_ingress": removed,
                           "remote_range_owner": source["owner"], "records": len(cursors)}, indent=2))
     finally:
-        if stopped:
-            subprocess.run([*COMPOSE, "start", stopped], check=True)
-        subprocess.run([*COMPOSE, "stop"], check=True)
+        subprocess.run([*COMPOSE, "down", "-v"], check=True)
 
 
 if __name__ == "__main__":

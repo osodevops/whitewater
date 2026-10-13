@@ -56,6 +56,7 @@ def wait_for_fabric():
 
 
 def main():
+    subprocess.run([*COMPOSE, "down", "-v"], check=True)
     subprocess.run([*COMPOSE, "up", "--build", "-d"], check=True)
     try:
         wait_for_fabric()
@@ -146,7 +147,7 @@ def main():
             raise AssertionError(f"replacement lost committed Cursor history after restart: {last_error}")
         print(json.dumps({"status": "ok", "feed": feed, "replicas": moved["assignment"]["replicas"], "records": len(records)}, indent=2))
     finally:
-        subprocess.run([*COMPOSE, "stop"], check=True)
+        subprocess.run([*COMPOSE, "down", "-v"], check=True)
 
 
 if __name__ == "__main__":
