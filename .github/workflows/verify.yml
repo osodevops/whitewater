@@ -1,0 +1,47 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.90.0
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets
+
+  live-acceptance:
+    needs: rust-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      COMPOSE_FILE: compose.verify.yml
+      WHITEWATER_TEST_BASE_PORT: "7371"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Live acceptance suite
+        run: python scripts/run-acceptance.py
+      - name: Verify no test residue
+        if: always()
+        run: |
+          echo "containers: $(docker ps -aq | wc -l)"
+          echo "volumes: $(docker volume ls -q | wc -l)"
+          docker ps -a --format "table {{.Names}}\t{{.Status}}"
+          docker volume ls
