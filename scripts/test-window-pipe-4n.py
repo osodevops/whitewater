@@ -322,6 +322,24 @@ def placement(node, feed):
     return wcl_retry(node, f"INSPECT PLACEMENT FOR FEED {feed};")[0]
 
 
+def show_pipe(node, pipe_name):
+    rows = wcl_retry(node, "SHOW PIPES;")[0]
+    for row in rows:
+        if row.get("name") == pipe_name:
+            return row
+    raise AssertionError({"pipes": rows})
+
+
+def admin_progress(node, subscription):
+    query = urllib.parse.urlencode({"subscription": subscription})
+    request = urllib.request.Request(
+        f"{node}/v1/admin/subscriptions/progress?{query}",
+        headers={"authorization": f"Bearer {KEY}"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)["assignment"]
+
+
 def storage_serves_read(feed, expected):
     """Poll until the storage Node serves at least `expected` committed
     records — its local replica must catch up to the moved prefix."""
@@ -431,6 +449,66 @@ def main():
         emitted = emissions(wait_records(results_feed, 5))
         assert_subset(emitted, expected)
 
+        # Compute-lease evidence: the Pipe's drive authority is a catalog
+        # lease seeded co-located with the Subscription progress owner —
+        # but it moves independently.
+        progress = admin_progress(VOTERS[0], subscription)
+        row = show_pipe(VOTERS[0], pipe)
+        if row["compute_owner"] != progress["owner"] or row["compute_epoch"] != 1:
+            raise AssertionError(
+                {"seeded_lease": row, "progress_owner": progress}
+            )
+        lease_target = next(
+            node
+            for node in VOTER_SERVICES
+            if node != progress["owner"]
+        )
+        wcl_retry(
+            VOTERS[0],
+            f"MOVE PIPE COMPUTE {pipe} TO NODE {lease_target};",
+        )
+        moved = show_pipe(VOTERS[0], pipe)
+        if (
+            moved["compute_owner"] != lease_target
+            or moved["compute_epoch"] != 2
+        ):
+            raise AssertionError({"lease_after_move": moved})
+        progress_after = admin_progress(VOTERS[0], subscription)
+        if (
+            progress_after["owner"] != progress["owner"]
+            or progress_after["ownership_epoch"]
+            != progress["ownership_epoch"]
+        ):
+            raise AssertionError(
+                "compute-lease move touched the progress placement: "
+                f"{progress} -> {progress_after}"
+            )
+
+        # Fresh input while the compute lease and the progress owner live
+        # on different Nodes proves the remote drive path end-to-end.
+        tm = time.time_ns()
+        pm = pane_of(tm)
+        append_json(
+            VOTERS[2],
+            writer,
+            writer_epoch,
+            [("acme", 9, tm)],
+            retries=30,
+        )
+        source_records += 1
+        expected[("acme", pm)] = (1, 9)
+        emitted = emissions(wait_records(results_feed, 6, deadline=90))
+        assert_subset(emitted, expected)
+
+        # Park the lease on the voter about to drain (it may already be
+        # there from the divergence move) so the drain must migrate it
+        # alongside ranges and progress.
+        if show_pipe(VOTERS[0], pipe)["compute_owner"] != "control-1":
+            wcl_retry(
+                VOTERS[0],
+                f"MOVE PIPE COMPUTE {pipe} TO NODE control-1;",
+            )
+
         # Three-to-four: start and register the storage Node. Its pin is not
         # in the voters' static peer set — only the catalog registration
         # makes it a trusted internal peer.
@@ -468,6 +546,11 @@ def main():
             raise AssertionError(
                 f"drain never moved data/progress to {STORAGE_NODE}: {moves_seen}"
             )
+        # The parked compute lease had to migrate off the drained voter
+        # too; it lands on any storage-eligible survivor.
+        post_drain = show_pipe(VOTERS[0], pipe)
+        if post_drain["compute_owner"] == "control-1":
+            raise AssertionError({"lease_still_on_drained_node": post_drain})
 
         placed = placement(VOTERS[0], source)
         if STORAGE_NODE not in placed["replicas"]:
@@ -501,15 +584,24 @@ def main():
         expected[("acme", p2 + 1)] = (1, 2)
         deadline = time.time() + 150
         emitted = None
+        last_error = None
         while time.time() < deadline:
             try:
                 emitted = emissions(wait_records(results_feed, 7, deadline=30))
                 assert_subset(emitted, expected)
                 break
-            except AssertionError:
+            except AssertionError as error:
+                last_error = error
                 time.sleep(2)
         else:
-            assert_subset(emitted or {}, expected)
+            raise AssertionError(
+                {
+                    "post_drain_emissions": last_error,
+                    "feed_records": len(read(VOTERS[2], results_feed)),
+                    "lease": show_pipe(VOTERS[0], pipe),
+                    "progress": admin_progress(VOTERS[0], subscription),
+                }
+            )
 
         # Hard restart of the joined Node: replicas re-sync, drives keep
         # committing through the quorum that includes it, and no pane
@@ -529,15 +621,25 @@ def main():
         source_records += 1
         expected[("acme", p3)] = (1, 4)
         deadline = time.time() + 150
+        emitted = None
+        last_error = None
         while time.time() < deadline:
             try:
                 emitted = emissions(wait_records(results_feed, 8, deadline=30))
                 assert_subset(emitted, expected)
                 break
-            except AssertionError:
+            except AssertionError as error:
+                last_error = error
                 time.sleep(2)
         else:
-            assert_subset(emitted or {}, expected)
+            raise AssertionError(
+                {
+                    "post_restart_emissions": last_error,
+                    "feed_records": len(read(VOTERS[2], results_feed)),
+                    "lease": show_pipe(VOTERS[0], pipe),
+                    "progress": admin_progress(VOTERS[0], subscription),
+                }
+            )
 
         # Exactly-once and quarantine evidence across the whole lifecycle.
         sentinels = sentinel_rows(VOTERS[1], panes_store)
@@ -559,6 +661,13 @@ def main():
                     "emissions": len(emitted),
                     "placement_after_drain": placed["replicas"],
                     "progress_moves_to_storage": progress_moves,
+                    "compute_lease_moves": sum(
+                        1
+                        for move in moves_seen
+                        if "move_pipe_compute_lease" in json.dumps(move)
+                    ),
+                    "compute_owner_after_drain": post_drain["compute_owner"],
+                    "compute_epoch_after_drain": post_drain["compute_epoch"],
                     "storage_served_records": len(
                         storage_serves_read(source, source_records)
                     ),

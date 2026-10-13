@@ -2691,6 +2691,17 @@ pub async fn drive_local_pipes(state: &AppState, limit: usize) -> Vec<PipeDriveO
             });
             continue;
         }
+        let Some(lease) = state.control.pipe_compute_lease(pipe.pipe_id).await else {
+            outcomes.push(PipeDriveOutcome::Failed {
+                pipe_id: pipe.pipe_id,
+                message: "Pipe compute lease is unavailable".to_owned(),
+            });
+            continue;
+        };
+        if lease.owner != local {
+            outcomes.push(PipeDriveOutcome::NotOwner);
+            continue;
+        }
         let Some(assignment) = state
             .control
             .active_subscription_progress_assignment_by_id(pipe.subscription_id)
@@ -2702,10 +2713,6 @@ pub async fn drive_local_pipes(state: &AppState, limit: usize) -> Vec<PipeDriveO
             });
             continue;
         };
-        if assignment.owner != local {
-            outcomes.push(PipeDriveOutcome::NotOwner);
-            continue;
-        }
         match drive_pipe(
             state,
             &pipe,
@@ -7980,6 +7987,16 @@ impl DrainMoveDriver for AdminDrainDriver {
             | crate::control::Command::RecoverSubscriptionProgressOwner { .. }) => {
                 self.post("/v1/admin/subscriptions/move-progress", &command)
                     .await
+            }
+            command @ crate::control::Command::MovePipeComputeLease { .. } => {
+                self.post(
+                    "/v1/admin/commands",
+                    &CommandBatchRequest {
+                        request_id: None,
+                        commands: vec![command],
+                    },
+                )
+                .await
             }
             _ => Err("drain plan emitted an unexpected command".to_owned()),
         }

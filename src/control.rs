@@ -384,6 +384,21 @@ pub struct PipeDefinition {
     pub created_at_ns: i64,
 }
 
+/// Which storage-eligible Node may drive a Pipe right now. The lease is
+/// pure catalog metadata — it owns no replica state of its own, so moving
+/// it is a single epoch-bumping compare-and-set rather than a staged
+/// replica cutover. Raced drives still converge on the deterministic
+/// Declare journal and the Subscription frontier CAS, so an in-flight
+/// drive finishing on the previous owner is safe; the fencing guarantee
+/// is that no *new* drive starts there after the move commits.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PipeComputeLease {
+    pub pipe_id: Uuid,
+    pub owner: StorageNodeId,
+    /// Bumped on every move; fences stale drain plans and operator moves.
+    pub compute_epoch: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriterDefinition {
     pub writer_id: Uuid,
@@ -706,6 +721,8 @@ struct CatalogState {
     #[serde(default)]
     subscription_progress_assignments: BTreeMap<Uuid, SubscriptionProgressAssignment>,
     #[serde(default)]
+    pipe_compute_leases: BTreeMap<Uuid, PipeComputeLease>,
+    #[serde(default)]
     subscription_feed_memberships: BTreeMap<Uuid, BTreeMap<Uuid, SubscriptionFeedMembership>>,
     #[serde(default)]
     state_store_assignments: BTreeMap<Uuid, crate::state_store::StateStoreAssignment>,
@@ -768,6 +785,7 @@ impl Default for CatalogState {
             readers: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
             subscription_progress_assignments: BTreeMap::new(),
+            pipe_compute_leases: BTreeMap::new(),
             subscription_feed_memberships: BTreeMap::new(),
             state_store_assignments: BTreeMap::new(),
             reader_frontiers: BTreeMap::new(),
@@ -1132,6 +1150,16 @@ pub enum Command {
         expected_ownership_epoch: u64,
         replaced: StorageNodeId,
         replacement: StorageNodeId,
+    },
+    /// Move a Pipe's epoch-fenced compute lease to another
+    /// storage-eligible Node. `expected_compute_epoch` fences stale
+    /// drain plans; operator moves through `MOVE PIPE COMPUTE` leave it
+    /// unset and take the current lease unconditionally.
+    MovePipeComputeLease {
+        pipe: String,
+        new_owner: StorageNodeId,
+        #[serde(default)]
+        expected_compute_epoch: Option<u64>,
     },
     RegisterStorageNode {
         node: StorageNodeId,
@@ -1992,6 +2020,16 @@ impl ControlController {
     }
 
     /// Every active Pipe in the catalog.
+    /// The compute lease currently authorizing a Node to drive this
+    /// Pipe. Pipes declared before compute leases existed synthesize a
+    /// lease on the Subscription progress owner — exactly the previous
+    /// implicit scheduling rule — until an explicit move writes a real
+    /// entry.
+    pub async fn pipe_compute_lease(&self, pipe_id: Uuid) -> Option<PipeComputeLease> {
+        let state = self.state.lock().await;
+        effective_pipe_compute_lease(&state, pipe_id)
+    }
+
     pub async fn active_pipes(&self) -> Vec<PipeDefinition> {
         self.state
             .lock()
@@ -2701,6 +2739,19 @@ impl ControlController {
                         (Some(output.feed_id), Some(store.store_id))
                     }
                 };
+                // The compute lease starts co-located with the
+                // Subscription progress owner (the previous implicit
+                // scheduling rule); it moves independently afterwards.
+                let compute_owner = state
+                    .subscription_progress_assignments
+                    .get(&subscription.subscription_id)
+                    .map(|assignment| assignment.owner.clone())
+                    .or_else(|| self.storage_pool(state).into_iter().next())
+                    .ok_or_else(|| {
+                        ControlError::InvalidOperation(
+                            "no storage-eligible Node can hold the Pipe compute lease".to_owned(),
+                        )
+                    })?;
                 let definition = PipeDefinition {
                     pipe_id: derived_resource_id(request_id, "pipe"),
                     name: name.clone(),
@@ -2714,6 +2765,14 @@ impl ControlController {
                     created_at_ns: issued_at_ns,
                 };
                 state.pipes.insert(definition.pipe_id, definition.clone());
+                let lease = PipeComputeLease {
+                    pipe_id: definition.pipe_id,
+                    owner: compute_owner,
+                    compute_epoch: 1,
+                };
+                state
+                    .pipe_compute_leases
+                    .insert(definition.pipe_id, lease);
                 Ok((
                     format!("declared Pipe {name}; no records flow until a Pipe driver exists"),
                     json!(definition),
@@ -3427,6 +3486,61 @@ impl ControlController {
                 Ok((
                     format!(
                         "moved Subscription progress replica {replaced} to {replacement} at epoch {next_epoch}"
+                    ),
+                    json!(next),
+                ))
+            }
+            Command::MovePipeComputeLease {
+                pipe,
+                new_owner,
+                expected_compute_epoch,
+            } => {
+                let definition = state
+                    .pipes
+                    .values()
+                    .find(|item| {
+                        item.name == pipe && item.status == ResourceStatus::Active
+                    })
+                    .cloned()
+                    .ok_or_else(|| ControlError::NotFound(format!("Pipe {pipe}")))?;
+                let current = effective_pipe_compute_lease(state, definition.pipe_id)
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!("Pipe compute lease for {pipe}"))
+                    })?;
+                if let Some(expected) = expected_compute_epoch {
+                    if current.compute_epoch != expected {
+                        return Err(ControlError::InvalidOperation(
+                            "Pipe compute lease changed while the move was being planned"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                if current.owner == new_owner {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "{new_owner} already owns the compute lease for Pipe {pipe}"
+                    )));
+                }
+                if !self.storage_eligible(state, &new_owner) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "compute lease target {new_owner} is not eligible for storage"
+                    )));
+                }
+                let next_epoch = current.compute_epoch.checked_add(1).ok_or_else(|| {
+                    ControlError::InvalidOperation(
+                        "Pipe compute lease epoch overflowed".to_owned(),
+                    )
+                })?;
+                let next = PipeComputeLease {
+                    pipe_id: definition.pipe_id,
+                    owner: new_owner.clone(),
+                    compute_epoch: next_epoch,
+                };
+                state
+                    .pipe_compute_leases
+                    .insert(definition.pipe_id, next.clone());
+                Ok((
+                    format!(
+                        "moved Pipe {pipe} compute lease to {new_owner} at epoch {next_epoch}"
                     ),
                     json!(next),
                 ))
@@ -4523,7 +4637,15 @@ impl ControlController {
                 state.subscription_feed_memberships.remove(&subscription_id);
                 Ok(result)
             }
-            ResourceKind::Pipe => drop_named(&mut state.pipes, name, "Pipe"),
+            ResourceKind::Pipe => {
+                let outcome = drop_named(&mut state.pipes, name, "Pipe");
+                if outcome.is_ok() {
+                    if let Some(pipe) = state.pipes.values().find(|item| item.name == name) {
+                        state.pipe_compute_leases.remove(&pipe.pipe_id);
+                    }
+                }
+                outcome
+            }
             ResourceKind::Index => {
                 // Nothing depends on a declared Index and no built data can
                 // exist yet, so dropping removes the definition outright.
@@ -5176,6 +5298,18 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 kind,
                 current: token(&tokens, 2)?.to_owned(),
                 new: token(&tokens, 4)?.to_owned(),
+            })
+        }
+        Some("MOVE") => {
+            expect_keyword(&tokens, 1, "PIPE")?;
+            expect_keyword(&tokens, 2, "COMPUTE")?;
+            expect_keyword(&tokens, 4, "TO")?;
+            expect_keyword(&tokens, 5, "NODE")?;
+            Ok(Command::MovePipeComputeLease {
+                pipe: token(&tokens, 3)?.to_owned(),
+                new_owner: StorageNodeId::try_new(token(&tokens, 6)?.to_owned())
+                    .map_err(|error| ControlError::Syntax(error.to_string()))?,
+                expected_compute_epoch: None,
             })
         }
         Some("PAUSE") => {
@@ -6147,6 +6281,14 @@ fn show_resources(
             .pipes
             .values()
             .filter(|item| item.status == ResourceStatus::Active)
+            .map(|item| {
+                let mut row = serde_json::to_value(item).unwrap_or_else(|_| json!({}));
+                if let Some(lease) = effective_pipe_compute_lease(state, item.pipe_id) {
+                    row["compute_owner"] = json!(lease.owner.as_str());
+                    row["compute_epoch"] = json!(lease.compute_epoch);
+                }
+                row
+            })
             .collect::<Vec<_>>()),
         ShowKind::Indexes => json!(state.indexes.values().collect::<Vec<_>>()),
         ShowKind::StateStores => json!(state
@@ -6299,6 +6441,13 @@ fn storage_node_in_use(state: &CatalogState, node: &StorageNodeId) -> Option<&'s
     {
         return Some("a Subscription progress assignment");
     }
+    if state
+        .pipe_compute_leases
+        .values()
+        .any(|lease| lease.owner == *node)
+    {
+        return Some("a Pipe compute lease");
+    }
     None
 }
 
@@ -6309,6 +6458,27 @@ pub struct StorageDrainPlan {
     pub moves: Vec<Command>,
     pub unplannable: Vec<String>,
     pub ready_to_retire: bool,
+}
+
+/// Resolve the lease that currently authorizes driving `pipe_id`: the
+/// persisted entry when one exists, otherwise the legacy co-location
+/// with the Subscription progress owner.
+fn effective_pipe_compute_lease(state: &CatalogState, pipe_id: Uuid) -> Option<PipeComputeLease> {
+    let pipe = state.pipes.get(&pipe_id)?;
+    if pipe.status != ResourceStatus::Active {
+        return None;
+    }
+    if let Some(lease) = state.pipe_compute_leases.get(&pipe_id) {
+        return Some(lease.clone());
+    }
+    let assignment = state
+        .subscription_progress_assignments
+        .get(&pipe.subscription_id)?;
+    Some(PipeComputeLease {
+        pipe_id,
+        owner: assignment.owner.clone(),
+        compute_epoch: assignment.ownership_epoch,
+    })
 }
 
 fn drain_replacement(
@@ -6424,6 +6594,26 @@ fn storage_drain_plan(
             )),
         }
     }
+    for (pipe_id, lease) in state.pipe_compute_leases.iter() {
+        if lease.owner != *node {
+            continue;
+        }
+        let Some(pipe) = state.pipes.get(pipe_id) else {
+            continue;
+        };
+        let excluded: BTreeSet<StorageNodeId> = [node.clone()].into_iter().collect();
+        match drain_replacement(state, controller, &excluded, pipe_id) {
+            Some(replacement) => moves.push(Command::MovePipeComputeLease {
+                pipe: pipe.name.clone(),
+                new_owner: replacement,
+                expected_compute_epoch: Some(lease.compute_epoch),
+            }),
+            None => unplannable.push(format!(
+                "Pipe {} compute lease has no eligible replacement Node for {node}",
+                pipe.name
+            )),
+        }
+    }
     StorageDrainPlan {
         node: node.clone(),
         draining: state.draining_storage_nodes.contains(node),
@@ -6527,6 +6717,7 @@ fn command_label(command: &Command) -> String {
         Command::AbortOwnerMove { .. } => "ABORT OWNER MOVE",
         Command::RecoverSubscriptionProgressOwner { .. } => "RECOVER SUBSCRIPTION PROGRESS OWNER",
         Command::MoveSubscriptionProgressReplica { .. } => "MOVE SUBSCRIPTION PROGRESS REPLICA",
+        Command::MovePipeComputeLease { .. } => "MOVE PIPE COMPUTE LEASE",
         Command::RegisterStorageNode { .. } => "REGISTER STORAGE NODE",
         Command::RetireStorageNode { .. } => "RETIRE STORAGE NODE",
         Command::DrainStorageNode { .. } => "DRAIN STORAGE NODE",
@@ -9517,5 +9708,191 @@ mod tests {
                 "{statement} must fail"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn pipe_compute_leases_seed_move_and_fence() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute(
+                "CREATE DOMAIN accounts; CREATE FEED accounts.events; \
+                 CREATE FEED accounts.enriched; CREATE SUBSCRIPTION accounts.flow \
+                 FROM accounts.events;",
+            )
+            .await
+            .unwrap();
+        controller
+            .execute("CREATE PIPE accounts.forward FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched;")
+            .await
+            .unwrap();
+        let pipe = controller
+            .active_pipe_by_name("accounts.forward")
+            .await
+            .unwrap();
+        let progress = controller
+            .active_subscription_progress_assignment_by_id(pipe.subscription_id)
+            .await
+            .unwrap();
+        // The seeded lease is co-located with the Subscription progress
+        // owner — the previous implicit scheduling rule.
+        let lease = controller.pipe_compute_lease(pipe.pipe_id).await.unwrap();
+        assert_eq!(lease.owner, progress.owner);
+        assert_eq!(lease.compute_epoch, 1);
+        // SHOW PIPES exposes the effective lease.
+        let shown = controller.execute("SHOW PIPES;").await.unwrap();
+        assert_eq!(
+            shown.results[0].data[0]["compute_owner"],
+            lease.owner.as_str()
+        );
+        assert_eq!(shown.results[0].data[0]["compute_epoch"], 1);
+        // MOVE PIPE COMPUTE migrates the lease to another eligible Node
+        // and bumps its epoch while the progress placement stays put.
+        let target = ["storage-1", "storage-2", "storage-3"]
+            .into_iter()
+            .map(|node| StorageNodeId::try_new(node).unwrap())
+            .find(|node| *node != lease.owner)
+            .unwrap();
+        controller
+            .execute(&format!(
+                "MOVE PIPE COMPUTE accounts.forward TO NODE {target};"
+            ))
+            .await
+            .unwrap();
+        let moved = controller.pipe_compute_lease(pipe.pipe_id).await.unwrap();
+        assert_eq!(moved.owner, target);
+        assert_eq!(moved.compute_epoch, 2);
+        let progress_after = controller
+            .active_subscription_progress_assignment_by_id(pipe.subscription_id)
+            .await
+            .unwrap();
+        assert_eq!(progress_after.owner, progress.owner);
+        assert_eq!(progress_after.ownership_epoch, progress.ownership_epoch);
+        // A stale expected epoch (a raced drain plan) is refused.
+        assert!(controller
+            .execute_commands(vec![Command::MovePipeComputeLease {
+                pipe: "accounts.forward".to_owned(),
+                new_owner: progress.owner.clone(),
+                expected_compute_epoch: Some(1),
+            }])
+            .await
+            .is_err());
+        // An ineligible target and a no-op move are both refused.
+        assert!(controller
+            .execute("MOVE PIPE COMPUTE accounts.forward TO NODE storage-9;")
+            .await
+            .is_err());
+        assert!(controller
+            .execute(&format!(
+                "MOVE PIPE COMPUTE accounts.forward TO NODE {target};"
+            ))
+            .await
+            .is_err());
+        // The lease survives a catalog snapshot/reopen.
+        drop(controller);
+        let reopened = new_controller(&directory);
+        let persisted = reopened.pipe_compute_lease(pipe.pipe_id).await.unwrap();
+        assert_eq!(persisted.owner, target);
+        assert_eq!(persisted.compute_epoch, 2);
+        // Dropping the Pipe retires its lease.
+        reopened
+            .execute("DROP PIPE accounts.forward;")
+            .await
+            .unwrap();
+        assert!(reopened.pipe_compute_lease(pipe.pipe_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn storage_drain_plan_moves_pipe_compute_leases() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute(
+                "CREATE DOMAIN accounts; CREATE FEED accounts.events; \
+                 CREATE FEED accounts.enriched; CREATE SUBSCRIPTION accounts.flow \
+                 FROM accounts.events; \
+                 CREATE PIPE accounts.forward FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched;",
+            )
+            .await
+            .unwrap();
+        let pipe = controller
+            .active_pipe_by_name("accounts.forward")
+            .await
+            .unwrap();
+        let lease = controller.pipe_compute_lease(pipe.pipe_id).await.unwrap();
+        let plan = controller.storage_drain_plan(&lease.owner).await.unwrap();
+        let planned = plan
+            .moves
+            .iter()
+            .find_map(|command| match command {
+                Command::MovePipeComputeLease {
+                    pipe,
+                    new_owner,
+                    expected_compute_epoch,
+                } if pipe == "accounts.forward" => {
+                    Some((new_owner.clone(), *expected_compute_epoch))
+                }
+                _ => None,
+            })
+            .expect("drain plan must move the Pipe compute lease");
+        assert_eq!(planned.1, Some(lease.compute_epoch));
+        assert_ne!(planned.0, lease.owner);
+        // Draining a Node that holds no lease plans no Pipe move.
+        let other = ["storage-1", "storage-2", "storage-3"]
+            .into_iter()
+            .map(|node| StorageNodeId::try_new(node).unwrap())
+            .find(|node| *node != lease.owner)
+            .unwrap();
+        let other_plan = controller.storage_drain_plan(&other).await.unwrap();
+        assert!(!other_plan
+            .moves
+            .iter()
+            .any(|command| matches!(command, Command::MovePipeComputeLease { .. })));
+    }
+
+    #[tokio::test]
+    async fn legacy_pipes_synthesize_their_lease_from_the_progress_owner() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute(
+                "CREATE DOMAIN accounts; CREATE FEED accounts.events; \
+                 CREATE FEED accounts.enriched; CREATE SUBSCRIPTION accounts.flow \
+                 FROM accounts.events; \
+                 CREATE PIPE accounts.forward FROM SUBSCRIPTION accounts.flow TO FEED accounts.enriched;",
+            )
+            .await
+            .unwrap();
+        let pipe = controller
+            .active_pipe_by_name("accounts.forward")
+            .await
+            .unwrap();
+        // Simulate a catalog written before compute leases existed.
+        controller.state.lock().await.pipe_compute_leases.clear();
+        let progress = controller
+            .active_subscription_progress_assignment_by_id(pipe.subscription_id)
+            .await
+            .unwrap();
+        let lease = controller.pipe_compute_lease(pipe.pipe_id).await.unwrap();
+        assert_eq!(lease.owner, progress.owner);
+        assert_eq!(lease.compute_epoch, progress.ownership_epoch);
+        // A legacy Pipe still takes an explicit move: the synthesized
+        // epoch is the CAS base.
+        let target = ["storage-1", "storage-2", "storage-3"]
+            .into_iter()
+            .map(|node| StorageNodeId::try_new(node).unwrap())
+            .find(|node| *node != lease.owner)
+            .unwrap();
+        controller
+            .execute_commands(vec![Command::MovePipeComputeLease {
+                pipe: "accounts.forward".to_owned(),
+                new_owner: target.clone(),
+                expected_compute_epoch: Some(lease.compute_epoch),
+            }])
+            .await
+            .unwrap();
+        let moved = controller.pipe_compute_lease(pipe.pipe_id).await.unwrap();
+        assert_eq!(moved.owner, target);
+        assert_eq!(moved.compute_epoch, progress.ownership_epoch + 1);
     }
 }
