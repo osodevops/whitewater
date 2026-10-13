@@ -1,10 +1,29 @@
-# Whitewater vs Kafka: fewer decisions, more time building
+# Whitewater vs Kafka: partition-free streaming, fewer operational decisions
 
-> Choose your data, your capacity, and your service policy. Let the platform handle placement and replication — without a topology project for every new Feed.
+> No partitions to create, count, assign, or repartition. Build around your business data — Whitewater handles the physical layout.
 
-Whitewater is a Rust-based streaming platform and distributed database designed to make distributed event infrastructure simpler to build on and operate. Applications work with Feeds, business Keys, Cursors, Subscriptions, and StateStores. The Riverbed handles the physical layout beneath them.
+**Whitewater is a partition-free streaming platform and distributed database, built in Rust.** A Feed has no user-defined partitions. You do not choose a partition count when creating it, assign consumers to numbered partitions, or plan repartitioning when your workload grows. You choose a Feed and a business Key; the Riverbed manages the storage and replication beneath them.
 
-**Partition-free for applications. Replica management-free for application teams. Three Nodes and three active replicas as the baseline — with a larger service footprint when your workload needs it.**
+This is the central difference from Kafka: **partition management is removed from the public model, not made into a friendlier configuration screen.** Applications work with Feeds, Keys, opaque Cursors, Subscriptions, and StateStores. Operators manage service capacity, durability intent, and resource policies rather than a partition plan for each Feed.
+
+**Partition-free by design. Replication managed by the platform. Three Nodes and three active replicas as the baseline — with a larger service footprint when your workload needs it.**
+
+## Partition-free: what you no longer have to manage
+
+| With Kafka | With Whitewater |
+|---|---|
+| A topic is divided into a configured number of partitions. | A Feed has no partition-count setting. |
+| Partitioning determines which partition receives a Key. | The business Key defines ordering; physical routing is internal. |
+| A consumer group assigns topic partitions to its consumers. | Applications use Readers and Subscriptions, not partition assignments. |
+| Stored progress is expressed through topic/partition offsets. | Progress is represented by opaque Cursors, not physical addresses. |
+| Capacity planning includes partition parallelism and placement. | Capacity is a Riverbed concern; adding capacity does not require users to change a Feed's partition count. |
+| Stateful processing can require matching partitioning across inputs. | The StateStore/Pipe contract uses logical lookups without client co-partitioning plans. |
+
+**Create the Feed. Choose the business Key. Write, read, and process data — without partition arithmetic.**
+
+Partition-free does not mean the storage engine has no internal divisions. Whitewater uses internal Active Ranges that can split, merge, and move beneath a stable Feed identity. These are storage mechanisms, not public partitions that customers must size or assign. Authorized diagnostics may show placement to explain an incident; inspecting it does not make it part of the application contract.
+
+Ordering is defined for the same Feed and Key, not as a total order across the entire Feed. Adding Nodes does not parallelize one strictly ordered hot Key. The partition-free interface is the contract; the delivery status of automatic placement, scaling, and processing is identified below.
 
 ## What this comparison means
 
@@ -20,9 +39,9 @@ The checkboxes below are for a reader evaluating which simplifications matter to
 
 | Evaluate | The job | Kafka model / typical team responsibility | Whitewater experience | Basis |
 |---|---|---|---|---|
-| [ ] | Create an event stream | A topic has a partition count and replication factor, explicitly chosen or inherited from defaults. | Create a Feed. No partition count or replica assignment in the application request. | Contract |
+| [ ] | Create a partition-free event stream | A topic has partitions, with a count and replication factor explicitly chosen or inherited from defaults. | Create a Feed with no public partitions: no partition count to choose, no partition assignments to maintain, and no replica layout to supply. | Contract |
 | [ ] | Preserve business ordering | Keys map to partitions; partitioning strategy and count changes can affect that mapping. | Supply the business Key. Same-Feed/same-Key accepted order is the contract; physical placement stays internal. | Contract |
-| [ ] | Set the durability baseline | Coordinate replication factor, producer acknowledgements, minimum in-sync replicas, and related policies. | Three active replicas and normal two-of-three durable acknowledgement are the baseline, not independent application tuning choices. | Contract |
+| [ ] | Set the durability baseline | Coordinate replication factor, producer acknowledgements, minimum in-sync replicas, and related policies; Kafka `acks=all` waits for the current in-sync replica set, subject to minimum ISR. | RF3 by default, with requested ACK ALL success on every replica required by the committed placement unless an authorized override is explicit. No silent downgrade when a replica is unavailable. | Direction: [ACK ALL tasks](tasks.md#m53--ack-all-by-default-explicit-acknowledgement-overrides); current code uses two-of-three quorum acknowledgement |
 | [ ] | Choose a larger service | Plan broker capacity separately from partition placement and assignments. | Set a Riverbed capacity floor, such as eight Nodes, without changing every Feed. Node count and replication factor remain separate choices. | Direction; eight-Node example below is not a verified deployment claim |
 | [ ] | Absorb sustained traffic growth | Add brokers and arrange useful placement through reassignment, an operator, or managed-service tooling. | Add capacity gradually and move eligible work onto it under platform control; no Feed-by-Feed reassignment plan for the customer. | Direction |
 | [ ] | Scale back down | Ensure data and leadership are safely moved before decommissioning a broker. | Automatically refuse removal until ownership/data drain is complete and the Node is verified safe to remove. | Direction |
@@ -109,7 +128,7 @@ The scaling controller runs outside the data Nodes; Nodes do not need Docker or 
 
 ## Delivery boundary: sell the experience, prove the guarantee
 
-The partition-free public model, RF3 baseline, and Rust implementation underpin this comparison. Automatic useful placement over larger live Riverbeds, complete Node draining, lifecycle scheduling, and production operational guarantees still require their acceptance evidence. Current executable storage eligibility is tied to configured Control Plane Nodes, and initial Feed placement takes the first three eligible Nodes. Discovery or a placement simulation alone does not prove an eight-Node data service.
+The partition-free public model, RF3 baseline, and Rust implementation underpin this comparison. Automatic useful placement over larger live Riverbeds, complete Node draining, lifecycle scheduling, and production operational guarantees still require their acceptance evidence. The current code already combines configured storage identities with independently registered storage Nodes, excludes draining/retired Nodes, and uses rendezvous hashing to place three replicas and an owner per Feed range. Replication factor remains fixed at three. The existing request-local autoscaling policy exposes minimum/maximum Node counts but does not yet provide an authoritative persisted Riverbed policy or restore a below-minimum service independently of traffic. See [capacity-policy tasks](tasks.md#m51--riverbed-capacity-policy-and-minimum-node-reconciliation) and [configurable-replication tasks](tasks.md#m52--service-wide-durability-policy-and-configurable-replication-factor). Discovery or a placement simulation alone does not prove an eight-Node data service.
 
 The eight-Node example and optional service-wide/adaptive RF controls describe direction and proposals. They do not change the architecture contract, introduce configuration keys, or certify throughput, storage capacity, or production readiness. Before promoting them to shipped features, demonstrate safe scale-out/in, sustained storage growth, maintenance under load, Node loss, interrupted movement, policy transitions, and recovery without losing acknowledged data.
 
