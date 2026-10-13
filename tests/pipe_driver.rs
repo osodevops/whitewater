@@ -24,8 +24,8 @@ use whitewater::effect::{
 use whitewater::index::IndexValue;
 use whitewater::pipe::{
     pipe_declare_request_id, pipe_effect_id, pipe_emission_writer_session,
-    pipe_output_writer_session, window_pane_row_key, EnrichResolution, FetchedPage, FetchedRecord,
-    PipeDriver, WindowEmission,
+    pipe_output_writer_session, window_group_key_bytes, window_pane_row_key, window_refused_groups,
+    EnrichResolution, FetchedPage, FetchedRecord, PipeDriver, WindowEmission,
 };
 use whitewater::reader::{
     FjallSubscriptionProgressReplica, SubscriptionCommitEvidence, SubscriptionMemberState,
@@ -625,6 +625,7 @@ fn page_with_emissions(
         positions: BTreeMap::from([(range(), cursor.to_owned())]),
         emissions,
         expired: Vec::new(),
+        refused: Vec::new(),
     }
 }
 
@@ -1069,6 +1070,7 @@ fn window_pipe() -> PipeDefinition {
             time: whitewater::control::WindowTime::Event,
             max_late_ns: None,
             expire_ns: None,
+            key_limit: None,
             aggregation: WindowAggregation::Sum {
                 value: IndexFieldSpec::Projection {
                     extractor: "json".to_owned(),
@@ -1111,6 +1113,7 @@ async fn window_pipe_quarantines_late_events_into_a_countable_row() {
         time: whitewater::control::WindowTime::Event,
         max_late_ns: Some(500),
         expire_ns: None,
+        key_limit: None,
     };
     let harness = harness_for(pipe);
     seed_frontier(&harness.progress, "p0").await;
@@ -1170,6 +1173,7 @@ fn ingest_window_pipe() -> PipeDefinition {
         time: whitewater::control::WindowTime::Ingest,
         max_late_ns: None,
         expire_ns: None,
+        key_limit: None,
     };
     pipe
 }
@@ -1598,6 +1602,7 @@ fn emit_window_pipe() -> PipeDefinition {
         time: whitewater::control::WindowTime::Event,
         max_late_ns: Some(20),
         expire_ns: None,
+        key_limit: None,
     };
     pipe.output_feed_id = Some(Uuid::from_u128(OUTPUT_FEED));
     pipe
@@ -1614,6 +1619,7 @@ fn expire_window_pipe() -> PipeDefinition {
         time: whitewater::control::WindowTime::Event,
         max_late_ns: None,
         expire_ns: Some(30),
+        key_limit: None,
     };
     pipe
 }
@@ -2060,4 +2066,104 @@ async fn window_emissions_without_an_emit_feed_fail_closed() {
     assert!(matches!(result, Err(EffectJournalError::Conflict)));
     assert!(harness.sink.appends.lock().unwrap().is_empty());
     assert!(harness.sink.mutations.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn window_limit_keys_quarantines_refused_groups_into_a_shared_sentinel() {
+    let harness = harness_for(window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+
+    // Fetch-time resolution refused new groups "b"/"c"; "a" admitted.
+    let tagged = |bytes: &[u8]| window_group_key_bytes(&IndexValue::Bytes(bytes.to_vec())).unwrap();
+    let records = vec![
+        json_record(1, b"a", 10, 5),
+        json_record(2, b"b", 10, 7),
+        json_record(3, b"c", 20, 9),
+        json_record(4, b"b", 30, 11),
+    ];
+    let refused = vec![tagged(b"b"), tagged(b"c")];
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async {
+                Ok(FetchedPage {
+                    records,
+                    cursor: "p1".to_owned(),
+                    positions: BTreeMap::from([(range(), "p1".to_owned())]),
+                    emissions: Vec::new(),
+                    expired: Vec::new(),
+                    refused,
+                })
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
+        panic!("expected AccumulateRows")
+    };
+    // One real pane row for "a" plus the single shared refusal row —
+    // refused groups never materialize per-group state.
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[0].named[0].values,
+        vec![IndexValue::Bytes(b"a".to_vec())]
+    );
+    assert_eq!(entries[0].named[1].values, vec![IndexValue::I64(1)]);
+    // Shared sentinel: `__keycap__` carries the count of every refused
+    // record regardless of which group it arrived under.
+    assert_eq!(
+        entries[1].named[0].values,
+        vec![IndexValue::Text("__keycap__".to_owned())]
+    );
+    assert_eq!(entries[1].named[1].values, vec![IndexValue::I64(-1)]);
+    assert_eq!(entries[1].count_delta, 3);
+    assert_eq!(entries[1].sum_delta, 0);
+    assert_eq!(
+        entries[1].key[entries[1].key.len() - 8..],
+        u64::MAX.to_be_bytes()
+    );
+}
+
+#[test]
+fn window_refused_groups_admits_seats_in_tagged_order() {
+    let key = IndexFieldSpec::Key;
+    let records = vec![
+        json_record(1, b"zeta", 10, 1),
+        json_record(2, b"alpha", 10, 1),
+        json_record(3, b"mid", 10, 1),
+        // A repeated key is one group, not four seats.
+        json_record(4, b"alpha", 20, 1),
+    ];
+    let tagged = |bytes: &[u8]| window_group_key_bytes(&IndexValue::Bytes(bytes.to_vec())).unwrap();
+
+    // One seat left after the existing key → the smallest tagged new key
+    // (byte order, not arrival order) admits; the rest refuse.
+    let active: BTreeSet<Vec<u8>> = [tagged(b"existing")].into_iter().collect();
+    let refused = window_refused_groups(&records, &key, 2, &active, false);
+    assert_eq!(refused, vec![tagged(b"mid"), tagged(b"zeta")]);
+
+    // Capacity for every incoming group → nothing refuses.
+    let refused = window_refused_groups(&records, &key, 10, &BTreeSet::new(), false);
+    assert!(refused.is_empty());
+
+    // A saturated scan provably exceeds the bound → every new key refuses.
+    let refused = window_refused_groups(&records, &key, 10, &BTreeSet::new(), true);
+    assert_eq!(refused.len(), 3);
+
+    // Already-active keys never refuse even at capacity; their records
+    // keep accumulating on the rows they already own.
+    let active: BTreeSet<Vec<u8>> = [tagged(b"alpha")].into_iter().collect();
+    let refused = window_refused_groups(&records, &key, 1, &active, false);
+    assert_eq!(refused, vec![tagged(b"mid"), tagged(b"zeta")]);
 }

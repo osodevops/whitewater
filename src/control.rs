@@ -142,6 +142,10 @@ pub enum PipeOperation {
         /// declared so a pane provably closes before it may expire.
         #[serde(default)]
         expire_ns: Option<u64>,
+        /// Bound on distinct active group Keys held in pane/sentinel state;
+        /// `None` leaves growth unbounded (the pre-limit behavior).
+        #[serde(default)]
+        key_limit: Option<u64>,
     },
     /// Point-lookup enrichment: for each delivered record, resolve one
     /// StateStore row by the projected `key` and copy its payload into the
@@ -2531,6 +2535,7 @@ impl ControlController {
                         time,
                         max_late_ns,
                         expire_ns,
+                        key_limit,
                     } => {
                         if *window_ns == 0 {
                             return Err(ControlError::InvalidOperation(
@@ -2562,6 +2567,19 @@ impl ControlController {
                                     ));
                                 }
                             }
+                        }
+                        if matches!(key_limit, Some(0)) {
+                            return Err(ControlError::InvalidOperation(
+                                "LIMIT KEYS requires a non-zero bound".to_owned(),
+                            ));
+                        }
+                        if key_limit
+                            .map(|limit| limit > crate::pipe::WINDOW_MAX_KEY_LIMIT)
+                            .unwrap_or(false)
+                        {
+                            return Err(ControlError::InvalidOperation(
+                                "LIMIT KEYS accepts at most 512 active Keys — the fetch-time scan must enumerate the store's key posting exactly, and larger cardinalities need a counted posting".to_owned(),
+                            ));
                         }
                         let output_store = output_store.ok_or_else(|| {
                             ControlError::InvalidOperation(
@@ -4925,6 +4943,25 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             expire_ns = Some(parse_duration_ns(token(&tokens, at + 1)?)?);
                             at += 2;
                         }
+                        // `LIMIT KEYS <n>` bounds the distinct active group
+                        // Keys the window may hold pane/sentinel state for.
+                        // New Keys beyond the bound refuse into a shared
+                        // sentinel row rather than growing state unboundedly.
+                        let mut key_limit = None;
+                        if token(&tokens, at)
+                            .map(|value| value.eq_ignore_ascii_case("LIMIT"))
+                            .unwrap_or(false)
+                        {
+                            expect_keyword(&tokens, at + 1, "KEYS")?;
+                            key_limit = Some(
+                                token(&tokens, at + 2)?.parse::<u64>().map_err(|_| {
+                                    ControlError::Syntax(
+                                        "LIMIT KEYS expects an unsigned integer".to_owned(),
+                                    )
+                                })?,
+                            );
+                            at += 3;
+                        }
                         let by = at;
                         expect_keyword(&tokens, by, "BY")?;
                         let (key, next) = parse_index_field_spec(&tokens, by + 1, "BY")?;
@@ -4969,6 +5006,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                                 window_ns,
                                 max_late_ns,
                                 expire_ns,
+                                key_limit,
                                 key,
                                 aggregation,
                                 time,
@@ -9298,6 +9336,7 @@ mod tests {
                 time: WindowTime::Event,
                 max_late_ns: None,
                 expire_ns: None,
+                key_limit: None,
             },
         };
         // Missing store, foreign-Domain store, zero window, and a missing
@@ -9399,6 +9438,7 @@ mod tests {
                 time: WindowTime::Event,
                 max_late_ns: None,
                 expire_ns: None,
+                key_limit: None,
                 ..
             }
         ));
@@ -9421,6 +9461,7 @@ mod tests {
                 time: WindowTime::Event,
                 max_late_ns: Some(bound),
                 expire_ns: None,
+                key_limit: None,
                 ..
             } if bound == 300_000_000_000
         ));
@@ -9499,6 +9540,7 @@ mod tests {
             PipeOperation::Window {
                 max_late_ns: Some(300_000_000_000),
                 expire_ns: Some(7_200_000_000_000),
+                key_limit: None,
                 ..
             }
         ));
@@ -9517,6 +9559,7 @@ mod tests {
                 .operation,
             PipeOperation::Window {
                 expire_ns: Some(7_200_000_000_000),
+                key_limit: None,
                 ..
             }
         ));
@@ -9525,6 +9568,42 @@ mod tests {
             "CREATE PIPE accounts.exp1 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h MAX_LATE 5m EXPIRE 1m BY KEY COUNT;",
             // Zero retention refuses.
             "CREATE PIPE accounts.exp2 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h EXPIRE 0s BY KEY COUNT;",
+        ] {
+            assert!(
+                leader.execute(statement).await.is_err(),
+                "{statement} must fail"
+            );
+        }
+
+        // LIMIT KEYS bounds the distinct active Keys the window may hold
+        // pane/sentinel state for; refusing Keys count one shared sentinel
+        // row instead of growing state without limit.
+        leader
+            .execute(
+                "CREATE PIPE accounts.capped FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h LIMIT KEYS 7 BY KEY COUNT;",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            leader
+                .active_pipe_by_name("accounts.capped")
+                .await
+                .unwrap()
+                .operation,
+            PipeOperation::Window {
+                key_limit: Some(7),
+                ..
+            }
+        ));
+        for statement in [
+            // A zero bound would refuse every record — rejected outright.
+            "CREATE PIPE accounts.cap0 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h LIMIT KEYS 0 BY KEY COUNT;",
+            // LIMIT requires the KEYS keyword.
+            "CREATE PIPE accounts.capx FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h LIMIT 7 BY KEY COUNT;",
+            // The bound must be an unsigned integer.
+            "CREATE PIPE accounts.capy FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h LIMIT KEYS many BY KEY COUNT;",
+            // Above the enumerable scan bound the count can't be proven.
+            "CREATE PIPE accounts.capz FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h LIMIT KEYS 513 BY KEY COUNT;",
         ] {
             assert!(
                 leader.execute(statement).await.is_err(),

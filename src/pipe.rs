@@ -10,14 +10,16 @@
 //! repeats instead of duplicating work. The driver never claims atomicity
 //! beyond what the journal's apply step provides.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::active_range::RangeId;
-use crate::control::{PipeDefinition, PipeOperation, WindowAggregation, WindowTime};
+use crate::control::{
+    IndexFieldSpec, PipeDefinition, PipeOperation, WindowAggregation, WindowTime,
+};
 use crate::effect::{
     effect_state_mutation_id, EffectConsume, EffectCoordinator, EffectJournalError, EffectMutation,
     EffectOutput, EffectStateMutation, EffectTransition,
@@ -74,6 +76,12 @@ pub struct FetchedPage {
     /// retention bound. They delete inside the same effect without
     /// emitting — expiry is a retention contract, not a close signal.
     pub expired: Vec<Vec<u8>>,
+    /// Window Pipes only: tagged group bytes refused by a declared
+    /// `LIMIT KEYS` bound, resolved at fetch time on the same serving
+    /// replica. Refused records accumulate the shared `__keycap__`
+    /// sentinel row rather than opening state for a new Key — the bound
+    /// holds on replay because the resolved set journals with the page.
+    pub refused: Vec<Vec<u8>>,
 }
 
 /// One closed window pane resolved for emission: the StateStore pane row
@@ -435,6 +443,7 @@ impl PipeDriver {
                 time,
                 max_late_ns,
                 expire_ns: _,
+                key_limit: _,
             } => {
                 let store_id = self
                     .pipe
@@ -451,6 +460,9 @@ impl PipeDriver {
                 // time quarantine into a countable per-group `late` row
                 // rather than revising closed panes or vanishing.
                 let mut late: BTreeMap<Vec<u8>, (u64, IndexValue)> = BTreeMap::new();
+                let refused: BTreeSet<&[u8]> =
+                    page.refused.iter().map(|group| group.as_slice()).collect();
+                let mut keycap = 0u64;
                 for record in &page.records {
                     let Some(source) = source_record(record) else {
                         continue;
@@ -469,6 +481,14 @@ impl PipeDriver {
                     else {
                         continue;
                     };
+                    // `LIMIT KEYS`: a group the fetch-time scan refused
+                    // accumulates the shared `__keycap__` sentinel row —
+                    // bounded, countable evidence instead of new pane
+                    // state. Lateness is moot for a refused group.
+                    if refused.contains(group.0.as_slice()) {
+                        keycap = keycap.saturating_add(1);
+                        continue;
+                    }
                     let lateness = record.ingest_time_ns.saturating_sub(record.event_time_ns);
                     if matches!(time, WindowTime::Event)
                         && max_late_ns
@@ -510,6 +530,7 @@ impl PipeDriver {
                 // rows still delete.
                 if panes.is_empty()
                     && late.is_empty()
+                    && keycap == 0
                     && page.emissions.is_empty()
                     && page.expired.is_empty()
                 {
@@ -537,6 +558,31 @@ impl PipeDriver {
                         },
                     )
                     .collect();
+                // `LIMIT KEYS` refusals accumulate one shared sentinel row
+                // regardless of group — per-refused-Key rows would defeat
+                // the bound itself.
+                if keycap > 0 {
+                    let keycap_value = IndexValue::Text(WINDOW_KEYCAP_GROUP.to_owned());
+                    let keycap_group =
+                        window_group_key_bytes(&keycap_value).unwrap_or_else(|| vec![2]);
+                    entries.push(AccumulateRowEntry {
+                        key: window_pane_row_key(&keycap_group, WINDOW_LATE_PANE),
+                        count_delta: keycap,
+                        sum_delta: 0,
+                        named: vec![
+                            NamedKeyValue {
+                                name: WINDOW_KEY_NAME.to_owned(),
+                                values: vec![keycap_value],
+                                unique: false,
+                            },
+                            NamedKeyValue {
+                                name: WINDOW_PANE_NAME.to_owned(),
+                                values: vec![IndexValue::I64(-1)],
+                                unique: false,
+                            },
+                        ],
+                    });
+                }
                 // Quarantined late events accumulate a count under the
                 // sentinel pane `u64::MAX` (posting value -1) — enumerable
                 // per group without revising real pane rows.
@@ -748,6 +794,27 @@ pub const WINDOW_PANE_NAME: &str = "pane";
 /// genuine pane (only 16 exist).
 pub const WINDOW_LATE_PANE: u64 = u64::MAX;
 
+/// Reserved group value for the shared `LIMIT KEYS` refusal row: every
+/// record refused by the active-Key bound accumulates this one sentinel
+/// row regardless of its own group — a per-refused-Key row would defeat
+/// the bound. It carries the usual `key`/`pane` postings so scans count
+/// it as exactly one active Key, and `window_row_disposition` keeps it
+/// forever like any other sentinel row.
+pub const WINDOW_KEYCAP_GROUP: &str = "__keycap__";
+
+/// Largest `LIMIT KEYS` a window Pipe may declare. The fetch-time
+/// active-Key scan must enumerate the store's `key` posting exactly:
+/// one Key's footprint is at most `WINDOW_PANE_COUNT` panes + the late
+/// sentinel (17 rows), plus the shared `__keycap__` refusal row — so
+/// `512 * 17 + 1` rows prove saturation only past the bound. Larger
+/// cardinalities need a counted posting rather than a row scan; refuse
+/// them at declaration instead of guessing.
+pub const WINDOW_MAX_KEY_LIMIT: u64 = 512;
+
+/// One Key's maximum row footprint in a window store: `WINDOW_PANE_COUNT`
+/// real pane rows plus its per-group late sentinel row.
+pub const WINDOW_KEY_ROW_FOOTPRINT: u64 = WINDOW_PANE_COUNT + 1;
+
 /// Closed-pane emissions ride the same effect mutation budget as the pane
 /// accumulation itself: `EFFECT_MAX_STATE_MUTATIONS` minus the one
 /// `AccumulateRows` leaves this many `DeleteRow`s per drive. A backlog
@@ -943,6 +1010,48 @@ pub fn window_group_key_bytes(value: &IndexValue) -> Option<Vec<u8>> {
     key.push(tag);
     key.extend_from_slice(&bytes);
     Some(key)
+}
+
+/// Resolve which incoming groups a `LIMIT KEYS` bound refuses. `active`
+/// is the distinct tagged-group set the fetch-time `key` scan returned and
+/// `saturated` says the scan hit its row bound — a saturated scan provably
+/// holds more Keys than the bound (16 panes + one sentinel bound a Key's
+/// footprint), so it admits nothing. Otherwise new groups — sorted by
+/// tagged bytes so the admit/refuse split is identical across replays —
+/// fill the remaining seats and the rest refuse into `__keycap__`.
+pub fn window_refused_groups(
+    records: &[FetchedRecord],
+    key: &IndexFieldSpec,
+    limit: u64,
+    active: &BTreeSet<Vec<u8>>,
+    saturated: bool,
+) -> Vec<Vec<u8>> {
+    let mut incoming: BTreeSet<Vec<u8>> = BTreeSet::new();
+    for record in records {
+        let Some(source) = source_record(record) else {
+            continue;
+        };
+        let Ok(extracted) = extract_index_values(std::slice::from_ref(key), &source) else {
+            continue;
+        };
+        if let Some(tagged) = extracted
+            .into_iter()
+            .next()
+            .and_then(|value| window_group_key_bytes(&value))
+        {
+            incoming.insert(tagged);
+        }
+    }
+    let seats = if saturated {
+        0
+    } else {
+        usize::try_from(limit.saturating_sub(active.len() as u64)).unwrap_or(usize::MAX)
+    };
+    incoming
+        .into_iter()
+        .filter(|group| !active.contains(group))
+        .skip(seats)
+        .collect()
 }
 
 /// Primary-key bytes for a point lookup: the byte contract an application

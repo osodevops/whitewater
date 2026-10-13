@@ -581,7 +581,9 @@ def main():
         )
         source_records += 3
         expected[("globex", p2)] = (1, 3)
-        expected[("acme", p2 + 1)] = (1, 2)
+        # t2 + 600ms can cross two pane boundaries when t2 sits in the
+        # last 100ms of its pane — compute the pane, don't assume p2 + 1.
+        expected[("acme", pane_of(t2 + 600_000_000))] = (1, 2)
         deadline = time.time() + 150
         emitted = None
         last_error = None

@@ -2555,12 +2555,32 @@ async fn drive_pipe(
                         }
                         _ => (Vec::new(), Vec::new()),
                     };
+                    // `LIMIT KEYS` resolves alongside the page on the same
+                    // serving replica: the admitted/refused split journals
+                    // inside the Declare, so a replay never re-scans.
+                    let refused = match &pipe.operation {
+                        crate::control::PipeOperation::Window {
+                            key_limit: Some(limit),
+                            key,
+                            ..
+                        } => {
+                            let (active, saturated) =
+                                resolve_window_active_keys(state, &pipe, *limit)
+                                    .await
+                                    .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
+                            crate::pipe::window_refused_groups(
+                                &records, key, *limit, &active, saturated,
+                            )
+                        }
+                        _ => Vec::new(),
+                    };
                     Ok(crate::pipe::FetchedPage {
                         cursor,
                         records,
                         positions,
                         emissions,
                         expired,
+                        refused,
                     })
                 }
             },
@@ -4529,6 +4549,107 @@ async fn resolve_window_emissions(
     emissions.sort_by(|a, b| a.row_key.cmp(&b.row_key));
     expired.sort();
     Ok((emissions, expired))
+}
+
+/// Fetch-time `LIMIT KEYS` resolution: scan the store's `key` posting for
+/// the distinct tagged-group set currently holding pane/sentinel state.
+/// 16 panes + the late sentinel bound one Key's row footprint, so the
+/// `limit * 17 + 1` row cap is exact — a truncated result provably means
+/// more than `limit` active Keys and admits nothing new. Local replica
+/// first, then owner, then any member; an unreadable scan fails closed
+/// (the drive retries) rather than guessing capacity.
+async fn resolve_window_active_keys(
+    state: &AppState,
+    pipe: &crate::control::PipeDefinition,
+    key_limit: u64,
+) -> Result<(std::collections::BTreeSet<Vec<u8>>, bool), ApiError> {
+    let store_id = pipe
+        .output_store_id
+        .ok_or_else(|| ApiError::conflict("Window Pipe has no output StateStore"))?;
+    let assignment = state
+        .control
+        .active_state_store_assignment_by_id(store_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("StateStore has no mutation-journal placement"))?;
+    let mut candidates: Vec<StorageNodeId> = Vec::new();
+    if let Some(local) = state.storage_node_id.clone() {
+        if assignment.replicas.iter().any(|node| *node == local) {
+            candidates.push(local);
+        }
+    }
+    candidates.push(assignment.owner.clone());
+    for replica in assignment.replicas.iter() {
+        if !candidates.contains(replica) {
+            candidates.push(replica.clone());
+        }
+    }
+    // `limit * (panes + sentinel) + 1` rows proves saturation only past
+    // the declared bound; WINDOW_MAX_KEY_LIMIT keeps the scan bounded.
+    let scan_limit = usize::try_from(
+        key_limit
+            .saturating_mul(crate::pipe::WINDOW_KEY_ROW_FOOTPRINT)
+            .saturating_add(1),
+    )
+    .unwrap_or(usize::MAX);
+    let mut reply = None;
+    let mut last_error: Option<ApiError> = None;
+    for replica in &candidates {
+        let read = crate::state_store::StateStoreReadRequest {
+            owner: assignment.owner.clone(),
+            receiver: replica.clone(),
+            store_id,
+            ownership_epoch: assignment.ownership_epoch,
+            key: Vec::new(),
+            strict: false,
+            wait_ms: 500,
+            by_named: None,
+            by_named_range: Some(crate::state_store::StateStoreNamedRangeRead {
+                name: crate::pipe::WINDOW_KEY_NAME.to_owned(),
+                lower: None,
+                upper: None,
+                limit: scan_limit,
+            }),
+        };
+        let outcome = if Some(replica) == state.storage_node_id.as_ref()
+            && state.state_store_journal.is_some()
+        {
+            state
+                .state_store_journal
+                .as_ref()
+                .unwrap()
+                .read_row(read)
+                .await
+                .map_err(state_store_api_error)
+        } else {
+            match state_store_transport_for(state, &assignment) {
+                Ok(transport) => transport
+                    .read(replica, read)
+                    .await
+                    .map_err(state_store_api_error),
+                Err(error) => Err(error),
+            }
+        };
+        match outcome {
+            Ok(result) => {
+                reply = Some(result);
+                break;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    let Some(reply) = reply else {
+        return Err(last_error.unwrap_or_else(|| {
+            ApiError::unavailable("no StateStore replica could serve the active-Key scan")
+        }));
+    };
+    let saturated = reply.result.named_rows.len() >= scan_limit;
+    let mut active = std::collections::BTreeSet::new();
+    for row in reply.result.named_rows {
+        if let Some((group, _)) = crate::pipe::window_pane_row_key_parse(&row.key) {
+            active.insert(group);
+        }
+    }
+    Ok((active, saturated))
 }
 
 fn state_store_coordinator_for(
@@ -14823,6 +14944,7 @@ mod tests {
                 time: crate::control::WindowTime::Event,
                 max_late_ns: Some(1_000),
                 expire_ns: None,
+                key_limit: None,
             },
             output_feed_id: Some(Uuid::new_v4()),
             output_store_id: Some(Uuid::new_v4()),

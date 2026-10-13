@@ -312,12 +312,15 @@ def main():
         domain = f"win{suffix}"
         source, results_feed = f"{domain}.source", f"{domain}.results"
         panes_store, retired_store = f"{domain}.panes", f"{domain}.retired"
+        capped_store = f"{domain}.capped"
         writer = f"writer{suffix}"
         # A Subscription is one shared durable frontier — members and
         # declared Pipes compete for the same pages. Each Pipe therefore
         # consumes its own Subscription over the shared source Feed.
         subscription, subscription_b = f"{domain}.flow", f"{domain}.flowb"
+        subscription_c = f"{domain}.flowc"
         totals_pipe, retire_pipe = f"{domain}.totals", f"{domain}.retire"
+        capped_pipe = f"{domain}.capped"
         results = wcl_retry(
             NODES[0],
             f"CREATE DOMAIN {domain}; "
@@ -338,7 +341,15 @@ def main():
             # retention contract that reclaims them without further input.
             f"CREATE PIPE {retire_pipe} FROM SUBSCRIPTION {subscription_b} "
             f"TO STATESTORE {retired_store} WINDOW 8s EVENT MAX_LATE 6s "
-            f"EXPIRE 15s BY JSON 'customer' COUNT;",
+            f"EXPIRE 15s BY JSON 'customer' COUNT; "
+            # Capped pipe: LIMIT KEYS 1 admits only the smallest tagged
+            # group to pane state; every other Key's records accumulate
+            # the shared __keycap__ sentinel — bounded refusal evidence.
+            f"DEFINE STATESTORE {capped_store} KEYS key, pane; "
+            f"CREATE SUBSCRIPTION {subscription_c} FROM {source} START AT BEGINNING; "
+            f"CREATE PIPE {capped_pipe} FROM SUBSCRIPTION {subscription_c} "
+            f"TO STATESTORE {capped_store} WINDOW 8s EVENT MAX_LATE 6s "
+            f"LIMIT KEYS 1 BY JSON 'customer' COUNT;",
         )
         writer_epoch = results[6]["session_epoch"]
         described = wcl(NODES[1], f"DESCRIBE PIPE {totals_pipe};")[0]
@@ -581,6 +592,40 @@ def main():
         if len(sentinel_rows(NODES[0], retired_store)) != 1:
             raise AssertionError("sentinel row expired or duplicated")
 
+        # LIMIT KEYS: the capped Pipe folds the same 12 source records but
+        # admits only "acme" (the smallest tagged group) to pane state.
+        # The five non-acme records accumulate the single shared
+        # `__keycap__` sentinel row — countable refusal evidence, and the
+        # bound holds no matter how many distinct Keys arrive.
+        capped_sentinels, capped_groups = [], None
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            capped_sentinels = sentinel_rows(NODES[0], capped_store)
+            capped_groups = {
+                decode_group(parse_row_key(row["key_base64"])[0])
+                for row in pane_rows(NODES[0], capped_store)
+            }
+            if (
+                len(capped_sentinels) == 1
+                and capped_groups == {"acme"}
+                and decode_accumulator(capped_sentinels[0]["payload_base64"])
+                == (5, 0)
+            ):
+                break
+            time.sleep(1)
+        else:
+            raise AssertionError(
+                {
+                    "capped pane rows": pane_rows(NODES[0], capped_store),
+                    "capped sentinels": capped_sentinels,
+                }
+            )
+        keycap_tagged, keycap_pane = parse_row_key(
+            capped_sentinels[0]["key_base64"]
+        )
+        if keycap_pane != 2**64 - 1 or decode_group(keycap_tagged) != "__keycap__":
+            raise AssertionError({"keycap sentinel": capped_sentinels[0]})
+
         print(
             json.dumps(
                 {
@@ -591,6 +636,9 @@ def main():
                     "owner_before_drain": owner,
                     "owner_after_drain": new_owner,
                     "owner_after_restart": recovered_owner,
+                    "keycap_refused": decode_accumulator(
+                        capped_sentinels[0]["payload_base64"]
+                    )[0],
                     "note": (
                         "window Pipe folded multi-pane event-time input into "
                         "RF3 StateStore rows, emitted five closed panes with "
@@ -626,6 +674,10 @@ def main():
             "retired_store_real": probe(lambda: pane_rows(NODES[0], retired_store)),
             "retired_store_sentinel": probe(
                 lambda: sentinel_rows(NODES[0], retired_store)
+            ),
+            "capped_store_real": probe(lambda: pane_rows(NODES[0], capped_store)),
+            "capped_store_sentinel": probe(
+                lambda: sentinel_rows(NODES[0], capped_store)
             ),
         }
         print(f"DIAGNOSTICS {json.dumps(diag, indent=2, default=str)}")
