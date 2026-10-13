@@ -374,6 +374,12 @@ impl FileActiveRangeStore {
             persisted.ownership_epoch = descriptor.ownership_epoch;
         }
         let (entries, recovered_deduplication) = recover_segments(&directory, &persisted)?;
+        let surviving_positions = entries.iter().map(|entry| entry.position.value()).collect();
+        let recovered_deduplication = merge_deduplication(
+            recovered_deduplication,
+            persisted.deduplication.clone(),
+            &surviving_positions,
+        );
         let cursor_positions = entries
             .iter()
             .map(|entry| (entry.cursor.clone(), entry.position))
@@ -819,7 +825,7 @@ fn append(
                         .ok_or(ActiveRangeStoreError::WriterSequenceConflict)?;
                     let existing_frame = read_indexed_frame(&inner.directory, existing)?;
                     let existing_record = decode_record(&existing_frame.frame)?;
-                    if !same_logical_record(&existing_record, &record) {
+                    if !same_request_record(&existing_record, &record) {
                         return Err(ActiveRangeStoreError::WriterSequenceConflict);
                     }
                 }
@@ -864,13 +870,42 @@ fn append(
         let existing_frame = read_indexed_frame(&inner.directory, existing)?;
         let existing_record = decode_record(&existing_frame.frame)?;
         if same_request_record(&existing_record, &record) {
+            // The API layer allocated this retry a fresh sequence before the
+            // Cursor dedup caught it; that number is consumed even though no
+            // record lands. Record it against the original position so the
+            // stream's high-water mark stays contiguous across retries and
+            // restarts, and a replay of the same allocated sequence dedupes
+            // on its request-derived fields above.
+            let landed_position = existing.position;
+            let landed_message_id = existing.message_id;
+            let landed_cursor = existing.cursor.clone();
+            let landed_digest = existing.frame_digest;
+            let landed_committed = landed_position.value() <= loaded.persisted.committed;
+            let consumed = DeduplicationState {
+                sequence: request.identity.sequence,
+                position: landed_position,
+                message_id: landed_message_id,
+                cursor: landed_cursor.clone(),
+                frame_digest,
+            };
+            let advanced = loaded
+                .deduplication
+                .get(&writer_key)
+                .is_none_or(|previous| previous.sequence < consumed.sequence);
+            if advanced {
+                loaded.deduplication.insert(writer_key, consumed);
+                let mut next = loaded.persisted.clone();
+                next.deduplication = persisted_deduplication(&loaded.deduplication);
+                persist_state(&inner.directory, &next)?;
+                loaded.persisted = next;
+            }
             return Ok(ActiveRangeAppendResult {
-                position: existing.position,
-                message_id: existing.message_id,
-                cursor: existing.cursor.clone(),
-                frame_digest: existing.frame_digest,
+                position: landed_position,
+                message_id: landed_message_id,
+                cursor: landed_cursor,
+                frame_digest: landed_digest,
                 deduplicated: true,
-                committed: existing.position.value() <= loaded.persisted.committed,
+                committed: landed_committed,
             });
         }
         return Err(ActiveRangeStoreError::InvalidState(
@@ -1114,7 +1149,16 @@ fn truncate_uncommitted(
     loaded
         .digest_positions
         .retain(|_, position| position.value() <= committed);
-    loaded.deduplication = deduplication_from_entries(&loaded.entries);
+    let surviving_positions = loaded
+        .entries
+        .iter()
+        .map(|entry| entry.position.value())
+        .collect();
+    loaded.deduplication = merge_deduplication(
+        deduplication_from_entries(&loaded.entries),
+        persisted_deduplication(&loaded.deduplication),
+        &surviving_positions,
+    );
     let mut next = loaded.persisted.clone();
     next.appended = committed;
     next.flushed = committed;
@@ -1389,16 +1433,6 @@ fn frame_offset_in_entry(entry: &DecodedEntry) -> Result<usize, ActiveRangeStore
         .ok_or(ActiveRangeStoreError::PositionOverflow)
 }
 
-fn same_logical_record(left: &StoredRecord, right: &StoredRecord) -> bool {
-    left.message_id == right.message_id
-        && left.producer_id == right.producer_id
-        && left.producer_sequence == right.producer_sequence
-        && left.event_time_ns == right.event_time_ns
-        && left.key == right.key
-        && left.payload == right.payload
-        && left.metadata == right.metadata
-}
-
 /// Same logical record ignoring the server-allocated `producer_sequence`:
 /// a resequenced retry carries identical request-derived fields.
 fn same_request_record(left: &StoredRecord, right: &StoredRecord) -> bool {
@@ -1471,6 +1505,46 @@ fn deduplication_from_entries(entries: &[EntryIndex]) -> HashMap<WriterKey, Dedu
         }
     }
     deduplication
+}
+
+/// Merge entry-derived dedup state with previously persisted state: a
+/// deduplicated retry consumes a Writer sequence without landing a record, so
+/// the landed-entry scan alone can regress the per-Writer high-water mark and
+/// permanently gap the stream after recovery or truncation. Keep the highest
+/// recorded sequence per Writer whose landing position still exists; a
+/// persisted entry pointing at a truncated position is dropped because a
+/// replay can no longer be answered honestly — the client retries it as new
+/// work under a fresh sequence. When two candidates carry the same sequence
+/// the entry-derived one wins because its position is known to exist.
+fn merge_deduplication(
+    derived: HashMap<WriterKey, DeduplicationState>,
+    persisted: Vec<PersistedDeduplicationState>,
+    surviving_positions: &std::collections::HashSet<u64>,
+) -> HashMap<WriterKey, DeduplicationState> {
+    let mut merged = derived;
+    for state in persisted {
+        if !surviving_positions.contains(&state.position) {
+            continue;
+        }
+        let key = WriterKey {
+            writer_session_id: state.writer_session_id,
+            writer_epoch: state.writer_epoch,
+        };
+        let candidate = DeduplicationState {
+            sequence: state.sequence,
+            position: RangePosition::new(state.position),
+            message_id: state.message_id,
+            cursor: state.cursor,
+            frame_digest: state.frame_digest,
+        };
+        match merged.get(&key) {
+            Some(existing) if existing.sequence >= candidate.sequence => {}
+            _ => {
+                merged.insert(key, candidate);
+            }
+        }
+    }
+    merged
 }
 
 fn persisted_deduplication(

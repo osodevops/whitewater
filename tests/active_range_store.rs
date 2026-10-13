@@ -143,13 +143,14 @@ async fn a_resequenced_retry_with_the_same_cursor_returns_the_original_position(
     retry_record.event_time_ns = first_record.event_time_ns;
     retry.frame = encode_record(&retry_record).unwrap();
     retry.cursor = first.cursor.clone();
-    let deduplicated = store.append(retry).await.unwrap();
+    let deduplicated = store.append(retry.clone()).await.unwrap();
     assert!(deduplicated.deduplicated);
     assert!(deduplicated.committed);
     assert_eq!(deduplicated.position, committed.position);
     assert_eq!(deduplicated.message_id, first_record.message_id);
 
-    // The retry consumed no sequence: the next stream position still expects 6.
+    // The consumed sequence is recorded against the landed position: replaying
+    // the allocated sequence with a different payload still fails closed.
     let mut forged = append(6, b"different payload");
     let mut forged_record = decode_record(&forged.frame).unwrap();
     forged_record.message_id = first_record.message_id;
@@ -158,8 +159,41 @@ async fn a_resequenced_retry_with_the_same_cursor_returns_the_original_position(
     forged.cursor = first.cursor.clone();
     assert!(matches!(
         store.append(forged).await,
+        Err(ActiveRangeStoreError::WriterSequenceConflict)
+    ));
+
+    // A forged reuse of the same Cursor at the next stream position fails
+    // closed on the request-identity comparison.
+    let mut forged_next = append(7, b"different payload");
+    let mut forged_next_record = decode_record(&forged_next.frame).unwrap();
+    forged_next_record.message_id = first_record.message_id;
+    forged_next_record.event_time_ns = first_record.event_time_ns;
+    forged_next.frame = encode_record(&forged_next_record).unwrap();
+    forged_next.cursor = first.cursor.clone();
+    assert!(matches!(
+        store.append(forged_next).await,
         Err(ActiveRangeStoreError::InvalidState(_))
     ));
+
+    // Recovery keeps the consumed high-water mark: reopening the range must
+    // not regress the Writer stream to the last landed sequence.
+    drop(store);
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+
+    // A replay of the consumed sequence after recovery still dedupes onto the
+    // original position.
+    let replay = store.append(retry).await.unwrap();
+    assert!(replay.deduplicated);
+    assert_eq!(replay.position, committed.position);
+
+    // A legitimate record at the consumed head lands cleanly.
+    let next = append(7, b"second");
+    let committed_next = store.append(next).await.unwrap();
+    assert_eq!(
+        committed_next.position.value(),
+        committed.position.value() + 1
+    );
+    assert!(!committed_next.deduplicated);
 }
 
 #[tokio::test]

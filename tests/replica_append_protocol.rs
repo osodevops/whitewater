@@ -179,6 +179,49 @@ async fn uncommitted_frames_are_invisible_until_commit_position_is_durable() {
 }
 
 #[tokio::test]
+async fn a_commit_retry_inside_the_committed_prefix_reports_existing_evidence() {
+    let fixture = Fixture::new().await;
+    let service = fixture.service("storage-2");
+    let first = service.append(fixture.request(1, 1, b"one")).await.unwrap();
+    let second = service.append(fixture.request(2, 2, b"two")).await.unwrap();
+    let commit = |position: u64, frame_digest| {
+        service.commit(whitewater::active_range::ReplicaCommitRequest {
+            feed_id: fixture.feed_id,
+            range_id: fixture.range_id,
+            generation: RangeGeneration::new(1),
+            ownership_epoch: whitewater::active_range::OwnershipEpoch::new(1),
+            append_owner: fixture.owner.clone(),
+            commit_position: whitewater::active_range::CommitPosition::new(position),
+            frame_digest,
+        })
+    };
+    commit(1, first.frame_digest).await.unwrap();
+    commit(2, second.frame_digest).await.unwrap();
+
+    // An ambiguous-commit retry arrives after the boundary advanced past its
+    // position: the replica already persisted that evidence, so the retry
+    // reports success instead of a permanent retryable failure.
+    let retry = commit(1, first.frame_digest).await.unwrap();
+    assert_eq!(
+        retry.commit_position,
+        whitewater::active_range::CommitPosition::new(1)
+    );
+    assert!(retry.durable);
+
+    // The relaxed path does not weaken identity checks: a retry carrying a
+    // different frame digest at a committed position still fails closed.
+    let forged = commit(1, second.frame_digest).await.unwrap_err();
+    assert_eq!(forged.code, ReplicaAppendErrorCode::PositionConflict);
+
+    // And the committed boundary never regressed.
+    let records = service
+        .read_committed(fixture.feed_id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 2);
+}
+
+#[tokio::test]
 async fn replica_rejects_position_gaps_and_conflicting_bytes() {
     let fixture = Fixture::new().await;
     let service = fixture.service("storage-2");

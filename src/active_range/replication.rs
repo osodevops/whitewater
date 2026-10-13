@@ -1018,14 +1018,23 @@ impl ReplicaAppendService {
                 format!("RangePosition {position} has a different frame digest"),
             ));
         }
-        store
+        match store
             .commit(
                 request.generation,
                 request.ownership_epoch,
                 request.commit_position,
             )
             .await
-            .map_err(map_store_error)?;
+        {
+            Ok(()) => {}
+            // A same-identity append retry reaches commit after the frame has
+            // already joined the committed prefix. The digest check above
+            // proved it is the same frame, so the CommitPosition evidence this
+            // request asks for is already persisted; report it rather than
+            // turning a completed append into a permanent failure.
+            Err(ActiveRangeStoreError::CommitMovedBackwards { .. }) => {}
+            Err(error) => return Err(map_store_error(error)),
+        }
         Ok(ReplicaCommitAccepted {
             commit_position: request.commit_position,
             durable: true,
