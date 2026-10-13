@@ -397,6 +397,24 @@ RESUME PIPE orders.enrich;
 consumed frontier stays put, and every later drive skips the Pipe until
 `RESUME`. Both are idempotent.
 
+Move a Pipe's compute lease to another storage-eligible Node:
+
+```wcl
+MOVE PIPE COMPUTE orders.enrich TO NODE storage-3;
+```
+
+Every Pipe carries an epoch-fenced *compute lease* naming the single Node
+authorized to drive it. `DEFINE PIPE` seeds the lease co-located with the
+input Subscription's progress owner; `MOVE PIPE COMPUTE` migrates it
+independently — the Subscription's progress placement is untouched.
+The lease carries no replica state, so a move is a single catalog
+compare-and-set that bumps `compute_epoch`: the previous owner starts no
+new drives, and an in-flight drive finishing late converges on the same
+deterministic Declare journal. `SHOW PIPES` reports `compute_owner` and
+`compute_epoch`; `DRAIN STORAGE NODE` plans a lease move for every Pipe
+whose lease sits on the draining Node, and a dropped Pipe's lease retires
+with it.
+
 ```
 
 
