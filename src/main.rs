@@ -5,7 +5,15 @@ use std::{
 };
 
 use anyhow::Result;
-use finnstream::{
+use openraft::BasicNode;
+use tokio::{
+    net::TcpListener,
+    sync::{watch, Mutex},
+};
+use tower_http::trace::TraceLayer;
+use tracing::info;
+use tracing_subscriber::EnvFilter;
+use whitewater::{
     active_range::{
         cold_adjacent_pairs, ColdRangeTracker, HttpRecoveryTransport, HttpReplicaTransport,
         LocalRepairSupervisor, MajorityAppendCoordinator, RecoverySupervisor, ReplicaAppendService,
@@ -29,21 +37,13 @@ use finnstream::{
     },
     storage::{FileLogStore, LogStore},
 };
-use openraft::BasicNode;
-use tokio::{
-    net::TcpListener,
-    sync::{watch, Mutex},
-};
-use tower_http::trace::TraceLayer;
-use tracing::info;
-use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("finnstream=info,tower_http=info")),
+                .unwrap_or_else(|_| EnvFilter::new("whitewater=info,tower_http=info")),
         )
         .json()
         .init();
@@ -152,10 +152,10 @@ async fn main() -> Result<()> {
     let effect_journal = if let Some(local) = &replica_append {
         let path = config.data_dir.join("effect-journal");
         let replica = tokio::task::spawn_blocking(move || {
-            finnstream::effect::FjallEffectJournalReplica::open(path)
+            whitewater::effect::FjallEffectJournalReplica::open(path)
         })
         .await??;
-        Some(Arc::new(finnstream::effect::EffectJournalService::new(
+        Some(Arc::new(whitewater::effect::EffectJournalService::new(
             local.local_node().clone(),
             control.clone(),
             Arc::new(replica),
@@ -168,19 +168,19 @@ async fn main() -> Result<()> {
         let journal_path = config.data_dir.join("state-store-journal");
         let index_path = config.data_dir.join("state-store-index");
         let journal = tokio::task::spawn_blocking(move || {
-            finnstream::state_store::FjallStateStoreMutationJournal::open(journal_path)
+            whitewater::state_store::FjallStateStoreMutationJournal::open(journal_path)
         })
         .await??;
         let index = tokio::task::spawn_blocking(move || {
-            finnstream::index::FjallIndexStore::open(index_path)
+            whitewater::index::FjallIndexStore::open(index_path)
         })
         .await??;
         Some(Arc::new(
-            finnstream::state_store::StateStoreMutationService::new(
+            whitewater::state_store::StateStoreMutationService::new(
                 local.local_node().clone(),
                 control.clone(),
                 Arc::new(journal),
-                Arc::new(finnstream::state_store::IndexStoreStateApply::new(
+                Arc::new(whitewater::state_store::IndexStoreStateApply::new(
                     Arc::new(index),
                 )),
             ),
@@ -336,7 +336,7 @@ async fn main() -> Result<()> {
     };
     let drain_task = match (
         control_plane.clone(),
-        std::env::var("FINNSTREAM_ADMIN_API_KEY").ok(),
+        std::env::var("WHITEWATER_ADMIN_API_KEY").ok(),
     ) {
         (Some(control_plane), Some(admin_key)) => {
             let driver = AdminDrainDriver::new(
@@ -386,7 +386,7 @@ async fn main() -> Result<()> {
         _ => None,
     };
     let split_task = control_plane.clone().and_then(|control_plane| {
-        let admin_key = std::env::var("FINNSTREAM_ADMIN_API_KEY").ok()?;
+        let admin_key = std::env::var("WHITEWATER_ADMIN_API_KEY").ok()?;
         let interval_ms = std::env::var("WHITEWATER_AUTO_SPLIT_INTERVAL_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
@@ -569,7 +569,7 @@ async fn main() -> Result<()> {
                                     .send()
                                     .await;
                                 let Ok(response) = response else { continue; };
-                                let Ok(samples) = response.json::<Vec<finnstream::demand::RangePressureSample>>().await else { continue; };
+                                let Ok(samples) = response.json::<Vec<whitewater::demand::RangePressureSample>>().await else { continue; };
                                 for sample in samples {
                                     let entry = totals.entry(sample.range_id).or_insert(0_u64);
                                     *entry = entry.saturating_add(sample.records);
@@ -676,8 +676,8 @@ async fn main() -> Result<()> {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        for outcome in finnstream::api::drive_local_state_stores(&state, 64).await {
-                            use finnstream::api::StateStoreDriveOutcome as Outcome;
+                        for outcome in whitewater::api::drive_local_state_stores(&state, 64).await {
+                            use whitewater::api::StateStoreDriveOutcome as Outcome;
                             match outcome {
                                 Outcome::Synced { store_id, applied, complete } => {
                                     tracing::debug!(%store_id, applied, complete, "state store replay pass committed")
@@ -692,9 +692,9 @@ async fn main() -> Result<()> {
                             }
                         }
                         for outcome in
-                            finnstream::api::drive_local_index_builds(&state, 128).await
+                            whitewater::api::drive_local_index_builds(&state, 128).await
                         {
-                            use finnstream::api::IndexBuildDriveOutcome as Outcome;
+                            use whitewater::api::IndexBuildDriveOutcome as Outcome;
                             match outcome {
                                 Outcome::Building { index_id, generation, applied } => {
                                     tracing::debug!(%index_id, generation, applied, "index shadow build pass applied")
@@ -712,9 +712,9 @@ async fn main() -> Result<()> {
                             }
                         }
                         for outcome in
-                            finnstream::api::drive_local_state_store_catch_ups(&state, 128).await
+                            whitewater::api::drive_local_state_store_catch_ups(&state, 128).await
                         {
-                            use finnstream::api::StateStoreCatchUpDriveOutcome as Outcome;
+                            use whitewater::api::StateStoreCatchUpDriveOutcome as Outcome;
                             match outcome {
                                 Outcome::Progress { store_id, installed, applied, complete } => {
                                     if installed > 0 || applied > 0 {
@@ -750,22 +750,22 @@ async fn main() -> Result<()> {
             loop {
                 tokio::select! {
                     _ = interval.tick() => {
-                        for outcome in finnstream::api::drive_local_pipes(&state, 64).await {
+                        for outcome in whitewater::api::drive_local_pipes(&state, 64).await {
                             match outcome {
-                                finnstream::api::PipeDriveOutcome::Applied {
+                                whitewater::api::PipeDriveOutcome::Applied {
                                     pipe_id,
                                     effect_id,
                                 } => {
                                     tracing::debug!(%pipe_id, %effect_id, "pipe cycle applied")
                                 }
-                                finnstream::api::PipeDriveOutcome::Failed {
+                                whitewater::api::PipeDriveOutcome::Failed {
                                     pipe_id,
                                     message,
                                 } => {
                                     tracing::warn!(%pipe_id, %message, "pipe drive cycle failed")
                                 }
-                                finnstream::api::PipeDriveOutcome::Idle
-                                | finnstream::api::PipeDriveOutcome::NotOwner => {}
+                                whitewater::api::PipeDriveOutcome::Idle
+                                | whitewater::api::PipeDriveOutcome::NotOwner => {}
                             }
                         }
                     }
@@ -790,7 +790,7 @@ async fn main() -> Result<()> {
         }
         _ => None,
     };
-    info!(node_id = %config.node_id, bind = %config.bind_addr, advertise = %config.advertise_url, "FinnStream node started");
+    info!(node_id = %config.node_id, bind = %config.bind_addr, advertise = %config.advertise_url, "Whitewater node started");
 
     let public =
         axum::serve(listener, app).with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()));

@@ -850,7 +850,29 @@ fn append(
             }
         }
     }
-    if loaded.cursor_positions.contains_key(&request.cursor) {
+    if let Some(existing_position) = loaded.cursor_positions.get(&request.cursor).copied() {
+        // The Cursor derives from (FeedId, request_id), so a hit means this
+        // request already landed. Resequence after a split or merge can hand
+        // the retry a fresh sequence — digest and writer dedup miss it — but
+        // the request-derived fields stay identical; return the original
+        // position instead of appending a duplicate.
+        let existing = loaded
+            .entries
+            .iter()
+            .find(|entry| entry.position == existing_position)
+            .ok_or(ActiveRangeStoreError::PositionConflict(existing_position))?;
+        let existing_frame = read_indexed_frame(&inner.directory, existing)?;
+        let existing_record = decode_record(&existing_frame.frame)?;
+        if same_request_record(&existing_record, &record) {
+            return Ok(ActiveRangeAppendResult {
+                position: existing.position,
+                message_id: existing.message_id,
+                cursor: existing.cursor.clone(),
+                frame_digest: existing.frame_digest,
+                deduplicated: true,
+                committed: existing.position.value() <= loaded.persisted.committed,
+            });
+        }
         return Err(ActiveRangeStoreError::InvalidState(
             "Cursor already belongs to another position".to_owned(),
         ));
@@ -1371,6 +1393,17 @@ fn same_logical_record(left: &StoredRecord, right: &StoredRecord) -> bool {
     left.message_id == right.message_id
         && left.producer_id == right.producer_id
         && left.producer_sequence == right.producer_sequence
+        && left.event_time_ns == right.event_time_ns
+        && left.key == right.key
+        && left.payload == right.payload
+        && left.metadata == right.metadata
+}
+
+/// Same logical record ignoring the server-allocated `producer_sequence`:
+/// a resequenced retry carries identical request-derived fields.
+fn same_request_record(left: &StoredRecord, right: &StoredRecord) -> bool {
+    left.message_id == right.message_id
+        && left.producer_id == right.producer_id
         && left.event_time_ns == right.event_time_ns
         && left.key == right.key
         && left.payload == right.payload

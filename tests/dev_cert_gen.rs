@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 /// `cargo test --test dev_cert_gen` with `WW_CERTS_DIR=<dir>` writes a
 /// development CA, one PEM certificate/key pair per requested Node, and a
 /// ready-to-use `<node>.env` file containing the full
-/// `FINNSTREAM_SUBSCRIPTION_MTLS_*` set. Without the environment variable
+/// `WHITEWATER_SUBSCRIPTION_MTLS_*` set. Without the environment variable
 /// the test is a no-op so the normal suite stays untouched.
 ///
 /// This material is for development and acceptance clusters only; private
@@ -58,12 +58,12 @@ fn generate_development_mtls_material() {
     let endpoint_line = endpoints.join(",");
     for node in pins.keys() {
         let env = format!(
-            "FINNSTREAM_SUBSCRIPTION_MTLS_BIND=0.0.0.0:{tls_port}\n\
-             FINNSTREAM_SUBSCRIPTION_MTLS_CERT=/certs/{node}.pem\n\
-             FINNSTREAM_SUBSCRIPTION_MTLS_KEY=/certs/{node}.key\n\
-             FINNSTREAM_SUBSCRIPTION_MTLS_CA=/certs/ca.pem\n\
-             FINNSTREAM_SUBSCRIPTION_MTLS_PEER_PINS={pin_line}\n\
-             FINNSTREAM_SUBSCRIPTION_MTLS_ENDPOINTS={endpoint_line}\n"
+            "WHITEWATER_SUBSCRIPTION_MTLS_BIND=0.0.0.0:{tls_port}\n\
+             WHITEWATER_SUBSCRIPTION_MTLS_CERT=/certs/{node}.pem\n\
+             WHITEWATER_SUBSCRIPTION_MTLS_KEY=/certs/{node}.key\n\
+             WHITEWATER_SUBSCRIPTION_MTLS_CA=/certs/ca.pem\n\
+             WHITEWATER_SUBSCRIPTION_MTLS_PEER_PINS={pin_line}\n\
+             WHITEWATER_SUBSCRIPTION_MTLS_ENDPOINTS={endpoint_line}\n"
         );
         std::fs::write(out.join(format!("{node}.env")), env).unwrap();
     }

@@ -156,7 +156,7 @@ def storage_pin():
     text = env_path(STORAGE_NODE).read_text()
     line = next(
         line for line in text.splitlines() if line.startswith(
-            "FINNSTREAM_SUBSCRIPTION_MTLS_PEER_PINS="
+            "WHITEWATER_SUBSCRIPTION_MTLS_PEER_PINS="
         )
     )
     entry = next(
@@ -178,14 +178,14 @@ def strip_voter_pins():
         lines = path.read_text().splitlines(keepends=True)
         rewritten = []
         for line in lines:
-            if line.startswith("FINNSTREAM_SUBSCRIPTION_MTLS_PEER_PINS="):
+            if line.startswith("WHITEWATER_SUBSCRIPTION_MTLS_PEER_PINS="):
                 entries = [
                     entry
                     for entry in line.strip().split("=", 1)[1].split(",")
                     if entry and not entry.startswith(f"{STORAGE_NODE}@")
                 ]
                 line = (
-                    "FINNSTREAM_SUBSCRIPTION_MTLS_PEER_PINS="
+                    "WHITEWATER_SUBSCRIPTION_MTLS_PEER_PINS="
                     + ",".join(entries)
                     + "\n"
                 )

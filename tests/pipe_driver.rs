@@ -9,31 +9,31 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use finnstream::active_range::{RangeId, RangePosition, ReplicaSet, StorageNodeId};
-use finnstream::control::{
+use tempfile::TempDir;
+use uuid::Uuid;
+use whitewater::active_range::{RangeId, RangePosition, ReplicaSet, StorageNodeId};
+use whitewater::control::{
     IndexFieldSpec, PipeDefinition, PipeOperation, PipeStage, ResourceStatus, WindowAggregation,
 };
-use finnstream::effect::{
+use whitewater::effect::{
     effect_apply_request_id, EffectApply, EffectCommitEvidence, EffectConsume, EffectCoordinator,
     EffectJournalError, EffectJournalInspection, EffectJournalTransport, EffectMutation,
     EffectOutput, EffectOutputReceipt, EffectPrepareVote, EffectReleaseOutcome,
     EffectReleaseTarget, EffectReplicaReply, EffectTransition, FjallEffectJournalReplica,
 };
-use finnstream::index::IndexValue;
-use finnstream::pipe::{
+use whitewater::index::IndexValue;
+use whitewater::pipe::{
     pipe_declare_request_id, pipe_effect_id, pipe_emission_writer_session,
     pipe_output_writer_session, window_pane_row_key, EnrichResolution, FetchedPage, FetchedRecord,
     PipeDriver, WindowEmission,
 };
-use finnstream::reader::{
+use whitewater::reader::{
     FjallSubscriptionProgressReplica, SubscriptionCommitEvidence, SubscriptionMemberState,
     SubscriptionPrepareVote, SubscriptionProgressAssignment, SubscriptionProgressCoordinator,
     SubscriptionProgressError, SubscriptionProgressInspection, SubscriptionProgressMutation,
     SubscriptionProgressTransport, SubscriptionReplicaReply,
 };
-use finnstream::state_store::StateStoreMutationOp;
-use tempfile::TempDir;
-use uuid::Uuid;
+use whitewater::state_store::StateStoreMutationOp;
 
 const SUBSCRIPTION: u128 = 0x5EED;
 const OUTPUT_FEED: u128 = 0x0E7;
@@ -428,7 +428,7 @@ impl EffectJournalTransport for PipeEffectTransport {
 struct RecordingApply {
     progress: SubscriptionProgressCoordinator,
     appends: Mutex<Vec<EffectOutput>>,
-    mutations: Mutex<Vec<finnstream::effect::EffectStateMutation>>,
+    mutations: Mutex<Vec<whitewater::effect::EffectStateMutation>>,
     fail_releases: Mutex<u8>,
     discards: Mutex<Vec<(Uuid, Uuid, Uuid)>>,
 }
@@ -512,7 +512,7 @@ impl EffectApply for RecordingApply {
 
     async fn mutate_state(
         &self,
-        mutation: &finnstream::effect::EffectStateMutation,
+        mutation: &whitewater::effect::EffectStateMutation,
     ) -> Result<(), EffectJournalError> {
         self.mutations.lock().unwrap().push(mutation.clone());
         Ok(())
@@ -523,12 +523,12 @@ impl EffectApply for RecordingApply {
         output: &EffectOutput,
         effect_id: Uuid,
         subscription_id: Uuid,
-    ) -> Result<finnstream::effect::EffectDiscardOutcome, EffectJournalError> {
+    ) -> Result<whitewater::effect::EffectDiscardOutcome, EffectJournalError> {
         self.discards
             .lock()
             .unwrap()
             .push((output.feed_id, effect_id, subscription_id));
-        Ok(finnstream::effect::EffectDiscardOutcome::Discarded { dropped_frames: 1 })
+        Ok(whitewater::effect::EffectDiscardOutcome::Discarded { dropped_frames: 1 })
     }
 }
 
@@ -1066,7 +1066,7 @@ fn window_pipe() -> PipeDefinition {
         operation: PipeOperation::Window {
             window_ns: 160,
             key: IndexFieldSpec::Key,
-            time: finnstream::control::WindowTime::Event,
+            time: whitewater::control::WindowTime::Event,
             max_late_ns: None,
             expire_ns: None,
             aggregation: WindowAggregation::Sum {
@@ -1108,7 +1108,7 @@ async fn window_pipe_quarantines_late_events_into_a_countable_row() {
         window_ns: 160,
         key: IndexFieldSpec::Key,
         aggregation: WindowAggregation::Count,
-        time: finnstream::control::WindowTime::Event,
+        time: whitewater::control::WindowTime::Event,
         max_late_ns: Some(500),
         expire_ns: None,
     };
@@ -1167,7 +1167,7 @@ fn ingest_window_pipe() -> PipeDefinition {
         window_ns: 160,
         key: IndexFieldSpec::Key,
         aggregation: WindowAggregation::Count,
-        time: finnstream::control::WindowTime::Ingest,
+        time: whitewater::control::WindowTime::Ingest,
         max_late_ns: None,
         expire_ns: None,
     };
@@ -1253,7 +1253,7 @@ async fn window_pipe_folds_a_page_into_one_accumulate_mutation() {
     assert_eq!(state_mutations.len(), 1);
     assert_eq!(
         state_mutations[0].mutation_id,
-        finnstream::effect::effect_state_mutation_id(applied.effect_id, 0)
+        whitewater::effect::effect_state_mutation_id(applied.effect_id, 0)
     );
     assert_eq!(state_mutations[0].store_id, Uuid::from_u128(OUTPUT_STORE));
 
@@ -1365,9 +1365,9 @@ fn enrich_pipe() -> PipeDefinition {
         subscription_id: Uuid::from_u128(SUBSCRIPTION),
         operation: PipeOperation::Enrich {
             key: IndexFieldSpec::Key,
-            freshness: finnstream::control::EnrichFreshness::Latest,
+            freshness: whitewater::control::EnrichFreshness::Latest,
             named: None,
-            on_miss: finnstream::control::EnrichMiss::Forward,
+            on_miss: whitewater::control::EnrichMiss::Forward,
             quarantine_feed_id: None,
         },
         output_feed_id: Some(Uuid::from_u128(OUTPUT_FEED)),
@@ -1423,9 +1423,9 @@ async fn enrich_pipe_drop_miss_consumes_without_emitting() {
     let mut pipe = enrich_pipe();
     pipe.operation = PipeOperation::Enrich {
         key: IndexFieldSpec::Key,
-        freshness: finnstream::control::EnrichFreshness::Latest,
+        freshness: whitewater::control::EnrichFreshness::Latest,
         named: None,
-        on_miss: finnstream::control::EnrichMiss::Drop,
+        on_miss: whitewater::control::EnrichMiss::Drop,
         quarantine_feed_id: None,
     };
     let harness = harness_for(pipe);
@@ -1471,9 +1471,9 @@ async fn enrich_pipe_quarantines_misses_to_the_declared_feed() {
     let mut pipe = enrich_pipe();
     pipe.operation = PipeOperation::Enrich {
         key: IndexFieldSpec::Key,
-        freshness: finnstream::control::EnrichFreshness::Latest,
+        freshness: whitewater::control::EnrichFreshness::Latest,
         named: None,
-        on_miss: finnstream::control::EnrichMiss::Quarantine,
+        on_miss: whitewater::control::EnrichMiss::Quarantine,
         quarantine_feed_id: Some(quarantine),
     };
     let harness = harness_for(pipe);
@@ -1595,7 +1595,7 @@ fn emit_window_pipe() -> PipeDefinition {
                 field: "v".to_owned(),
             },
         },
-        time: finnstream::control::WindowTime::Event,
+        time: whitewater::control::WindowTime::Event,
         max_late_ns: Some(20),
         expire_ns: None,
     };
@@ -1611,7 +1611,7 @@ fn expire_window_pipe() -> PipeDefinition {
         window_ns: 160,
         key: IndexFieldSpec::Key,
         aggregation: WindowAggregation::Count,
-        time: finnstream::control::WindowTime::Event,
+        time: whitewater::control::WindowTime::Event,
         max_late_ns: None,
         expire_ns: Some(30),
     };
@@ -1619,7 +1619,7 @@ fn expire_window_pipe() -> PipeDefinition {
 }
 
 fn pane_emission(group: IndexValue, pane: u64, count: u64, sum: i128) -> WindowEmission {
-    let tagged = finnstream::pipe::window_group_key_bytes(&group).unwrap();
+    let tagged = whitewater::pipe::window_group_key_bytes(&group).unwrap();
     WindowEmission {
         row_key: window_pane_row_key(&tagged, pane),
         group,
@@ -1672,7 +1672,7 @@ async fn window_pipe_emits_a_closed_pane_and_deletes_its_row_atomically() {
     assert_eq!(
         output.key_base64,
         b64(
-            &finnstream::pipe::window_group_key_bytes(&IndexValue::Bytes(b"key-a".to_vec()))
+            &whitewater::pipe::window_group_key_bytes(&IndexValue::Bytes(b"key-a".to_vec()))
                 .unwrap()
         )
     );
@@ -1714,7 +1714,7 @@ async fn window_pipe_emits_a_closed_pane_and_deletes_its_row_atomically() {
     assert_eq!(*key, emission.row_key);
     assert_eq!(
         state_mutations[1].mutation_id,
-        finnstream::effect::effect_state_mutation_id(applied.effect_id, 1)
+        whitewater::effect::effect_state_mutation_id(applied.effect_id, 1)
     );
     let StateStoreMutationOp::AccumulateRows { .. } = &state_mutations[0].op else {
         panic!("expected AccumulateRows first")
@@ -1749,7 +1749,7 @@ async fn idle_pages_close_panes_with_an_emission_only_effect() {
         .expect("applied");
     assert_eq!(
         applied.effect_id,
-        finnstream::pipe::pipe_emission_effect_id(
+        whitewater::pipe::pipe_emission_effect_id(
             emit_window_pipe().pipe_id,
             Uuid::from_u128(SUBSCRIPTION),
             "p0",
@@ -1835,7 +1835,7 @@ async fn window_pipe_expires_pane_rows_without_emitting() {
     let harness = harness_for(expire_window_pipe());
     seed_frontier(&harness.progress, "p0").await;
     let tagged =
-        finnstream::pipe::window_group_key_bytes(&IndexValue::Bytes(b"key-a".to_vec())).unwrap();
+        whitewater::pipe::window_group_key_bytes(&IndexValue::Bytes(b"key-a".to_vec())).unwrap();
     let expired_key = window_pane_row_key(&tagged, 2);
 
     let mut page = page(vec![json_record(1, b"key-a", 0, 5)], "p1");
@@ -1877,7 +1877,7 @@ async fn expired_panes_delete_on_an_idle_page() {
     let harness = harness_for(expire_window_pipe());
     seed_frontier(&harness.progress, "p0").await;
     let tagged =
-        finnstream::pipe::window_group_key_bytes(&IndexValue::Bytes(b"key-a".to_vec())).unwrap();
+        whitewater::pipe::window_group_key_bytes(&IndexValue::Bytes(b"key-a".to_vec())).unwrap();
     let expired_key = window_pane_row_key(&tagged, 2);
 
     let mut page = page(vec![], "p0");
@@ -1899,7 +1899,7 @@ async fn expired_panes_delete_on_an_idle_page() {
     // Expiry rides the emission-effect identity keyed on the delete set.
     assert_eq!(
         applied.effect_id,
-        finnstream::pipe::pipe_emission_effect_id(
+        whitewater::pipe::pipe_emission_effect_id(
             expire_window_pipe().pipe_id,
             Uuid::from_u128(SUBSCRIPTION),
             "p0",
@@ -1934,7 +1934,7 @@ async fn emitted_panes_fill_the_delete_budget_before_expired_ones() {
         .map(|pane| pane_emission(IndexValue::Bytes(b"key-a".to_vec()), pane, 1, 1))
         .collect();
     let tagged =
-        finnstream::pipe::window_group_key_bytes(&IndexValue::Bytes(b"key-b".to_vec())).unwrap();
+        whitewater::pipe::window_group_key_bytes(&IndexValue::Bytes(b"key-b".to_vec())).unwrap();
     let expired: Vec<Vec<u8>> = (20..23)
         .map(|pane| window_pane_row_key(&tagged, pane))
         .collect();

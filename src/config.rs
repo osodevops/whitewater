@@ -43,16 +43,16 @@ pub struct NodeConfig {
 
 impl NodeConfig {
     pub fn from_env() -> Result<Self> {
-        let bind_addr: SocketAddr = env::var("FINNSTREAM_BIND_ADDR")
+        let bind_addr: SocketAddr = env::var("WHITEWATER_BIND_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:7070".to_owned())
             .parse()
-            .context("FINNSTREAM_BIND_ADDR must be a socket address")?;
-        let node_id = env::var("FINNSTREAM_NODE_ID")
+            .context("WHITEWATER_BIND_ADDR must be a socket address")?;
+        let node_id = env::var("WHITEWATER_NODE_ID")
             .or_else(|_| env::var("HOSTNAME"))
             .unwrap_or_else(|_| uuid::Uuid::new_v4().to_string());
-        let advertise_url = env::var("FINNSTREAM_ADVERTISE_URL")
+        let advertise_url = env::var("WHITEWATER_ADVERTISE_URL")
             .unwrap_or_else(|_| format!("http://{}:{}", discover_local_ip(), bind_addr.port()));
-        let seeds = env::var("FINNSTREAM_SEEDS")
+        let seeds = env::var("WHITEWATER_SEEDS")
             .unwrap_or_default()
             .split(',')
             .map(str::trim)
@@ -60,38 +60,38 @@ impl NodeConfig {
             .map(ToOwned::to_owned)
             .collect();
         let heartbeat_interval =
-            Duration::from_millis(parse_env("FINNSTREAM_HEARTBEAT_MS", 2_000)?);
+            Duration::from_millis(parse_env("WHITEWATER_HEARTBEAT_MS", 2_000)?);
         let member_timeout =
-            Duration::from_millis(parse_env("FINNSTREAM_MEMBER_TIMEOUT_MS", 10_000)?);
+            Duration::from_millis(parse_env("WHITEWATER_MEMBER_TIMEOUT_MS", 10_000)?);
         if heartbeat_interval >= member_timeout {
             anyhow::bail!(
-                "FINNSTREAM_HEARTBEAT_MS must be lower than FINNSTREAM_MEMBER_TIMEOUT_MS"
+                "WHITEWATER_HEARTBEAT_MS must be lower than WHITEWATER_MEMBER_TIMEOUT_MS"
             );
         }
-        let control_node_id = env::var("FINNSTREAM_CONTROL_NODE_ID")
+        let control_node_id = env::var("WHITEWATER_CONTROL_NODE_ID")
             .ok()
             .map(|value| value.parse::<u64>())
             .transpose()
-            .context("FINNSTREAM_CONTROL_NODE_ID must be an unsigned integer")?;
+            .context("WHITEWATER_CONTROL_NODE_ID must be an unsigned integer")?;
         let control_nodes =
-            parse_control_nodes(&env::var("FINNSTREAM_CONTROL_NODES").unwrap_or_default())?;
-        let control_plane_key = env::var("FINNSTREAM_CONTROL_PLANE_KEY").ok();
+            parse_control_nodes(&env::var("WHITEWATER_CONTROL_NODES").unwrap_or_default())?;
+        let control_plane_key = env::var("WHITEWATER_CONTROL_PLANE_KEY").ok();
         validate_control_topology(
             control_node_id,
             &control_nodes,
             control_plane_key.as_deref(),
         )?;
         let storage_node_id = resolve_storage_node_id(
-            env::var("FINNSTREAM_STORAGE_NODE_ID").ok().as_deref(),
+            env::var("WHITEWATER_STORAGE_NODE_ID").ok().as_deref(),
             control_node_id,
         )?;
         let tls = [
-            env::var("FINNSTREAM_SUBSCRIPTION_MTLS_BIND").ok(),
-            env::var("FINNSTREAM_SUBSCRIPTION_MTLS_CERT").ok(),
-            env::var("FINNSTREAM_SUBSCRIPTION_MTLS_KEY").ok(),
-            env::var("FINNSTREAM_SUBSCRIPTION_MTLS_CA").ok(),
-            env::var("FINNSTREAM_SUBSCRIPTION_MTLS_PEER_PINS").ok(),
-            env::var("FINNSTREAM_SUBSCRIPTION_MTLS_ENDPOINTS").ok(),
+            env::var("WHITEWATER_SUBSCRIPTION_MTLS_BIND").ok(),
+            env::var("WHITEWATER_SUBSCRIPTION_MTLS_CERT").ok(),
+            env::var("WHITEWATER_SUBSCRIPTION_MTLS_KEY").ok(),
+            env::var("WHITEWATER_SUBSCRIPTION_MTLS_CA").ok(),
+            env::var("WHITEWATER_SUBSCRIPTION_MTLS_PEER_PINS").ok(),
+            env::var("WHITEWATER_SUBSCRIPTION_MTLS_ENDPOINTS").ok(),
         ];
         if tls.iter().any(Option::is_some) && !tls.iter().all(Option::is_some) {
             anyhow::bail!("Subscription mTLS bind, certificate, key, CA, peer pins and peer endpoints must be configured together");
@@ -139,11 +139,11 @@ impl NodeConfig {
             advertise_url: advertise_url.trim_end_matches('/').to_owned(),
             seeds,
             data_dir: PathBuf::from(
-                env::var("FINNSTREAM_DATA_DIR").unwrap_or_else(|_| "./data".to_owned()),
+                env::var("WHITEWATER_DATA_DIR").unwrap_or_else(|_| "./data".to_owned()),
             ),
             heartbeat_interval,
             member_timeout,
-            capacity: parse_env("FINNSTREAM_NODE_CAPACITY", 100)?,
+            capacity: parse_env("WHITEWATER_NODE_CAPACITY", 100)?,
             control_node_id,
             control_nodes,
             control_plane_key,
@@ -223,21 +223,21 @@ fn validate_control_topology(
 ) -> Result<()> {
     if control_node_id.is_some() && (control_nodes.is_empty() || control_plane_key.is_none()) {
         anyhow::bail!(
-            "FINNSTREAM_CONTROL_NODE_ID requires FINNSTREAM_CONTROL_NODES and FINNSTREAM_CONTROL_PLANE_KEY"
+            "WHITEWATER_CONTROL_NODE_ID requires WHITEWATER_CONTROL_NODES and WHITEWATER_CONTROL_PLANE_KEY"
         );
     }
     if !control_nodes.is_empty() && control_plane_key.is_none() {
-        anyhow::bail!("FINNSTREAM_CONTROL_NODES requires FINNSTREAM_CONTROL_PLANE_KEY");
+        anyhow::bail!("WHITEWATER_CONTROL_NODES requires WHITEWATER_CONTROL_PLANE_KEY");
     }
     if control_node_id.is_some_and(|id| !control_nodes.iter().any(|(peer, _)| *peer == id)) {
-        anyhow::bail!("FINNSTREAM_CONTROL_NODE_ID must appear in FINNSTREAM_CONTROL_NODES");
+        anyhow::bail!("WHITEWATER_CONTROL_NODE_ID must appear in WHITEWATER_CONTROL_NODES");
     }
     Ok(())
 }
 
 /// Resolves this Node's storage identity on the internal data plane.
 /// Voters derive `control-N`; a Node without a voter role sets
-/// `FINNSTREAM_STORAGE_NODE_ID` explicitly to serve as an independently
+/// `WHITEWATER_STORAGE_NODE_ID` explicitly to serve as an independently
 /// registered storage Node.
 fn resolve_storage_node_id(
     explicit: Option<&str>,
@@ -250,10 +250,10 @@ fn resolve_storage_node_id(
     match explicit {
         Some(value) => {
             let identity = StorageNodeId::try_new(value.trim().to_owned())
-                .context("FINNSTREAM_STORAGE_NODE_ID must be a valid storage Node ID")?;
+                .context("WHITEWATER_STORAGE_NODE_ID must be a valid storage Node ID")?;
             if derived.is_some_and(|node| node != identity) {
                 anyhow::bail!(
-                    "FINNSTREAM_STORAGE_NODE_ID must match control-N on Control Plane voters"
+                    "WHITEWATER_STORAGE_NODE_ID must match control-N on Control Plane voters"
                 );
             }
             Ok(Some(identity))

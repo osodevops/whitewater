@@ -4,11 +4,11 @@ x-node: &node
   build:
     context: .
   environment: &node-environment
-    FINNSTREAM_SEEDS: node1:7070,node2:7070,node3:7070
-    FINNSTREAM_NODE_CAPACITY: 100
-    FINNSTREAM_ADMIN_API_KEY: ${FINNSTREAM_ADMIN_API_KEY:-whitewater-local-development-admin-key}
-    FINNSTREAM_CONTROL_NODES: 1@node1:7070,2@node2:7070,3@node3:7070
-    FINNSTREAM_CONTROL_PLANE_KEY: ${FINNSTREAM_CONTROL_PLANE_KEY:-whitewater-local-development-control-key}
+    WHITEWATER_SEEDS: node1:7070,node2:7070,node3:7070
+    WHITEWATER_NODE_CAPACITY: 100
+    WHITEWATER_ADMIN_API_KEY: ${WHITEWATER_ADMIN_API_KEY:-whitewater-local-development-admin-key}
+    WHITEWATER_CONTROL_NODES: 1@node1:7070,2@node2:7070,3@node3:7070
+    WHITEWATER_CONTROL_PLANE_KEY: ${WHITEWATER_CONTROL_PLANE_KEY:-whitewater-local-development-control-key}
     WHITEWATER_AUTO_SPLIT_INTERVAL_MS: ${WHITEWATER_AUTO_SPLIT_INTERVAL_MS:-2000}
     WHITEWATER_AUTO_SPLIT_APPEND_RATE: ${WHITEWATER_AUTO_SPLIT_APPEND_RATE:-10000}
     WHITEWATER_AUTO_SPLIT_SUSTAINED_SAMPLES: ${WHITEWATER_AUTO_SPLIT_SUSTAINED_SAMPLES:-3}
@@ -26,11 +26,11 @@ services:
       - "7071:7070"
     environment:
       <<: *node-environment
-      FINNSTREAM_NODE_ID: whitewater-node1
-      FINNSTREAM_CONTROL_NODE_ID: 1
-      FINNSTREAM_ADVERTISE_URL: http://node1:7070
+      WHITEWATER_NODE_ID: whitewater-node1
+      WHITEWATER_CONTROL_NODE_ID: 1
+      WHITEWATER_ADVERTISE_URL: http://node1:7070
     volumes:
-      - whitewater-node1-data:/var/lib/finnstream
+      - whitewater-node1-data:/var/lib/whitewater
 
   node2:
     <<: *node
@@ -39,11 +39,11 @@ services:
       - "7072:7070"
     environment:
       <<: *node-environment
-      FINNSTREAM_NODE_ID: whitewater-node2
-      FINNSTREAM_CONTROL_NODE_ID: 2
-      FINNSTREAM_ADVERTISE_URL: http://node2:7070
+      WHITEWATER_NODE_ID: whitewater-node2
+      WHITEWATER_CONTROL_NODE_ID: 2
+      WHITEWATER_ADVERTISE_URL: http://node2:7070
     volumes:
-      - whitewater-node2-data:/var/lib/finnstream
+      - whitewater-node2-data:/var/lib/whitewater
 
   node3:
     <<: *node
@@ -52,11 +52,11 @@ services:
       - "7073:7070"
     environment:
       <<: *node-environment
-      FINNSTREAM_NODE_ID: whitewater-node3
-      FINNSTREAM_CONTROL_NODE_ID: 3
-      FINNSTREAM_ADVERTISE_URL: http://node3:7070
+      WHITEWATER_NODE_ID: whitewater-node3
+      WHITEWATER_CONTROL_NODE_ID: 3
+      WHITEWATER_ADVERTISE_URL: http://node3:7070
     volumes:
-      - whitewater-node3-data:/var/lib/finnstream
+      - whitewater-node3-data:/var/lib/whitewater
 
 volumes:
   whitewater-node1-data:

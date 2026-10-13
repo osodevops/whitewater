@@ -15,7 +15,7 @@ IB_ROWS=10000 IB_OPS=8000 IB_BURST=10000 ./target/release/index-bench
 ## Method
 
 One deterministic logical workload replayed identically against each
-engine, using the real `finnstream::index` key codecs — `primary_key`,
+engine, using the real `whitewater::index` key codecs — `primary_key`,
 `posting_key`, `posting_prefix`, `unique_claim_key`. Three storage
 namespaces per engine (primary rows, shared secondary/unique-claim
 entries, checkpoints), matching `FjallIndexStore`'s layout:

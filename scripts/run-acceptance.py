@@ -141,27 +141,39 @@ def wait_healthy(timeout_s: int = HEALTH_TIMEOUT_S) -> None:
 
 def wait_control_plane(deadline: float) -> None:
     # `/health` reports the HTTP listener only; WCL calls fail with "leader
-    # election is in progress" until every voter observes a leader. Gate the
-    # suite on `/v1/admin/control-plane` so no script races the election.
-    key = os.environ.get("FINNSTREAM_ADMIN_API_KEY", "whitewater-local-development-admin-key")
-    pending = set(NODES)
+    # election is in progress" until every voter observes a leader. A Node that
+    # restarted mid-suite must also finish replaying its catalog backlog before
+    # scripts run — otherwise read-your-writes requests hit a half-applied
+    # state (a Reader exists but its session open has not landed). Gate on
+    # `/v1/admin/control-plane` until every Node reports a leader AND each
+    # Node's applied index has converged with the log tail. The catalog is
+    # quiescent between scripts, so the indexes converge.
+    key = os.environ.get("WHITEWATER_ADMIN_API_KEY", "whitewater-local-development-admin-key")
     while time.monotonic() < deadline:
-        for endpoint in list(pending):
+        statuses = []
+        for endpoint in NODES:
             try:
                 request = urllib.request.Request(
                     f"{endpoint}/v1/admin/control-plane",
                     headers={"authorization": f"Bearer {key}"},
                 )
                 with urllib.request.urlopen(request, timeout=3) as response:
-                    status = json.loads(response.read())
-                    if status.get("leader_id") is not None:
-                        pending.remove(endpoint)
+                    statuses.append(json.loads(response.read()))
             except Exception:
-                pass
-        if not pending:
-            return
+                statuses = []
+                break
+        if len(statuses) == len(NODES):
+            tails = {status.get("last_log_index") for status in statuses}
+            leaders_ok = all(status.get("leader_id") is not None for status in statuses)
+            applied_ok = all(
+                status.get("last_applied_index") is not None
+                and status["last_applied_index"] >= (status.get("last_log_index") or 0)
+                for status in statuses
+            )
+            if leaders_ok and applied_ok and len(tails) == 1:
+                return
         time.sleep(1)
-    raise AssertionError(f"verification Control Plane did not elect a leader: {sorted(pending)}")
+    raise AssertionError("verification Control Plane did not converge: leader or applied index missing")
 
 
 def main() -> int:

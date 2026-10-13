@@ -1,7 +1,8 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use finnstream::{
+use tempfile::TempDir;
+use whitewater::{
     active_range::{
         plan_owner_recovery, AppendIdentity, CommitPosition, OwnerRecoveryError, RangeGeneration,
         RangePosition, ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitRequest,
@@ -12,7 +13,6 @@ use finnstream::{
     domain::StoredRecord,
     storage::{FileLogStore, LogStore},
 };
-use tempfile::TempDir;
 
 fn node(value: &str) -> StorageNodeId {
     StorageNodeId::try_new(value).unwrap()
@@ -21,7 +21,7 @@ fn node(value: &str) -> StorageNodeId {
 async fn fixture() -> (
     TempDir,
     ControlController,
-    finnstream::active_range::ActiveRangeAssignment,
+    whitewater::active_range::ActiveRangeAssignment,
 ) {
     let directory = TempDir::new().unwrap();
     let store: Arc<dyn LogStore> =

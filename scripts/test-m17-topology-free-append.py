@@ -10,7 +10,7 @@ import uuid
 BASE_PORT = int(os.environ.get("WHITEWATER_TEST_BASE_PORT", "7071"))
 ENDPOINTS = {f"control-{index}": f"http://localhost:{BASE_PORT + index - 1}" for index in range(1, 4)}
 ADMIN_KEY = os.environ.get(
-    "FINNSTREAM_ADMIN_API_KEY", "whitewater-local-development-admin-key"
+    "WHITEWATER_ADMIN_API_KEY", "whitewater-local-development-admin-key"
 )
 
 

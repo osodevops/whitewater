@@ -8,7 +8,7 @@ use base64::{engine::general_purpose::STANDARD, Engine as _};
 use uuid::Uuid;
 
 use anyhow::{bail, Context, Result};
-use finnstream::{
+use whitewater::{
     admin::{AdminClient, CLIENT_API_KEY_ENV},
     api::TemporaryReaderFetchRequest,
     control::ControlExecution,

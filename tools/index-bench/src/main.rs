@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use finnstream::index::{
+use whitewater::index::{
     posting_key, posting_prefix, primary_key, unique_claim_key, IndexEntry, IndexId, IndexValue,
     PrimaryRef,
 };

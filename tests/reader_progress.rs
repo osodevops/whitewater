@@ -4,7 +4,9 @@ use std::{
     time::Duration,
 };
 
-use finnstream::{
+use tempfile::TempDir;
+use uuid::Uuid;
+use whitewater::{
     active_range::{KeyToken, RangeId, RangePosition, ReplicaSet, StorageNodeId},
     control::{Command, ControlController},
     reader::{
@@ -19,8 +21,6 @@ use finnstream::{
     },
     storage::{FileLogStore, LogStore},
 };
-use tempfile::TempDir;
-use uuid::Uuid;
 
 #[test]
 fn split_and_merge_frontiers_keep_acknowledged_history_without_skipping() {
@@ -2087,7 +2087,7 @@ fn lease_mutation(
     base: &SubscriptionProgressMutation,
     sequence: u64,
     tick: u64,
-    lease_ops: Vec<finnstream::reader::SubscriptionLeaseOp>,
+    lease_ops: Vec<whitewater::reader::SubscriptionLeaseOp>,
 ) -> SubscriptionProgressMutation {
     let mut mutation = progress_mutation(
         base.subscription_id,
@@ -2105,7 +2105,7 @@ fn lease_mutation(
 
 #[tokio::test]
 async fn subscription_member_leases_replicate_survive_restart_and_recover() {
-    use finnstream::reader::SubscriptionLeaseOp;
+    use whitewater::reader::SubscriptionLeaseOp;
 
     let directory = TempDir::new().unwrap();
     let nodes = progress_nodes();
@@ -2193,7 +2193,7 @@ async fn subscription_member_leases_replicate_survive_restart_and_recover() {
     assert!(matches!(
         coordinator.apply(steal).await,
         Err(SubscriptionProgressError::Lease(
-            finnstream::reader::SubscriptionLeaseError::Busy
+            whitewater::reader::SubscriptionLeaseError::Busy
         ))
     ));
 
@@ -2311,7 +2311,7 @@ async fn subscription_member_leases_replicate_survive_restart_and_recover() {
 
 #[tokio::test]
 async fn subscription_member_api_fences_acks_by_quorum_leases() {
-    use finnstream::reader::{
+    use whitewater::reader::{
         SubscriptionLeaseOp, SubscriptionQuarantineDelta, SubscriptionWorkLease,
     };
 
@@ -2416,7 +2416,7 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
             )
             .await,
         Err(SubscriptionProgressError::Lease(
-            finnstream::reader::SubscriptionLeaseError::StaleLease
+            whitewater::reader::SubscriptionLeaseError::StaleLease
         ))
     ));
     let wrong_lease = SubscriptionWorkLease {
@@ -2435,7 +2435,7 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
             )
             .await,
         Err(SubscriptionProgressError::Lease(
-            finnstream::reader::SubscriptionLeaseError::StaleLease
+            whitewater::reader::SubscriptionLeaseError::StaleLease
         ))
     ));
 
@@ -2605,7 +2605,7 @@ async fn epoch_stale_replica_rows_are_lagging_witnesses_for_reads_and_writes() {
         .apply_member_ops(
             Uuid::from_u128(9_001),
             1,
-            vec![finnstream::reader::SubscriptionLeaseOp::Join {
+            vec![whitewater::reader::SubscriptionLeaseOp::Join {
                 member_id: Uuid::from_u128(9_002),
                 member_epoch: 1,
             }],
@@ -2621,7 +2621,7 @@ async fn epoch_stale_replica_rows_are_lagging_witnesses_for_reads_and_writes() {
     retry.request_id = Uuid::from_u128(9_003);
     retry.expected_cursor = Some(applied.cursor.clone());
     retry.cursor = "rf1_4".to_owned();
-    retry.lease_ops = vec![finnstream::reader::SubscriptionLeaseOp::Claim {
+    retry.lease_ops = vec![whitewater::reader::SubscriptionLeaseOp::Claim {
         work_id: Uuid::from_u128(9_004),
         member_id: Uuid::from_u128(9_002),
         member_epoch: 1,
@@ -2779,7 +2779,7 @@ async fn recovery_then_member_ops_when_a_survivor_lags_one_sequence() {
         .apply_member_ops(
             Uuid::from_u128(7_777),
             1,
-            vec![finnstream::reader::SubscriptionLeaseOp::Join {
+            vec![whitewater::reader::SubscriptionLeaseOp::Join {
                 member_id: Uuid::from_u128(8_888),
                 member_epoch: 1,
             }],
@@ -2791,7 +2791,7 @@ async fn recovery_then_member_ops_when_a_survivor_lags_one_sequence() {
 
 #[tokio::test]
 async fn subscription_acks_carry_a_bounded_quarantine_set() {
-    use finnstream::reader::{
+    use whitewater::reader::{
         SubscriptionLeaseOp, SubscriptionQuarantineDelta, SubscriptionWorkLease,
     };
 

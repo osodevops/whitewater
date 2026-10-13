@@ -2,7 +2,9 @@ use std::{collections::BTreeMap, fs, sync::Arc};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use finnstream::{
+use tempfile::TempDir;
+use uuid::Uuid;
+use whitewater::{
     active_range::{
         copy_follower_move, repair_replica, AppendIdentity, CommitPosition, FollowerMoveControl,
         FollowerMoveCopyResult, FollowerMoveExecutor, MajorityAppendCoordinator, OwnershipEpoch,
@@ -16,8 +18,6 @@ use finnstream::{
     domain::StoredRecord,
     storage::{FileLogStore, LogStore},
 };
-use tempfile::TempDir;
-use uuid::Uuid;
 
 fn node(value: &str) -> StorageNodeId {
     StorageNodeId::try_new(value).unwrap()

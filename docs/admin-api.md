@@ -23,7 +23,7 @@ Authorization: Bearer <api-key>
 The Node reads its expected key from:
 
 ```text
-FINNSTREAM_ADMIN_API_KEY
+WHITEWATER_ADMIN_API_KEY
 ```
 
 Keys shorter than 24 characters are rejected during configuration. The server stores only an in-memory BLAKE3 digest and compares supplied digests without early exit.
@@ -39,14 +39,14 @@ whitewater-local-development-admin-key
 Override it before starting Compose:
 
 ```bash
-export FINNSTREAM_ADMIN_API_KEY='replace-with-a-random-development-key'
+export WHITEWATER_ADMIN_API_KEY='replace-with-a-random-development-key'
 docker compose up --build -d
 ```
 
 PowerShell:
 
 ```powershell
-$env:FINNSTREAM_ADMIN_API_KEY = 'replace-with-a-random-development-key'
+$env:WHITEWATER_ADMIN_API_KEY = 'replace-with-a-random-development-key'
 docker compose up --build -d
 ```
 
@@ -645,7 +645,7 @@ WCL and typed requests return the same structure:
 ## Rust AdminClient
 
 ```rust
-use finnstream::{
+use whitewater::{
     admin::AdminClient,
     control::{Command, ReaderStart, ShowKind},
 };

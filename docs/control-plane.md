@@ -186,9 +186,9 @@ Each voter persists:
 
 ```text
 
-/var/lib/finnstream/control-plane-raft.json
+/var/lib/whitewater/control-plane-raft.json
 
-/var/lib/finnstream/control-plane-catalog.json
+/var/lib/whitewater/control-plane-catalog.json
 
 ```
 
@@ -346,7 +346,7 @@ The shared prototype credential is configured with:
 
 ```text
 
-FINNSTREAM_CONTROL_PLANE_KEY
+WHITEWATER_CONTROL_PLANE_KEY
 
 ```
 
@@ -374,17 +374,17 @@ An optional dedicated listener now protects the entire internal Node-to-Node pla
 
 ```text
 
-FINNSTREAM_SUBSCRIPTION_MTLS_BIND
+WHITEWATER_SUBSCRIPTION_MTLS_BIND
 
-FINNSTREAM_SUBSCRIPTION_MTLS_CERT
+WHITEWATER_SUBSCRIPTION_MTLS_CERT
 
-FINNSTREAM_SUBSCRIPTION_MTLS_KEY
+WHITEWATER_SUBSCRIPTION_MTLS_KEY
 
-FINNSTREAM_SUBSCRIPTION_MTLS_CA
+WHITEWATER_SUBSCRIPTION_MTLS_CA
 
-FINNSTREAM_SUBSCRIPTION_MTLS_PEER_PINS
+WHITEWATER_SUBSCRIPTION_MTLS_PEER_PINS
 
-FINNSTREAM_SUBSCRIPTION_MTLS_ENDPOINTS
+WHITEWATER_SUBSCRIPTION_MTLS_ENDPOINTS
 
 ```
 
@@ -412,11 +412,11 @@ Control voter membership is currently configured statically:
 
 ```text
 
-FINNSTREAM_CONTROL_NODE_ID
+WHITEWATER_CONTROL_NODE_ID
 
-FINNSTREAM_CONTROL_NODES
+WHITEWATER_CONTROL_NODES
 
-FINNSTREAM_CONTROL_PLANE_KEY
+WHITEWATER_CONTROL_PLANE_KEY
 
 ```
 
@@ -428,9 +428,9 @@ Example:
 
 ```text
 
-FINNSTREAM_CONTROL_NODE_ID=1
+WHITEWATER_CONTROL_NODE_ID=1
 
-FINNSTREAM_CONTROL_NODES=1@node1:7070,2@node2:7070,3@node3:7070
+WHITEWATER_CONTROL_NODES=1@node1:7070,2@node2:7070,3@node3:7070
 
 ```
 
@@ -440,7 +440,7 @@ Dynamic learner addition and joint-consensus membership changes are future work.
 
 ### Storage-only Nodes
 
-A Node without `FINNSTREAM_CONTROL_NODE_ID` holds no voter role but can still serve the data plane. `FINNSTREAM_STORAGE_NODE_ID` names its internal storage identity (voters derive `control-N` automatically and must not override it), and `FINNSTREAM_CONTROL_NODES` plus `FINNSTREAM_CONTROL_PLANE_KEY` give it the voter endpoints and internal credential without requiring the full voter triple; internal data-plane routes authenticate on that shared credential alone when no local voter exists, while Raft RPC handlers continue to refuse requests on a Node with no Control Plane. Registered in the catalog (`REGISTER STORAGE NODE <id> AT <endpoint> [WITH CERT PIN ...]`), the Node joins the eligible placement pool, and every internal transport resolves its endpoint through the catalog record.
+A Node without `WHITEWATER_CONTROL_NODE_ID` holds no voter role but can still serve the data plane. `WHITEWATER_STORAGE_NODE_ID` names its internal storage identity (voters derive `control-N` automatically and must not override it), and `WHITEWATER_CONTROL_NODES` plus `WHITEWATER_CONTROL_PLANE_KEY` give it the voter endpoints and internal credential without requiring the full voter triple; internal data-plane routes authenticate on that shared credential alone when no local voter exists, while Raft RPC handlers continue to refuse requests on a Node with no Control Plane. Registered in the catalog (`REGISTER STORAGE NODE <id> AT <endpoint> [WITH CERT PIN ...]`), the Node joins the eligible placement pool, and every internal transport resolves its endpoint through the catalog record.
 
 Non-voters cannot receive Raft log replication, so each runs a catalog sync supervisor (`WHITEWATER_CATALOG_SYNC_MS`, default 1s) that installs the newest committed snapshot served by `POST /internal/catalog/snapshot` on any reachable voter. Installs are revision-gated so a lagging peer can never roll catalog state backwards, and the synced catalog runs in read-through replica mode: local mutations are refused rather than diverging silently. Until the first snapshot lands, replica append and progress fencing fail closed on the empty catalog, so a freshly started storage Node cannot serve placements it has not seen committed. `scripts/test-storage-node-join.py` (`compose.storage-join.yml`) demonstrates the lifecycle live: three voters plus a registered non-voter, catalog-distributed certificate-pin trust (voters carry no static pin for the Node), rendezvous placement onto the Node, mTLS replica appends, synced-catalog reads through its public API, and restart re-join with durable replica bytes.
 

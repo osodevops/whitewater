@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
-use finnstream::{
+use tempfile::TempDir;
+use uuid::Uuid;
+use whitewater::{
     domain::AppendInput,
     storage::{FileLogStore, LogStore},
 };
-use tempfile::TempDir;
-use uuid::Uuid;
 
 #[tokio::test]
 async fn records_and_deduplication_survive_restart() {

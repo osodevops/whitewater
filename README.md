@@ -142,7 +142,7 @@ curl -X POST http://localhost:7071/v1/admin/wcl \
   -d '{"script":"SHOW FEEDS;"}'
 ```
 
-All administrative commands pass through the authenticated Admin API. Clients may submit WCL to `/v1/admin/wcl` or typed commands to `/v1/admin/commands`. See the [Admin API](docs/admin-api.md) and [Whitewater Control Language v0](docs/wcl.md). The Compose key shown above is a public local-development credential; override `FINNSTREAM_ADMIN_API_KEY` outside local testing.
+All administrative commands pass through the authenticated Admin API. Clients may submit WCL to `/v1/admin/wcl` or typed commands to `/v1/admin/commands`. See the [Admin API](docs/admin-api.md) and [Whitewater Control Language v0](docs/wcl.md). The Compose key shown above is a public local-development credential; override `WHITEWATER_ADMIN_API_KEY` outside local testing.
 
 ## API examples
 

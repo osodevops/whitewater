@@ -1,7 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use finnstream::{
+use tempfile::TempDir;
+use uuid::Uuid;
+use whitewater::{
     active_range::{
         AppendIdentity, RangeGeneration, RangeId, RangePosition, ReplicaAppendErrorCode,
         ReplicaAppendRequest, ReplicaAppendService, StorageNodeId,
@@ -11,8 +13,6 @@ use finnstream::{
     domain::StoredRecord,
     storage::{FileLogStore, LogStore},
 };
-use tempfile::TempDir;
-use uuid::Uuid;
 
 struct Fixture {
     _catalog_directory: TempDir,
@@ -89,7 +89,7 @@ impl Fixture {
             feed_id: self.feed_id,
             range_id: self.range_id,
             generation: RangeGeneration::new(1),
-            ownership_epoch: finnstream::active_range::OwnershipEpoch::new(1),
+            ownership_epoch: whitewater::active_range::OwnershipEpoch::new(1),
             append_owner: self.owner.clone(),
             expected_position: RangePosition::new(position),
             identity: AppendIdentity {
@@ -154,13 +154,13 @@ async fn uncommitted_frames_are_invisible_until_commit_position_is_durable() {
         .unwrap()
         .is_empty());
     service
-        .commit(finnstream::active_range::ReplicaCommitRequest {
+        .commit(whitewater::active_range::ReplicaCommitRequest {
             feed_id: fixture.feed_id,
             range_id: fixture.range_id,
             generation: request.generation,
             ownership_epoch: request.ownership_epoch,
             append_owner: request.append_owner,
-            commit_position: finnstream::active_range::CommitPosition::new(1),
+            commit_position: whitewater::active_range::CommitPosition::new(1),
             frame_digest: accepted.frame_digest,
         })
         .await
@@ -232,7 +232,7 @@ async fn replica_rejects_wrong_range_generation_epoch_owner_and_receiver() {
     );
 
     let mut stale_epoch = fixture.request(1, 1, b"one");
-    stale_epoch.ownership_epoch = finnstream::active_range::OwnershipEpoch::new(0);
+    stale_epoch.ownership_epoch = whitewater::active_range::OwnershipEpoch::new(0);
     assert_eq!(
         service.append(stale_epoch).await.unwrap_err().code,
         ReplicaAppendErrorCode::StaleOwnershipEpoch
@@ -281,7 +281,7 @@ async fn replica_rejects_unknown_feed_and_oversized_or_invalid_base64() {
 
     let mut oversized = fixture.request(1, 1, b"one");
     oversized.frame_base64 =
-        "A".repeat(finnstream::active_range::MAX_REPLICA_FRAME_BASE64_BYTES + 1);
+        "A".repeat(whitewater::active_range::MAX_REPLICA_FRAME_BASE64_BYTES + 1);
     assert_eq!(
         service.append(oversized).await.unwrap_err().code,
         ReplicaAppendErrorCode::FrameTooLarge
@@ -289,7 +289,7 @@ async fn replica_rejects_unknown_feed_and_oversized_or_invalid_base64() {
 }
 
 fn pending_request(request: &mut ReplicaAppendRequest, effect_id: Uuid, subscription_id: Uuid) {
-    request.pending_effect = Some(finnstream::active_range::PendingEffectRef {
+    request.pending_effect = Some(whitewater::active_range::PendingEffectRef {
         effect_id,
         subscription_id,
     });
@@ -364,13 +364,13 @@ async fn commit_at_the_marker_position_releases_the_pending_tail() {
     // The deferred commit that releases the tail is the ordinary commit
     // path targeted at the marker's last frame digest.
     service
-        .commit(finnstream::active_range::ReplicaCommitRequest {
+        .commit(whitewater::active_range::ReplicaCommitRequest {
             feed_id: fixture.feed_id,
             range_id: fixture.range_id,
             generation: RangeGeneration::new(1),
-            ownership_epoch: finnstream::active_range::OwnershipEpoch::new(1),
+            ownership_epoch: whitewater::active_range::OwnershipEpoch::new(1),
             append_owner: fixture.owner.clone(),
-            commit_position: finnstream::active_range::CommitPosition::new(1),
+            commit_position: whitewater::active_range::CommitPosition::new(1),
             frame_digest: accepted.frame_digest,
         })
         .await
@@ -388,12 +388,12 @@ fn discard_request(
     fixture: &Fixture,
     effect_id: Uuid,
     subscription_id: Uuid,
-) -> finnstream::active_range::ReplicaDiscardPendingRequest {
-    finnstream::active_range::ReplicaDiscardPendingRequest {
+) -> whitewater::active_range::ReplicaDiscardPendingRequest {
+    whitewater::active_range::ReplicaDiscardPendingRequest {
         feed_id: fixture.feed_id,
         range_id: fixture.range_id,
         generation: RangeGeneration::new(1),
-        ownership_epoch: finnstream::active_range::OwnershipEpoch::new(1),
+        ownership_epoch: whitewater::active_range::OwnershipEpoch::new(1),
         append_owner: fixture.owner.clone(),
         effect_id,
         subscription_id,
@@ -414,7 +414,7 @@ async fn discard_pending_truncates_only_the_matching_marker_on_the_replica() {
         .unwrap();
     assert_eq!(
         outcome.outcome,
-        Some(finnstream::active_range::ReplicaDiscardOutcome::NotPending)
+        Some(whitewater::active_range::ReplicaDiscardOutcome::NotPending)
     );
 
     let mut held = fixture.request(1, 1, b"held");
@@ -433,7 +433,7 @@ async fn discard_pending_truncates_only_the_matching_marker_on_the_replica() {
         .unwrap();
     assert_eq!(
         outcome.outcome,
-        Some(finnstream::active_range::ReplicaDiscardOutcome::Occupied)
+        Some(whitewater::active_range::ReplicaDiscardOutcome::Occupied)
     );
     assert_eq!(outcome.occupant.unwrap().effect_id, effect);
 
@@ -445,7 +445,7 @@ async fn discard_pending_truncates_only_the_matching_marker_on_the_replica() {
         .unwrap();
     assert_eq!(
         outcome.outcome,
-        Some(finnstream::active_range::ReplicaDiscardOutcome::Discarded { dropped_frames: 1 })
+        Some(whitewater::active_range::ReplicaDiscardOutcome::Discarded { dropped_frames: 1 })
     );
     let assignment = fixture
         .controller
@@ -468,7 +468,7 @@ async fn discard_pending_fences_stale_epochs_and_non_members() {
 
     // A stale ownership epoch refuses before touching the tail.
     let mut stale = discard_request(&fixture, effect, subscription);
-    stale.ownership_epoch = finnstream::active_range::OwnershipEpoch::new(9);
+    stale.ownership_epoch = whitewater::active_range::OwnershipEpoch::new(9);
     let error = service.discard_pending(stale).await.unwrap_err();
     assert_eq!(error.code, ReplicaAppendErrorCode::StaleOwnershipEpoch);
     let assignment = fixture

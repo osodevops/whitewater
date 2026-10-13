@@ -67,6 +67,6 @@ Each entry is `{ "path.to.field": expected }` over the named bound result
   combined when both are meaningful.
 
 Scenarios run against a fresh Riverbed with the development admin key from
-`FINNSTREAM_ADMIN_API_KEY` (default `whitewater-local-development-admin-key`).
+`WHITEWATER_ADMIN_API_KEY` (default `whitewater-local-development-admin-key`).
 A runner creates its own Domain via `wcl` before use — never hardcode a
 pre-existing resource.

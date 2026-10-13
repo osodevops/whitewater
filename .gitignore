@@ -13,3 +13,4 @@ Thumbs.db
 /.cargo-target/
 .tmp_*.py
 __pycache__/
+/acceptance-logs/

@@ -1,7 +1,9 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use finnstream::{
+use tempfile::TempDir;
+use uuid::Uuid;
+use whitewater::{
     active_range::{
         AppendIdentity, OwnershipEpoch, RangeGeneration, RangeId, RangePosition,
         ReplicaAppendErrorCode, ReplicaAppendRequest, ReplicaAppendService, StorageNodeId,
@@ -14,8 +16,6 @@ use finnstream::{
     },
     storage::FileLogStore,
 };
-use tempfile::TempDir;
-use uuid::Uuid;
 
 fn node(name: &str) -> StorageNodeId {
     StorageNodeId::try_new(name).unwrap()

@@ -1,6 +1,8 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use finnstream::{
+use tempfile::TempDir;
+use uuid::Uuid;
+use whitewater::{
     active_range::{CommitPosition, KeyToken, StorageNodeId},
     control::{
         Command, ControlController, ControlError, RangeMergePlan, RangeSplitPlan, RangeSplitStage,
@@ -8,8 +10,6 @@ use finnstream::{
     },
     storage::{FileLogStore, LogStore},
 };
-use tempfile::TempDir;
-use uuid::Uuid;
 
 fn storage_nodes(names: &[&str]) -> Vec<StorageNodeId> {
     names
@@ -536,7 +536,7 @@ async fn owner_move_plan_cannot_overwrite_newer_recovery_placement() {
         .execute_commands(vec![Command::RecoverActiveRangeOwnership {
             feed: "orders.created".to_owned(),
             expected_owner: placed_owner(&original),
-            expected_epoch: finnstream::active_range::OwnershipEpoch::new(1),
+            expected_epoch: whitewater::active_range::OwnershipEpoch::new(1),
             new_owner: recovered_owner.clone(),
         }])
         .await
@@ -835,7 +835,7 @@ async fn follower_move_cannot_overwrite_newer_ownership() {
         .execute_commands(vec![Command::RecoverActiveRangeOwnership {
             feed: "orders.created".to_owned(),
             expected_owner: placed_owner(&original),
-            expected_epoch: finnstream::active_range::OwnershipEpoch::new(1),
+            expected_epoch: whitewater::active_range::OwnershipEpoch::new(1),
             new_owner: recovered_owner.clone(),
         }])
         .await
@@ -1702,7 +1702,7 @@ async fn drain_plan_explains_ordered_moves_and_unplannable_references() {
     let owner = placed_owner(&plc);
 
     // INSPECT DRAIN explains the required moves without changing state.
-    let plan: finnstream::control::StorageDrainPlan = serde_json::from_value(
+    let plan: whitewater::control::StorageDrainPlan = serde_json::from_value(
         control
             .execute(&format!("INSPECT DRAIN FOR STORAGE NODE {held};"))
             .await
@@ -1755,7 +1755,7 @@ async fn drain_plan_explains_ordered_moves_and_unplannable_references() {
         .await
         .unwrap();
     let progress_held = progress_assignment.replicas.iter().next().unwrap().clone();
-    let progress_plan: finnstream::control::StorageDrainPlan = serde_json::from_value(
+    let progress_plan: whitewater::control::StorageDrainPlan = serde_json::from_value(
         control
             .execute(&format!("INSPECT DRAIN FOR STORAGE NODE {progress_held};"))
             .await
@@ -1806,7 +1806,7 @@ async fn drain_plan_explains_ordered_moves_and_unplannable_references() {
         .execute(&format!("DRAIN STORAGE NODE {held};"))
         .await
         .unwrap();
-    let plan: finnstream::control::StorageDrainPlan = serde_json::from_value(
+    let plan: whitewater::control::StorageDrainPlan = serde_json::from_value(
         control
             .execute(&format!("INSPECT DRAIN FOR STORAGE NODE {held};"))
             .await
@@ -1830,7 +1830,7 @@ async fn drain_plan_explains_ordered_moves_and_unplannable_references() {
     );
     create_feed(&tight, Uuid::from_u128(820)).await;
     let tight_held = placed_replicas(&placement(&tight).await)[0].clone();
-    let plan: finnstream::control::StorageDrainPlan = serde_json::from_value(
+    let plan: whitewater::control::StorageDrainPlan = serde_json::from_value(
         tight
             .execute(&format!("INSPECT DRAIN FOR STORAGE NODE {tight_held};"))
             .await

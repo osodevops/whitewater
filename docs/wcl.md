@@ -795,7 +795,7 @@ UNDRAIN STORAGE NODE storage-4;
 
 
 
-When the Control Plane is configured and `FINNSTREAM_ADMIN_API_KEY` is set, the leader runs `StorageDrainSupervisor` automatically: every few seconds it walks the marked Nodes and executes their plans through `AdminDrainDriver`, which invokes the same admin move endpoints an operator would call. The log reports each completed move, blocked `unplannable` references, and the `safe-to-remove` signal once a Node is fully drained; `RETIRE STORAGE NODE` then completes removal. The supervisor honors a movement disruption budget (`WHITEWATER_DRAIN_MOVE_BUDGET`, default 2): when that many Active Range move plans are already in flight — including plans wedged by a crashed driver — supervised drains wait instead of stacking freezes onto unresolved movement.
+When the Control Plane is configured and `WHITEWATER_ADMIN_API_KEY` is set, the leader runs `StorageDrainSupervisor` automatically: every few seconds it walks the marked Nodes and executes their plans through `AdminDrainDriver`, which invokes the same admin move endpoints an operator would call. The log reports each completed move, blocked `unplannable` references, and the `safe-to-remove` signal once a Node is fully drained; `RETIRE STORAGE NODE` then completes removal. The supervisor honors a movement disruption budget (`WHITEWATER_DRAIN_MOVE_BUDGET`, default 2): when that many Active Range move plans are already in flight — including plans wedged by a crashed driver — supervised drains wait instead of stacking freezes onto unresolved movement.
 
 
 

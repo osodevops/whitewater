@@ -30,7 +30,7 @@ Discussing Whitewater: a Rust-based distributed database and streaming platform 
 
 ## Pinned introduction
 
-I run FinnStream in Finland, and I am building a clean-sheet Kafka replacement called **Whitewater**.
+I run Whitewater in Finland, and I am building a clean-sheet Kafka replacement called **Whitewater**.
 
 Whitewater is intended to be both:
 
@@ -490,7 +490,7 @@ No. Metadata, Keys, and payloads remain bytes. Optional Schema Policies can vali
 
 ### Is the project open source?
 
-The implementation, licensing, contribution model, and public repository details should be announced only when FinnStream has made those decisions. This community can still discuss architecture and publish progress without promising a model prematurely.
+The implementation, licensing, contribution model, and public repository details should be announced only when Whitewater has made those decisions. This community can still discuss architecture and publish progress without promising a model prematurely.
 
 ### When is it production-ready?
 
@@ -552,4 +552,4 @@ If that coupling is removed, event infrastructure can become easier to use, safe
 
 That is what Whitewater is trying to prove.
 
-— FinnStream, Finland
+— Whitewater, Finland

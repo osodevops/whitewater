@@ -5,7 +5,9 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use finnstream::{
+use tempfile::TempDir;
+use uuid::Uuid;
+use whitewater::{
     active_range::{
         repair_replica, AppendIdentity, CommitPosition, MajorityAppendCoordinator,
         MajorityAppendErrorCode, OwnerMoveControl, OwnerMoveError, OwnerMoveEvidence,
@@ -19,8 +21,6 @@ use finnstream::{
     domain::StoredRecord,
     storage::{FileLogStore, LogStore},
 };
-use tempfile::TempDir;
-use uuid::Uuid;
 
 #[derive(Clone)]
 struct DirectTransport {
@@ -1047,7 +1047,7 @@ async fn retry_after_commit_returns_the_original_logical_result() {
 }
 
 fn pending_request(request: &mut ReplicaAppendRequest, effect_id: Uuid, subscription_id: Uuid) {
-    request.pending_effect = Some(finnstream::active_range::PendingEffectRef {
+    request.pending_effect = Some(whitewater::active_range::PendingEffectRef {
         effect_id,
         subscription_id,
     });
@@ -1158,7 +1158,7 @@ async fn commit_pending_effect_releases_the_tail_across_replicas() {
         .await
         .unwrap();
     let released = coordinator
-        .commit_pending_effect(finnstream::active_range::PendingReleaseRequest {
+        .commit_pending_effect(whitewater::active_range::PendingReleaseRequest {
             feed_id: request.feed_id,
             range_id: request.range_id,
             generation: request.generation,
@@ -1171,7 +1171,7 @@ async fn commit_pending_effect_releases_the_tail_across_replicas() {
         .unwrap();
     assert_eq!(
         released,
-        finnstream::active_range::PendingReleaseOutcome::Released {
+        whitewater::active_range::PendingReleaseOutcome::Released {
             commit_position: CommitPosition::new(1),
         }
     );
@@ -1207,7 +1207,7 @@ async fn commit_pending_effect_is_idempotent_and_fences_wrong_effects() {
     pending_request(&mut request, effect, subscription);
     coordinator.append(request.clone()).await.unwrap();
 
-    let release = |effect_id: Uuid| finnstream::active_range::PendingReleaseRequest {
+    let release = |effect_id: Uuid| whitewater::active_range::PendingReleaseRequest {
         feed_id: request.feed_id,
         range_id: request.range_id,
         generation: request.generation,
@@ -1223,7 +1223,7 @@ async fn commit_pending_effect_is_idempotent_and_fences_wrong_effects() {
         .await
         .unwrap();
     match outcome {
-        finnstream::active_range::PendingReleaseOutcome::Occupied { occupant } => {
+        whitewater::active_range::PendingReleaseOutcome::Occupied { occupant } => {
             assert_eq!(occupant.effect_id, effect);
         }
         other => panic!("expected Occupied, got {other:?}"),
@@ -1240,7 +1240,7 @@ async fn commit_pending_effect_is_idempotent_and_fences_wrong_effects() {
         .await
         .unwrap();
     match outcome {
-        finnstream::active_range::PendingReleaseOutcome::NotPending { committed } => {
+        whitewater::active_range::PendingReleaseOutcome::NotPending { committed } => {
             assert_eq!(committed, 1);
         }
         other => panic!("expected NotPending, got {other:?}"),
@@ -1263,7 +1263,7 @@ async fn release_is_unambiguous_when_one_follower_is_down() {
     coordinator.append(request.clone()).await.unwrap();
 
     let outcome = coordinator
-        .commit_pending_effect(finnstream::active_range::PendingReleaseRequest {
+        .commit_pending_effect(whitewater::active_range::PendingReleaseRequest {
             feed_id: request.feed_id,
             range_id: request.range_id,
             generation: request.generation,
@@ -1276,7 +1276,7 @@ async fn release_is_unambiguous_when_one_follower_is_down() {
         .unwrap();
     assert_eq!(
         outcome,
-        finnstream::active_range::PendingReleaseOutcome::Released {
+        whitewater::active_range::PendingReleaseOutcome::Released {
             commit_position: CommitPosition::new(1),
         }
     );
@@ -1287,8 +1287,8 @@ fn discard_release(
     owner: &StorageNodeId,
     effect_id: Uuid,
     subscription_id: Uuid,
-) -> finnstream::active_range::PendingReleaseRequest {
-    finnstream::active_range::PendingReleaseRequest {
+) -> whitewater::active_range::PendingReleaseRequest {
+    whitewater::active_range::PendingReleaseRequest {
         feed_id: request.feed_id,
         range_id: request.range_id,
         generation: request.generation,
@@ -1326,7 +1326,7 @@ async fn discard_pending_effect_truncates_the_tail_across_replicas() {
         .unwrap();
     assert_eq!(
         outcome,
-        finnstream::active_range::PendingDiscardOutcome::Discarded { dropped_frames: 1 }
+        whitewater::active_range::PendingDiscardOutcome::Discarded { dropped_frames: 1 }
     );
 
     // Owner and both followers dropped the marker and the uncommitted
@@ -1366,7 +1366,7 @@ async fn discard_pending_effect_is_idempotent_and_fences_wrong_effects() {
         .await
         .unwrap();
     match outcome {
-        finnstream::active_range::PendingDiscardOutcome::Occupied(marker) => {
+        whitewater::active_range::PendingDiscardOutcome::Occupied(marker) => {
             assert_eq!(marker.effect_id, effect);
         }
         other => panic!("expected Occupied, got {other:?}"),
@@ -1394,7 +1394,7 @@ async fn discard_pending_effect_is_idempotent_and_fences_wrong_effects() {
         .unwrap();
     assert_eq!(
         outcome,
-        finnstream::active_range::PendingDiscardOutcome::NotPending
+        whitewater::active_range::PendingDiscardOutcome::NotPending
     );
 }
 
@@ -1442,7 +1442,7 @@ async fn discard_pending_effect_heals_a_follower_that_missed_the_first_discard()
         .unwrap();
     assert_eq!(
         outcome,
-        finnstream::active_range::PendingDiscardOutcome::NotPending
+        whitewater::active_range::PendingDiscardOutcome::NotPending
     );
     assert_eq!(
         fixture.services[&follower]

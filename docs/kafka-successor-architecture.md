@@ -9,7 +9,7 @@ Visual companion: [Whitewater sequence diagrams](sequence-diagrams.md).
 - **Status:** Early architecture proposal
 - **Purpose:** Living design document for continued development and prototyping
 - **Product:** Whitewater
-- **Company and package namespace:** FinnStream / `finnstream`
+- **Company and package namespace:** Whitewater / `whitewater`
 - **Implementation language:** Rust
 - **Motivation and terminology:** [Why Whitewater](why-whitewater.md)
 - **Operational experience:** [Humane operations and day-two requirements](operational-experience.md)

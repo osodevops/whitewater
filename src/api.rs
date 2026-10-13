@@ -5765,6 +5765,22 @@ async fn reader_fetch(
     )
     .await
     .ok_or_else(|| ApiError::bad_request("Reader does not exist"))?;
+    let mut reader = reader;
+    // A committed open can lag on this Node's applied catalog; wait briefly
+    // for the session to land instead of fencing a fresh epoch. An applied
+    // epoch ahead of the request can never match again, so fail fast.
+    for _ in 0..20 {
+        if reader.session_active && reader.session_epoch == request.session_epoch {
+            break;
+        }
+        if state.control_plane.is_none() || reader.session_epoch > request.session_epoch {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        if let Some(fresh) = state.control.active_reader_by_name(&request.reader).await {
+            reader = fresh;
+        }
+    }
     if !reader.session_active || reader.session_epoch != request.session_epoch {
         return Err(ApiError::bad_request("Reader session is stale or inactive"));
     }

@@ -5,7 +5,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use finnstream::{
+use tempfile::TempDir;
+use uuid::Uuid;
+use whitewater::{
     active_range::{
         ActiveRangeAppend, ActiveRangeDescriptor, ActiveRangeStore, ActiveRangeStoreError,
         AppendIdentity, CommitPosition, FileActiveRangeStore, FileActiveRangeStoreOptions,
@@ -14,8 +16,6 @@ use finnstream::{
     codec::{decode_record, encode_record, encode_record_with_compression},
     domain::StoredRecord,
 };
-use tempfile::TempDir;
-use uuid::Uuid;
 
 fn descriptor() -> ActiveRangeDescriptor {
     ActiveRangeDescriptor {
@@ -114,6 +114,52 @@ async fn compression_can_be_enabled_and_disabled_on_existing_history_and_after_r
             .unwrap();
     }
     assert_eq!(reopened.read_committed(None, 10).await.unwrap().len(), 6);
+}
+
+#[tokio::test]
+async fn a_resequenced_retry_with_the_same_cursor_returns_the_original_position() {
+    // After a split or merge the routed child range allocates a fresh Writer
+    // sequence, so a retried request arrives with the same request-derived
+    // Cursor and record fields but new frame bytes: the digest and Writer
+    // dedup layers miss it, and only the Cursor index identifies the replay.
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+
+    let first = append(5, b"first");
+    let committed = store.append(first.clone()).await.unwrap();
+    store
+        .commit(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            CommitPosition::new(committed.position.value()),
+        )
+        .await
+        .unwrap();
+
+    let first_record = decode_record(&first.frame).unwrap();
+    let mut retry = append(6, b"first");
+    let mut retry_record = decode_record(&retry.frame).unwrap();
+    retry_record.message_id = first_record.message_id;
+    retry_record.event_time_ns = first_record.event_time_ns;
+    retry.frame = encode_record(&retry_record).unwrap();
+    retry.cursor = first.cursor.clone();
+    let deduplicated = store.append(retry).await.unwrap();
+    assert!(deduplicated.deduplicated);
+    assert!(deduplicated.committed);
+    assert_eq!(deduplicated.position, committed.position);
+    assert_eq!(deduplicated.message_id, first_record.message_id);
+
+    // The retry consumed no sequence: the next stream position still expects 6.
+    let mut forged = append(6, b"different payload");
+    let mut forged_record = decode_record(&forged.frame).unwrap();
+    forged_record.message_id = first_record.message_id;
+    forged_record.event_time_ns = first_record.event_time_ns;
+    forged.frame = encode_record(&forged_record).unwrap();
+    forged.cursor = first.cursor.clone();
+    assert!(matches!(
+        store.append(forged).await,
+        Err(ActiveRangeStoreError::InvalidState(_))
+    ));
 }
 
 #[tokio::test]
@@ -689,7 +735,7 @@ async fn imported_merge_branches_deduplicate_colliding_sequences_by_frame_digest
 
 fn pending_append(sequence: u64, payload: &[u8], effect_id: Uuid) -> ActiveRangeAppend {
     let mut request = append(sequence, payload);
-    request.pending_effect = Some(finnstream::active_range::PendingEffectRef {
+    request.pending_effect = Some(whitewater::active_range::PendingEffectRef {
         effect_id,
         subscription_id: Uuid::from_u128(77),
     });
@@ -880,8 +926,8 @@ async fn pending_marker_survives_restart_and_still_fences_reads() {
     assert_eq!(reopened.read_committed(None, 10).await.unwrap().len(), 2);
 }
 
-fn pending_identity(effect_id: Uuid) -> finnstream::active_range::PendingEffectRef {
-    finnstream::active_range::PendingEffectRef {
+fn pending_identity(effect_id: Uuid) -> whitewater::active_range::PendingEffectRef {
+    whitewater::active_range::PendingEffectRef {
         effect_id,
         subscription_id: Uuid::from_u128(77),
     }
@@ -911,7 +957,7 @@ async fn discard_pending_effect_reports_not_pending_on_an_empty_tail() {
         .unwrap();
     assert_eq!(
         outcome,
-        finnstream::active_range::PendingDiscardOutcome::NotPending
+        whitewater::active_range::PendingDiscardOutcome::NotPending
     );
 }
 
@@ -934,7 +980,7 @@ async fn discard_pending_effect_refuses_a_foreign_occupant() {
         )
         .await
         .unwrap();
-    let finnstream::active_range::PendingDiscardOutcome::Occupied(marker) = outcome else {
+    let whitewater::active_range::PendingDiscardOutcome::Occupied(marker) = outcome else {
         panic!("expected occupied")
     };
     assert_eq!(marker.effect_id, effect);
@@ -975,7 +1021,7 @@ async fn discard_pending_effect_truncates_the_matching_tail_and_frees_the_range(
         .unwrap();
     assert_eq!(
         outcome,
-        finnstream::active_range::PendingDiscardOutcome::Discarded { dropped_frames: 2 }
+        whitewater::active_range::PendingDiscardOutcome::Discarded { dropped_frames: 2 }
     );
     assert_eq!(store.pending_effect().await.unwrap(), None);
     // Only the uncommitted tail went; the committed prefix survives.

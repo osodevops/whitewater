@@ -3,16 +3,16 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use finnstream::active_range::{RangeId, RangePosition, ReplicaSet, StorageNodeId};
-use finnstream::effect::{
+use tempfile::TempDir;
+use uuid::Uuid;
+use whitewater::active_range::{RangeId, RangePosition, ReplicaSet, StorageNodeId};
+use whitewater::effect::{
     effect_apply_request_id, EffectApply, EffectCommitEvidence, EffectConsume, EffectCoordinator,
     EffectJournalError, EffectJournalInspection, EffectJournalTransport, EffectMutation,
     EffectOutput, EffectOutputReceipt, EffectPrepareVote, EffectReleaseOutcome,
     EffectReleaseTarget, EffectReplicaReply, EffectTransition, FjallEffectJournalReplica,
 };
-use finnstream::reader::SubscriptionProgressAssignment;
-use tempfile::TempDir;
-use uuid::Uuid;
+use whitewater::reader::SubscriptionProgressAssignment;
 
 fn nodes() -> [StorageNodeId; 3] {
     ["effect-a", "effect-b", "effect-c"].map(|name| StorageNodeId::try_new(name).unwrap())
@@ -382,9 +382,9 @@ struct RecordingApply {
     appended: Mutex<Vec<EffectOutput>>,
     frontier_request_log: Mutex<Vec<Uuid>>,
     releases: Mutex<Vec<EffectReleaseTarget>>,
-    state_mutated: Mutex<Vec<finnstream::effect::EffectStateMutation>>,
+    state_mutated: Mutex<Vec<whitewater::effect::EffectStateMutation>>,
     call_log: Mutex<Vec<&'static str>>,
-    resolved: Mutex<Vec<finnstream::effect::EffectOccupant>>,
+    resolved: Mutex<Vec<whitewater::effect::EffectOccupant>>,
     fail_once: Mutex<BTreeSet<Uuid>>,
     fail_frontier: Mutex<u8>,
     fail_releases: Mutex<u8>,
@@ -475,7 +475,7 @@ impl EffectApply for RecordingApply {
             if *remaining > 0 {
                 *remaining -= 1;
                 return Ok(EffectReleaseOutcome::Occupied {
-                    occupant: finnstream::effect::EffectOccupant {
+                    occupant: whitewater::effect::EffectOccupant {
                         effect_id: Uuid::from_u128(5252),
                         subscription_id: Uuid::from_u128(5353),
                     },
@@ -501,7 +501,7 @@ impl EffectApply for RecordingApply {
 
     async fn mutate_state(
         &self,
-        mutation: &finnstream::effect::EffectStateMutation,
+        mutation: &whitewater::effect::EffectStateMutation,
     ) -> Result<(), EffectJournalError> {
         {
             let mut remaining = self.fail_state_mutations.lock().unwrap();
@@ -523,7 +523,7 @@ impl EffectApply for RecordingApply {
 
     async fn resolve_pending(
         &self,
-        occupant: finnstream::effect::EffectOccupant,
+        occupant: whitewater::effect::EffectOccupant,
     ) -> Result<(), EffectJournalError> {
         {
             let mut remaining = self.fail_resolves.lock().unwrap();
@@ -560,7 +560,7 @@ impl EffectApply for RecordingApply {
         output: &EffectOutput,
         effect_id: Uuid,
         subscription_id: Uuid,
-    ) -> Result<finnstream::effect::EffectDiscardOutcome, EffectJournalError> {
+    ) -> Result<whitewater::effect::EffectDiscardOutcome, EffectJournalError> {
         self.discards
             .lock()
             .unwrap()
@@ -576,8 +576,8 @@ impl EffectApply for RecordingApply {
             let mut remaining = self.occupied_discards.lock().unwrap();
             if *remaining > 0 {
                 *remaining -= 1;
-                return Ok(finnstream::effect::EffectDiscardOutcome::Occupied {
-                    occupant: finnstream::effect::EffectOccupant {
+                return Ok(whitewater::effect::EffectDiscardOutcome::Occupied {
+                    occupant: whitewater::effect::EffectOccupant {
                         effect_id: Uuid::from_u128(6262),
                         subscription_id: Uuid::from_u128(6363),
                     },
@@ -588,10 +588,10 @@ impl EffectApply for RecordingApply {
             let mut remaining = self.not_pending_discards.lock().unwrap();
             if *remaining > 0 {
                 *remaining -= 1;
-                return Ok(finnstream::effect::EffectDiscardOutcome::NotPending);
+                return Ok(whitewater::effect::EffectDiscardOutcome::NotPending);
             }
         }
-        Ok(finnstream::effect::EffectDiscardOutcome::Discarded { dropped_frames: 1 })
+        Ok(whitewater::effect::EffectDiscardOutcome::Discarded { dropped_frames: 1 })
     }
 }
 
@@ -744,7 +744,7 @@ async fn apply_committed_sweeps_an_occupied_append_through_resolve_pending() {
     ));
     assert_eq!(
         sink.resolved.lock().unwrap().as_slice(),
-        &[finnstream::effect::EffectOccupant {
+        &[whitewater::effect::EffectOccupant {
             effect_id: Uuid::from_u128(4242),
             subscription_id: Uuid::from_u128(4343),
         }]
@@ -778,7 +778,7 @@ async fn apply_committed_sweeps_an_occupied_release_through_resolve_pending() {
     ));
     assert_eq!(
         sink.resolved.lock().unwrap().as_slice(),
-        &[finnstream::effect::EffectOccupant {
+        &[whitewater::effect::EffectOccupant {
             effect_id: Uuid::from_u128(5252),
             subscription_id: Uuid::from_u128(5353),
         }]
@@ -932,11 +932,11 @@ async fn apply_committed_rereleases_a_tail_the_terminal_marker_left_pending() {
     assert_eq!(sink.releases.lock().unwrap().len(), 4);
 }
 
-fn state_mutation(index: usize) -> finnstream::effect::EffectStateMutation {
-    finnstream::effect::EffectStateMutation {
+fn state_mutation(index: usize) -> whitewater::effect::EffectStateMutation {
+    whitewater::effect::EffectStateMutation {
         store_id: Uuid::from_u128(700 + index as u128),
-        mutation_id: finnstream::effect::effect_state_mutation_id(Uuid::from_u128(1), index),
-        op: finnstream::state_store::StateStoreMutationOp::PutRow {
+        mutation_id: whitewater::effect::effect_state_mutation_id(Uuid::from_u128(1), index),
+        op: whitewater::state_store::StateStoreMutationOp::PutRow {
             key: format!("row-{index}").into_bytes(),
             payload: b"payload".to_vec(),
             named: Vec::new(),
@@ -948,7 +948,7 @@ fn declare_with_state(
     effect_id: Uuid,
     sequence: u64,
     epoch: u64,
-    mutations: Vec<finnstream::effect::EffectStateMutation>,
+    mutations: Vec<whitewater::effect::EffectStateMutation>,
 ) -> EffectMutation {
     let mut mutation = declare(effect_id, sequence, epoch);
     let EffectTransition::Declare {
@@ -1108,7 +1108,7 @@ async fn oversized_state_mutations_are_refused_before_durability() {
         Uuid::new_v4(),
         1,
         1,
-        (0..=finnstream::effect::EFFECT_MAX_STATE_MUTATIONS)
+        (0..=whitewater::effect::EFFECT_MAX_STATE_MUTATIONS)
             .map(state_mutation)
             .collect(),
     );
@@ -1118,12 +1118,12 @@ async fn oversized_state_mutations_are_refused_before_durability() {
     ));
 
     // A mutation whose serialized op exceeds the field bound is refused.
-    let oversized = finnstream::effect::EffectStateMutation {
+    let oversized = whitewater::effect::EffectStateMutation {
         store_id: Uuid::new_v4(),
         mutation_id: Uuid::new_v4(),
-        op: finnstream::state_store::StateStoreMutationOp::PutRow {
+        op: whitewater::state_store::StateStoreMutationOp::PutRow {
             key: b"row".to_vec(),
-            payload: vec![b'x'; finnstream::effect::EFFECT_MAX_OUTPUT_FIELD],
+            payload: vec![b'x'; whitewater::effect::EFFECT_MAX_OUTPUT_FIELD],
             named: Vec::new(),
         },
     };
@@ -1417,7 +1417,7 @@ async fn apply_committed_abort_sweeps_a_foreign_discard_occupant() {
     ));
     assert_eq!(
         sink.resolved.lock().unwrap().as_slice(),
-        &[finnstream::effect::EffectOccupant {
+        &[whitewater::effect::EffectOccupant {
             effect_id: Uuid::from_u128(6262),
             subscription_id: Uuid::from_u128(6363),
         }]

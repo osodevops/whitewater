@@ -593,7 +593,7 @@ impl ControlPlane {
         }
         if key.len() < 24 {
             return Err(ControlPlaneError::Unavailable(
-                "FINNSTREAM_CONTROL_PLANE_KEY must contain at least 24 characters".to_owned(),
+                "WHITEWATER_CONTROL_PLANE_KEY must contain at least 24 characters".to_owned(),
             ));
         }
         let store = PersistentRaftStore::open(storage_path, controller.clone())?;

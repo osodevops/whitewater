@@ -17,7 +17,7 @@ use crate::{
     reader::ReaderRetryPolicy,
 };
 
-pub const ADMIN_API_KEY_ENV: &str = "FINNSTREAM_ADMIN_API_KEY";
+pub const ADMIN_API_KEY_ENV: &str = "WHITEWATER_ADMIN_API_KEY";
 pub const CLIENT_API_KEY_ENV: &str = "WHITEWATER_API_KEY";
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -14,17 +14,17 @@ FROM debian:bookworm-slim AS runtime
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
-    && groupadd --system --gid 10001 finnstream \
-    && useradd --system --uid 10001 --gid finnstream --home-dir /var/lib/finnstream finnstream \
-    && mkdir -p /var/lib/finnstream \
-    && chown finnstream:finnstream /var/lib/finnstream
-COPY --from=builder /workspace/target/release/finnstream /usr/local/bin/finnstream
+    && groupadd --system --gid 10001 whitewater \
+    && useradd --system --uid 10001 --gid whitewater --home-dir /var/lib/whitewater whitewater \
+    && mkdir -p /var/lib/whitewater \
+    && chown whitewater:whitewater /var/lib/whitewater
+COPY --from=builder /workspace/target/release/whitewater /usr/local/bin/whitewater
 COPY --from=builder /workspace/target/release/wwctl /usr/local/bin/wwctl
-USER finnstream
+USER whitewater
 EXPOSE 7070
-VOLUME ["/var/lib/finnstream"]
-ENV FINNSTREAM_BIND_ADDR=0.0.0.0:7070 \
-    FINNSTREAM_DATA_DIR=/var/lib/finnstream \
-    RUST_LOG=finnstream=info,tower_http=info
+VOLUME ["/var/lib/whitewater"]
+ENV WHITEWATER_BIND_ADDR=0.0.0.0:7070 \
+    WHITEWATER_DATA_DIR=/var/lib/whitewater \
+    RUST_LOG=whitewater=info,tower_http=info
 HEALTHCHECK --interval=5s --timeout=2s --start-period=5s --retries=12 CMD ["curl", "--fail", "--silent", "http://127.0.0.1:7070/health"]
-ENTRYPOINT ["/usr/local/bin/finnstream"]
+ENTRYPOINT ["/usr/local/bin/whitewater"]

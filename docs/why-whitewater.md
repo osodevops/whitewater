@@ -6,7 +6,7 @@
 
 - **Status:** Product motivation and terminology proposal
 - **Product:** Whitewater
-- **Company and package namespace:** FinnStream / `finnstream`
+- **Company and package namespace:** Whitewater / `whitewater`
 - **Architecture source:** [Whitewater architecture](kafka-successor-architecture.md)
 - **Operational experience:** [Humane operations and day-two requirements](operational-experience.md)
 - **Public model:** `riverbed -> domain -> feed -> key -> cursor -> subscription`

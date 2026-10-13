@@ -8,7 +8,9 @@ use std::{
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use finnstream::{
+use tempfile::TempDir;
+use uuid::Uuid;
+use whitewater::{
     active_range::{
         AppendIdentity, CommitPosition, DrainCommandAuthority, DrainMoveDriver,
         DrainProgressDriver, FollowerMoveControl, FollowerMoveCopyResult, FollowerMoveExecutor,
@@ -30,8 +32,6 @@ use finnstream::{
     },
     storage::{FileLogStore, LogStore},
 };
-use tempfile::TempDir;
-use uuid::Uuid;
 
 fn node(value: &str) -> StorageNodeId {
     StorageNodeId::try_new(value).unwrap()

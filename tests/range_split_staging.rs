@@ -2,7 +2,9 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use finnstream::{
+use tempfile::TempDir;
+use uuid::Uuid;
+use whitewater::{
     active_range::{
         abort_frozen_split, freeze_and_stage_final_boundary, orchestrate_split_cutover,
         stage_candidate_ranges, stage_merged_range, stage_right_range, AppendIdentity,
@@ -17,8 +19,6 @@ use finnstream::{
     domain::StoredRecord,
     storage::{FileLogStore, LogStore},
 };
-use tempfile::TempDir;
-use uuid::Uuid;
 
 fn node(value: &str) -> StorageNodeId {
     StorageNodeId::try_new(value).unwrap()
