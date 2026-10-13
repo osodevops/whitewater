@@ -399,6 +399,17 @@ impl RaftNetworkFactory<ControlTypeConfig> for ControlNetworkFactory {
     }
 }
 
+/// Peer addresses may be bare `host:port` (shared-key development plane) or
+/// fully-schemed mTLS endpoints; only the former needs `http://` supplied.
+fn internal_peer_url(address: &str, path: &str) -> String {
+    let address = address.trim_end_matches('/');
+    if address.contains("://") {
+        format!("{address}{path}")
+    } else {
+        format!("http://{address}{path}")
+    }
+}
+
 impl ControlNetwork {
     async fn request<Request, Response, Error>(
         &self,
@@ -410,11 +421,7 @@ impl ControlNetwork {
         Response: DeserializeOwned,
         Error: std::error::Error + DeserializeOwned,
     {
-        let url = if self.address.contains("://") {
-            format!("{}{}", self.address, path)
-        } else {
-            format!("http://{}{}", self.address, path)
-        };
+        let url = internal_peer_url(&self.address, path);
         let response = self
             .http
             .post(&url)
@@ -743,9 +750,9 @@ impl ControlPlane {
         })?;
         let response = self
             .http
-            .post(format!(
-                "http://{}/internal/control-plane/commands",
-                leader.addr.trim_end_matches('/')
+            .post(internal_peer_url(
+                &leader.addr,
+                "/internal/control-plane/commands",
             ))
             .header("x-whitewater-control-key", &self.key)
             .json(&InternalCommandsRequest {
@@ -789,9 +796,9 @@ impl ControlPlane {
         })?;
         let response = self
             .http
-            .post(format!(
-                "http://{}/internal/control-plane/write",
-                leader.addr.trim_end_matches('/')
+            .post(internal_peer_url(
+                &leader.addr,
+                "/internal/control-plane/write",
             ))
             .header("x-whitewater-control-key", &self.key)
             .json(&command)
@@ -875,4 +882,35 @@ fn unix_ns() -> i64 {
         .as_nanos()
         .try_into()
         .unwrap_or(i64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::internal_peer_url;
+
+    #[test]
+    fn internal_peer_url_keeps_fully_schemed_endpoints_verbatim() {
+        // mTLS peer endpoints arrive as `https://host:port`; forwarding
+        // commands must not wrap them in another scheme.
+        assert_eq!(
+            internal_peer_url("https://control-1:7271", "/internal/control-plane/commands"),
+            "https://control-1:7271/internal/control-plane/commands"
+        );
+        assert_eq!(
+            internal_peer_url("https://control-1:7271/", "/internal/control-plane/write"),
+            "https://control-1:7271/internal/control-plane/write"
+        );
+    }
+
+    #[test]
+    fn internal_peer_url_supplies_http_for_bare_host_ports() {
+        assert_eq!(
+            internal_peer_url("control-1:7070", "/internal/control-plane/commands"),
+            "http://control-1:7070/internal/control-plane/commands"
+        );
+        assert_eq!(
+            internal_peer_url("control-1:7070/", "/internal/control-plane/write"),
+            "http://control-1:7070/internal/control-plane/write"
+        );
+    }
 }
