@@ -38,6 +38,16 @@ The aim is a small set of composable concepts:
 
 This is **functional parity, not identical spelling**. `get_by`, `getBy`, and `GetByAsync` can feel native in their respective languages while representing the same lookup. Async control flow, cancellation, byte types, and error handling should fit the host language without changing what an operation means.
 
+## No partitions to configure. Three Nodes to start.
+
+**Every SDK uses a partition-free application model.** Choose a Feed and a business Key — not a partition count, partitioning strategy, storage owner, or replica assignment. Applications do not need co-partitioning plans to look up state or build processing flows.
+
+A supported Whitewater Riverbed starts with **a minimum of three Nodes**, including in standard development. Placement and replication are handled inside that Riverbed: each internal active range has at least three replicas on distinct Nodes, with normal durable writes acknowledged by a quorum. These are platform responsibilities, not topology settings repeated in every SDK or service.
+
+Partition-free does not mean storage has no internal divisions. Whitewater uses internal ranges so placement can evolve without changing the Feed/Key/Cursor API. Automated movement and scaling remain subject to their implementation and verification gates; three Nodes are the minimum topology, not a promise of unlimited capacity. Adding Nodes also cannot parallelize one strictly ordered hot Key. Production replicas need separate failure domains — three containers on one laptop are a development topology, not protection against losing that laptop.
+
+**The same simple interface in every language, with distributed storage behind it — not distributed-storage administration in your application.**
+
 ## Streaming functions, not just transport wrappers
 
 The common model covers the work around a record, not only its HTTP request:
