@@ -90,7 +90,7 @@ Each call scans at most 10,000 committed frames in the same merged order the pla
 }
 ```
 
-Predicates combine with AND semantics: `key_base64` selects the exact Key, while `from_event_time_ns` / `to_event_time_ns` bound the record's `event_time_ns` inclusively as signed epoch-nanosecond decimals — together or alone, but at least one predicate is required because the plain read is the contract for unfiltered history. Inverted ranges and non-decimal bounds are refused; an unknown `after` Cursor fails closed like the plain read. Metadata filters remain planned.
+Predicates combine with AND semantics: `key_base64` selects the exact Key; `from_event_time_ns` / `to_event_time_ns` bound the record's `event_time_ns` inclusively as signed epoch-nanosecond decimals; and `metadata_key` asserts a Metadata entry's presence — paired with `metadata_value_base64` it requires an exact value, so a correlation or trace id written into Metadata is a first-class way to find the records belonging to one business flow. At least one predicate is required because the plain read is the contract for unfiltered history. Inverted ranges, non-decimal bounds, an empty `metadata_key`, or a value without its key are refused; an unknown `after` Cursor fails closed like the plain read.
 
 ### Single-record lookup
 

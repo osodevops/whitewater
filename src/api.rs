@@ -10246,6 +10246,10 @@ struct FeedSearchQuery {
     /// matching the client timestamp convention.
     from_event_time_ns: Option<String>,
     to_event_time_ns: Option<String>,
+    /// Metadata entry filter: the key alone asserts presence, and pairing
+    /// it with metadata_value_base64 requires an exact value match.
+    metadata_key: Option<String>,
+    metadata_value_base64: Option<String>,
     after: Option<String>,
     limit: Option<usize>,
 }
@@ -10285,9 +10289,26 @@ async fn search_feed_records(
     let from_event_time_ns =
         parse_bound("from_event_time_ns", query.from_event_time_ns.as_deref())?;
     let to_event_time_ns = parse_bound("to_event_time_ns", query.to_event_time_ns.as_deref())?;
-    if key.is_none() && from_event_time_ns.is_none() && to_event_time_ns.is_none() {
+    if query.metadata_key.as_deref().is_some_and(str::is_empty) {
+        return Err(ApiError::bad_request("metadata_key must not be empty"));
+    }
+    let metadata_value = query
+        .metadata_value_base64
+        .as_deref()
+        .map(|value| decode_base64("metadata_value_base64", value))
+        .transpose()?;
+    if metadata_value.is_some() && query.metadata_key.is_none() {
         return Err(ApiError::bad_request(
-            "search requires key_base64 or an event-time bound",
+            "metadata_value_base64 requires metadata_key",
+        ));
+    }
+    if key.is_none()
+        && from_event_time_ns.is_none()
+        && to_event_time_ns.is_none()
+        && query.metadata_key.is_none()
+    {
+        return Err(ApiError::bad_request(
+            "search requires key_base64, an event-time bound, or metadata_key",
         ));
     }
     if from_event_time_ns.is_some_and(|from| to_event_time_ns.is_some_and(|to| from > to)) {
@@ -10299,6 +10320,13 @@ async fn search_feed_records(
         key.as_ref().is_none_or(|key| record.key == *key)
             && from_event_time_ns.is_none_or(|from| record.event_time_ns >= from)
             && to_event_time_ns.is_none_or(|to| record.event_time_ns <= to)
+            && query.metadata_key.as_ref().is_none_or(|name| {
+                record.metadata.get(name).is_some_and(|value| {
+                    metadata_value
+                        .as_ref()
+                        .is_none_or(|expected| value == expected)
+                })
+            })
     };
     let limit = query.limit.unwrap_or(64).clamp(1, 256);
     let feed = feed_when_applied(&state.control, &query.feed, state.control_plane.is_some())
@@ -15724,7 +15752,15 @@ mod tests {
                 control: control.clone(),
                 control_plane: plane,
                 progress_authority: control.clone(),
-                majority_append: None,
+                majority_append: Some(Arc::new(
+                    crate::active_range::MajorityAppendCoordinator::new(
+                        services[node].clone(),
+                        control.clone(),
+                        Arc::new(LoopbackReplicaTransport {
+                            services: Arc::new(services.clone()),
+                        }),
+                    ),
+                )),
                 subscription_progress: None,
                 effect_journal: None,
                 state_store_journal: None,
@@ -15963,6 +15999,63 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Metadata tracing: a record appended over the public path with a
+        // Metadata entry is findable by that entry without a consumer.
+        let appended = client
+            .post(format!("{}/v1/feeds/append", endpoints[&nodes[0]]))
+            .bearer_auth("this-is-a-long-development-api-key")
+            .json(&json!({
+                "request_id": Uuid::new_v4(),
+                "feed": "orders.events",
+                "writer_session_id": Uuid::new_v4(),
+                "writer_epoch": 1,
+                "sequence": 1,
+                "key_base64": STANDARD.encode(&search_key),
+                "payload_base64": STANDARD.encode(b"traced"),
+                "metadata_base64": {"trace_id": STANDARD.encode(b"trace-42")},
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(appended.status(), StatusCode::OK);
+        let (status, body) =
+            search(&[("feed", "orders.events"), ("metadata_key", "trace_id")]).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let records = body["records"].as_array().unwrap();
+        assert_eq!(records.len(), 1, "{body}");
+        assert_eq!(
+            records[0]["metadata_base64"]["trace_id"],
+            json!(STANDARD.encode(b"trace-42"))
+        );
+        // The exact-value arm narrows the same entry; a non-matching value
+        // scans the history and reports the miss.
+        for (value, expected) in [
+            (STANDARD.encode(b"trace-42"), 1_usize),
+            (STANDARD.encode(b"trace-99"), 0),
+        ] {
+            let (status, body) = search(&[
+                ("feed", "orders.events"),
+                ("metadata_key", "trace_id"),
+                ("metadata_value_base64", &value),
+            ])
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                body["records"].as_array().unwrap().len(),
+                expected,
+                "{body}"
+            );
+            assert_eq!(body["exhausted"], json!(true));
+        }
+        let (status, _) = search(&[
+            ("feed", "orders.events"),
+            ("metadata_value_base64", &STANDARD.encode(b"trace-42")),
+        ])
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = search(&[("feed", "orders.events"), ("metadata_key", "")]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
 
         let (status, body) = read_feed("orders.deep", None, 12_000).await;
         assert_eq!(status, StatusCode::OK);
