@@ -3584,14 +3584,27 @@ impl ControlController {
                         "split preparation has no consensus-prepared RF3 placement".to_owned(),
                     )
                 })?;
-                let fallback_owner = placement.owner;
-                let replicas = ReplicaSet::try_new(placement.replicas)
-                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
-                let owner = replicas
+                // Split staging reads the frozen source prefix on every
+                // right-hand replica, so the right-hand range must stay on
+                // Nodes that already hold the source Range; the consensus
+                // draw only chooses which of them owns it.
+                let replicas = source_assignment.replicas.clone();
+                let owner = placement
+                    .replicas
                     .iter()
-                    .find(|node| *node != &source_assignment.owner)
+                    .find(|node| **node != source_assignment.owner && replicas.contains(node))
+                    .or_else(|| {
+                        replicas
+                            .iter()
+                            .find(|node| *node != &source_assignment.owner)
+                    })
                     .cloned()
-                    .unwrap_or(fallback_owner);
+                    .ok_or_else(|| {
+                        ControlError::InvalidOperation(
+                            "split source replicas cannot elect a distinct right-hand owner"
+                                .to_owned(),
+                        )
+                    })?;
                 let generation = candidate_map
                     .routes()
                     .iter()

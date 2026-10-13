@@ -49,7 +49,7 @@ def wait_for_fabric():
         try:
             if all(urllib.request.urlopen(f"{node}/health", timeout=2).status == 200 for node in NODES):
                 return
-        except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.RemoteDisconnected):
             pass
         time.sleep(1)
     raise AssertionError("four-Node Riverbed did not become healthy")
@@ -91,24 +91,67 @@ def main():
         for index in range(1, 7):
             append(index)
         before = placement(NODES[1], feed)
-        if before["replicas"] != ["control-1", "control-2", "control-3"]:
+        if len(before["replicas"]) != 3 or before["owner"] not in before["replicas"]:
             raise AssertionError(before)
+        # Rendezvous placement picks any three Nodes; the follower move
+        # exercises whichever non-owner replica was placed and whichever
+        # fourth Node stayed unassigned.
+        removed_replica = next(replica for replica in before["replicas"] if replica != before["owner"])
+        spares = [f"control-{index}" for index in range(1, 5) if f"control-{index}" not in before["replicas"]]
+        if len(spares) != 1:
+            raise AssertionError(before)
+        replacement_replica = spares[0]
+        target_service = f"node{replacement_replica.removeprefix('control-')}"
+        expected_replicas = sorted(
+            replacement_replica if replica == removed_replica else replica
+            for replica in before["replicas"]
+        )
         move = {
             "request_id": str(uuid.uuid4()),
             "feed": feed,
             "range_id": before["range_id"],
-            "removed_replica": "control-3",
-            "replacement_replica": "control-4",
+            "removed_replica": removed_replica,
+            "replacement_replica": replacement_replica,
         }
         status, invalid = post(NODES[1], "/v1/admin/ranges/move-follower", {**move, "request_id": str(uuid.uuid4()), "replacement_replica": "control-5"})
         if status == 200 or placement(NODES[0], feed)["replicas"] != before["replicas"]:
             raise AssertionError(invalid)
-        subprocess.run([*COMPOSE, "stop", "node4"], check=True)
-        status, unavailable = post(NODES[1], "/v1/admin/ranges/move-follower", move)
-        if status == 200 or placement(NODES[0], feed)["replicas"] != before["replicas"]:
-            raise AssertionError(unavailable)
-        append(7, NODES[0])
-        subprocess.run([*COMPOSE, "start", "node4"], check=True)
+        subprocess.run([*COMPOSE, "stop", target_service], check=True)
+        # The stopped spare can be any Node, including a Control Plane voter;
+        # probe through one that stays up and ride out any re-election before
+        # expecting the refused move and unchanged placement.
+        live = next(
+            node
+            for index, node in enumerate(NODES)
+            if f"control-{index + 1}" != replacement_replica
+        )
+        deadline = time.time() + 45
+        while True:
+            try:
+                status, unavailable = post(live, "/v1/admin/ranges/move-follower", move)
+                probe_status, probe = post(
+                    live, "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"}
+                )
+                if status == 200:
+                    raise AssertionError(unavailable)
+                if probe_status == 200:
+                    if probe["results"][0]["data"]["replicas"] != before["replicas"]:
+                        raise AssertionError(unavailable)
+                    break
+            except (ConnectionError, urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
+                pass
+            if time.time() > deadline:
+                raise AssertionError("Control Plane did not recover after stopping the spare Node")
+            time.sleep(0.5)
+        for _ in range(60):
+            try:
+                append(7, live)
+                break
+            except (AssertionError, ConnectionError, urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
+                time.sleep(0.5)
+        else:
+            raise AssertionError("append did not recover after stopping the spare Node")
+        subprocess.run([*COMPOSE, "start", target_service], check=True)
         wait_for_fabric()
         for _ in range(20):
             status, moved = post(NODES[1], "/v1/admin/ranges/move-follower", move)
@@ -117,7 +160,7 @@ def main():
             time.sleep(0.5)
         if status != 200 or moved.get("status") != "activated":
             raise AssertionError(moved)
-        if moved["assignment"]["replicas"] != ["control-1", "control-2", "control-4"]:
+        if sorted(moved["assignment"]["replicas"]) != expected_replicas:
             raise AssertionError(moved)
         status, repeated = post(NODES[2], "/v1/admin/ranges/move-follower", move)
         if status != 200 or repeated.get("status") != "activated":
@@ -130,7 +173,7 @@ def main():
         after = read(NODES[3], feed, cursors[5])
         if [record["cursor"] for record in after] != cursors[6:]:
             raise AssertionError(after)
-        subprocess.run([*COMPOSE, "restart", "node4"], check=True)
+        subprocess.run([*COMPOSE, "restart", target_service], check=True)
         wait_for_fabric()
         resumed = None
         last_error = None

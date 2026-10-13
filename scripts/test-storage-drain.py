@@ -64,7 +64,7 @@ def wait_for_fabric():
         try:
             if all(urllib.request.urlopen(f"{node}/health", timeout=2).status == 200 for node in NODES):
                 return
-        except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.RemoteDisconnected):
             pass
         time.sleep(1)
     raise AssertionError("four-Node Riverbed did not become healthy")

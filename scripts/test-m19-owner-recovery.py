@@ -46,7 +46,7 @@ def main():
                     if placement["owner"] != old_owner:
                         recovered = placement
                         break
-                except (urllib.error.URLError, TimeoutError):
+                except (urllib.error.URLError, TimeoutError, ConnectionError):
                     pass
             if recovered:
                 break

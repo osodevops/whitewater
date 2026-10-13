@@ -222,18 +222,22 @@ def main():
             # Phase 1 — sustained dominance flags the Key on its owner.
             deadline = time.time() + DETECT_DEADLINE
             flagged = []
+            isolated = []
             while time.time() < deadline:
                 flagged = [e for e in hot_keys() if e["feed"] == feed]
-                if flagged:
+                # The boundary stays null until a neighbouring cold Key is
+                # observed in the window, so the flag alone is not enough.
+                isolated = [e for e in flagged if e["isolating_boundary"]]
+                if isolated:
                     break
                 if driver.errors:
                     raise AssertionError(f"append driver failing: {driver.errors[:3]}")
                 time.sleep(1)
-            assert flagged, (
-                "dominant Key was never flagged hot; "
-                f"driver errors={driver.errors[:3]}"
+            assert isolated, (
+                "dominant Key was never flagged with an isolating boundary; "
+                f"last flagged={flagged}; driver errors={driver.errors[:3]}"
             )
-            evidence = flagged[0]
+            evidence = isolated[0]
             print(f"flagged: {json.dumps(evidence, indent=2)}")
             assert evidence["share_bps"] >= 5_000, evidence
             assert evidence["window_records"] > 0, evidence

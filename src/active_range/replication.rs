@@ -496,6 +496,15 @@ impl ReplicaAppendService {
                     format!("no committed Active Range assignment exists for Feed {feed_id}"),
                 )
             })?;
+        if !assignment.replicas.contains(&self.local_node) {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::ReceiverNotReplica,
+                format!(
+                    "Node {} is not a replica for Active Range {}",
+                    self.local_node, assignment.range_id
+                ),
+            ));
+        }
         let store = self.store_for(&assignment).await?;
         let snapshot = store.snapshot().await.map_err(map_store_error)?;
         if snapshot.progress.commit_position() < committed_prefix {

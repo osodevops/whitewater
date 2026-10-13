@@ -1201,6 +1201,59 @@ async fn split_plan_is_consensus_persisted_but_cannot_change_authoritative_routi
 }
 
 #[tokio::test]
+async fn split_right_replicas_stay_on_the_source_replica_set() {
+    let directory = TempDir::new().unwrap();
+    let leader = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3", "storage-4"]),
+    );
+    leader
+        .execute_commands_with_request_id(
+            vec![Command::CreateSpace {
+                name: "orders".to_owned(),
+            }],
+            Uuid::from_u128(700),
+        )
+        .await
+        .unwrap();
+    for (index, feed) in ["orders.created", "orders.shipped", "orders.paid"]
+        .iter()
+        .enumerate()
+    {
+        leader
+            .execute_commands_with_request_id(
+                vec![Command::CreateFeed {
+                    name: feed.to_string(),
+                }],
+                Uuid::from_u128(701 + index as u128),
+            )
+            .await
+            .unwrap();
+        let feed_id = leader.active_feed_by_name(feed).await.unwrap().feed_id;
+        let source = leader.active_range_assignment(feed_id).await.unwrap();
+        let prepared = leader
+            .execute_commands_with_request_id(
+                vec![Command::PrepareActiveRangeSplit {
+                    feed: feed.to_string(),
+                    split_at: KeyToken::from_bytes([0x80; 16]),
+                }],
+                Uuid::from_u128(710 + index as u128),
+            )
+            .await
+            .unwrap();
+        let plan: RangeSplitPlan =
+            serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+        // The consensus draw for a split is free to rank the fourth Node
+        // first, but right-hand staging reads the frozen source prefix
+        // locally on every replica, so membership must remain the source
+        // replica set and only the owner may rotate.
+        assert_eq!(plan.right_assignment.replicas, source.replicas);
+        assert_ne!(plan.right_assignment.owner, source.owner);
+        assert!(source.replicas.contains(&plan.right_assignment.owner));
+    }
+}
+
+#[tokio::test]
 async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() {
     let directory = TempDir::new().unwrap();
     let control = controller(

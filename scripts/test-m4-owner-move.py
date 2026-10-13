@@ -49,7 +49,7 @@ def wait_for_fabric():
         try:
             if all(urllib.request.urlopen(f"{node}/health", timeout=2).status == 200 for node in NODES):
                 return
-        except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.RemoteDisconnected):
             pass
         time.sleep(1)
     raise AssertionError("isolated owner-movement Riverbed did not become healthy")
@@ -90,23 +90,58 @@ def main():
         for index in range(1, 7):
             append(index, NODES[index % 3])
         before = placement(NODES[1], feed)
-        if before["owner"] != "control-1" or before["replicas"] != ["control-1", "control-2", "control-3"]:
+        if len(before["replicas"]) != 3 or before["owner"] not in before["replicas"]:
             raise AssertionError(before)
+        # Rendezvous placement picks any replica as owner; drive the move
+        # relative to whichever one won instead of assuming control-1.
+        old_owner = before["owner"]
+        new_owner = next(replica for replica in before["replicas"] if replica != old_owner)
+        target_service = f"node{new_owner.removeprefix('control-')}"
         move = {
             "request_id": str(uuid.uuid4()),
             "feed": feed,
             "range_id": before["range_id"],
-            "new_owner": "control-2",
+            "new_owner": new_owner,
         }
         status, invalid = post(NODES[2], "/v1/admin/ranges/move-owner", {**move, "request_id": str(uuid.uuid4()), "new_owner": "control-4"})
-        if status == 200 or placement(NODES[0], feed)["owner"] != "control-1":
+        if status == 200 or placement(NODES[0], feed)["owner"] != old_owner:
             raise AssertionError(invalid)
-        subprocess.run([*COMPOSE, "stop", "node2"], check=True)
-        status, unavailable = post(NODES[2], "/v1/admin/ranges/move-owner", move)
-        if status == 200 or placement(NODES[0], feed)["owner"] != "control-1":
-            raise AssertionError(unavailable)
-        append(7, NODES[0])
-        subprocess.run([*COMPOSE, "start", "node2"], check=True)
+        subprocess.run([*COMPOSE, "stop", target_service], check=True)
+        # The stopped target can be any replica, including a Control Plane
+        # voter; probe through one that stays up and ride out any re-election
+        # before expecting the refused move and unchanged owner.
+        live = next(
+            node
+            for index, node in enumerate(NODES)
+            if f"control-{index + 1}" != new_owner
+        )
+        deadline = time.time() + 45
+        while True:
+            try:
+                status, unavailable = post(live, "/v1/admin/ranges/move-owner", move)
+                probe_status, probe = post(
+                    live, "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"}
+                )
+                if status == 200:
+                    raise AssertionError(unavailable)
+                if probe_status == 200:
+                    if probe["results"][0]["data"]["owner"] != old_owner:
+                        raise AssertionError(unavailable)
+                    break
+            except (ConnectionError, urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
+                pass
+            if time.time() > deadline:
+                raise AssertionError("Control Plane did not recover after stopping the target Node")
+            time.sleep(0.5)
+        for _ in range(60):
+            try:
+                append(7, live)
+                break
+            except (AssertionError, ConnectionError, urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
+                time.sleep(0.5)
+        else:
+            raise AssertionError("append did not recover after stopping the target Node")
+        subprocess.run([*COMPOSE, "start", target_service], check=True)
         wait_for_fabric()
         for _ in range(35):
             status, moved = post(NODES[2], "/v1/admin/ranges/move-owner", move)
@@ -115,7 +150,7 @@ def main():
             time.sleep(0.5)
         if status != 200 or moved.get("status") != "activated":
             raise AssertionError(moved)
-        if moved["assignment"]["owner"] != "control-2" or moved["assignment"]["replicas"] != before["replicas"]:
+        if moved["assignment"]["owner"] != new_owner or moved["assignment"]["replicas"] != before["replicas"]:
             raise AssertionError(moved)
         status, repeated = post(NODES[0], "/v1/admin/ranges/move-owner", move)
         if status != 200 or repeated.get("status") != "activated":
@@ -128,7 +163,7 @@ def main():
                 raise AssertionError(f"committed history differs on {node}: {rows}")
             if [row["cursor"] for row in read(node, feed, cursors[5])] != cursors[6:]:
                 raise AssertionError(f"Cursor continuation differs on {node}")
-        subprocess.run([*COMPOSE, "restart", "node2"], check=True)
+        subprocess.run([*COMPOSE, "restart", target_service], check=True)
         wait_for_fabric()
         last_error = None
         for _ in range(30):
@@ -143,7 +178,7 @@ def main():
                 time.sleep(0.5)
         else:
             raise AssertionError(f"new owner did not recover committed history: {last_error}")
-        print(json.dumps({"status": "ok", "feed": feed, "owner": "control-2", "records": len(cursors)}, indent=2))
+        print(json.dumps({"status": "ok", "feed": feed, "owner": new_owner, "records": len(cursors)}, indent=2))
     finally:
         subprocess.run([*COMPOSE, "down", "-v"], check=True)
 

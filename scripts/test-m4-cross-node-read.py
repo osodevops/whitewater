@@ -51,7 +51,7 @@ def wait_for_fabric():
         try:
             if all(urllib.request.urlopen(f"{node}/health", timeout=2).status == 200 for node in NODES.values()):
                 return
-        except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.RemoteDisconnected):
             pass
         time.sleep(1)
     raise AssertionError("isolated four-Node Riverbed did not become healthy")
@@ -93,8 +93,15 @@ def main():
         if status != 200 or split.get("status") != "activated":
             raise AssertionError(split)
         ranges = placement(NODES["control-2"], feed)["range_assignments"]
-        if len(ranges) != 2 or any("control-4" in item["replicas"] for item in ranges):
+        if len(ranges) != 2:
             raise AssertionError(ranges)
+        # The unplaced fourth Node is whichever control Node no range
+        # assigned; rendezvous placement varies per Feed.
+        used = {replica for item in ranges for replica in item["replicas"]}
+        spares = [f"control-{index}" for index in range(1, 5) if f"control-{index}" not in used]
+        if len(spares) != 1:
+            raise AssertionError(ranges)
+        spare = spares[0]
         source, other = ranges
         removed = next((node for node in source["replicas"] if node != source["owner"] and node in other["replicas"]), None)
         if removed is None:
@@ -102,7 +109,7 @@ def main():
         status, moved = post(NODES["control-2"], "/v1/admin/ranges/move-follower", {
             "request_id": str(uuid.uuid4()), "feed": feed,
             "range_id": source["range_id"], "removed_replica": removed,
-            "replacement_replica": "control-4",
+            "replacement_replica": spare,
         })
         if status != 200 or moved.get("status") != "activated":
             raise AssertionError(moved)

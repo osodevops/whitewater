@@ -130,7 +130,7 @@ def main():
                 try:
                     status, _ = post(ENDPOINTS[index], "/v1/admin/wcl", {"script": "SHOW DOMAINS;"})
                     if status == 200: break
-                except (urllib.error.URLError, TimeoutError): pass
+                except (urllib.error.URLError, TimeoutError, ConnectionError): pass
                 time.sleep(1)
             else: raise AssertionError(f"{service} did not come back after restart")
     if not recovered: raise AssertionError("member mutations never recovered a lost progress owner")

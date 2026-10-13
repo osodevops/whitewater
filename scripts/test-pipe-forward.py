@@ -97,7 +97,7 @@ def wait_for_fabric():
                 for node in NODES
             ):
                 return
-        except (urllib.error.URLError, TimeoutError, http.client.RemoteDisconnected):
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.RemoteDisconnected):
             pass
         time.sleep(1)
     raise AssertionError("pipe Riverbed did not become healthy")
