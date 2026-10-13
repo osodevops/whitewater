@@ -20,6 +20,7 @@ refuses to start when the verification ports are already bound, so it can
 never disrupt the development Riverbed on 7071-7073.
 """
 
+import json
 import os
 import re
 import socket
@@ -103,8 +104,8 @@ def ports_free() -> list[int]:
     return busy
 
 
-def wait_healthy() -> None:
-    deadline = time.monotonic() + HEALTH_TIMEOUT_S
+def wait_healthy(timeout_s: int = HEALTH_TIMEOUT_S) -> None:
+    deadline = time.monotonic() + timeout_s
     pending = set(NODES)
     while time.monotonic() < deadline:
         for endpoint in list(pending):
@@ -115,9 +116,36 @@ def wait_healthy() -> None:
             except Exception:
                 pass
         if not pending:
+            break
+        time.sleep(1)
+    else:
+        raise AssertionError(f"verification Riverbed did not become healthy: {sorted(pending)}")
+    wait_control_plane(deadline)
+
+
+def wait_control_plane(deadline: float) -> None:
+    # `/health` reports the HTTP listener only; WCL calls fail with "leader
+    # election is in progress" until every voter observes a leader. Gate the
+    # suite on `/v1/admin/control-plane` so no script races the election.
+    key = os.environ.get("FINNSTREAM_ADMIN_API_KEY", "whitewater-local-development-admin-key")
+    pending = set(NODES)
+    while time.monotonic() < deadline:
+        for endpoint in list(pending):
+            try:
+                request = urllib.request.Request(
+                    f"{endpoint}/v1/admin/control-plane",
+                    headers={"authorization": f"Bearer {key}"},
+                )
+                with urllib.request.urlopen(request, timeout=3) as response:
+                    status = json.loads(response.read())
+                    if status.get("leader_id") is not None:
+                        pending.remove(endpoint)
+            except Exception:
+                pass
+        if not pending:
             return
         time.sleep(1)
-    raise AssertionError(f"verification Riverbed did not become healthy: {sorted(pending)}")
+    raise AssertionError(f"verification Control Plane did not elect a leader: {sorted(pending)}")
 
 
 def main() -> int:
@@ -153,6 +181,15 @@ def main() -> int:
                 continue
             print(f"--- {script}")
             started = time.monotonic()
+            try:
+                # A predecessor may have restarted fixture Nodes and left a
+                # fresh Control Plane election in flight; re-gate so the
+                # script starts against a ready Riverbed.
+                wait_healthy(timeout_s=120)
+            except AssertionError as error:
+                results[script] = f"fixture not ready: {error}"
+                print(f"--- {script}: {results[script]}")
+                continue
             try:
                 subprocess.run(
                     [sys.executable, str(path)],

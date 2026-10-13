@@ -15,6 +15,24 @@ KEY = "whitewater-local-development-admin-key"
 CONTROL_KEY = "whitewater-local-development-control-key"
 
 
+# Transient connection errors between the host and Docker-published ports are
+# retried; HTTP statuses and assertion failures still propagate unchanged.
+def _retried(operation):
+    def wrapped(*args, **kwargs):
+        last = None
+        for _ in range(60):
+            try:
+                return operation(*args, **kwargs)
+            except urllib.error.HTTPError:
+                raise
+            except (ConnectionError, urllib.error.URLError, TimeoutError) as error:
+                last = error
+                time.sleep(0.5)
+        raise last
+
+    return wrapped
+
+@_retried
 def post(node, path, payload, control=False):
     headers = {"content-type": "application/json"}
     if control:

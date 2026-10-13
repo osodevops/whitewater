@@ -4,19 +4,63 @@ BASE_PORT = int(os.environ.get("WHITEWATER_TEST_BASE_PORT", "7071"))
 ENDPOINTS = [f"http://localhost:{BASE_PORT + offset}" for offset in range(3)]
 KEY = "whitewater-local-development-admin-key"
 
+# Transient connection errors between the host and Docker-published ports are
+# retried; HTTP statuses and assertion failures still propagate unchanged.
+def _retried(operation):
+    def wrapped(*args, **kwargs):
+        last = None
+        for _ in range(60):
+            try:
+                return operation(*args, **kwargs)
+            except urllib.error.HTTPError:
+                raise
+            except (ConnectionError, urllib.error.URLError, TimeoutError) as error:
+                last = error
+                time.sleep(0.5)
+        raise last
+
+    return wrapped
+
+@_retried
 def post(endpoint, path, body):
     request = urllib.request.Request(endpoint + path, data=json.dumps(body).encode(), headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=30) as response: return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error: return error.code, json.loads(error.read() or b"{}")
 
+@_retried
 def get(endpoint, path):
     request = urllib.request.Request(endpoint + path, headers={"authorization": f"Bearer {KEY}"})
     try:
         with urllib.request.urlopen(request, timeout=30) as response: return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error: return error.code, json.loads(error.read() or b"{}")
 
+def wait_ready():
+    for _ in range(60):
+        status, _ = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": "SHOW DOMAINS;"})
+        if status == 200:
+            return
+        time.sleep(1)
+    raise AssertionError("verification Riverbed did not answer WCL")
+
+
+def member_ready(endpoint, path, body):
+    # Stopping a voter can drop the Control Plane leader; the survivor must
+    # finish re-electing before member mutations succeed again. Ride out the
+    # election window — every retry replays the same request_id, so repeats
+    # are idempotent.
+    for _ in range(45):
+        status, response = post(endpoint, path, body)
+        if status == 200:
+            return response
+        if not (isinstance(response, dict) and "leader election" in str(response.get("error", ""))):
+            raise AssertionError(response)
+        time.sleep(1)
+    raise AssertionError(f"member call still failing after re-election window: {response}")
+
+
 def main():
+    wait_ready()
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:6]}"
     domain, feed, writer = f"m7{suffix}", f"m7{suffix}.events", f"writer{suffix}"
     subscription = f"{domain}.billing"
@@ -111,17 +155,14 @@ def main():
         subprocess.run(["docker", "compose", "stop", service], check=True)
         survivor = ENDPOINTS[(index + 1) % 3]
         try:
-            status, join = post(survivor, f"{members}/join", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": str(uuid.uuid4())})
-            if status != 200:
-                for probe in ENDPOINTS:
-                    try:
-                        ps, pbody = get(probe, f"{members}/state?subscription={subscription}")
-                        print(f"PROBE {probe}: {ps} {pbody}")
-                    except Exception as error:
-                        print(f"PROBE {probe}: unreachable {error}")
-                raise AssertionError(f"member op failed with {service} down: {join}")
-            status, after = get(survivor, f"{members}/state?subscription={subscription}")
-            if status != 200: raise AssertionError(after)
+            member_ready(survivor, f"{members}/join", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": str(uuid.uuid4())})
+            for _ in range(45):
+                status, after = get(survivor, f"{members}/state?subscription={subscription}")
+                if status == 200:
+                    break
+                time.sleep(1)
+            else:
+                raise AssertionError(after)
             if after["ownership_epoch"] > epoch:
                 epoch, recovered = after["ownership_epoch"], True
         finally:

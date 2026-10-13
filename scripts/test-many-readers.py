@@ -47,6 +47,24 @@ def compose(*args):
     return result.returncode, result.stdout + result.stderr
 
 
+# Transient connection errors between the host and Docker-published ports are
+# retried; HTTP statuses and assertion failures still propagate unchanged.
+def _retried(operation):
+    def wrapped(*args, **kwargs):
+        last = None
+        for _ in range(60):
+            try:
+                return operation(*args, **kwargs)
+            except urllib.error.HTTPError:
+                raise
+            except (ConnectionError, urllib.error.URLError, TimeoutError) as error:
+                last = error
+                time.sleep(0.5)
+        raise last
+
+    return wrapped
+
+@_retried
 def post(endpoint, path, body, timeout=30):
     request = urllib.request.Request(
         endpoint + path,
@@ -66,6 +84,7 @@ def post(endpoint, path, body, timeout=30):
         return 0, {"error": str(error)}
 
 
+@_retried
 def get(endpoint, path, timeout=30):
     request = urllib.request.Request(
         endpoint + path, headers={"authorization": f"Bearer {KEY}"}
@@ -138,81 +157,88 @@ def member_worker(index, subscription, member_id, work_id, stats, stop):
     lease_epoch = None
     empties = 0
     while not stop.is_set() and empties < 3:
-        if lease_epoch is None:
+        try:
+            if lease_epoch is None:
+                status, body = post(
+                    endpoint,
+                    f"{members}/claim",
+                    {
+                        "subscription": subscription,
+                        "request_id": str(uuid.uuid4()),
+                        "member_id": member_id,
+                        "member_epoch": 1,
+                        "work_id": work_id,
+                        "lease_ticks": LEASE_TICKS,
+                    },
+                )
+                if status == 200 and body.get("lease"):
+                    lease_epoch = body["lease"]["lease_epoch"]
+                else:
+                    with stats.lock:
+                        stats.errors += 1
+                    time.sleep(0.3)
+                    continue
             status, body = post(
                 endpoint,
-                f"{members}/claim",
+                f"{members}/fetch",
                 {
                     "subscription": subscription,
                     "request_id": str(uuid.uuid4()),
                     "member_id": member_id,
                     "member_epoch": 1,
                     "work_id": work_id,
-                    "lease_ticks": LEASE_TICKS,
+                    "lease_epoch": lease_epoch,
+                    "limit": PAGE,
                 },
             )
-            if status == 200 and body.get("lease"):
-                lease_epoch = body["lease"]["lease_epoch"]
-            else:
+            if status != 200:
                 with stats.lock:
-                    stats.errors += 1
-                time.sleep(0.3)
+                    if body.get("code") in ("lease.stale_lease", "lease.busy"):
+                        stats.conflicts += 1
+                    else:
+                        stats.errors += 1
+                if status in (0, 500, 503):
+                    time.sleep(0.3)
+                    continue
+                lease_epoch = None
                 continue
-        status, body = post(
-            endpoint,
-            f"{members}/fetch",
-            {
-                "subscription": subscription,
-                "request_id": str(uuid.uuid4()),
-                "member_id": member_id,
-                "member_epoch": 1,
-                "work_id": work_id,
-                "lease_epoch": lease_epoch,
-                "limit": PAGE,
-            },
-        )
-        if status != 200:
+            records = body["records"]
+            stats.record_fetch(records)
+            if not records:
+                empties += 1
+                time.sleep(0.2)
+                continue
+            empties = 0
+            status, acked = post(
+                endpoint,
+                f"{members}/ack",
+                {
+                    "subscription": subscription,
+                    "request_id": str(uuid.uuid4()),
+                    "member_id": member_id,
+                    "member_epoch": 1,
+                    "work_id": work_id,
+                    "lease_epoch": lease_epoch,
+                    "cursor": body["cursor"],
+                    "positions": body["positions"],
+                },
+            )
             with stats.lock:
-                if body.get("code") in ("lease.stale_lease", "lease.busy"):
+                if status == 200:
+                    stats.acks += 1
+                elif acked.get("code") == "lease.stale_lease":
+                    lease_epoch = None
                     stats.conflicts += 1
                 else:
-                    stats.errors += 1
-            if status in (0, 500, 503):
-                time.sleep(0.3)
+                    stats.conflicts += 1
+            if status != 200:
                 continue
-            lease_epoch = None
-            continue
-        records = body["records"]
-        stats.record_fetch(records)
-        if not records:
-            empties += 1
-            time.sleep(0.2)
-            continue
-        empties = 0
-        status, acked = post(
-            endpoint,
-            f"{members}/ack",
-            {
-                "subscription": subscription,
-                "request_id": str(uuid.uuid4()),
-                "member_id": member_id,
-                "member_epoch": 1,
-                "work_id": work_id,
-                "lease_epoch": lease_epoch,
-                "cursor": body["cursor"],
-                "positions": body["positions"],
-            },
-        )
-        with stats.lock:
-            if status == 200:
-                stats.acks += 1
-            elif acked.get("code") == "lease.stale_lease":
-                lease_epoch = None
-                stats.conflicts += 1
-            else:
-                stats.conflicts += 1
-        if status != 200:
-            continue
+        except (ConnectionError, urllib.error.URLError, TimeoutError):
+            # A stopped owner or a transient drop must not kill the worker:
+            # count it and let the member keep driving after recovery.
+            with stats.lock:
+                stats.errors += 1
+            time.sleep(0.3)
     with stats.lock:
         stats.done.add(index)
 

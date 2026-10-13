@@ -44,6 +44,24 @@ def compose(*args):
     return result.returncode, result.stdout + result.stderr
 
 
+# Transient connection errors between the host and Docker-published ports are
+# retried; HTTP statuses and assertion failures still propagate unchanged.
+def _retried(operation):
+    def wrapped(*args, **kwargs):
+        last = None
+        for _ in range(60):
+            try:
+                return operation(*args, **kwargs)
+            except urllib.error.HTTPError:
+                raise
+            except (ConnectionError, urllib.error.URLError, TimeoutError) as error:
+                last = error
+                time.sleep(0.5)
+        raise last
+
+    return wrapped
+
+@_retried
 def post(endpoint, path, body, timeout=30):
     request = urllib.request.Request(
         endpoint + path,
@@ -63,6 +81,7 @@ def post(endpoint, path, body, timeout=30):
         return 0, {"error": str(error)}
 
 
+@_retried
 def get(endpoint, path, timeout=15):
     request = urllib.request.Request(
         endpoint + path, headers={"authorization": f"Bearer {KEY}"}

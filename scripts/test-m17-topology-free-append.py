@@ -14,6 +14,24 @@ ADMIN_KEY = os.environ.get(
 )
 
 
+# Transient connection errors between the host and Docker-published ports are
+# retried; HTTP statuses and assertion failures still propagate unchanged.
+def _retried(operation):
+    def wrapped(*args, **kwargs):
+        last = None
+        for _ in range(60):
+            try:
+                return operation(*args, **kwargs)
+            except urllib.error.HTTPError:
+                raise
+            except (ConnectionError, urllib.error.URLError, TimeoutError) as error:
+                last = error
+                time.sleep(0.5)
+        raise last
+
+    return wrapped
+
+@_retried
 def request(endpoint, path, body, authenticated=True):
     headers = {"content-type": "application/json"}
     if authenticated:
@@ -32,6 +50,7 @@ def request(endpoint, path, body, authenticated=True):
         return error.code, payload
 
 
+@_retried
 def get(endpoint, path):
     request_value = urllib.request.Request(
         f"{endpoint}{path}",

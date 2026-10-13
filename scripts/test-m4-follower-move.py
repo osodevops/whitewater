@@ -13,6 +13,24 @@ NODES = [f"http://localhost:{port}" for port in range(7171, 7175)]
 KEY = "whitewater-local-development-admin-key"
 
 
+# Transient connection errors between the host and Docker-published ports are
+# retried; HTTP statuses and assertion failures still propagate unchanged.
+def _retried(operation):
+    def wrapped(*args, **kwargs):
+        last = None
+        for _ in range(60):
+            try:
+                return operation(*args, **kwargs)
+            except urllib.error.HTTPError:
+                raise
+            except (ConnectionError, urllib.error.URLError, TimeoutError) as error:
+                last = error
+                time.sleep(0.5)
+        raise last
+
+    return wrapped
+
+@_retried
 def post(node, path, payload):
     request = urllib.request.Request(
         f"{node}{path}",

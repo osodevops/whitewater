@@ -12,6 +12,24 @@ ENDPOINTS = {f"control-{index}": f"http://localhost:{BASE_PORT + index - 1}" for
 KEY = "whitewater-local-development-admin-key"
 
 
+# Transient connection errors between the host and Docker-published ports are
+# retried; HTTP statuses and assertion failures still propagate unchanged.
+def _retried(operation):
+    def wrapped(*args, **kwargs):
+        last = None
+        for _ in range(60):
+            try:
+                return operation(*args, **kwargs)
+            except urllib.error.HTTPError:
+                raise
+            except (ConnectionError, urllib.error.URLError, TimeoutError) as error:
+                last = error
+                time.sleep(0.5)
+        raise last
+
+    return wrapped
+
+@_retried
 def post(endpoint, path, body):
     request = urllib.request.Request(
         endpoint + path,
