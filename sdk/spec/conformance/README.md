@@ -33,7 +33,7 @@ successfully.
 | `member.join` / `member.claim` / `member.renew` / `member.release` / `member.fetch` / `member.ack` | subscription member ops | `subscription`, `member_id`, `member_epoch`, `work_id`, `lease_epoch`, `limit`, `lease_ticks` |
 | `feed.append` | `feed.append` | `feed`, `request_id`, `writer_session_id`, `writer_epoch`, `sequence`, `key`, `payload`, `event_time_ns` |
 | `feed.records` | `feed.records` | `feed`, `limit`, `after` |
-| `chaos.<action>` | driver fault hook | none — the driving environment performs the fault and returns only once the Riverbed is usable again; a runner without a chaos hook reports `unsupported` |
+| `chaos.<action>` | driver fault hook | optional `args` — rendered scalar values append space-separated to the hook invocation (e.g. `{"feed": "..."}` becomes `chaos.restart_owner <feed>`); the driving environment performs the fault and returns only once the Riverbed is usable again; a runner without a chaos hook reports `unsupported` |
 | `expect` | assertions | see below |
 
 ### Bindings and substitution
@@ -79,6 +79,8 @@ parsed fixture and `run_directory` a corpus directory, returning typed
 `tests/sdk_conformance.rs` drives it against the verification topology,
 installing the chaos hook when `WHITEWATER_CHAOS_CMD` names a command the
 runner invokes as `<cmd> <op>` per `chaos.*` step
-(`scripts/chaos_driver.py` restarts a Node and re-gates on
-majority-committed WCL). Chaos fixtures sort last by convention (`zz-`
-prefix) since they perturb the shared Riverbed.
+(`scripts/chaos_driver.py` restarts a Node — `chaos.restart_owner`
+resolves the named Feed's current range owner through `INSPECT
+PLACEMENT` — and re-gates on majority-committed WCL). Chaos fixtures
+sort last by convention (`zz-` prefix) since they perturb the shared
+Riverbed.

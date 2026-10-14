@@ -6,7 +6,9 @@ meaning and does not return until the Riverbed answers majority-
 committed WCL again, so fixtures never carry timing waits.
 
 Actions:
-  chaos.restart   restart one storage Node (node2) and re-gate on health
+  chaos.restart         restart one storage Node (node2) and re-gate on health
+  chaos.restart_owner   INSPECT PLACEMENT for the named Feed, restart the
+                        Node that currently owns its range, and re-gate
 """
 
 import json
@@ -65,17 +67,57 @@ def restart():
     time.sleep(3)
 
 
+def placement(feed):
+    # Retry through a still-recovering control plane; the action runs
+    # immediately after the previous step committed WCL.
+    deadline = time.monotonic() + 30
+    last = None
+    while time.monotonic() < deadline:
+        for endpoint in ENDPOINTS:
+            try:
+                request = urllib.request.Request(
+                    f"{endpoint}/v1/admin/wcl",
+                    data=json.dumps({"script": f"INSPECT PLACEMENT FOR FEED {feed};"}).encode(),
+                    headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=5) as reply:
+                    body = json.load(reply)
+                data = body["results"][0]["data"]
+                if data.get("owner"):
+                    return data
+            except Exception as error:
+                last = error
+        time.sleep(0.5)
+    raise AssertionError(f"placement for {feed} never answered: {last}")
+
+
+def restart_owner(feed):
+    # The named Feed's current range owner is the fault target, so the
+    # scenario exercises loss of the serving owner rather than a replica
+    # chosen at random.
+    owner = placement(feed)["owner"]
+    service = f"node{owner.removeprefix('control-')}"
+    subprocess.run(
+        ["docker", "compose", "-f", COMPOSE_FILE, "restart", service],
+        cwd=ROOT, check=True, timeout=120,
+    )
+    wait_riverbed()
+    time.sleep(3)
+
+
 ACTIONS = {
     "chaos.restart": restart,
+    "chaos.restart_owner": restart_owner,
 }
 
 
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ACTIONS:
+    if len(sys.argv) < 2 or sys.argv[1] not in ACTIONS:
         known = ", ".join(sorted(ACTIONS))
-        print(f"usage: chaos_driver.py <action>; known: {known}", file=sys.stderr)
+        print(f"usage: chaos_driver.py <action> [args]; known: {known}", file=sys.stderr)
         return 2
-    ACTIONS[sys.argv[1]]()
+    ACTIONS[sys.argv[1]](*sys.argv[2:])
 
 
 if __name__ == "__main__":

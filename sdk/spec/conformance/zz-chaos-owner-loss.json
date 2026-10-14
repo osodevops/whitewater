@@ -1,0 +1,59 @@
+{
+  "scenario": "zz-chaos-owner-loss",
+  "requires": ["admin.wcl", "writer.append", "feed.records", "chaos.restart_owner"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN cho{{uniq}}; CREATE FEED cho{{uniq}}.events; CREATE WRITER chow{{uniq}} TO cho{{uniq}}.events; OPEN WRITER SESSION chow{{uniq}};"
+      },
+      "bind": "setup"
+    },
+    {
+      "op": "writer.append",
+      "args": {
+        "request_id": "{{uuid:before}}",
+        "writer": "chow{{uniq}}",
+        "session_epoch": "{{setup.results[3].data.session_epoch}}",
+        "key": {"utf8": "order-1"},
+        "payload": {"utf8": "before"},
+        "event_time_ns": "1700000000000000001"
+      },
+      "bind": "before",
+      "expect": {
+        "deduplicated": false,
+        "cursor": "!=null"
+      }
+    },
+    {
+      "op": "chaos.restart_owner",
+      "args": {"feed": "cho{{uniq}}.events"}
+    },
+    {
+      "op": "writer.append",
+      "args": {
+        "request_id": "{{uuid:after}}",
+        "writer": "chow{{uniq}}",
+        "session_epoch": "{{setup.results[3].data.session_epoch}}",
+        "key": {"utf8": "order-1"},
+        "payload": {"utf8": "after"},
+        "event_time_ns": "1700000000000000002"
+      },
+      "expect": {
+        "deduplicated": false,
+        "cursor": "!=null"
+      }
+    },
+    {
+      "op": "feed.records",
+      "args": {"feed": "cho{{uniq}}.events", "limit": 10},
+      "expect": {
+        "records[0].key_base64": "b3JkZXItMQ==",
+        "records[0].payload_base64": "YmVmb3Jl",
+        "records[1].key_base64": "b3JkZXItMQ==",
+        "records[1].payload_base64": "YWZ0ZXI=",
+        "records[2]": "absent"
+      }
+    }
+  ]
+}

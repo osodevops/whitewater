@@ -107,9 +107,34 @@ impl ConformanceRunner {
                 .to_owned();
             if op.starts_with("chaos.") {
                 // A chaos step binds nothing and has no expect: its only
-                // outcome is the hook returning or reporting failure.
+                // outcome is the hook returning or reporting failure. An
+                // optional `args` object renders through the same
+                // substitutions as request args and appends each scalar
+                // value space-separated to the hook invocation, so a driver
+                // action can name its target (for example the Feed whose
+                // owner should restart) without fixtures hardcoding
+                // placement.
+                let args =
+                    context.substitute(&step.get("args").cloned().unwrap_or_else(|| json!({})));
+                let rendered: Vec<String> = args
+                    .as_object()
+                    .map(|values| {
+                        values
+                            .values()
+                            .map(|value| match value {
+                                Value::String(text) => text.clone(),
+                                other => other.to_string(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let action = if rendered.is_empty() {
+                    op.clone()
+                } else {
+                    format!("{} {}", op, rendered.join(" "))
+                };
                 match &self.chaos_hook {
-                    Some(hook) => match hook(&op) {
+                    Some(hook) => match hook(&action) {
                         Ok(()) => continue,
                         Err(message) => {
                             return ScenarioReport {
@@ -654,12 +679,16 @@ mod tests {
                 "c",
                 &json!({"steps": [
                     {"op": "chaos.restart"},
+                    {"op": "chaos.restart_owner", "args": {"feed": "{{uuid:target}}.events"}},
                     {"op": "wcl", "args": {"script": "SHOW FEEDS;"}, "expect": {"results": []}}
                 ]}),
             )
             .await;
         assert!(report.passed(), "{report:?}");
-        assert_eq!(*actions.lock().unwrap(), vec!["chaos.restart".to_owned()]);
+        let seen_actions = actions.lock().unwrap().clone();
+        assert_eq!(seen_actions[0], "chaos.restart");
+        assert!(seen_actions[1].starts_with("chaos.restart_owner "));
+        assert!(seen_actions[1].ends_with(".events"));
 
         // Without a hook the same op reports unsupported explicitly.
         let (unhooked, _) = runner(vec![]);
