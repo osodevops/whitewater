@@ -1,0 +1,86 @@
+{
+  "scenario": "enrich-pipe",
+  "requires": ["wcl", "statestore.mutate", "statestore.lookup", "writer.append_batch", "feed.records"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN en{{uniq}}; CREATE FEED en{{uniq}}.source; CREATE FEED en{{uniq}}.enriched; CREATE FEED en{{uniq}}.quarantine; DEFINE STATESTORE en{{uniq}}.profiles; CREATE WRITER ew{{uniq}} TO en{{uniq}}.source; OPEN WRITER SESSION ew{{uniq}}; CREATE SUBSCRIPTION en{{uniq}}.flow FROM en{{uniq}}.source START AT BEGINNING; CREATE PIPE en{{uniq}}.enrich FROM SUBSCRIPTION en{{uniq}}.flow TO FEED en{{uniq}}.enriched ENRICH STATESTORE en{{uniq}}.profiles BY KEY MISS QUARANTINE en{{uniq}}.quarantine;"
+      },
+      "bind": "setup"
+    },
+    {
+      "op": "statestore.mutate",
+      "args": {
+        "store": "en{{uniq}}.profiles",
+        "mutation_id": "{{uuid:row1}}",
+        "kind": "put_row",
+        "key": {"utf8": "user-1"},
+        "payload": {"utf8": "{\"tier\":\"pro\"}"}
+      },
+      "expect": {"deduplicated": false, "sequence": "present"}
+    },
+    {
+      "op": "statestore.lookup",
+      "args": {
+        "store": "en{{uniq}}.profiles",
+        "key": {"utf8": "user-1"},
+        "wait_ms": 5000
+      },
+      "poll": {"times": 15, "interval_ms": 1000},
+      "expect": {"found": true, "payload_base64": "eyJ0aWVyIjoicHJvIn0="}
+    },
+    {
+      "op": "writer.append_batch",
+      "args": {
+        "records": [
+          {
+            "request_id": "{{uuid:hit}}",
+            "writer": "ew{{uniq}}",
+            "session_epoch": "{{setup.results[6].data.session_epoch}}",
+            "key": {"utf8": "user-1"},
+            "payload": {"utf8": "event-1"},
+            "event_time_ns": "1700000000000000042",
+            "metadata": {"trace": {"utf8": "trace-1"}}
+          },
+          {
+            "request_id": "{{uuid:miss}}",
+            "writer": "ew{{uniq}}",
+            "session_epoch": "{{setup.results[6].data.session_epoch}}",
+            "key": {"utf8": "user-miss"},
+            "payload": {"utf8": "event-2"},
+            "event_time_ns": "1700000000000000043"
+          }
+        ]
+      },
+      "expect": {"results": "len>=2", "results[0].cursor": "!=null", "results[1].cursor": "!=null"}
+    },
+    {
+      "op": "feed.records",
+      "args": {"feed": "en{{uniq}}.enriched", "limit": 10},
+      "poll": {"times": 20, "interval_ms": 1000},
+      "expect": {
+        "records": "len>=1",
+        "records[0].key_base64": "dXNlci0x",
+        "records[0].payload_base64": "ZXZlbnQtMQ==",
+        "records[0].event_time_ns": "1700000000000000042",
+        "records[0].metadata_base64.trace": "dHJhY2UtMQ==",
+        "records[0].metadata_base64[\"enrich.matched\"]": "dHJ1ZQ==",
+        "records[0].metadata_base64[\"enrich.payload\"]": "eyJ0aWVyIjoicHJvIn0=",
+        "records[0].metadata_base64[\"enrich.seq\"]": "present"
+      }
+    },
+    {
+      "op": "feed.records",
+      "args": {"feed": "en{{uniq}}.quarantine", "limit": 10},
+      "poll": {"times": 20, "interval_ms": 1000},
+      "expect": {
+        "records": "len>=1",
+        "records[0].key_base64": "dXNlci1taXNz",
+        "records[0].payload_base64": "ZXZlbnQtMg==",
+        "records[0].metadata_base64[\"enrich.matched\"]": "ZmFsc2U=",
+        "records[0].metadata_base64[\"enrich.quarantine\"]": "dHJ1ZQ=="
+      }
+    }
+  ]
+}

@@ -301,10 +301,30 @@ impl ConformanceRunner {
 }
 
 /// Resolve `a.b[0].c` over a bound Value: dotted fields with `[n]`
-/// array indexing.
+/// array indexing and `["key"]` quoted brackets for field names that
+/// themselves contain dots (enriched-record metadata such as
+/// `enrich.matched`). A malformed bracket fails the path rather than
+/// silently resolving to the field alone.
 fn get_path<'v>(value: &'v Value, path: &str) -> Option<&'v Value> {
+    // Dots inside `["..."]` brackets belong to the key, not a separator.
+    let mut segments = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    for (index, byte) in path.bytes().enumerate() {
+        match byte {
+            b'[' => depth += 1,
+            b']' => depth = depth.saturating_sub(1),
+            b'.' if depth == 0 => {
+                segments.push(&path[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    segments.push(&path[start..]);
+
     let mut current = value;
-    for segment in path.split('.') {
+    for segment in segments {
         let (field, indices) = match segment.split_once('[') {
             Some((field, rest)) => (field, rest),
             None => (segment, ""),
@@ -312,11 +332,16 @@ fn get_path<'v>(value: &'v Value, path: &str) -> Option<&'v Value> {
         if !field.is_empty() {
             current = current.get(field)?;
         }
-        for index in indices
-            .split(']')
-            .filter_map(|part| part.trim_start_matches('[').parse::<usize>().ok())
-        {
-            current = current.get(index)?;
+        for part in indices.split(']').filter(|part| !part.is_empty()) {
+            let token = part.trim_start_matches('[');
+            if let Some(key) = token
+                .strip_prefix('"')
+                .and_then(|inner| inner.strip_suffix('"'))
+            {
+                current = current.get(key)?;
+            } else {
+                current = current.get(token.parse::<usize>().ok()?)?;
+            }
         }
     }
     Some(current)
@@ -915,5 +940,27 @@ mod tests {
         assert!(!failure.unsupported);
         assert_eq!(failure.status, Some(400));
         assert!(failure.message.contains("expected status 200"));
+    }
+
+    #[test]
+    fn get_path_resolves_quoted_bracket_keys_for_dotted_fields() {
+        let value = json!({
+            "records": [{
+                "cursor": "c1",
+                "metadata_base64": {"enrich.matched": "dHJ1ZQ==", "trace": "dA=="}
+            }]
+        });
+        assert_eq!(
+            get_path(&value, "records[0].metadata_base64[\"enrich.matched\"]"),
+            Some(&json!("dHJ1ZQ=="))
+        );
+        assert_eq!(
+            get_path(&value, "records[0].metadata_base64.trace"),
+            Some(&json!("dA=="))
+        );
+        // A naive dot split must not alias a dotted key to `enrich`→`matched`.
+        assert_eq!(get_path(&value, "records[0].metadata_base64.enrich"), None);
+        // Malformed brackets fail closed rather than resolve to the field.
+        assert_eq!(get_path(&value, "records[0].metadata_base64[oops]"), None);
     }
 }

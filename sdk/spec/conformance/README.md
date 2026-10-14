@@ -59,7 +59,10 @@ successfully.
 ### `expect` assertions
 
 Each entry is `{ "path.to.field": expected }` over the named bound result
-(or the immediately previous step when unnamed). Operators:
+(or the immediately previous step when unnamed). Paths resolve dotted
+fields and `[n]` array indices; a field name that itself contains dots
+uses a quoted bracket — `records[0].metadata_base64["enrich.matched"]`.
+Operators:
 
 - literal value — deep equality
 - `"==<bind>.<field>"` — equals another bound field
