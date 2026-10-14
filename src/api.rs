@@ -719,6 +719,7 @@ pub fn router(state: AppState) -> Router {
             get(admin_subscription_progress),
         )
         .route("/v1/admin/demand/hot-keys", get(admin_hot_keys))
+        .route("/v1/admin/demand/pipes", get(admin_pipe_demand))
         .route("/v1/admin/control-plane", get(control_plane_status))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
@@ -2483,12 +2484,16 @@ async fn drive_pipe(
         sweep_depth: 0,
     };
     let driver = crate::pipe::PipeDriver::new(pipe.clone(), Arc::new(journal), Arc::new(progress));
-    driver
+    let started = std::time::Instant::now();
+    let tally = Arc::new(std::sync::Mutex::new(PipeFetchTally::default()));
+    let tally_cell = Arc::clone(&tally);
+    let result = driver
         .drive_once(
             limit,
             |frontier, limit| {
                 let frontier = frontier.clone();
                 let pipe = pipe.clone();
+                let tally = Arc::clone(&tally_cell);
                 async move {
                     let eligible_ingest_ns = delivery_delay_ns.map(|delay| {
                         unix_ns().saturating_sub(i64::try_from(delay).unwrap_or(i64::MAX))
@@ -2503,6 +2508,17 @@ async fn drive_pipe(
                         .unwrap_or_else(|| frontier.cursor.clone());
                     let mut records = Vec::with_capacity(delivered.len());
                     for (_, record) in delivered {
+                        if let Ok(mut tally) = tally.lock() {
+                            tally.fetch_bytes = tally.fetch_bytes.saturating_add(
+                                (record.key.len()
+                                    + record.payload.len()
+                                    + record
+                                        .metadata
+                                        .values()
+                                        .map(|value| value.len())
+                                        .sum::<usize>()) as u64,
+                            );
+                        }
                         // Enrich lookups resolve at fetch time: the outcome
                         // rides inside the Declare, so an applied output is
                         // byte-identical across replays and raced drives
@@ -2602,7 +2618,7 @@ async fn drive_pipe(
                         }
                         _ => (Vec::new(), Default::default(), false),
                     };
-                    Ok(crate::pipe::FetchedPage {
+                    let page = crate::pipe::FetchedPage {
                         cursor,
                         records,
                         positions,
@@ -2611,7 +2627,19 @@ async fn drive_pipe(
                         refused,
                         pane_rows,
                         pane_rows_saturated,
-                    })
+                    };
+                    if let Ok(mut tally) = tally.lock() {
+                        tally.records = page.records.len() as u64;
+                        tally.emissions = page.emissions.len() as u64;
+                        tally.pane_rows = page.pane_rows.len() as u64;
+                        tally.pane_bytes = page
+                            .pane_rows
+                            .iter()
+                            .map(|(group, _)| (4 + group.len() + 8 + 24) as u64)
+                            .sum();
+                        tally.page_limit = limit as u64;
+                    }
+                    Ok(page)
                 }
             },
             || async move {
@@ -2622,7 +2650,101 @@ async fn drive_pipe(
             &sink,
         )
         .await
-        .map_err(effect_journal_api_error)
+        .map_err(effect_journal_api_error);
+    record_pipe_drive_telemetry(state, pipe, started, &tally, limit, &result);
+    result
+}
+
+/// Count records a Window Pipe diverted into sentinel rows this drive:
+/// `LIMIT KEYS`/`LIMIT BYTES` refusals and lateness quarantine all
+/// accumulate `count_delta` under row keys with the `WINDOW_LATE_PANE`
+/// pane index, so the applied mutations carry the honest refused-Record
+/// total — fetch-time `page.refused` only names refused groups.
+fn window_sentinel_refusals(state_mutations: &[crate::effect::EffectStateMutation]) -> u64 {
+    state_mutations
+        .iter()
+        .map(|mutation| match &mutation.op {
+            crate::state_store::StateStoreMutationOp::AccumulateRows { entries } => entries
+                .iter()
+                .filter(|entry| {
+                    crate::pipe::window_pane_row_key_parse(&entry.key)
+                        .is_some_and(|(_, pane)| pane == crate::pipe::WINDOW_LATE_PANE)
+                })
+                .map(|entry| entry.count_delta)
+                .sum(),
+            _ => 0,
+        })
+        .sum()
+}
+
+/// Per-cycle fetch measurements the drive closure reports back through a
+/// shared cell: the closure runs inside `drive_once`, so its counts land
+/// before the outcome is known and merge with the result below.
+#[derive(Clone, Default)]
+struct PipeFetchTally {
+    records: u64,
+    fetch_bytes: u64,
+    emissions: u64,
+    pane_rows: u64,
+    pane_bytes: u64,
+    page_limit: u64,
+}
+
+/// Fold a finished drive into the Pipe's Node-local attribution row on
+/// `DemandMetrics` — the honest scope, since a compute-lease move
+/// restarts driving on the new owner.
+fn record_pipe_drive_telemetry(
+    state: &AppState,
+    pipe: &crate::control::PipeDefinition,
+    started: std::time::Instant,
+    tally: &std::sync::Mutex<PipeFetchTally>,
+    page_limit: usize,
+    result: &Result<Option<crate::effect::EffectMutation>, ApiError>,
+) {
+    let wall_ns = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    let counts = tally
+        .lock()
+        .map(|counts| counts.clone())
+        .unwrap_or_default();
+    let (outcome, outputs, state_mutations, refused) = match result {
+        Ok(Some(mutation)) => match &mutation.transition {
+            crate::effect::EffectTransition::Applied {
+                outputs,
+                state_mutations,
+                ..
+            } => (
+                crate::demand::PipeDriveResult::Applied,
+                outputs.len() as u64,
+                state_mutations.len() as u64,
+                window_sentinel_refusals(state_mutations),
+            ),
+            _ => (crate::demand::PipeDriveResult::Applied, 0, 0, 0),
+        },
+        Ok(None) => (crate::demand::PipeDriveResult::Idle, 0, 0, 0),
+        Err(error) => (
+            crate::demand::PipeDriveResult::Failed(error.message.clone()),
+            0,
+            0,
+            0,
+        ),
+    };
+    state.demand.record_pipe_drive(
+        pipe.pipe_id,
+        crate::demand::PipeDriveSample {
+            result: outcome,
+            outputs,
+            state_mutations,
+            records: counts.records,
+            fetch_bytes: counts.fetch_bytes,
+            refused,
+            emissions: counts.emissions,
+            pane_rows: counts.pane_rows,
+            pane_bytes: counts.pane_bytes,
+            page_limit: counts.page_limit.max(page_limit as u64),
+            wall_ns,
+            sampled_at_ns: unix_ns(),
+        },
+    );
 }
 
 /// Build the sequence-1 frontier mutation a Pipe driver commits when no
@@ -8577,6 +8699,83 @@ async fn admin_hot_keys(
         })
         .collect();
     Ok(Json(json!({ "hot_keys": hot_keys })))
+}
+
+/// `GET /v1/admin/demand/pipes`
+/// Per-Pipe drive attribution on this Node — cycle counts, folded input,
+/// declared outputs, window-pane state estimate, and wall time — plus a
+/// per-Domain rollup so operators can attribute Pipe CPU/backfill/state
+/// cost to its logical owner. Scope is Node-local since process start:
+/// a compute-lease move restarts attribution on the new owner rather
+/// than pretending a portable counter.
+async fn admin_pipe_demand(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let pipes = state.control.active_pipes().await;
+    let live: std::collections::BTreeSet<Uuid> = pipes.iter().map(|pipe| pipe.pipe_id).collect();
+    state.demand.prune_pipe_drives(&live);
+    let telemetry = state.demand.pipe_drive_telemetry();
+    let mut domains: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut rows = Vec::with_capacity(pipes.len());
+    for pipe in &pipes {
+        let domain = state
+            .control
+            .active_domain_name(pipe.space_id)
+            .await
+            .unwrap_or_else(|| pipe.space_id.to_string());
+        let operation = match &pipe.operation {
+            crate::control::PipeOperation::Forward => "forward",
+            crate::control::PipeOperation::Window { .. } => "window",
+            crate::control::PipeOperation::Enrich { .. } => "enrich",
+        };
+        let telemetry = telemetry.get(&pipe.pipe_id);
+        let backfilling = telemetry
+            .is_some_and(|t| t.last_page_records >= t.last_page_limit && t.last_page_records > 0);
+        let row = json!({
+            "pipe": pipe.name,
+            "domain": domain,
+            "operation": operation,
+            "stage": pipe.stage,
+            "telemetry": telemetry,
+            "backfilling": backfilling,
+        });
+        let rollup = domains.entry(domain).or_insert_with(|| {
+            json!({
+                "pipes": 0, "drives": 0, "applied": 0, "failed": 0,
+                "records_fetched": 0, "fetch_bytes": 0, "outputs": 0,
+                "state_mutations": 0, "emissions": 0, "records_refused": 0,
+                "pane_rows": 0, "pane_bytes": 0, "drive_wall_ns_total": 0,
+            })
+        });
+        rollup["pipes"] = json!(rollup["pipes"].as_u64().unwrap_or(0) + 1);
+        if let Some(t) = telemetry {
+            for (field, value) in [
+                ("drives", t.drives),
+                ("applied", t.applied),
+                ("failed", t.failed),
+                ("records_fetched", t.records_fetched),
+                ("fetch_bytes", t.fetch_bytes),
+                ("outputs", t.outputs),
+                ("state_mutations", t.state_mutations),
+                ("emissions", t.emissions),
+                ("records_refused", t.records_refused),
+                ("pane_rows", t.pane_rows_last),
+                ("pane_bytes", t.pane_bytes_last),
+                ("drive_wall_ns_total", t.drive_wall_ns_total),
+            ] {
+                rollup[field] = json!(rollup[field].as_u64().unwrap_or(0) + value);
+            }
+        }
+        rows.push(row);
+    }
+    Ok(Json(json!({
+        "node": state.storage_node_id,
+        "scope": "node-local since process start; a compute-lease move restarts attribution on the new owner",
+        "pipes": rows,
+        "domains": domains,
+    })))
 }
 
 fn hot_key_entry(
@@ -18420,5 +18619,41 @@ mod tests {
             code: Some("writer.sequence_gap"),
         };
         assert_eq!(writer_sequence_boundary(&malformed), None);
+    }
+
+    #[test]
+    fn window_sentinel_refusals_counts_sentinel_pane_deltas() {
+        let entry = |key: Vec<u8>, count_delta: u64| crate::effect::EffectStateMutation {
+            store_id: Uuid::nil(),
+            mutation_id: Uuid::nil(),
+            op: crate::state_store::StateStoreMutationOp::AccumulateRows {
+                entries: vec![crate::state_store::AccumulateRowEntry {
+                    key,
+                    count_delta,
+                    sum_delta: 0,
+                    named: Vec::new(),
+                }],
+            },
+        };
+        let group =
+            crate::pipe::window_group_key_bytes(&crate::index::IndexValue::Text("acme".to_owned()))
+                .unwrap_or_else(|| vec![2]);
+        let real_pane = entry(crate::pipe::window_pane_row_key(&group, 7), 3);
+        let keycap = entry(
+            crate::pipe::window_pane_row_key(&group, crate::pipe::WINDOW_LATE_PANE),
+            5,
+        );
+        let malformed = crate::effect::EffectStateMutation {
+            store_id: Uuid::nil(),
+            mutation_id: Uuid::nil(),
+            op: crate::state_store::StateStoreMutationOp::PutRow {
+                key: b"not-a-pane-row".to_vec(),
+                payload: Vec::new(),
+                named: Vec::new(),
+            },
+        };
+        // Only sentinel-pane accumulate deltas count: real pane rows and
+        // non-accumulate ops carry no refused records.
+        assert_eq!(window_sentinel_refusals(&[real_pane, keycap, malformed]), 5);
     }
 }

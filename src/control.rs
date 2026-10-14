@@ -2030,6 +2030,17 @@ impl ControlController {
             .cloned()
     }
 
+    /// The active Domain's name for telemetry attribution reporting.
+    pub async fn active_domain_name(&self, space_id: Uuid) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .spaces
+            .get(&space_id)
+            .filter(|space| space.status == ResourceStatus::Active)
+            .map(|space| space.name.clone())
+    }
+
     /// The declared Pipe by immutable id.
     pub async fn active_pipe_by_id(&self, pipe_id: Uuid) -> Option<PipeDefinition> {
         self.state

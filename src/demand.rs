@@ -26,6 +26,7 @@ struct DemandCounters {
     range_appends: Mutex<BTreeMap<RangeId, RangeAppendWindow>>,
     range_totals: Mutex<BTreeMap<RangeId, RangeAppendWindow>>,
     hot_keys: Mutex<BTreeMap<RangeId, (HotKeyEvidence, std::time::Instant)>>,
+    pipe_drives: Mutex<BTreeMap<uuid::Uuid, PipeDriveTelemetry>>,
 }
 
 #[derive(Default)]
@@ -193,6 +194,64 @@ impl DemandMetrics {
             .is_some_and(|hot| hot.token == KeyToken::from_key(key))
     }
 
+    /// Fold one finished drive cycle into the Pipe's Node-local
+    /// attribution row; counters saturate rather than wrap so a
+    /// long-lived Node never reports negative demand.
+    pub fn record_pipe_drive(&self, pipe_id: uuid::Uuid, sample: PipeDriveSample) {
+        let Ok(mut drives) = self.inner.pipe_drives.lock() else {
+            return;
+        };
+        let telemetry = drives.entry(pipe_id).or_default();
+        telemetry.drives = telemetry.drives.saturating_add(1);
+        match &sample.result {
+            PipeDriveResult::Applied => {
+                telemetry.applied = telemetry.applied.saturating_add(1);
+                telemetry.last_error = None;
+            }
+            PipeDriveResult::Idle => {
+                telemetry.idle = telemetry.idle.saturating_add(1);
+                telemetry.last_error = None;
+            }
+            PipeDriveResult::Failed(message) => {
+                telemetry.failed = telemetry.failed.saturating_add(1);
+                telemetry.last_error = Some(message.clone());
+            }
+        }
+        telemetry.outputs = telemetry.outputs.saturating_add(sample.outputs);
+        telemetry.state_mutations = telemetry
+            .state_mutations
+            .saturating_add(sample.state_mutations);
+        telemetry.records_fetched = telemetry.records_fetched.saturating_add(sample.records);
+        telemetry.fetch_bytes = telemetry.fetch_bytes.saturating_add(sample.fetch_bytes);
+        telemetry.records_refused = telemetry.records_refused.saturating_add(sample.refused);
+        telemetry.emissions = telemetry.emissions.saturating_add(sample.emissions);
+        telemetry.drive_wall_ns_total =
+            telemetry.drive_wall_ns_total.saturating_add(sample.wall_ns);
+        telemetry.last_drive_wall_ns = sample.wall_ns;
+        telemetry.last_page_records = sample.records;
+        telemetry.last_page_limit = sample.page_limit;
+        telemetry.pane_rows_last = sample.pane_rows;
+        telemetry.pane_bytes_last = sample.pane_bytes;
+        telemetry.last_drive_at_ns = Some(sample.sampled_at_ns);
+    }
+
+    /// A consistent snapshot of per-Pipe attribution rows on this Node.
+    pub fn pipe_drive_telemetry(&self) -> BTreeMap<uuid::Uuid, PipeDriveTelemetry> {
+        self.inner
+            .pipe_drives
+            .lock()
+            .map(|drives| drives.clone())
+            .unwrap_or_default()
+    }
+
+    /// Drop attribution rows for Pipes that no longer exist so a
+    /// churned declaration cannot grow the map unboundedly.
+    pub fn prune_pipe_drives(&self, live: &std::collections::BTreeSet<uuid::Uuid>) {
+        if let Ok(mut drives) = self.inner.pipe_drives.lock() {
+            drives.retain(|pipe_id, _| live.contains(pipe_id));
+        }
+    }
+
     pub fn record_read(&self, records: usize) {
         self.inner.reads_total.fetch_add(1, Ordering::Relaxed);
         self.inner
@@ -210,6 +269,71 @@ impl DemandMetrics {
             records_read_total: self.inner.records_read_total.load(Ordering::Relaxed),
         }
     }
+}
+
+/// One Pipe drive cycle's measured cost on this Node: input folded, the
+/// outputs/state mutations the committed effect declared, records
+/// diverted into window sentinel rows (`LIMIT` refusals and lateness
+/// quarantine), emissions, the fetched page's window-pane state
+/// estimate, and wall time. `page_limit` records the bound the page was
+/// fetched under so a saturated page marks the Pipe as backfilling.
+#[derive(Clone, Debug, Default)]
+pub struct PipeDriveSample {
+    pub result: PipeDriveResult,
+    pub outputs: u64,
+    pub state_mutations: u64,
+    pub records: u64,
+    pub fetch_bytes: u64,
+    pub refused: u64,
+    pub emissions: u64,
+    pub pane_rows: u64,
+    pub pane_bytes: u64,
+    pub page_limit: u64,
+    pub wall_ns: u64,
+    pub sampled_at_ns: i64,
+}
+
+/// How one drive cycle ended: committed an effect, found the input
+/// caught up, or failed closed (message kept for the last-error field).
+#[derive(Clone, Debug)]
+pub enum PipeDriveResult {
+    Applied,
+    Idle,
+    Failed(String),
+}
+
+impl Default for PipeDriveResult {
+    fn default() -> Self {
+        Self::Idle
+    }
+}
+
+/// Per-Pipe drive attribution on this Node since process start — the
+/// honest scope, because a compute-lease move restarts driving on the
+/// new owner rather than pretending counters are portable. Domain
+/// rollups sum these rows; an operator reading `pane_*_last` gets the
+/// serving replica's most recent window-state estimate.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct PipeDriveTelemetry {
+    pub drives: u64,
+    pub applied: u64,
+    pub idle: u64,
+    pub failed: u64,
+    pub outputs: u64,
+    pub state_mutations: u64,
+    pub records_fetched: u64,
+    pub fetch_bytes: u64,
+    pub records_refused: u64,
+    pub emissions: u64,
+    pub pane_rows_last: u64,
+    pub pane_bytes_last: u64,
+    pub last_page_records: u64,
+    pub last_page_limit: u64,
+    pub drive_wall_ns_total: u64,
+    pub last_drive_wall_ns: u64,
+    pub last_drive_at_ns: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 /// Per-range bounded distinct-Key tracking budget. Windows holding more
@@ -723,5 +847,72 @@ mod tests {
         metrics.clear_hot_key(range_id);
         assert!(!metrics.is_hot_key(range_id, b"hot"));
         assert!(metrics.hot_keys().is_empty());
+    }
+
+    #[test]
+    fn pipe_drive_telemetry_aggregates_outcomes_and_prunes_dropped_pipes() {
+        let metrics = DemandMetrics::default();
+        let pipe = uuid::Uuid::from_u128(7_001);
+        let dropped = uuid::Uuid::from_u128(7_002);
+        let sample = |result, records| PipeDriveSample {
+            result,
+            outputs: 2,
+            state_mutations: 1,
+            records,
+            fetch_bytes: 512,
+            refused: 3,
+            emissions: 4,
+            pane_rows: 9,
+            pane_bytes: 340,
+            page_limit: 16,
+            wall_ns: 2_000,
+            sampled_at_ns: 42,
+        };
+        metrics.record_pipe_drive(pipe, sample(PipeDriveResult::Applied, 5));
+        metrics.record_pipe_drive(pipe, sample(PipeDriveResult::Idle, 0));
+        metrics.record_pipe_drive(
+            pipe,
+            sample(PipeDriveResult::Failed("quorum lost".to_owned()), 0),
+        );
+        metrics.record_pipe_drive(dropped, sample(PipeDriveResult::Idle, 1));
+
+        let telemetry = metrics.pipe_drive_telemetry();
+        let row = telemetry.get(&pipe).unwrap();
+        assert_eq!(row.drives, 3);
+        assert_eq!(row.applied, 1);
+        assert_eq!(row.idle, 1);
+        assert_eq!(row.failed, 1);
+        assert_eq!(row.outputs, 6);
+        assert_eq!(row.state_mutations, 3);
+        assert_eq!(row.records_fetched, 5);
+        assert_eq!(row.fetch_bytes, 1_536);
+        assert_eq!(row.records_refused, 9);
+        assert_eq!(row.emissions, 12);
+        assert_eq!(row.pane_rows_last, 9);
+        assert_eq!(row.pane_bytes_last, 340);
+        assert_eq!(row.last_page_records, 0);
+        assert_eq!(row.last_page_limit, 16);
+        assert_eq!(row.drive_wall_ns_total, 6_000);
+        assert_eq!(row.last_drive_wall_ns, 2_000);
+        assert_eq!(row.last_drive_at_ns, Some(42));
+        assert_eq!(row.last_error.as_deref(), Some("quorum lost"));
+
+        // A successful cycle clears the last error.
+        metrics.record_pipe_drive(pipe, sample(PipeDriveResult::Idle, 0));
+        assert_eq!(
+            metrics
+                .pipe_drive_telemetry()
+                .get(&pipe)
+                .unwrap()
+                .last_error,
+            None
+        );
+
+        // Dropped Pipes leave no attribution residue.
+        let live = std::collections::BTreeSet::from([pipe]);
+        metrics.prune_pipe_drives(&live);
+        let telemetry = metrics.pipe_drive_telemetry();
+        assert!(telemetry.contains_key(&pipe));
+        assert!(!telemetry.contains_key(&dropped));
     }
 }

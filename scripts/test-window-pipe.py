@@ -79,6 +79,15 @@ def wcl_retry(node, script, attempts=30, delay=1):
     raise last
 
 
+def get_json(node, path):
+    request = urllib.request.Request(
+        f"{node}{path}",
+        headers={"authorization": f"Bearer {KEY}"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
 def read(node, feed):
     query = urllib.parse.urlencode({"feed": feed, "limit": 100})
     request = urllib.request.Request(
@@ -194,6 +203,55 @@ def pane_rows(node, store):
         "pane",
         lower={"value": {"kind": "i64", "value": 0}, "inclusive": True},
     )
+
+
+def pipe_demand():
+    """Merged `/v1/admin/demand/pipes` across all Nodes.
+
+    Telemetry is Node-local since process start — a compute-lease move
+    restarts the row on the new owner — so run-total cost is the sum of
+    per-Node rows. `last_*`/`*_last` fields merge by max (most-recent
+    estimates, not costs); `pipes` in a Domain rollup merges by max for
+    the same reason (every Node reports the same live Pipe set).
+    """
+    merged, domains = {}, {}
+    for node in NODES:
+        try:
+            candidate = get_json(node, "/v1/admin/demand/pipes")
+        except Exception:
+            continue
+        for row in candidate.get("pipes", []):
+            entry = merged.setdefault(
+                row["pipe"],
+                {
+                    "domain": row["domain"],
+                    "operation": row["operation"],
+                    "backfilling": False,
+                    "telemetry": {},
+                },
+            )
+            entry["backfilling"] = entry["backfilling"] or row.get(
+                "backfilling", False
+            )
+            for field, value in (row.get("telemetry") or {}).items():
+                if not isinstance(value, (int, float)):
+                    continue
+                prior = entry["telemetry"].get(field, 0)
+                entry["telemetry"][field] = (
+                    max(prior, value)
+                    if field.startswith("last_") or field.endswith("_last")
+                    else prior + value
+                )
+        for name, rollup in candidate.get("domains", {}).items():
+            target = domains.setdefault(name, {})
+            for field, value in rollup.items():
+                if isinstance(value, (int, float)):
+                    target[field] = (
+                        max(target.get(field, 0), value)
+                        if field == "pipes"
+                        else target.get(field, 0) + value
+                    )
+    return merged, domains
 
 
 def sentinel_rows(node, store):
@@ -523,6 +581,46 @@ def main():
         emitted = emissions(wait_records(results_feed, 7, deadline=60))
         assert_subset(emitted, expected)
 
+        # Per-Domain Pipe cost attribution, read while every drive Node is
+        # still up: telemetry is Node-local since process start, so the
+        # hard restart below would wipe the rows this proves. The merge
+        # sums per-Node counters and max-merges *_last estimates.
+        merged, domains = pipe_demand()
+        assert totals_pipe in merged, "no Node reported Pipe drive telemetry"
+        totals_row = merged[totals_pipe]
+        assert totals_row["domain"] == domain
+        assert totals_row["operation"] == "window"
+        telemetry = totals_row["telemetry"]
+        assert telemetry["drives"] > 0
+        assert telemetry["applied"] > 0
+        # 11 records appended so far (batches A-C plus the post-move one).
+        assert telemetry["records_fetched"] >= 11, {"totals": telemetry}
+        assert telemetry["emissions"] >= 5
+        assert telemetry["outputs"] >= 5
+        assert telemetry["state_mutations"] >= 5
+        assert telemetry["drive_wall_ns_total"] > 0
+        assert not totals_row["backfilling"]
+        # Both capped Pipes divert refused records into sentinel rows; the
+        # applied mutations carry the refused-Record totals: LIMIT KEYS
+        # refused every non-acme record, LIMIT BYTES refused every new
+        # (group, pane) past its three admitted rows.
+        keycap_row = merged[capped_pipe]
+        assert keycap_row["telemetry"]["records_refused"] >= 5, {
+            "keycap": keycap_row["telemetry"]
+        }
+        byte_row = merged[byte_pipe]
+        assert byte_row["telemetry"]["records_refused"] >= 5, {
+            "bytecap": byte_row["telemetry"]
+        }
+        assert byte_row["telemetry"]["pane_rows_last"] >= 3
+        assert byte_row["telemetry"]["pane_bytes_last"] >= 125
+        rollup = domains[domain]
+        assert rollup["pipes"] >= 3
+        # Four Pipes each fetch the same 11 records through their own
+        # Subscriptions, so the Domain rollup exceeds the per-Pipe count.
+        assert rollup["records_fetched"] >= 11
+        assert rollup["drive_wall_ns_total"] > 0
+
         # Hard restart of the progress owner: a member join recovers the
         # lost owner through the placement authority, and the Pipe resumes
         # on the surviving owner without re-emitting acknowledged panes.
@@ -675,6 +773,15 @@ def main():
         )
         if bytecap_pane != 2**64 - 1 or decode_group(bytecap_tagged) != "__bytecap__":
             raise AssertionError({"bytecap sentinel": byte_sentinels[0]})
+
+        # Post-restart attribution: the recovered compute-lease owner
+        # records fresh drives for the same Pipes — the restarted Node's
+        # wiped row is honest, not a loss, and the recovered owner's row
+        # proves attribution keeps following the lease.
+        merged, _ = pipe_demand()
+        assert totals_pipe in merged, "Pipe telemetry vanished post-restart"
+        telemetry = merged[totals_pipe]["telemetry"]
+        assert telemetry["drives"] > 0
 
         print(
             json.dumps(
