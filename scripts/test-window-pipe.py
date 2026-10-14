@@ -313,14 +313,17 @@ def main():
         source, results_feed = f"{domain}.source", f"{domain}.results"
         panes_store, retired_store = f"{domain}.panes", f"{domain}.retired"
         capped_store = f"{domain}.capped"
+        byte_store = f"{domain}.bytecap"
         writer = f"writer{suffix}"
         # A Subscription is one shared durable frontier — members and
         # declared Pipes compete for the same pages. Each Pipe therefore
         # consumes its own Subscription over the shared source Feed.
         subscription, subscription_b = f"{domain}.flow", f"{domain}.flowb"
         subscription_c = f"{domain}.flowc"
+        subscription_d = f"{domain}.flowd"
         totals_pipe, retire_pipe = f"{domain}.totals", f"{domain}.retire"
         capped_pipe = f"{domain}.capped"
+        byte_pipe = f"{domain}.bytecap"
         results = wcl_retry(
             NODES[0],
             f"CREATE DOMAIN {domain}; "
@@ -349,7 +352,15 @@ def main():
             f"CREATE SUBSCRIPTION {subscription_c} FROM {source} START AT BEGINNING; "
             f"CREATE PIPE {capped_pipe} FROM SUBSCRIPTION {subscription_c} "
             f"TO STATESTORE {capped_store} WINDOW 8s EVENT MAX_LATE 6s "
-            f"LIMIT KEYS 1 BY JSON 'customer' COUNT;",
+            f"LIMIT KEYS 1 BY JSON 'customer' COUNT; "
+            # Byte-capped pipe: LIMIT BYTES 130 admits three pane rows
+            # (41-43 accounted bytes each) then refuses every further new
+            # (group, pane) row into the shared __bytecap__ sentinel.
+            f"DEFINE STATESTORE {byte_store} KEYS key, pane; "
+            f"CREATE SUBSCRIPTION {subscription_d} FROM {source} START AT BEGINNING; "
+            f"CREATE PIPE {byte_pipe} FROM SUBSCRIPTION {subscription_d} "
+            f"TO STATESTORE {byte_store} WINDOW 8s EVENT MAX_LATE 6s "
+            f"LIMIT BYTES 130 BY JSON 'customer' COUNT;",
         )
         writer_epoch = results[6]["session_epoch"]
         described = wcl(NODES[1], f"DESCRIBE PIPE {totals_pipe};")[0]
@@ -626,6 +637,45 @@ def main():
         if keycap_pane != 2**64 - 1 or decode_group(keycap_tagged) != "__keycap__":
             raise AssertionError({"keycap sentinel": capped_sentinels[0]})
 
+        # LIMIT BYTES: the byte-capped Pipe admits the first three pane
+        # rows it encounters — (acme,P0), (globex,P0), (acme,P0+1) at
+        # 41+43+41=125 accounted bytes — then every later new (group,
+        # pane) row refuses into the one shared `__bytecap__` sentinel:
+        # globex P0+2, acme P0+3, lateco's late row, acme pfresh, edge's
+        # overflow pane, and the post-move/restart records — 7 refused
+        # records total. Merges into admitted rows never grow the budget.
+        byte_sentinels, byte_panes = [], None
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            byte_sentinels = sentinel_rows(NODES[0], byte_store)
+            byte_panes = pane_rows(NODES[0], byte_store)
+            if (
+                len(byte_sentinels) == 1
+                and len(byte_panes) == 3
+                and decode_accumulator(byte_sentinels[0]["payload_base64"])
+                == (7, 0)
+            ):
+                break
+            time.sleep(1)
+        else:
+            raise AssertionError(
+                {
+                    "byte-capped pane rows": byte_panes,
+                    "byte-capped sentinels": byte_sentinels,
+                }
+            )
+        byte_groups = sorted(
+            decode_group(parse_row_key(row["key_base64"])[0])
+            for row in byte_panes
+        )
+        if byte_groups != ["acme", "acme", "globex"]:
+            raise AssertionError({"admitted rows": byte_groups})
+        bytecap_tagged, bytecap_pane = parse_row_key(
+            byte_sentinels[0]["key_base64"]
+        )
+        if bytecap_pane != 2**64 - 1 or decode_group(bytecap_tagged) != "__bytecap__":
+            raise AssertionError({"bytecap sentinel": byte_sentinels[0]})
+
         print(
             json.dumps(
                 {
@@ -638,6 +688,9 @@ def main():
                     "owner_after_restart": recovered_owner,
                     "keycap_refused": decode_accumulator(
                         capped_sentinels[0]["payload_base64"]
+                    )[0],
+                    "bytecap_refused": decode_accumulator(
+                        byte_sentinels[0]["payload_base64"]
                     )[0],
                     "note": (
                         "window Pipe folded multi-pane event-time input into "

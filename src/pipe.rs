@@ -82,6 +82,15 @@ pub struct FetchedPage {
     /// sentinel row rather than opening state for a new Key — the bound
     /// holds on replay because the resolved set journals with the page.
     pub refused: Vec<Vec<u8>>,
+    /// Window Pipes with `LIMIT BYTES` only: the (group, pane) rows the
+    /// fetch-time scan proved exist on the same serving replica. The
+    /// fold admits records only onto rows already here or into remaining
+    /// byte budget; the rest accumulate `__bytecap__`. The set journals
+    /// with the page so a replayed effect never re-scans.
+    pub pane_rows: std::collections::BTreeSet<(Vec<u8>, u64)>,
+    /// The pane-row scan hit its row bound — the fold refuses every new
+    /// (group, pane) row rather than guessing remaining byte capacity.
+    pub pane_rows_saturated: bool,
 }
 
 /// One closed window pane resolved for emission: the StateStore pane row
@@ -444,6 +453,7 @@ impl PipeDriver {
                 max_late_ns,
                 expire_ns: _,
                 key_limit: _,
+                byte_limit,
             } => {
                 let store_id = self
                     .pipe
@@ -463,6 +473,34 @@ impl PipeDriver {
                 let refused: BTreeSet<&[u8]> =
                     page.refused.iter().map(|group| group.as_slice()).collect();
                 let mut keycap = 0u64;
+                // `LIMIT BYTES`: pane-state bytes = the scanned rows plus
+                // rows this page already admitted; a record whose new
+                // (group, pane) row would exceed the bound accumulates
+                // the shared `__bytecap__` sentinel instead. Records
+                // merging into an existing row never grow the budget —
+                // a saturated scan refuses every new row.
+                let mut bytecap = 0u64;
+                let mut admitted_panes: BTreeSet<(Vec<u8>, u64)> = page.pane_rows.clone();
+                let mut used_bytes: u64 = page
+                    .pane_rows
+                    .iter()
+                    .map(|(group, _)| window_pane_row_bytes(group))
+                    .sum();
+                let mut admit_pane = |target: &(Vec<u8>, u64)| -> bool {
+                    let Some(limit) = byte_limit else {
+                        return true;
+                    };
+                    if admitted_panes.contains(target) {
+                        return true;
+                    }
+                    let row_bytes = window_pane_row_bytes(&target.0);
+                    if page.pane_rows_saturated || used_bytes.saturating_add(row_bytes) > *limit {
+                        return false;
+                    }
+                    used_bytes += row_bytes;
+                    admitted_panes.insert(target.clone());
+                    true
+                };
                 for record in &page.records {
                     let Some(source) = source_record(record) else {
                         continue;
@@ -495,6 +533,10 @@ impl PipeDriver {
                             .map(|bound| lateness > bound as i64)
                             .unwrap_or(false)
                     {
+                        if !admit_pane(&(group.0.clone(), WINDOW_LATE_PANE)) {
+                            bytecap = bytecap.saturating_add(1);
+                            continue;
+                        }
                         let entry = late.entry(group.0).or_insert((0, group.1));
                         entry.0 = entry.0.saturating_add(1);
                         continue;
@@ -520,6 +562,10 @@ impl PipeDriver {
                         WindowTime::Ingest => record.ingest_time_ns,
                     };
                     let pane = u64::try_from(instant.max(0)).unwrap_or(0) / pane_ns;
+                    if !admit_pane(&(group.0.clone(), pane)) {
+                        bytecap = bytecap.saturating_add(1);
+                        continue;
+                    }
                     let entry = panes.entry((group.0, pane)).or_insert((0, 0, group.1));
                     entry.0 = entry.0.saturating_add(1);
                     entry.1 = entry.1.saturating_add(sum_delta);
@@ -531,6 +577,7 @@ impl PipeDriver {
                 if panes.is_empty()
                     && late.is_empty()
                     && keycap == 0
+                    && bytecap == 0
                     && page.emissions.is_empty()
                     && page.expired.is_empty()
                 {
@@ -573,6 +620,30 @@ impl PipeDriver {
                             NamedKeyValue {
                                 name: WINDOW_KEY_NAME.to_owned(),
                                 values: vec![keycap_value],
+                                unique: false,
+                            },
+                            NamedKeyValue {
+                                name: WINDOW_PANE_NAME.to_owned(),
+                                values: vec![IndexValue::I64(-1)],
+                                unique: false,
+                            },
+                        ],
+                    });
+                }
+                // `LIMIT BYTES` refusals share the same contract: one
+                // bounded sentinel row counts every byte-refused record.
+                if bytecap > 0 {
+                    let bytecap_value = IndexValue::Text(WINDOW_BYTECAP_GROUP.to_owned());
+                    let bytecap_group =
+                        window_group_key_bytes(&bytecap_value).unwrap_or_else(|| vec![2]);
+                    entries.push(AccumulateRowEntry {
+                        key: window_pane_row_key(&bytecap_group, WINDOW_LATE_PANE),
+                        count_delta: bytecap,
+                        sum_delta: 0,
+                        named: vec![
+                            NamedKeyValue {
+                                name: WINDOW_KEY_NAME.to_owned(),
+                                values: vec![bytecap_value],
                                 unique: false,
                             },
                             NamedKeyValue {
@@ -814,6 +885,49 @@ pub const WINDOW_MAX_KEY_LIMIT: u64 = 512;
 /// One Key's maximum row footprint in a window store: `WINDOW_PANE_COUNT`
 /// real pane rows plus its per-group late sentinel row.
 pub const WINDOW_KEY_ROW_FOOTPRINT: u64 = WINDOW_PANE_COUNT + 1;
+
+/// Reserved group value for the shared `LIMIT BYTES` refusal row: every
+/// record refused by the pane-state byte bound accumulates this one
+/// sentinel row regardless of its own (group, pane) — bounded, countable
+/// evidence that never grows with the refused input.
+pub const WINDOW_BYTECAP_GROUP: &str = "__bytecap__";
+
+/// Largest `LIMIT BYTES` a window Pipe may declare. The fetch-time
+/// pane-row scan must enumerate the store's `key` posting exactly:
+/// every accounted row is at least `WINDOW_MIN_ACCOUNTED_ROW_BYTES`,
+/// so an in-budget store under this bound always fits inside the
+/// 8192-row scan the read path enforces. Larger budgets need a counted
+/// posting rather than a row scan; refuse them at declaration.
+pub const WINDOW_MAX_BYTE_LIMIT: u64 = 256 * 1024;
+
+/// Floor of one pane row's accounted bytes — `window_pane_row_bytes`
+/// with a zero-length group. Keeps the `LIMIT BYTES` declaration bound
+/// honest: any under-budget store stays inside the 8192-row scan.
+pub const WINDOW_MIN_ACCOUNTED_ROW_BYTES: u64 = 36;
+
+/// The accounted byte size of one pane row — 4-byte group length prefix,
+/// group bytes, 8-byte big-endian pane, and the 24-byte accumulator.
+/// Posting overhead is an internal detail; the operator-facing bound
+/// counts enumerable pane-state bytes.
+pub fn window_pane_row_bytes(group: &[u8]) -> u64 {
+    (4 + group.len() + 8 + 24) as u64
+}
+
+/// Fetch-time `key`-posting scan bound for `LIMIT KEYS`/`LIMIT BYTES`
+/// Pipes. The row cap must exceed every row an in-budget store may hold:
+/// the tighter declared bound plus the two global sentinel rows and one
+/// probe row — a scan returning this many rows is saturated and the
+/// drive fails closed rather than guessing capacity.
+pub fn window_scan_row_limit(key_limit: Option<u64>, byte_limit: Option<u64>) -> usize {
+    let key_bound = key_limit.map(|limit| limit.saturating_mul(WINDOW_KEY_ROW_FOOTPRINT));
+    let byte_bound = byte_limit.map(|limit| limit / WINDOW_MIN_ACCOUNTED_ROW_BYTES);
+    let bound = [key_bound, byte_bound]
+        .into_iter()
+        .flatten()
+        .min()
+        .unwrap_or(0);
+    usize::try_from(bound.saturating_add(3).min(8192)).unwrap_or(usize::MAX)
+}
 
 /// Closed-pane emissions ride the same effect mutation budget as the pane
 /// accumulation itself: `EFFECT_MAX_STATE_MUTATIONS` minus the one

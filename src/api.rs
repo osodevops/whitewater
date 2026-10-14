@@ -2566,24 +2566,41 @@ async fn drive_pipe(
                         }
                         _ => (Vec::new(), Vec::new()),
                     };
-                    // `LIMIT KEYS` resolves alongside the page on the same
-                    // serving replica: the admitted/refused split journals
-                    // inside the Declare, so a replay never re-scans.
-                    let refused = match &pipe.operation {
+                    // `LIMIT KEYS`/`LIMIT BYTES` resolve alongside the
+                    // page on the same serving replica: the admitted and
+                    // refused split journals inside the Declare, so a
+                    // replayed effect never re-scans.
+                    let (refused, pane_rows, pane_rows_saturated) = match &pipe.operation {
                         crate::control::PipeOperation::Window {
-                            key_limit: Some(limit),
+                            key_limit,
+                            byte_limit,
                             key,
                             ..
-                        } => {
-                            let (active, saturated) =
-                                resolve_window_active_keys(state, &pipe, *limit)
+                        } if key_limit.is_some() || byte_limit.is_some() => {
+                            let scan_limit =
+                                crate::pipe::window_scan_row_limit(*key_limit, *byte_limit);
+                            let (rows, saturated) =
+                                resolve_window_pane_rows(state, &pipe, scan_limit)
                                     .await
                                     .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
-                            crate::pipe::window_refused_groups(
-                                &records, key, *limit, &active, saturated,
-                            )
+                            let refused = match key_limit {
+                                Some(limit) => {
+                                    let active: std::collections::BTreeSet<Vec<u8>> =
+                                        rows.iter().map(|(group, _)| group.clone()).collect();
+                                    crate::pipe::window_refused_groups(
+                                        &records, key, *limit, &active, saturated,
+                                    )
+                                }
+                                None => Vec::new(),
+                            };
+                            let pane_rows = if byte_limit.is_some() {
+                                rows
+                            } else {
+                                Default::default()
+                            };
+                            (refused, pane_rows, saturated && byte_limit.is_some())
                         }
-                        _ => Vec::new(),
+                        _ => (Vec::new(), Default::default(), false),
                     };
                     Ok(crate::pipe::FetchedPage {
                         cursor,
@@ -2592,6 +2609,8 @@ async fn drive_pipe(
                         emissions,
                         expired,
                         refused,
+                        pane_rows,
+                        pane_rows_saturated,
                     })
                 }
             },
@@ -4562,18 +4581,18 @@ async fn resolve_window_emissions(
     Ok((emissions, expired))
 }
 
-/// Fetch-time `LIMIT KEYS` resolution: scan the store's `key` posting for
-/// the distinct tagged-group set currently holding pane/sentinel state.
-/// 16 panes + the late sentinel bound one Key's row footprint, so the
-/// `limit * 17 + 1` row cap is exact — a truncated result provably means
-/// more than `limit` active Keys and admits nothing new. Local replica
-/// first, then owner, then any member; an unreadable scan fails closed
-/// (the drive retries) rather than guessing capacity.
-async fn resolve_window_active_keys(
+/// Fetch-time pane-row resolution for `LIMIT KEYS`/`LIMIT BYTES`: scan
+/// the store's `key` posting for the (group, pane) rows currently held.
+/// `scan_limit` (`window_scan_row_limit`) exceeds every row an
+/// in-budget store can hold, so a truncated result provably means the
+/// bound is exceeded — nothing new admits. Local replica first, then
+/// owner, then any member; an unreadable scan fails closed (the drive
+/// retries) rather than guessing capacity.
+async fn resolve_window_pane_rows(
     state: &AppState,
     pipe: &crate::control::PipeDefinition,
-    key_limit: u64,
-) -> Result<(std::collections::BTreeSet<Vec<u8>>, bool), ApiError> {
+    scan_limit: usize,
+) -> Result<(std::collections::BTreeSet<(Vec<u8>, u64)>, bool), ApiError> {
     let store_id = pipe
         .output_store_id
         .ok_or_else(|| ApiError::conflict("Window Pipe has no output StateStore"))?;
@@ -4596,12 +4615,6 @@ async fn resolve_window_active_keys(
     }
     // `limit * (panes + sentinel) + 1` rows proves saturation only past
     // the declared bound; WINDOW_MAX_KEY_LIMIT keeps the scan bounded.
-    let scan_limit = usize::try_from(
-        key_limit
-            .saturating_mul(crate::pipe::WINDOW_KEY_ROW_FOOTPRINT)
-            .saturating_add(1),
-    )
-    .unwrap_or(usize::MAX);
     let mut reply = None;
     let mut last_error: Option<ApiError> = None;
     for replica in &candidates {
@@ -4654,13 +4667,13 @@ async fn resolve_window_active_keys(
         }));
     };
     let saturated = reply.result.named_rows.len() >= scan_limit;
-    let mut active = std::collections::BTreeSet::new();
+    let mut rows = std::collections::BTreeSet::new();
     for row in reply.result.named_rows {
-        if let Some((group, _)) = crate::pipe::window_pane_row_key_parse(&row.key) {
-            active.insert(group);
+        if let Some(pair) = crate::pipe::window_pane_row_key_parse(&row.key) {
+            rows.insert(pair);
         }
     }
-    Ok((active, saturated))
+    Ok((rows, saturated))
 }
 
 fn state_store_coordinator_for(
@@ -14956,6 +14969,7 @@ mod tests {
                 max_late_ns: Some(1_000),
                 expire_ns: None,
                 key_limit: None,
+                byte_limit: None,
             },
             output_feed_id: Some(Uuid::new_v4()),
             output_store_id: Some(Uuid::new_v4()),

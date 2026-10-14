@@ -146,6 +146,11 @@ pub enum PipeOperation {
         /// `None` leaves growth unbounded (the pre-limit behavior).
         #[serde(default)]
         key_limit: Option<u64>,
+        /// Bound on accounted pane-state bytes (`window_pane_row_bytes`
+        /// per row); `None` leaves byte growth unbounded. New (group,
+        /// pane) rows beyond the bound refuse into `__bytecap__`.
+        #[serde(default)]
+        byte_limit: Option<u64>,
     },
     /// Point-lookup enrichment: for each delivered record, resolve one
     /// StateStore row by the projected `key` and copy its payload into the
@@ -2536,6 +2541,7 @@ impl ControlController {
                         max_late_ns,
                         expire_ns,
                         key_limit,
+                        byte_limit,
                     } => {
                         if *window_ns == 0 {
                             return Err(ControlError::InvalidOperation(
@@ -2581,7 +2587,20 @@ impl ControlController {
                                 "LIMIT KEYS accepts at most 512 active Keys — the fetch-time scan must enumerate the store's key posting exactly, and larger cardinalities need a counted posting".to_owned(),
                             ));
                         }
-                        let output_store = output_store.ok_or_else(|| {
+                        if matches!(byte_limit, Some(0)) {
+                            return Err(ControlError::InvalidOperation(
+                                "LIMIT BYTES requires a non-zero bound".to_owned(),
+                            ));
+                        }
+                        if byte_limit
+                            .map(|limit| limit > crate::pipe::WINDOW_MAX_BYTE_LIMIT)
+                            .unwrap_or(false)
+                        {
+                            return Err(ControlError::InvalidOperation(
+                                "LIMIT BYTES accepts at most 256 KiB of pane state — the fetch-time scan must enumerate the store's key posting exactly, and larger budgets need a counted posting".to_owned(),
+                            ));
+                        }
+                                                let output_store = output_store.ok_or_else(|| {
                             ControlError::InvalidOperation(
                                 "Window Pipes require an output StateStore".to_owned(),
                             )
@@ -4944,22 +4963,46 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             at += 2;
                         }
                         // `LIMIT KEYS <n>` bounds the distinct active group
-                        // Keys the window may hold pane/sentinel state for.
-                        // New Keys beyond the bound refuse into a shared
-                        // sentinel row rather than growing state unboundedly.
+                        // Keys and `LIMIT BYTES <n>` the accounted pane-state
+                        // bytes the window may hold. Rows beyond either bound
+                        // refuse into a shared sentinel rather than growing
+                        // state unboundedly; either order is accepted.
                         let mut key_limit = None;
-                        if token(&tokens, at)
+                        let mut byte_limit = None;
+                        while token(&tokens, at)
                             .map(|value| value.eq_ignore_ascii_case("LIMIT"))
                             .unwrap_or(false)
                         {
-                            expect_keyword(&tokens, at + 1, "KEYS")?;
-                            key_limit = Some(
-                                token(&tokens, at + 2)?.parse::<u64>().map_err(|_| {
-                                    ControlError::Syntax(
-                                        "LIMIT KEYS expects an unsigned integer".to_owned(),
-                                    )
-                                })?,
-                            );
+                            match token(&tokens, at + 1)?.to_ascii_uppercase().as_str()
+                            {
+                                "KEYS" => {
+                                    key_limit = Some(
+                                        token(&tokens, at + 2)?.parse::<u64>().map_err(
+                                            |_| {
+                                                ControlError::Syntax(
+                                                    "LIMIT KEYS expects an unsigned integer".to_owned(),
+                                                )
+                                            },
+                                        )?,
+                                    );
+                                }
+                                "BYTES" => {
+                                    byte_limit = Some(
+                                        token(&tokens, at + 2)?.parse::<u64>().map_err(
+                                            |_| {
+                                                ControlError::Syntax(
+                                                    "LIMIT BYTES expects an unsigned integer".to_owned(),
+                                                )
+                                            },
+                                        )?,
+                                    );
+                                }
+                                other => {
+                                    return Err(ControlError::Syntax(format!(
+                                        "LIMIT accepts KEYS or BYTES; got {other}"
+                                    )))
+                                }
+                            }
                             at += 3;
                         }
                         let by = at;
@@ -5007,6 +5050,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                                 max_late_ns,
                                 expire_ns,
                                 key_limit,
+                                byte_limit,
                                 key,
                                 aggregation,
                                 time,
@@ -9337,6 +9381,7 @@ mod tests {
                 max_late_ns: None,
                 expire_ns: None,
                 key_limit: None,
+                byte_limit: None,
             },
         };
         // Missing store, foreign-Domain store, zero window, and a missing
@@ -9439,6 +9484,7 @@ mod tests {
                 max_late_ns: None,
                 expire_ns: None,
                 key_limit: None,
+                byte_limit: None,
                 ..
             }
         ));
@@ -9462,6 +9508,7 @@ mod tests {
                 max_late_ns: Some(bound),
                 expire_ns: None,
                 key_limit: None,
+                byte_limit: None,
                 ..
             } if bound == 300_000_000_000
         ));
@@ -9541,6 +9588,7 @@ mod tests {
                 max_late_ns: Some(300_000_000_000),
                 expire_ns: Some(7_200_000_000_000),
                 key_limit: None,
+                byte_limit: None,
                 ..
             }
         ));
@@ -9560,6 +9608,7 @@ mod tests {
             PipeOperation::Window {
                 expire_ns: Some(7_200_000_000_000),
                 key_limit: None,
+                byte_limit: None,
                 ..
             }
         ));
@@ -9604,6 +9653,61 @@ mod tests {
             "CREATE PIPE accounts.capy FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h LIMIT KEYS many BY KEY COUNT;",
             // Above the enumerable scan bound the count can't be proven.
             "CREATE PIPE accounts.capz FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h LIMIT KEYS 513 BY KEY COUNT;",
+        ] {
+            assert!(
+                leader.execute(statement).await.is_err(),
+                "{statement} must fail"
+            );
+        }
+
+        // LIMIT BYTES bounds accounted pane-state bytes; refused records
+        // count one shared __bytecap__ sentinel. Either LIMIT order
+        // parses, and both bounds may compose.
+        leader
+            .execute(
+                "CREATE PIPE accounts.bytecap FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h LIMIT BYTES 4096 BY KEY COUNT;",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            leader
+                .active_pipe_by_name("accounts.bytecap")
+                .await
+                .unwrap()
+                .operation,
+            PipeOperation::Window {
+                byte_limit: Some(4096),
+                ..
+            }
+        ));
+        leader
+            .execute(
+                "CREATE PIPE accounts.bothcaps FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h LIMIT BYTES 2048 LIMIT KEYS 3 BY KEY COUNT;",
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            leader
+                .active_pipe_by_name("accounts.bothcaps")
+                .await
+                .unwrap()
+                .operation,
+            PipeOperation::Window {
+                key_limit: Some(3),
+                byte_limit: Some(2048),
+                ..
+            }
+        ));
+        for statement in [
+            // A zero bound would refuse every record — rejected outright.
+            "CREATE PIPE accounts.bcap0 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h LIMIT BYTES 0 BY KEY COUNT;",
+            // LIMIT requires a bound keyword.
+            "CREATE PIPE accounts.bcapx FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h LIMIT 7 BY KEY COUNT;",
+            // The bound must be an unsigned integer.
+            "CREATE PIPE accounts.bcapy FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h LIMIT BYTES many BY KEY COUNT;",
+            // Above the enumerable scan bound the byte total can't be
+            // proven exactly — refused at declaration.
+            "CREATE PIPE accounts.bcapz FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h LIMIT BYTES 262145 BY KEY COUNT;",
         ] {
             assert!(
                 leader.execute(statement).await.is_err(),

@@ -626,6 +626,8 @@ fn page_with_emissions(
         emissions,
         expired: Vec::new(),
         refused: Vec::new(),
+        pane_rows: Default::default(),
+        pane_rows_saturated: false,
     }
 }
 
@@ -1071,6 +1073,7 @@ fn window_pipe() -> PipeDefinition {
             max_late_ns: None,
             expire_ns: None,
             key_limit: None,
+            byte_limit: None,
             aggregation: WindowAggregation::Sum {
                 value: IndexFieldSpec::Projection {
                     extractor: "json".to_owned(),
@@ -1114,6 +1117,7 @@ async fn window_pipe_quarantines_late_events_into_a_countable_row() {
         max_late_ns: Some(500),
         expire_ns: None,
         key_limit: None,
+        byte_limit: None,
     };
     let harness = harness_for(pipe);
     seed_frontier(&harness.progress, "p0").await;
@@ -1174,6 +1178,7 @@ fn ingest_window_pipe() -> PipeDefinition {
         max_late_ns: None,
         expire_ns: None,
         key_limit: None,
+        byte_limit: None,
     };
     pipe
 }
@@ -1603,6 +1608,7 @@ fn emit_window_pipe() -> PipeDefinition {
         max_late_ns: Some(20),
         expire_ns: None,
         key_limit: None,
+        byte_limit: None,
     };
     pipe.output_feed_id = Some(Uuid::from_u128(OUTPUT_FEED));
     pipe
@@ -1620,6 +1626,7 @@ fn expire_window_pipe() -> PipeDefinition {
         max_late_ns: None,
         expire_ns: Some(30),
         key_limit: None,
+        byte_limit: None,
     };
     pipe
 }
@@ -2094,6 +2101,8 @@ async fn window_limit_keys_quarantines_refused_groups_into_a_shared_sentinel() {
                     emissions: Vec::new(),
                     expired: Vec::new(),
                     refused,
+                    pane_rows: Default::default(),
+                    pane_rows_saturated: false,
                 })
             },
             || async { Ok(bootstrap_with("p0")) },
@@ -2166,4 +2175,164 @@ fn window_refused_groups_admits_seats_in_tagged_order() {
     let active: BTreeSet<Vec<u8>> = [tagged(b"alpha")].into_iter().collect();
     let refused = window_refused_groups(&records, &key, 1, &active, false);
     assert_eq!(refused, vec![tagged(b"mid"), tagged(b"zeta")]);
+}
+
+#[tokio::test]
+async fn window_limit_bytes_refuses_new_pane_rows_into_bytecap() {
+    let mut pipe = window_pipe();
+    let PipeOperation::Window { byte_limit, .. } = &mut pipe.operation else {
+        panic!("window pipe")
+    };
+    // 120 bytes: one existing 38-byte row leaves 82 — two further rows
+    // (38 each) admit, the third would exceed and refuses.
+    *byte_limit = Some(120);
+    let harness = harness_for(pipe);
+    seed_frontier(&harness.progress, "p0").await;
+
+    let tagged = |bytes: &[u8]| window_group_key_bytes(&IndexValue::Bytes(bytes.to_vec())).unwrap();
+    // The fetch-time scan proved group "a" already owns pane 0.
+    let existing: BTreeSet<(Vec<u8>, u64)> = [(tagged(b"a"), 0u64)].into_iter().collect();
+    let records = vec![
+        json_record(1, b"b", 5, 7),   // new pane (b,0): admits
+        json_record(2, b"c", 15, 9),  // new pane (c,1): admits, budget spent
+        json_record(3, b"d", 5, 11),  // new pane (d,0): refuses
+        json_record(4, b"b", 25, 13), // new pane (b,2): refuses
+        json_record(5, b"b", 7, 13),  // merges into admitted (b,0)
+    ];
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async {
+                Ok(FetchedPage {
+                    records,
+                    cursor: "p1".to_owned(),
+                    positions: BTreeMap::from([(range(), "p1".to_owned())]),
+                    emissions: Vec::new(),
+                    expired: Vec::new(),
+                    refused: Vec::new(),
+                    pane_rows: existing,
+                    pane_rows_saturated: false,
+                })
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
+        panic!("expected AccumulateRows")
+    };
+    // (b,0) and (c,1) admitted; (d,0) and (b,2) refused into the shared
+    // `__bytecap__` sentinel; (a,0) untouched — rows never revise on merge.
+    assert_eq!(entries.len(), 3);
+    assert_eq!(
+        entries[0].named[0].values,
+        vec![IndexValue::Bytes(b"b".to_vec())]
+    );
+    assert_eq!(entries[0].named[1].values, vec![IndexValue::I64(0)]);
+    assert_eq!(entries[0].count_delta, 2);
+    assert_eq!(entries[0].sum_delta, 20);
+    assert_eq!(
+        entries[1].named[0].values,
+        vec![IndexValue::Bytes(b"c".to_vec())]
+    );
+    assert_eq!(entries[1].named[1].values, vec![IndexValue::I64(1)]);
+    assert_eq!(
+        entries[2].named[0].values,
+        vec![IndexValue::Text("__bytecap__".to_owned())]
+    );
+    assert_eq!(entries[2].named[1].values, vec![IndexValue::I64(-1)]);
+    assert_eq!(entries[2].count_delta, 2);
+    assert_eq!(entries[2].sum_delta, 0);
+    assert_eq!(
+        entries[2].key[entries[2].key.len() - 8..],
+        u64::MAX.to_be_bytes()
+    );
+}
+
+#[tokio::test]
+async fn window_limit_bytes_saturated_scan_refuses_every_new_row() {
+    let mut pipe = window_pipe();
+    let PipeOperation::Window { byte_limit, .. } = &mut pipe.operation else {
+        panic!("window pipe")
+    };
+    *byte_limit = Some(200_000);
+    let harness = harness_for(pipe);
+    seed_frontier(&harness.progress, "p0").await;
+
+    let tagged = |bytes: &[u8]| window_group_key_bytes(&IndexValue::Bytes(bytes.to_vec())).unwrap();
+    let existing: BTreeSet<(Vec<u8>, u64)> = [(tagged(b"a"), 0u64)].into_iter().collect();
+    let records = vec![
+        json_record(1, b"a", 5, 7), // merges into scanned (a,0): admits
+        json_record(2, b"b", 5, 9), // unproven budget: refuses
+    ];
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async {
+                Ok(FetchedPage {
+                    records,
+                    cursor: "p1".to_owned(),
+                    positions: BTreeMap::from([(range(), "p1".to_owned())]),
+                    emissions: Vec::new(),
+                    expired: Vec::new(),
+                    refused: Vec::new(),
+                    pane_rows: existing,
+                    pane_rows_saturated: true,
+                })
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
+        panic!("expected AccumulateRows")
+    };
+    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries[0].named[0].values,
+        vec![IndexValue::Bytes(b"a".to_vec())]
+    );
+    assert_eq!(entries[0].count_delta, 1);
+    assert_eq!(
+        entries[1].named[0].values,
+        vec![IndexValue::Text("__bytecap__".to_owned())]
+    );
+    assert_eq!(entries[1].count_delta, 1);
+}
+
+#[test]
+fn window_scan_row_limit_tracks_the_tighter_declared_bound() {
+    use whitewater::pipe::{
+        window_pane_row_bytes, window_scan_row_limit, WINDOW_KEY_ROW_FOOTPRINT,
+    };
+    assert_eq!(window_pane_row_bytes(b"ab"), 38);
+    // Key bound: 7 Keys * 17-row footprint + sentinel/probe headroom.
+    assert_eq!(
+        window_scan_row_limit(Some(7), None),
+        usize::try_from(7 * WINDOW_KEY_ROW_FOOTPRINT + 3).unwrap()
+    );
+    // Byte bound: floor(limit / min-row) + headroom — tighter here.
+    assert_eq!(window_scan_row_limit(Some(7), Some(4096)), 4096 / 36 + 3);
+    // The largest declared byte bound stays inside the 8192-row scan.
+    assert!(window_scan_row_limit(None, Some(whitewater::pipe::WINDOW_MAX_BYTE_LIMIT)) <= 8192);
 }
