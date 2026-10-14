@@ -955,6 +955,19 @@ pub enum Command {
         session_epoch: u64,
         range_id: RangeId,
     },
+    /// Rewind a Writer's per-Range allocation counter after the API heal
+    /// path lands a record at the range-reported boundary: sequences
+    /// between the boundary and the counter were allocated but never
+    /// committed, so the counter must rewind or every later append
+    /// repeats the same gap refusal. Applied only when it rewinds — a
+    /// counter already at or below `next_sequence` stays put, and an
+    /// absent allocation entry is never created.
+    RepairWriterRangeSequence {
+        writer: String,
+        session_epoch: u64,
+        range_id: RangeId,
+        next_sequence: u64,
+    },
     RevokeWriterSession {
         writer: String,
         session_epoch: u64,
@@ -2897,6 +2910,42 @@ impl ControlController {
                         "range_id": range_id,
                         "session_epoch": definition.session_epoch,
                         "sequence": sequence
+                    }),
+                ))
+            }
+            Command::RepairWriterRangeSequence {
+                writer,
+                session_epoch,
+                range_id,
+                next_sequence,
+            } => {
+                let definition = active_writer_mut(state, &writer)?;
+                validate_writer_epoch(definition, session_epoch)?;
+                // Only rewind: numbers above `next_sequence` were
+                // allocated but never committed (the heal path proved
+                // the boundary), so reusing them is safe. A counter at
+                // or below the bound is left alone — never skip forward.
+                let rewound = matches!(
+                    definition.range_next_sequences.get_mut(&range_id),
+                    Some(current) if *current > next_sequence
+                );
+                if rewound {
+                    definition
+                        .range_next_sequences
+                        .insert(range_id, next_sequence);
+                }
+                Ok((
+                    format!("repaired Writer range sequence for {writer}"),
+                    json!({
+                        "writer_id": definition.writer_id,
+                        "feed_id": definition.feed_id,
+                        "range_id": range_id,
+                        "session_epoch": definition.session_epoch,
+                        "next_sequence": definition
+                            .range_next_sequences
+                            .get(&range_id)
+                            .copied(),
+                        "rewound": rewound
                     }),
                 ))
             }
@@ -6763,6 +6812,7 @@ fn command_label(command: &Command) -> String {
         Command::OpenWriterSession { .. } => "OPEN WRITER SESSION",
         Command::AllocateWriterSequence { .. } => "ALLOCATE WRITER SEQUENCE",
         Command::AllocateWriterRangeSequence { .. } => "ALLOCATE WRITER RANGE SEQUENCE",
+        Command::RepairWriterRangeSequence { .. } => "REPAIR WRITER RANGE SEQUENCE",
         Command::RevokeWriterSession { .. } => "REVOKE WRITER SESSION",
         Command::CreateReader { .. } => "CREATE READER",
         Command::CreateSubscription { .. } => "CREATE SUBSCRIPTION",
@@ -7424,6 +7474,123 @@ mod tests {
             .unwrap();
         assert!(reopened
             .execute("ALLOCATE WRITER SEQUENCE checkout EPOCH 2;")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn repair_writer_range_sequence_only_rewinds_burned_counters() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute(
+                "CREATE SPACE orders; CREATE FEED orders.events; CREATE WRITER checkout TO orders.events; OPEN WRITER SESSION checkout;",
+            )
+            .await
+            .unwrap();
+        let range_id = RangeId::from_uuid(Uuid::from_u128(4_201));
+        for sequence in [1_u64, 2] {
+            let allocated = controller
+                .execute_commands_with_request_id(
+                    vec![Command::AllocateWriterRangeSequence {
+                        writer: "checkout".to_owned(),
+                        session_epoch: 1,
+                        range_id,
+                    }],
+                    Uuid::from_u128(9_000 + sequence as u128),
+                )
+                .await
+                .unwrap();
+            assert_eq!(allocated.results[0].data["sequence"], sequence);
+        }
+
+        // A repair at-or-below the counter rewinds it to the boundary;
+        // the next allocation reuses the previously burned number.
+        let repaired = controller
+            .execute_commands_with_request_id(
+                vec![Command::RepairWriterRangeSequence {
+                    writer: "checkout".to_owned(),
+                    session_epoch: 1,
+                    range_id,
+                    next_sequence: 2,
+                }],
+                Uuid::from_u128(9_010),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repaired.results[0].data["next_sequence"], 2);
+        assert_eq!(repaired.results[0].data["rewound"], true);
+        let allocated = controller
+            .execute_commands_with_request_id(
+                vec![Command::AllocateWriterRangeSequence {
+                    writer: "checkout".to_owned(),
+                    session_epoch: 1,
+                    range_id,
+                }],
+                Uuid::from_u128(9_011),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allocated.results[0].data["sequence"], 2);
+
+        // A repair above the counter must never skip forward.
+        let repaired = controller
+            .execute_commands_with_request_id(
+                vec![Command::RepairWriterRangeSequence {
+                    writer: "checkout".to_owned(),
+                    session_epoch: 1,
+                    range_id,
+                    next_sequence: 40,
+                }],
+                Uuid::from_u128(9_012),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repaired.results[0].data["rewound"], false);
+        let allocated = controller
+            .execute_commands_with_request_id(
+                vec![Command::AllocateWriterRangeSequence {
+                    writer: "checkout".to_owned(),
+                    session_epoch: 1,
+                    range_id,
+                }],
+                Uuid::from_u128(9_013),
+            )
+            .await
+            .unwrap();
+        assert_eq!(allocated.results[0].data["sequence"], 3);
+
+        // An unknown Range allocation entry is never created.
+        let foreign = RangeId::from_uuid(Uuid::from_u128(4_299));
+        let repaired = controller
+            .execute_commands_with_request_id(
+                vec![Command::RepairWriterRangeSequence {
+                    writer: "checkout".to_owned(),
+                    session_epoch: 1,
+                    range_id: foreign,
+                    next_sequence: 1,
+                }],
+                Uuid::from_u128(9_014),
+            )
+            .await
+            .unwrap();
+        assert_eq!(repaired.results[0].data["rewound"], false);
+        assert_eq!(
+            repaired.results[0].data["next_sequence"],
+            serde_json::Value::Null
+        );
+
+        // A stale session epoch fences the repair like any allocation.
+        assert!(controller
+            .execute_commands_with_request_id(
+                vec![Command::RepairWriterRangeSequence {
+                    writer: "checkout".to_owned(),
+                    session_epoch: 99,
+                    range_id,
+                    next_sequence: 2,
+                }],
+                Uuid::from_u128(9_015),
+            )
             .await
             .is_err());
     }

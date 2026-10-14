@@ -246,7 +246,16 @@ def main():
                 flagged = [e for e in hot_keys() if e["feed"] == feed]
                 # The boundary stays null until a neighbouring cold Key is
                 # observed in the window, so the flag alone is not enough.
-                isolated = [e for e in flagged if e["isolating_boundary"]]
+                # A split can also commit between polls: a child range that
+                # starts exactly at the Key's token is the same isolation
+                # already landed — and the flag re-landed on the owning
+                # range, which Phase 2's feedback probe needs. Phase 3 then
+                # still confirms the split edge.
+                isolated = [
+                    e
+                    for e in flagged
+                    if e["isolating_boundary"] or e["range_start"] == e["token"]
+                ]
                 if isolated:
                     break
                 if driver.errors:
@@ -256,12 +265,24 @@ def main():
                 "dominant Key was never flagged with an isolating boundary; "
                 f"last flagged={flagged}; driver errors={driver.errors[:3]}"
             )
-            evidence = isolated[0]
+            # Prefer the boundary-bearing flag, then the child whose start is
+            # the Key's token (the flag already re-landed on the owning
+            # range — Phase 2's feedback probe needs it live there).
+            evidence = sorted(
+                isolated,
+                key=lambda e: (
+                    not e["isolating_boundary"],
+                    e["range_start"] != e["token"],
+                ),
+            )[0]
             print(f"flagged: {json.dumps(evidence, indent=2)}")
             assert evidence["share_bps"] >= 5_000, evidence
             assert evidence["window_records"] > 0, evidence
             assert evidence["feed"] == feed, evidence
-            assert evidence["isolating_boundary"], evidence
+            assert (
+                evidence["isolating_boundary"]
+                or evidence["range_start"] == evidence["token"]
+            ), evidence
             first_range = evidence["range_id"]
 
             # Phase 2 — Writer feedback carries the flag and tightens only

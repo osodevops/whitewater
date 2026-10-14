@@ -8765,27 +8765,63 @@ async fn writer_session_append(
         "writer-range",
     )
     .await;
-    match result {
-        Err(error) if error.code == Some("writer.stale_sequence") => {
-            // The deduped allocation pinned a sequence the Writer's stream
-            // has already passed — a refused append consumed the number
-            // without landing the record. Re-allocate under a distinct
-            // identity so the retry lands at the stream tail; frame-digest
-            // and cursor dedup still fence any double-apply.
-            session_append_with_sequence(
-                &state,
-                &headers,
-                &request,
-                &feed.name,
-                writer.writer_id,
-                route.range_id,
-                "writer-range-reseq",
-            )
-            .await
-            .map(Json)
-        }
-        other => other.map(Json),
+    // A refused append leaves its catalog-allocated Writer sequence
+    // unconsumed; the deduped allocation returns the same number on
+    // retry, so a burned sequence wedges the Writer permanently. The
+    // range reports its boundary in the refusal — re-land this record
+    // exactly there (cursor/digest dedup still fences any ambiguous
+    // commit, and an in-flight rival loses loudly rather than
+    // reordering silently). Bounded hops: each refusal moves the
+    // boundary forward only when a concurrent append already landed.
+    let mut healed = result;
+    let mut boundary = None;
+    for _ in 0..4 {
+        let next = match &healed {
+            Err(error) => writer_sequence_boundary(error),
+            Ok(_) => break,
+        };
+        let Some(next) = next else { break };
+        boundary = Some(next);
+        healed = client_append(
+            State(state.clone()),
+            headers.clone(),
+            Json(ClientAppendRequest {
+                request_id: request.request_id,
+                feed: feed.name.clone(),
+                writer_session_id: writer.writer_id,
+                writer_epoch: request.session_epoch,
+                sequence: next,
+                event_time_ns: request.event_time_ns.clone(),
+                key_base64: request.key_base64.clone(),
+                payload_base64: request.payload_base64.clone(),
+                metadata_base64: request.metadata_base64.clone(),
+                use_compression: request.use_compression,
+                pending_effect: None,
+            }),
+        )
+        .await
+        .map(|Json(response)| response);
     }
+    if healed.is_ok() {
+        if let Some(boundary) = boundary {
+            // Rewind the allocator past the burned span so later
+            // appends allocate at the stream tail instead of paying a
+            // gap+heal round trip each. Best-effort: a failed repair
+            // leaves the counter ahead — correct, only slower.
+            let _ = execute_writer_command(
+                &state,
+                vec![crate::control::Command::RepairWriterRangeSequence {
+                    writer: request.writer.clone(),
+                    session_epoch: request.session_epoch,
+                    range_id: route.range_id,
+                    next_sequence: boundary.saturating_add(1),
+                }],
+                deterministic_uuid(request.request_id, "writer-range-repair"),
+            )
+            .await;
+        }
+    }
+    healed.map(Json)
 }
 
 /// Allocate the Writer's next per-range sequence under `allocation_scope`
@@ -8941,6 +8977,7 @@ async fn route_append_to_owner(
             .unwrap_or_else(|| "Append Owner returned no result".to_owned()),
         code: match response.code.as_deref() {
             Some("writer.stale_sequence") => Some("writer.stale_sequence"),
+            Some("writer.sequence_gap") => Some("writer.sequence_gap"),
             _ => None,
         },
     })
@@ -9449,6 +9486,15 @@ async fn owner_append_local(
                     message: error.message,
                     code: Some("writer.stale_sequence"),
                 }
+            } else if error.code
+                == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
+                && error.message.contains("has a gap; expected")
+            {
+                ApiError {
+                    status: StatusCode::CONFLICT,
+                    message: error.message,
+                    code: Some("writer.sequence_gap"),
+                }
             } else {
                 majority_api_error(error)
             };
@@ -9469,6 +9515,52 @@ async fn owner_append_local(
         range_id: assignment.range_id,
         position: result.position,
     })
+}
+
+/// The sequence the range can accept next, parsed out of a Writer
+/// sequence refusal: `has a gap; expected N` reports N directly while
+/// `is stale; latest accepted sequence is N` bounds at N+1. `None` for
+/// any other error — only these two carry a heal-able boundary.
+fn writer_sequence_boundary(error: &ApiError) -> Option<u64> {
+    if error.code == Some("writer.sequence_gap")
+        || (error.code.is_none() && error.message.contains("has a gap; expected"))
+    {
+        return error.message.rsplit(' ').next()?.parse::<u64>().ok();
+    }
+    if error.code == Some("writer.stale_sequence")
+        || (error.code.is_none() && error.message.contains("is stale; latest accepted sequence"))
+    {
+        return error
+            .message
+            .rsplit(' ')
+            .next()?
+            .parse::<u64>()
+            .ok()?
+            .checked_add(1);
+    }
+    None
+}
+
+/// Execute typed Control commands through the Control Plane when one is
+/// configured, falling back to the in-process controller otherwise.
+async fn execute_writer_command(
+    state: &AppState,
+    commands: Vec<crate::control::Command>,
+    request_id: Uuid,
+) -> Result<(), ApiError> {
+    match &state.control_plane {
+        Some(control_plane) => control_plane
+            .execute_commands_with_request_id(commands, request_id)
+            .await
+            .map_err(|error| ApiError::unavailable(error.to_string()))?,
+        None => {
+            state
+                .control
+                .execute_commands_with_request_id(commands, request_id)
+                .await?
+        }
+    };
+    Ok(())
 }
 
 fn writer_feedback(demand: &DemandMetrics, hot_key: bool) -> WriterServerFeedback {
@@ -18285,5 +18377,48 @@ mod tests {
         assert!(reply.result.is_some());
         assert_eq!(reply.position, Some(1));
         plane.raft().shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn writer_sequence_boundary_parses_gap_and_stale_refusals() {
+        let gap = ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Writer sequence 31 has a gap; expected 22".to_owned(),
+            code: Some("writer.sequence_gap"),
+        };
+        assert_eq!(writer_sequence_boundary(&gap), Some(22));
+        let stale = ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Writer sequence 12 is stale; latest accepted sequence is 13".to_owned(),
+            code: Some("writer.stale_sequence"),
+        };
+        assert_eq!(writer_sequence_boundary(&stale), Some(14));
+        // Forwarded refusals can lose the code field; the message shape
+        // alone must still recover the boundary.
+        let untagged_gap = ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Writer sequence 31 has a gap; expected 22".to_owned(),
+            code: None,
+        };
+        assert_eq!(writer_sequence_boundary(&untagged_gap), Some(22));
+        let untagged_stale = ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Writer sequence 12 is stale; latest accepted sequence is 13".to_owned(),
+            code: None,
+        };
+        assert_eq!(writer_sequence_boundary(&untagged_stale), Some(14));
+        // Unrelated refusals and malformed tails carry no boundary.
+        let unrelated = ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Writer epoch is stale".to_owned(),
+            code: Some("writer.stale_epoch"),
+        };
+        assert_eq!(writer_sequence_boundary(&unrelated), None);
+        let malformed = ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Writer sequence 9 has a gap; expected soon".to_owned(),
+            code: Some("writer.sequence_gap"),
+        };
+        assert_eq!(writer_sequence_boundary(&malformed), None);
     }
 }

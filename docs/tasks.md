@@ -1180,7 +1180,7 @@ Additional evidence:
 
 
 
-- `python scripts/test-m2-writer-session.py` verifies session creation, automatic idempotent sequence allocation, append through all three ingress Nodes, stable MessageId, stale-epoch rejection, revocation, and batching feedback. Ingress now waits briefly for freshly committed Writer metadata to apply locally before returning a retryable unavailable error; a unit test covers the apply race.
+- `python scripts/test-m2-writer-session.py` verifies session creation, automatic idempotent sequence allocation, append through all three ingress Nodes, stable MessageId, stale-epoch rejection, revocation, and batching feedback. Ingress now waits briefly for freshly committed Writer metadata to apply locally before returning a retryable unavailable error; a unit test covers the apply race. The session append path also heals a burned sequence: an append refused after its catalog allocation leaves a gap the deduped allocation can never fill, so `writer_session_append` re-lands the record at the range-reported boundary (`writer.sequence_gap`/`writer.stale_sequence` refusals carry it, bounded to four hops) and `REPAIR WRITER RANGE SEQUENCE` rewinds the allocator past the burned span — `scripts/test-hot-keys.py` drives the split-cutover failures that previously wedged the stream, `control::repair_writer_range_sequence_only_rewinds_burned_counters` proves rewind-only semantics, and `api::writer_sequence_boundary_parses_gap_and_stale_refusals` covers boundary extraction.
 
 - The adaptive policy has unit coverage for message-size, pressure, retry, frame-size, and retry-delay adjustments.
 
