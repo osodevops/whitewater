@@ -641,6 +641,7 @@ async fn main() -> Result<()> {
         membership,
         demand: demand.clone(),
         autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+        reader_pacing: whitewater::reader::ReaderPacingTable::default(),
         control,
         control_plane: control_plane.clone(),
         progress_authority,

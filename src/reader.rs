@@ -198,6 +198,14 @@ impl ReaderPacingController {
         }
     }
 
+    /// Grant `initial` records immediately: a session opens trusted at
+    /// its declared capacity and pressure halves it, while recovery
+    /// back up still requires the sustained healthy samples.
+    pub fn with_initial_grant(mut self, initial: usize) -> Self {
+        self.current_records = initial.clamp(self.min_records, self.max_records);
+        self
+    }
+
     pub fn observe(
         &mut self,
         sample: ReaderPressureSample,
@@ -236,6 +244,181 @@ impl ReaderPacingController {
             } else {
                 Duration::ZERO
             },
+        }
+    }
+}
+
+struct ReaderPacingEntry {
+    controller: ReaderPacingController,
+    session_capacity: usize,
+    last_fetch_at: Option<std::time::Instant>,
+    last_ack_latency: Duration,
+    unacknowledged_bytes: usize,
+    average_record_bytes: usize,
+    backlog_hint: bool,
+    last_plan: ReaderPacingPlan,
+}
+
+/// Node-local advisory pacing state per ReaderId. Delivery correctness
+/// never depends on it — the fetch path still fails closed on real
+/// errors — it only shapes the effective page bound and the
+/// `recommended_capacity`/`retry_after_ms` advice a Reader receives, so
+/// a slow or unacknowledging Reader throttles itself without squeezing
+/// the capacity honest Readers observe. A session opens trusted at its
+/// declared capacity; pressure halves the grant and only sustained
+/// healthy, acknowledged full pages grow it back. State is intentionally local
+/// to the serving Node (like demand telemetry): an ingress change
+/// resets advice to the cautious minimum rather than migrating
+/// heuristics through consensus.
+#[derive(Clone, Default)]
+pub struct ReaderPacingTable {
+    inner: std::sync::Arc<std::sync::Mutex<BTreeMap<Uuid, ReaderPacingEntry>>>,
+}
+
+impl ReaderPacingTable {
+    const MAX_ENTRIES: usize = 8192;
+    const MIN_RECORDS: usize = 8;
+    const TARGET_ACK_LATENCY: Duration = Duration::from_millis(250);
+
+    /// One pacing observation per fetch: the plan bounds this page and
+    /// fills the response advice. A poisoned or saturated table fails
+    /// open to the client's own capacity — pacing must never become a
+    /// correctness dependency.
+    pub fn plan(
+        &self,
+        reader_id: Uuid,
+        session_capacity: usize,
+        client_capacity: usize,
+        node_pressure: f64,
+        max_bytes: usize,
+    ) -> ReaderPacingPlan {
+        let fallback = ReaderPacingPlan {
+            max_records: client_capacity,
+            max_bytes,
+            retry_after: Duration::ZERO,
+            record_exceeds_budget: false,
+        };
+        let Ok(mut map) = self.inner.lock() else {
+            return fallback;
+        };
+        if !map.contains_key(&reader_id) {
+            if map.len() >= Self::MAX_ENTRIES {
+                return fallback;
+            }
+            let capacity = session_capacity.max(1);
+            map.insert(
+                reader_id,
+                ReaderPacingEntry {
+                    controller: ReaderPacingController::new(
+                        Self::MIN_RECORDS.min(capacity),
+                        capacity,
+                        max_bytes,
+                        Self::TARGET_ACK_LATENCY,
+                    )
+                    .with_initial_grant(capacity),
+                    session_capacity: capacity,
+                    last_fetch_at: None,
+                    last_ack_latency: Duration::ZERO,
+                    unacknowledged_bytes: 0,
+                    average_record_bytes: 1,
+                    backlog_hint: false,
+                    last_plan: fallback,
+                },
+            );
+        }
+        let Some(entry) = map.get_mut(&reader_id) else {
+            return fallback;
+        };
+        // A reopened session may declare a different capacity: re-
+        // baseline the controller to its bounds while keeping the
+        // reader-level signals (unacknowledged bytes, sizes, latency)
+        // that describe delivered work regardless of session epoch.
+        let capacity = session_capacity.max(1);
+        if entry.session_capacity != capacity {
+            entry.session_capacity = capacity;
+            entry.controller = ReaderPacingController::new(
+                Self::MIN_RECORDS.min(capacity),
+                capacity,
+                max_bytes,
+                Self::TARGET_ACK_LATENCY,
+            )
+            .with_initial_grant(capacity);
+        }
+        let plan = entry.controller.observe(
+            ReaderPressureSample {
+                // A page that filled its bound is the honest signal that
+                // more history waits behind it; the merge does not price
+                // an exact remaining count.
+                backlog_records: if entry.backlog_hint { u64::MAX } else { 0 },
+                average_record_bytes: entry.average_record_bytes,
+                acknowledgement_latency: entry.last_ack_latency,
+                unacknowledged_bytes: entry.unacknowledged_bytes,
+                node_pressure,
+                // The fetch path already fails closed when replicas
+                // cannot corroborate, so reaching the plan means the
+                // data path was served.
+                replica_ready: true,
+            },
+            client_capacity,
+        );
+        entry.last_plan = plan;
+        plan
+    }
+
+    /// The plan issued for the in-flight page, so a replayed fetch
+    /// reports the same advice instead of a fresh observation.
+    pub fn last_plan(&self, reader_id: Uuid) -> Option<ReaderPacingPlan> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&reader_id).map(|entry| entry.last_plan))
+    }
+
+    /// Record a served page: byte volume feeds the unacknowledged-byte
+    /// budget until the next ack, the filled-page flag is the backlog
+    /// hint, and the fetch timestamp starts the ack-latency sample.
+    pub fn record_page(
+        &self,
+        reader_id: Uuid,
+        page_records: usize,
+        page_bytes: usize,
+        effective_limit: usize,
+    ) {
+        let Ok(mut map) = self.inner.lock() else {
+            return;
+        };
+        let Some(entry) = map.get_mut(&reader_id) else {
+            return;
+        };
+        entry.last_fetch_at = Some(std::time::Instant::now());
+        entry.unacknowledged_bytes = entry.unacknowledged_bytes.saturating_add(page_bytes);
+        if page_records > 0 {
+            entry.average_record_bytes = (page_bytes / page_records).max(1);
+        }
+        entry.backlog_hint = effective_limit > 0 && page_records >= effective_limit;
+    }
+
+    /// An ack retires the delivered byte budget and completes the
+    /// fetch→ack latency sample. Acks landing on a Node that never
+    /// served a page have no state to update.
+    pub fn observe_ack(&self, reader_id: Uuid) {
+        let Ok(mut map) = self.inner.lock() else {
+            return;
+        };
+        let Some(entry) = map.get_mut(&reader_id) else {
+            return;
+        };
+        entry.unacknowledged_bytes = 0;
+        if let Some(fetch_at) = entry.last_fetch_at.take() {
+            entry.last_ack_latency = fetch_at.elapsed();
+        }
+    }
+
+    /// Session close drops the entry; bounded capacity plus removal on
+    /// close keeps the table proportional to live Readers.
+    pub fn remove(&self, reader_id: Uuid) {
+        if let Ok(mut map) = self.inner.lock() {
+            map.remove(&reader_id);
         }
     }
 }
@@ -3458,6 +3641,68 @@ mod tests {
         );
         assert!(oversized.record_exceeds_budget);
         assert_eq!(oversized.max_records, 0);
+    }
+    #[test]
+    fn pacing_table_isolates_readers_and_replays_advice() {
+        let table = ReaderPacingTable::default();
+        let slow = Uuid::from_u128(1);
+        let healthy = Uuid::from_u128(2);
+        // A session opens trusted at its declared capacity.
+        let warm = table.plan(slow, 64, 64, 0.0, 1024);
+        assert_eq!(warm.max_records, 64);
+        // A slow Reader that never acks fills its delivered-byte budget;
+        // the plan defers delivery entirely once the budget saturates.
+        table.record_page(slow, 64, 2048, 64);
+        let deferred = table.plan(slow, 64, 64, 0.0, 1024);
+        assert_eq!(deferred.max_records, 0);
+        assert!(deferred.retry_after > Duration::ZERO);
+        // The saturated Reader does not squeeze the healthy one.
+        let unaffected = table.plan(healthy, 64, 64, 0.0, 1024);
+        assert_eq!(unaffected.max_records, 64);
+        assert_eq!(unaffected.retry_after, Duration::ZERO);
+        // A replay reports the deferred advice, not a fresh observation.
+        assert_eq!(table.last_plan(slow), Some(deferred));
+        // An ack retires the byte budget; the halved grant reopens flow
+        // cautiously rather than bouncing straight back to capacity.
+        table.observe_ack(slow);
+        let reopened = table.plan(slow, 64, 64, 0.0, 1024);
+        assert!(reopened.max_records < warm.max_records && reopened.max_records > 0);
+        table.remove(slow);
+        assert_eq!(table.last_plan(slow), None);
+    }
+
+    #[test]
+    fn pacing_table_grows_back_only_on_sustained_full_pages() {
+        let table = ReaderPacingTable::default();
+        let reader = Uuid::from_u128(3);
+        // The optimistic grant still defers when the byte budget is gone.
+        let first = table.plan(reader, 64, 64, 0.0, 1 << 20);
+        assert_eq!(first.max_records, 64);
+        table.record_page(reader, 64, 2 << 20, 64);
+        let deferred = table.plan(reader, 64, 64, 0.0, 1 << 20);
+        assert_eq!(deferred.max_records, 0);
+        assert!(deferred.retry_after > Duration::ZERO);
+        // After the ack the grant starts halved, then grows only on
+        // sustained full, acknowledged pages.
+        table.observe_ack(reader);
+        let halved = table.plan(reader, 64, 64, 0.0, 1 << 20);
+        assert_eq!(halved.max_records, 32);
+        let mut plan = halved;
+        for _ in 0..12 {
+            table.record_page(
+                reader,
+                plan.max_records.max(1),
+                100,
+                plan.max_records.max(1),
+            );
+            table.observe_ack(reader);
+            plan = table.plan(reader, 64, 64, 0.0, 1 << 20);
+        }
+        assert!(plan.max_records > halved.max_records && plan.max_records <= 64);
+        // Reopening with a different capacity re-baselines the grant to
+        // the new session's declared bound.
+        let rebased = table.plan(reader, 16, 16, 0.0, 1 << 20);
+        assert_eq!(rebased.max_records, 16);
     }
 
     #[test]

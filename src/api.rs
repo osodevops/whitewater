@@ -76,6 +76,7 @@ pub struct AppState {
     pub store: Arc<dyn LogStore>,
     pub membership: Arc<MembershipService>,
     pub demand: DemandMetrics,
+    pub reader_pacing: crate::reader::ReaderPacingTable,
     pub autoscaler: Arc<Mutex<AutoscaleController>>,
     pub control: Arc<ControlController>,
     pub control_plane: Option<Arc<ControlPlane>>,
@@ -6671,7 +6672,10 @@ async fn replay_reader_fetch(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     state.demand.record_read(records.len());
-    let pressure = (state.demand.snapshot().requests_in_flight as f64 / 100.0).clamp(0.0, 1.0);
+    // A replay serves the identical page, so it reports the advice that
+    // page was paced under; an ingress that never saw the original
+    // fetch falls back to the persisted page bound.
+    let replayed_plan = state.reader_pacing.last_plan(reader.reader_id);
     Ok(Json(ReaderFetchResponse {
         records,
         delivered_cursor: Some(reader_frontier_cursor(
@@ -6680,12 +6684,12 @@ async fn replay_reader_fetch(
             request.request_id,
         )),
         acknowledged_cursor: fresh.acknowledged_cursor,
-        recommended_capacity: if pressure > 0.75 {
-            fresh.session_capacity.min(16)
-        } else {
-            fresh.session_capacity
-        },
-        retry_after_ms: if pressure > 0.9 { 50 } else { 0 },
+        recommended_capacity: replayed_plan
+            .map(|plan| plan.max_records)
+            .unwrap_or(frontier.last_fetch_limit),
+        retry_after_ms: replayed_plan
+            .map(|plan| plan.retry_after.as_millis().min(u64::MAX as u128) as u64)
+            .unwrap_or(0),
     }))
 }
 
@@ -6735,11 +6739,32 @@ async fn reader_fetch(
     {
         return replay_reader_fetch(&state, &reader, &feed.name, &request).await;
     }
-    let limit = request
+    let client_limit = request
         .limit
         .unwrap_or(reader.session_capacity)
         .min(reader.session_capacity)
         .max(1);
+    let node_pressure = (state.demand.snapshot().requests_in_flight as f64 / 100.0).clamp(0.0, 1.0);
+    let pacing = state.reader_pacing.plan(
+        reader.reader_id,
+        reader.session_capacity,
+        client_limit,
+        node_pressure,
+        MAX_LOGICAL_READ_BYTES,
+    );
+    if pacing.max_records == 0 {
+        // The delivered-byte budget is exhausted or records exceed it:
+        // defer delivery honestly through the response advice instead
+        // of silently shrinking the page or erroring the session.
+        return Ok(Json(ReaderFetchResponse {
+            records: Vec::new(),
+            delivered_cursor: reader.delivered_cursor.clone(),
+            acknowledged_cursor: reader.acknowledged_cursor.clone(),
+            recommended_capacity: 0,
+            retry_after_ms: pacing.retry_after.as_millis().min(u64::MAX as u128) as u64,
+        }));
+    }
+    let limit = pacing.max_records;
     let timestamp_start = match (&reader.start, &reader.delivered_cursor) {
         (crate::control::ReaderStart::Timestamp(value), None) => Some(*value),
         _ => None,
@@ -6785,6 +6810,10 @@ async fn reader_fetch(
         frames.truncate(limit);
     }
     let source = record_source_by_id(&state, reader.feed_id).await;
+    let page_bytes = frames
+        .iter()
+        .map(|item| item.frame.len().saturating_add(item.cursor.len()))
+        .sum::<usize>();
     let records = frames
         .into_iter()
         .map(|item| {
@@ -6869,17 +6898,15 @@ async fn reader_fetch(
         }
     }
     state.demand.record_read(records.len());
-    let pressure = (state.demand.snapshot().requests_in_flight as f64 / 100.0).clamp(0.0, 1.0);
+    state
+        .reader_pacing
+        .record_page(reader.reader_id, records.len(), page_bytes, limit);
     Ok(Json(ReaderFetchResponse {
         records,
         delivered_cursor,
         acknowledged_cursor: reader.acknowledged_cursor,
-        recommended_capacity: if pressure > 0.75 {
-            reader.session_capacity.min(16)
-        } else {
-            reader.session_capacity
-        },
-        retry_after_ms: if pressure > 0.9 { 50 } else { 0 },
+        recommended_capacity: pacing.max_records,
+        retry_after_ms: pacing.retry_after.as_millis().min(u64::MAX as u128) as u64,
     }))
 }
 
@@ -6910,6 +6937,7 @@ async fn reader_ack(
     let reader: crate::control::ReaderDefinition =
         serde_json::from_value(execution.results[0].data.clone())
             .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    state.reader_pacing.observe_ack(reader.reader_id);
     Ok(Json(reader_session_response(reader)))
 }
 
@@ -6939,6 +6967,7 @@ async fn reader_close(
     let reader: crate::control::ReaderDefinition =
         serde_json::from_value(execution.results[0].data.clone())
             .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    state.reader_pacing.remove(reader.reader_id);
     Ok(Json(reader_session_response(reader)))
 }
 
@@ -13035,6 +13064,7 @@ mod tests {
                 membership,
                 demand: DemandMetrics::default(),
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                reader_pacing: crate::reader::ReaderPacingTable::default(),
                 control: control.clone(),
                 control_plane: None,
                 progress_authority: control.clone(),
@@ -13228,6 +13258,7 @@ mod tests {
                 membership,
                 demand: DemandMetrics::default(),
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                reader_pacing: crate::reader::ReaderPacingTable::default(),
                 control: control.clone(),
                 control_plane: None,
                 progress_authority: control.clone(),
@@ -13454,6 +13485,7 @@ mod tests {
                 membership,
                 demand: DemandMetrics::default(),
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                reader_pacing: crate::reader::ReaderPacingTable::default(),
                 control: control.clone(),
                 control_plane: None,
                 progress_authority: control.clone(),
@@ -13658,6 +13690,7 @@ mod tests {
                 membership,
                 demand: DemandMetrics::default(),
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                reader_pacing: crate::reader::ReaderPacingTable::default(),
                 control: control.clone(),
                 control_plane: None,
                 progress_authority: control.clone(),
@@ -13983,6 +14016,7 @@ mod tests {
                 membership,
                 demand: DemandMetrics::default(),
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                reader_pacing: crate::reader::ReaderPacingTable::default(),
                 control: control.clone(),
                 control_plane: None,
                 progress_authority: control.clone(),
@@ -14272,6 +14306,7 @@ mod tests {
                 membership,
                 demand: DemandMetrics::default(),
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                reader_pacing: crate::reader::ReaderPacingTable::default(),
                 control: control.clone(),
                 control_plane: None,
                 progress_authority: control.clone(),
@@ -14590,6 +14625,7 @@ mod tests {
                 membership,
                 demand: DemandMetrics::default(),
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                reader_pacing: crate::reader::ReaderPacingTable::default(),
                 control: control.clone(),
                 control_plane: None,
                 progress_authority: control.clone(),
@@ -14929,6 +14965,7 @@ mod tests {
             membership,
             demand: DemandMetrics::default(),
             autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+            reader_pacing: crate::reader::ReaderPacingTable::default(),
             replica_append: Some(Arc::new(ReplicaAppendService::new(
                 root,
                 assignment.owner.clone(),
@@ -15033,6 +15070,7 @@ mod tests {
             membership,
             demand: DemandMetrics::default(),
             autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+            reader_pacing: crate::reader::ReaderPacingTable::default(),
             control: control.clone(),
             control_plane: None,
             progress_authority: control.clone(),
@@ -15124,6 +15162,7 @@ mod tests {
                 membership,
                 demand: DemandMetrics::default(),
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                reader_pacing: crate::reader::ReaderPacingTable::default(),
                 control: control.clone(),
                 control_plane: Some(control_plane.clone()),
                 progress_authority: control.clone(),
@@ -17993,6 +18032,7 @@ mod tests {
                 membership,
                 demand: DemandMetrics::default(),
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                reader_pacing: crate::reader::ReaderPacingTable::default(),
                 replica_append: Some(services[node].clone()),
                 control: control.clone(),
                 control_plane: plane,
@@ -18479,6 +18519,7 @@ mod tests {
                 membership,
                 demand: DemandMetrics::default(),
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                reader_pacing: crate::reader::ReaderPacingTable::default(),
                 replica_append: Some(services[node].clone()),
                 control: control.clone(),
                 control_plane: Some(plane),
@@ -19552,6 +19593,7 @@ mod tests {
                 membership,
                 demand: DemandMetrics::default(),
                 autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+                reader_pacing: crate::reader::ReaderPacingTable::default(),
                 control: control.clone(),
                 control_plane: None,
                 progress_authority: control.clone(),
