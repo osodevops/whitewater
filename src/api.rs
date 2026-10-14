@@ -1888,13 +1888,14 @@ async fn subscription_member_join(
                         frame.map(|frame| frame.cursor.clone()).unwrap_or_default(),
                     );
                     if let Some(frame) = frame {
-                        let decoded = STANDARD
-                            .decode(frame.frame_base64.as_bytes())
-                            .map_err(|_| {
-                                ApiError::unavailable(
-                                    "current owner returned an invalid frame encoding",
-                                )
-                            })?;
+                        let decoded =
+                            STANDARD
+                                .decode(frame.frame_base64.as_bytes())
+                                .map_err(|_| {
+                                    ApiError::unavailable(
+                                        "current owner returned an invalid frame encoding",
+                                    )
+                                })?;
                         let record = decode_record(&decoded)
                             .map_err(|error| ApiError::unavailable(error.to_string()))?;
                         let key = (record.ingest_time_ns, record.message_id);
@@ -1909,15 +1910,14 @@ async fn subscription_member_join(
                     positions,
                 )
             }
-            crate::control::ReaderStart::Cursor(_) | crate::control::ReaderStart::Timestamp(_) => {
-                return Err(ApiError {
-                    status: StatusCode::CONFLICT,
-                    message: "Subscription member sessions support beginning and now starts; explicit-Cursor and timestamp starts need merged-order position resolution"
-                        .to_owned(),
-
-                    code: None,
-})
-            }
+            crate::control::ReaderStart::Timestamp(threshold) => (
+                format!("timestamp:{threshold}"),
+                resolve_timestamp_positions(&state, &range_assignments, *threshold).await?,
+            ),
+            crate::control::ReaderStart::Cursor(cursor) => (
+                cursor.clone(),
+                resolve_cursor_positions(&state, &range_assignments, cursor).await?,
+            ),
         };
         coordinator
             .apply(crate::reader::SubscriptionProgressMutation {
@@ -2484,6 +2484,63 @@ async fn resolve_tail_positions(
         }
     }
     Ok((tail, positions))
+}
+
+/// Resolve per-Range positions behind one Feed Cursor for a Subscription
+/// start: every Active Range resumes after the last frame it contributed
+/// to the merged-order prefix at-or-before the Cursor, the same skip a
+/// named Reader's `after` read applies. Frames on other Ranges that merge
+/// after the Cursor stay undelivered because the min-head pick proves they
+/// do not sort earlier. An unknown, uncommitted, or foreign-Feed Cursor
+/// fails closed exactly like the Feed-read contract.
+async fn resolve_cursor_positions(
+    state: &AppState,
+    range_assignments: &[ActiveRangeAssignment],
+    after: &str,
+) -> Result<BTreeMap<RangeId, String>, ApiError> {
+    let mut streams: Vec<RangeFrameStream> = range_assignments
+        .iter()
+        .map(|assignment| RangeFrameStream::new(state, assignment))
+        .collect();
+    let mut heads: Vec<Option<((i64, Uuid), StoredRangeFrame)>> =
+        (0..streams.len()).map(|_| None).collect();
+    let mut positions: BTreeMap<RangeId, String> = range_assignments
+        .iter()
+        .map(|assignment| (assignment.range_id, String::new()))
+        .collect();
+    loop {
+        for index in 0..streams.len() {
+            if heads[index].is_none() {
+                heads[index] = match streams[index].next_frame().await? {
+                    Some(frame) => {
+                        let record = decode_record(&frame.frame)
+                            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                        Some(((record.ingest_time_ns, record.message_id), frame))
+                    }
+                    None => None,
+                };
+            }
+        }
+        let Some(index) = heads
+            .iter()
+            .enumerate()
+            .filter_map(|(index, head)| head.as_ref().map(|(key, _)| (index, *key)))
+            .min_by_key(|(index, key)| (*key, *index))
+            .map(|(index, _)| index)
+        else {
+            break;
+        };
+        let Some((_, frame)) = heads[index].take() else {
+            continue;
+        };
+        positions.insert(range_assignments[index].range_id, frame.cursor.clone());
+        if frame.cursor == after {
+            return Ok(positions);
+        }
+    }
+    Err(ApiError::bad_request(
+        "Cursor is unknown, uncommitted, or belongs to another Feed",
+    ))
 }
 
 /// Resolve per-Range positions so the next delivered record in each Active

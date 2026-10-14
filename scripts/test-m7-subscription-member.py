@@ -174,6 +174,60 @@ def main():
     if status != 200: raise AssertionError(appended)
     status, page = post(ENDPOINTS[2], f"{members}/fetch", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work, "lease_epoch": claimed["lease"]["lease_epoch"], "wait_ms": 2000})
     if status != 200 or len(page["records"]) != 1: raise AssertionError(page)
+    phase("now start verified")
+
+    # A standalone Reader exposes each record's opaque Cursor and ingest
+    # timestamp; explicit-Cursor and timestamp Subscription starts resolve
+    # them into internal per-Range positions at first join.
+    timeline_reader = f"m7timeline{suffix}"
+    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE READER {timeline_reader} FROM {feed} START AT BEGINNING;"})
+    if status != 200: raise AssertionError(declared)
+    status, opened = post(ENDPOINTS[0], "/v1/readers/open", {"request_id": str(uuid.uuid4()), "reader": timeline_reader, "capacity": 10})
+    if status != 200: raise AssertionError(opened)
+    status, timeline = post(ENDPOINTS[0], "/v1/readers/fetch", {"request_id": str(uuid.uuid4()), "reader": timeline_reader, "session_epoch": opened["session_epoch"], "limit": 10})
+    if status != 200 or len(timeline["records"]) != 6: raise AssertionError(timeline)
+    history = timeline["records"]
+
+    # A timestamp start pins every internal Range to the last frame ingested
+    # before the threshold; the first delivery is the first record
+    # at-or-after it on the ingest clock.
+    threshold = int(history[3]["ingest_time_ns"])
+    ts_sub = f"{domain}.timeshifted"
+    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {ts_sub} FROM {feed} START AT TIMESTAMP {threshold};"})
+    if status != 200: raise AssertionError(declared)
+    status, joined = post(ENDPOINTS[1], f"{members}/join", {"subscription": ts_sub, "request_id": str(uuid.uuid4()), "member_id": member})
+    if status != 200 or joined["member_epoch"] != 1: raise AssertionError(joined)
+    status, claimed = post(ENDPOINTS[2], f"{members}/claim", {"subscription": ts_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work})
+    if status != 200: raise AssertionError(claimed)
+    status, page = post(ENDPOINTS[0], f"{members}/fetch", {"subscription": ts_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work, "lease_epoch": claimed["lease"]["lease_epoch"], "limit": 10})
+    expected = [row["event_time_ns"] for row in history if int(row["ingest_time_ns"]) >= threshold]
+    if status != 200 or [row["event_time_ns"] for row in page["records"]] != expected: raise AssertionError(page)
+    phase("timestamp start verified")
+
+    # An explicit-Cursor start resumes each internal Range after the last
+    # frame it contributed to the merged-order prefix at-or-before the
+    # Cursor — the same skip a Reader `after` read applies.
+    boundary = history[2]["cursor"]
+    cursor_sub = f"{domain}.replaying"
+    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {cursor_sub} FROM {feed} START AT CURSOR '{boundary}';"})
+    if status != 200: raise AssertionError(declared)
+    status, joined = post(ENDPOINTS[1], f"{members}/join", {"subscription": cursor_sub, "request_id": str(uuid.uuid4()), "member_id": member})
+    if status != 200 or joined["member_epoch"] != 1: raise AssertionError(joined)
+    status, claimed = post(ENDPOINTS[2], f"{members}/claim", {"subscription": cursor_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work})
+    if status != 200: raise AssertionError(claimed)
+    status, page = post(ENDPOINTS[0], f"{members}/fetch", {"subscription": cursor_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work, "lease_epoch": claimed["lease"]["lease_epoch"], "limit": 10})
+    boundary_index = next(index for index, row in enumerate(history) if row["cursor"] == boundary)
+    expected = [row["event_time_ns"] for row in history[boundary_index + 1:]]
+    if status != 200 or [row["event_time_ns"] for row in page["records"]] != expected: raise AssertionError(page)
+
+    # An unknown or foreign-Feed Cursor fails closed instead of guessing a
+    # starting position.
+    bogus_sub = f"{domain}.bogus"
+    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {bogus_sub} FROM {feed} START AT CURSOR 'not-a-feed-cursor';"})
+    if status != 200: raise AssertionError(declared)
+    status, refused = post(ENDPOINTS[1], f"{members}/join", {"subscription": bogus_sub, "request_id": str(uuid.uuid4()), "member_id": member})
+    if status != 400: raise AssertionError(refused)
+    phase("cursor start verified")
 
     # Member state reports the fenced epoch and no live leases after acks.
     status, state = get(ENDPOINTS[1], f"{members}/state?subscription={subscription}")

@@ -308,6 +308,18 @@ CREATE SUBSCRIPTION orders.billing
 
 
 
+The start position is `BEGINNING`, `NOW`, `TIMESTAMP <ns>` on the ingest clock, or `CURSOR '<value>'`. A timestamp or explicit Cursor start resolves internally to per-Range positions when the first member joins — a timestamp start delivers the first record accepted at-or-after the threshold, and a Cursor start resumes after the last record at-or-before it in merged order, the same skip a Reader `after` read applies. Unknown or foreign-Feed Cursors fail closed:
+
+```sql
+CREATE SUBSCRIPTION orders.timeshifted
+  FROM orders.created
+  START AT TIMESTAMP 1735689600000000000;
+
+CREATE SUBSCRIPTION orders.replaying
+  FROM orders.created
+  START AT CURSOR 'AbGTj_j2...';
+```
+
 A Subscription belongs to the same Domain as its Feed. The source can instead be the whole Domain — covering every current and future Feed under immutable Domain identity, with per-Feed progress tracked incrementally (no global cross-Feed order is promised):
 
 ```sql

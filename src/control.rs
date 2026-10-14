@@ -7425,6 +7425,22 @@ mod tests {
     }
 
     #[test]
+    fn parser_supports_subscription_cursor_and_timestamp_starts() {
+        let commands = parse_wcl(
+            "CREATE DOMAIN orders; CREATE FEED orders.created;              CREATE SUBSCRIPTION orders.timeshifted FROM orders.created START AT TIMESTAMP 1735689600000000000;              CREATE SUBSCRIPTION orders.replaying FROM orders.created START AT CURSOR 'opaque;cursor';",
+        )
+        .unwrap();
+        assert!(matches!(
+            &commands[2],
+            Command::CreateSubscription { start: ReaderStart::Timestamp(ns), .. } if *ns == 1735689600000000000
+        ));
+        assert!(matches!(
+            &commands[3],
+            Command::CreateSubscription { start: ReaderStart::Cursor(cursor), .. } if cursor == "opaque;cursor"
+        ));
+    }
+
+    #[test]
     fn domain_wcl_is_accepted_alongside_legacy_space_syntax() {
         let commands = parse_wcl(
             "CREATE DOMAIN orders; SHOW DOMAINS; DESCRIBE DOMAIN orders; RENAME DOMAIN orders TO billing; DROP DOMAIN billing; CREATE SPACE legacy; SHOW SPACES;",
