@@ -380,7 +380,9 @@
         "records": "Record[]",
         "cursor": "cursor",
         "positions": "map<string,string>",
-        "ownership_epoch": "u64"
+        "ownership_epoch": "u64",
+        "delivery_attempt": "u64 (delivering claim's lease epoch — the durable per-work delivery-attempt counter for retry budgets)",
+        "next_delivery_ns": "i64 ns decimal string? (earliest delayed head eligibility)"
       },
       "errors": [
         "lease.stale_lease(409)",

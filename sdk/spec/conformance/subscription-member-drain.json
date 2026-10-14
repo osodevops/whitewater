@@ -44,7 +44,11 @@
         "limit": 8
       },
       "bind": "delivered",
-      "expect": {"records": "len>=1", "cursor": "!=null"}
+      "expect": {
+        "records": "len>=1",
+        "cursor": "!=null",
+        "delivery_attempt": "==claim.lease.lease_epoch"
+      }
     },
     {
       "op": "member.ack",

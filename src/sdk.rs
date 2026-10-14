@@ -926,6 +926,9 @@ pub struct WorkPage {
     /// Opaque per-range progress evidence; internal detail passed back
     /// to `ack` verbatim so no physical layout crosses the SDK contract.
     pub positions: Value,
+    /// The delivering claim's lease epoch — the durable per-work
+    /// delivery-attempt counter retry budgets count against.
+    pub delivery_attempt: u64,
     /// Unix epoch nanos when the earliest delayed head becomes eligible.
     pub next_delivery_ns: Option<i64>,
 }
@@ -1038,6 +1041,10 @@ impl Member {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             positions: body.get("positions").cloned().unwrap_or(Value::Null),
+            delivery_attempt: body
+                .get("delivery_attempt")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
             next_delivery_ns: body
                 .get("next_delivery_ns")
                 .and_then(Value::as_str)
@@ -1814,6 +1821,7 @@ mod tests {
             records: Vec::new(),
             cursor: Some("frontier-9".to_owned()),
             positions: json!({"9f5c": "pos-3"}),
+            delivery_attempt: 4,
             next_delivery_ns: None,
         };
         member.ack(&work, &page).await.unwrap();

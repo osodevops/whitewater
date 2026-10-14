@@ -118,6 +118,9 @@ async fn sdk_roundtrip_against_a_live_riverbed() {
     assert!(work.lease_epoch >= 1);
     let work_page = member.fetch(&work, 16).await.expect("member fetch");
     assert_eq!(work_page.records.len(), 1, "member page: {work_page:?}");
+    // The page reports its delivering claim's attempt number — the
+    // durable per-work delivery counter retry budgets count against.
+    assert_eq!(work_page.delivery_attempt, work.lease_epoch);
     member.ack(&work, &work_page).await.expect("member ack");
     // The ack consumes the lease: releasing it now must fence stale, not
     // silently succeed — the durable frontier already moved.

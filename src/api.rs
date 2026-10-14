@@ -1893,6 +1893,9 @@ struct SubscriptionMemberFetchResponse {
     cursor: Option<String>,
     positions: BTreeMap<RangeId, String>,
     ownership_epoch: u64,
+    /// The current delivery attempt for the claimed work — the durable lease
+    /// epoch, which advances each time work is reclaimed or re-claimed.
+    delivery_attempt: u64,
     /// Unix epoch nanoseconds (decimal string) at which the earliest
     /// delivery-delayed head becomes eligible; `None` when nothing is parked.
     next_delivery_ns: Option<String>,
@@ -1973,6 +1976,7 @@ async fn subscription_member_fetch(
         cursor,
         positions,
         ownership_epoch: progress_assignment.ownership_epoch,
+        delivery_attempt: request.lease_epoch,
         next_delivery_ns,
     }))
 }
@@ -17442,6 +17446,9 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        // The fetch exposes the delivering claim's durable attempt so members
+        // can budget retries against redelivery.
+        assert_eq!(body["delivery_attempt"], json!(fresh_epoch));
         assert_eq!(
             body["records"]
                 .as_array()
