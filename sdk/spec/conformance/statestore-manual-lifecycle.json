@@ -1,0 +1,85 @@
+{
+  "scenario": "statestore-manual-lifecycle",
+  "requires": [
+    "wcl",
+    "statestore.mutate",
+    "statestore.lookup",
+    "statestore.get_by",
+    "statestore.iterate"
+  ],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN ss{{uniq}}; DEFINE STATESTORE ss{{uniq}}.profiles KEYS department;"
+      }
+    },
+    {
+      "op": "statestore.mutate",
+      "args": {
+        "store": "ss{{uniq}}.profiles",
+        "mutation_id": "{{uuid:put1}}",
+        "kind": "put_row",
+        "key": {"utf8": "emp-1"},
+        "payload": {"utf8": "alice"},
+        "named": [{"name": "department", "values": [{"kind": "text", "value": "eng"}]}]
+      },
+      "bind": "put",
+      "expect": {"deduplicated": false, "sequence": "present"}
+    },
+    {
+      "op": "statestore.mutate",
+      "args": {
+        "store": "ss{{uniq}}.profiles",
+        "mutation_id": "{{uuid:put1}}",
+        "kind": "put_row",
+        "key": {"utf8": "emp-1"},
+        "payload": {"utf8": "alice"},
+        "named": [{"name": "department", "values": [{"kind": "text", "value": "eng"}]}]
+      },
+      "expect": {"deduplicated": true, "sequence": "==put.sequence"}
+    },
+    {
+      "op": "statestore.lookup",
+      "args": {
+        "store": "ss{{uniq}}.profiles",
+        "key": {"utf8": "emp-1"},
+        "wait_ms": 5000
+      },
+      "expect": {"found": true, "payload_base64": "YWxpY2U="}
+    },
+    {
+      "op": "statestore.get_by",
+      "args": {
+        "store": "ss{{uniq}}.profiles",
+        "named_key": "department",
+        "values": [{"kind": "text", "value": "eng"}]
+      },
+      "expect": {"rows": "len>=1", "rows[0].key_base64": "ZW1wLTE="}
+    },
+    {
+      "op": "statestore.iterate",
+      "args": {"store": "ss{{uniq}}.profiles", "limit": 10},
+      "expect": {"rows": "len>=1"}
+    },
+    {
+      "op": "statestore.mutate",
+      "args": {
+        "store": "ss{{uniq}}.profiles",
+        "mutation_id": "{{uuid:del1}}",
+        "kind": "delete_row",
+        "key": {"utf8": "emp-1"}
+      },
+      "expect": {"deduplicated": false}
+    },
+    {
+      "op": "statestore.lookup",
+      "args": {
+        "store": "ss{{uniq}}.profiles",
+        "key": {"utf8": "emp-1"},
+        "wait_ms": 5000
+      },
+      "expect": {"found": false}
+    }
+  ]
+}

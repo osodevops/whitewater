@@ -33,6 +33,10 @@ successfully.
 | `member.join` / `member.claim` / `member.renew` / `member.release` / `member.fetch` / `member.ack` | subscription member ops | `subscription`, `member_id`, `member_epoch`, `work_id`, `lease_epoch`, `limit`, `lease_ticks` |
 | `feed.append` | `feed.append` | `feed`, `request_id`, `writer_session_id`, `writer_epoch`, `sequence`, `key`, `payload`, `event_time_ns` |
 | `feed.records` | `feed.records` | `feed`, `limit`, `after` |
+| `statestore.mutate` | `POST /v1/state-stores/mutate` | `store`, `mutation_id`, `kind` (`put_row`/`delete_row`), `key`, `payload`, `named` — flat `key`/`payload` lower to base64 inside `op` |
+| `statestore.lookup` | `POST /v1/state-stores/lookup` | `store`, `key`, `strict`, `wait_ms` |
+| `statestore.get_by` | `POST /v1/state-stores/get-by` | `store`, `named_key`, `values` (`IndexValueWire` list), `lower`, `upper`, `limit` |
+| `statestore.iterate` | `POST /v1/state-stores/iterate` | `store`, `after_key`, `limit` |
 | `chaos.<action>` | driver fault hook | optional `args` — rendered scalar values append space-separated to the hook invocation (e.g. `{"feed": "..."}` becomes `chaos.restart_owner <feed>`); the driving environment performs the fault and returns only once the Riverbed is usable again; a runner without a chaos hook reports `unsupported` |
 | `expect` | assertions | see below |
 

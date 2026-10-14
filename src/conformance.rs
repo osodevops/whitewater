@@ -163,7 +163,9 @@ impl ConformanceRunner {
                     }
                 }
             }
-            if endpoint(&op).is_none() && !matches!(op.as_str(), "feed.records" | "health") {
+            if endpoint(&op).is_none()
+                && !matches!(op.as_str(), "feed.records" | "health" | "statestore.mutate")
+            {
                 return ScenarioReport {
                     name,
                     failure: Some(ScenarioFailure {
@@ -456,6 +458,10 @@ fn endpoint(op: &str) -> Option<(&'static str, &'static str)> {
         "member.transfer" => ("POST", "/v1/subscriptions/members/transfer"),
         "member.fetch" => ("POST", "/v1/subscriptions/members/fetch"),
         "member.ack" => ("POST", "/v1/subscriptions/members/ack"),
+        "statestore.lookup" => ("POST", "/v1/state-stores/lookup"),
+        "statestore.get_by" => ("POST", "/v1/state-stores/get-by"),
+        "statestore.iterate" => ("POST", "/v1/state-stores/iterate"),
+        "statestore.clear" => ("POST", "/v1/state-stores/clear"),
         _ => return None,
     })
 }
@@ -490,6 +496,33 @@ async fn dispatch(client: &Client, op: &str, args: &Value) -> Result<(u16, Value
             other => other,
         };
         return Ok((reply.status, body));
+    }
+    if op == "statestore.mutate" {
+        // `{store, mutation_id, kind, key, payload, named}` lowers to
+        // `{store, mutation_id, op: {kind, key_base64?, payload_base64?,
+        // named?}}` — the flat fixture vocabulary stays identical to the
+        // other ops while the wire nests the mutation under `op`.
+        let mut body = wire_args(args);
+        let Some(map) = body.as_object_mut() else {
+            return Err("statestore.mutate args must be an object".to_owned());
+        };
+        let mut operation = serde_json::Map::new();
+        let kind = map
+            .remove("kind")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| "statestore.mutate needs a `kind`".to_owned())?;
+        operation.insert("kind".to_owned(), Value::String(kind));
+        for field in ["key_base64", "payload_base64", "named"] {
+            if let Some(value) = map.remove(field) {
+                operation.insert(field.to_owned(), value);
+            }
+        }
+        map.insert("op".to_owned(), Value::Object(operation));
+        let reply = client
+            .wire("POST", "/v1/state-stores/mutate", Some(&body))
+            .await
+            .map_err(|error| format!("transport: {error:?}"))?;
+        return Ok((reply.status, reply.body));
     }
     let (method, path) = endpoint(op).ok_or_else(|| format!("unsupported op {op}"))?;
     let body = wire_args(args);
@@ -710,6 +743,54 @@ mod tests {
         let failure = report.failure.expect("chaos failure reported");
         assert!(!failure.unsupported);
         assert_eq!(failure.message, "riverbed never came back");
+    }
+
+    #[tokio::test]
+    async fn runner_lowers_statestore_mutate_into_the_op_envelope() {
+        let (runner, transport) = runner(vec![
+            (
+                200,
+                json!({"store_id": "s1", "mutation_id": "m1", "sequence": 1, "deduplicated": false}),
+            ),
+            (200, json!({"found": true, "payload_base64": "YWxpY2U="})),
+        ]);
+        let report = runner
+            .run_scenario(
+                "ss",
+                &json!({"steps": [
+                    {
+                        "op": "statestore.mutate",
+                        "args": {
+                            "store": "ss.profiles",
+                            "mutation_id": "11111111-1111-1111-1111-111111111111",
+                            "kind": "put_row",
+                            "key": {"utf8": "emp-1"},
+                            "payload": {"utf8": "alice"},
+                            "named": [{"name": "department", "values": [{"kind": "text", "value": "eng"}]}]
+                        },
+                        "expect": {"deduplicated": false}
+                    },
+                    {
+                        "op": "statestore.lookup",
+                        "args": {"store": "ss.profiles", "key": {"utf8": "emp-1"}},
+                        "expect": {"found": true, "payload_base64": "YWxpY2U="}
+                    }
+                ]}),
+            )
+            .await;
+        assert!(report.passed(), "{report:?}");
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests[0].1, "/v1/state-stores/mutate");
+        let body = &requests[0].2;
+        assert_eq!(body["store"], "ss.profiles");
+        assert_eq!(body["op"]["kind"], "put_row");
+        // Flat `key`/`payload` fixture args become base64 inside `op`.
+        assert_eq!(body["op"]["key_base64"], "ZW1wLTE=");
+        assert_eq!(body["op"]["payload_base64"], "YWxpY2U=");
+        assert_eq!(body["op"]["named"][0]["name"], "department");
+        // The lookup op uses the same lowering at the top level.
+        assert_eq!(requests[1].1, "/v1/state-stores/lookup");
+        assert_eq!(requests[1].2["key_base64"], "ZW1wLTE=");
     }
 
     #[tokio::test]
