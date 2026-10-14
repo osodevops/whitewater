@@ -880,10 +880,10 @@ fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError
 /// whose namespace pattern covers `feed` for `action` (`manage`
 /// implies read and write). Endpoints that resolve Writer, Reader,
 /// Subscription, StateStore, or Index names still require admin scope.
-fn authorize_feed(
+fn authorize_namespace(
     state: &AppState,
     headers: &HeaderMap,
-    feed: &str,
+    namespace: &str,
     action: PermissionAction,
 ) -> Result<(), ApiError> {
     let authorization = headers
@@ -893,7 +893,7 @@ fn authorize_feed(
         authorization,
         &state.control.issued_api_keys(),
         unix_ns(),
-        feed,
+        namespace,
         action,
     )?;
     Ok(())
@@ -902,7 +902,7 @@ fn authorize_feed(
 /// Authenticate the Bearer credential before a named resource is
 /// resolved — an invalid credential receives `401` rather than a
 /// not-found response that would leak resource existence. The
-/// resource's owning Feed check runs afterward via `authorize_feed`.
+/// resource's owning Feed check runs afterward via `authorize_namespace`.
 fn authenticate_credential(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     let authorization = headers
         .get(AUTHORIZATION)
@@ -921,10 +921,11 @@ async fn authorize_subscription(
     state: &AppState,
     headers: &HeaderMap,
     definition: &crate::control::SubscriptionDefinition,
+    action: PermissionAction,
 ) -> Result<(), ApiError> {
     match &definition.source {
         crate::control::SubscriptionSource::Feed { feed_id } => {
-            authorize_resource_feed(state, headers, *feed_id, PermissionAction::Read).await
+            authorize_resource_feed(state, headers, *feed_id, action).await
         }
         crate::control::SubscriptionSource::Domain { domain_id } => {
             let domain = state
@@ -940,7 +941,7 @@ async fn authorize_subscription(
                 &state.control.issued_api_keys(),
                 unix_ns(),
                 &domain,
-                PermissionAction::Read,
+                action,
             )?;
             Ok(())
         }
@@ -962,7 +963,7 @@ async fn authorize_resource_feed(
         .active_feed_by_id(feed_id)
         .await
         .ok_or_else(|| ApiError::unavailable("owning Feed is unavailable"))?;
-    authorize_feed(state, headers, &feed.name, action)
+    authorize_namespace(state, headers, &feed.name, action)
 }
 
 async fn control_plane_status(
@@ -1634,7 +1635,7 @@ async fn subscription_member_join(
     )
     .await
     .ok_or_else(|| ApiError::bad_request("Subscription does not exist or is not active"))?;
-    authorize_subscription(&state, &headers, &definition).await?;
+    authorize_subscription(&state, &headers, &definition, PermissionAction::Read).await?;
     let (coordinator, assignment, definition) =
         member_coordinator_recovering(&state, &request.subscription).await?;
     let replayed = coordinator
@@ -1825,7 +1826,7 @@ async fn subscription_member_claim(
     )
     .await
     .ok_or_else(|| ApiError::bad_request("Subscription does not exist or is not active"))?;
-    authorize_subscription(&state, &headers, &definition).await?;
+    authorize_subscription(&state, &headers, &definition, PermissionAction::Read).await?;
     let (coordinator, assignment, definition) =
         member_coordinator_recovering(&state, &request.subscription).await?;
     let lease_ticks = member_lease_ticks(request.lease_ticks)?;
@@ -1875,7 +1876,7 @@ async fn subscription_member_renew(
     )
     .await
     .ok_or_else(|| ApiError::bad_request("Subscription does not exist or is not active"))?;
-    authorize_subscription(&state, &headers, &definition).await?;
+    authorize_subscription(&state, &headers, &definition, PermissionAction::Read).await?;
     let (coordinator, assignment, definition) =
         member_coordinator_recovering(&state, &request.subscription).await?;
     let lease_ticks = member_lease_ticks(request.lease_ticks)?;
@@ -1929,7 +1930,7 @@ async fn subscription_member_release(
     )
     .await
     .ok_or_else(|| ApiError::bad_request("Subscription does not exist or is not active"))?;
-    authorize_subscription(&state, &headers, &definition).await?;
+    authorize_subscription(&state, &headers, &definition, PermissionAction::Read).await?;
     let (coordinator, assignment, definition) =
         member_coordinator_recovering(&state, &request.subscription).await?;
     let member_state = member_apply(
@@ -1977,7 +1978,7 @@ async fn subscription_member_transfer(
     )
     .await
     .ok_or_else(|| ApiError::bad_request("Subscription does not exist or is not active"))?;
-    authorize_subscription(&state, &headers, &definition).await?;
+    authorize_subscription(&state, &headers, &definition, PermissionAction::Read).await?;
     let (coordinator, assignment, definition) =
         member_coordinator_recovering(&state, &request.subscription).await?;
     let lease_ticks = member_lease_ticks(request.lease_ticks)?;
@@ -2029,7 +2030,7 @@ async fn subscription_member_ack(
     )
     .await
     .ok_or_else(|| ApiError::bad_request("Subscription does not exist or is not active"))?;
-    authorize_subscription(&state, &headers, &definition).await?;
+    authorize_subscription(&state, &headers, &definition, PermissionAction::Read).await?;
     let (coordinator, assignment, definition) =
         member_coordinator_recovering(&state, &request.subscription).await?;
     match (request.cursor, request.positions) {
@@ -2209,7 +2210,7 @@ async fn subscription_member_fetch(
     )
     .await
     .ok_or_else(|| ApiError::bad_request("Subscription does not exist or is not active"))?;
-    authorize_subscription(&state, &headers, &definition).await?;
+    authorize_subscription(&state, &headers, &definition, PermissionAction::Read).await?;
     let (coordinator, progress_assignment, definition) =
         member_coordinator(&state, &request.subscription).await?;
     let members = read_member_state(&coordinator).await?;
@@ -2392,7 +2393,15 @@ async fn subscription_seek(
     headers: HeaderMap,
     Json(request): Json<SubscriptionSeekRequest>,
 ) -> Result<Json<SubscriptionSeekResponse>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authenticate_credential(&state, &headers)?;
+    let definition = subscription_when_applied(
+        &state.control,
+        &request.subscription,
+        state.control_plane.is_some(),
+    )
+    .await
+    .ok_or_else(|| ApiError::bad_request("Subscription does not exist or is not active"))?;
+    authorize_subscription(&state, &headers, &definition, PermissionAction::Manage).await?;
     let (coordinator, assignment, definition) =
         member_coordinator_recovering(&state, &request.subscription).await?;
     let source_feed = definition.source.feed_id().ok_or_else(|| ApiError {
@@ -3246,7 +3255,7 @@ async fn subscription_member_state(
     )
     .await
     .ok_or_else(|| ApiError::bad_request("Subscription does not exist or is not active"))?;
-    authorize_subscription(&state, &headers, &definition).await?;
+    authorize_subscription(&state, &headers, &definition, PermissionAction::Read).await?;
     let (coordinator, assignment, _definition) =
         member_coordinator(&state, &query.subscription).await?;
     let member_state = read_member_state(&coordinator).await?;
@@ -4003,7 +4012,10 @@ async fn index_query(
     headers: HeaderMap,
     Json(request): Json<IndexQueryRequest>,
 ) -> Result<Json<IndexQueryResponse>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authenticate_credential(&state, &headers)?;
+    if let Some(index) = state.control.declared_index_by_name(&request.index).await {
+        authorize_namespace(&state, &headers, &index.name, PermissionAction::Read)?;
+    }
     let predicate = request.mode.clone().into_predicate()?;
     run_index_query(
         &state,
@@ -4259,7 +4271,7 @@ async fn state_store_lookup(
     headers: HeaderMap,
     Json(request): Json<StateStoreLookupApiRequest>,
 ) -> Result<Json<StateStoreLookupApiResponse>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authenticate_credential(&state, &headers)?;
     let store = state
         .control
         .declared_state_store_by_name(&request.store)
@@ -4267,6 +4279,7 @@ async fn state_store_lookup(
         .ok_or_else(|| {
             ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
         })?;
+    authorize_namespace(&state, &headers, &store.name, PermissionAction::Read)?;
     let assignment = state
         .control
         .active_state_store_assignment_by_id(store.store_id)
@@ -4448,7 +4461,7 @@ async fn state_store_get_by(
     headers: HeaderMap,
     Json(request): Json<StateStoreGetByRequest>,
 ) -> Result<Json<StateStoreGetByResponse>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authenticate_credential(&state, &headers)?;
     let store = state
         .control
         .declared_state_store_by_name(&request.store)
@@ -4456,6 +4469,7 @@ async fn state_store_get_by(
         .ok_or_else(|| {
             ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
         })?;
+    authorize_namespace(&state, &headers, &store.name, PermissionAction::Read)?;
     if !store
         .named_keys
         .iter()
@@ -4584,7 +4598,7 @@ async fn state_store_iterate(
     headers: HeaderMap,
     Json(request): Json<StateStoreIterateRequest>,
 ) -> Result<Json<StateStoreIterateResponse>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authenticate_credential(&state, &headers)?;
     let store = state
         .control
         .declared_state_store_by_name(&request.store)
@@ -4592,6 +4606,7 @@ async fn state_store_iterate(
         .ok_or_else(|| {
             ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
         })?;
+    authorize_namespace(&state, &headers, &store.name, PermissionAction::Read)?;
     let assignment = state
         .control
         .active_state_store_assignment_by_id(store.store_id)
@@ -4685,7 +4700,7 @@ async fn state_store_clear(
     headers: HeaderMap,
     Json(request): Json<StateStoreClearRequest>,
 ) -> Result<Json<StateStoreMutateResponse>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authenticate_credential(&state, &headers)?;
     let store = state
         .control
         .declared_state_store_by_name(&request.store)
@@ -4693,6 +4708,7 @@ async fn state_store_clear(
         .ok_or_else(|| {
             ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
         })?;
+    authorize_namespace(&state, &headers, &store.name, PermissionAction::Write)?;
     if !matches!(store.source, crate::control::StateStoreSource::Manual) {
         return Err(ApiError::bad_request(
             "clear applies only to manual StateStores; Feed-derived stores replay from their source",
@@ -5207,7 +5223,7 @@ async fn state_store_mutate(
     headers: HeaderMap,
     Json(request): Json<StateStoreMutateRequest>,
 ) -> Result<Json<StateStoreMutateResponse>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authenticate_credential(&state, &headers)?;
     let store = state
         .control
         .declared_state_store_by_name(&request.store)
@@ -5215,6 +5231,7 @@ async fn state_store_mutate(
         .ok_or_else(|| {
             ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
         })?;
+    authorize_namespace(&state, &headers, &store.name, PermissionAction::Write)?;
     if !matches!(store.source, crate::control::StateStoreSource::Manual) {
         return Err(ApiError::bad_request(
             "mutations apply only to manual StateStores; Feed-derived stores replay from their source",
@@ -5447,8 +5464,9 @@ async fn state_store_sync(
     headers: HeaderMap,
     Json(request): Json<StateStoreSyncRequest>,
 ) -> Result<Json<StateStoreSyncResponse>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authenticate_credential(&state, &headers)?;
     let store = feed_derived_store(&state, &request.store).await?;
+    authorize_namespace(&state, &headers, &store.name, PermissionAction::Write)?;
     let outcome = state_store_replay_driver(&state)
         .pass(&store, None, STATE_STORE_REPLAY_PASS_LIMIT)
         .await
@@ -5470,8 +5488,9 @@ async fn state_store_rebuild(
     headers: HeaderMap,
     Json(request): Json<StateStoreRebuildRequest>,
 ) -> Result<Json<StateStoreSyncResponse>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authenticate_credential(&state, &headers)?;
     let store = feed_derived_store(&state, &request.store).await?;
+    authorize_namespace(&state, &headers, &store.name, PermissionAction::Write)?;
     let outcome = state_store_replay_driver(&state)
         .pass(
             &store,
@@ -6402,7 +6421,7 @@ async fn reader_fetch(
         .active_feed_by_id(reader.feed_id)
         .await
         .ok_or_else(|| ApiError::unavailable("Reader Feed is not applied on this Node"))?;
-    authorize_feed(&state, &headers, &feed.name, PermissionAction::Read)?;
+    authorize_namespace(&state, &headers, &feed.name, PermissionAction::Read)?;
     let mut reader = reader;
     // A committed open can lag on this Node's applied catalog; wait briefly
     // for the session to land instead of fencing a fresh epoch. An applied
@@ -6659,7 +6678,7 @@ async fn temporary_reader_fetch(
     headers: HeaderMap,
     Json(request): Json<TemporaryReaderFetchRequest>,
 ) -> Result<Json<TemporaryReaderFetchResponse>, ApiError> {
-    authorize_feed(&state, &headers, &request.feed, PermissionAction::Read)?;
+    authorize_namespace(&state, &headers, &request.feed, PermissionAction::Read)?;
     if request.new_only && request.after.is_some() {
         return Err(ApiError::bad_request(
             "new_only cannot be combined with after",
@@ -9620,7 +9639,7 @@ async fn writer_session_append(
         .active_feed_by_id(writer.feed_id)
         .await
         .ok_or_else(|| ApiError::bad_request("Writer Feed does not exist"))?;
-    authorize_feed(&state, &headers, &feed.name, PermissionAction::Write)?;
+    authorize_namespace(&state, &headers, &feed.name, PermissionAction::Write)?;
     let routing_key = decode_base64("key_base64", &request.key_base64)?;
     if routing_key.is_empty() {
         return Err(ApiError::bad_request(
@@ -9763,7 +9782,7 @@ async fn client_append(
     headers: HeaderMap,
     Json(request): Json<ClientAppendRequest>,
 ) -> Result<Json<WriterAppendResponse>, ApiError> {
-    authorize_feed(&state, &headers, &request.feed, PermissionAction::Write)?;
+    authorize_namespace(&state, &headers, &request.feed, PermissionAction::Write)?;
     if request.pending_effect.is_some() {
         return Err(ApiError::bad_request(
             "pending_effect is reserved for effect-journal appends; public Writers commit on success",
@@ -11501,7 +11520,7 @@ async fn search_feed_records(
     headers: HeaderMap,
     Query(query): Query<FeedSearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_feed(&state, &headers, &query.feed, PermissionAction::Read)?;
+    authorize_namespace(&state, &headers, &query.feed, PermissionAction::Read)?;
     let parse_bound = |field: &str, value: Option<&str>| -> Result<Option<i64>, ApiError> {
         value
             .map(|bound| {
@@ -11643,7 +11662,7 @@ async fn lookup_feed_record(
     headers: HeaderMap,
     Query(query): Query<FeedLookupQuery>,
 ) -> Result<Json<RecordResponse>, ApiError> {
-    authorize_feed(&state, &headers, &query.feed, PermissionAction::Read)?;
+    authorize_namespace(&state, &headers, &query.feed, PermissionAction::Read)?;
     let feed = feed_when_applied(&state.control, &query.feed, state.control_plane.is_some())
         .await
         .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", query.feed)))?;
@@ -11720,7 +11739,7 @@ async fn read_feed_records(
     headers: HeaderMap,
     Query(query): Query<FeedReadQuery>,
 ) -> Result<Json<Vec<RecordResponse>>, ApiError> {
-    authorize_feed(&state, &headers, &query.feed, PermissionAction::Read)?;
+    authorize_namespace(&state, &headers, &query.feed, PermissionAction::Read)?;
     let feed = feed_when_applied(&state.control, &query.feed, state.control_plane.is_some())
         .await
         .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", query.feed)))?;
@@ -16736,6 +16755,9 @@ mod tests {
                      CREATE READER billing.sneaky FROM orders.events START AT BEGINNING; \
                      CREATE SUBSCRIPTION orders.billing FROM orders.events; \
                      CREATE SUBSCRIPTION orders.everything FROM DOMAIN orders; \
+                     DEFINE STATESTORE orders.inventory; \
+                     DEFINE STATESTORE orders.summary FROM FEED orders.events; \
+                     CREATE INDEX orders.bykey ON orders.events FIELDS KEY; \
                      CREATE ROLE billing.ops; \
                      GRANT read, write ON NAMESPACE billing.* TO ROLE billing.ops; \
                      ISSUE API KEY ops.billingkey ROLE billing.ops DIGEST {};",
@@ -17030,6 +17052,118 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        // StateStore reads need read on the store's own namespace;
+        // mutate needs write. orders.* covers orders.inventory while
+        // billing.* never reaches it.
+        let store_lookup = |key: Option<&str>| {
+            admin_request(
+                "/v1/state-stores/lookup",
+                json!({ "store": "orders.inventory", "key_base64": "a2V5" }),
+                key,
+            )
+        };
+        let looked = app
+            .clone()
+            .oneshot(store_lookup(Some(reader_secret)))
+            .await
+            .unwrap();
+        assert_eq!(looked.status(), StatusCode::SERVICE_UNAVAILABLE);
+        for key in [Some(writer_secret), Some(billing_secret)] {
+            let denied = app.clone().oneshot(store_lookup(key)).await.unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        }
+        let store_mutate = |key: Option<&str>| {
+            admin_request(
+                "/v1/state-stores/mutate",
+                json!({
+                    "store": "orders.inventory",
+                    "mutation_id": Uuid::new_v4(),
+                    "op": { "kind": "put_row", "key_base64": "a2V5", "payload_base64": "cGF5" },
+                }),
+                key,
+            )
+        };
+        let mutated = app
+            .clone()
+            .oneshot(store_mutate(Some(writer_secret)))
+            .await
+            .unwrap();
+        assert_eq!(mutated.status(), StatusCode::SERVICE_UNAVAILABLE);
+        for key in [Some(reader_secret), Some(billing_secret)] {
+            let denied = app.clone().oneshot(store_mutate(key)).await.unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        }
+        // A feed-derived sync replays into the store: write scope.
+        let store_sync = |key: Option<&str>| {
+            admin_request(
+                "/v1/state-stores/sync",
+                json!({ "store": "orders.summary" }),
+                key,
+            )
+        };
+        let synced = app
+            .clone()
+            .oneshot(store_sync(Some(writer_secret)))
+            .await
+            .unwrap();
+        assert_eq!(synced.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let denied = app
+            .clone()
+            .oneshot(store_sync(Some(reader_secret)))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        // Index queries need read on the Index's own name; a declared
+        // but unbuilt Index reaches the readiness check downstream.
+        let index_query = |key: Option<&str>| {
+            admin_request(
+                "/v1/indexes/query",
+                json!({
+                    "index": "orders.bykey",
+                    "mode": "exact",
+                    "values": [{ "kind": "text", "value": "k" }],
+                }),
+                key,
+            )
+        };
+        let queried = app
+            .clone()
+            .oneshot(index_query(Some(reader_secret)))
+            .await
+            .unwrap();
+        assert_eq!(queried.status(), StatusCode::CONFLICT);
+        for key in [Some(writer_secret), Some(billing_secret), None] {
+            let denied = app.clone().oneshot(index_query(key)).await.unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        }
+        // Subscription seeking repositions shared progress: manage scope
+        // on the source, not read or write.
+        let seek = |key: Option<&str>| {
+            admin_request(
+                "/v1/subscriptions/seek",
+                json!({
+                    "subscription": "orders.billing",
+                    "request_id": Uuid::new_v4(),
+                    "position": "beginning",
+                }),
+                key,
+            )
+        };
+        let sought = app
+            .clone()
+            .oneshot(seek(Some(manage_secret)))
+            .await
+            .unwrap();
+        assert_eq!(sought.status(), StatusCode::SERVICE_UNAVAILABLE);
+        for key in [
+            Some(reader_secret),
+            Some(writer_secret),
+            Some(billing_secret),
+            None,
+        ] {
+            let denied = app.clone().oneshot(seek(key)).await.unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        }
         // Revocation fences the read grant immediately.
         let revoked = app
             .clone()

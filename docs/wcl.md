@@ -521,9 +521,13 @@ identities pass every scope. Subscription member endpoints
 Subscription's source: a Feed-sourced Subscription checks its Feed's
 namespace, while a Domain-sourced one needs a spanning grant (`*` or
 `{domain}.*`) — an exact-name grant never covers a Domain's member
-Feeds. Explicit deny and grant enforcement on Subscription
-administration, StateStore, and Index operations are future
-control-plane work.
+Feeds; `POST /v1/subscriptions/seek` needs `manage` on the source.
+StateStore reads (`/v1/state-stores/lookup`, `/get-by`, `/iterate`)
+need `read` and mutations (`/mutate`, `/clear`, `/sync`, `/rebuild`)
+need `write` on the store's own name; `POST /v1/indexes/query` needs
+`read` on the Index's name. Explicit deny and WCL-side grant
+enforcement on Subscription declaration and lifecycle commands are
+future control-plane work.
 
 
 
