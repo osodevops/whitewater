@@ -48,9 +48,9 @@ use crate::{
     codec::{decode_record, MAX_FRAME_BYTES},
     config::SubscriptionMtlsConfig,
     control::{
-        ControlController, ControlError, RangeMergePlan, RangeMovePlan, RangeMoveStage,
-        RangeOwnerMovePlan, RangeSplitPlan, ReaderCutoverSnapshot, ReaderFrontierTranslation,
-        ReplicatedCommand,
+        ControlController, ControlError, PermissionAction, RangeMergePlan, RangeMovePlan,
+        RangeMoveStage, RangeOwnerMovePlan, RangeSplitPlan, ReaderCutoverSnapshot,
+        ReaderFrontierTranslation, ReplicatedCommand,
     },
     control_plane::{
         ControlNodeId, ControlPlane, ControlPlaneError, ControlTypeConfig, FullSnapshotRequest,
@@ -870,6 +870,31 @@ fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError
         authorization,
         &state.control.issued_api_keys(),
         unix_ns(),
+    )?;
+    Ok(())
+}
+
+/// Authorize a data-plane `action` against the Feed named in the
+/// request. The configured bootstrap key and `manage`-on-`*` issued
+/// identities pass everywhere; other issued identities need a grant
+/// whose namespace pattern covers `feed` for `action` (`manage`
+/// implies read and write). Endpoints that resolve Writer, Reader,
+/// Subscription, StateStore, or Index names still require admin scope.
+fn authorize_feed(
+    state: &AppState,
+    headers: &HeaderMap,
+    feed: &str,
+    action: PermissionAction,
+) -> Result<(), ApiError> {
+    let authorization = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    state.admin_auth.authorize_scoped(
+        authorization,
+        &state.control.issued_api_keys(),
+        unix_ns(),
+        feed,
+        action,
     )?;
     Ok(())
 }
@@ -6463,7 +6488,7 @@ async fn temporary_reader_fetch(
     headers: HeaderMap,
     Json(request): Json<TemporaryReaderFetchRequest>,
 ) -> Result<Json<TemporaryReaderFetchResponse>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authorize_feed(&state, &headers, &request.feed, PermissionAction::Read)?;
     if request.new_only && request.after.is_some() {
         return Err(ApiError::bad_request(
             "new_only cannot be combined with after",
@@ -9566,7 +9591,7 @@ async fn client_append(
     headers: HeaderMap,
     Json(request): Json<ClientAppendRequest>,
 ) -> Result<Json<WriterAppendResponse>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authorize_feed(&state, &headers, &request.feed, PermissionAction::Write)?;
     if request.pending_effect.is_some() {
         return Err(ApiError::bad_request(
             "pending_effect is reserved for effect-journal appends; public Writers commit on success",
@@ -11304,7 +11329,7 @@ async fn search_feed_records(
     headers: HeaderMap,
     Query(query): Query<FeedSearchQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authorize_feed(&state, &headers, &query.feed, PermissionAction::Read)?;
     let parse_bound = |field: &str, value: Option<&str>| -> Result<Option<i64>, ApiError> {
         value
             .map(|bound| {
@@ -11446,7 +11471,7 @@ async fn lookup_feed_record(
     headers: HeaderMap,
     Query(query): Query<FeedLookupQuery>,
 ) -> Result<Json<RecordResponse>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authorize_feed(&state, &headers, &query.feed, PermissionAction::Read)?;
     let feed = feed_when_applied(&state.control, &query.feed, state.control_plane.is_some())
         .await
         .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", query.feed)))?;
@@ -11523,7 +11548,7 @@ async fn read_feed_records(
     headers: HeaderMap,
     Query(query): Query<FeedReadQuery>,
 ) -> Result<Json<Vec<RecordResponse>>, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authorize_feed(&state, &headers, &query.feed, PermissionAction::Read)?;
     let feed = feed_when_applied(&state.control, &query.feed, state.control_plane.is_some())
         .await
         .ok_or_else(|| ApiError::bad_request(format!("Feed does not exist: {}", query.feed)))?;
@@ -16511,6 +16536,182 @@ mod tests {
         // The bootstrap env key is unaffected by catalog revocation.
         let still_ok = app.oneshot(wcl("SHOW API KEYS;", bootstrap)).await.unwrap();
         assert_eq!(still_ok.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn feed_data_plane_enforces_namespace_grants() {
+        let directory = TempDir::new().unwrap();
+        let app = admin_test_router(&directory);
+        let bootstrap = Some("this-is-a-long-development-api-key");
+        let reader_secret = "orders-reader-key-0123456789abcdef";
+        let writer_secret = "orders-writer-key-0123456789abcdef";
+        let manage_secret = "ops-manage-key-0123456789abcdef00";
+        let digest = |secret: &str| blake3::hash(secret.as_bytes()).to_hex().to_string();
+        let wcl = |script: &str, key: Option<&str>| {
+            admin_request(
+                "/v1/admin/wcl",
+                json!({ "request_id": Uuid::new_v4(), "script": script }),
+                key,
+            )
+        };
+        let setup = app
+            .clone()
+            .oneshot(wcl(
+                &format!(
+                    "CREATE DOMAIN orders; CREATE FEED orders.events;                      CREATE DOMAIN billing; CREATE FEED billing.invoices;                      CREATE ROLE ops.reader;                      GRANT read ON NAMESPACE orders.* TO ROLE ops.reader;                      ISSUE API KEY ops.readerkey ROLE ops.reader DIGEST {};                      CREATE ROLE ops.writer;                      GRANT write ON NAMESPACE orders.* TO ROLE ops.writer;                      ISSUE API KEY ops.writerkey ROLE ops.writer DIGEST {};                      CREATE ROLE ops.admins;                      GRANT manage ON NAMESPACE * TO ROLE ops.admins;                      ISSUE API KEY ops.managekey ROLE ops.admins DIGEST {};",
+                    digest(reader_secret),
+                    digest(writer_secret),
+                    digest(manage_secret),
+                ),
+                bootstrap,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(setup.status(), StatusCode::OK);
+
+        let get = |path: &str, key: Option<&str>| {
+            let mut request = Request::builder().method("GET").uri(path);
+            if let Some(key) = key {
+                request = request.header("authorization", format!("Bearer {key}"));
+            }
+            request.body(Body::empty()).unwrap()
+        };
+        let append = |key: Option<&str>| {
+            admin_request(
+                "/v1/feeds/append",
+                json!({
+                    "request_id": Uuid::new_v4(),
+                    "feed": "orders.events",
+                    "writer_session_id": Uuid::new_v4(),
+                    "writer_epoch": 1,
+                    "sequence": 1,
+                    "key_base64": "a2V5LTE=",
+                    "payload_base64": "cGF5bG9hZA==",
+                }),
+                key,
+            )
+        };
+        // This test Node serves no Active Range storage, so an authorized
+        // request clears the gate and fails downstream as UNAVAILABLE —
+        // while an unauthorized request is refused as UNAUTHORIZED.
+        let read_path = "/v1/feeds/records?feed=orders.events&limit=1";
+        for (key, name) in [
+            (Some(reader_secret), "reader"),
+            (Some(manage_secret), "manager"),
+            (bootstrap, "bootstrap"),
+        ] {
+            let response = app.clone().oneshot(get(read_path, key)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{name} should clear the read gate"
+            );
+        }
+        // Read-only and write-only grants stay separated.
+        let denied = app
+            .clone()
+            .oneshot(get(read_path, Some(writer_secret)))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let denied = app
+            .clone()
+            .oneshot(append(Some(reader_secret)))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let allowed = app
+            .clone()
+            .oneshot(append(Some(writer_secret)))
+            .await
+            .unwrap();
+        assert_eq!(allowed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let allowed = app.clone().oneshot(append(bootstrap)).await.unwrap();
+        assert_eq!(allowed.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // An orders.* grant does not reach other Domains.
+        let foreign = app
+            .clone()
+            .oneshot(get(
+                "/v1/feeds/records?feed=billing.invoices&limit=1",
+                Some(reader_secret),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::UNAUTHORIZED);
+        // Missing credentials refuse before any data-plane work.
+        let missing = app.clone().oneshot(get(read_path, None)).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        // Temporary fetch and search share the same gate.
+        let fetch = app
+            .clone()
+            .oneshot(admin_request(
+                "/v1/readers/temporary/fetch",
+                json!({ "feed": "orders.events", "limit": 1 }),
+                Some(reader_secret),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fetch.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let fetch = app
+            .clone()
+            .oneshot(admin_request(
+                "/v1/readers/temporary/fetch",
+                json!({ "feed": "orders.events", "limit": 1 }),
+                Some(writer_secret),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(fetch.status(), StatusCode::UNAUTHORIZED);
+        let search = app
+            .clone()
+            .oneshot(get(
+                "/v1/feeds/records/search?feed=orders.events&key_base64=a2V5LTE%3D",
+                Some(reader_secret),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(search.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let search = app
+            .clone()
+            .oneshot(get(
+                "/v1/feeds/records/search?feed=orders.events&key_base64=a2V5LTE%3D",
+                Some(writer_secret),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(search.status(), StatusCode::UNAUTHORIZED);
+        // Cursor lookup shares the read gate too.
+        let lookup = app
+            .clone()
+            .oneshot(get(
+                "/v1/feeds/records/lookup?feed=orders.events&cursor=opaque",
+                Some(reader_secret),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(lookup.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let lookup = app
+            .clone()
+            .oneshot(get(
+                "/v1/feeds/records/lookup?feed=orders.events&cursor=opaque",
+                Some(writer_secret),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(lookup.status(), StatusCode::UNAUTHORIZED);
+        // Revocation fences the read grant immediately.
+        let revoked = app
+            .clone()
+            .oneshot(wcl("REVOKE API KEY ops.readerkey;", bootstrap))
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let fenced = app
+            .clone()
+            .oneshot(get(read_path, Some(reader_secret)))
+            .await
+            .unwrap();
+        assert_eq!(fenced.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

@@ -644,7 +644,17 @@ pub struct IssuedApiKey {
     /// Whether the bound Role currently holds `manage` on the root `*`
     /// namespace, which admin endpoints require.
     pub riverbed_admin: bool,
+    /// The bound Role's grants cloned at refresh so request-time
+    /// namespace checks never touch the catalog lock.
+    pub grants: Vec<IssuedGrant>,
     pub expires_at_ns: Option<i64>,
+}
+
+/// One namespace grant resolved against an issued identity's Role.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssuedGrant {
+    pub namespace: String,
+    pub actions: BTreeSet<PermissionAction>,
 }
 
 /// Issued-identity authorization view keyed by verifier digest.
@@ -6180,11 +6190,21 @@ fn issued_api_key_view(state: &CatalogState) -> IssuedApiKeySet {
                 && grant.actions.contains(&PermissionAction::Manage)
                 && grant.namespace == "*"
         });
+        let grants = state
+            .grants
+            .values()
+            .filter(|grant| grant.role_id == identity.role_id)
+            .map(|grant| IssuedGrant {
+                namespace: grant.namespace.clone(),
+                actions: grant.actions.clone(),
+            })
+            .collect();
         view.insert(
             *digest.as_bytes(),
             IssuedApiKey {
                 name: identity.name.clone(),
                 riverbed_admin,
+                grants,
                 expires_at_ns: identity.expires_at_ns,
             },
         );
@@ -6203,7 +6223,7 @@ fn validate_namespace_pattern(pattern: &str) -> Result<(), ControlError> {
     }
 }
 
-fn namespace_matches(pattern: &str, feed: &str) -> bool {
+pub(crate) fn namespace_matches(pattern: &str, feed: &str) -> bool {
     if pattern == "*" {
         return true;
     }

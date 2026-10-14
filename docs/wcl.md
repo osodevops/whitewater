@@ -439,7 +439,7 @@ CREATE ROLE orderanalytics;
 
 GRANT READ
 
-  ON NAMEDOMAIN orders.*
+  ON NAMESPACE orders.*
 
   TO ROLE orderanalytics;
 
@@ -455,7 +455,7 @@ Multiple actions:
 
 GRANT READ, WRITE
 
-  ON NAMEDOMAIN orders.*
+  ON NAMESPACE orders.*
 
   TO ROLE orderapplication;
 
@@ -503,7 +503,15 @@ Namespace `orders.*` matches descendants such as `orders.created` and `orders.eu
 
 
 
-WCL v0 uses default deny and allow grants. Explicit deny and permission enforcement are future control-plane work.
+WCL v0 uses default deny and allow grants. Grants bound to issued
+API-key identities enforce on the Feed-named data-plane endpoints:
+`GET /v1/feeds/records`, `GET /v1/feeds/records/search`,
+`GET /v1/feeds/records/lookup`, and `POST /v1/readers/temporary/fetch`
+require `read`; `POST /v1/feeds/append` requires `write`; `manage`
+implies both. The configured bootstrap key and `manage`-on-`*`
+identities pass every scope. Explicit deny and grant enforcement on
+Writer, Reader, Subscription, StateStore, and Index operations are
+future control-plane work.
 
 
 
@@ -645,9 +653,13 @@ An issued identity authorizes Admin API requests when its bound Role
 
 holds `manage` on the root `*` namespace and the identity has not
 
-expired; Domain-scoped Roles do not authorize Admin API requests yet.
+expired. Domain-scoped Roles authorize the Feed-named data-plane
 
-The catalog is bounded at 512 issued identities.
+endpoints above when a grant's namespace pattern covers the request's
+
+Feed for the required action. The catalog is bounded at 512 issued
+
+identities.
 
 
 
@@ -1087,7 +1099,7 @@ CREATE ROLE orderapplication;
 
 GRANT READ, WRITE
 
-  ON NAMEDOMAIN orders.*
+  ON NAMESPACE orders.*
 
   TO ROLE orderapplication;
 

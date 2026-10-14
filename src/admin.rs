@@ -14,8 +14,8 @@ use crate::{
         WriterSessionAppendRequest,
     },
     control::{
-        Command, ControlExecution, IssuedApiKeySet, PermissionAction, ReaderStart, ResourceKind,
-        ShowKind,
+        namespace_matches, Command, ControlExecution, IssuedApiKeySet, PermissionAction,
+        ReaderStart, ResourceKind, ShowKind,
     },
     reader::ReaderRetryPolicy,
 };
@@ -86,6 +86,53 @@ impl AdminAuthenticator {
         now_unix_ns: i64,
     ) -> Result<(), AdminAuthError> {
         self.authorize_inner(authorization, Some((issued, now_unix_ns)))
+    }
+
+    /// Authorize a data-plane `action` against `namespace` (a Feed
+    /// name, or any dotted resource inside a Domain). The configured
+    /// bootstrap key and unexpired riverbed-admin identities always
+    /// pass; otherwise an unexpired issued identity needs a grant whose
+    /// pattern covers `namespace` for `action` — `manage` implies
+    /// `read` and `write`.
+    pub fn authorize_scoped(
+        &self,
+        authorization: Option<&str>,
+        issued: &IssuedApiKeySet,
+        now_unix_ns: i64,
+        namespace: &str,
+        action: PermissionAction,
+    ) -> Result<(), AdminAuthError> {
+        let issued_empty = issued.is_empty();
+        if self.expected_digest.is_none() && issued_empty {
+            return Err(AdminAuthError::NotConfigured);
+        }
+        let supplied = authorization
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .filter(|value| !value.is_empty())
+            .ok_or(AdminAuthError::Missing)?;
+        let actual = *blake3::hash(supplied.as_bytes()).as_bytes();
+        if self
+            .expected_digest
+            .is_some_and(|expected| constant_time_equal(&expected, &actual))
+        {
+            return Ok(());
+        }
+        if let Some(identity) = issued.get(&actual) {
+            let unexpired = identity
+                .expires_at_ns
+                .is_none_or(|expiry| now_unix_ns < expiry);
+            if unexpired
+                && (identity.riverbed_admin
+                    || identity.grants.iter().any(|grant| {
+                        (grant.actions.contains(&action)
+                            || grant.actions.contains(&PermissionAction::Manage))
+                            && namespace_matches(&grant.namespace, namespace)
+                    }))
+            {
+                return Ok(());
+            }
+        }
+        Err(AdminAuthError::Invalid)
     }
 
     fn authorize_inner(
@@ -746,6 +793,7 @@ mod tests {
             IssuedApiKey {
                 name: "ops.release".to_owned(),
                 riverbed_admin: true,
+                grants: vec![],
                 expires_at_ns: None,
             },
         );
@@ -785,6 +833,122 @@ mod tests {
         // An unknown key refuses.
         assert_eq!(
             auth.authorize_issued(Some("Bearer unknown-key-0123456789012345"), &issued, 1_000),
+            Err(AdminAuthError::Invalid)
+        );
+    }
+
+    #[test]
+    fn scoped_authorization_enforces_namespace_grants() {
+        use crate::control::{IssuedApiKey, IssuedGrant};
+
+        let bootstrap = "this-is-a-long-development-api-key";
+        let auth = AdminAuthenticator::new(Some(bootstrap.to_owned())).unwrap();
+        let secret = "reader-scoped-key-0123456789abcdef0";
+        let digest = *blake3::hash(secret.as_bytes()).as_bytes();
+        let header = format!("Bearer {secret}");
+        let mut issued = IssuedApiKeySet::new();
+        issued.insert(
+            digest,
+            IssuedApiKey {
+                name: "ops.reader".to_owned(),
+                riverbed_admin: false,
+                grants: vec![IssuedGrant {
+                    namespace: "orders.*".to_owned(),
+                    actions: [PermissionAction::Read].into_iter().collect(),
+                }],
+                expires_at_ns: None,
+            },
+        );
+        // A read grant on orders.* authorizes reads inside the Domain…
+        assert!(auth
+            .authorize_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders.events",
+                PermissionAction::Read,
+            )
+            .is_ok());
+        // …but not writes…
+        assert_eq!(
+            auth.authorize_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders.events",
+                PermissionAction::Write,
+            ),
+            Err(AdminAuthError::Invalid)
+        );
+        // …and not a different namespace.
+        assert_eq!(
+            auth.authorize_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "billing.invoices",
+                PermissionAction::Read,
+            ),
+            Err(AdminAuthError::Invalid)
+        );
+        // manage on the same namespace implies read and write.
+        issued.get_mut(&digest).unwrap().grants = vec![IssuedGrant {
+            namespace: "orders.*".to_owned(),
+            actions: [PermissionAction::Manage].into_iter().collect(),
+        }];
+        assert!(auth
+            .authorize_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders.events",
+                PermissionAction::Write,
+            )
+            .is_ok());
+        // An exact-Feed grant does not reach other Feeds in the Domain.
+        issued.get_mut(&digest).unwrap().grants = vec![IssuedGrant {
+            namespace: "orders.events".to_owned(),
+            actions: [PermissionAction::Read].into_iter().collect(),
+        }];
+        assert!(auth
+            .authorize_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders.events",
+                PermissionAction::Read,
+            )
+            .is_ok());
+        assert_eq!(
+            auth.authorize_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders.other",
+                PermissionAction::Read,
+            ),
+            Err(AdminAuthError::Invalid)
+        );
+        // The bootstrap key passes every scope check.
+        assert!(auth
+            .authorize_scoped(
+                Some(&format!("Bearer {bootstrap}")),
+                &issued,
+                1_000,
+                "billing.invoices",
+                PermissionAction::Write,
+            )
+            .is_ok());
+        // An expired scoped identity refuses.
+        issued.get_mut(&digest).unwrap().expires_at_ns = Some(500);
+        assert_eq!(
+            auth.authorize_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders.events",
+                PermissionAction::Read,
+            ),
             Err(AdminAuthError::Invalid)
         );
     }
