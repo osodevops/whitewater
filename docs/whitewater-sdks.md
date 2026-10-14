@@ -128,7 +128,7 @@ Parity matters most outside the happy path:
 
 ## One contract, measured parity
 
-The [versioned wire protocol](../sdk/spec/PROTOCOL.md) and [shared conformance corpus](../sdk/spec/conformance/README.md) define what every SDK must preserve. The release gate is the same scenario corpus against a real three-Node Riverbed, alongside language-specific unit tests. An `unsupported` result blocks a parity claim.
+The [versioned wire protocol](../sdk/spec/PROTOCOL.md) and [shared conformance corpus](../sdk/spec/conformance/README.md) define what every SDK must preserve. The release gate is the same scenario corpus against a real three-Node Riverbed, alongside language-specific unit tests. An `unsupported` result blocks a parity claim. The Rust SDK ships the corpus runner itself as `whitewater::conformance::ConformanceRunner`, so an application's own client instance can replay every fixture and report typed `ScenarioReport` outcomes.
 
 That distinction keeps the promise meaningful: a shared method name or a working demo is not enough. Supported operations must agree on results, retries, recovery, and failure behavior. New features need equivalent conformance evidence before they can be sold as available across all six languages.
 

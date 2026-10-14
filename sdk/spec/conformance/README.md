@@ -70,3 +70,9 @@ Scenarios run against a fresh Riverbed with the development admin key from
 `WHITEWATER_ADMIN_API_KEY` (default `whitewater-local-development-admin-key`).
 A runner creates its own Domain via `wcl` before use — never hardcode a
 pre-existing resource.
+
+The Rust SDK ships the reference runner as
+`whitewater::conformance::ConformanceRunner` — `run_scenario` executes one
+parsed fixture and `run_directory` a corpus directory, returning typed
+`ScenarioReport`s with explicit `unsupported` and per-step failure detail.
+`tests/sdk_conformance.rs` drives it against the verification topology.

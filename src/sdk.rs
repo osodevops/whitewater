@@ -252,6 +252,19 @@ impl Client {
         self
     }
 
+    /// A clone sharing transport, endpoint pool, and compression
+    /// preference but carrying a different API key — the conformance
+    /// runner uses it for scenario-level credential overrides.
+    pub fn with_api_key(&self, api_key: impl Into<String>) -> Self {
+        Self {
+            transport: self.transport.clone(),
+            bases: self.bases.clone(),
+            api_key: api_key.into(),
+            use_compression: self.use_compression,
+            cursor: self.cursor.clone(),
+        }
+    }
+
     fn base(&self) -> &str {
         let index = self
             .cursor

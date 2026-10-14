@@ -4,6 +4,7 @@ pub mod api;
 pub mod autoscale;
 pub mod codec;
 pub mod config;
+pub mod conformance;
 pub mod control;
 pub mod control_plane;
 pub mod cursor;
