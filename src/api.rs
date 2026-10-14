@@ -739,11 +739,21 @@ pub fn internal_mtls_router(state: AppState) -> Router {
     internal_routes(&state, false).with_state(state)
 }
 
+/// Wire protocol revision reported by `/health`; SDKs verify `major`
+/// before exercising operations (sdk/spec/PROTOCOL.md). Bumped only on
+/// incompatible wire changes — additive fields never increment it.
+#[derive(Serialize)]
+struct HealthProtocol {
+    major: u64,
+    minor: u64,
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
     node_id: String,
     members: usize,
+    protocol: HealthProtocol,
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -751,6 +761,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         status: "ok",
         node_id: state.membership.local().node_id.clone(),
         members: state.membership.members().await.len(),
+        protocol: HealthProtocol { major: 1, minor: 0 },
     })
 }
 

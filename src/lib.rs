@@ -16,6 +16,7 @@ pub mod internal_plane;
 pub mod membership;
 pub mod pipe;
 pub mod reader;
+pub mod sdk;
 pub mod state_store;
 pub mod storage;
 pub mod writer;
