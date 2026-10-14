@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -15,7 +16,22 @@ def wait_ready(endpoint):
     for _ in range(120):
         try:
             with urllib.request.urlopen(f"{endpoint}/health", timeout=3) as response:
-                if response.status == 200:
+                if response.status != 200:
+                    continue
+            request = urllib.request.Request(
+                f"{endpoint}/v1/admin/wcl",
+                data=json.dumps({"script": "SHOW DOMAINS;"}).encode(),
+                headers={
+                    "content-type": "application/json",
+                    "authorization": f"Bearer {KEY}",
+                },
+                method="POST",
+            )
+            # /health answers before Control Plane authority exists —
+            # fixtures issue WCL immediately, so readiness means a
+            # majority-committed catalog answers, not just the listener.
+            with urllib.request.urlopen(request, timeout=3) as wcl_reply:
+                if wcl_reply.status == 200:
                     return
         except Exception:
             pass
@@ -45,9 +61,18 @@ def main():
     if "skipping conformance corpus" in run.stdout + run.stderr:
         raise AssertionError("the conformance corpus skipped — env wiring failed")
     passed = (run.stdout + run.stderr).count("conformance ok")
-    if passed < 9:
-        raise AssertionError(f"only {passed}/9 fixtures reported ok; output above")
-    print(f"sdk conformance corpus green ({passed}/9 fixtures)")
+    fixtures = len(
+        [
+            name
+            for name in os.listdir(os.path.join(ROOT, "sdk", "spec", "conformance"))
+            if name.endswith(".json")
+        ]
+    )
+    if passed < fixtures:
+        raise AssertionError(
+            f"only {passed}/{fixtures} fixtures reported ok; output above"
+        )
+    print(f"sdk conformance corpus green ({passed}/{fixtures} fixtures)")
 
 
 if __name__ == "__main__":

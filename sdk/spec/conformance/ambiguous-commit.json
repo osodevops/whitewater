@@ -1,0 +1,95 @@
+{
+  "scenario": "ambiguous-commit",
+  "requires": ["admin.wcl", "writer.append", "feed.records"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN amb{{uniq}}; CREATE FEED amb{{uniq}}.events; CREATE WRITER wr{{uniq}} TO amb{{uniq}}.events; OPEN WRITER SESSION wr{{uniq}};"
+      },
+      "bind": "setup"
+    },
+    {
+      "op": "writer.append",
+      "args": {
+        "request_id": "{{uuid:amb1}}",
+        "writer": "wr{{uniq}}",
+        "session_epoch": "{{setup.results[3].data.session_epoch}}",
+        "key": {"utf8": "order-1"},
+        "payload": {"utf8": "committed"},
+        "event_time_ns": "1700000000000000001",
+        "metadata": {"source": {"utf8": "conformance"}}
+      },
+      "bind": "first",
+      "expect": {
+        "deduplicated": false,
+        "cursor": "!=null",
+        "message_id": "!=null"
+      }
+    },
+    {
+      "op": "writer.append",
+      "args": {
+        "request_id": "{{uuid:amb1}}",
+        "writer": "wr{{uniq}}",
+        "session_epoch": "{{setup.results[3].data.session_epoch}}",
+        "key": {"utf8": "order-1"},
+        "payload": {"utf8": "committed"},
+        "event_time_ns": "1700000000000000001",
+        "metadata": {"source": {"utf8": "conformance"}}
+      },
+      "bind": "retry",
+      "expect": {
+        "deduplicated": true,
+        "cursor": "==first.cursor",
+        "message_id": "==first.message_id"
+      }
+    },
+    {
+      "op": "writer.append",
+      "args": {
+        "request_id": "{{uuid:amb1}}",
+        "writer": "wr{{uniq}}",
+        "session_epoch": "{{setup.results[3].data.session_epoch}}",
+        "key": {"utf8": "order-1"},
+        "payload": {"utf8": "tampered"},
+        "event_time_ns": "1700000000000000001",
+        "metadata": {"source": {"utf8": "conformance"}}
+      },
+      "expect": {
+        "error_status": 409
+      }
+    },
+    {
+      "op": "writer.append",
+      "args": {
+        "request_id": "{{uuid}}",
+        "writer": "wr{{uniq}}",
+        "session_epoch": "{{setup.results[3].data.session_epoch}}",
+        "key": {"utf8": "order-1"},
+        "payload": {"utf8": "committed"},
+        "event_time_ns": "1700000000000000001",
+        "metadata": {"source": {"utf8": "conformance"}}
+      },
+      "bind": "second",
+      "expect": {
+        "deduplicated": false,
+        "cursor": "!=null",
+        "message_id": "!=null"
+      }
+    },
+    {
+      "op": "feed.records",
+      "args": {
+        "feed": "amb{{uniq}}.events",
+        "limit": 10
+      },
+      "expect": {
+        "records": "len>=2",
+        "records[0].cursor": "==first.cursor",
+        "records[1].cursor": "==second.cursor",
+        "records[2]": "absent"
+      }
+    }
+  ]
+}
