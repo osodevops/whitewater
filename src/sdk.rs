@@ -271,6 +271,32 @@ impl Client {
         Err(last)
     }
 
+    /// Raw protocol escape hatch for ops without a typed façade — the
+    /// same endpoint pool, bearer auth, and transport failure policy as
+    /// every call, but the caller owns argument encoding and reads the
+    /// raw `(status, body)` reply (including error statuses). The
+    /// conformance runner drives shared fixtures through this surface.
+    pub async fn wire(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<TransportReply, SdkError> {
+        let mut last = SdkError::Transport("no Node attempted".to_owned());
+        for _ in 0..self.bases.len() {
+            let base = self.base().to_owned();
+            match self
+                .transport
+                .request(&base, method, path, body, &self.api_key)
+                .await
+            {
+                Ok(reply) => return Ok(reply),
+                Err(error) => last = error,
+            }
+        }
+        Err(last)
+    }
+
     /// `GET /health` capability check: reports the server's protocol
     /// metadata; `check_compatible` turns a mismatched major into an
     /// explicit error instead of a silent capability gap.
