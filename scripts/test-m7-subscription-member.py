@@ -179,6 +179,42 @@ def main():
     status, state = get(ENDPOINTS[1], f"{members}/state?subscription={subscription}")
     if status != 200 or state["member_epochs"][member] != 2: raise AssertionError(state)
 
+    # Member-traffic demand attribution is Node-local: merge every Node's
+    # rows so the round-robin calls above all count, and the per-Domain
+    # rollup covers both Subscriptions in the Domain.
+    merged = {}
+    rollups = {}
+    for endpoint in ENDPOINTS:
+        status, demand = get(endpoint, "/v1/admin/demand/subscriptions")
+        if status != 200: raise AssertionError(demand)
+        for row in demand["subscriptions"]:
+            telemetry = row.get("telemetry") or {}
+            slot = merged.setdefault(row["subscription"], {})
+            for field, value in telemetry.items():
+                if isinstance(value, int):
+                    if field.startswith("last_") or field.endswith("_last") or field == "members_active":
+                        slot[field] = max(slot.get(field, 0), value)
+                    else:
+                        slot[field] = slot.get(field, 0) + value
+        for domain_name, rollup in demand["domains"].items():
+            slot = rollups.setdefault(domain_name, {})
+            for field, value in rollup.items():
+                if isinstance(value, int):
+                    if field == "subscriptions":
+                        slot[field] = max(slot.get(field, 0), value)
+                    else:
+                        slot[field] = slot.get(field, 0) + value
+    telemetry = merged.get(subscription, {})
+    if telemetry.get("joins", 0) < 4: raise AssertionError(f"joins {telemetry}")
+    if telemetry.get("claims", 0) < 3: raise AssertionError(f"claims {telemetry}")
+    if telemetry.get("fetches", 0) < 4: raise AssertionError(f"fetches {telemetry}")
+    if telemetry.get("fetch_records", 0) < 5: raise AssertionError(f"fetch_records {telemetry}")
+    if telemetry.get("acks", 0) < 2: raise AssertionError(f"acks {telemetry}")
+    if telemetry.get("transfers", 0) < 1: raise AssertionError(f"transfers {telemetry}")
+    rollup = rollups.get(domain, {})
+    if rollup.get("subscriptions", 0) < 2: raise AssertionError(f"domain rollup {rollup}")
+    phase("subscription demand attribution verified")
+
     # Killing Nodes one at a time: a replica loss never fails member calls,
     # and the owner kill is detected by the ownership_epoch bump the
     # endpoint's transparent recovery performs before serving the mutation.

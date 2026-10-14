@@ -720,6 +720,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/admin/demand/hot-keys", get(admin_hot_keys))
         .route("/v1/admin/demand/pipes", get(admin_pipe_demand))
+        .route(
+            "/v1/admin/demand/subscriptions",
+            get(admin_subscription_demand),
+        )
         .route("/v1/admin/control-plane", get(control_plane_status))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
@@ -1646,6 +1650,18 @@ async fn subscription_member_join(
             .map_err(subscription_progress_api_error)?;
         read_member_state(&coordinator).await?
     };
+    state.demand.record_subscription_op(
+        definition.subscription_id,
+        crate::demand::SubscriptionTrafficSample {
+            op: crate::demand::SubscriptionTrafficOp::Join,
+            records: 0,
+            ranges: 0,
+            quarantine_add: 0,
+            quarantine_remove: 0,
+            members: member_state.member_epochs.len() as u64,
+            sampled_at_ns: unix_ns(),
+        },
+    );
     let mut response = member_response(
         request.subscription,
         assignment.ownership_epoch,
@@ -1660,7 +1676,7 @@ async fn subscription_member_claim(
     Json(request): Json<SubscriptionMemberLeaseRequest>,
 ) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
     let lease_ticks = member_lease_ticks(request.lease_ticks)?;
-    let (coordinator, assignment, _definition) =
+    let (coordinator, assignment, definition) =
         member_coordinator_recovering(&state, &request.subscription).await?;
     let member_state = member_apply(
         &coordinator,
@@ -1673,6 +1689,18 @@ async fn subscription_member_claim(
         }],
     )
     .await?;
+    state.demand.record_subscription_op(
+        definition.subscription_id,
+        crate::demand::SubscriptionTrafficSample {
+            op: crate::demand::SubscriptionTrafficOp::Claim,
+            records: 0,
+            ranges: 0,
+            quarantine_add: 0,
+            quarantine_remove: 0,
+            members: member_state.member_epochs.len() as u64,
+            sampled_at_ns: unix_ns(),
+        },
+    );
     let mut response = member_response(
         request.subscription,
         assignment.ownership_epoch,
@@ -1691,7 +1719,7 @@ async fn subscription_member_renew(
     let lease_epoch = request.lease_epoch.ok_or_else(|| {
         ApiError::bad_request("lease_epoch is required to renew a Subscription member lease")
     })?;
-    let (coordinator, assignment, _definition) =
+    let (coordinator, assignment, definition) =
         member_coordinator_recovering(&state, &request.subscription).await?;
     let member_state = member_apply(
         &coordinator,
@@ -1705,6 +1733,18 @@ async fn subscription_member_renew(
         }],
     )
     .await?;
+    state.demand.record_subscription_op(
+        definition.subscription_id,
+        crate::demand::SubscriptionTrafficSample {
+            op: crate::demand::SubscriptionTrafficOp::Renew,
+            records: 0,
+            ranges: 0,
+            quarantine_add: 0,
+            quarantine_remove: 0,
+            members: member_state.member_epochs.len() as u64,
+            sampled_at_ns: unix_ns(),
+        },
+    );
     let mut response = member_response(
         request.subscription,
         assignment.ownership_epoch,
@@ -1719,7 +1759,7 @@ async fn subscription_member_release(
     State(state): State<AppState>,
     Json(request): Json<SubscriptionMemberReleaseRequest>,
 ) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
-    let (coordinator, assignment, _definition) =
+    let (coordinator, assignment, definition) =
         member_coordinator_recovering(&state, &request.subscription).await?;
     let member_state = member_apply(
         &coordinator,
@@ -1732,6 +1772,18 @@ async fn subscription_member_release(
         }],
     )
     .await?;
+    state.demand.record_subscription_op(
+        definition.subscription_id,
+        crate::demand::SubscriptionTrafficSample {
+            op: crate::demand::SubscriptionTrafficOp::Release,
+            records: 0,
+            ranges: 0,
+            quarantine_add: 0,
+            quarantine_remove: 0,
+            members: member_state.member_epochs.len() as u64,
+            sampled_at_ns: unix_ns(),
+        },
+    );
     let mut response = member_response(
         request.subscription,
         assignment.ownership_epoch,
@@ -1746,7 +1798,7 @@ async fn subscription_member_transfer(
     Json(request): Json<SubscriptionMemberTransferRequest>,
 ) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
     let lease_ticks = member_lease_ticks(request.lease_ticks)?;
-    let (coordinator, assignment, _definition) =
+    let (coordinator, assignment, definition) =
         member_coordinator_recovering(&state, &request.subscription).await?;
     let member_state = member_apply(
         &coordinator,
@@ -1761,6 +1813,18 @@ async fn subscription_member_transfer(
         }],
     )
     .await?;
+    state.demand.record_subscription_op(
+        definition.subscription_id,
+        crate::demand::SubscriptionTrafficSample {
+            op: crate::demand::SubscriptionTrafficOp::Transfer,
+            records: 0,
+            ranges: 0,
+            quarantine_add: 0,
+            quarantine_remove: 0,
+            members: member_state.member_epochs.len() as u64,
+            sampled_at_ns: unix_ns(),
+        },
+    );
     let mut response = member_response(
         request.subscription,
         assignment.ownership_epoch,
@@ -1775,7 +1839,7 @@ async fn subscription_member_ack(
     State(state): State<AppState>,
     Json(request): Json<SubscriptionMemberAckRequest>,
 ) -> Result<Json<SubscriptionMemberResponse>, ApiError> {
-    let (coordinator, assignment, _definition) =
+    let (coordinator, assignment, definition) =
         member_coordinator_recovering(&state, &request.subscription).await?;
     match (request.cursor, request.positions) {
         (Some(cursor), Some(positions)) => {
@@ -1824,6 +1888,13 @@ async fn subscription_member_ack(
                 .await?
                 .last_tick
                 .saturating_add(1);
+            let ack_ranges = positions.len() as u64;
+            let quarantine_add = request.quarantine.as_ref().map_or(0_u64, |delta| {
+                delta.values().map(Vec::len).sum::<usize>() as u64
+            });
+            let quarantine_remove = request.release_quarantine.as_ref().map_or(0_u64, |delta| {
+                delta.values().map(Vec::len).sum::<usize>() as u64
+            });
             coordinator
                 .acknowledge(
                     &grant,
@@ -1839,6 +1910,18 @@ async fn subscription_member_ack(
                 .await
                 .map_err(subscription_progress_api_error)?;
             let member_state = read_member_state(&coordinator).await?;
+            state.demand.record_subscription_op(
+                definition.subscription_id,
+                crate::demand::SubscriptionTrafficSample {
+                    op: crate::demand::SubscriptionTrafficOp::Ack,
+                    records: 0,
+                    ranges: ack_ranges,
+                    quarantine_add,
+                    quarantine_remove,
+                    members: member_state.member_epochs.len() as u64,
+                    sampled_at_ns: unix_ns(),
+                },
+            );
             let mut response = member_response(
                 request.subscription,
                 assignment.ownership_epoch,
@@ -1859,6 +1942,18 @@ async fn subscription_member_ack(
                 }],
             )
             .await?;
+            state.demand.record_subscription_op(
+                definition.subscription_id,
+                crate::demand::SubscriptionTrafficSample {
+                    op: crate::demand::SubscriptionTrafficOp::Release,
+                    records: 0,
+                    ranges: 0,
+                    quarantine_add: 0,
+                    quarantine_remove: 0,
+                    members: member_state.member_epochs.len() as u64,
+                    sampled_at_ns: unix_ns(),
+                },
+            );
             let mut response = member_response(
                 request.subscription,
                 assignment.ownership_epoch,
@@ -1956,6 +2051,7 @@ async fn subscription_member_fetch(
                     .saturating_add(i64::try_from(delay).unwrap_or(i64::MAX))
                     .to_string()
             });
+    let delivered_records = delivered.len() as u64;
     let cursor = delivered.last().map(|(cursor, _)| cursor.clone());
     let source = record_source_by_id(&state, frontier.feed_id).await;
     let records = delivered
@@ -1970,6 +2066,18 @@ async fn subscription_member_fetch(
             )
         })
         .collect();
+    state.demand.record_subscription_op(
+        definition.subscription_id,
+        crate::demand::SubscriptionTrafficSample {
+            op: crate::demand::SubscriptionTrafficOp::Fetch,
+            records: delivered_records,
+            ranges: 0,
+            quarantine_add: 0,
+            quarantine_remove: 0,
+            members: members.member_epochs.len() as u64,
+            sampled_at_ns: unix_ns(),
+        },
+    );
     Ok(Json(SubscriptionMemberFetchResponse {
         request_id: request.request_id,
         records,
@@ -2216,6 +2324,18 @@ async fn subscription_seek(
         .apply(mutation)
         .await
         .map_err(subscription_progress_api_error)?;
+    state.demand.record_subscription_op(
+        definition.subscription_id,
+        crate::demand::SubscriptionTrafficSample {
+            op: crate::demand::SubscriptionTrafficOp::Seek,
+            records: 0,
+            ranges: 0,
+            quarantine_add: 0,
+            quarantine_remove: 0,
+            members: members.member_epochs.len() as u64,
+            sampled_at_ns: unix_ns(),
+        },
+    );
     Ok(Json(SubscriptionSeekResponse {
         request_id: request.request_id,
         cursor: seek_cursor,
@@ -8778,6 +8898,78 @@ async fn admin_pipe_demand(
         "node": state.storage_node_id,
         "scope": "node-local since process start; a compute-lease move restarts attribution on the new owner",
         "pipes": rows,
+        "domains": domains,
+    })))
+}
+
+/// Per-Subscription member-traffic attribution on this Node. Counters are
+/// Node-local since process start: a progress-placement move serves members
+/// on the new owner rather than pretending a portable counter.
+async fn admin_subscription_demand(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let subscriptions = state.control.active_subscriptions().await;
+    let live: std::collections::BTreeSet<Uuid> = subscriptions
+        .iter()
+        .map(|subscription| subscription.subscription_id)
+        .collect();
+    state.demand.prune_subscription_traffic(&live);
+    let telemetry = state.demand.subscription_traffic();
+    let mut domains: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut rows = Vec::with_capacity(subscriptions.len());
+    for subscription in &subscriptions {
+        let domain = state
+            .control
+            .active_domain_name(subscription.space_id)
+            .await
+            .unwrap_or_else(|| subscription.space_id.to_string());
+        let telemetry = telemetry.get(&subscription.subscription_id);
+        let row = json!({
+            "subscription": subscription.name,
+            "domain": domain,
+            "stage": subscription.stage,
+            "telemetry": telemetry,
+        });
+        let rollup = domains.entry(domain).or_insert_with(|| {
+            json!({
+                "subscriptions": 0, "requests": 0, "joins": 0, "claims": 0,
+                "renews": 0, "releases": 0, "transfers": 0, "fetches": 0,
+                "fetch_records": 0, "acks": 0, "ack_ranges": 0,
+                "quarantined_records": 0, "released_quarantined_records": 0,
+                "seeks": 0,
+            })
+        });
+        rollup["subscriptions"] = json!(rollup["subscriptions"].as_u64().unwrap_or(0) + 1);
+        if let Some(t) = telemetry {
+            for (field, value) in [
+                ("requests", t.requests),
+                ("joins", t.joins),
+                ("claims", t.claims),
+                ("renews", t.renews),
+                ("releases", t.releases),
+                ("transfers", t.transfers),
+                ("fetches", t.fetches),
+                ("fetch_records", t.fetch_records),
+                ("acks", t.acks),
+                ("ack_ranges", t.ack_ranges),
+                ("quarantined_records", t.quarantined_records),
+                (
+                    "released_quarantined_records",
+                    t.released_quarantined_records,
+                ),
+                ("seeks", t.seeks),
+            ] {
+                rollup[field] = json!(rollup[field].as_u64().unwrap_or(0) + value);
+            }
+        }
+        rows.push(row);
+    }
+    Ok(Json(json!({
+        "node": state.storage_node_id,
+        "scope": "node-local since process start; a progress-placement move restarts attribution on the new owner",
+        "subscriptions": rows,
         "domains": domains,
     })))
 }
@@ -17545,6 +17737,36 @@ mod tests {
             .unwrap()
             .iter()
             .all(|replica| replica["reachable"] == json!(true)));
+
+        // Member-traffic demand attribution reports per-Subscription op
+        // counters and a per-Domain rollup on the serving Node.
+        let response = client
+            .get(format!(
+                "{}/v1/admin/demand/subscriptions",
+                endpoints[&nodes[0]]
+            ))
+            .header("authorization", "Bearer this-is-a-long-development-api-key")
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let rows = body["subscriptions"].as_array().unwrap();
+        let fresh = rows
+            .iter()
+            .find(|row| row["subscription"] == json!("orders.fresh"))
+            .unwrap();
+        let telemetry = &fresh["telemetry"];
+        assert!(telemetry["requests"].as_u64().unwrap() >= 3, "{telemetry}");
+        assert!(telemetry["joins"].as_u64().unwrap() >= 1, "{telemetry}");
+        assert!(telemetry["claims"].as_u64().unwrap() >= 1, "{telemetry}");
+        assert!(telemetry["fetches"].as_u64().unwrap() >= 1, "{telemetry}");
+        assert_eq!(telemetry["fetch_records"], json!(4));
+        assert_eq!(telemetry["last_op"], json!("fetch"));
+        let orders = &body["domains"]["orders"];
+        assert!(orders["subscriptions"].as_u64().unwrap() >= 3, "{orders}");
+        assert!(orders["fetch_records"].as_u64().unwrap() >= 4, "{orders}");
 
         // A lost progress owner leaves member reads on surviving quorum
         // evidence while the next mutation transparently recovers placement

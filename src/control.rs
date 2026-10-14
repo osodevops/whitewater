@@ -1831,6 +1831,17 @@ impl ControlController {
             .cloned()
     }
 
+    pub async fn active_subscriptions(&self) -> Vec<SubscriptionDefinition> {
+        self.state
+            .lock()
+            .await
+            .subscriptions
+            .values()
+            .filter(|subscription| subscription.status == ResourceStatus::Active)
+            .cloned()
+            .collect()
+    }
+
     pub async fn active_subscription_by_name(&self, name: &str) -> Option<SubscriptionDefinition> {
         self.state
             .lock()

@@ -446,6 +446,42 @@
       "errors": []
     },
     {
+      "op": "admin.demand.subscriptions",
+      "method": "GET",
+      "path": "/v1/admin/demand/subscriptions",
+      "auth": "admin",
+      "response": {
+        "node": "string",
+        "scope": "node-local since process start",
+        "subscriptions": [
+          {
+            "subscription": "name",
+            "domain": "name",
+            "telemetry": {
+              "requests": "u64",
+              "joins": "u64",
+              "claims": "u64",
+              "renews": "u64",
+              "releases": "u64",
+              "transfers": "u64",
+              "fetches": "u64",
+              "fetch_records": "u64",
+              "acks": "u64",
+              "ack_ranges": "u64",
+              "quarantined_records": "u64",
+              "released_quarantined_records": "u64",
+              "seeks": "u64",
+              "members_active": "u64",
+              "last_op": "string|null",
+              "last_op_at_ns": "i64|null"
+            }
+          }
+        ],
+        "domains": "per-domain counter rollups"
+      },
+      "errors": []
+    },
+    {
       "op": "admin.subscriptions.progress",
       "method": "GET",
       "path": "/v1/admin/subscriptions/progress?subscription=<name>",

@@ -27,6 +27,7 @@ struct DemandCounters {
     range_totals: Mutex<BTreeMap<RangeId, RangeAppendWindow>>,
     hot_keys: Mutex<BTreeMap<RangeId, (HotKeyEvidence, std::time::Instant)>>,
     pipe_drives: Mutex<BTreeMap<uuid::Uuid, PipeDriveTelemetry>>,
+    subscription_traffic: Mutex<BTreeMap<uuid::Uuid, SubscriptionTrafficTelemetry>>,
 }
 
 #[derive(Default)]
@@ -252,6 +253,68 @@ impl DemandMetrics {
         }
     }
 
+    /// Fold one successfully served Subscription member/admin request into
+    /// the durable Node-local attribution row. Replayed request identities
+    /// count too: the request still cost a quorum read even when it applied
+    /// no new mutation.
+    pub fn record_subscription_op(
+        &self,
+        subscription_id: uuid::Uuid,
+        sample: SubscriptionTrafficSample,
+    ) {
+        let Ok(mut traffic) = self.inner.subscription_traffic.lock() else {
+            return;
+        };
+        let telemetry = traffic.entry(subscription_id).or_default();
+        telemetry.requests = telemetry.requests.saturating_add(1);
+        match sample.op {
+            SubscriptionTrafficOp::Join => telemetry.joins = telemetry.joins.saturating_add(1),
+            SubscriptionTrafficOp::Claim => telemetry.claims = telemetry.claims.saturating_add(1),
+            SubscriptionTrafficOp::Renew => telemetry.renews = telemetry.renews.saturating_add(1),
+            SubscriptionTrafficOp::Release => {
+                telemetry.releases = telemetry.releases.saturating_add(1)
+            }
+            SubscriptionTrafficOp::Transfer => {
+                telemetry.transfers = telemetry.transfers.saturating_add(1)
+            }
+            SubscriptionTrafficOp::Fetch => {
+                telemetry.fetches = telemetry.fetches.saturating_add(1);
+                telemetry.fetch_records = telemetry.fetch_records.saturating_add(sample.records);
+            }
+            SubscriptionTrafficOp::Ack => {
+                telemetry.acks = telemetry.acks.saturating_add(1);
+                telemetry.ack_ranges = telemetry.ack_ranges.saturating_add(sample.ranges);
+                telemetry.quarantined_records = telemetry
+                    .quarantined_records
+                    .saturating_add(sample.quarantine_add);
+                telemetry.released_quarantined_records = telemetry
+                    .released_quarantined_records
+                    .saturating_add(sample.quarantine_remove);
+            }
+            SubscriptionTrafficOp::Seek => telemetry.seeks = telemetry.seeks.saturating_add(1),
+        }
+        telemetry.members_active = sample.members;
+        telemetry.last_op = Some(sample.op.label());
+        telemetry.last_op_at_ns = Some(sample.sampled_at_ns);
+    }
+
+    /// A consistent snapshot of per-Subscription attribution rows on this
+    /// Node.
+    pub fn subscription_traffic(&self) -> BTreeMap<uuid::Uuid, SubscriptionTrafficTelemetry> {
+        self.inner
+            .subscription_traffic
+            .lock()
+            .map(|traffic| traffic.clone())
+            .unwrap_or_default()
+    }
+
+    /// Drop attribution rows for Subscriptions that no longer exist.
+    pub fn prune_subscription_traffic(&self, live: &std::collections::BTreeSet<uuid::Uuid>) {
+        if let Ok(mut traffic) = self.inner.subscription_traffic.lock() {
+            traffic.retain(|subscription_id, _| live.contains(subscription_id));
+        }
+    }
+
     pub fn record_read(&self, records: usize) {
         self.inner.reads_total.fetch_add(1, Ordering::Relaxed);
         self.inner
@@ -334,6 +397,73 @@ pub struct PipeDriveTelemetry {
     pub last_drive_at_ns: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+}
+
+/// One served member/admin request against a Subscription — the op plus
+/// the evidence that rides it (delivered records, acked ranges, quarantine
+/// deltas, and the member gauge observed when it committed).
+pub struct SubscriptionTrafficSample {
+    pub op: SubscriptionTrafficOp,
+    pub records: u64,
+    pub ranges: u64,
+    pub quarantine_add: u64,
+    pub quarantine_remove: u64,
+    pub members: u64,
+    pub sampled_at_ns: i64,
+}
+
+/// The member/admin verbs a Subscription serves.
+#[derive(Clone, Copy, Debug)]
+pub enum SubscriptionTrafficOp {
+    Join,
+    Claim,
+    Renew,
+    Release,
+    Transfer,
+    Fetch,
+    Ack,
+    Seek,
+}
+
+impl SubscriptionTrafficOp {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Join => "join",
+            Self::Claim => "claim",
+            Self::Renew => "renew",
+            Self::Release => "release",
+            Self::Transfer => "transfer",
+            Self::Fetch => "fetch",
+            Self::Ack => "ack",
+            Self::Seek => "seek",
+        }
+    }
+}
+
+/// Per-Subscription member-traffic attribution on this Node since process
+/// start — the honest scope, because progress-placement movement serves
+/// members on the new owner rather than pretending counters are portable.
+/// `requests` counts every successfully served member/admin request,
+/// including request-id replays that apply no new mutation.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct SubscriptionTrafficTelemetry {
+    pub requests: u64,
+    pub joins: u64,
+    pub claims: u64,
+    pub renews: u64,
+    pub releases: u64,
+    pub transfers: u64,
+    pub fetches: u64,
+    pub fetch_records: u64,
+    pub acks: u64,
+    pub ack_ranges: u64,
+    pub quarantined_records: u64,
+    pub released_quarantined_records: u64,
+    pub seeks: u64,
+    pub members_active: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_op: Option<&'static str>,
+    pub last_op_at_ns: Option<i64>,
 }
 
 /// Per-range bounded distinct-Key tracking budget. Windows holding more
@@ -913,6 +1043,70 @@ mod tests {
         metrics.prune_pipe_drives(&live);
         let telemetry = metrics.pipe_drive_telemetry();
         assert!(telemetry.contains_key(&pipe));
+        assert!(!telemetry.contains_key(&dropped));
+    }
+
+    #[test]
+    fn subscription_traffic_aggregates_ops_and_prunes_dropped_subscriptions() {
+        let metrics = DemandMetrics::default();
+        let subscription = uuid::Uuid::from_u128(8_001);
+        let dropped = uuid::Uuid::from_u128(8_002);
+        let sample = |op, records, ranges, add, remove, members| SubscriptionTrafficSample {
+            op,
+            records,
+            ranges,
+            quarantine_add: add,
+            quarantine_remove: remove,
+            members,
+            sampled_at_ns: 77,
+        };
+        metrics.record_subscription_op(
+            subscription,
+            sample(SubscriptionTrafficOp::Join, 0, 0, 0, 0, 1),
+        );
+        metrics.record_subscription_op(
+            subscription,
+            sample(SubscriptionTrafficOp::Claim, 0, 0, 0, 0, 1),
+        );
+        metrics.record_subscription_op(
+            subscription,
+            sample(SubscriptionTrafficOp::Fetch, 12, 0, 0, 0, 1),
+        );
+        metrics.record_subscription_op(
+            subscription,
+            sample(SubscriptionTrafficOp::Fetch, 8, 0, 0, 0, 1),
+        );
+        metrics.record_subscription_op(
+            subscription,
+            sample(SubscriptionTrafficOp::Ack, 0, 2, 3, 1, 1),
+        );
+        metrics.record_subscription_op(
+            subscription,
+            sample(SubscriptionTrafficOp::Seek, 0, 0, 0, 0, 0),
+        );
+        metrics.record_subscription_op(dropped, sample(SubscriptionTrafficOp::Join, 0, 0, 0, 0, 1));
+
+        let telemetry = metrics.subscription_traffic();
+        let row = telemetry.get(&subscription).unwrap();
+        assert_eq!(row.requests, 6);
+        assert_eq!(row.joins, 1);
+        assert_eq!(row.claims, 1);
+        assert_eq!(row.fetches, 2);
+        assert_eq!(row.fetch_records, 20);
+        assert_eq!(row.acks, 1);
+        assert_eq!(row.ack_ranges, 2);
+        assert_eq!(row.quarantined_records, 3);
+        assert_eq!(row.released_quarantined_records, 1);
+        assert_eq!(row.seeks, 1);
+        assert_eq!(row.members_active, 0);
+        assert_eq!(row.last_op, Some("seek"));
+        assert_eq!(row.last_op_at_ns, Some(77));
+
+        // Dropped Subscriptions leave no attribution residue.
+        let live = std::collections::BTreeSet::from([subscription]);
+        metrics.prune_subscription_traffic(&live);
+        let telemetry = metrics.subscription_traffic();
+        assert!(telemetry.contains_key(&subscription));
         assert!(!telemetry.contains_key(&dropped));
     }
 }
