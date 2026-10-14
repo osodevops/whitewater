@@ -804,6 +804,16 @@ Persist those exports in `~/.zshrc` or the shell's equivalent. Use a secret mana
 
 Endpoint failover is safe for the standard three-Node Riverbed because every Node routes through one replicated Control Plane. Nodes deliberately started without Control Plane configuration report `local_prototype`; do not mix those isolated test Nodes into an endpoint list.
 
+### Appending records with `wcl-cli write`
+
+`wcl-cli write` posts the same `/v1/writers/append` data-API request as `wwctl write` and the SDKs. A declared Writer session is required first (`OPEN WRITER SESSION` returns the epoch):
+
+```powershell
+wcl-cli write -Writer orders.app -SessionEpoch 3 -Key order-42 -Payload 'total=99'
+```
+
+Optional inputs mirror `wwctl write`: `-RequestId <uuid>` pins the idempotency id (a fresh one is generated otherwise), `-EventTimeNs <signed-ns>` sets the record's event time, `-KeyBase64` supplies a binary key, `-PayloadBase64`/`-PayloadFile`/`-PayloadStdin` are alternate payload sources (exactly one payload source is required), and `-Metadata 'name=base64'` attaches record Metadata. If every endpoint fails, the error names the request_id — retry the same id and the server deduplicates rather than double-committing.
+
 ## Any language can use the API
 
 JavaScript:

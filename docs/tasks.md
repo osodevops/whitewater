@@ -1152,7 +1152,7 @@ Autoscaling must never apply one generic removal procedure to all three cases.
 
 - [x] Add server feedback fields for recommended batch bytes/count, pressure, retry delay, and maximum accepted frame size without exposing physical topology.
 
-- [~] Add Writer CLI frontends: `wwctl write` is complete; the standalone PowerShell `wcl-cli write` wrapper remains.
+- [x] Add Writer CLI frontends: `wwctl write` and the standalone PowerShell `wcl-cli write` wrapper both ship. The `write` subcommand in `scripts/wcl-cli.ps1` posts the identical `WriterSessionAppendRequest` wire shape to `/v1/writers/append` (`-Writer`/`-SessionEpoch` required; `-Key`/`-KeyBase64`, `-Payload`/`-PayloadBase64`/`-PayloadFile`/`-PayloadStdin` exactly-one-source validation; `-EventTimeNs` signed-nanoseconds string; `-Metadata name=base64`; `-RequestId` caller idempotency) with the same multi-endpoint failover as the WCL path — an ambiguous outcome names the request_id and instructs retry-the-same-id to deduplicate. Live evidence: `scripts/test-wcl-cli-write.py` appends through a real three-Node Riverbed, proves identical-request_id dedup on a second endpoint, reads the exact record bytes back via temporary fetch, and asserts validation refuses before wire traffic.
 
 - [x] Add text/base64 key and payload, file, stdin, binary, Metadata, event-time, request-ID, and JSON response options to `wwctl write`.
 
@@ -1201,7 +1201,7 @@ Definition of Done:
 
 - [x] Ambiguous retry returns original MessageId and Cursor.
 
-- [~] Rust SDK and `wwctl write` use the same data API; PowerShell `wcl-cli write` remains.
+- [x] Rust SDK and `wwctl write` use the same data API; the PowerShell `wcl-cli write` wrapper posts the identical `/v1/writers/append` contract — `scripts/test-wcl-cli-write.py` proves the wire shape, request_id dedup replay, and read-back against a live three-Node Riverbed.
 
 
 
