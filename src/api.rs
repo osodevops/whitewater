@@ -6610,6 +6610,85 @@ fn verify_reader_frontier_result(
     Ok(())
 }
 
+/// Replay the exact page a duplicate `fetch_request_id` already committed:
+/// the persisted `previous`/`delivered` positions bracket the last fetch and
+/// `last_fetch_limit` its bound, so re-reading immutable history must yield
+/// the same frames and the same deterministic progress token. A retry after
+/// an ambiguous transport failure therefore observes the identical page
+/// instead of a forced session reopen. If placement moved or the proof does
+/// not hold, the caller gets the original reopen instruction rather than a
+/// silently different page.
+async fn replay_reader_fetch(
+    state: &AppState,
+    reader: &crate::control::ReaderDefinition,
+    feed_name: &str,
+    request: &ReaderFetchRequest,
+) -> Result<Json<ReaderFetchResponse>, ApiError> {
+    let reopen = || {
+        ApiError::unavailable(
+            "Reader fetch request already delivered; reopen the session to replay unacknowledged progress",
+        )
+    };
+    let frontier = state
+        .control
+        .active_reader_frontier(reader.reader_id)
+        .await
+        .filter(|value| value.last_fetch_request_id == Some(request.request_id))
+        .ok_or_else(reopen)?;
+    if frontier.last_fetch_limit == 0 || frontier.delivered.is_empty() {
+        return Err(reopen());
+    }
+    let (frames, progress) = read_reader_frontier(
+        state,
+        reader.feed_id,
+        feed_name,
+        &frontier.previous,
+        frontier.last_fetch_limit,
+    )
+    .await?;
+    if frames.is_empty() || progress != frontier.delivered {
+        return Err(reopen());
+    }
+    let fresh = state
+        .control
+        .active_reader_by_name(&reader.name)
+        .await
+        .unwrap_or_else(|| reader.clone());
+    let source = record_source_by_id(state, reader.feed_id).await;
+    let records = frames
+        .into_iter()
+        .map(|item| {
+            decode_record(&item.frame).map(|record| {
+                record_response(
+                    CursorRecord {
+                        cursor: item.cursor,
+                        record,
+                    },
+                    source.clone(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    state.demand.record_read(records.len());
+    let pressure = (state.demand.snapshot().requests_in_flight as f64 / 100.0).clamp(0.0, 1.0);
+    Ok(Json(ReaderFetchResponse {
+        records,
+        delivered_cursor: Some(reader_frontier_cursor(
+            reader.reader_id,
+            request.session_epoch,
+            request.request_id,
+        )),
+        acknowledged_cursor: fresh.acknowledged_cursor,
+        recommended_capacity: if pressure > 0.75 {
+            fresh.session_capacity.min(16)
+        } else {
+            fresh.session_capacity
+        },
+        retry_after_ms: if pressure > 0.9 { 50 } else { 0 },
+    }))
+}
+
 async fn reader_fetch(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -6654,7 +6733,7 @@ async fn reader_fetch(
         .and_then(|value| value.last_fetch_request_id)
         == Some(request.request_id)
     {
-        return Err(ApiError::unavailable("Reader fetch request already delivered; reopen the session to replay unacknowledged progress"));
+        return replay_reader_fetch(&state, &reader, &feed.name, &request).await;
     }
     let limit = request
         .limit
@@ -6755,18 +6834,31 @@ async fn reader_fetch(
                 cursor,
             }
         };
-        let execution = execute_reader_command(&state, command, request.request_id)
-            .await
-            .map_err(|error| {
-                if expected_frontier.is_some() && error.status == StatusCode::BAD_REQUEST {
-                    ApiError::unavailable(format!(
+        let execution = match execute_reader_command(&state, command, request.request_id).await {
+            Ok(execution) => execution,
+            Err(error) => {
+                if expected_frontier.is_some() {
+                    // A duplicate racing the same fetch_request_id loses the
+                    // frontier commit after the winner landed; re-derive the
+                    // stored page instead of refusing when it proves identical.
+                    if let Ok(response) =
+                        replay_reader_fetch(&state, &reader, &feed.name, &request).await
+                    {
+                        return Ok(response);
+                    }
+                }
+                return Err(
+                    if expected_frontier.is_some() && error.status == StatusCode::BAD_REQUEST {
+                        ApiError::unavailable(format!(
                         "Reader progress was not committed; reopen the session to retry safely: {}",
                         error.message
                     ))
-                } else {
-                    error
-                }
-            })?;
+                    } else {
+                        error
+                    },
+                );
+            }
+        };
         if let Some(positions) = expected_frontier {
             verify_reader_frontier_result(
                 &execution,

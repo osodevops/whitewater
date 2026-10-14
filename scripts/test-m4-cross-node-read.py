@@ -217,6 +217,29 @@ def main():
         })
         if status != 200 or [row["cursor"] for row in second_next["records"]] != cursors[5:10]:
             raise AssertionError(f"second Reader did not continue independently: {second_next}")
+        # A retried fetch carrying the same request_id replays the identical
+        # page and deterministic progress token — even on a different ingress
+        # Node — instead of forcing a session reopen after an ambiguous
+        # transport failure.
+        replay_id = str(uuid.uuid4())
+        status, first_page = post(ingress, "/v1/readers/fetch", {
+            "request_id": replay_id, "reader": second_name,
+            "session_epoch": second_open["session_epoch"], "limit": 2,
+        })
+        if status != 200 or len(first_page["records"]) != 2:
+            raise AssertionError(first_page)
+        status, replayed = post(reopened_ingress, "/v1/readers/fetch", {
+            "request_id": replay_id, "reader": second_name,
+            "session_epoch": second_open["session_epoch"], "limit": 2,
+        })
+        if status != 200 or replayed["records"] != first_page["records"] or replayed["delivered_cursor"] != first_page["delivered_cursor"]:
+            raise AssertionError(f"replayed fetch returned a different page: {replayed}")
+        status, continued = post(ingress, "/v1/readers/fetch", {
+            "request_id": str(uuid.uuid4()), "reader": second_name,
+            "session_epoch": second_open["session_epoch"], "limit": 5,
+        })
+        if status != 200 or [row["cursor"] for row in continued["records"]] != cursors[12:17]:
+            raise AssertionError(f"Reader did not continue after replay: {continued}")
         status, temporary = post(ingress, "/v1/readers/temporary/fetch", {
             "feed": feed, "after": cursors[10], "limit": 100,
         })
