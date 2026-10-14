@@ -40,7 +40,25 @@ async fn shared_conformance_corpus() {
         bases,
         ADMIN_KEY,
     );
-    let runner = ConformanceRunner::new(client);
+    let mut runner = ConformanceRunner::new(client);
+    if let Ok(command) = std::env::var("WHITEWATER_CHAOS_CMD") {
+        // The driving script names a command that performs a fault action
+        // and returns only once the Riverbed is usable again (restart +
+        // health re-gate). Without it, `chaos.*` steps report unsupported.
+        runner = runner.with_chaos_hook(Arc::new(move |action| {
+            let shell = if cfg!(windows) { "cmd" } else { "sh" };
+            let flag = if cfg!(windows) { "/C" } else { "-c" };
+            let status = std::process::Command::new(shell)
+                .arg(flag)
+                .arg(format!("{command} {action}"))
+                .status()
+                .map_err(|error| format!("chaos command failed to start: {error}"))?;
+            status
+                .success()
+                .then_some(())
+                .ok_or_else(|| format!("chaos command exited {status}"))
+        }));
+    }
 
     let reports = runner.run_directory(&directory).await;
     assert!(

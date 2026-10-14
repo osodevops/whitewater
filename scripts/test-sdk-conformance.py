@@ -46,6 +46,10 @@ def main():
     env = dict(os.environ)
     env["WHITEWATER_SDK_NODES"] = ",".join(ENDPOINTS)
     env["WHITEWATER_ADMIN_API_KEY"] = KEY
+    # `chaos.*` steps shell out to the driver, which performs the fault and
+    # re-gates on majority-committed WCL before returning — fixtures carry
+    # no timing waits.
+    env["WHITEWATER_CHAOS_CMD"] = f"{sys.executable} {os.path.join(ROOT, 'scripts', 'chaos_driver.py')}"
     run = subprocess.run(
         ["cargo", "test", "--test", "sdk_conformance", "--", "--nocapture"],
         cwd=ROOT,

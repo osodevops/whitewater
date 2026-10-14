@@ -53,11 +53,31 @@ impl ScenarioReport {
 /// wire statuses and codes the typed facades map away.
 pub struct ConformanceRunner {
     client: Client,
+    chaos_hook: Option<ChaosHook>,
 }
+
+/// Driver-injected fault action: `chaos.<action>` steps call it with
+/// the action name and the step passes when it returns `Ok`. The hook
+/// owns the meaning of each action (restart a Node, partition, pause)
+/// and must not return until the Riverbed is usable again — fixtures
+/// intentionally carry no timing waits.
+pub type ChaosHook = std::sync::Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 impl ConformanceRunner {
     pub fn new(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            chaos_hook: None,
+        }
+    }
+
+    /// Install the driver-provided fault executor for `chaos.*` steps.
+    /// Without one, a scenario listing `chaos.*` ops reports
+    /// `unsupported` — the corpus contract requires explicit reporting
+    /// rather than a silent skip.
+    pub fn with_chaos_hook(mut self, hook: ChaosHook) -> Self {
+        self.chaos_hook = Some(hook);
+        self
     }
 
     /// Run one parsed scenario: `{ "api_key"?: string, "steps": [...] }`.
@@ -85,6 +105,39 @@ impl ConformanceRunner {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_owned();
+            if op.starts_with("chaos.") {
+                // A chaos step binds nothing and has no expect: its only
+                // outcome is the hook returning or reporting failure.
+                match &self.chaos_hook {
+                    Some(hook) => match hook(&op) {
+                        Ok(()) => continue,
+                        Err(message) => {
+                            return ScenarioReport {
+                                name,
+                                failure: Some(ScenarioFailure {
+                                    step: index,
+                                    op,
+                                    unsupported: false,
+                                    status: None,
+                                    message,
+                                }),
+                            }
+                        }
+                    },
+                    None => {
+                        return ScenarioReport {
+                            name,
+                            failure: Some(ScenarioFailure {
+                                step: index,
+                                op,
+                                unsupported: true,
+                                status: None,
+                                message: "no chaos hook installed".to_owned(),
+                            }),
+                        }
+                    }
+                }
+            }
             if endpoint(&op).is_none() && !matches!(op.as_str(), "feed.records" | "health") {
                 return ScenarioReport {
                     name,
@@ -585,6 +638,49 @@ mod tests {
         assert_eq!(requests[0].1, "/v1/admin/wcl");
         assert!(requests[1].1.starts_with("/v1/feeds/records?feed=sdk"));
         assert!(requests[1].1.contains("after=abc%3B123"));
+    }
+
+    #[tokio::test]
+    async fn runner_dispatches_chaos_steps_through_the_hook() {
+        let actions = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (base, _) = runner(vec![(200, json!({"results": []}))]);
+        let seen = actions.clone();
+        let hooked = base.with_chaos_hook(std::sync::Arc::new(move |action| {
+            seen.lock().unwrap().push(action.to_owned());
+            Ok(())
+        }));
+        let report = hooked
+            .run_scenario(
+                "c",
+                &json!({"steps": [
+                    {"op": "chaos.restart"},
+                    {"op": "wcl", "args": {"script": "SHOW FEEDS;"}, "expect": {"results": []}}
+                ]}),
+            )
+            .await;
+        assert!(report.passed(), "{report:?}");
+        assert_eq!(*actions.lock().unwrap(), vec!["chaos.restart".to_owned()]);
+
+        // Without a hook the same op reports unsupported explicitly.
+        let (unhooked, _) = runner(vec![]);
+        let report = unhooked
+            .run_scenario("u", &json!({"steps": [{"op": "chaos.restart"}]}))
+            .await;
+        let failure = report.failure.expect("unsupported reported");
+        assert!(failure.unsupported);
+        assert!(failure.message.contains("no chaos hook"));
+
+        // A hook failure surfaces as a normal step failure.
+        let (base, _) = runner(vec![]);
+        let failing = base.with_chaos_hook(std::sync::Arc::new(|_| {
+            Err("riverbed never came back".to_owned())
+        }));
+        let report = failing
+            .run_scenario("f", &json!({"steps": [{"op": "chaos.restart"}]}))
+            .await;
+        let failure = report.failure.expect("chaos failure reported");
+        assert!(!failure.unsupported);
+        assert_eq!(failure.message, "riverbed never came back");
     }
 
     #[tokio::test]
