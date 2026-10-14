@@ -525,9 +525,15 @@ Feeds; `POST /v1/subscriptions/seek` needs `manage` on the source.
 StateStore reads (`/v1/state-stores/lookup`, `/get-by`, `/iterate`)
 need `read` and mutations (`/mutate`, `/clear`, `/sync`, `/rebuild`)
 need `write` on the store's own name; `POST /v1/indexes/query` needs
-`read` on the Index's name. Explicit deny and WCL-side grant
-enforcement on Subscription declaration and lifecycle commands are
-future control-plane work.
+`read` on the Index's name. WCL and typed commands scope per
+command: declaration and lifecycle (`CREATE FEED`, `DEFINE
+STATESTORE`, `DEFINE INDEX`, `CREATE WRITER`/`READER`/`SUBSCRIPTION`/
+`PIPE`, `RENAME`, `DROP`, `REBUILD INDEX`, `SEEK`) need `manage`
+spanning the resource's Domain plus `manage` on each referenced
+source's Domain; `DESCRIBE` needs `read` on the resource's Domain and
+`SHOW`/`EXPLAIN ACCESS` need `read` on `*`. RBAC, `CREATE DOMAIN`,
+session, placement, movement, and Node commands stay Riverbed-wide.
+Explicit deny remains future control-plane work.
 
 
 

@@ -799,10 +799,11 @@ async fn execute_admin_wcl(
     headers: HeaderMap,
     Json(request): Json<WclRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authenticate_credential(&state, &headers)?;
     let _request = state.demand.begin_request();
     let request_id = request.request_id.unwrap_or_else(Uuid::new_v4);
     let commands = crate::control::parse_wcl(&request.script)?;
+    authorize_wcl_commands(&state, &headers, &commands).await?;
     if let Some(execution) = evaluate_data_plane_reads(&state, commands.clone(), request_id).await?
     {
         return Ok(Json(execution));
@@ -827,7 +828,7 @@ async fn execute_admin_commands(
     headers: HeaderMap,
     Json(request): Json<CommandBatchRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
-    authorize_admin(&state, &headers)?;
+    authenticate_credential(&state, &headers)?;
     if request
         .commands
         .iter()
@@ -837,6 +838,7 @@ async fn execute_admin_commands(
             "replica recovery and movement cutover require internal Node authority",
         ));
     }
+    authorize_wcl_commands(&state, &headers, &request.commands).await?;
     let _request = state.demand.begin_request();
     let request_id = request.request_id.unwrap_or_else(Uuid::new_v4);
     if let Some(execution) =
@@ -964,6 +966,154 @@ async fn authorize_resource_feed(
         .await
         .ok_or_else(|| ApiError::unavailable("owning Feed is unavailable"))?;
     authorize_namespace(state, headers, &feed.name, action)
+}
+
+/// A name a command's grants must cover: `Resource` resolves to its
+/// owning Domain by longest dotted prefix (a Feed, Writer, Store,
+/// etc.); `Domain` is already a Domain name (a Domain-wide
+/// Subscription source, `REBUILD INDEXES IN`, DROP/RENAME DOMAIN).
+enum ScopedName {
+    Resource(String),
+    Domain(String),
+}
+
+/// The grants one WCL or typed command needs beyond authentication:
+/// `Domains` require `manage` spanning every listed Domain; `Reads`
+/// require `read` spanning them; `CatalogRead` inspects metadata
+/// Riverbed-wide (`read` on `*`); `Riverbed` keeps the historical
+/// Riverbed-wide administrative scope (RBAC, Domains, sessions,
+/// placement, Node membership).
+enum WclCommandScope {
+    Domains(Vec<ScopedName>),
+    Reads(Vec<ScopedName>),
+    CatalogRead,
+    Riverbed,
+}
+
+fn wcl_command_scope(command: &crate::control::Command) -> WclCommandScope {
+    use crate::control::{Command, ResourceKind, StateStoreSourceRequest};
+    let resource = |name: &str| ScopedName::Resource(name.to_owned());
+    let domain = |name: &str| ScopedName::Domain(name.to_owned());
+    match command {
+        Command::CreateFeed { name }
+        | Command::RebuildIndex { name }
+        | Command::PausePipe { name }
+        | Command::ResumePipe { name }
+        | Command::SeekReader { reader: name, .. }
+        | Command::SeekSubscription { name, .. } => WclCommandScope::Domains(vec![resource(name)]),
+        Command::DefineStateStore { name, source, .. } => {
+            let mut scopes = vec![resource(name)];
+            if let StateStoreSourceRequest::Feed { feed } = source {
+                scopes.push(resource(feed));
+            }
+            WclCommandScope::Domains(scopes)
+        }
+        Command::DefineIndex { name, feed, .. }
+        | Command::CreateWriter { name, feed }
+        | Command::CreateReader { name, feed, .. } => {
+            WclCommandScope::Domains(vec![resource(name), resource(feed)])
+        }
+        Command::DefinePipe {
+            name, subscription, ..
+        } => WclCommandScope::Domains(vec![resource(name), resource(subscription)]),
+        Command::CreateSubscription {
+            name, feed, domain, ..
+        } => {
+            let mut scopes = vec![resource(name)];
+            if let Some(feed) = feed {
+                scopes.push(resource(feed));
+            }
+            if let Some(domain) = domain {
+                scopes.push(ScopedName::Domain(domain.clone()));
+            }
+            WclCommandScope::Domains(scopes)
+        }
+        Command::Rename { kind, current, new } => match kind {
+            ResourceKind::Role => WclCommandScope::Riverbed,
+            ResourceKind::Domain | ResourceKind::Space => {
+                WclCommandScope::Domains(vec![domain(current), domain(new)])
+            }
+            _ => WclCommandScope::Domains(vec![resource(current), resource(new)]),
+        },
+        Command::Drop { kind, name } => match kind {
+            ResourceKind::Role => WclCommandScope::Riverbed,
+            ResourceKind::Domain | ResourceKind::Space => {
+                WclCommandScope::Domains(vec![domain(name)])
+            }
+            _ => WclCommandScope::Domains(vec![resource(name)]),
+        },
+        Command::RebuildIndexesInDomain { domain } => {
+            WclCommandScope::Domains(vec![ScopedName::Domain(domain.clone())])
+        }
+        Command::Describe { kind, name } => WclCommandScope::Reads(match kind {
+            ResourceKind::Domain | ResourceKind::Space => vec![domain(name)],
+            ResourceKind::Role => vec![],
+            _ => vec![resource(name)],
+        }),
+        Command::Show { .. } | Command::ExplainAccess { .. } => WclCommandScope::CatalogRead,
+        _ => WclCommandScope::Riverbed,
+    }
+}
+
+/// Resolve a `ScopedName` to the Domain name a grant must span:
+/// catalog longest-prefix for resources (first-segment fallback when
+/// the Domain is missing — command apply still validates existence)
+/// and the name itself for Domains.
+async fn scoped_domain(state: &AppState, scoped: &ScopedName) -> String {
+    match scoped {
+        ScopedName::Domain(name) => name.clone(),
+        ScopedName::Resource(name) => state
+            .control
+            .owning_domain_name(name)
+            .await
+            .unwrap_or_else(|| name.split('.').next().unwrap_or(name).to_owned()),
+    }
+}
+
+/// Authenticate the caller, then require every command's scope:
+/// bootstrap and riverbed-admin identities pass all scopes; issued
+/// identities need `manage` (`read` for inspection) spanning each
+/// command's Domains — or `*` for Riverbed-wide commands.
+async fn authorize_wcl_commands(
+    state: &AppState,
+    headers: &HeaderMap,
+    commands: &[crate::control::Command],
+) -> Result<(), ApiError> {
+    authenticate_credential(state, headers)?;
+    let authorization = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    for command in commands {
+        let (scopes, action) = match wcl_command_scope(command) {
+            WclCommandScope::Riverbed => {
+                authorize_admin(state, headers)?;
+                continue;
+            }
+            WclCommandScope::CatalogRead => {
+                state.admin_auth.authorize_domain_scoped(
+                    authorization,
+                    &state.control.issued_api_keys(),
+                    unix_ns(),
+                    "*",
+                    PermissionAction::Read,
+                )?;
+                continue;
+            }
+            WclCommandScope::Domains(scopes) => (scopes, PermissionAction::Manage),
+            WclCommandScope::Reads(scopes) => (scopes, PermissionAction::Read),
+        };
+        for scoped in &scopes {
+            let domain = scoped_domain(state, scoped).await;
+            state.admin_auth.authorize_domain_scoped(
+                authorization,
+                &state.control.issued_api_keys(),
+                unix_ns(),
+                &domain,
+                action,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 async fn control_plane_status(
@@ -16738,6 +16888,7 @@ mod tests {
         let writer_secret = "orders-writer-key-0123456789abcdef";
         let manage_secret = "ops-manage-key-0123456789abcdef00";
         let billing_secret = "billing-ops-key-0123456789abcdef0";
+        let domain_secret = "orders-domain-manage-key-0123456789";
         let digest = |secret: &str| blake3::hash(secret.as_bytes()).to_hex().to_string();
         let wcl = |script: &str, key: Option<&str>| {
             admin_request(
@@ -16760,11 +16911,15 @@ mod tests {
                      CREATE INDEX orders.bykey ON orders.events FIELDS KEY; \
                      CREATE ROLE billing.ops; \
                      GRANT read, write ON NAMESPACE billing.* TO ROLE billing.ops; \
-                     ISSUE API KEY ops.billingkey ROLE billing.ops DIGEST {};",
+                     ISSUE API KEY ops.billingkey ROLE billing.ops DIGEST {}; \
+                     CREATE ROLE ops.ordersmanage; \
+                     GRANT manage ON NAMESPACE orders.* TO ROLE ops.ordersmanage; \
+                     ISSUE API KEY ops.domainkey ROLE ops.ordersmanage DIGEST {};",
                     digest(reader_secret),
                     digest(writer_secret),
                     digest(manage_secret),
                     digest(billing_secret),
+                    digest(domain_secret),
                 ),
                 bootstrap,
             ))
@@ -17164,6 +17319,51 @@ mod tests {
             let denied = app.clone().oneshot(seek(key)).await.unwrap();
             assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
         }
+        // WCL declaration commands scope to the resource's Domain:
+        // manage on orders.* declares inside orders, never billing.
+        let created = app
+            .clone()
+            .oneshot(wcl("CREATE FEED orders.new;", Some(domain_secret)))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        for key in [
+            Some(reader_secret),
+            Some(writer_secret),
+            Some(billing_secret),
+        ] {
+            let denied = app
+                .clone()
+                .oneshot(wcl("CREATE FEED orders.another;", key))
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        }
+        let denied = app
+            .clone()
+            .oneshot(wcl("CREATE FEED billing.foreign;", Some(domain_secret)))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        // DESCRIBE reads span the resource's Domain; SHOW enumerates the
+        // whole catalog and needs read on *.
+        let described = app
+            .clone()
+            .oneshot(wcl("DESCRIBE FEED orders.events;", Some(reader_secret)))
+            .await
+            .unwrap();
+        assert_eq!(described.status(), StatusCode::OK);
+        for key in [Some(reader_secret), Some(domain_secret)] {
+            let denied = app.clone().oneshot(wcl("SHOW FEEDS;", key)).await.unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        }
+        // RBAC administration stays Riverbed-wide even for Domain manages.
+        let denied = app
+            .clone()
+            .oneshot(wcl("CREATE ROLE sneaky.role;", Some(domain_secret)))
+            .await
+            .unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
         // Revocation fences the read grant immediately.
         let revoked = app
             .clone()

@@ -2144,6 +2144,25 @@ impl ControlController {
             .cloned()
     }
 
+    /// The active Domain owning `resource` by longest dotted-prefix
+    /// match — the same rule `owning_space` applies inside command
+    /// apply. Request-path grant checks resolve a resource name's
+    /// Domain through this accessor rather than assuming a single
+    /// leading segment.
+    pub async fn owning_domain_name(&self, resource: &str) -> Option<String> {
+        self.state
+            .lock()
+            .await
+            .spaces
+            .values()
+            .filter(|space| {
+                space.status == ResourceStatus::Active
+                    && resource.starts_with(&(space.name.clone() + "."))
+            })
+            .max_by_key(|space| space.name.len())
+            .map(|space| space.name.clone())
+    }
+
     /// The active Domain's name for telemetry attribution reporting.
     pub async fn active_domain_name(&self, space_id: Uuid) -> Option<String> {
         self.state
