@@ -39,6 +39,8 @@ successfully.
 | `statestore.iterate` | `POST /v1/state-stores/iterate` | `store`, `after_key`, `limit` |
 | `chaos.<action>` | driver fault hook | optional `args` — rendered scalar values append space-separated to the hook invocation (e.g. `{"feed": "..."}` becomes `chaos.restart_owner <feed>`); the driving environment performs the fault and returns only once the Riverbed is usable again; a runner without a chaos hook reports `unsupported` |
 | `expect` | assertions | see below |
+| `poll` | bounded retry on the step | `{"times": N, "interval_ms": M}` — re-dispatches the step until `expect` passes or attempts exhaust (times ≤ 30, interval ≤ 10s); for asynchronous surfaces like Pipe drives and index builds — never a timing sleep |
+
 
 ### Bindings and substitution
 

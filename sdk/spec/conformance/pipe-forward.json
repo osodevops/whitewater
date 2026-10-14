@@ -1,0 +1,36 @@
+{
+  "scenario": "pipe-forward",
+  "requires": ["wcl", "writer.append", "feed.records"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN pf{{uniq}}; CREATE FEED pf{{uniq}}.in; CREATE FEED pf{{uniq}}.out; CREATE WRITER pw{{uniq}} TO pf{{uniq}}.in; OPEN WRITER SESSION pw{{uniq}}; CREATE SUBSCRIPTION pf{{uniq}}.sub FROM pf{{uniq}}.in START AT BEGINNING; CREATE PIPE pf{{uniq}}.copy FROM SUBSCRIPTION pf{{uniq}}.sub TO FEED pf{{uniq}}.out;"
+      },
+      "bind": "setup"
+    },
+    {
+      "op": "writer.append",
+      "args": {
+        "request_id": "{{uuid:fwd}}",
+        "writer": "pw{{uniq}}",
+        "session_epoch": "{{setup.results[4].data.session_epoch}}",
+        "key": {"utf8": "order-1"},
+        "payload": {"utf8": "forwarded"},
+        "event_time_ns": "1700000000000000042"
+      },
+      "expect": {"deduplicated": false, "cursor": "!=null"}
+    },
+    {
+      "op": "feed.records",
+      "args": {"feed": "pf{{uniq}}.out", "limit": 10},
+      "poll": {"times": 15, "interval_ms": 1000},
+      "expect": {
+        "records": "len>=1",
+        "records[0].key_base64": "b3JkZXItMQ==",
+        "records[0].payload_base64": "Zm9yd2FyZGVk",
+        "records[0].event_time_ns": "1700000000000000042"
+      }
+    }
+  ]
+}

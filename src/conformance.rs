@@ -11,6 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -178,42 +179,78 @@ impl ConformanceRunner {
                 };
             }
             let args = context.substitute(&step.get("args").cloned().unwrap_or_else(|| json!({})));
-            let (status, body) = match dispatch(&client, &op, &args).await {
-                Ok(pair) => pair,
-                Err(message) => {
-                    return ScenarioReport {
-                        name,
-                        failure: Some(ScenarioFailure {
-                            step: index,
-                            op,
-                            unsupported: false,
-                            status: None,
-                            message,
-                        }),
+            // `poll` re-dispatches the step until `expect` passes (or
+            // dispatch stops erroring): asynchronous surfaces — Pipe
+            // drives, index builds, replica catch-up — settle on their
+            // own schedule, so the corpus carries one bounded explicit
+            // retry instead of sleeps. `times` is clamped to 30 and
+            // `interval_ms` to 10s to keep suites honest.
+            let poll_times = step
+                .get("poll")
+                .and_then(|poll| poll.get("times"))
+                .and_then(Value::as_u64)
+                .unwrap_or(1)
+                .clamp(1, 30);
+            let poll_interval_ms = step
+                .get("poll")
+                .and_then(|poll| poll.get("interval_ms"))
+                .and_then(Value::as_u64)
+                .unwrap_or(500)
+                .min(10_000);
+            let mut attempt = 0u64;
+            let (_status, body) = loop {
+                attempt += 1;
+                match dispatch(&client, &op, &args).await {
+                    Err(message) => {
+                        if attempt < poll_times {
+                            tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
+                            continue;
+                        }
+                        return ScenarioReport {
+                            name,
+                            failure: Some(ScenarioFailure {
+                                step: index,
+                                op,
+                                unsupported: false,
+                                status: None,
+                                message,
+                            }),
+                        };
+                    }
+                    Ok((status, body)) => {
+                        if let Some(expect) = step.get("expect").and_then(Value::as_object) {
+                            // Literal expectations can carry tokens
+                            // (`"sdk{{uniq}}.events"`); operator strings
+                            // (`!=null`, `len>=`, `==bind.path`) contain no
+                            // braces and pass substitution untouched.
+                            let expect_value = context.substitute(&Value::Object(expect.clone()));
+                            let expect_map = expect_value.as_object().cloned().unwrap_or_default();
+                            if let Err(message) =
+                                check_expect(&expect_map, status, &body, &context.bindings)
+                            {
+                                if attempt < poll_times {
+                                    tokio::time::sleep(Duration::from_millis(poll_interval_ms))
+                                        .await;
+                                    continue;
+                                }
+                                return ScenarioReport {
+                                    name,
+                                    failure: Some(ScenarioFailure {
+                                        step: index,
+                                        op,
+                                        unsupported: false,
+                                        status: Some(status),
+                                        message,
+                                    }),
+                                };
+                            }
+                        }
+                        break (status, body);
                     }
                 }
             };
             if let Some(bind) = step.get("bind").and_then(Value::as_str) {
                 context.bindings.insert(bind.to_owned(), body.clone());
-            }
-            if let Some(expect) = step.get("expect").and_then(Value::as_object) {
-                // Literal expectations can carry tokens (`"sdk{{uniq}}.events"`);
-                // operator strings (`!=null`, `len>=`, `==bind.path`) contain no
-                // braces and pass substitution untouched.
-                let expect_value = context.substitute(&Value::Object(expect.clone()));
-                let expect_map = expect_value.as_object().cloned().unwrap_or_default();
-                if let Err(message) = check_expect(&expect_map, status, &body, &context.bindings) {
-                    return ScenarioReport {
-                        name,
-                        failure: Some(ScenarioFailure {
-                            step: index,
-                            op,
-                            unsupported: false,
-                            status: Some(status),
-                            message,
-                        }),
-                    };
-                }
             }
         }
         ScenarioReport {
@@ -791,6 +828,72 @@ mod tests {
         // The lookup op uses the same lowering at the top level.
         assert_eq!(requests[1].1, "/v1/state-stores/lookup");
         assert_eq!(requests[1].2["key_base64"], "ZW1wLTE=");
+    }
+
+    #[tokio::test]
+    async fn runner_polls_until_expect_passes_then_binds() {
+        // First attempt returns an empty page; the poll retry sees the
+        // record the asynchronous drive eventually produced.
+        let (runner, transport) = runner(vec![
+            (200, json!({"records": []})),
+            (
+                200,
+                json!({"records": [{"payload_base64": "Zm9yd2FyZGVk"}]}),
+            ),
+            (
+                200,
+                json!({"records": [{"payload_base64": "Zm9yd2FyZGVk"}]}),
+            ),
+        ]);
+        let report = runner
+            .run_scenario(
+                "poll",
+                &json!({"steps": [
+                    {
+                        "op": "feed.records",
+                        "args": {"feed": "p.events"},
+                        "expect": {"records[0].payload_base64": "Zm9yd2FyZGVk"},
+                        "bind": "seen",
+                        "poll": {"times": 5, "interval_ms": 1}
+                    },
+                    {
+                        "op": "feed.records",
+                        "args": {"feed": "p.events"},
+                        "expect": {"records[0].payload_base64": "==seen.records[0].payload_base64"}
+                    }
+                ]}),
+            )
+            .await;
+        assert!(report.passed(), "{report:?}");
+        // Two dispatches for the polled step (empty then populated) plus
+        // one for the bind-consuming step.
+        assert_eq!(transport.requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn runner_exhausts_poll_and_reports_the_last_failure() {
+        let (runner, _) = runner(vec![
+            (200, json!({"records": []})),
+            (200, json!({"records": []})),
+            (200, json!({"records": []})),
+        ]);
+        let report = runner
+            .run_scenario(
+                "exhaust",
+                &json!({"steps": [
+                    {
+                        "op": "feed.records",
+                        "args": {"feed": "p.events"},
+                        "expect": {"records": "len>=1"},
+                        "poll": {"times": 3, "interval_ms": 1}
+                    }
+                ]}),
+            )
+            .await;
+        let failure = report.failure.expect("poll exhaustion reported");
+        assert!(!failure.unsupported);
+        assert_eq!(failure.step, 0);
+        assert_eq!(failure.status, Some(200));
     }
 
     #[tokio::test]
