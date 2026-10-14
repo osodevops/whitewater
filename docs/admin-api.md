@@ -28,6 +28,8 @@ WHITEWATER_ADMIN_API_KEY
 
 Keys shorter than 24 characters are rejected during configuration. The server stores only an in-memory BLAKE3 digest and compares supplied digests without early exit.
 
+Catalog-issued API-key identities (`ISSUE API KEY`, `REVOKE API KEY`, `SHOW API KEYS` in WCL) extend this surface: an identity authorizes Admin API requests when its bound Role holds `manage` on the root `*` namespace and it has not expired. Only a BLAKE3-256 verifier digest is persisted and replicated — plaintext keys never enter WCL, typed commands, the replicated log, or catalog state. Revocation propagates to every Node's request-time authorization view through the same catalog commit. Data-plane scoping for issued identities is not enforced yet.
+
 If no key is configured, Admin API requests return `503 Service Unavailable`. Missing or incorrect credentials return `401 Unauthorized`.
 
 Docker development files use this clearly non-production fallback:

@@ -863,7 +863,14 @@ fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError
     let authorization = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    state.admin_auth.authorize(authorization)?;
+    // The configured Admin key is checked first; otherwise the
+    // replicated catalog's issued identities decide via their bound
+    // Role's grants (currently `manage` on the root `*` namespace).
+    state.admin_auth.authorize_issued(
+        authorization,
+        &state.control.issued_api_keys(),
+        unix_ns(),
+    )?;
     Ok(())
 }
 
@@ -16411,6 +16418,99 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(authorized.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn issued_api_keys_authorize_admin_requests_until_revoked() {
+        let directory = TempDir::new().unwrap();
+        let app = admin_test_router(&directory);
+        let bootstrap = Some("this-is-a-long-development-api-key");
+        let issued_secret = "issued-release-key-0123456789abcdef";
+        let digest = blake3::hash(issued_secret.as_bytes()).to_hex().to_string();
+        let wcl = |script: &str, key: Option<&str>| {
+            admin_request(
+                "/v1/admin/wcl",
+                json!({ "request_id": Uuid::new_v4(), "script": script }),
+                key,
+            )
+        };
+        // Issue an identity whose Role holds `manage` on the root scope.
+        let setup = app
+            .clone()
+            .oneshot(wcl(
+                &format!(
+                    "CREATE ROLE ops.platform; \
+                     GRANT manage ON NAMESPACE * TO ROLE ops.platform; \
+                     ISSUE API KEY ops.release ROLE ops.platform DIGEST {digest};"
+                ),
+                bootstrap,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(setup.status(), StatusCode::OK);
+        // SHOW API KEYS masks the verifier to a prefix.
+        let shown = app
+            .clone()
+            .oneshot(wcl("SHOW API KEYS;", bootstrap))
+            .await
+            .unwrap();
+        assert_eq!(shown.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(shown.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let execution: Value = serde_json::from_slice(&body).unwrap();
+        let rows = execution["results"][0]["data"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "ops.release");
+        assert_eq!(rows[0]["role"], "ops.platform");
+        assert_eq!(rows[0]["digest_prefix"].as_str().unwrap(), &digest[..16]);
+        assert!(rows[0].get("digest").is_none());
+        // The issued key authorizes an admin request end to end.
+        let authorized = app
+            .clone()
+            .oneshot(wcl("SHOW ROLES;", Some(issued_secret)))
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::OK);
+        // A Domain-scoped Role does not authorize admin requests.
+        let scoped_secret = "scoped-reader-key-0123456789abcdef01";
+        let scoped_digest = blake3::hash(scoped_secret.as_bytes()).to_hex().to_string();
+        let scoped = app
+            .clone()
+            .oneshot(wcl(
+                &format!(
+                    "CREATE DOMAIN orders; \
+                     CREATE ROLE ops.reader; \
+                     GRANT read ON NAMESPACE orders.* TO ROLE ops.reader; \
+                     ISSUE API KEY ops.readkey ROLE ops.reader DIGEST {scoped_digest};"
+                ),
+                bootstrap,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(scoped.status(), StatusCode::OK);
+        let refused = app
+            .clone()
+            .oneshot(wcl("SHOW ROLES;", Some(scoped_secret)))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        // Revocation propagates into the request-time view immediately.
+        let revoked = app
+            .clone()
+            .oneshot(wcl("REVOKE API KEY ops.release;", bootstrap))
+            .await
+            .unwrap();
+        assert_eq!(revoked.status(), StatusCode::OK);
+        let refused = app
+            .clone()
+            .oneshot(wcl("SHOW ROLES;", Some(issued_secret)))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+        // The bootstrap env key is unaffected by catalog revocation.
+        let still_ok = app.oneshot(wcl("SHOW API KEYS;", bootstrap)).await.unwrap();
+        assert_eq!(still_ok.status(), StatusCode::OK);
     }
 
     #[tokio::test]

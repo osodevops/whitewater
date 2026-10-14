@@ -463,6 +463,26 @@ GRANT READ, WRITE
 
 
 
+The root pattern `*` grants an action across every namespace. It is
+
+what binds a Role to Riverbed-wide administration:
+
+
+
+```sql
+
+GRANT MANAGE
+
+  ON NAMESPACE *
+
+  TO ROLE platformops;
+
+```
+
+
+
+
+
 Available v0 actions:
 
 
@@ -555,6 +575,8 @@ SHOW ROLES;
 
 SHOW GRANTS;
 
+SHOW API KEYS;
+
 SHOW INDEXES;
 
 SHOW STATESTORES;
@@ -564,6 +586,68 @@ SHOW STATESTORES;
 
 
 Dropped resources are excluded from `SHOW` results.
+
+
+
+## Issued API-key identities
+
+
+
+Beyond the bootstrap `WHITEWATER_ADMIN_API_KEY`, operators issue named
+
+API-key identities that persist in the replicated catalog. Only the
+
+BLAKE3-256 verifier is ever transmitted or stored — compute it from
+
+the caller-held secret and keep the plaintext out of WCL:
+
+
+
+```sql
+
+ISSUE API KEY ops.release
+
+  ROLE platformops
+
+  DIGEST <64-digit-blake3-hex>;
+
+
+
+-- optional expiry, epoch nanoseconds
+
+ISSUE API KEY ops.temporary
+
+  ROLE platformops
+
+  DIGEST <64-digit-blake3-hex>
+
+  EXPIRES AT 1735689600000000000;
+
+
+
+REVOKE API KEY ops.release;
+
+SHOW API KEYS;
+
+```
+
+
+
+Issuance is idempotent on an identical digest, Role, and expiry; a
+
+conflicting re-issue while the name is Active is refused. Revoking a
+
+name tombstones it durably, and the name may be re-issued with new
+
+material for rotation. `SHOW API KEYS` reports only a verifier prefix.
+
+An issued identity authorizes Admin API requests when its bound Role
+
+holds `manage` on the root `*` namespace and the identity has not
+
+expired; Domain-scoped Roles do not authorize Admin API requests yet.
+
+The catalog is bounded at 512 issued identities.
 
 
 

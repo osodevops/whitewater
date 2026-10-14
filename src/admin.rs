@@ -13,7 +13,10 @@ use crate::{
         WriterAppendResponse, WriterBatchAppendRequest, WriterBatchAppendResponse,
         WriterSessionAppendRequest,
     },
-    control::{Command, ControlExecution, PermissionAction, ReaderStart, ResourceKind, ShowKind},
+    control::{
+        Command, ControlExecution, IssuedApiKeySet, PermissionAction, ReaderStart, ResourceKind,
+        ShowKind,
+    },
     reader::ReaderRetryPolicy,
 };
 
@@ -68,17 +71,54 @@ impl AdminAuthenticator {
     }
 
     pub fn authorize(&self, authorization: Option<&str>) -> Result<(), AdminAuthError> {
-        let expected = self.expected_digest.ok_or(AdminAuthError::NotConfigured)?;
+        self.authorize_inner(authorization, None)
+    }
+
+    /// Authorize against the configured Admin key plus catalog-issued
+    /// identities from `issued` (the Control Plane-maintained view).
+    /// An issued identity authorizes admin endpoints when its Role
+    /// holds `manage` on the root `*` namespace and it has not expired
+    /// as of `now_unix_ns`.
+    pub fn authorize_issued(
+        &self,
+        authorization: Option<&str>,
+        issued: &IssuedApiKeySet,
+        now_unix_ns: i64,
+    ) -> Result<(), AdminAuthError> {
+        self.authorize_inner(authorization, Some((issued, now_unix_ns)))
+    }
+
+    fn authorize_inner(
+        &self,
+        authorization: Option<&str>,
+        issued: Option<(&IssuedApiKeySet, i64)>,
+    ) -> Result<(), AdminAuthError> {
+        let issued_empty = issued.is_none_or(|(set, _)| set.is_empty());
+        if self.expected_digest.is_none() && issued_empty {
+            return Err(AdminAuthError::NotConfigured);
+        }
         let supplied = authorization
             .and_then(|value| value.strip_prefix("Bearer "))
             .filter(|value| !value.is_empty())
             .ok_or(AdminAuthError::Missing)?;
         let actual = *blake3::hash(supplied.as_bytes()).as_bytes();
-        if constant_time_equal(&expected, &actual) {
-            Ok(())
-        } else {
-            Err(AdminAuthError::Invalid)
+        if self
+            .expected_digest
+            .is_some_and(|expected| constant_time_equal(&expected, &actual))
+        {
+            return Ok(());
         }
+        if let Some((set, now_unix_ns)) = issued {
+            if let Some(identity) = set.get(&actual) {
+                let unexpired = identity
+                    .expires_at_ns
+                    .is_none_or(|expiry| now_unix_ns < expiry);
+                if identity.riverbed_admin && unexpired {
+                    return Ok(());
+                }
+            }
+        }
+        Err(AdminAuthError::Invalid)
     }
 }
 
@@ -250,6 +290,34 @@ impl AdminClient {
         name: impl Into<String>,
     ) -> Result<ControlExecution, AdminClientError> {
         self.execute_one(Command::CreateRole { name: name.into() })
+            .await
+    }
+
+    /// Issue a catalog-persisted API-key identity. `digest` is the
+    /// BLAKE3-256 hex verifier of the caller-held key, computed
+    /// client-side (e.g. `blake3(key)`); the plaintext key is never
+    /// sent to the server.
+    pub async fn issue_api_key(
+        &self,
+        name: impl Into<String>,
+        role: impl Into<String>,
+        digest: impl Into<String>,
+        expires_at_ns: Option<i64>,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::IssueApiKey {
+            name: name.into(),
+            role: role.into(),
+            digest: digest.into(),
+            expires_at_ns,
+        })
+        .await
+    }
+
+    pub async fn revoke_api_key(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::RevokeApiKey { name: name.into() })
             .await
     }
 
@@ -661,6 +729,64 @@ mod tests {
         assert!(compressed.use_compression);
         assert_eq!(plain.writer, writer.writer);
         assert_eq!(plain.session_epoch, writer.session_epoch);
+    }
+
+    #[test]
+    fn issued_identities_extend_and_fence_admin_authorization() {
+        use crate::control::IssuedApiKey;
+
+        let bootstrap = "this-is-a-long-development-api-key";
+        let auth = AdminAuthenticator::new(Some(bootstrap.to_owned())).unwrap();
+        let issued_secret = "issued-release-key-0123456789abcdef";
+        let digest = *blake3::hash(issued_secret.as_bytes()).as_bytes();
+        let header = format!("Bearer {issued_secret}");
+        let mut issued = IssuedApiKeySet::new();
+        issued.insert(
+            digest,
+            IssuedApiKey {
+                name: "ops.release".to_owned(),
+                riverbed_admin: true,
+                expires_at_ns: None,
+            },
+        );
+        // An issued riverbed-admin identity authorizes.
+        assert!(auth.authorize_issued(Some(&header), &issued, 1_000).is_ok());
+        // A non-admin Role binding does not.
+        issued.get_mut(&digest).unwrap().riverbed_admin = false;
+        assert_eq!(
+            auth.authorize_issued(Some(&header), &issued, 1_000),
+            Err(AdminAuthError::Invalid)
+        );
+        // An expired identity refuses even with an admin Role.
+        issued.get_mut(&digest).unwrap().riverbed_admin = true;
+        issued.get_mut(&digest).unwrap().expires_at_ns = Some(500);
+        assert_eq!(
+            auth.authorize_issued(Some(&header), &issued, 1_000),
+            Err(AdminAuthError::Invalid)
+        );
+        // ...but a not-yet-expired one authorizes.
+        assert!(auth.authorize_issued(Some(&header), &issued, 400).is_ok());
+        issued.get_mut(&digest).unwrap().expires_at_ns = None;
+        // The configured bootstrap key still authorizes first.
+        assert!(auth
+            .authorize_issued(Some(&format!("Bearer {bootstrap}")), &issued, 1_000)
+            .is_ok());
+        // Issued identities work even when no env key is configured.
+        let catalog_only = AdminAuthenticator::new(None).unwrap();
+        assert!(catalog_only
+            .authorize_issued(Some(&header), &issued, 1_000)
+            .is_ok());
+        // With neither an env key nor issued identities, the surface
+        // stays NotConfigured rather than silently open.
+        assert_eq!(
+            catalog_only.authorize_issued(Some(&header), &IssuedApiKeySet::new(), 1_000),
+            Err(AdminAuthError::NotConfigured)
+        );
+        // An unknown key refuses.
+        assert_eq!(
+            auth.authorize_issued(Some("Bearer unknown-key-0123456789012345"), &issued, 1_000),
+            Err(AdminAuthError::Invalid)
+        );
     }
 
     #[tokio::test]

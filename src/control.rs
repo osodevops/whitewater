@@ -614,6 +614,46 @@ pub struct NamespaceGrant {
     pub created_at_ns: i64,
 }
 
+/// An issued API-key identity persisted in the replicated catalog.
+/// Only the BLAKE3-256 hex verifier of the caller-held secret is
+/// stored: the plaintext key never enters WCL, typed commands, the
+/// replicated log, or persisted catalog state.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApiKeyIdentity {
+    pub key_id: Uuid,
+    pub name: String,
+    /// BLAKE3-256 verifier of the caller-held key, as 64-digit hex.
+    pub digest: String,
+    /// The Role whose grants decide what this identity may do.
+    pub role_id: Uuid,
+    pub status: ResourceStatus,
+    pub created_at_ns: i64,
+    /// Optional epoch-nanosecond expiry; authorization refuses the
+    /// identity at request time once this passes.
+    #[serde(default)]
+    pub expires_at_ns: Option<i64>,
+    #[serde(default)]
+    pub revoked_at_ns: Option<i64>,
+}
+
+/// The slice of an issued identity the request-time authorization path
+/// needs; recomputed from committed catalog state after every apply.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssuedApiKey {
+    pub name: String,
+    /// Whether the bound Role currently holds `manage` on the root `*`
+    /// namespace, which admin endpoints require.
+    pub riverbed_admin: bool,
+    pub expires_at_ns: Option<i64>,
+}
+
+/// Issued-identity authorization view keyed by verifier digest.
+pub type IssuedApiKeySet = BTreeMap<[u8; 32], IssuedApiKey>;
+
+/// Hard bound on catalog-issued identities: keeps the catalog small
+/// and the request-time authorization scan bounded.
+pub const MAX_ISSUED_API_KEYS: usize = 512;
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RangeSplitStage {
@@ -740,6 +780,8 @@ struct CatalogState {
     roles: BTreeMap<Uuid, RoleDefinition>,
     grants: BTreeMap<Uuid, NamespaceGrant>,
     #[serde(default)]
+    api_keys: BTreeMap<Uuid, ApiKeyIdentity>,
+    #[serde(default)]
     active_ranges: BTreeMap<Uuid, ActiveRangeAssignment>,
     #[serde(default)]
     range_maps: BTreeMap<Uuid, RangeMap>,
@@ -800,6 +842,7 @@ impl Default for CatalogState {
             reader_frontiers: BTreeMap::new(),
             roles: BTreeMap::new(),
             grants: BTreeMap::new(),
+            api_keys: BTreeMap::new(),
             active_ranges: BTreeMap::new(),
             range_maps: BTreeMap::new(),
             range_assignments: BTreeMap::new(),
@@ -843,6 +886,7 @@ pub enum ShowKind {
     Subscriptions,
     Roles,
     Grants,
+    ApiKeys,
     StorageNodes,
     Pipes,
     Indexes,
@@ -1051,6 +1095,21 @@ pub enum Command {
         actions: BTreeSet<PermissionAction>,
         namespace: String,
         role: String,
+    },
+    /// Issue a named API-key identity bound to a Role. `digest` is the
+    /// BLAKE3-256 hex verifier the caller computed; the plaintext key
+    /// must never appear in a command.
+    IssueApiKey {
+        name: String,
+        digest: String,
+        role: String,
+        #[serde(default)]
+        expires_at_ns: Option<i64>,
+    },
+    /// Revoke an issued identity durably. Revocation is replicated and
+    /// fenced on every Node's request-time authorization view.
+    RevokeApiKey {
+        name: String,
     },
     ExplainAccess {
         role: String,
@@ -1339,6 +1398,10 @@ pub struct ControlController {
     path: Arc<PathBuf>,
     state: Arc<Mutex<CatalogState>>,
     eligible_storage_nodes: Arc<BTreeSet<StorageNodeId>>,
+    /// Request-time authorization view of issued API-key digests,
+    /// recomputed from catalog state on load, snapshot install, and
+    /// every applied command so leader and replicas converge.
+    issued_api_keys: Arc<std::sync::RwLock<IssuedApiKeySet>>,
     synced_replica: bool,
 }
 
@@ -1359,10 +1422,12 @@ impl ControlController {
             CatalogState::default()
         };
         state.migrate_range_metadata();
+        let issued_api_keys = issued_api_key_view(&state);
         Ok(Self {
             path: Arc::new(path),
             state: Arc::new(Mutex::new(state)),
             eligible_storage_nodes: Arc::new(eligible_storage_nodes.into_iter().collect()),
+            issued_api_keys: Arc::new(std::sync::RwLock::new(issued_api_keys)),
             synced_replica: false,
         })
     }
@@ -1769,12 +1834,18 @@ impl ControlController {
         state.applied_requests.insert(request_id, response.clone());
         if let Err(error) = persist_state(&self.path, &state) {
             *state = previous_state;
+            // The view must follow the restored state, never the
+            // rolled-back attempt — a failed persist must not leave a
+            // phantom issued key authorized.
+            self.refresh_issued_api_keys(&state);
             return ReplicatedCommandResult {
                 revision: state.revision,
                 result: None,
                 error: Some(error.to_string()),
             };
         }
+        // Authorization view follows committed catalog state.
+        self.refresh_issued_api_keys(&state);
         response
     }
 
@@ -1786,12 +1857,34 @@ impl ControlController {
         let mut state: CatalogState = serde_json::from_slice(bytes)?;
         state.migrate_range_metadata();
         persist_state(&self.path, &state)?;
+        let issued_api_keys = issued_api_key_view(&state);
         *self.state.lock().await = state;
+        if let Ok(mut guard) = self.issued_api_keys.write() {
+            *guard = issued_api_keys;
+        }
         Ok(())
     }
 
     pub async fn revision(&self) -> u64 {
         self.state.lock().await.revision
+    }
+
+    /// Read access to the issued API-key authorization view. The guard
+    /// is held only for the bounded digest lookup at request time.
+    pub fn issued_api_keys(&self) -> std::sync::RwLockReadGuard<'_, IssuedApiKeySet> {
+        self.issued_api_keys
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Recompute the request-time authorization view from catalog
+    /// state. Called after every apply so issued/revoked/expired-key
+    /// handling is identical on leader and replicas.
+    fn refresh_issued_api_keys(&self, state: &CatalogState) {
+        let view = issued_api_key_view(state);
+        if let Ok(mut guard) = self.issued_api_keys.write() {
+            *guard = view;
+        }
     }
 
     pub async fn active_reader_by_id(&self, reader_id: Uuid) -> Option<ReaderDefinition> {
@@ -3309,6 +3402,62 @@ impl ControlController {
                 format!("described {} {name}", resource_name(&kind)),
                 describe_resource(state, kind, &name)?,
             )),
+            Command::IssueApiKey {
+                name,
+                digest,
+                role,
+                expires_at_ns,
+            } => {
+                validate_dotted_name(&name)?;
+                let digest = canonical_api_key_digest(&digest)?;
+                if expires_at_ns.is_some_and(|expiry| expiry <= issued_at_ns) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "API key {name} expiry must lie in the future"
+                    )));
+                }
+                let role_id = active_role(state, &role)?.role_id;
+                if let Some(existing) = state.api_keys.values().find(|identity| {
+                    identity.name == name && identity.status == ResourceStatus::Active
+                }) {
+                    if existing.digest == digest
+                        && existing.role_id == role_id
+                        && existing.expires_at_ns == expires_at_ns
+                    {
+                        return Ok((format!("API key {name} already issued"), json!(existing)));
+                    }
+                    return Err(ControlError::AlreadyExists(format!("API key {name}")));
+                }
+                if state.api_keys.len() >= MAX_ISSUED_API_KEYS {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "issued API key catalog is full ({MAX_ISSUED_API_KEYS} identities)"
+                    )));
+                }
+                let definition = ApiKeyIdentity {
+                    key_id: derived_resource_id(request_id, "api-key"),
+                    name: name.clone(),
+                    digest,
+                    role_id,
+                    status: ResourceStatus::Active,
+                    created_at_ns: issued_at_ns,
+                    expires_at_ns,
+                    revoked_at_ns: None,
+                };
+                state.api_keys.insert(definition.key_id, definition.clone());
+                Ok((format!("issued API key {name}"), json!(definition)))
+            }
+            Command::RevokeApiKey { name } => {
+                let identity = state
+                    .api_keys
+                    .values_mut()
+                    .find(|identity| {
+                        identity.name == name && identity.status == ResourceStatus::Active
+                    })
+                    .ok_or_else(|| ControlError::NotFound(format!("API key {name}")))?;
+                identity.status = ResourceStatus::Dropped;
+                identity.revoked_at_ns = Some(issued_at_ns);
+                let identity = identity.clone();
+                Ok((format!("revoked API key {name}"), json!(identity)))
+            }
             Command::Grant {
                 actions,
                 namespace,
@@ -5431,17 +5580,59 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 "REBUILD supports INDEX and INDEXES IN DOMAIN".to_owned(),
             )),
         },
-        Some("REVOKE") => {
-            expect_keyword(&tokens, 1, "WRITER")?;
-            expect_keyword(&tokens, 2, "SESSION")?;
-            expect_keyword(&tokens, 4, "EPOCH")?;
-            Ok(Command::RevokeWriterSession {
-                writer: token(&tokens, 3)?.to_owned(),
-                session_epoch: token(&tokens, 5)?.parse().map_err(|_| {
-                    ControlError::Syntax(
-                        "Writer session epoch must be an unsigned integer".to_owned(),
-                    )
-                })?,
+        Some("REVOKE") => match keyword(1).as_deref() {
+            Some("WRITER") => {
+                expect_keyword(&tokens, 2, "SESSION")?;
+                expect_keyword(&tokens, 4, "EPOCH")?;
+                Ok(Command::RevokeWriterSession {
+                    writer: token(&tokens, 3)?.to_owned(),
+                    session_epoch: token(&tokens, 5)?.parse().map_err(|_| {
+                        ControlError::Syntax(
+                            "Writer session epoch must be an unsigned integer".to_owned(),
+                        )
+                    })?,
+                })
+            }
+            Some("API") => {
+                expect_keyword(&tokens, 2, "KEY")?;
+                Ok(Command::RevokeApiKey {
+                    name: token(&tokens, 3)?.to_owned(),
+                })
+            }
+            _ => Err(ControlError::Syntax(
+                "expected REVOKE WRITER SESSION or REVOKE API KEY".to_owned(),
+            )),
+        },
+        Some("ISSUE") => {
+            // ISSUE API KEY <name> ROLE <role> DIGEST <64-hex>
+            //   [EXPIRES AT <unix-ns>]
+            // The digest is the BLAKE3-256 verifier of a caller-held
+            // key; the plaintext secret must never appear in WCL.
+            expect_keyword(&tokens, 1, "API")?;
+            expect_keyword(&tokens, 2, "KEY")?;
+            expect_keyword(&tokens, 4, "ROLE")?;
+            expect_keyword(&tokens, 6, "DIGEST")?;
+            let expires_at_ns = match keyword(8).as_deref() {
+                None => None,
+                Some("EXPIRES") => {
+                    expect_keyword(&tokens, 9, "AT")?;
+                    Some(token(&tokens, 10)?.parse::<i64>().map_err(|_| {
+                        ControlError::Syntax(
+                            "API key expiry must be signed epoch nanoseconds".to_owned(),
+                        )
+                    })?)
+                }
+                Some(_) => {
+                    return Err(ControlError::Syntax(
+                        "expected EXPIRES AT <unix-ns> or end of statement".to_owned(),
+                    ))
+                }
+            };
+            Ok(Command::IssueApiKey {
+                name: token(&tokens, 3)?.to_owned(),
+                role: token(&tokens, 5)?.to_owned(),
+                digest: token(&tokens, 7)?.to_owned(),
+                expires_at_ns,
             })
         }
         Some("RENAME") => {
@@ -5485,6 +5676,9 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             kind: if token(&tokens, 1)?.eq_ignore_ascii_case("STORAGE") {
                 expect_keyword(&tokens, 2, "NODES")?;
                 ShowKind::StorageNodes
+            } else if token(&tokens, 1)?.eq_ignore_ascii_case("API") {
+                expect_keyword(&tokens, 2, "KEYS")?;
+                ShowKind::ApiKeys
             } else {
                 parse_show_kind(token(&tokens, 1)?)?
             },
@@ -5956,7 +6150,52 @@ fn validate_dotted_name(name: &str) -> Result<(), ControlError> {
     Ok(())
 }
 
+/// Validate and canonicalize a BLAKE3-256 hex verifier supplied on
+/// `ISSUE API KEY`. The plaintext key never appears in commands.
+fn canonical_api_key_digest(digest: &str) -> Result<String, ControlError> {
+    let normalized = digest.trim().to_ascii_lowercase();
+    let hash = blake3::Hash::from_hex(&normalized).map_err(|_| {
+        ControlError::InvalidOperation(
+            "API key digest must be a 64-digit hex BLAKE3-256 verifier".to_owned(),
+        )
+    })?;
+    Ok(hash.to_hex().to_string())
+}
+
+/// Compute the request-time authorization view from catalog state:
+/// every Active issued identity whose digest authorizes as
+/// `riverbed_admin` when its Role holds `manage` on the root `*`
+/// namespace.
+fn issued_api_key_view(state: &CatalogState) -> IssuedApiKeySet {
+    let mut view = IssuedApiKeySet::new();
+    for identity in state.api_keys.values() {
+        if identity.status != ResourceStatus::Active {
+            continue;
+        }
+        let Ok(digest) = blake3::Hash::from_hex(&identity.digest) else {
+            continue;
+        };
+        let riverbed_admin = state.grants.values().any(|grant| {
+            grant.role_id == identity.role_id
+                && grant.actions.contains(&PermissionAction::Manage)
+                && grant.namespace == "*"
+        });
+        view.insert(
+            *digest.as_bytes(),
+            IssuedApiKey {
+                name: identity.name.clone(),
+                riverbed_admin,
+                expires_at_ns: identity.expires_at_ns,
+            },
+        );
+    }
+    view
+}
+
 fn validate_namespace_pattern(pattern: &str) -> Result<(), ControlError> {
+    if pattern == "*" {
+        return Ok(());
+    }
     if let Some(prefix) = pattern.strip_suffix(".*") {
         validate_dotted_name(prefix)
     } else {
@@ -5965,6 +6204,9 @@ fn validate_namespace_pattern(pattern: &str) -> Result<(), ControlError> {
 }
 
 fn namespace_matches(pattern: &str, feed: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
     pattern
         .strip_suffix(".*")
         .map_or(pattern == feed, |prefix| {
@@ -6444,6 +6686,28 @@ fn show_resources(
             })
             .collect::<Vec<_>>()),
         ShowKind::Indexes => json!(state.indexes.values().collect::<Vec<_>>()),
+        ShowKind::ApiKeys => json!(state
+            .api_keys
+            .values()
+            .map(|identity| {
+                let role = state
+                    .roles
+                    .get(&identity.role_id)
+                    .map(|role| role.name.clone());
+                json!({
+                    "key_id": identity.key_id,
+                    "name": identity.name,
+                    "role": role,
+                    // Only a verifier prefix is exposed; the full digest
+                    // stays internal even though it is not a secret.
+                    "digest_prefix": identity.digest.chars().take(16).collect::<String>(),
+                    "status": identity.status,
+                    "created_at_ns": identity.created_at_ns,
+                    "expires_at_ns": identity.expires_at_ns,
+                    "revoked_at_ns": identity.revoked_at_ns,
+                })
+            })
+            .collect::<Vec<_>>()),
         ShowKind::StateStores => json!(state
             .state_stores
             .values()
@@ -6849,6 +7113,8 @@ fn command_label(command: &Command) -> String {
         Command::Show { .. } => "SHOW",
         Command::Describe { .. } => "DESCRIBE",
         Command::Grant { .. } => "GRANT",
+        Command::IssueApiKey { .. } => "ISSUE API KEY",
+        Command::RevokeApiKey { .. } => "REVOKE API KEY",
         Command::ExplainAccess { .. } => "EXPLAIN ACCESS",
         Command::SeekReader { .. } => "SEEK READER",
         Command::SeekSubscription { .. } => "SEEK SUBSCRIPTION",
@@ -6907,6 +7173,7 @@ fn show_name(kind: &ShowKind) -> &'static str {
         ShowKind::StateStores => "StateStores",
         ShowKind::Roles => "Roles",
         ShowKind::Grants => "Grants",
+        ShowKind::ApiKeys => "API Keys",
         ShowKind::StorageNodes => "Storage Nodes",
     }
 }
@@ -10266,5 +10533,154 @@ mod tests {
         let moved = controller.pipe_compute_lease(pipe.pipe_id).await.unwrap();
         assert_eq!(moved.owner, target);
         assert_eq!(moved.compute_epoch, progress.ownership_epoch + 1);
+    }
+
+    #[tokio::test]
+    async fn issued_api_keys_persist_digest_only_and_drive_admin_view() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        let issued_secret = "issued-release-key-0123456789abcdef";
+        let digest = blake3::hash(issued_secret.as_bytes()).to_hex().to_string();
+        controller
+            .execute("CREATE ROLE ops.platform; GRANT manage ON NAMESPACE * TO ROLE ops.platform;")
+            .await
+            .unwrap();
+        // Issue binds the digest verifier to the Role; plaintext never
+        // appears in the command or catalog.
+        let issued = controller
+            .execute(&format!(
+                "ISSUE API KEY ops.release ROLE ops.platform DIGEST {digest};"
+            ))
+            .await
+            .unwrap();
+        let identity = &issued.results[0].data;
+        assert_eq!(identity["digest"].as_str().unwrap(), digest);
+        assert_eq!(identity["status"].as_str().unwrap(), "active");
+        // The authorization view marks the key riverbed-admin through
+        // its Role's `manage` grant on `*`.
+        {
+            let view = controller.issued_api_keys();
+            let entry = view
+                .get(blake3::hash(issued_secret.as_bytes()).as_bytes())
+                .expect("issued digest must enter the authorization view");
+            assert!(entry.riverbed_admin);
+            assert_eq!(entry.name, "ops.release");
+        }
+        // An identical replay is idempotent; a conflicting re-issue is refused.
+        controller
+            .execute(&format!(
+                "ISSUE API KEY ops.release ROLE ops.platform DIGEST {digest};"
+            ))
+            .await
+            .unwrap();
+        let other_digest = blake3::hash(b"different-secret-material-01234")
+            .to_hex()
+            .to_string();
+        assert!(controller
+            .execute(&format!(
+                "ISSUE API KEY ops.release ROLE ops.platform DIGEST {other_digest};"
+            ))
+            .await
+            .is_err());
+        // A Domain-scoped Role does not grant riverbed admin.
+        controller
+            .execute("CREATE ROLE ops.reader; GRANT read ON NAMESPACE orders.* TO ROLE ops.reader;")
+            .await
+            .unwrap();
+        let reader_digest = blake3::hash(b"reader-secret-material-0123456")
+            .to_hex()
+            .to_string();
+        controller
+            .execute(&format!(
+                "ISSUE API KEY ops.readkey ROLE ops.reader DIGEST {reader_digest};"
+            ))
+            .await
+            .unwrap();
+        {
+            let view = controller.issued_api_keys();
+            let entry = view
+                .get(blake3::hash(b"reader-secret-material-0123456").as_bytes())
+                .expect("reader key must enter the authorization view");
+            assert!(!entry.riverbed_admin);
+        }
+        // SHOW API KEYS masks the verifier to a prefix and resolves the Role.
+        let shown = controller.execute("SHOW API KEYS;").await.unwrap();
+        let rows = shown.results[0].data.as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        let release = rows
+            .iter()
+            .find(|row| row["name"] == "ops.release")
+            .unwrap();
+        assert_eq!(release["role"].as_str().unwrap(), "ops.platform");
+        assert_eq!(release["digest_prefix"].as_str().unwrap(), &digest[..16]);
+        assert!(release.get("digest").is_none());
+        // Revocation is durable and removes the digest from the view.
+        controller
+            .execute("REVOKE API KEY ops.release;")
+            .await
+            .unwrap();
+        assert!(controller
+            .issued_api_keys()
+            .get(blake3::hash(issued_secret.as_bytes()).as_bytes())
+            .is_none());
+        // Revoked names can be re-issued (rotation), while revoking an
+        // unknown key fails closed.
+        controller
+            .execute(&format!(
+                "ISSUE API KEY ops.release ROLE ops.platform DIGEST {digest};"
+            ))
+            .await
+            .unwrap();
+        assert!(controller
+            .execute("REVOKE API KEY ops.release;")
+            .await
+            .is_ok());
+        assert!(controller
+            .execute("REVOKE API KEY ops.release;")
+            .await
+            .is_err());
+        // Expiry must lie in the future at issue time.
+        assert!(controller
+            .execute(&format!(
+                "ISSUE API KEY ops.expired ROLE ops.platform DIGEST {digest} EXPIRES AT 1;"
+            ))
+            .await
+            .is_err());
+        // Malformed digests and unknown Roles fail closed.
+        assert!(controller
+            .execute("ISSUE API KEY ops.bad ROLE ops.platform DIGEST deadbeef;")
+            .await
+            .is_err());
+        assert!(controller
+            .execute(&format!(
+                "ISSUE API KEY ops.orphan ROLE ops.missing DIGEST {digest};"
+            ))
+            .await
+            .is_err());
+        // The catalog persists identities across reopen (digest only).
+        let reopened = new_controller(&directory);
+        let view = reopened.issued_api_keys();
+        assert!(view
+            .get(blake3::hash(b"reader-secret-material-0123456").as_bytes())
+            .is_some());
+        assert!(view
+            .get(blake3::hash(issued_secret.as_bytes()).as_bytes())
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn root_namespace_pattern_matches_every_feed() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        let result = controller
+            .execute(
+                "CREATE DOMAIN orders; CREATE FEED orders.events;                  CREATE ROLE ops.everything;                  GRANT manage ON NAMESPACE * TO ROLE ops.everything;                  EXPLAIN ACCESS FOR ROLE ops.everything ACTION MANAGE ON FEED orders.events;",
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.results[4].data["allowed"], true);
+        assert!(namespace_matches("*", "orders.events"));
+        assert!(namespace_matches("*", "anything.deep"));
+        assert!(validate_namespace_pattern("*").is_ok());
     }
 }
