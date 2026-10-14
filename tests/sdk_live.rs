@@ -311,6 +311,29 @@ async fn state_store_index_and_temporary_facades_live() {
         )
         .await
         .expect("range query");
+
+    // Index demand attribution: every served query lands on the answering
+    // replica's Node-local row — merge across the endpoint pool since the
+    // query could have been served by any of them.
+    let mut queries = 0_u64;
+    let mut rows_returned = 0_u64;
+    for _ in 0..3 {
+        let reply = client
+            .wire("GET", "/v1/admin/demand/indexes", None)
+            .await
+            .expect("index demand telemetry");
+        for row in reply.body["indexes"].as_array().into_iter().flatten() {
+            if row["index"] == index {
+                let telemetry = &row["telemetry"];
+                queries += telemetry["queries"].as_u64().unwrap_or(0);
+                rows_returned += telemetry["rows_returned"].as_u64().unwrap_or(0);
+            }
+        }
+    }
+    assert_eq!(queries, 2, "served index queries attributed");
+    // The exact lookup returned one posting; the unbounded range scan
+    // covers it too, so both queries returned one row each.
+    assert_eq!(rows_returned, 2, "returned postings attributed");
 }
 
 #[tokio::test]

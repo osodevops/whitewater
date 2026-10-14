@@ -28,6 +28,7 @@ struct DemandCounters {
     hot_keys: Mutex<BTreeMap<RangeId, (HotKeyEvidence, std::time::Instant)>>,
     pipe_drives: Mutex<BTreeMap<uuid::Uuid, PipeDriveTelemetry>>,
     subscription_traffic: Mutex<BTreeMap<uuid::Uuid, SubscriptionTrafficTelemetry>>,
+    index_queries: Mutex<BTreeMap<uuid::Uuid, IndexQueryTelemetry>>,
 }
 
 #[derive(Default)]
@@ -315,6 +316,53 @@ impl DemandMetrics {
         }
     }
 
+    /// Fold one Index query this Node materially served into its
+    /// Node-local attribution row — whether the request arrived publicly
+    /// or peer-forwarded, the answering replica did the posting scan.
+    pub fn record_index_query(&self, index_id: uuid::Uuid, sample: IndexQuerySample) {
+        let Ok(mut queries) = self.inner.index_queries.lock() else {
+            return;
+        };
+        let telemetry = queries.entry(index_id).or_default();
+        telemetry.queries = telemetry.queries.saturating_add(1);
+        match sample.mode {
+            IndexQueryMode::Exact => {
+                telemetry.exact_queries = telemetry.exact_queries.saturating_add(1)
+            }
+            IndexQueryMode::Prefix => {
+                telemetry.prefix_queries = telemetry.prefix_queries.saturating_add(1)
+            }
+            IndexQueryMode::Range => {
+                telemetry.range_queries = telemetry.range_queries.saturating_add(1)
+            }
+        }
+        telemetry.rows_returned = telemetry.rows_returned.saturating_add(sample.rows);
+        if sample.truncated {
+            telemetry.truncated_queries = telemetry.truncated_queries.saturating_add(1);
+        }
+        if sample.behind {
+            telemetry.served_behind = telemetry.served_behind.saturating_add(1);
+        }
+        telemetry.last_mode = Some(sample.mode.label());
+        telemetry.last_query_at_ns = Some(sample.sampled_at_ns);
+    }
+
+    /// A consistent snapshot of per-Index attribution rows on this Node.
+    pub fn index_query_telemetry(&self) -> BTreeMap<uuid::Uuid, IndexQueryTelemetry> {
+        self.inner
+            .index_queries
+            .lock()
+            .map(|queries| queries.clone())
+            .unwrap_or_default()
+    }
+
+    /// Drop attribution rows for Indexes that no longer exist.
+    pub fn prune_index_queries(&self, live: &std::collections::BTreeSet<uuid::Uuid>) {
+        if let Ok(mut queries) = self.inner.index_queries.lock() {
+            queries.retain(|index_id, _| live.contains(index_id));
+        }
+    }
+
     pub fn record_read(&self, records: usize) {
         self.inner.reads_total.fetch_add(1, Ordering::Relaxed);
         self.inner
@@ -464,6 +512,55 @@ pub struct SubscriptionTrafficTelemetry {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_op: Option<&'static str>,
     pub last_op_at_ns: Option<i64>,
+}
+
+/// One Index query the serving Node answered — mode plus the evidence
+/// that rides it (rows returned, whether the limit truncated, and whether
+/// the postings lagged the activation frontier on a non-strict read).
+pub struct IndexQuerySample {
+    pub mode: IndexQueryMode,
+    pub rows: u64,
+    pub truncated: bool,
+    pub behind: bool,
+    pub sampled_at_ns: i64,
+}
+
+/// The Index read shapes the wire contract exposes.
+#[derive(Clone, Copy, Debug)]
+pub enum IndexQueryMode {
+    Exact,
+    Prefix,
+    Range,
+}
+
+impl IndexQueryMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Prefix => "prefix",
+            Self::Range => "range",
+        }
+    }
+}
+
+/// Per-Index query attribution on this Node since process start — the
+/// honest scope, because a peer-forwarded read counts on the replica that
+/// served it rather than the Node the client happened to reach.
+/// `served_behind` counts non-strict reads answered from postings that
+/// still lagged the activation frontier — evidence operators need when a
+/// build looks slow.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct IndexQueryTelemetry {
+    pub queries: u64,
+    pub exact_queries: u64,
+    pub prefix_queries: u64,
+    pub range_queries: u64,
+    pub rows_returned: u64,
+    pub truncated_queries: u64,
+    pub served_behind: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_mode: Option<&'static str>,
+    pub last_query_at_ns: Option<i64>,
 }
 
 /// Per-range bounded distinct-Key tracking budget. Windows holding more
@@ -1107,6 +1204,44 @@ mod tests {
         metrics.prune_subscription_traffic(&live);
         let telemetry = metrics.subscription_traffic();
         assert!(telemetry.contains_key(&subscription));
+        assert!(!telemetry.contains_key(&dropped));
+    }
+
+    #[test]
+    fn index_query_telemetry_aggregates_served_reads_and_prunes_dropped_indexes() {
+        let metrics = DemandMetrics::default();
+        let index = uuid::Uuid::from_u128(9_001);
+        let dropped = uuid::Uuid::from_u128(9_002);
+        let sample = |mode, rows, truncated, behind| IndexQuerySample {
+            mode,
+            rows,
+            truncated,
+            behind,
+            sampled_at_ns: 55,
+        };
+        metrics.record_index_query(index, sample(IndexQueryMode::Exact, 1, false, false));
+        metrics.record_index_query(index, sample(IndexQueryMode::Exact, 0, false, true));
+        metrics.record_index_query(index, sample(IndexQueryMode::Prefix, 7, false, false));
+        metrics.record_index_query(index, sample(IndexQueryMode::Range, 256, true, false));
+        metrics.record_index_query(dropped, sample(IndexQueryMode::Exact, 2, false, false));
+
+        let telemetry = metrics.index_query_telemetry();
+        let row = telemetry.get(&index).unwrap();
+        assert_eq!(row.queries, 4);
+        assert_eq!(row.exact_queries, 2);
+        assert_eq!(row.prefix_queries, 1);
+        assert_eq!(row.range_queries, 1);
+        assert_eq!(row.rows_returned, 264);
+        assert_eq!(row.truncated_queries, 1);
+        assert_eq!(row.served_behind, 1);
+        assert_eq!(row.last_mode, Some("range"));
+        assert_eq!(row.last_query_at_ns, Some(55));
+
+        // Dropped Indexes leave no attribution residue.
+        let live = std::collections::BTreeSet::from([index]);
+        metrics.prune_index_queries(&live);
+        let telemetry = metrics.index_query_telemetry();
+        assert!(telemetry.contains_key(&index));
         assert!(!telemetry.contains_key(&dropped));
     }
 }

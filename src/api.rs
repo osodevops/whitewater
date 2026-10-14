@@ -724,6 +724,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/admin/demand/subscriptions",
             get(admin_subscription_demand),
         )
+        .route("/v1/admin/demand/indexes", get(admin_index_demand))
         .route("/v1/admin/control-plane", get(control_plane_status))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
@@ -3619,6 +3620,11 @@ async fn index_query_local(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
     let index_read = index.clone();
     let predicate = predicate.clone();
+    let query_mode = match &predicate {
+        crate::control::IndexQueryPredicate::Exact { .. } => crate::demand::IndexQueryMode::Exact,
+        crate::control::IndexQueryPredicate::Prefix { .. } => crate::demand::IndexQueryMode::Prefix,
+        crate::control::IndexQueryPredicate::Range { .. } => crate::demand::IndexQueryMode::Range,
+    };
     if strict {
         // Bounded-wait for the checkpoint; filesystem reads stay off the
         // Tokio executor.
@@ -3668,6 +3674,16 @@ async fn index_query_local(
     .map_err(index_store_api_error)?;
     let frontier = index.last_applied(shadow).map_err(index_store_api_error)?;
     let behind = frontier.as_deref() != target.as_deref();
+    state.demand.record_index_query(
+        definition.index_id,
+        crate::demand::IndexQuerySample {
+            mode: query_mode,
+            rows: rows.len() as u64,
+            truncated: rows.len() == limit,
+            behind,
+            sampled_at_ns: unix_ns(),
+        },
+    );
     Ok(IndexQueryResponse {
         index: definition.name.clone(),
         index_id: definition.index_id,
@@ -8970,6 +8986,71 @@ async fn admin_subscription_demand(
         "node": state.storage_node_id,
         "scope": "node-local since process start; a progress-placement move restarts attribution on the new owner",
         "subscriptions": rows,
+        "domains": domains,
+    })))
+}
+
+/// Per-Index query attribution on this Node. Counters are Node-local
+/// since process start and count on the replica that served the posting
+/// scan — a peer-forwarded read lands here rather than on the ingress
+/// Node the client happened to reach.
+async fn admin_index_demand(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let indexes = state.control.index_definitions().await;
+    let live: std::collections::BTreeSet<Uuid> =
+        indexes.iter().map(|index| index.index_id).collect();
+    state.demand.prune_index_queries(&live);
+    let telemetry = state.demand.index_query_telemetry();
+    let mut domains: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut rows = Vec::with_capacity(indexes.len());
+    for index in &indexes {
+        let domain = state
+            .control
+            .active_domain_name(index.space_id)
+            .await
+            .unwrap_or_else(|| index.space_id.to_string());
+        let stage = match &index.stage {
+            crate::control::IndexBuildStage::Declared => "declared",
+            crate::control::IndexBuildStage::Building { .. } => "building",
+            crate::control::IndexBuildStage::Active { .. } => "active",
+        };
+        let telemetry = telemetry.get(&index.index_id);
+        let row = json!({
+            "index": index.name,
+            "domain": domain,
+            "stage": stage,
+            "telemetry": telemetry,
+        });
+        let rollup = domains.entry(domain).or_insert_with(|| {
+            json!({
+                "indexes": 0, "queries": 0, "exact_queries": 0,
+                "prefix_queries": 0, "range_queries": 0, "rows_returned": 0,
+                "truncated_queries": 0, "served_behind": 0,
+            })
+        });
+        rollup["indexes"] = json!(rollup["indexes"].as_u64().unwrap_or(0) + 1);
+        if let Some(t) = telemetry {
+            for (field, value) in [
+                ("queries", t.queries),
+                ("exact_queries", t.exact_queries),
+                ("prefix_queries", t.prefix_queries),
+                ("range_queries", t.range_queries),
+                ("rows_returned", t.rows_returned),
+                ("truncated_queries", t.truncated_queries),
+                ("served_behind", t.served_behind),
+            ] {
+                rollup[field] = json!(rollup[field].as_u64().unwrap_or(0) + value);
+            }
+        }
+        rows.push(row);
+    }
+    Ok(Json(json!({
+        "node": state.storage_node_id,
+        "scope": "node-local since process start; counts on the replica that served the posting scan",
+        "indexes": rows,
         "domains": domains,
     })))
 }
