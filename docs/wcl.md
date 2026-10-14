@@ -533,7 +533,28 @@ spanning the resource's Domain plus `manage` on each referenced
 source's Domain; `DESCRIBE` needs `read` on the resource's Domain and
 `SHOW`/`EXPLAIN ACCESS` need `read` on `*`. RBAC, `CREATE DOMAIN`,
 session, placement, movement, and Node commands stay Riverbed-wide.
-Explicit deny remains future control-plane work.
+
+`DENY` reuses the `GRANT` grammar to fence an action instead of
+permitting it:
+
+```sql
+
+DENY READ
+
+  ON NAMESPACE orders.events
+
+  TO ROLE orderanalytics;
+
+```
+
+A covering deny wins over every covering allow, `manage`-implied
+coverage, and Riverbed-admin issued identities — the configured
+bootstrap key is the only break-glass credential. A `DENY` containing
+`manage` fences read, write, and manage on the namespace. Allow and
+deny rows coexist on the same `(Role, namespace, actions)` triple so
+an exception can be fenced under a broad grant; `SHOW GRANTS` and
+`EXPLAIN ACCESS` expose the effect (`matched_denies` lists covering
+denies).
 
 
 

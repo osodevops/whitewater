@@ -17364,6 +17364,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        // An explicit DENY overrides covering allows: fencing the Index
+        // name revokes just that resource for the reader while the rest
+        // of the wildcard allow keeps working.
+        let denied_grant = app
+            .clone()
+            .oneshot(wcl(
+                "DENY read ON NAMESPACE orders.bykey TO ROLE ops.reader;",
+                bootstrap,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(denied_grant.status(), StatusCode::OK);
+        let fenced = app
+            .clone()
+            .oneshot(index_query(Some(reader_secret)))
+            .await
+            .unwrap();
+        assert_eq!(fenced.status(), StatusCode::UNAUTHORIZED);
+        // The bootstrap key is break-glass and still reaches the service.
+        let allowed = app.clone().oneshot(index_query(bootstrap)).await.unwrap();
+        assert_eq!(allowed.status(), StatusCode::CONFLICT);
+        // Reads elsewhere in the wildcard scope are unaffected.
+        let still = app
+            .clone()
+            .oneshot(get(read_path, Some(reader_secret)))
+            .await
+            .unwrap();
+        assert_eq!(still.status(), StatusCode::SERVICE_UNAVAILABLE);
         // Revocation fences the read grant immediately.
         let revoked = app
             .clone()

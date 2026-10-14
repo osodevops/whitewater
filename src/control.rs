@@ -605,12 +605,29 @@ pub enum PermissionAction {
     Manage,
 }
 
+/// Whether a namespace grant permits or refuses an action. Explicit
+/// `DENY` rows evaluate before `GRANT` rows at request time: a
+/// covering deny wins even against `manage`-implied permissions and
+/// Riverbed-admin issued identities; the configured bootstrap key is
+/// the only break-glass credential.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum GrantEffect {
+    #[default]
+    Allow,
+    Deny,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NamespaceGrant {
     pub grant_id: Uuid,
     pub role_id: Uuid,
     pub namespace: String,
     pub actions: BTreeSet<PermissionAction>,
+    /// `allow` for legacy persisted rows; `deny` fences the action even
+    /// when another grant would cover it.
+    #[serde(default)]
+    pub effect: GrantEffect,
     pub created_at_ns: i64,
 }
 
@@ -655,6 +672,7 @@ pub struct IssuedApiKey {
 pub struct IssuedGrant {
     pub namespace: String,
     pub actions: BTreeSet<PermissionAction>,
+    pub effect: GrantEffect,
 }
 
 /// Issued-identity authorization view keyed by verifier digest.
@@ -1105,6 +1123,10 @@ pub enum Command {
         actions: BTreeSet<PermissionAction>,
         namespace: String,
         role: String,
+        /// `deny` rows fence the action ahead of every covering allow.
+        /// Legacy commands and replicated entries decode as `allow`.
+        #[serde(default)]
+        effect: GrantEffect,
     },
     /// Issue a named API-key identity bound to a Role. `digest` is the
     /// BLAKE3-256 hex verifier the caller computed; the plaintext key
@@ -3491,6 +3513,7 @@ impl ControlController {
                 actions,
                 namespace,
                 role,
+                effect,
             } => {
                 validate_namespace_pattern(&namespace)?;
                 let role_id = active_role(state, &role)?.role_id;
@@ -3498,6 +3521,7 @@ impl ControlController {
                     grant.role_id == role_id
                         && grant.namespace == namespace
                         && grant.actions == actions
+                        && grant.effect == effect
                 }) {
                     return Err(ControlError::AlreadyExists(format!(
                         "grant for Role {role} on {namespace}"
@@ -3508,11 +3532,16 @@ impl ControlController {
                     role_id,
                     namespace: namespace.clone(),
                     actions,
+                    effect,
                     created_at_ns: issued_at_ns,
                 };
                 state.grants.insert(definition.grant_id, definition.clone());
+                let verb = match effect {
+                    GrantEffect::Allow => "granted",
+                    GrantEffect::Deny => "denied",
+                };
                 Ok((
-                    format!("granted namespace permissions on {namespace} to Role {role}"),
+                    format!("{verb} namespace permissions on {namespace} for Role {role}"),
                     json!(definition),
                 ))
             }
@@ -3524,12 +3553,29 @@ impl ControlController {
                     .values()
                     .filter(|grant| {
                         grant.role_id == role_id
-                            && grant.actions.contains(&action)
+                            && grant.effect == GrantEffect::Allow
+                            && (grant.actions.contains(&action)
+                                || grant.actions.contains(&PermissionAction::Manage))
                             && namespace_matches(&grant.namespace, &feed)
                     })
                     .cloned()
                     .collect();
-                let allowed = !matched.is_empty();
+                let denies: Vec<_> = state
+                    .grants
+                    .values()
+                    .filter(|grant| {
+                        grant.role_id == role_id
+                            && grant.effect == GrantEffect::Deny
+                            && (grant.actions.contains(&action)
+                                || grant.actions.contains(&PermissionAction::Manage))
+                            && namespace_matches(&grant.namespace, &feed)
+                    })
+                    .cloned()
+                    .collect();
+                // A covering DENY wins over every covering allow and
+                // manage-implied coverage, matching request-time
+                // authorization.
+                let allowed = !matched.is_empty() && denies.is_empty();
                 Ok((
                     format!(
                         "access {} for Role {role}",
@@ -3541,6 +3587,7 @@ impl ControlController {
                         "action": action,
                         "feed": feed,
                         "matched_grants": matched,
+                        "matched_denies": denies,
                         "default": "deny"
                     }),
                 ))
@@ -5760,7 +5807,8 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             kind: parse_resource_kind(token(&tokens, 1)?)?,
             name: token(&tokens, 2)?.to_owned(),
         }),
-        Some("GRANT") => parse_grant(&tokens),
+        Some("GRANT") => parse_grant(&tokens, GrantEffect::Allow),
+        Some("DENY") => parse_grant(&tokens, GrantEffect::Deny),
         Some("EXPLAIN") => parse_explain(&tokens),
         Some("INSPECT") => {
             if token(&tokens, 1)?.eq_ignore_ascii_case("DRAIN") {
@@ -5821,7 +5869,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
     }
 }
 
-fn parse_grant(tokens: &[String]) -> Result<Command, ControlError> {
+fn parse_grant(tokens: &[String], effect: GrantEffect) -> Result<Command, ControlError> {
     let on_index = tokens
         .iter()
         .position(|token| token.eq_ignore_ascii_case("ON"))
@@ -5846,6 +5894,7 @@ fn parse_grant(tokens: &[String]) -> Result<Command, ControlError> {
         actions,
         namespace,
         role,
+        effect,
     })
 }
 
@@ -6206,6 +6255,7 @@ fn issued_api_key_view(state: &CatalogState) -> IssuedApiKeySet {
         };
         let riverbed_admin = state.grants.values().any(|grant| {
             grant.role_id == identity.role_id
+                && grant.effect == GrantEffect::Allow
                 && grant.actions.contains(&PermissionAction::Manage)
                 && grant.namespace == "*"
         });
@@ -6216,6 +6266,7 @@ fn issued_api_key_view(state: &CatalogState) -> IssuedApiKeySet {
             .map(|grant| IssuedGrant {
                 namespace: grant.namespace.clone(),
                 actions: grant.actions.clone(),
+                effect: grant.effect,
             })
             .collect();
         view.insert(
@@ -7159,7 +7210,10 @@ fn command_label(command: &Command) -> String {
         Command::Drop { .. } => "DROP",
         Command::Show { .. } => "SHOW",
         Command::Describe { .. } => "DESCRIBE",
-        Command::Grant { .. } => "GRANT",
+        Command::Grant { effect, .. } => match effect {
+            GrantEffect::Allow => "GRANT",
+            GrantEffect::Deny => "DENY",
+        },
         Command::IssueApiKey { .. } => "ISSUE API KEY",
         Command::RevokeApiKey { .. } => "REVOKE API KEY",
         Command::ExplainAccess { .. } => "EXPLAIN ACCESS",
@@ -10741,5 +10795,80 @@ mod tests {
         // orders.eu.* spans only the orders.eu subdomain, not orders.
         assert!(!grant_covers_domain("orders.eu.*", "orders"));
         assert!(grant_covers_domain("orders.eu.*", "orders.eu"));
+    }
+
+    #[tokio::test]
+    async fn deny_grants_fence_covering_allows_and_coexist() {
+        let directory = tempfile::tempdir().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute(
+                "CREATE DOMAIN orders; CREATE FEED orders.events; \
+                 CREATE ROLE ops.reader; \
+                 GRANT read ON NAMESPACE orders.* TO ROLE ops.reader; \
+                 DENY read ON NAMESPACE orders.events TO ROLE ops.reader;",
+            )
+            .await
+            .unwrap();
+        // DENY reuses the GRANT grammar and lands as a typed Grant
+        // command with the deny effect.
+        let parsed =
+            parse_wcl("DENY read, write ON NAMESPACE orders.* TO ROLE ops.reader;").unwrap();
+        assert!(matches!(
+            &parsed[0],
+            Command::Grant {
+                effect: GrantEffect::Deny,
+                actions,
+                ..
+            } if actions.len() == 2
+        ));
+        // Allow and deny coexist on the same (Role, namespace, action)
+        // triple because dedupe includes the effect; re-denying an
+        // identical row is refused as a duplicate.
+        assert!(controller
+            .execute("DENY read ON NAMESPACE orders.events TO ROLE ops.reader;")
+            .await
+            .is_err());
+        controller
+            .execute("GRANT read ON NAMESPACE orders.events TO ROLE ops.reader;")
+            .await
+            .unwrap();
+        // An issued key bound to the Role sees both effects in the
+        // request-time view, so the exact deny fences the wildcard
+        // allow at authorization time.
+        let digest = blake3::hash(b"reader-deny-key-0123456789abcdef")
+            .to_hex()
+            .to_string();
+        controller
+            .execute(&format!(
+                "ISSUE API KEY ops.denykey ROLE ops.reader DIGEST {digest};"
+            ))
+            .await
+            .unwrap();
+        let key_digest = *blake3::hash(b"reader-deny-key-0123456789abcdef").as_bytes();
+        {
+            let view = controller.issued_api_keys();
+            let identity = view.get(&key_digest).expect("issued identity");
+            let effects: BTreeSet<_> = identity.grants.iter().map(|g| g.effect).collect();
+            assert!(effects.contains(&GrantEffect::Allow));
+            assert!(effects.contains(&GrantEffect::Deny));
+        }
+        // EXPLAIN ACCESS reports the covering deny and refuses.
+        let explained = controller
+            .execute("EXPLAIN ACCESS FOR ROLE ops.reader ACTION read ON FEED orders.events;")
+            .await
+            .unwrap();
+        assert_eq!(explained.results[0].data["allowed"], false);
+        assert!(!explained.results[0].data["matched_denies"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        // The deny survives a catalog reopen through persistence.
+        drop(controller);
+        let reopened = new_controller(&directory);
+        let view = reopened.issued_api_keys();
+        let identity = view.get(&key_digest).expect("issued identity");
+        let effects: BTreeSet<_> = identity.grants.iter().map(|g| g.effect).collect();
+        assert!(effects.contains(&GrantEffect::Deny));
     }
 }

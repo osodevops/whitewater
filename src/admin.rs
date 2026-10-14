@@ -14,7 +14,7 @@ use crate::{
         WriterSessionAppendRequest,
     },
     control::{
-        namespace_matches, Command, ControlExecution, IssuedApiKey, IssuedApiKeySet,
+        namespace_matches, Command, ControlExecution, GrantEffect, IssuedApiKey, IssuedApiKeySet,
         PermissionAction, ReaderStart, ResourceKind, ShowKind,
     },
     reader::ReaderRetryPolicy,
@@ -155,10 +155,24 @@ impl AdminAuthenticator {
         let Some(identity) = self.verified_identity(authorization, issued, now_unix_ns)? else {
             return Ok(());
         };
+        // A covering DENY wins over every allow, `manage`-implied
+        // coverage, and Riverbed-admin status. The bootstrap key is
+        // the only break-glass credential: it returns `Ok(None)` from
+        // `verified_identity` before this point.
+        let denied = identity.grants.iter().any(|grant| {
+            grant.effect == crate::control::GrantEffect::Deny
+                && (grant.actions.contains(&action)
+                    || grant.actions.contains(&PermissionAction::Manage))
+                && namespace_matches(&grant.namespace, namespace)
+        });
+        if denied {
+            return Err(AdminAuthError::Invalid);
+        }
         if identity.riverbed_admin
             || identity.grants.iter().any(|grant| {
-                (grant.actions.contains(&action)
-                    || grant.actions.contains(&PermissionAction::Manage))
+                grant.effect == crate::control::GrantEffect::Allow
+                    && (grant.actions.contains(&action)
+                        || grant.actions.contains(&PermissionAction::Manage))
                     && namespace_matches(&grant.namespace, namespace)
             })
         {
@@ -184,10 +198,20 @@ impl AdminAuthenticator {
         let Some(identity) = self.verified_identity(authorization, issued, now_unix_ns)? else {
             return Ok(());
         };
+        let denied = identity.grants.iter().any(|grant| {
+            grant.effect == crate::control::GrantEffect::Deny
+                && (grant.actions.contains(&action)
+                    || grant.actions.contains(&PermissionAction::Manage))
+                && crate::control::grant_covers_domain(&grant.namespace, domain)
+        });
+        if denied {
+            return Err(AdminAuthError::Invalid);
+        }
         if identity.riverbed_admin
             || identity.grants.iter().any(|grant| {
-                (grant.actions.contains(&action)
-                    || grant.actions.contains(&PermissionAction::Manage))
+                grant.effect == crate::control::GrantEffect::Allow
+                    && (grant.actions.contains(&action)
+                        || grant.actions.contains(&PermissionAction::Manage))
                     && crate::control::grant_covers_domain(&grant.namespace, domain)
             })
         {
@@ -221,7 +245,12 @@ impl AdminAuthenticator {
                 let unexpired = identity
                     .expires_at_ns
                     .is_none_or(|expiry| now_unix_ns < expiry);
-                if identity.riverbed_admin && unexpired {
+                let denied = identity.grants.iter().any(|grant| {
+                    grant.effect == crate::control::GrantEffect::Deny
+                        && grant.actions.contains(&PermissionAction::Manage)
+                        && namespace_matches(&grant.namespace, "*")
+                });
+                if identity.riverbed_admin && unexpired && !denied {
                     return Ok(());
                 }
             }
@@ -504,6 +533,25 @@ impl AdminClient {
             actions: actions.into_iter().collect::<BTreeSet<_>>(),
             namespace: namespace.into(),
             role: role.into(),
+            effect: GrantEffect::Allow,
+        })
+        .await
+    }
+
+    /// Fence `actions` on `namespace` for `role` ahead of every
+    /// covering allow — the explicit-deny counterpart to
+    /// [`AdminClient::grant_namespace`].
+    pub async fn deny_namespace(
+        &self,
+        actions: impl IntoIterator<Item = PermissionAction>,
+        namespace: impl Into<String>,
+        role: impl Into<String>,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::Grant {
+            actions: actions.into_iter().collect::<BTreeSet<_>>(),
+            namespace: namespace.into(),
+            role: role.into(),
+            effect: GrantEffect::Deny,
         })
         .await
     }
@@ -964,6 +1012,7 @@ mod tests {
                 grants: vec![IssuedGrant {
                     namespace: "orders.*".to_owned(),
                     actions: [PermissionAction::Read].into_iter().collect(),
+                    effect: GrantEffect::Allow,
                 }],
                 expires_at_ns: None,
             },
@@ -1004,6 +1053,7 @@ mod tests {
         issued.get_mut(&digest).unwrap().grants = vec![IssuedGrant {
             namespace: "orders.*".to_owned(),
             actions: [PermissionAction::Manage].into_iter().collect(),
+            effect: GrantEffect::Allow,
         }];
         assert!(auth
             .authorize_scoped(
@@ -1018,6 +1068,7 @@ mod tests {
         issued.get_mut(&digest).unwrap().grants = vec![IssuedGrant {
             namespace: "orders.events".to_owned(),
             actions: [PermissionAction::Read].into_iter().collect(),
+            effect: GrantEffect::Allow,
         }];
         assert!(auth
             .authorize_scoped(
@@ -1080,6 +1131,7 @@ mod tests {
                 grants: vec![IssuedGrant {
                     namespace: "orders.*".to_owned(),
                     actions: [PermissionAction::Read].into_iter().collect(),
+                    effect: GrantEffect::Allow,
                 }],
                 expires_at_ns: None,
             },
@@ -1120,6 +1172,7 @@ mod tests {
         issued.get_mut(&digest).unwrap().grants = vec![IssuedGrant {
             namespace: "orders.events".to_owned(),
             actions: [PermissionAction::Read].into_iter().collect(),
+            effect: GrantEffect::Allow,
         }];
         assert_eq!(
             auth.authorize_domain_scoped(
@@ -1135,6 +1188,7 @@ mod tests {
         issued.get_mut(&digest).unwrap().grants = vec![IssuedGrant {
             namespace: "orders.*".to_owned(),
             actions: [PermissionAction::Manage].into_iter().collect(),
+            effect: GrantEffect::Allow,
         }];
         assert!(auth
             .authorize_domain_scoped(
@@ -1171,6 +1225,7 @@ mod tests {
         issued.get_mut(&digest).unwrap().grants = vec![IssuedGrant {
             namespace: "orders.*".to_owned(),
             actions: [PermissionAction::Read].into_iter().collect(),
+            effect: GrantEffect::Allow,
         }];
         issued.get_mut(&digest).unwrap().expires_at_ns = Some(500);
         assert_eq!(
@@ -1183,6 +1238,170 @@ mod tests {
             ),
             Err(AdminAuthError::Invalid)
         );
+    }
+
+    #[test]
+    fn deny_effect_fences_covering_allows() {
+        use crate::control::IssuedGrant;
+
+        let auth =
+            AdminAuthenticator::new(Some("this-is-a-long-development-api-key".to_owned())).unwrap();
+        let mut issued = IssuedApiKeySet::new();
+        let secret = "orders-reader-key-0123456789abcdef";
+        let digest = *blake3::hash(secret.as_bytes()).as_bytes();
+        let header = format!("Bearer {secret}");
+        let grants = |grants: Vec<IssuedGrant>| IssuedApiKey {
+            name: "ops.reader".to_owned(),
+            riverbed_admin: false,
+            grants,
+            expires_at_ns: None,
+        };
+        let grant = |namespace: &str, action: PermissionAction, effect: GrantEffect| IssuedGrant {
+            namespace: namespace.to_owned(),
+            actions: [action].into_iter().collect(),
+            effect,
+        };
+        // A wildcard allow covers the Domain, but an exact deny on one
+        // resource still wins.
+        issued.insert(
+            digest,
+            grants(vec![
+                grant("orders.*", PermissionAction::Read, GrantEffect::Allow),
+                grant("orders.events", PermissionAction::Read, GrantEffect::Deny),
+            ]),
+        );
+        assert_eq!(
+            auth.authorize_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders.events",
+                PermissionAction::Read,
+            ),
+            Err(AdminAuthError::Invalid)
+        );
+        assert!(auth
+            .authorize_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders.other",
+                PermissionAction::Read,
+            )
+            .is_ok());
+        // A narrower deny does not fence resources outside its pattern.
+        issued.get_mut(&digest).unwrap().grants = vec![
+            grant("orders.*", PermissionAction::Read, GrantEffect::Allow),
+            grant("orders.eu.*", PermissionAction::Read, GrantEffect::Deny),
+        ];
+        assert!(auth
+            .authorize_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders.events",
+                PermissionAction::Read,
+            )
+            .is_ok());
+        assert_eq!(
+            auth.authorize_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders.eu.events",
+                PermissionAction::Read,
+            ),
+            Err(AdminAuthError::Invalid)
+        );
+        // A manage deny fences every implied action on the namespace.
+        issued.get_mut(&digest).unwrap().grants = vec![
+            grant("orders.*", PermissionAction::Manage, GrantEffect::Allow),
+            grant("orders.events", PermissionAction::Manage, GrantEffect::Deny),
+        ];
+        for action in [
+            PermissionAction::Read,
+            PermissionAction::Write,
+            PermissionAction::Manage,
+        ] {
+            assert_eq!(
+                auth.authorize_scoped(Some(&header), &issued, 1_000, "orders.events", action,),
+                Err(AdminAuthError::Invalid),
+                "{action:?} must be fenced by the manage deny"
+            );
+        }
+        // Deny rows fence Riverbed-admin identities on scoped checks too;
+        // only the bootstrap key is break-glass.
+        issued.insert(
+            digest,
+            IssuedApiKey {
+                name: "ops.admin".to_owned(),
+                riverbed_admin: true,
+                grants: vec![grant(
+                    "orders.*",
+                    PermissionAction::Manage,
+                    GrantEffect::Deny,
+                )],
+                expires_at_ns: None,
+            },
+        );
+        assert_eq!(
+            auth.authorize_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders.events",
+                PermissionAction::Read,
+            ),
+            Err(AdminAuthError::Invalid)
+        );
+        assert!(auth
+            .authorize_scoped(
+                Some("Bearer this-is-a-long-development-api-key"),
+                &issued,
+                1_000,
+                "orders.events",
+                PermissionAction::Read,
+            )
+            .is_ok());
+        // Domain-spanning checks honor the same precedence: a covering
+        // deny beats the spanning allow.
+        issued.get_mut(&digest).unwrap().riverbed_admin = false;
+        issued.get_mut(&digest).unwrap().grants = vec![
+            grant("orders.*", PermissionAction::Read, GrantEffect::Allow),
+            grant("orders.*", PermissionAction::Read, GrantEffect::Deny),
+        ];
+        assert_eq!(
+            auth.authorize_domain_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders",
+                PermissionAction::Read,
+            ),
+            Err(AdminAuthError::Invalid)
+        );
+        // A `DENY manage ON *` also fences Riverbed-admin identities on
+        // the unscoped admin surface; a narrower manage deny does not.
+        issued.get_mut(&digest).unwrap().riverbed_admin = true;
+        issued.get_mut(&digest).unwrap().grants =
+            vec![grant("*", PermissionAction::Manage, GrantEffect::Deny)];
+        assert_eq!(
+            auth.authorize_issued(Some(&header), &issued, 1_000),
+            Err(AdminAuthError::Invalid)
+        );
+        issued.get_mut(&digest).unwrap().grants = vec![grant(
+            "orders.*",
+            PermissionAction::Manage,
+            GrantEffect::Deny,
+        )];
+        assert!(auth.authorize_issued(Some(&header), &issued, 1_000).is_ok());
+        assert!(auth
+            .authorize_issued(
+                Some("Bearer this-is-a-long-development-api-key"),
+                &issued,
+                1_000
+            )
+            .is_ok());
     }
 
     #[tokio::test]
@@ -1292,6 +1511,7 @@ mod tests {
                 actions: BTreeSet::from([PermissionAction::Read, PermissionAction::Write]),
                 namespace: "orders.*".to_owned(),
                 role: "orderapp".to_owned(),
+                effect: GrantEffect::Allow,
             }],
         };
         let json = serde_json::to_value(&request).unwrap();
