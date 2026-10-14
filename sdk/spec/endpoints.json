@@ -526,7 +526,14 @@
             "appended_records": "u64",
             "appended_bytes": "u64",
             "read_pages": "u64",
-            "records_read": "u64"
+            "records_read": "u64",
+            "replicated_frames": "u64",
+            "replicated_wire_bytes": "u64",
+            "replicated_commits": "u64",
+            "moves": "u64",
+            "moved_records": "u64",
+            "moved_bytes": "u64",
+            "moved_skipped_records": "u64"
           }
         ],
         "domains": "per-domain counter rollups"

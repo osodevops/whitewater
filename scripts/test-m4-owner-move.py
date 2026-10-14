@@ -55,6 +55,15 @@ def read(node, feed, after=None):
         return json.load(response)
 
 
+def get_json(node, path):
+    request = urllib.request.Request(
+        f"{node}{path}",
+        headers={"authorization": f"Bearer {KEY}"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
 def placement(node, feed):
     status, response = post(node, "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"})
     if status != 200:
@@ -173,6 +182,20 @@ def main():
         status, repeated = post(NODES[0], "/v1/admin/ranges/move-owner", move)
         if status != 200 or repeated.get("status") != "activated":
             raise AssertionError(repeated)
+        # Node-local move telemetry: an owner move verifies the staged
+        # replica instead of copying, so the event records on its serving
+        # Node; merge the Feed demand rows across all Nodes.
+        merged = {}
+        for node in NODES:
+            body = get_json(node, "/v1/admin/demand/feeds")
+            for row in body.get("feeds", []):
+                entry = merged.setdefault(row["feed"], {})
+                for field, value in row.items():
+                    if field in ("feed", "domain"):
+                        continue
+                    entry[field] = entry.get(field, 0) + value
+        if merged.get(feed, {}).get("moves", 0) < 1:
+            raise AssertionError(f"moves {merged.get(feed, {})}")
         for index in range(8, 12):
             append(index, NODES[index % 3])
         for node in NODES:

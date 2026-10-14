@@ -55,6 +55,15 @@ def read(node, feed, after=None):
         return json.load(response)
 
 
+def get_json(node, path):
+    request = urllib.request.Request(
+        f"{node}{path}",
+        headers={"authorization": f"Bearer {KEY}"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
 def placement(node, feed):
     status, response = post(node, "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"})
     if status != 200:
@@ -183,6 +192,27 @@ def main():
         status, repeated = post(NODES[2], "/v1/admin/ranges/move-follower", move)
         if status != 200 or repeated.get("status") != "activated":
             raise AssertionError(repeated)
+        # Node-local move telemetry: merge the Feed demand rows across all
+        # Nodes; the moves landed with real copy evidence on their serving
+        # Node.
+        merged = {}
+        for node in NODES:
+            body = get_json(node, "/v1/admin/demand/feeds")
+            for row in body.get("feeds", []):
+                entry = merged.setdefault(row["feed"], {})
+                for field, value in row.items():
+                    if field in ("feed", "domain"):
+                        continue
+                    entry[field] = entry.get(field, 0) + value
+        counters = merged.get(feed, {})
+        if counters.get("moves", 0) < 1:
+            raise AssertionError(f"moves {counters}")
+        # The staged copy either transferred records or resumed past the
+        # already-replicated prefix — either way the covered span is copy
+        # evidence, not an inferred cost.
+        covered = counters.get("moved_records", 0) + counters.get("moved_skipped_records", 0)
+        if covered < 1:
+            raise AssertionError(f"move copy evidence {counters}")
         for index in range(8, 12):
             append(index)
         records = read(NODES[3], feed)

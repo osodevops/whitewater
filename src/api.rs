@@ -1080,11 +1080,16 @@ async fn replica_append(
 
         code: None,
     })?;
+    let range_id = request.range_id;
+    let wire_bytes = request.frame_base64.len();
     Ok(Json(match service.append(request).await {
-        Ok(result) => ReplicaAppendResponse {
-            result: Some(result),
-            error: None,
-        },
+        Ok(result) => {
+            state.demand.record_range_replication(range_id, wire_bytes);
+            ReplicaAppendResponse {
+                result: Some(result),
+                error: None,
+            }
+        }
         Err(error) => ReplicaAppendResponse {
             result: None,
             error: Some(error),
@@ -1102,11 +1107,15 @@ async fn replica_commit(
 
         code: None,
     })?;
+    let range_id = request.range_id;
     Ok(Json(match service.commit(request).await {
-        Ok(result) => ReplicaCommitResponse {
-            result: Some(result),
-            error: None,
-        },
+        Ok(result) => {
+            state.demand.record_range_replication_commit(range_id);
+            ReplicaCommitResponse {
+                result: Some(result),
+                error: None,
+            }
+        }
         Err(error) => ReplicaCommitResponse {
             result: None,
             error: Some(error),
@@ -7957,6 +7966,16 @@ async fn admin_move_follower(
         .activate(&request.feed, &plan)
         .await
         .map_err(ApiError::unavailable)?;
+    if let Some(feed) =
+        feed_when_applied(&state.control, &request.feed, state.control_plane.is_some()).await
+    {
+        state.demand.record_feed_move(
+            feed.feed_id,
+            copied.transferred_records,
+            copied.transferred_bytes,
+            copied.skipped_records,
+        );
+    }
     unfreeze_move(&state, &source_endpoint, key, &plan_request).await?;
     Ok(Json(
         json!({ "status": "activated", "assignment": plan.candidate_assignment,
@@ -8532,13 +8551,21 @@ async fn admin_move_owner(
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     control_plane
         .execute_commands(vec![crate::control::Command::ActivateOwnerMove {
-            feed: request.feed,
+            feed: request.feed.clone(),
             plan_id: plan.plan_id,
         }])
         .await
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
     unfreeze_owner_move(&state, &target_endpoint, key, &plan_request).await?;
+    // An owner move verifies the staged replica rather than copying outside
+    // replication, so the event records zero transfer bytes — the data
+    // arrived through replicated_frames/wire_bytes already attributed.
+    if let Some(feed) =
+        feed_when_applied(&state.control, &request.feed, state.control_plane.is_some()).await
+    {
+        state.demand.record_feed_move(feed.feed_id, 0, 0, 0);
+    }
     Ok(Json(
         json!({ "status": "activated", "assignment": plan.candidate_assignment,
         "committed_position": evidence.target_commit }),
@@ -9059,9 +9086,12 @@ async fn admin_index_demand(
 /// Per-Feed storage-traffic attribution on this Node. Append counters are
 /// cumulative per-Range totals recorded on the storing replica and joined
 /// to Feeds through the catalog; served-read counters count committed
-/// pages this replica answered. Both scopes are Node-local since process
-/// start — an ownership move serves traffic on the new owner rather than
-/// pretending a portable counter.
+/// pages this replica answered; replication counters count replica-append
+/// frames/commits this replica accepted; movement counters record
+/// completed ownership/follower moves with their transferred/skipped copy
+/// evidence. All scopes are Node-local since process start — an ownership
+/// move serves traffic on the new owner rather than pretending a portable
+/// counter.
 async fn admin_feed_demand(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -9069,7 +9099,18 @@ async fn admin_feed_demand(
     authorize_admin(&state, &headers)?;
     let appends = state.demand.range_pressure_totals();
     let reads = state.demand.range_read_totals();
+    let replication = state.demand.range_replication_totals();
+    let moves = state.demand.feed_move_totals();
     let assignments = state.control.active_feed_assignments().await;
+    let live_ranges: std::collections::BTreeSet<RangeId> = assignments
+        .iter()
+        .map(|(_, assignment)| assignment.range_id)
+        .collect();
+    let live_feeds: std::collections::BTreeSet<uuid::Uuid> = assignments
+        .iter()
+        .map(|(_, assignment)| assignment.feed_id)
+        .collect();
+    state.demand.prune_feed_demand(&live_feeds, &live_ranges);
     let mut feeds: BTreeMap<Uuid, (String, serde_json::Value)> = BTreeMap::new();
     for (feed_name, assignment) in &assignments {
         let entry = feeds.entry(assignment.feed_id).or_insert_with(|| {
@@ -9078,6 +9119,9 @@ async fn admin_feed_demand(
                 json!({
                     "appended_records": 0, "appended_bytes": 0,
                     "read_pages": 0, "records_read": 0,
+                    "replicated_frames": 0, "replicated_wire_bytes": 0,
+                    "replicated_commits": 0, "moves": 0, "moved_records": 0,
+                    "moved_bytes": 0, "moved_skipped_records": 0,
                 }),
             )
         });
@@ -9095,6 +9139,26 @@ async fn admin_feed_demand(
                 json!(entry.1["read_pages"].as_u64().unwrap_or(0) + totals.pages);
             entry.1["records_read"] =
                 json!(entry.1["records_read"].as_u64().unwrap_or(0) + totals.records);
+        }
+        if let Some(totals) = replication.get(&assignment.range_id) {
+            entry.1["replicated_frames"] =
+                json!(entry.1["replicated_frames"].as_u64().unwrap_or(0) + totals.frames);
+            entry.1["replicated_wire_bytes"] =
+                json!(entry.1["replicated_wire_bytes"].as_u64().unwrap_or(0) + totals.wire_bytes);
+            entry.1["replicated_commits"] =
+                json!(entry.1["replicated_commits"].as_u64().unwrap_or(0) + totals.commits);
+        }
+    }
+    for (feed_id, totals) in &moves {
+        if let Some(entry) = feeds.get_mut(feed_id) {
+            entry.1["moves"] = json!(entry.1["moves"].as_u64().unwrap_or(0) + totals.moves);
+            entry.1["moved_records"] =
+                json!(entry.1["moved_records"].as_u64().unwrap_or(0) + totals.records);
+            entry.1["moved_bytes"] =
+                json!(entry.1["moved_bytes"].as_u64().unwrap_or(0) + totals.bytes);
+            entry.1["moved_skipped_records"] = json!(
+                entry.1["moved_skipped_records"].as_u64().unwrap_or(0) + totals.skipped_records
+            );
         }
     }
     let mut domains: BTreeMap<String, serde_json::Value> = BTreeMap::new();
@@ -9118,11 +9182,21 @@ async fn admin_feed_demand(
             "appended_bytes": counters["appended_bytes"],
             "read_pages": counters["read_pages"],
             "records_read": counters["records_read"],
+            "replicated_frames": counters["replicated_frames"],
+            "replicated_wire_bytes": counters["replicated_wire_bytes"],
+            "replicated_commits": counters["replicated_commits"],
+            "moves": counters["moves"],
+            "moved_records": counters["moved_records"],
+            "moved_bytes": counters["moved_bytes"],
+            "moved_skipped_records": counters["moved_skipped_records"],
         }));
         let rollup = domains.entry(domain).or_insert_with(|| {
             json!({
                 "feeds": 0, "appended_records": 0, "appended_bytes": 0,
-                "read_pages": 0, "records_read": 0,
+                "read_pages": 0, "records_read": 0, "replicated_frames": 0,
+                "replicated_wire_bytes": 0, "replicated_commits": 0,
+                "moves": 0, "moved_records": 0, "moved_bytes": 0,
+                "moved_skipped_records": 0,
             })
         });
         rollup["feeds"] = json!(rollup["feeds"].as_u64().unwrap_or(0) + 1);
@@ -9131,6 +9205,13 @@ async fn admin_feed_demand(
             "appended_bytes",
             "read_pages",
             "records_read",
+            "replicated_frames",
+            "replicated_wire_bytes",
+            "replicated_commits",
+            "moves",
+            "moved_records",
+            "moved_bytes",
+            "moved_skipped_records",
         ] {
             rollup[field] =
                 json!(rollup[field].as_u64().unwrap_or(0) + counters[field].as_u64().unwrap_or(0));

@@ -30,6 +30,8 @@ struct DemandCounters {
     subscription_traffic: Mutex<BTreeMap<uuid::Uuid, SubscriptionTrafficTelemetry>>,
     index_queries: Mutex<BTreeMap<uuid::Uuid, IndexQueryTelemetry>>,
     range_reads: Mutex<BTreeMap<RangeId, RangeReadTotals>>,
+    range_replication: Mutex<BTreeMap<RangeId, RangeReplicationTotals>>,
+    feed_moves: Mutex<BTreeMap<uuid::Uuid, FeedMoveTotals>>,
 }
 
 #[derive(Default)]
@@ -383,6 +385,86 @@ impl DemandMetrics {
             .unwrap_or_default()
     }
 
+    /// Fold one replica-append frame this follower accepted into its
+    /// cumulative replication-attribution counter. `wire_bytes` is the
+    /// encoded frame size — what replication actually moved on the wire.
+    pub fn record_range_replication(&self, range_id: RangeId, wire_bytes: usize) {
+        if let Ok(mut replication) = self.inner.range_replication.lock() {
+            let totals = replication.entry(range_id).or_default();
+            totals.frames = totals.frames.saturating_add(1);
+            totals.wire_bytes = totals.wire_bytes.saturating_add(wire_bytes as u64);
+        }
+    }
+
+    /// Fold one accepted replica commit into the range's replication
+    /// counter — a quorum write with no frame payload.
+    pub fn record_range_replication_commit(&self, range_id: RangeId) {
+        if let Ok(mut replication) = self.inner.range_replication.lock() {
+            let totals = replication.entry(range_id).or_default();
+            totals.commits = totals.commits.saturating_add(1);
+        }
+    }
+
+    /// Cumulative replication-receive rows keyed by RangeId on this Node.
+    pub fn range_replication_totals(&self) -> BTreeMap<RangeId, RangeReplicationTotals> {
+        self.inner
+            .range_replication
+            .lock()
+            .map(|replication| replication.clone())
+            .unwrap_or_default()
+    }
+
+    /// Fold one completed ownership/follower move into the Feed's
+    /// cumulative movement-attribution counter. `skipped_records` counts
+    /// positions the copy resumed past — evidence the move did not have to
+    /// re-transfer.
+    pub fn record_feed_move(
+        &self,
+        feed_id: uuid::Uuid,
+        records: u64,
+        bytes: u64,
+        skipped_records: u64,
+    ) {
+        if let Ok(mut moves) = self.inner.feed_moves.lock() {
+            let totals = moves.entry(feed_id).or_default();
+            totals.moves = totals.moves.saturating_add(1);
+            totals.records = totals.records.saturating_add(records);
+            totals.bytes = totals.bytes.saturating_add(bytes);
+            totals.skipped_records = totals.skipped_records.saturating_add(skipped_records);
+        }
+    }
+
+    /// Cumulative movement rows keyed by FeedId on this Node.
+    pub fn feed_move_totals(&self) -> BTreeMap<uuid::Uuid, FeedMoveTotals> {
+        self.inner
+            .feed_moves
+            .lock()
+            .map(|moves| moves.clone())
+            .unwrap_or_default()
+    }
+
+    /// Release Feed/Range attribution rows whose logical resource no longer
+    /// exists in the catalog, so Feed/Range churn cannot grow the maps
+    /// without bound.
+    pub fn prune_feed_demand(
+        &self,
+        live_feeds: &std::collections::BTreeSet<uuid::Uuid>,
+        live_ranges: &std::collections::BTreeSet<RangeId>,
+    ) {
+        if let Ok(mut reads) = self.inner.range_reads.lock() {
+            reads.retain(|range_id, _| live_ranges.contains(range_id));
+        }
+        if let Ok(mut replication) = self.inner.range_replication.lock() {
+            replication.retain(|range_id, _| live_ranges.contains(range_id));
+        }
+        if let Ok(mut totals) = self.inner.range_totals.lock() {
+            totals.retain(|range_id, _| live_ranges.contains(range_id));
+        }
+        if let Ok(mut moves) = self.inner.feed_moves.lock() {
+            moves.retain(|feed_id, _| live_feeds.contains(feed_id));
+        }
+    }
+
     pub fn record_read(&self, records: usize) {
         self.inner.reads_total.fetch_add(1, Ordering::Relaxed);
         self.inner
@@ -569,6 +651,29 @@ impl IndexQueryMode {
 pub struct RangeReadTotals {
     pub pages: u64,
     pub records: u64,
+}
+
+/// Cumulative replica-append receive service on one Active Range on this
+/// follower Node. `wire_bytes` counts encoded frame bytes — what the
+/// replication protocol actually moved to this replica.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RangeReplicationTotals {
+    pub frames: u64,
+    pub wire_bytes: u64,
+    /// Accepted replica commits — frame-free quorum writes.
+    pub commits: u64,
+}
+
+/// Cumulative ownership/follower movement evidence for one Feed on this
+/// Node — records and bytes the completed move transferred.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct FeedMoveTotals {
+    pub moves: u64,
+    pub records: u64,
+    pub bytes: u64,
+    /// Committed positions staged copies resumed past instead of
+    /// re-transferring.
+    pub skipped_records: u64,
 }
 
 /// Per-Index query attribution on this Node since process start — the
@@ -1286,5 +1391,38 @@ mod tests {
         assert_eq!(totals.get(&first).unwrap().pages, 2);
         assert_eq!(totals.get(&first).unwrap().records, 12);
         assert_eq!(totals.get(&second).unwrap().records, 1);
+    }
+
+    #[test]
+    fn replication_and_move_totals_accumulate_per_range_and_feed() {
+        let metrics = DemandMetrics::default();
+        let range = range_id(21);
+        let feed = uuid::Uuid::from_u128(9_101);
+        metrics.record_range_replication(range, 512);
+        metrics.record_range_replication(range, 300);
+        metrics.record_range_replication_commit(range);
+        metrics.record_range_read(range, 3);
+        metrics.record_range_append(range, b"key", 96);
+        metrics.record_feed_move(feed, 1_000, 48_000, 200);
+        metrics.record_feed_move(feed, 12, 600, 0);
+
+        let replication = metrics.range_replication_totals();
+        assert_eq!(replication.get(&range).unwrap().frames, 2);
+        assert_eq!(replication.get(&range).unwrap().wire_bytes, 812);
+        assert_eq!(replication.get(&range).unwrap().commits, 1);
+        let moves = metrics.feed_move_totals();
+        assert_eq!(moves.get(&feed).unwrap().moves, 2);
+        assert_eq!(moves.get(&feed).unwrap().records, 1_012);
+        assert_eq!(moves.get(&feed).unwrap().bytes, 48_600);
+        assert_eq!(moves.get(&feed).unwrap().skipped_records, 200);
+
+        metrics.prune_feed_demand(
+            &std::collections::BTreeSet::new(),
+            &std::collections::BTreeSet::new(),
+        );
+        assert!(metrics.range_replication_totals().is_empty());
+        assert!(metrics.feed_move_totals().is_empty());
+        assert!(metrics.range_read_totals().is_empty());
+        assert!(metrics.range_pressure_totals().is_empty());
     }
 }
