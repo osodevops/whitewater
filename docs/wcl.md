@@ -504,14 +504,26 @@ Namespace `orders.*` matches descendants such as `orders.created` and `orders.eu
 
 
 WCL v0 uses default deny and allow grants. Grants bound to issued
-API-key identities enforce on the Feed-named data-plane endpoints:
-`GET /v1/feeds/records`, `GET /v1/feeds/records/search`,
-`GET /v1/feeds/records/lookup`, and `POST /v1/readers/temporary/fetch`
-require `read`; `POST /v1/feeds/append` requires `write`; `manage`
-implies both. The configured bootstrap key and `manage`-on-`*`
-identities pass every scope. Explicit deny and grant enforcement on
-Writer, Reader, Subscription, StateStore, and Index operations are
-future control-plane work.
+API-key identities enforce on the Feed-named and resource-named
+data-plane endpoints: `GET /v1/feeds/records`,
+`GET /v1/feeds/records/search`, `GET /v1/feeds/records/lookup`,
+`POST /v1/readers/temporary/fetch`, and the Reader session endpoints
+(`/v1/readers/open`, `/v1/readers/fetch`, `/v1/readers/ack`,
+`/v1/readers/close`) require `read` on the accessed Feed;
+`POST /v1/feeds/append` and the Writer session endpoints
+(`/v1/writers/append`, `/v1/writers/append-batch`) require `write` on
+the target Feed; `manage` implies both. A Writer or Reader declared in
+a foreign Domain still authorizes against its Feed's namespace, never
+its own name. The configured bootstrap key and `manage`-on-`*`
+identities pass every scope. Subscription member endpoints
+(`/v1/subscriptions/members/*` plus `GET
+/v1/subscriptions/members/state`) require `read` on the
+Subscription's source: a Feed-sourced Subscription checks its Feed's
+namespace, while a Domain-sourced one needs a spanning grant (`*` or
+`{domain}.*`) — an exact-name grant never covers a Domain's member
+Feeds. Explicit deny and grant enforcement on Subscription
+administration, StateStore, and Index operations are future
+control-plane work.
 
 
 

@@ -14,8 +14,8 @@ use crate::{
         WriterSessionAppendRequest,
     },
     control::{
-        namespace_matches, Command, ControlExecution, IssuedApiKeySet, PermissionAction,
-        ReaderStart, ResourceKind, ShowKind,
+        namespace_matches, Command, ControlExecution, IssuedApiKey, IssuedApiKeySet,
+        PermissionAction, ReaderStart, ResourceKind, ShowKind,
     },
     reader::ReaderRetryPolicy,
 };
@@ -88,6 +88,56 @@ impl AdminAuthenticator {
         self.authorize_inner(authorization, Some((issued, now_unix_ns)))
     }
 
+    /// Authenticate the Bearer credential without evaluating grants —
+    /// the configured bootstrap key or any unexpired issued identity.
+    /// Resource-named data-plane endpoints authenticate before
+    /// resolution so an invalid credential cannot probe existence, then
+    /// run `authorize_scoped` against the resolved owning Feed.
+    pub fn authenticate(
+        &self,
+        authorization: Option<&str>,
+        issued: &IssuedApiKeySet,
+        now_unix_ns: i64,
+    ) -> Result<(), AdminAuthError> {
+        self.verified_identity(authorization, issued, now_unix_ns)
+            .map(|_| ())
+    }
+
+    /// Resolve the supplied credential: `Ok(None)` when the configured
+    /// bootstrap key matched, `Ok(Some(identity))` for an unexpired
+    /// issued identity, and `Err` for missing, unknown, or expired
+    /// credentials. Grant evaluation is the caller's concern.
+    fn verified_identity<'a>(
+        &self,
+        authorization: Option<&str>,
+        issued: &'a IssuedApiKeySet,
+        now_unix_ns: i64,
+    ) -> Result<Option<&'a IssuedApiKey>, AdminAuthError> {
+        if self.expected_digest.is_none() && issued.is_empty() {
+            return Err(AdminAuthError::NotConfigured);
+        }
+        let supplied = authorization
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .filter(|value| !value.is_empty())
+            .ok_or(AdminAuthError::Missing)?;
+        let actual = *blake3::hash(supplied.as_bytes()).as_bytes();
+        if self
+            .expected_digest
+            .is_some_and(|expected| constant_time_equal(&expected, &actual))
+        {
+            return Ok(None);
+        }
+        if let Some(identity) = issued.get(&actual) {
+            if identity
+                .expires_at_ns
+                .is_none_or(|expiry| now_unix_ns < expiry)
+            {
+                return Ok(Some(identity));
+            }
+        }
+        Err(AdminAuthError::Invalid)
+    }
+
     /// Authorize a data-plane `action` against `namespace` (a Feed
     /// name, or any dotted resource inside a Domain). The configured
     /// bootstrap key and unexpired riverbed-admin identities always
@@ -102,35 +152,46 @@ impl AdminAuthenticator {
         namespace: &str,
         action: PermissionAction,
     ) -> Result<(), AdminAuthError> {
-        let issued_empty = issued.is_empty();
-        if self.expected_digest.is_none() && issued_empty {
-            return Err(AdminAuthError::NotConfigured);
-        }
-        let supplied = authorization
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .filter(|value| !value.is_empty())
-            .ok_or(AdminAuthError::Missing)?;
-        let actual = *blake3::hash(supplied.as_bytes()).as_bytes();
-        if self
-            .expected_digest
-            .is_some_and(|expected| constant_time_equal(&expected, &actual))
+        let Some(identity) = self.verified_identity(authorization, issued, now_unix_ns)? else {
+            return Ok(());
+        };
+        if identity.riverbed_admin
+            || identity.grants.iter().any(|grant| {
+                (grant.actions.contains(&action)
+                    || grant.actions.contains(&PermissionAction::Manage))
+                    && namespace_matches(&grant.namespace, namespace)
+            })
         {
             return Ok(());
         }
-        if let Some(identity) = issued.get(&actual) {
-            let unexpired = identity
-                .expires_at_ns
-                .is_none_or(|expiry| now_unix_ns < expiry);
-            if unexpired
-                && (identity.riverbed_admin
-                    || identity.grants.iter().any(|grant| {
-                        (grant.actions.contains(&action)
-                            || grant.actions.contains(&PermissionAction::Manage))
-                            && namespace_matches(&grant.namespace, namespace)
-                    }))
-            {
-                return Ok(());
-            }
+        Err(AdminAuthError::Invalid)
+    }
+
+    /// Authorize `action` across a whole Domain — for Domain-scoped
+    /// Subscription member operations, whose member Feeds attach
+    /// incrementally. The bootstrap key and riverbed-admin identities
+    /// pass; otherwise an unexpired issued identity needs a spanning
+    /// grant (`*` or `{domain}.*`) for `action` — an exact grant names
+    /// one resource, never a Domain's contents.
+    pub fn authorize_domain_scoped(
+        &self,
+        authorization: Option<&str>,
+        issued: &IssuedApiKeySet,
+        now_unix_ns: i64,
+        domain: &str,
+        action: PermissionAction,
+    ) -> Result<(), AdminAuthError> {
+        let Some(identity) = self.verified_identity(authorization, issued, now_unix_ns)? else {
+            return Ok(());
+        };
+        if identity.riverbed_admin
+            || identity.grants.iter().any(|grant| {
+                (grant.actions.contains(&action)
+                    || grant.actions.contains(&PermissionAction::Manage))
+                    && crate::control::grant_covers_domain(&grant.namespace, domain)
+            })
+        {
+            return Ok(());
         }
         Err(AdminAuthError::Invalid)
     }
@@ -838,6 +899,54 @@ mod tests {
     }
 
     #[test]
+    fn authenticate_accepts_any_unexpired_identity_before_scope_checks() {
+        use crate::control::IssuedApiKey;
+
+        let bootstrap = "this-is-a-long-development-api-key";
+        let auth = AdminAuthenticator::new(Some(bootstrap.to_owned())).unwrap();
+        let scoped_secret = "narrow-scope-key-0123456789abcdef0";
+        let digest = *blake3::hash(scoped_secret.as_bytes()).as_bytes();
+        let mut issued = IssuedApiKeySet::new();
+        issued.insert(
+            digest,
+            IssuedApiKey {
+                name: "narrow".to_owned(),
+                riverbed_admin: false,
+                grants: vec![],
+                expires_at_ns: Some(5_000),
+            },
+        );
+        // Bootstrap, scoped, and grantless-but-unexpired identities all
+        // authenticate; grant checks are a separate concern.
+        for secret in [bootstrap, scoped_secret] {
+            let header = format!("Bearer {secret}");
+            assert!(auth.authenticate(Some(&header), &issued, 1_000).is_ok());
+        }
+        // Missing, unknown, and expired credentials refuse.
+        assert_eq!(
+            auth.authenticate(None, &issued, 1_000),
+            Err(AdminAuthError::Missing)
+        );
+        let unknown = "Bearer unknown-key-0123456789abcdef";
+        assert_eq!(
+            auth.authenticate(Some(unknown), &issued, 1_000),
+            Err(AdminAuthError::Invalid)
+        );
+        let header = format!("Bearer {scoped_secret}");
+        assert_eq!(
+            auth.authenticate(Some(&header), &issued, 9_000),
+            Err(AdminAuthError::Invalid)
+        );
+        // With no configured key and no issued identities the
+        // authenticator reports NotConfigured rather than a bad request.
+        let bare = AdminAuthenticator::new(None).unwrap();
+        assert_eq!(
+            bare.authenticate(Some(&header), &IssuedApiKeySet::new(), 1_000),
+            Err(AdminAuthError::NotConfigured)
+        );
+    }
+
+    #[test]
     fn scoped_authorization_enforces_namespace_grants() {
         use crate::control::{IssuedApiKey, IssuedGrant};
 
@@ -947,6 +1056,129 @@ mod tests {
                 &issued,
                 1_000,
                 "orders.events",
+                PermissionAction::Read,
+            ),
+            Err(AdminAuthError::Invalid)
+        );
+    }
+
+    #[test]
+    fn domain_scoped_authorization_requires_spanning_grants() {
+        use crate::control::{IssuedApiKey, IssuedGrant};
+
+        let bootstrap = "this-is-a-long-development-api-key";
+        let auth = AdminAuthenticator::new(Some(bootstrap.to_owned())).unwrap();
+        let secret = "subscription-scoped-key-01234567abcd";
+        let digest = *blake3::hash(secret.as_bytes()).as_bytes();
+        let header = format!("Bearer {secret}");
+        let mut issued = IssuedApiKeySet::new();
+        issued.insert(
+            digest,
+            IssuedApiKey {
+                name: "ops.subscription".to_owned(),
+                riverbed_admin: false,
+                grants: vec![IssuedGrant {
+                    namespace: "orders.*".to_owned(),
+                    actions: [PermissionAction::Read].into_iter().collect(),
+                }],
+                expires_at_ns: None,
+            },
+        );
+        // orders.* spans the Domain for member reads.
+        assert!(auth
+            .authorize_domain_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders",
+                PermissionAction::Read,
+            )
+            .is_ok());
+        // ...but does not imply writes on the Domain...
+        assert_eq!(
+            auth.authorize_domain_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders",
+                PermissionAction::Write,
+            ),
+            Err(AdminAuthError::Invalid)
+        );
+        // ...and does not reach a different Domain.
+        assert_eq!(
+            auth.authorize_domain_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "billing",
+                PermissionAction::Read,
+            ),
+            Err(AdminAuthError::Invalid)
+        );
+        // An exact-Feed grant never covers its Domain's member Feeds.
+        issued.get_mut(&digest).unwrap().grants = vec![IssuedGrant {
+            namespace: "orders.events".to_owned(),
+            actions: [PermissionAction::Read].into_iter().collect(),
+        }];
+        assert_eq!(
+            auth.authorize_domain_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders",
+                PermissionAction::Read,
+            ),
+            Err(AdminAuthError::Invalid)
+        );
+        // manage on a spanning namespace covers member reads too.
+        issued.get_mut(&digest).unwrap().grants = vec![IssuedGrant {
+            namespace: "orders.*".to_owned(),
+            actions: [PermissionAction::Manage].into_iter().collect(),
+        }];
+        assert!(auth
+            .authorize_domain_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders",
+                PermissionAction::Read,
+            )
+            .is_ok());
+        // The bootstrap key and issued riverbed admins pass Domain scopes.
+        assert!(auth
+            .authorize_domain_scoped(
+                Some(&format!("Bearer {bootstrap}")),
+                &issued,
+                1_000,
+                "billing",
+                PermissionAction::Write,
+            )
+            .is_ok());
+        issued.get_mut(&digest).unwrap().riverbed_admin = true;
+        issued.get_mut(&digest).unwrap().grants = vec![];
+        assert!(auth
+            .authorize_domain_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "billing",
+                PermissionAction::Write,
+            )
+            .is_ok());
+        // An expired scoped identity refuses.
+        issued.get_mut(&digest).unwrap().riverbed_admin = false;
+        issued.get_mut(&digest).unwrap().grants = vec![IssuedGrant {
+            namespace: "orders.*".to_owned(),
+            actions: [PermissionAction::Read].into_iter().collect(),
+        }];
+        issued.get_mut(&digest).unwrap().expires_at_ns = Some(500);
+        assert_eq!(
+            auth.authorize_domain_scoped(
+                Some(&header),
+                &issued,
+                1_000,
+                "orders",
                 PermissionAction::Read,
             ),
             Err(AdminAuthError::Invalid)

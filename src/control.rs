@@ -6223,6 +6223,14 @@ fn validate_namespace_pattern(pattern: &str) -> Result<(), ControlError> {
     }
 }
 
+/// Whether a grant namespace `pattern` spans an entire Domain — the
+/// root `*` or a `{domain}.*` wildcard. An exact grant names one
+/// resource, never a Domain's member Feeds, so Domain-scoped
+/// Subscriptions need one of the two spanning forms.
+pub(crate) fn grant_covers_domain(pattern: &str, domain: &str) -> bool {
+    pattern == "*" || pattern.strip_suffix(".*") == Some(domain)
+}
+
 pub(crate) fn namespace_matches(pattern: &str, feed: &str) -> bool {
     if pattern == "*" {
         return true;
@@ -10702,5 +10710,17 @@ mod tests {
         assert!(namespace_matches("*", "orders.events"));
         assert!(namespace_matches("*", "anything.deep"));
         assert!(validate_namespace_pattern("*").is_ok());
+    }
+
+    #[test]
+    fn domain_spanning_grant_forms_cover_only_the_named_domain() {
+        assert!(grant_covers_domain("*", "orders"));
+        assert!(grant_covers_domain("orders.*", "orders"));
+        // An exact pattern names one resource, never the Domain itself.
+        assert!(!grant_covers_domain("orders", "orders"));
+        assert!(!grant_covers_domain("billing.*", "orders"));
+        // orders.eu.* spans only the orders.eu subdomain, not orders.
+        assert!(!grant_covers_domain("orders.eu.*", "orders"));
+        assert!(grant_covers_domain("orders.eu.*", "orders.eu"));
     }
 }
