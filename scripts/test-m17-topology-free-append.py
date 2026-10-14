@@ -171,6 +171,8 @@ def main():
         raise AssertionError(f"appended_bytes {counters}")
     if counters.get("records_read", 0) < 3:
         raise AssertionError(f"records_read {counters}")
+    if counters.get("read_bytes", 0) < 1:
+        raise AssertionError(f"read_bytes {counters}")
     # RF3: the owner replicated the frame to the follower replicas.
     if counters.get("replicated_frames", 0) < 1:
         raise AssertionError(f"replicated_frames {counters}")

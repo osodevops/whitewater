@@ -368,11 +368,12 @@ impl DemandMetrics {
 
     /// Fold one committed range page this replica served into its
     /// cumulative read-attribution counter.
-    pub fn record_range_read(&self, range_id: RangeId, records: usize) {
+    pub fn record_range_read(&self, range_id: RangeId, records: usize, bytes: u64) {
         if let Ok(mut reads) = self.inner.range_reads.lock() {
             let totals = reads.entry(range_id).or_default();
             totals.pages = totals.pages.saturating_add(1);
             totals.records = totals.records.saturating_add(records as u64);
+            totals.bytes = totals.bytes.saturating_add(bytes);
         }
     }
 
@@ -651,6 +652,8 @@ impl IndexQueryMode {
 pub struct RangeReadTotals {
     pub pages: u64,
     pub records: u64,
+    /// Committed frame bytes served — the replica's read egress evidence.
+    pub bytes: u64,
 }
 
 /// Cumulative replica-append receive service on one Active Range on this
@@ -1383,14 +1386,16 @@ mod tests {
         let metrics = DemandMetrics::default();
         let first = range_id(11);
         let second = range_id(12);
-        metrics.record_range_read(first, 8);
-        metrics.record_range_read(first, 4);
-        metrics.record_range_read(second, 1);
+        metrics.record_range_read(first, 8, 400);
+        metrics.record_range_read(first, 4, 200);
+        metrics.record_range_read(second, 1, 48);
 
         let totals = metrics.range_read_totals();
         assert_eq!(totals.get(&first).unwrap().pages, 2);
         assert_eq!(totals.get(&first).unwrap().records, 12);
+        assert_eq!(totals.get(&first).unwrap().bytes, 600);
         assert_eq!(totals.get(&second).unwrap().records, 1);
+        assert_eq!(totals.get(&second).unwrap().bytes, 48);
     }
 
     #[test]
@@ -1401,7 +1406,7 @@ mod tests {
         metrics.record_range_replication(range, 512);
         metrics.record_range_replication(range, 300);
         metrics.record_range_replication_commit(range);
-        metrics.record_range_read(range, 3);
+        metrics.record_range_read(range, 3, 96);
         metrics.record_range_append(range, b"key", 96);
         metrics.record_feed_move(feed, 1_000, 48_000, 200);
         metrics.record_feed_move(feed, 12, 600, 0);

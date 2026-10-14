@@ -527,6 +527,7 @@
             "appended_bytes": "u64",
             "read_pages": "u64",
             "records_read": "u64",
+            "read_bytes": "u64",
             "replicated_frames": "u64",
             "replicated_wire_bytes": "u64",
             "replicated_commits": "u64",

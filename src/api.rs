@@ -9118,7 +9118,7 @@ async fn admin_feed_demand(
                 feed_name.clone(),
                 json!({
                     "appended_records": 0, "appended_bytes": 0,
-                    "read_pages": 0, "records_read": 0,
+                    "read_pages": 0, "records_read": 0, "read_bytes": 0,
                     "replicated_frames": 0, "replicated_wire_bytes": 0,
                     "replicated_commits": 0, "moves": 0, "moved_records": 0,
                     "moved_bytes": 0, "moved_skipped_records": 0,
@@ -9139,6 +9139,8 @@ async fn admin_feed_demand(
                 json!(entry.1["read_pages"].as_u64().unwrap_or(0) + totals.pages);
             entry.1["records_read"] =
                 json!(entry.1["records_read"].as_u64().unwrap_or(0) + totals.records);
+            entry.1["read_bytes"] =
+                json!(entry.1["read_bytes"].as_u64().unwrap_or(0) + totals.bytes);
         }
         if let Some(totals) = replication.get(&assignment.range_id) {
             entry.1["replicated_frames"] =
@@ -9182,6 +9184,7 @@ async fn admin_feed_demand(
             "appended_bytes": counters["appended_bytes"],
             "read_pages": counters["read_pages"],
             "records_read": counters["records_read"],
+            "read_bytes": counters["read_bytes"],
             "replicated_frames": counters["replicated_frames"],
             "replicated_wire_bytes": counters["replicated_wire_bytes"],
             "replicated_commits": counters["replicated_commits"],
@@ -9193,7 +9196,8 @@ async fn admin_feed_demand(
         let rollup = domains.entry(domain).or_insert_with(|| {
             json!({
                 "feeds": 0, "appended_records": 0, "appended_bytes": 0,
-                "read_pages": 0, "records_read": 0, "replicated_frames": 0,
+                "read_pages": 0, "records_read": 0, "read_bytes": 0,
+                "replicated_frames": 0,
                 "replicated_wire_bytes": 0, "replicated_commits": 0,
                 "moves": 0, "moved_records": 0, "moved_bytes": 0,
                 "moved_skipped_records": 0,
@@ -9205,6 +9209,7 @@ async fn admin_feed_demand(
             "appended_bytes",
             "read_pages",
             "records_read",
+            "read_bytes",
             "replicated_frames",
             "replicated_wire_bytes",
             "replicated_commits",
@@ -10482,9 +10487,11 @@ async fn read_owned_range_page(
             ));
         }
     }
-    state
-        .demand
-        .record_range_read(request.assignment.range_id, frames.len());
+    state.demand.record_range_read(
+        request.assignment.range_id,
+        frames.len(),
+        frames.iter().map(|frame| frame.frame.len() as u64).sum(),
+    );
     Ok(Json(ReadRangePageResponse {
         committed,
         resolved_after,
@@ -18025,7 +18032,12 @@ mod tests {
         // Feed-level storage attribution lands on the storing replica:
         // member fetches drove committed range reads on the owning Node,
         // so the merged rows show served-read evidence for the Feed.
+        // Replica-accept replication counters live on the internal HTTP
+        // handler, which the in-process LoopbackReplicaTransport bypasses
+        // by design — live Compose scripts (m17, m4 moves) cover that
+        // path on a real Riverbed.
         let mut records_read = 0_u64;
+        let mut read_bytes = 0_u64;
         let mut feed_seen = false;
         for node in &nodes {
             let response = client
@@ -18039,6 +18051,7 @@ mod tests {
                 if row["feed"] == json!("orders.events") {
                     feed_seen = true;
                     records_read += row["records_read"].as_u64().unwrap_or(0);
+                    read_bytes += row["read_bytes"].as_u64().unwrap_or(0);
                 }
             }
         }
@@ -18046,6 +18059,10 @@ mod tests {
         assert!(
             records_read >= 4,
             "member fetches must attribute served records: {records_read}"
+        );
+        assert!(
+            read_bytes >= 1,
+            "served reads must attribute egress frame bytes: {read_bytes}"
         );
 
         // A lost progress owner leaves member reads on surviving quorum
