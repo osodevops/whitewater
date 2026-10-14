@@ -86,6 +86,9 @@ pub enum SdkError {
     Ambiguous(String),
     /// Quorum/replica unavailable: safe to retry the identical request.
     Unavailable(String),
+    /// `index_behind`: strict freshness could not be reached inside the
+    /// bounded wait; the read may be retried.
+    IndexBehind,
     /// Refused before commit (syntax, validation, authentication).
     Refused(String),
     /// Server reports a different protocol major.
@@ -104,7 +107,10 @@ impl SdkError {
     pub fn retryable(&self) -> bool {
         matches!(
             self,
-            SdkError::Ambiguous(_) | SdkError::Unavailable(_) | SdkError::Transport(_)
+            SdkError::Ambiguous(_)
+                | SdkError::Unavailable(_)
+                | SdkError::Transport(_)
+                | SdkError::IndexBehind
         )
     }
 }
@@ -122,6 +128,7 @@ fn map_error(status: u16, body: &Value) -> SdkError {
         (409, Some("lease.busy")) => SdkError::LeaseBusy,
         (409, Some("lease.stale_lease")) => SdkError::LeaseStale,
         (409, Some("lease.capacity")) => SdkError::LeaseCapacity,
+        (409, Some("index_behind")) => SdkError::IndexBehind,
         (409, _) => SdkError::Conflict(detail),
         (503, _) => SdkError::Unavailable(detail),
         _ if status >= 500 => SdkError::Ambiguous(detail),
@@ -427,6 +434,149 @@ impl Client {
             .or_else(|| body.get("records").and_then(Value::as_array).cloned())
             .unwrap_or_default();
         records.iter().map(decode_record).collect()
+    }
+
+    /// Bind a declared StateStore handle — no call; operations resolve
+    /// the store per request and map its typed errors.
+    pub fn state_store(&self, name: &str) -> StateStore {
+        StateStore {
+            client: self.clone(),
+            name: name.to_owned(),
+        }
+    }
+
+    /// Temporary read against a Feed without declaring a Reader:
+    /// bounded history walks, live tails, or fresh-only waits per
+    /// `options` — see `TemporaryFetch`.
+    pub async fn temporary_fetch(
+        &self,
+        feed: &str,
+        options: TemporaryFetch,
+    ) -> Result<TemporaryPage, SdkError> {
+        let body = self
+            .call(
+                "POST",
+                "/v1/readers/temporary/fetch",
+                Some(&json!({
+                    "feed": feed,
+                    "after": options.after,
+                    "limit": options.limit,
+                    "new_only": options.new_only,
+                    "tail": options.tail,
+                    "wait_ms": options.wait_ms,
+                    "after_event_time_ns": options
+                        .after_event_time_ns
+                        .map(|nanos| nanos.to_string()),
+                })),
+            )
+            .await?;
+        let records = body
+            .get("records")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(decode_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(TemporaryPage {
+            records,
+            next_cursor: body
+                .get("next_cursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        })
+    }
+
+    /// Query a declared persisted Index. `mode` selects exact,
+    /// prefix, or range matching per `sdk/spec/endpoints.json`; `strict`
+    /// bounded-waits for the serving Node's checkpoint to reach the
+    /// activation frontier, surfacing `IndexBehind` when it cannot.
+    pub async fn query_index(
+        &self,
+        index: &str,
+        mode: IndexQuery,
+        limit: Option<u64>,
+        strict: bool,
+    ) -> Result<IndexPage, SdkError> {
+        let mode_fields = match &mode {
+            IndexQuery::Exact(values) => json!({
+                "mode": "exact",
+                "values": values.iter().map(wire_typed).collect::<Vec<_>>(),
+            }),
+            IndexQuery::Prefix {
+                leading,
+                partial_text,
+            } => json!({
+                "mode": "prefix",
+                "leading": leading.iter().map(wire_typed).collect::<Vec<_>>(),
+                "partial_text": partial_text,
+            }),
+            IndexQuery::Range {
+                leading,
+                lower,
+                upper,
+            } => json!({
+                "mode": "range",
+                "leading": leading.iter().map(wire_typed).collect::<Vec<_>>(),
+                "lower": {"value": wire_typed(&lower.value), "inclusive": lower.inclusive},
+                "upper": {"value": wire_typed(&upper.value), "inclusive": upper.inclusive},
+            }),
+        };
+        let mut request = json!({
+            "index": index,
+            "strict": strict,
+        });
+        if let Some(object) = request.as_object_mut() {
+            if let Some(fields) = mode_fields.as_object() {
+                for (key, value) in fields {
+                    object.insert(key.clone(), value.clone());
+                }
+            }
+            if let Some(limit) = limit {
+                object.insert("limit".to_owned(), json!(limit));
+            }
+        }
+        let body = self
+            .call("POST", "/v1/indexes/query", Some(&request))
+            .await?;
+        let rows = body
+            .get("rows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|row| {
+                let decode = |field: &str| -> Result<Vec<u8>, SdkError> {
+                    row.get(field)
+                        .and_then(Value::as_str)
+                        .and_then(|raw| STANDARD.decode(raw).ok())
+                        .ok_or_else(|| SdkError::Protocol(format!("index row missing {field}")))
+                };
+                Ok((decode("key_base64")?, decode("payload_base64")?))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(IndexPage {
+            rows,
+            generation: body.get("generation").and_then(Value::as_u64).unwrap_or(0),
+            applied_cursor: body
+                .get("applied_cursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            target_cursor: body
+                .get("target_cursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            behind: body.get("behind").and_then(Value::as_bool).unwrap_or(false),
+            truncated: body
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            served_by: body
+                .get("served_by")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        })
     }
 }
 
@@ -933,6 +1083,453 @@ impl Member {
     }
 }
 
+/// One typed Index/StateStore field value — the wire contract shared by
+/// `query_index`, `state_store.get_by`, and named-key mutations. Bytes
+/// travel base64 like every binary field on the API.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TypedValue {
+    Null,
+    Bool(bool),
+    I64(i64),
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+fn wire_typed(value: &TypedValue) -> Value {
+    match value {
+        TypedValue::Null => json!({"kind": "null"}),
+        TypedValue::Bool(value) => json!({"kind": "bool", "value": value}),
+        TypedValue::I64(value) => json!({"kind": "i64", "value": value}),
+        TypedValue::Text(value) => json!({"kind": "text", "value": value}),
+        TypedValue::Bytes(value) => {
+            json!({"kind": "bytes", "value_base64": STANDARD.encode(value)})
+        }
+    }
+}
+
+/// Options for `Client::temporary_fetch`: `new_only` waits for fresh
+/// history, `tail` follows live delivery, `after`/`after_event_time_ns`
+/// bound where the page starts.
+#[derive(Clone, Debug, Default)]
+pub struct TemporaryFetch {
+    /// Opaque Cursor to resume after; `None` starts per `tail`/`new_only`.
+    pub after: Option<String>,
+    pub limit: u64,
+    pub new_only: bool,
+    pub tail: bool,
+    /// Bounded server-side wait for records on a live tail.
+    pub wait_ms: Option<u64>,
+    /// Event-time lower bound (signed epoch nanoseconds).
+    pub after_event_time_ns: Option<i64>,
+}
+
+/// A page returned by `Client::temporary_fetch`.
+#[derive(Clone, Debug)]
+pub struct TemporaryPage {
+    pub records: Vec<Record>,
+    /// Opaque continuation for the next page; `None` at the tip.
+    pub next_cursor: Option<String>,
+}
+
+/// Inclusive/exclusive bound for an Index range query.
+#[derive(Clone, Debug)]
+pub struct IndexBound {
+    pub value: TypedValue,
+    pub inclusive: bool,
+}
+
+/// The query shape `Client::query_index` lowers onto the wire.
+#[derive(Clone, Debug)]
+pub enum IndexQuery {
+    /// Every declared field, exact match.
+    Exact(Vec<TypedValue>),
+    /// Leading fields exact, plus an optional text prefix on the next.
+    Prefix {
+        leading: Vec<TypedValue>,
+        partial_text: Option<String>,
+    },
+    /// Leading fields exact, the next field between `lower`/`upper`.
+    Range {
+        leading: Vec<TypedValue>,
+        lower: IndexBound,
+        upper: IndexBound,
+    },
+}
+
+/// A page returned by `Client::query_index`.
+#[derive(Clone, Debug)]
+pub struct IndexPage {
+    /// Decoded `(key, payload)` posting rows.
+    pub rows: Vec<(Vec<u8>, Vec<u8>)>,
+    /// Active generation that served — changes on rebuild.
+    pub generation: u64,
+    pub applied_cursor: Option<String>,
+    pub target_cursor: Option<String>,
+    /// Serving Node still materializing the activation frontier.
+    pub behind: bool,
+    /// The page hit a server bound; narrow the query to continue.
+    pub truncated: bool,
+    /// Node identity that served — diagnostics, never routing input.
+    pub served_by: String,
+}
+
+/// Outcome of one committed StateStore mutation.
+#[derive(Clone, Debug)]
+pub struct MutationOutcome {
+    pub store_id: Uuid,
+    pub sequence: u64,
+    /// Identical `mutation_id` replay — the row did not commit twice.
+    pub deduplicated: bool,
+}
+
+/// One row as served by lookup/get_by/iterate.
+#[derive(Clone, Debug)]
+pub struct StoreRow {
+    pub key: Vec<u8>,
+    pub payload: Vec<u8>,
+}
+
+/// Freshness + identity envelope every StateStore read reports.
+#[derive(Clone, Debug)]
+pub struct ReadFreshness {
+    /// Highest journal sequence the serving replica applied.
+    pub applied_seq: u64,
+    /// Highest committed sequence on the serving replica.
+    pub committed_seq: u64,
+    /// `applied_seq < committed_seq`: the replica is still applying.
+    pub behind: bool,
+    /// Node identity that served — diagnostics, never routing input.
+    pub served_by: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct LookupOutcome {
+    pub row: Option<StoreRow>,
+    pub freshness: ReadFreshness,
+}
+
+#[derive(Clone, Debug)]
+pub struct GetByPage {
+    pub rows: Vec<StoreRow>,
+    pub freshness: ReadFreshness,
+}
+
+#[derive(Clone, Debug)]
+pub struct IteratePage {
+    pub rows: Vec<StoreRow>,
+    /// Continuation key for the next page; `None` at the end.
+    pub next_key: Option<Vec<u8>>,
+    /// Journal position the page was pinned to.
+    pub pinned_seq: u64,
+    pub served_by: String,
+}
+
+/// Outcome of `sync`/`rebuild`: records applied this pass plus whether
+/// the store reached the committed tip of its source Feed.
+#[derive(Clone, Debug)]
+pub struct SyncOutcome {
+    pub applied: u64,
+    pub frontier: Option<String>,
+    pub complete: bool,
+}
+
+/// A declared StateStore bound by name. Manual stores accept
+/// `put_row`/`delete_row`/`clear` under caller `mutation_id`s (identical
+/// retries dedupe); feed-sourced stores refuse mutation server-side and
+/// are maintained by `sync`/`rebuild`.
+#[derive(Clone)]
+pub struct StateStore {
+    client: Client,
+    name: String,
+}
+
+fn decode_store_row(value: &Value, key_field: &str) -> Result<StoreRow, SdkError> {
+    let decode = |field: &str| -> Result<Vec<u8>, SdkError> {
+        value
+            .get(field)
+            .and_then(Value::as_str)
+            .and_then(|raw| STANDARD.decode(raw).ok())
+            .ok_or_else(|| SdkError::Protocol(format!("store row missing {field}")))
+    };
+    Ok(StoreRow {
+        key: decode(key_field)?,
+        payload: decode("payload_base64")?,
+    })
+}
+
+fn decode_freshness(body: &Value) -> ReadFreshness {
+    ReadFreshness {
+        applied_seq: body.get("applied_seq").and_then(Value::as_u64).unwrap_or(0),
+        committed_seq: body
+            .get("committed_seq")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        behind: body.get("behind").and_then(Value::as_bool).unwrap_or(false),
+        served_by: body
+            .get("served_by")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    }
+}
+
+fn decode_mutation_outcome(body: &Value) -> Result<MutationOutcome, SdkError> {
+    Ok(MutationOutcome {
+        store_id: body
+            .get("store_id")
+            .and_then(Value::as_str)
+            .and_then(|raw| Uuid::parse_str(raw).ok())
+            .ok_or_else(|| SdkError::Protocol("mutation returned no store_id".to_owned()))?,
+        sequence: body.get("sequence").and_then(Value::as_u64).unwrap_or(0),
+        deduplicated: body
+            .get("deduplicated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+fn decode_sync_outcome(body: &Value) -> SyncOutcome {
+    SyncOutcome {
+        applied: body.get("applied").and_then(Value::as_u64).unwrap_or(0),
+        frontier: body
+            .get("frontier")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        complete: body
+            .get("complete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+impl StateStore {
+    /// Put one row with optional named-key postings. `mutation_id` is the
+    /// idempotency identity: an identical retry dedupes, a different
+    /// payload under the same id conflicts.
+    pub async fn put_row(
+        &self,
+        mutation_id: Uuid,
+        key: &[u8],
+        payload: &[u8],
+        named: &[(String, Vec<TypedValue>)],
+    ) -> Result<MutationOutcome, SdkError> {
+        let named_wire: Vec<Value> = named
+            .iter()
+            .map(|(name, values)| {
+                json!({
+                    "name": name,
+                    "values": values.iter().map(wire_typed).collect::<Vec<_>>(),
+                })
+            })
+            .collect();
+        let body = self
+            .client
+            .call(
+                "POST",
+                "/v1/state-stores/mutate",
+                Some(&json!({
+                    "store": self.name,
+                    "mutation_id": mutation_id.to_string(),
+                    "op": {
+                        "kind": "put_row",
+                        "key_base64": STANDARD.encode(key),
+                        "payload_base64": STANDARD.encode(payload),
+                        "named": named_wire,
+                    },
+                })),
+            )
+            .await?;
+        decode_mutation_outcome(&body)
+    }
+
+    /// Delete one row by primary key under a `mutation_id` identity.
+    pub async fn delete_row(
+        &self,
+        mutation_id: Uuid,
+        key: &[u8],
+    ) -> Result<MutationOutcome, SdkError> {
+        let body = self
+            .client
+            .call(
+                "POST",
+                "/v1/state-stores/mutate",
+                Some(&json!({
+                    "store": self.name,
+                    "mutation_id": mutation_id.to_string(),
+                    "op": {
+                        "kind": "delete_row",
+                        "key_base64": STANDARD.encode(key),
+                    },
+                })),
+            )
+            .await?;
+        decode_mutation_outcome(&body)
+    }
+
+    /// Empty the store under a `mutation_id` identity — replay dedupes.
+    pub async fn clear(&self, mutation_id: Uuid) -> Result<MutationOutcome, SdkError> {
+        let body = self
+            .client
+            .call(
+                "POST",
+                "/v1/state-stores/clear",
+                Some(&json!({
+                    "store": self.name,
+                    "mutation_id": mutation_id.to_string(),
+                })),
+            )
+            .await?;
+        decode_mutation_outcome(&body)
+    }
+
+    /// Point lookup by primary key. `strict` bounded-waits for the
+    /// replica's applied sequence to reach its committed snapshot;
+    /// unreachable freshness answers `IndexBehind`.
+    pub async fn lookup(&self, key: &[u8], strict: bool) -> Result<LookupOutcome, SdkError> {
+        let body = self
+            .client
+            .call(
+                "POST",
+                "/v1/state-stores/lookup",
+                Some(&json!({
+                    "store": self.name,
+                    "key_base64": STANDARD.encode(key),
+                    "strict": strict,
+                })),
+            )
+            .await?;
+        let row = match body.get("found").and_then(Value::as_bool) {
+            Some(true) => Some(StoreRow {
+                key: key.to_vec(),
+                payload: body
+                    .get("payload_base64")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| STANDARD.decode(raw).ok())
+                    .ok_or_else(|| {
+                        SdkError::Protocol("lookup found a row without payload".to_owned())
+                    })?,
+            }),
+            _ => None,
+        };
+        Ok(LookupOutcome {
+            row,
+            freshness: decode_freshness(&body),
+        })
+    }
+
+    /// Rows whose declared `named_key` posting equals one of `values`.
+    /// Bounded by `limit`; `strict` carries the same freshness contract
+    /// as `lookup`.
+    pub async fn get_by(
+        &self,
+        named_key: &str,
+        values: &[TypedValue],
+        limit: Option<u64>,
+        strict: bool,
+    ) -> Result<GetByPage, SdkError> {
+        let body = self
+            .client
+            .call(
+                "POST",
+                "/v1/state-stores/get-by",
+                Some(&json!({
+                    "store": self.name,
+                    "named_key": named_key,
+                    "values": values.iter().map(wire_typed).collect::<Vec<_>>(),
+                    "limit": limit,
+                    "strict": strict,
+                })),
+            )
+            .await?;
+        let rows = body
+            .get("rows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|row| decode_store_row(row, "key_base64"))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(GetByPage {
+            rows,
+            freshness: decode_freshness(&body),
+        })
+    }
+
+    /// Primary-key ordered page; `after_key` continues from a prior
+    /// page's `next_key`, `None` starts at the first row.
+    pub async fn iterate(
+        &self,
+        after_key: Option<&[u8]>,
+        limit: Option<u64>,
+    ) -> Result<IteratePage, SdkError> {
+        let body = self
+            .client
+            .call(
+                "POST",
+                "/v1/state-stores/iterate",
+                Some(&json!({
+                    "store": self.name,
+                    "after_key_base64": after_key.map(|key| STANDARD.encode(key)),
+                    "limit": limit,
+                })),
+            )
+            .await?;
+        let rows = body
+            .get("rows")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|row| decode_store_row(row, "key_base64"))
+            .collect::<Result<Vec<_>, _>>()?;
+        let next_key = body
+            .get("next_key_base64")
+            .and_then(Value::as_str)
+            .and_then(|raw| STANDARD.decode(raw).ok());
+        Ok(IteratePage {
+            rows,
+            next_key,
+            pinned_seq: body.get("pinned_seq").and_then(Value::as_u64).unwrap_or(0),
+            served_by: body
+                .get("served_by")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        })
+    }
+
+    /// Drive one catch-up pass on a feed-sourced store; `complete` means
+    /// the committed tip was reached.
+    pub async fn sync(&self) -> Result<SyncOutcome, SdkError> {
+        let body = self
+            .client
+            .call(
+                "POST",
+                "/v1/state-stores/sync",
+                Some(&json!({ "store": self.name })),
+            )
+            .await?;
+        Ok(decode_sync_outcome(&body))
+    }
+
+    /// Rebuild a feed-sourced store from retained history; `token` is the
+    /// caller's retry identity for the pass.
+    pub async fn rebuild(&self, token: Option<Uuid>) -> Result<SyncOutcome, SdkError> {
+        let body = self
+            .client
+            .call(
+                "POST",
+                "/v1/state-stores/rebuild",
+                Some(&json!({
+                    "store": self.name,
+                    "token": token.map(|value| value.to_string()),
+                })),
+            )
+            .await?;
+        Ok(decode_sync_outcome(&body))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1200,6 +1797,171 @@ mod tests {
         assert_eq!(body["positions"], json!({"9f5c": "pos-3"}));
         assert_eq!(body["lease_epoch"], 4);
         assert!(body.get("request_id").is_some());
+    }
+
+    #[test]
+    fn typed_values_serialize_to_the_wire_tags() {
+        assert_eq!(wire_typed(&TypedValue::Null), json!({"kind": "null"}));
+        assert_eq!(
+            wire_typed(&TypedValue::Bool(true)),
+            json!({"kind": "bool", "value": true})
+        );
+        assert_eq!(
+            wire_typed(&TypedValue::I64(-7)),
+            json!({"kind": "i64", "value": -7})
+        );
+        assert_eq!(
+            wire_typed(&TypedValue::Text("acme".to_owned())),
+            json!({"kind": "text", "value": "acme"})
+        );
+        assert_eq!(
+            wire_typed(&TypedValue::Bytes(b"\x00\xff".to_vec())),
+            json!({"kind": "bytes", "value_base64": "AP8="})
+        );
+    }
+
+    #[tokio::test]
+    async fn put_row_carries_mutation_id_and_named_postings() {
+        let (client, transport) = client(vec![(
+            200,
+            json!({
+                "store_id": Uuid::nil().to_string(),
+                "mutation_id": Uuid::nil().to_string(),
+                "sequence": 3,
+                "deduplicated": false
+            }),
+        )]);
+        let store = client.state_store("crm.accounts");
+        let outcome = store
+            .put_row(
+                Uuid::new_v4(),
+                b"acct-1",
+                b"{\"tier\":\"gold\"}",
+                &[(
+                    "region".to_owned(),
+                    vec![TypedValue::Text("emea".to_owned())],
+                )],
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.sequence, 3);
+        let requests = transport.take_requests();
+        let body = &requests[0].2;
+        assert_eq!(requests[0].1, "/v1/state-stores/mutate");
+        assert_eq!(body["op"]["kind"], "put_row");
+        assert_eq!(body["op"]["named"][0]["values"][0]["kind"], "text");
+        assert!(body.get("mutation_id").is_some());
+    }
+
+    #[tokio::test]
+    async fn get_by_sends_typed_values_and_decodes_freshness() {
+        let (client, transport) = client(vec![(
+            200,
+            json!({
+                "store_id": Uuid::nil().to_string(),
+                "rows": [{"key_base64": STANDARD.encode(b"k"), "payload_base64": STANDARD.encode(b"p")}],
+                "applied_seq": 41,
+                "committed_seq": 43,
+                "behind": true,
+                "served_by": "node-2"
+            }),
+        )]);
+        let page = client
+            .state_store("crm.accounts")
+            .get_by(
+                "region",
+                &[TypedValue::Text("emea".to_owned())],
+                Some(10),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].payload, b"p");
+        assert!(page.freshness.behind);
+        assert_eq!(page.freshness.applied_seq, 41);
+        let requests = transport.take_requests();
+        let body = &requests[0].2;
+        assert_eq!(body["named_key"], "region");
+        assert_eq!(body["strict"], true);
+        assert_eq!(body["limit"], 10);
+    }
+
+    #[tokio::test]
+    async fn index_range_query_flattens_mode_and_bounds() {
+        let (client, transport) = client(vec![(
+            200,
+            json!({
+                "index": "crm.by_region",
+                "index_id": Uuid::nil().to_string(),
+                "generation": 2,
+                "rows": [],
+                "applied_cursor": null,
+                "target_cursor": null,
+                "behind": false,
+                "truncated": false,
+                "served_by": "node-1"
+            }),
+        )]);
+        client
+            .query_index(
+                "crm.by_region",
+                IndexQuery::Range {
+                    leading: vec![TypedValue::Text("emea".to_owned())],
+                    lower: IndexBound {
+                        value: TypedValue::I64(0),
+                        inclusive: true,
+                    },
+                    upper: IndexBound {
+                        value: TypedValue::I64(99),
+                        inclusive: false,
+                    },
+                },
+                Some(50),
+                true,
+            )
+            .await
+            .unwrap();
+        let requests = transport.take_requests();
+        let body = &requests[0].2;
+        assert_eq!(body["mode"], "range");
+        assert_eq!(body["leading"][0]["value"], "emea");
+        assert_eq!(body["lower"]["inclusive"], true);
+        assert_eq!(body["upper"]["inclusive"], false);
+        assert_eq!(body["strict"], true);
+    }
+
+    #[tokio::test]
+    async fn index_behind_maps_to_a_retryable_typed_error() {
+        let error = map_error(409, &json!({"error": "freshness", "code": "index_behind"}));
+        assert_eq!(error, SdkError::IndexBehind);
+        assert!(error.retryable());
+    }
+
+    #[tokio::test]
+    async fn temporary_fetch_carries_flags_and_decimal_nanos() {
+        let (client, transport) = client(vec![(200, json!({"records": [], "next_cursor": "c-9"}))]);
+        let page = client
+            .temporary_fetch(
+                "orders.events",
+                TemporaryFetch {
+                    after: Some("resume-1".to_owned()),
+                    limit: 25,
+                    tail: true,
+                    wait_ms: Some(400),
+                    after_event_time_ns: Some(1_700_000_000_000_000_001),
+                    ..TemporaryFetch::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.next_cursor.as_deref(), Some("c-9"));
+        let requests = transport.take_requests();
+        let body = &requests[0].2;
+        assert_eq!(body["tail"], true);
+        assert_eq!(body["new_only"], false);
+        assert_eq!(body["wait_ms"], 400);
+        assert_eq!(body["after_event_time_ns"], "1700000000000000001");
     }
 
     #[tokio::test]

@@ -132,6 +132,185 @@ async fn sdk_roundtrip_against_a_live_riverbed() {
 }
 
 #[tokio::test]
+async fn state_store_index_and_temporary_facades_live() {
+    use whitewater::sdk::{IndexBound, IndexQuery, TypedValue};
+
+    let Some(client) = live_client() else {
+        eprintln!("WHITEWATER_SDK_NODES unset — skipping live SDK acceptance");
+        return;
+    };
+    let run = uniq();
+    let (domain, feed, writer, store, index) = (
+        format!("sdk{run}"),
+        format!("sdk{run}.events"),
+        format!("wr{run}"),
+        format!("sdk{run}.kv"),
+        format!("sdk{run}.bykey"),
+    );
+    client
+        .wcl(&format!(
+            "CREATE DOMAIN {domain}; \
+             CREATE FEED {feed}; \
+             CREATE WRITER {writer} TO {feed}; \
+             OPEN WRITER SESSION {writer}; \
+             DEFINE STATESTORE {store} KEYS region; \
+             CREATE INDEX {index} ON {feed} FIELDS KEY, METADATA 'tenant';"
+        ))
+        .await
+        .expect("setup WCL");
+
+    // Manual StateStore: put -> strict lookup -> named get_by -> iterate
+    // -> delete -> clear, with an identical mutation replay deduped.
+    let store_api = client.state_store(&store);
+    let mutation = uuid::Uuid::new_v4();
+    let outcome = store_api
+        .put_row(
+            mutation,
+            b"acct-1",
+            b"{\"tier\":\"gold\"}",
+            &[(
+                "region".to_owned(),
+                vec![TypedValue::Text("emea".to_owned())],
+            )],
+        )
+        .await
+        .expect("put_row");
+    assert!(!outcome.deduplicated);
+    let replay = store_api
+        .put_row(
+            mutation,
+            b"acct-1",
+            b"{\"tier\":\"gold\"}",
+            &[(
+                "region".to_owned(),
+                vec![TypedValue::Text("emea".to_owned())],
+            )],
+        )
+        .await
+        .expect("identical retry");
+    assert!(replay.deduplicated, "same mutation_id dedupes");
+
+    let lookup = store_api.lookup(b"acct-1", true).await.expect("lookup");
+    assert_eq!(
+        lookup.row.as_ref().map(|row| row.payload.as_slice()),
+        Some(b"{\"tier\":\"gold\"}".as_slice())
+    );
+    let page = store_api
+        .get_by(
+            "region",
+            &[TypedValue::Text("emea".to_owned())],
+            Some(10),
+            false,
+        )
+        .await
+        .expect("get_by");
+    assert_eq!(page.rows.len(), 1);
+    let walk = store_api.iterate(None, Some(10)).await.expect("iterate");
+    assert_eq!(walk.rows.len(), 1);
+    assert_eq!(walk.next_key, None);
+    store_api
+        .delete_row(uuid::Uuid::new_v4(), b"acct-1")
+        .await
+        .expect("delete_row");
+    assert!(store_api
+        .lookup(b"acct-1", true)
+        .await
+        .expect("lookup after delete")
+        .row
+        .is_none());
+    store_api.clear(uuid::Uuid::new_v4()).await.expect("clear");
+
+    // Writer append lands in retained history, then REBUILD INDEX runs
+    // the shadow build; bounded-poll the query until activation posts
+    // the row (builds are asynchronous by design).
+    let writer_api = client.writer(&writer).await.expect("writer session");
+    writer_api
+        .append(
+            uuid::Uuid::new_v4(),
+            b"order-7",
+            b"created",
+            1_700_000_000_000_000_010,
+            BTreeMap::from([("tenant".to_owned(), b"acme".to_vec())]),
+        )
+        .await
+        .expect("append");
+    client
+        .wcl(&format!("REBUILD INDEX {index};"))
+        .await
+        .expect("rebuild index");
+
+    // The shadow build activates asynchronously — wait on the catalog
+    // lifecycle (`stage=active`) rather than racing query errors.
+    let mut activated = false;
+    for _ in 0..240 {
+        if let Ok(results) = client.wcl(&format!("DESCRIBE INDEX {index};")).await {
+            let stage = results
+                .first()
+                .and_then(|result| result.get("data"))
+                .and_then(|data| data.get("stage"));
+            if stage.map(|value| value.get("active").is_some()) == Some(true) {
+                activated = true;
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert!(activated, "index build activated within the bounded wait");
+
+    // `strict` bounded-waits for the serving checkpoint to reach the
+    // activation frontier — the posting must be visible now.
+    let page = client
+        .query_index(
+            &index,
+            IndexQuery::Exact(vec![
+                TypedValue::Bytes(b"order-7".to_vec()),
+                // METADATA extractors post raw bytes — never Text.
+                TypedValue::Bytes(b"acme".to_vec()),
+            ]),
+            Some(10),
+            true,
+        )
+        .await
+        .expect("index query after activation");
+    assert_eq!(page.rows.len(), 1, "exact posting: {page:?}");
+
+    // Temporary fetch: bounded read off the same Feed.
+    let page = client
+        .temporary_fetch(
+            &feed,
+            whitewater::sdk::TemporaryFetch {
+                limit: 10,
+                wait_ms: Some(500),
+                ..whitewater::sdk::TemporaryFetch::default()
+            },
+        )
+        .await
+        .expect("temporary fetch");
+    assert!(page.records.iter().any(|record| record.key == b"order-7"));
+
+    // Range mode wire shape end-to-end (empty results are valid evidence).
+    let _ = client
+        .query_index(
+            &index,
+            IndexQuery::Range {
+                leading: vec![],
+                lower: IndexBound {
+                    value: TypedValue::Bytes(vec![]),
+                    inclusive: true,
+                },
+                upper: IndexBound {
+                    value: TypedValue::Bytes(vec![0xff]),
+                    inclusive: true,
+                },
+            },
+            Some(10),
+            false,
+        )
+        .await
+        .expect("range query");
+}
+
+#[tokio::test]
 async fn stale_member_epoch_fences_as_typed_errors() {
     let Some(client) = live_client() else {
         eprintln!("WHITEWATER_SDK_NODES unset — skipping live SDK acceptance");

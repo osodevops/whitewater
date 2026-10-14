@@ -42,7 +42,11 @@ def main():
     sys.stderr.write(run.stderr)
     if run.returncode != 0:
         raise AssertionError(f"cargo test --test sdk_live exited {run.returncode}")
-    for test in ("sdk_roundtrip_against_a_live_riverbed", "stale_member_epoch_fences_as_typed_errors"):
+    for test in (
+        "sdk_roundtrip_against_a_live_riverbed",
+        "state_store_index_and_temporary_facades_live",
+        "stale_member_epoch_fences_as_typed_errors",
+    ):
         if f"test {test} ... ok" not in run.stdout:
             raise AssertionError(f"{test} did not report ok; output above")
     if "skipping live SDK acceptance" in run.stdout + run.stderr:
