@@ -556,6 +556,24 @@ an exception can be fenced under a broad grant; `SHOW GRANTS` and
 `EXPLAIN ACCESS` expose the effect (`matched_denies` lists covering
 denies).
 
+`REVOKE` subtracts the listed actions from a Role's grant rows on an
+exact namespace — a row that empties is dropped:
+
+```sql
+
+REVOKE READ, WRITE
+
+  ON NAMESPACE orders.events
+
+  FROM ROLE orderanalytics;
+
+```
+
+`REVOKE DENY` removes actions from deny rows the same way, so an
+exception fenced earlier can be lifted without rebuilding the Role.
+Revoking an action no row contains, an unknown Role, or a namespace
+with no grants fails closed.
+
 
 
 ## Explain access

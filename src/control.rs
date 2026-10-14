@@ -1128,6 +1128,19 @@ pub enum Command {
         #[serde(default)]
         effect: GrantEffect,
     },
+    /// Remove the listed actions from the Role's grant rows on an
+    /// exact namespace. GRANTed `read, write` followed by REVOKEing
+    /// `read` leaves `write` — an exact-subtraction model rather than
+    /// all-or-nothing row removal.
+    RevokeGrant {
+        actions: BTreeSet<PermissionAction>,
+        namespace: String,
+        role: String,
+        /// `deny` revokes from `DENY` rows (`REVOKE DENY ...`);
+        /// `allow` from `GRANT` rows. Legacy decode defaults to allow.
+        #[serde(default)]
+        effect: GrantEffect,
+    },
     /// Issue a named API-key identity bound to a Role. `digest` is the
     /// BLAKE3-256 hex verifier the caller computed; the plaintext key
     /// must never appear in a command.
@@ -3545,6 +3558,53 @@ impl ControlController {
                     json!(definition),
                 ))
             }
+            Command::RevokeGrant {
+                actions,
+                namespace,
+                role,
+                effect,
+            } => {
+                let role_id = active_role(state, &role)?.role_id;
+                let mut changed = 0_usize;
+                let mut emptied = Vec::new();
+                for grant in state.grants.values_mut() {
+                    if grant.role_id == role_id
+                        && grant.namespace == namespace
+                        && grant.effect == effect
+                    {
+                        let before = grant.actions.len();
+                        grant.actions = grant.actions.difference(&actions).copied().collect();
+                        if grant.actions.len() != before {
+                            changed += 1;
+                        }
+                        if grant.actions.is_empty() {
+                            emptied.push(grant.grant_id);
+                        }
+                    }
+                }
+                for grant_id in emptied {
+                    state.grants.remove(&grant_id);
+                }
+                if changed == 0 {
+                    return Err(ControlError::NotFound(format!(
+                        "grant for Role {role} on {namespace}"
+                    )));
+                }
+                let verb = match effect {
+                    GrantEffect::Allow => "revoked",
+                    GrantEffect::Deny => "un-denied",
+                };
+                Ok((
+                    format!("{verb} namespace permissions on {namespace} for Role {role}"),
+                    json!({
+                        "role": role,
+                        "namespace": namespace,
+                        "effect": effect,
+                        "actions_revoked": actions,
+                        "grants_changed": changed,
+                    }),
+                ))
+            }
             Command::ExplainAccess { role, action, feed } => {
                 let role_id = active_role(state, &role)?.role_id;
                 active_feed(state, &feed)?;
@@ -5675,9 +5735,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                     name: token(&tokens, 3)?.to_owned(),
                 })
             }
-            _ => Err(ControlError::Syntax(
-                "expected REVOKE WRITER SESSION or REVOKE API KEY".to_owned(),
-            )),
+            _ => parse_revoke_grant(&tokens),
         },
         Some("ISSUE") => {
             // ISSUE API KEY <name> ROLE <role> DIGEST <64-hex>
@@ -5891,6 +5949,43 @@ fn parse_grant(tokens: &[String], effect: GrantEffect) -> Result<Command, Contro
     expect_keyword(tokens, on_index + 4, "ROLE")?;
     let role = token(tokens, on_index + 5)?.to_owned();
     Ok(Command::Grant {
+        actions,
+        namespace,
+        role,
+        effect,
+    })
+}
+
+/// `REVOKE [DENY] <actions> ON NAMESPACE <pattern> FROM ROLE <name>`
+/// — the GRANT grammar with `FROM` and an optional `DENY` prefix that
+/// selects deny rows instead of allow rows.
+fn parse_revoke_grant(tokens: &[String]) -> Result<Command, ControlError> {
+    let (effect, start) = if token(tokens, 1)?.eq_ignore_ascii_case("DENY") {
+        (GrantEffect::Deny, 2)
+    } else {
+        (GrantEffect::Allow, 1)
+    };
+    let on_index = tokens
+        .iter()
+        .position(|token| token.eq_ignore_ascii_case("ON"))
+        .ok_or_else(|| ControlError::Syntax("REVOKE requires ON NAMESPACE".to_owned()))?;
+    let mut actions = BTreeSet::new();
+    for token in &tokens[start..on_index] {
+        if token != "," {
+            actions.insert(parse_action(token)?);
+        }
+    }
+    if actions.is_empty() {
+        return Err(ControlError::Syntax(
+            "REVOKE requires at least one action".to_owned(),
+        ));
+    }
+    expect_keyword(tokens, on_index + 1, "NAMESPACE")?;
+    let namespace = token(tokens, on_index + 2)?.to_owned();
+    expect_keyword(tokens, on_index + 3, "FROM")?;
+    expect_keyword(tokens, on_index + 4, "ROLE")?;
+    let role = token(tokens, on_index + 5)?.to_owned();
+    Ok(Command::RevokeGrant {
         actions,
         namespace,
         role,
@@ -7213,6 +7308,10 @@ fn command_label(command: &Command) -> String {
         Command::Grant { effect, .. } => match effect {
             GrantEffect::Allow => "GRANT",
             GrantEffect::Deny => "DENY",
+        },
+        Command::RevokeGrant { effect, .. } => match effect {
+            GrantEffect::Allow => "REVOKE",
+            GrantEffect::Deny => "REVOKE DENY",
         },
         Command::IssueApiKey { .. } => "ISSUE API KEY",
         Command::RevokeApiKey { .. } => "REVOKE API KEY",
@@ -10870,5 +10969,72 @@ mod tests {
         let identity = view.get(&key_digest).expect("issued identity");
         let effects: BTreeSet<_> = identity.grants.iter().map(|g| g.effect).collect();
         assert!(effects.contains(&GrantEffect::Deny));
+    }
+
+    #[tokio::test]
+    async fn revoke_subtracts_granted_actions_and_deny_rows() {
+        let directory = tempfile::tempdir().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute(
+                "CREATE DOMAIN orders; CREATE FEED orders.events; CREATE FEED orders.other;                  CREATE ROLE ops.reader;                  GRANT read, write ON NAMESPACE orders.* TO ROLE ops.reader;                  DENY read ON NAMESPACE orders.events TO ROLE ops.reader;",
+            )
+            .await
+            .unwrap();
+        // REVOKE parses through the typed command as an allow effect.
+        let parsed = parse_wcl("REVOKE read ON NAMESPACE orders.* FROM ROLE ops.reader;").unwrap();
+        assert!(matches!(
+            &parsed[0],
+            Command::RevokeGrant {
+                effect: GrantEffect::Allow,
+                ..
+            }
+        ));
+        // Revoking read subtracts it — write survives on the same row.
+        controller
+            .execute("REVOKE read ON NAMESPACE orders.* FROM ROLE ops.reader;")
+            .await
+            .unwrap();
+        let explained = controller
+            .execute("EXPLAIN ACCESS FOR ROLE ops.reader ACTION write ON FEED orders.other;")
+            .await
+            .unwrap();
+        assert_eq!(explained.results[0].data["allowed"], true);
+        let explained = controller
+            .execute("EXPLAIN ACCESS FOR ROLE ops.reader ACTION read ON FEED orders.other;")
+            .await
+            .unwrap();
+        assert_eq!(explained.results[0].data["allowed"], false);
+        // REVOKE DENY removes the covering deny; the surviving write
+        // allow then covers orders.events for write only.
+        controller
+            .execute("REVOKE DENY read ON NAMESPACE orders.events FROM ROLE ops.reader;")
+            .await
+            .unwrap();
+        let explained = controller
+            .execute("EXPLAIN ACCESS FOR ROLE ops.reader ACTION write ON FEED orders.events;")
+            .await
+            .unwrap();
+        assert_eq!(explained.results[0].data["allowed"], true);
+        // Revoking an action no remaining row contains, an unknown
+        // Role, or a namespace with no grants fails closed.
+        for script in [
+            "REVOKE read ON NAMESPACE orders.* FROM ROLE ops.reader;",
+            "REVOKE read ON NAMESPACE billing.* FROM ROLE ops.reader;",
+            "REVOKE read ON NAMESPACE orders.* FROM ROLE ops.missing;",
+        ] {
+            assert!(
+                controller.execute(script).await.is_err(),
+                "{script} must fail"
+            );
+        }
+        // The surviving write grant persists a catalog reopen.
+        drop(controller);
+        let reopened = new_controller(&directory);
+        let explained = reopened
+            .execute("EXPLAIN ACCESS FOR ROLE ops.reader ACTION write ON FEED orders.other;")
+            .await
+            .unwrap();
+        assert_eq!(explained.results[0].data["allowed"], true);
     }
 }

@@ -556,6 +556,46 @@ impl AdminClient {
         .await
     }
 
+    /// Remove `actions` from `role`'s GRANT rows on `namespace` —
+    /// the listed actions subtract from covering allow rows and a row
+    /// that empties is dropped.
+    pub async fn revoke_namespace(
+        &self,
+        actions: impl IntoIterator<Item = PermissionAction>,
+        namespace: impl Into<String>,
+        role: impl Into<String>,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.revoke_namespace_effect(actions, namespace, role, GrantEffect::Allow)
+            .await
+    }
+
+    /// Remove `actions` from `role`'s DENY rows on `namespace`.
+    pub async fn revoke_deny_namespace(
+        &self,
+        actions: impl IntoIterator<Item = PermissionAction>,
+        namespace: impl Into<String>,
+        role: impl Into<String>,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.revoke_namespace_effect(actions, namespace, role, GrantEffect::Deny)
+            .await
+    }
+
+    async fn revoke_namespace_effect(
+        &self,
+        actions: impl IntoIterator<Item = PermissionAction>,
+        namespace: impl Into<String>,
+        role: impl Into<String>,
+        effect: GrantEffect,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::RevokeGrant {
+            actions: actions.into_iter().collect::<BTreeSet<_>>(),
+            namespace: namespace.into(),
+            role: role.into(),
+            effect,
+        })
+        .await
+    }
+
     pub async fn explain_access(
         &self,
         role: impl Into<String>,

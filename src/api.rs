@@ -17392,6 +17392,33 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(still.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // REVOKE GRANT subtracts the wildcard allow — the reader's
+        // remaining DENY is unaffected and nothing covers orders.* now.
+        let revoked_grant = app
+            .clone()
+            .oneshot(wcl(
+                "REVOKE read ON NAMESPACE orders.* FROM ROLE ops.reader;",
+                bootstrap,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(revoked_grant.status(), StatusCode::OK);
+        let fenced = app
+            .clone()
+            .oneshot(get(read_path, Some(reader_secret)))
+            .await
+            .unwrap();
+        assert_eq!(fenced.status(), StatusCode::UNAUTHORIZED);
+        // Revoking what no longer exists fails closed.
+        let gone = app
+            .clone()
+            .oneshot(wcl(
+                "REVOKE read ON NAMESPACE orders.* FROM ROLE ops.reader;",
+                bootstrap,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(gone.status(), StatusCode::BAD_REQUEST);
         // Revocation fences the read grant immediately.
         let revoked = app
             .clone()
