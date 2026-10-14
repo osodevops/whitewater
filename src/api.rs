@@ -755,12 +755,26 @@ struct HealthProtocol {
     minor: u64,
 }
 
+/// Enforced transport bounds advertised by `/health` so SDKs negotiate
+/// capacity before a request hits a 4xx refusal — the values are the
+/// compiled-in constants, not configuration.
+#[derive(Serialize)]
+struct HealthLimits {
+    max_frame_bytes: usize,
+    max_committed_read_bytes: usize,
+    max_logical_read_frames: usize,
+    max_logical_read_ranges: usize,
+    subscription_member_fetch_max_limit: usize,
+    subscription_member_max_lease_ticks: u64,
+}
+
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
     node_id: String,
     members: usize,
     protocol: HealthProtocol,
+    limits: HealthLimits,
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -769,6 +783,14 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         node_id: state.membership.local().node_id.clone(),
         members: state.membership.members().await.len(),
         protocol: HealthProtocol { major: 1, minor: 0 },
+        limits: HealthLimits {
+            max_frame_bytes: MAX_FRAME_BYTES,
+            max_committed_read_bytes: MAX_COMMITTED_READ_BYTES,
+            max_logical_read_frames: MAX_LOGICAL_READ_FRAMES,
+            max_logical_read_ranges: MAX_LOGICAL_READ_RANGES,
+            subscription_member_fetch_max_limit: SUBSCRIPTION_MEMBER_FETCH_MAX_LIMIT,
+            subscription_member_max_lease_ticks: SUBSCRIPTION_MEMBER_MAX_LEASE_TICKS,
+        },
     })
 }
 

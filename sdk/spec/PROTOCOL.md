@@ -121,3 +121,11 @@ differs must produce an explicit `IncompatibleServerError`, never silent
 degradation. Per-operation availability follows the conformance corpus —
 a server that lacks an operation returns `refused`, which the SDK reports
 verbatim.
+
+`GET /health` also returns `limits` — the enforced transport bounds a
+client should negotiate against before a request hits a 4xx refusal:
+`max_frame_bytes`, `max_committed_read_bytes`, `max_logical_read_frames`,
+`max_logical_read_ranges`, `subscription_member_fetch_max_limit`, and
+`subscription_member_max_lease_ticks`. These are the compiled-in bounds,
+not configuration; an SDK that cannot decode the section must surface a
+protocol error rather than guess.

@@ -63,9 +63,23 @@
       "path": "/health",
       "auth": "none",
       "response": {
-        "status": "string"
+        "status": "string",
+        "node_id": "string",
+        "members": "u64",
+        "protocol": {
+          "major": "u64",
+          "minor": "u64"
+        },
+        "limits": {
+          "max_frame_bytes": "u64",
+          "max_committed_read_bytes": "u64",
+          "max_logical_read_frames": "u64",
+          "max_logical_read_ranges": "u64",
+          "subscription_member_fetch_max_limit": "u64",
+          "subscription_member_max_lease_ticks": "u64"
+        }
       },
-      "notes": "liveness; any Node"
+      "notes": "liveness + capability negotiation; any Node"
     },
     {
       "op": "admin.wcl",

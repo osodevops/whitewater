@@ -40,6 +40,12 @@ async fn sdk_roundtrip_against_a_live_riverbed() {
         return;
     };
     client.check_compatible().await.expect("protocol major");
+    let limits = client
+        .transport_limits()
+        .await
+        .expect("advertised transport bounds");
+    assert_eq!(limits.max_frame_bytes, 64 * 1024 * 1024);
+    assert!(limits.member_fetch_max_limit >= 1);
 
     let run = uniq();
     let (domain, feed) = (format!("sdk{run}"), format!("sdk{run}.events"));

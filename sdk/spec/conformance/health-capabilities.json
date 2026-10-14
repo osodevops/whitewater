@@ -1,0 +1,36 @@
+{
+  "scenario": "health-capabilities",
+  "requires": ["health"],
+  "steps": [
+    {
+      "op": "health",
+      "args": {},
+      "bind": "health",
+      "expect": {
+        "status": "ok",
+        "protocol.major": 1,
+        "limits.max_frame_bytes": 67108864,
+        "limits.max_committed_read_bytes": 16777216,
+        "limits.max_logical_read_frames": 10000,
+        "limits.max_logical_read_ranges": 128,
+        "limits.subscription_member_fetch_max_limit": 256,
+        "limits.subscription_member_max_lease_ticks": 600
+      }
+    },
+    {
+      "op": "health",
+      "args": {},
+      "bind": "again",
+      "expect": {
+        "status": "ok",
+        "protocol.major": "==health.protocol.major",
+        "limits.max_frame_bytes": "==health.limits.max_frame_bytes",
+        "limits.max_committed_read_bytes": "==health.limits.max_committed_read_bytes",
+        "limits.max_logical_read_frames": "==health.limits.max_logical_read_frames",
+        "limits.max_logical_read_ranges": "==health.limits.max_logical_read_ranges",
+        "limits.subscription_member_fetch_max_limit": "==health.limits.subscription_member_fetch_max_limit",
+        "limits.subscription_member_max_lease_ticks": "==health.limits.subscription_member_max_lease_ticks"
+      }
+    }
+  ]
+}

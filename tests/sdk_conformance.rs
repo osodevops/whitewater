@@ -241,6 +241,13 @@ fn endpoint(op: &str) -> Option<(&'static str, &'static str)> {
 }
 
 async fn dispatch(client: &Client, op: &str, args: &Value) -> Result<(u16, Value), String> {
+    if op == "health" {
+        let reply = client
+            .wire("GET", "/health", None)
+            .await
+            .map_err(|error| format!("transport: {error:?}"))?;
+        return Ok((reply.status, reply.body));
+    }
     if op == "feed.records" {
         let mut path = format!(
             "/v1/feeds/records?feed={}",
@@ -403,7 +410,7 @@ async fn shared_conformance_corpus() {
         let mut scenario_failure = None;
         for (index, step) in steps.iter().enumerate() {
             let op = step.get("op").and_then(Value::as_str).unwrap_or("");
-            if endpoint(op).is_none() && op != "feed.records" {
+            if endpoint(op).is_none() && !matches!(op, "feed.records" | "health") {
                 scenario_failure = Some(format!("step {index}: unsupported op {op}"));
                 break;
             }

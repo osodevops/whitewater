@@ -54,6 +54,18 @@ pub struct AppendOutcome {
     pub retry_after_ms: Option<u64>,
 }
 
+/// Enforced transport bounds the server advertises on `/health` — SDKs
+/// negotiate capacity before a request hits a 4xx refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportLimits {
+    pub max_frame_bytes: u64,
+    pub max_committed_read_bytes: u64,
+    pub max_logical_read_frames: u64,
+    pub max_logical_read_ranges: u64,
+    pub member_fetch_max_limit: u64,
+    pub member_max_lease_ticks: u64,
+}
+
 /// A page of delivered records plus the cursors that describe progress.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FetchPage {
@@ -328,6 +340,30 @@ impl Client {
                 }),
             }),
         }
+    }
+
+    /// The transport bounds this server enforces, decoded from
+    /// `/health.limits`. A missing or malformed section is a protocol
+    /// error — capability negotiation refuses silent downgrade.
+    pub async fn transport_limits(&self) -> Result<TransportLimits, SdkError> {
+        let health = self.health().await?;
+        let limits = health
+            .get("limits")
+            .ok_or_else(|| SdkError::Protocol("health carries no limits section".to_owned()))?;
+        let field = |name: &str| {
+            limits
+                .get(name)
+                .and_then(Value::as_u64)
+                .ok_or_else(|| SdkError::Protocol(format!("health limits missing {name}")))
+        };
+        Ok(TransportLimits {
+            max_frame_bytes: field("max_frame_bytes")?,
+            max_committed_read_bytes: field("max_committed_read_bytes")?,
+            max_logical_read_frames: field("max_logical_read_frames")?,
+            max_logical_read_ranges: field("max_logical_read_ranges")?,
+            member_fetch_max_limit: field("subscription_member_fetch_max_limit")?,
+            member_max_lease_ticks: field("subscription_member_max_lease_ticks")?,
+        })
     }
 
     /// Execute a WCL script; the response is the per-statement
@@ -1647,6 +1683,39 @@ mod tests {
         assert!(SdkError::Ambiguous(String::new()).retryable());
         assert!(SdkError::Unavailable(String::new()).retryable());
         assert!(!SdkError::StaleEpoch.retryable());
+    }
+
+    #[tokio::test]
+    async fn transport_limits_decode_advertised_bounds_and_refuse_gaps() {
+        let (ready, _transport) = client(vec![(
+            200,
+            json!({
+                "status": "ok",
+                "protocol": {"major": 1, "minor": 0},
+                "limits": {
+                    "max_frame_bytes": 67108864,
+                    "max_committed_read_bytes": 16777216,
+                    "max_logical_read_frames": 10000,
+                    "max_logical_read_ranges": 128,
+                    "subscription_member_fetch_max_limit": 256,
+                    "subscription_member_max_lease_ticks": 600
+                }
+            }),
+        )]);
+        let limits = ready.transport_limits().await.unwrap();
+        assert_eq!(limits.max_frame_bytes, 67_108_864);
+        assert_eq!(limits.max_committed_read_bytes, 16_777_216);
+        assert_eq!(limits.member_fetch_max_limit, 256);
+        assert_eq!(limits.member_max_lease_ticks, 600);
+
+        let (missing, _transport) = client(vec![(
+            200,
+            json!({"status": "ok", "protocol": {"major": 1, "minor": 0}}),
+        )]);
+        assert!(matches!(
+            missing.transport_limits().await,
+            Err(SdkError::Protocol(_))
+        ));
     }
 
     #[tokio::test]
