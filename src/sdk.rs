@@ -507,6 +507,30 @@ impl Client {
         }
     }
 
+    /// Bind a declared Pipe for lifecycle operations: `describe`
+    /// reports the live catalog row while `pause`/`resume`/`drop`
+    /// drive the same typed commands WCL lowers to.
+    pub fn pipe(&self, name: &str) -> Pipe {
+        Pipe {
+            client: self.clone(),
+            name: name.to_owned(),
+        }
+    }
+
+    /// `SHOW PIPES` decoded as [`PipeInfo`] rows.
+    pub async fn pipes(&self) -> Result<Vec<PipeInfo>, SdkError> {
+        let results = self
+            .commands(vec![json!({ "command": "show", "kind": "pipes" })])
+            .await?;
+        let rows = results
+            .first()
+            .and_then(|result| result.get("data"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        Ok(rows.iter().filter_map(pipe_info).collect())
+    }
+
     /// Temporary read against a Feed without declaring a Reader:
     /// bounded history walks, live tails, or fresh-only waits per
     /// `options` — see `TemporaryFetch`.
@@ -1173,6 +1197,105 @@ fn wire_typed(value: &TypedValue) -> Value {
         TypedValue::Bytes(value) => {
             json!({"kind": "bytes", "value_base64": STANDARD.encode(value)})
         }
+    }
+}
+
+/// The catalog row `DESCRIBE PIPE`/`SHOW PIPES` returns for a declared
+/// Pipe. `operation` stays an opaque [`Value`] — Forward, Window, and
+/// Enrich variants evolve server-side without an SDK type bump.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PipeInfo {
+    pub name: String,
+    /// `declared` while driven, `paused` under `PAUSE PIPE`.
+    pub stage: String,
+    pub subscription_id: Uuid,
+    pub operation: Value,
+    pub output_feed_id: Option<Uuid>,
+    pub output_store_id: Option<Uuid>,
+    pub status: String,
+    pub created_at_ns: i64,
+}
+
+fn pipe_info(value: &Value) -> Option<PipeInfo> {
+    let uuid = |field: &str| {
+        value
+            .get(field)
+            .and_then(Value::as_str)
+            .and_then(|raw| raw.parse::<Uuid>().ok())
+    };
+    Some(PipeInfo {
+        name: value.get("name")?.as_str()?.to_owned(),
+        stage: value.get("stage")?.as_str()?.to_owned(),
+        subscription_id: uuid("subscription_id")?,
+        operation: value.get("operation").cloned().unwrap_or(Value::Null),
+        output_feed_id: uuid("output_feed_id"),
+        output_store_id: uuid("output_store_id"),
+        status: value.get("status")?.as_str()?.to_owned(),
+        created_at_ns: value.get("created_at_ns")?.as_i64()?,
+    })
+}
+
+/// A declared Pipe's lifecycle surface. Pausing is cooperative — an
+/// in-flight effect finishes and the frontier stays put so redelivery
+/// stays replay-safe — and resume restarts driving from the same
+/// durable frontier.
+pub struct Pipe {
+    client: Client,
+    name: String,
+}
+
+impl Pipe {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// `DESCRIBE PIPE`: the live catalog row including stage and the
+    /// opaque operation definition.
+    pub async fn describe(&self) -> Result<PipeInfo, SdkError> {
+        let results = self
+            .client
+            .commands(vec![json!({
+                "command": "describe",
+                "kind": "pipe",
+                "name": self.name,
+            })])
+            .await?;
+        let data = results
+            .first()
+            .and_then(|result| result.get("data"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        pipe_info(&data)
+            .ok_or_else(|| SdkError::Protocol("describe pipe returned no definition".to_owned()))
+    }
+
+    /// `PAUSE PIPE`: halts every drive cooperatively; idempotent.
+    pub async fn pause(&self) -> Result<(), SdkError> {
+        self.lifecycle("pause_pipe").await
+    }
+
+    /// `RESUME PIPE`: restarts driving from the durable frontier.
+    pub async fn resume(&self) -> Result<(), SdkError> {
+        self.lifecycle("resume_pipe").await
+    }
+
+    /// `DROP PIPE`: retires the declaration and its compute lease.
+    pub async fn drop(self) -> Result<(), SdkError> {
+        self.client
+            .commands(vec![json!({
+                "command": "drop",
+                "kind": "pipe",
+                "name": self.name,
+            })])
+            .await
+            .map(|_| ())
+    }
+
+    async fn lifecycle(&self, command: &str) -> Result<(), SdkError> {
+        self.client
+            .commands(vec![json!({ "command": command, "name": self.name })])
+            .await
+            .map(|_| ())
     }
 }
 
@@ -2087,5 +2210,58 @@ mod tests {
         let requests = transport.take_requests();
         assert_eq!(requests[0].0, "GET");
         assert!(requests[0].1.contains("after=opaque%2Bcursor%2Fbytes%3D"));
+    }
+
+    #[tokio::test]
+    async fn pipe_facade_wires_lifecycle_and_decodes_catalog_rows() {
+        let subscription_id = uuid::Uuid::new_v4().to_string();
+        let output_feed_id = uuid::Uuid::new_v4().to_string();
+        let row = json!({
+            "name": "orders.relay",
+            "stage": "paused",
+            "subscription_id": subscription_id,
+            "operation": { "operation": "forward" },
+            "output_feed_id": output_feed_id,
+            "output_store_id": null,
+            "status": "active",
+            "created_at_ns": 42
+        });
+        let (client, transport) = client(vec![
+            (200, json!({"results": [{"data": row}]})),
+            (200, json!({"results": [{"data": [row]}]})),
+            (200, json!({"results": [{}]})),
+            (200, json!({"results": [{}]})),
+            (200, json!({"results": [{}]})),
+        ]);
+        // describe decodes the catalog row verbatim.
+        let described = client.pipe("orders.relay").describe().await.unwrap();
+        assert_eq!(described.name, "orders.relay");
+        assert_eq!(described.stage, "paused");
+        assert_eq!(described.subscription_id.to_string(), subscription_id);
+        assert_eq!(described.operation["operation"], "forward");
+        assert_eq!(
+            described.output_feed_id.unwrap().to_string(),
+            output_feed_id
+        );
+        assert_eq!(described.output_store_id, None);
+        // pipes lists the same row; lifecycle commands post the typed verbs.
+        let listed = client.pipes().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        client.pipe("orders.relay").pause().await.unwrap();
+        client.pipe("orders.relay").resume().await.unwrap();
+        client.pipe("orders.relay").drop().await.unwrap();
+        let requests = transport.take_requests();
+        let command = |index: usize| requests[index].2["commands"][0].clone();
+        assert_eq!(command(0)["command"], "describe");
+        assert_eq!(command(0)["kind"], "pipe");
+        assert_eq!(command(0)["name"], "orders.relay");
+        assert_eq!(command(1)["kind"], "pipes");
+        assert_eq!(command(2)["command"], "pause_pipe");
+        assert_eq!(command(3)["command"], "resume_pipe");
+        assert_eq!(command(4)["command"], "drop");
+        assert_eq!(command(4)["kind"], "pipe");
+        assert!(requests
+            .iter()
+            .all(|request| request.1 == "/v1/admin/commands"));
     }
 }

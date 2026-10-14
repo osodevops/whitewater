@@ -138,6 +138,60 @@ async fn sdk_roundtrip_against_a_live_riverbed() {
         records.iter().any(|record| record.key == b"order-42"),
         "feed read surfaces the appended record"
     );
+
+    // Pipe facade: declare a forward Pipe, then drive its lifecycle —
+    // describe reports the live catalog row, pause/resume hold and
+    // restart drives, and drop retires the declaration.
+    let (out_feed, relay) = (format!("{domain}.out"), format!("{domain}.relay"));
+    client
+        .wcl(&format!(
+            "CREATE FEED {out_feed}; \
+             CREATE PIPE {relay} FROM SUBSCRIPTION {subscription} TO FEED {out_feed};"
+        ))
+        .await
+        .expect("pipe setup WCL");
+    let described = client.pipe(&relay).describe().await.expect("pipe describe");
+    assert_eq!(described.name, relay);
+    assert_eq!(described.stage, "declared");
+    assert_eq!(
+        described.subscription_id,
+        client
+            .wcl(&format!("DESCRIBE SUBSCRIPTION {subscription};"))
+            .await
+            .expect("subscription describe")[0]
+            .pointer("/data/subscription_id")
+            .and_then(|v| v.as_str())
+            .expect("subscription id")
+            .parse::<uuid::Uuid>()
+            .expect("uuid")
+    );
+    assert_eq!(described.operation["operation"], "forward");
+    assert!(described.output_feed_id.is_some());
+    assert!(client
+        .pipes()
+        .await
+        .expect("list pipes")
+        .iter()
+        .any(|pipe| pipe.name == relay));
+    client.pipe(&relay).pause().await.expect("pause");
+    let paused = client
+        .pipe(&relay)
+        .describe()
+        .await
+        .expect("paused describe");
+    assert_eq!(paused.stage, "paused");
+    client.pipe(&relay).resume().await.expect("resume");
+    let resumed = client
+        .pipe(&relay)
+        .describe()
+        .await
+        .expect("resumed describe");
+    assert_eq!(resumed.stage, "declared");
+    client.pipe(&relay).drop().await.expect("drop");
+    assert!(
+        client.pipe(&relay).describe().await.is_err(),
+        "dropped pipe refuses describe"
+    );
 }
 
 #[tokio::test]
