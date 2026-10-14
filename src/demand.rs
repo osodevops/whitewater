@@ -29,6 +29,7 @@ struct DemandCounters {
     pipe_drives: Mutex<BTreeMap<uuid::Uuid, PipeDriveTelemetry>>,
     subscription_traffic: Mutex<BTreeMap<uuid::Uuid, SubscriptionTrafficTelemetry>>,
     index_queries: Mutex<BTreeMap<uuid::Uuid, IndexQueryTelemetry>>,
+    range_reads: Mutex<BTreeMap<RangeId, RangeReadTotals>>,
 }
 
 #[derive(Default)]
@@ -363,6 +364,25 @@ impl DemandMetrics {
         }
     }
 
+    /// Fold one committed range page this replica served into its
+    /// cumulative read-attribution counter.
+    pub fn record_range_read(&self, range_id: RangeId, records: usize) {
+        if let Ok(mut reads) = self.inner.range_reads.lock() {
+            let totals = reads.entry(range_id).or_default();
+            totals.pages = totals.pages.saturating_add(1);
+            totals.records = totals.records.saturating_add(records as u64);
+        }
+    }
+
+    /// Cumulative served-read rows keyed by RangeId on this Node.
+    pub fn range_read_totals(&self) -> BTreeMap<RangeId, RangeReadTotals> {
+        self.inner
+            .range_reads
+            .lock()
+            .map(|reads| reads.clone())
+            .unwrap_or_default()
+    }
+
     pub fn record_read(&self, records: usize) {
         self.inner.reads_total.fetch_add(1, Ordering::Relaxed);
         self.inner
@@ -541,6 +561,14 @@ impl IndexQueryMode {
             Self::Range => "range",
         }
     }
+}
+
+/// Cumulative committed-read service on one Active Range on this Node —
+/// the storing replica that answered, not the ingress the client reached.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct RangeReadTotals {
+    pub pages: u64,
+    pub records: u64,
 }
 
 /// Per-Index query attribution on this Node since process start — the
@@ -1243,5 +1271,20 @@ mod tests {
         let telemetry = metrics.index_query_telemetry();
         assert!(telemetry.contains_key(&index));
         assert!(!telemetry.contains_key(&dropped));
+    }
+
+    #[test]
+    fn range_read_totals_accumulate_served_pages_per_range() {
+        let metrics = DemandMetrics::default();
+        let first = range_id(11);
+        let second = range_id(12);
+        metrics.record_range_read(first, 8);
+        metrics.record_range_read(first, 4);
+        metrics.record_range_read(second, 1);
+
+        let totals = metrics.range_read_totals();
+        assert_eq!(totals.get(&first).unwrap().pages, 2);
+        assert_eq!(totals.get(&first).unwrap().records, 12);
+        assert_eq!(totals.get(&second).unwrap().records, 1);
     }
 }

@@ -725,6 +725,7 @@ pub fn router(state: AppState) -> Router {
             get(admin_subscription_demand),
         )
         .route("/v1/admin/demand/indexes", get(admin_index_demand))
+        .route("/v1/admin/demand/feeds", get(admin_feed_demand))
         .route("/v1/admin/control-plane", get(control_plane_status))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
@@ -9055,6 +9056,94 @@ async fn admin_index_demand(
     })))
 }
 
+/// Per-Feed storage-traffic attribution on this Node. Append counters are
+/// cumulative per-Range totals recorded on the storing replica and joined
+/// to Feeds through the catalog; served-read counters count committed
+/// pages this replica answered. Both scopes are Node-local since process
+/// start — an ownership move serves traffic on the new owner rather than
+/// pretending a portable counter.
+async fn admin_feed_demand(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let appends = state.demand.range_pressure_totals();
+    let reads = state.demand.range_read_totals();
+    let assignments = state.control.active_feed_assignments().await;
+    let mut feeds: BTreeMap<Uuid, (String, serde_json::Value)> = BTreeMap::new();
+    for (feed_name, assignment) in &assignments {
+        let entry = feeds.entry(assignment.feed_id).or_insert_with(|| {
+            (
+                feed_name.clone(),
+                json!({
+                    "appended_records": 0, "appended_bytes": 0,
+                    "read_pages": 0, "records_read": 0,
+                }),
+            )
+        });
+        if let Some(sample) = appends
+            .iter()
+            .find(|sample| sample.range_id == assignment.range_id)
+        {
+            entry.1["appended_records"] =
+                json!(entry.1["appended_records"].as_u64().unwrap_or(0) + sample.records);
+            entry.1["appended_bytes"] =
+                json!(entry.1["appended_bytes"].as_u64().unwrap_or(0) + sample.bytes);
+        }
+        if let Some(totals) = reads.get(&assignment.range_id) {
+            entry.1["read_pages"] =
+                json!(entry.1["read_pages"].as_u64().unwrap_or(0) + totals.pages);
+            entry.1["records_read"] =
+                json!(entry.1["records_read"].as_u64().unwrap_or(0) + totals.records);
+        }
+    }
+    let mut domains: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut rows = Vec::with_capacity(feeds.len());
+    for (feed_id, (feed_name, counters)) in &feeds {
+        let domain = state
+            .control
+            .active_feed_by_id(*feed_id)
+            .await
+            .map(|feed| feed.space_id)
+            .unwrap_or(*feed_id);
+        let domain = state
+            .control
+            .active_domain_name(domain)
+            .await
+            .unwrap_or_else(|| domain.to_string());
+        rows.push(json!({
+            "feed": feed_name,
+            "domain": domain,
+            "appended_records": counters["appended_records"],
+            "appended_bytes": counters["appended_bytes"],
+            "read_pages": counters["read_pages"],
+            "records_read": counters["records_read"],
+        }));
+        let rollup = domains.entry(domain).or_insert_with(|| {
+            json!({
+                "feeds": 0, "appended_records": 0, "appended_bytes": 0,
+                "read_pages": 0, "records_read": 0,
+            })
+        });
+        rollup["feeds"] = json!(rollup["feeds"].as_u64().unwrap_or(0) + 1);
+        for field in [
+            "appended_records",
+            "appended_bytes",
+            "read_pages",
+            "records_read",
+        ] {
+            rollup[field] =
+                json!(rollup[field].as_u64().unwrap_or(0) + counters[field].as_u64().unwrap_or(0));
+        }
+    }
+    Ok(Json(json!({
+        "node": state.storage_node_id,
+        "scope": "node-local since process start; counts on the storing/serving replica",
+        "feeds": rows,
+        "domains": domains,
+    })))
+}
+
 fn hot_key_entry(
     evidence: HotKeyEvidence,
     feed_bounds: Option<(String, crate::active_range::KeyRange)>,
@@ -10312,6 +10401,9 @@ async fn read_owned_range_page(
             ));
         }
     }
+    state
+        .demand
+        .record_range_read(request.assignment.range_id, frames.len());
     Ok(Json(ReadRangePageResponse {
         committed,
         resolved_after,
@@ -17848,6 +17940,32 @@ mod tests {
         let orders = &body["domains"]["orders"];
         assert!(orders["subscriptions"].as_u64().unwrap() >= 3, "{orders}");
         assert!(orders["fetch_records"].as_u64().unwrap() >= 4, "{orders}");
+
+        // Feed-level storage attribution lands on the storing replica:
+        // member fetches drove committed range reads on the owning Node,
+        // so the merged rows show served-read evidence for the Feed.
+        let mut records_read = 0_u64;
+        let mut feed_seen = false;
+        for node in &nodes {
+            let response = client
+                .get(format!("{}/v1/admin/demand/feeds", endpoints[node]))
+                .header("authorization", "Bearer this-is-a-long-development-api-key")
+                .send()
+                .await
+                .unwrap();
+            let body: Value = response.json().await.unwrap();
+            for row in body["feeds"].as_array().unwrap() {
+                if row["feed"] == json!("orders.events") {
+                    feed_seen = true;
+                    records_read += row["records_read"].as_u64().unwrap_or(0);
+                }
+            }
+        }
+        assert!(feed_seen, "orders.events must appear in feed demand rows");
+        assert!(
+            records_read >= 4,
+            "member fetches must attribute served records: {records_read}"
+        );
 
         // A lost progress owner leaves member reads on surviving quorum
         // evidence while the next mutation transparently recovers placement

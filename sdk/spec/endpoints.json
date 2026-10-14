@@ -512,6 +512,28 @@
       "errors": []
     },
     {
+      "op": "admin.demand.feeds",
+      "method": "GET",
+      "path": "/v1/admin/demand/feeds",
+      "auth": "admin",
+      "response": {
+        "node": "string",
+        "scope": "node-local since process start; counts on the storing/serving replica",
+        "feeds": [
+          {
+            "feed": "name",
+            "domain": "name",
+            "appended_records": "u64",
+            "appended_bytes": "u64",
+            "read_pages": "u64",
+            "records_read": "u64"
+          }
+        ],
+        "domains": "per-domain counter rollups"
+      },
+      "errors": []
+    },
+    {
       "op": "admin.subscriptions.progress",
       "method": "GET",
       "path": "/v1/admin/subscriptions/progress?subscription=<name>",

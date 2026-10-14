@@ -144,6 +144,37 @@ def main():
     if "error" not in error:
         raise AssertionError("unknown Feed append did not return an actionable error")
 
+    # Storage-traffic attribution lands on the storing/serving replica:
+    # merge every Node's rows so owner-side append and read service count.
+    merged = {}
+    rollups = {}
+    for node in ENDPOINTS:
+        status, demand = get(ENDPOINTS[node], "/v1/admin/demand/feeds")
+        assert_equal(status, 200, f"feed demand through {node}")
+        for row in demand["feeds"]:
+            slot = merged.setdefault(row["feed"], {})
+            for field, value in row.items():
+                if isinstance(value, int):
+                    slot[field] = slot.get(field, 0) + value
+        for domain_name, rollup in demand["domains"].items():
+            slot = rollups.setdefault(domain_name, {})
+            for field, value in rollup.items():
+                if isinstance(value, int):
+                    if field == "feeds":
+                        slot[field] = max(slot.get(field, 0), value)
+                    else:
+                        slot[field] = slot.get(field, 0) + value
+    counters = merged.get(feed, {})
+    if counters.get("appended_records", 0) < 1:
+        raise AssertionError(f"appended_records {counters}")
+    if counters.get("appended_bytes", 0) < 1:
+        raise AssertionError(f"appended_bytes {counters}")
+    if counters.get("records_read", 0) < 3:
+        raise AssertionError(f"records_read {counters}")
+    rollup = rollups.get(space, {})
+    if rollup.get("feeds", 0) < 1 or rollup.get("records_read", 0) < 3:
+        raise AssertionError(f"domain rollup {rollup}")
+
     print(
         json.dumps(
             {
