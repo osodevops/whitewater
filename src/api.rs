@@ -2222,6 +2222,7 @@ async fn subscription_member_join(
                             expected_commit: None,
                             after_cursor: None,
                             tail_count: Some(1),
+                            ingest_threshold: None,
                             single_range: true,
                             page_limit: Some(1),
                         },
@@ -2927,6 +2928,7 @@ async fn resolve_tail_positions(
                 expected_commit: None,
                 after_cursor: None,
                 tail_count: Some(1),
+                ingest_threshold: None,
                 single_range: true,
                 page_limit: Some(1),
             },
@@ -3034,6 +3036,7 @@ async fn resolve_seek_cursor_positions(
             expected_commit: None,
             after_cursor: Some(cursor.to_owned()),
             tail_count: None,
+            ingest_threshold: None,
             single_range: true,
             page_limit: Some(1),
         },
@@ -3062,6 +3065,30 @@ async fn resolve_timestamp_positions(
 ) -> Result<BTreeMap<RangeId, String>, ApiError> {
     let mut positions = BTreeMap::new();
     for range_assignment in range_assignments {
+        // The owner keeps an ingest-time index over the committed prefix;
+        // one probe resolves the boundary without walking history. A range
+        // whose ingest clock is not monotonic (a backwards time step)
+        // reports `ordered: false` and falls back to the frame scan.
+        let probe = fetch_range_page(
+            state,
+            ReadRangePageRequest {
+                assignment: range_assignment.clone(),
+                after: None,
+                expected_commit: None,
+                after_cursor: None,
+                tail_count: None,
+                ingest_threshold: Some(threshold),
+                single_range: true,
+                page_limit: Some(1),
+            },
+        )
+        .await?;
+        if let Some(boundary) = probe.ingest_boundary {
+            if boundary.ordered {
+                positions.insert(range_assignment.range_id, boundary.cursor);
+                continue;
+            }
+        }
         let mut stream = RangeFrameStream::new(state, range_assignment);
         let mut last_before = String::new();
         while let Some(frame) = stream.next_frame().await? {
@@ -8035,6 +8062,7 @@ async fn read_cutover_lineage(
                 expected_commit: after.map(|_| boundary),
                 after_cursor: None,
                 tail_count: None,
+                ingest_threshold: None,
                 single_range: true,
                 page_limit: Some(32),
             },
@@ -10690,6 +10718,7 @@ async fn admin_subscription_progress(
                         // the committed position the frontier Cursor resolves
                         // to, and committed is the tail.
                         tail_count: None,
+                        ingest_threshold: None,
                         single_range: true,
                         page_limit: Some(1),
                     },
@@ -12373,6 +12402,11 @@ struct ReadRangePageRequest {
     after_cursor: Option<String>,
     #[serde(default)]
     tail_count: Option<usize>,
+    /// Ingest-clock seek probe: resolve the last committed frame ingested
+    /// before this threshold against the owner's ingest index instead of
+    /// streaming frames; the reply's `ingest_boundary` carries the result.
+    #[serde(default)]
+    ingest_threshold: Option<i64>,
     #[serde(default)]
     single_range: bool,
     #[serde(default)]
@@ -12384,7 +12418,21 @@ struct ReadRangePageResponse {
     committed: CommitPosition,
     #[serde(default)]
     resolved_after: Option<RangePosition>,
+    /// Set when `ingest_threshold` was requested: the indexed boundary, or
+    /// `ordered: false` when the range's ingest clock is not monotonic and
+    /// the caller must resolve the threshold by scanning frames instead.
+    #[serde(default)]
+    ingest_boundary: Option<IngestBoundaryReply>,
     frames: Vec<RepairFrame>,
+}
+
+/// Wire form of the owner's ingest-boundary probe result.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct IngestBoundaryReply {
+    ordered: bool,
+    /// Cursor of the last committed frame ingested before the threshold;
+    /// empty when every committed frame is eligible.
+    cursor: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -12581,20 +12629,45 @@ async fn read_owned_range_page(
     } else {
         request.expected_commit
     };
-    let (committed, resolved_after, frames) = if request.single_range {
+    let (committed, resolved_after, ingest_boundary, frames) = if request.single_range {
         service
             .read_owned_range_cursor_page(
                 &request.assignment,
-                request.after_cursor.as_deref(),
-                request.after,
+                crate::active_range::RangeReadSpec {
+                    cursor: request.after_cursor.as_deref(),
+                    after: request.after,
+                    tail_count: request.tail_count,
+                    ingest_threshold: request.ingest_threshold,
+                },
                 expected_commit,
-                request.tail_count,
                 request.page_limit.unwrap_or(1),
             )
             .await
-    } else if request.after_cursor.is_some() || request.tail_count.is_some() {
+            .map(|(commit, resolved, probe, frames)| {
+                (
+                    commit,
+                    resolved,
+                    probe.map(|boundary| match boundary {
+                        crate::active_range::IngestBoundary::Ordered { cursor, .. } => {
+                            IngestBoundaryReply {
+                                ordered: true,
+                                cursor,
+                            }
+                        }
+                        crate::active_range::IngestBoundary::Unordered => IngestBoundaryReply {
+                            ordered: false,
+                            cursor: String::new(),
+                        },
+                    }),
+                    frames,
+                )
+            })
+    } else if request.after_cursor.is_some()
+        || request.tail_count.is_some()
+        || request.ingest_threshold.is_some()
+    {
         return Err(ApiError::bad_request(
-            "Cursor and tail read modes require single-range routing",
+            "Cursor, tail, and ingest read modes require single-range routing",
         ));
     } else {
         service
@@ -12605,7 +12678,7 @@ async fn read_owned_range_page(
                 request.page_limit.unwrap_or(32),
             )
             .await
-            .map(|(commit, frames)| (commit, request.after, frames))
+            .map(|(commit, frames)| (commit, request.after, None, frames))
     }
     .map_err(|error| ApiError {
         status: if error.retryable {
@@ -12632,6 +12705,7 @@ async fn read_owned_range_page(
     Ok(Json(ReadRangePageResponse {
         committed,
         resolved_after,
+        ingest_boundary,
         frames: frames
             .into_iter()
             .map(|frame| RepairFrame {
@@ -12823,6 +12897,7 @@ async fn read_single_range(
                 expected_commit: boundary,
                 after_cursor: after_cursor.take(),
                 tail_count: (mode.tail && boundary.is_none()).then_some(limit),
+                ingest_threshold: None,
                 single_range: true,
                 page_limit: Some(limit.saturating_sub(frames.len()).clamp(1, 32)),
             },
@@ -12917,6 +12992,7 @@ async fn reader_range_head(
             expected_commit: boundary,
             after_cursor: after_cursor.map(str::to_owned),
             tail_count: None,
+            ingest_threshold: None,
             single_range: true,
             page_limit: Some(1),
         },
@@ -13112,6 +13188,7 @@ impl RangeFrameStream<'_> {
                     single_range: after_cursor.is_some(),
                     after_cursor,
                     tail_count: None,
+                    ingest_threshold: None,
                     page_limit: Some(128),
                 },
             )
@@ -13301,6 +13378,7 @@ async fn read_complete_feed(
                 expected_commit: boundary,
                 after_cursor: None,
                 tail_count: None,
+                ingest_threshold: None,
                 single_range: false,
                 page_limit: Some(128),
             };
@@ -13568,6 +13646,7 @@ async fn lookup_feed_record(
                 expected_commit: None,
                 after_cursor: Some(query.cursor.clone()),
                 tail_count: None,
+                ingest_threshold: None,
                 single_range: true,
                 page_limit: Some(1),
             },
@@ -13591,6 +13670,7 @@ async fn lookup_feed_record(
                 expected_commit: committed,
                 after_cursor: None,
                 tail_count: None,
+                ingest_threshold: None,
                 single_range: true,
                 page_limit: Some(1),
             },
@@ -20187,6 +20267,25 @@ mod tests {
                     exhausted_policy: None,
                 },
                 Command::CreateSubscription {
+                    name: "orders.timeshifted".to_owned(),
+                    feed: Some("orders.events".to_owned()),
+                    domain: None,
+                    start: crate::control::ReaderStart::Timestamp(7),
+                    delivery_delay_ns: None,
+                    exhausted_policy: None,
+                },
+                Command::CreateFeed {
+                    name: "orders.deep".to_owned(),
+                },
+                Command::CreateSubscription {
+                    name: "orders.deeptime".to_owned(),
+                    feed: Some("orders.deep".to_owned()),
+                    domain: None,
+                    start: crate::control::ReaderStart::Timestamp(11_000),
+                    delivery_delay_ns: None,
+                    exhausted_policy: None,
+                },
+                Command::CreateSubscription {
                     name: "orders.budget".to_owned(),
                     feed: Some("orders.events".to_owned()),
                     domain: None,
@@ -20253,6 +20352,28 @@ mod tests {
                 &directory.path().join(format!("node-{index}")),
                 &descriptor,
                 12,
+            );
+        }
+        let deep_feed = control.active_feed_by_name("orders.deep").await.unwrap();
+        let deep_parent = control
+            .active_range_assignment(deep_feed.feed_id)
+            .await
+            .unwrap();
+        let deep_descriptor = ActiveRangeDescriptor {
+            feed_id: deep_feed.feed_id,
+            range_id: deep_parent.range_id,
+            generation: deep_parent.generation,
+            ownership_epoch: deep_parent.ownership_epoch,
+        };
+        for node in deep_parent.replicas.iter() {
+            let index = nodes
+                .iter()
+                .position(|candidate| candidate == node)
+                .unwrap();
+            seed_committed_history(
+                &directory.path().join(format!("node-{index}")),
+                &deep_descriptor,
+                12_001,
             );
         }
         let progress_range = parent.range_id;
@@ -21043,6 +21164,82 @@ mod tests {
         assert_eq!(
             body["positions"][progress_range.to_string()],
             json!("cursor-12")
+        );
+
+        // A timestamp start resolves each range's boundary through the
+        // owner's ingest index: the seeded frames carry ingest times 1..=12,
+        // so threshold 7 pins the frontier on cursor-6 and first delivery is
+        // cursor-7.
+        let (status, body) = post(
+            "join",
+            json!({"subscription": "orders.timeshifted", "request_id": Uuid::from_u128(33),
+                "member_id": member}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.timeshifted", "request_id": Uuid::from_u128(34),
+                "member_id": member, "member_epoch": 1, "work_id": work}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let ts_epoch = body["lease"]["lease_epoch"].as_u64().unwrap();
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.timeshifted", "request_id": Uuid::from_u128(35),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_epoch": ts_epoch,
+                "limit": 4}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["cursor"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["cursor-7", "cursor-8", "cursor-9", "cursor-10"]
+        );
+
+        // The indexed probe also resolves deep history: with 12,001
+        // committed frames the threshold-11,000 boundary lands on
+        // cursor-10999 and the first delivered record is cursor-11000 —
+        // no frame-by-frame prefix scan.
+        let (status, body) = post(
+            "join",
+            json!({"subscription": "orders.deeptime", "request_id": Uuid::from_u128(36),
+                "member_id": member}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.deeptime", "request_id": Uuid::from_u128(37),
+                "member_id": member, "member_epoch": 1, "work_id": work}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let deep_epoch = body["lease"]["lease_epoch"].as_u64().unwrap();
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.deeptime", "request_id": Uuid::from_u128(38),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_epoch": deep_epoch,
+                "limit": 3}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["cursor"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["cursor-11000", "cursor-11001", "cursor-11002"]
         );
 
         // The admin progress view reports placement, committed frontier,

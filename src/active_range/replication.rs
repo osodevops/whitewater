@@ -206,6 +206,22 @@ pub struct ReadReplicaEvidence {
     pub digest: Option<[u8; 32]>,
 }
 
+/// The exclusive start selectors for a single-range committed read. Exactly
+/// one of `cursor`/`tail_count`/`ingest_threshold` may be set, or `after`
+/// alone for physical continuation; the service rejects combinations.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RangeReadSpec<'a> {
+    /// Opaque record Cursor to resolve against the committed index.
+    pub cursor: Option<&'a str>,
+    /// Physical continuation position; `None` starts at the committed head.
+    pub after: Option<RangePosition>,
+    /// Serve the last `n` committed frames.
+    pub tail_count: Option<usize>,
+    /// Ingest-clock probe: resolve the committed ingest boundary without
+    /// streaming frames; the reply carries `ingest_boundary` instead.
+    pub ingest_threshold: Option<i64>,
+}
+
 #[derive(Clone)]
 pub struct ReplicaAppendService {
     root: Arc<PathBuf>,
@@ -716,15 +732,14 @@ impl ReplicaAppendService {
     pub async fn read_owned_range_cursor_page(
         &self,
         assignment: &ActiveRangeAssignment,
-        cursor: Option<&str>,
-        after: Option<RangePosition>,
+        spec: RangeReadSpec<'_>,
         expected_commit: Option<CommitPosition>,
-        tail_count: Option<usize>,
         page_limit: usize,
     ) -> Result<
         (
             CommitPosition,
             Option<RangePosition>,
+            Option<super::store::IngestBoundary>,
             Vec<super::StoredRangeFrame>,
         ),
         ReplicaAppendError,
@@ -741,12 +756,20 @@ impl ReplicaAppendService {
                 "single-range read requires the current committed Append Owner assignment",
             ));
         }
-        if (cursor.is_some() && after.is_some())
-            || (tail_count.is_some() && (after.is_some() || cursor.is_some()))
+        if [
+            spec.cursor.is_some(),
+            spec.after.is_some(),
+            spec.tail_count.is_some(),
+            spec.ingest_threshold.is_some(),
+        ]
+        .iter()
+        .filter(|set| **set)
+        .count()
+            > 1
         {
             return Err(ReplicaAppendError::rejected(
                 ReplicaAppendErrorCode::InvalidFrame,
-                "Cursor, physical continuation, and tail start cannot be combined",
+                "Cursor, physical continuation, tail, and ingest-threshold starts cannot be combined",
             ));
         }
         let store = self.store_for(assignment).await?;
@@ -763,7 +786,8 @@ impl ReplicaAppendService {
             ));
         }
         let boundary = expected_commit.unwrap_or(committed);
-        let start = if let Some(cursor) = cursor {
+        let mut ingest_boundary = None;
+        let start = if let Some(cursor) = spec.cursor {
             Some(
                 store
                     .committed_position_for_cursor(cursor)
@@ -777,20 +801,37 @@ impl ReplicaAppendService {
                         )
                     })?,
             )
-        } else if let Some(count) = tail_count {
+        } else if let Some(count) = spec.tail_count {
             Some(RangePosition::new(
                 boundary.value().saturating_sub(count as u64),
             ))
+        } else if let Some(threshold) = spec.ingest_threshold {
+            let resolved = store
+                .committed_ingest_boundary(threshold, boundary)
+                .await
+                .map_err(map_store_error)?;
+            let position = match &resolved {
+                super::store::IngestBoundary::Ordered { position, .. } => *position,
+                super::store::IngestBoundary::Unordered => None,
+            };
+            ingest_boundary = Some(resolved);
+            position
         } else {
-            after
+            spec.after
         };
-        let frames = store
-            .read_committed_bounded(start, page_limit.clamp(1, 32), MAX_COMMITTED_READ_BYTES)
-            .await
-            .map_err(map_store_error)?
-            .into_iter()
-            .filter(|frame| frame.position.value() <= boundary.value())
-            .collect();
+        // An ingest probe resolves its boundary in the index and serves no
+        // frames; other modes stream the bounded page after `start`.
+        let frames = if spec.ingest_threshold.is_some() {
+            Vec::new()
+        } else {
+            store
+                .read_committed_bounded(start, page_limit.clamp(1, 32), MAX_COMMITTED_READ_BYTES)
+                .await
+                .map_err(map_store_error)?
+                .into_iter()
+                .filter(|frame| frame.position.value() <= boundary.value())
+                .collect()
+        };
         if self
             .control
             .active_range_assignment_by_id(assignment.range_id)
@@ -802,7 +843,7 @@ impl ReplicaAppendService {
                 "range placement changed during the committed read; retry safely",
             ));
         }
-        Ok((boundary, start, frames))
+        Ok((boundary, start, ingest_boundary, frames))
     }
 
     pub async fn read_replica_evidence(

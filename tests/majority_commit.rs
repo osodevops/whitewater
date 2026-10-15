@@ -790,12 +790,13 @@ async fn committed_range_pages_require_the_current_owner_and_preserve_the_bounda
         .await
         .unwrap();
     assert!(exhausted.is_empty());
-    let (_, resolved, suffix) = owner
+    let (_, resolved, _, suffix) = owner
         .read_owned_range_cursor_page(
             &assignment,
-            Some(&fixture.request.cursor),
-            None,
-            None,
+            whitewater::active_range::RangeReadSpec {
+                cursor: Some(&fixture.request.cursor),
+                ..Default::default()
+            },
             None,
             32,
         )
@@ -803,15 +804,31 @@ async fn committed_range_pages_require_the_current_owner_and_preserve_the_bounda
         .unwrap();
     assert_eq!(resolved, Some(RangePosition::new(1)));
     assert!(suffix.is_empty());
-    let (_, start, tail) = owner
-        .read_owned_range_cursor_page(&assignment, None, None, None, Some(1), 32)
+    let (_, start, _, tail) = owner
+        .read_owned_range_cursor_page(
+            &assignment,
+            whitewater::active_range::RangeReadSpec {
+                tail_count: Some(1),
+                ..Default::default()
+            },
+            None,
+            32,
+        )
         .await
         .unwrap();
     assert_eq!(start, Some(RangePosition::new(0)));
     assert_eq!(tail[0].cursor, fixture.request.cursor);
     assert_eq!(
         owner
-            .read_owned_range_cursor_page(&assignment, Some("unknown"), None, None, None, 32)
+            .read_owned_range_cursor_page(
+                &assignment,
+                whitewater::active_range::RangeReadSpec {
+                    cursor: Some("unknown"),
+                    ..Default::default()
+                },
+                None,
+                32,
+            )
             .await
             .unwrap_err()
             .code,
@@ -949,8 +966,16 @@ async fn cursor_pages_continue_after_a_bounded_batch_without_rescanning_the_pref
         );
         coordinator.append(request).await.unwrap();
     }
-    let (commit, position, page) = owner
-        .read_owned_range_cursor_page(&assignment, Some("cursor-1"), None, None, None, 32)
+    let (commit, position, _, page) = owner
+        .read_owned_range_cursor_page(
+            &assignment,
+            whitewater::active_range::RangeReadSpec {
+                cursor: Some("cursor-1"),
+                ..Default::default()
+            },
+            None,
+            32,
+        )
         .await
         .unwrap();
     assert_eq!(commit, CommitPosition::new(34));
@@ -958,21 +983,30 @@ async fn cursor_pages_continue_after_a_bounded_batch_without_rescanning_the_pref
     assert_eq!(page.len(), 32);
     assert_eq!(page.first().unwrap().cursor, "cursor-2");
     assert_eq!(page.last().unwrap().cursor, "cursor-33");
-    let (_, _, next) = owner
+    let (_, _, _, next) = owner
         .read_owned_range_cursor_page(
             &assignment,
-            None,
-            Some(RangePosition::new(33)),
+            whitewater::active_range::RangeReadSpec {
+                after: Some(RangePosition::new(33)),
+                ..Default::default()
+            },
             Some(commit),
-            None,
             32,
         )
         .await
         .unwrap();
     assert_eq!(next.len(), 1);
     assert_eq!(next[0].cursor, "cursor-34");
-    let (_, tail_start, tail) = owner
-        .read_owned_range_cursor_page(&assignment, None, None, None, Some(2), 32)
+    let (_, tail_start, _, tail) = owner
+        .read_owned_range_cursor_page(
+            &assignment,
+            whitewater::active_range::RangeReadSpec {
+                tail_count: Some(2),
+                ..Default::default()
+            },
+            None,
+            32,
+        )
         .await
         .unwrap();
     assert_eq!(tail_start, Some(RangePosition::new(32)));
@@ -981,6 +1015,112 @@ async fn cursor_pages_continue_after_a_bounded_batch_without_rescanning_the_pref
             .map(|frame| frame.cursor.as_str())
             .collect::<Vec<_>>(),
         vec!["cursor-33", "cursor-34"]
+    );
+}
+
+#[tokio::test]
+async fn ingest_threshold_probe_resolves_the_fenced_committed_boundary() {
+    let fixture = Fixture::new().await;
+    let assignment = fixture
+        .control
+        .active_range_assignment(fixture.request.feed_id)
+        .await
+        .unwrap();
+    let owner = fixture.services[&assignment.owner].clone();
+    let follower_name = fixture.non_owner_names().remove(0);
+    let follower =
+        fixture.services[&StorageNodeId::try_new(follower_name.as_str()).unwrap()].clone();
+    fixture
+        .coordinator(&[], &[], None)
+        .append(fixture.request.clone())
+        .await
+        .unwrap();
+    for sequence in 2..=5_u64 {
+        fixture
+            .coordinator(&[], &[], None)
+            .append(paged_request(&fixture, sequence))
+            .await
+            .unwrap();
+    }
+    // Committed ingest times are 2,3,4,5,6 (record sequence + 1); the
+    // threshold 5 lands on the frame at position 3.
+    let (boundary, start, probe, frames) = owner
+        .read_owned_range_cursor_page(
+            &assignment,
+            whitewater::active_range::RangeReadSpec {
+                ingest_threshold: Some(5),
+                ..Default::default()
+            },
+            None,
+            32,
+        )
+        .await
+        .unwrap();
+    assert_eq!(boundary, CommitPosition::new(5));
+    assert_eq!(start, Some(RangePosition::new(3)));
+    assert!(frames.is_empty());
+    match probe.unwrap() {
+        whitewater::active_range::IngestBoundary::Ordered { position, cursor } => {
+            assert_eq!(position, Some(RangePosition::new(3)));
+            assert_eq!(cursor, "cursor-3");
+        }
+        other => panic!("expected an ordered boundary, got {other:?}"),
+    }
+    // A threshold at-or-before the head resolves to the range start.
+    let (_, start, probe, _) = owner
+        .read_owned_range_cursor_page(
+            &assignment,
+            whitewater::active_range::RangeReadSpec {
+                ingest_threshold: Some(2),
+                ..Default::default()
+            },
+            None,
+            32,
+        )
+        .await
+        .unwrap();
+    assert_eq!(start, None);
+    match probe.unwrap() {
+        whitewater::active_range::IngestBoundary::Ordered { position, cursor } => {
+            assert_eq!(position, None);
+            assert!(cursor.is_empty());
+        }
+        other => panic!("expected an ordered boundary, got {other:?}"),
+    }
+    // The probe cannot be combined with another read mode.
+    assert_eq!(
+        owner
+            .read_owned_range_cursor_page(
+                &assignment,
+                whitewater::active_range::RangeReadSpec {
+                    cursor: Some("cursor-1"),
+                    ingest_threshold: Some(5),
+                    ..Default::default()
+                },
+                None,
+                32
+            )
+            .await
+            .unwrap_err()
+            .code,
+        ReplicaAppendErrorCode::InvalidFrame
+    );
+    // A non-owner is fenced before the index is consulted.
+    assert_eq!(
+        follower
+            .read_owned_range_cursor_page(
+                &assignment,
+                whitewater::active_range::RangeReadSpec {
+                    ingest_threshold: Some(5),
+                    ..Default::default()
+                },
+                None,
+                32,
+            )
+            .await
+            .unwrap_err()
+            .code,
+        ReplicaAppendErrorCode::NotCurrentOwner
     );
 }
 

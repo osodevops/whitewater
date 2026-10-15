@@ -171,6 +171,22 @@ def main():
         if status != 200:
             raise AssertionError("mTLS Riverbed setup failed")
 
+        # Range placement is rendezvous-scored per Feed over the eligible
+        # storage Nodes; a small sample can legitimately miss the drain
+        # target. Declare more Feeds (bounded) until one places a replica on
+        # DRAINED so the drain exercise always has real work to move.
+        next_index = len(feeds)
+        for _ in range(5):
+            held = {feed: placement(NODES[0], feed)["replicas"] for feed in feeds}
+            if any(DRAINED in replicas for replicas in held.values()):
+                break
+            extra = [f"{suffix}.events{index}" for index in range(next_index, next_index + 5)]
+            next_index += 5
+            wcl_retry(NODES[0], "; ".join(f"CREATE FEED {feed}" for feed in extra) + ";")
+            feeds.extend(extra)
+        else:
+            raise AssertionError(f"{DRAINED} never received a Feed replica: {held}")
+
         # Append through a non-owner Node so the request forwards over the
         # authenticated internal plane; RF3 commit then uses mTLS replica
         # append/commit.
@@ -212,6 +228,7 @@ def main():
         held = {feed: placement(NODES[0], feed)["replicas"] for feed in feeds}
         if not any(DRAINED in replicas for replicas in held.values()):
             raise AssertionError(f"{DRAINED} holds no Feed replicas: {held}")
+
 
         wcl_retry(NODES[0], f"DRAIN STORAGE NODE {DRAINED};")
 

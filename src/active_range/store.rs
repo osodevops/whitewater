@@ -197,6 +197,22 @@ pub enum ActiveRangeStoreError {
     Io(#[from] std::io::Error),
 }
 
+/// The ingest-time seek boundary for one Range. `Ordered` carries the
+/// resolved boundary; `Unordered` tells the caller the range's ingest
+/// clock is not monotonic and the boundary must be resolved by scanning.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IngestBoundary {
+    /// `position`/`cursor` name the last committed frame ingested before
+    /// the threshold; `None`/`""` means every committed frame is eligible.
+    Ordered {
+        position: Option<RangePosition>,
+        cursor: String,
+    },
+    /// ingest_time_ns is not monotonic inside this Range's committed
+    /// history; the boundary must be resolved by scanning frames.
+    Unordered,
+}
+
 #[async_trait]
 pub trait ActiveRangeStore: Send + Sync {
     async fn snapshot(&self) -> Result<ActiveRangeSnapshot, ActiveRangeStoreError>;
@@ -229,6 +245,16 @@ pub trait ActiveRangeStore: Send + Sync {
         &self,
         cursor: &str,
     ) -> Result<Option<RangePosition>, ActiveRangeStoreError>;
+    /// Resolve the ingest-time boundary inside the committed prefix: the
+    /// last committed frame ingested before `threshold` (its position and
+    /// Cursor), or the range-start marker when the committed head already
+    /// qualifies. `Unordered` reports a range whose ingest clock is not
+    /// monotonic; callers resolve those by scanning instead.
+    async fn committed_ingest_boundary(
+        &self,
+        threshold: i64,
+        boundary: CommitPosition,
+    ) -> Result<IngestBoundary, ActiveRangeStoreError>;
     async fn frame_digest(
         &self,
         position: RangePosition,
@@ -276,6 +302,10 @@ struct LoadedRange {
     cursor_positions: HashMap<String, RangePosition>,
     digest_positions: HashMap<[u8; 32], RangePosition>,
     deduplication: HashMap<WriterKey, DeduplicationState>,
+    /// True while committed ingest_time_ns is non-decreasing in position
+    /// order; a backwards clock step disables indexed ingest seeks, which
+    /// callers resolve by scanning instead.
+    ingest_monotonic: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -328,6 +358,7 @@ struct DecodedEntry {
     frame: Vec<u8>,
     frame_digest: [u8; 32],
     message_id: Uuid,
+    ingest_time_ns: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +372,7 @@ struct EntryIndex {
     entry_end: u64,
     frame_offset: u64,
     frame_length: u64,
+    ingest_time_ns: i64,
 }
 
 impl FileActiveRangeStore {
@@ -398,6 +430,9 @@ impl FileActiveRangeStore {
                 "duplicate frame digest identity".to_owned(),
             ));
         }
+        let ingest_monotonic = entries
+            .windows(2)
+            .all(|pair| pair[0].ingest_time_ns <= pair[1].ingest_time_ns);
         let recovered_position = entries.last().map_or(0, |entry| entry.position.value());
         if persisted.committed > recovered_position {
             return Err(ActiveRangeStoreError::InvalidState(format!(
@@ -431,6 +466,7 @@ impl FileActiveRangeStore {
                     cursor_positions,
                     digest_positions,
                     deduplication: recovered_deduplication,
+                    ingest_monotonic,
                 }),
             }),
         })
@@ -521,6 +557,35 @@ impl ActiveRangeStore for FileActiveRangeStore {
                 .get(&cursor)
                 .copied()
                 .filter(|position| position.value() <= loaded.persisted.committed))
+        })
+        .await
+    }
+
+    async fn committed_ingest_boundary(
+        &self,
+        threshold: i64,
+        boundary: CommitPosition,
+    ) -> Result<IngestBoundary, ActiveRangeStoreError> {
+        self.blocking(move |inner| {
+            let loaded = inner
+                .loaded
+                .lock()
+                .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+            if !loaded.ingest_monotonic {
+                return Ok(IngestBoundary::Unordered);
+            }
+            let upto = usize::try_from(boundary.value())
+                .unwrap_or(usize::MAX)
+                .min(loaded.entries.len());
+            let prefix = &loaded.entries[..upto];
+            // partition_point counts committed frames ingested before the
+            // threshold; its predecessor is the boundary frame.
+            let first_eligible = prefix.partition_point(|entry| entry.ingest_time_ns < threshold);
+            let boundary_frame = first_eligible.checked_sub(1).map(|index| &prefix[index]);
+            Ok(IngestBoundary::Ordered {
+                position: boundary_frame.map(|entry| entry.position),
+                cursor: boundary_frame.map_or_else(String::new, |entry| entry.cursor.clone()),
+            })
         })
         .await
     }
@@ -929,6 +994,7 @@ fn append(
         frame: request.frame,
         frame_digest,
         message_id: record.message_id,
+        ingest_time_ns: record.ingest_time_ns,
     };
     let encoded = encode_entry(&decoded)?;
     if let Some(limit) = inner.options.max_range_bytes {
@@ -958,6 +1024,7 @@ fn append(
         entry_end,
         frame_offset,
         frame_length: decoded.frame.len() as u64,
+        ingest_time_ns: decoded.ingest_time_ns,
     };
     let deduplication = DeduplicationState {
         sequence: decoded.identity.sequence,
@@ -970,6 +1037,11 @@ fn append(
         .cursor_positions
         .insert(index.cursor.clone(), position);
     loaded.digest_positions.insert(frame_digest, position);
+    loaded.ingest_monotonic = loaded.ingest_monotonic
+        && loaded
+            .entries
+            .last()
+            .is_none_or(|tail| tail.ingest_time_ns <= index.ingest_time_ns);
     loaded.entries.push(index);
     match loaded.deduplication.get_mut(&writer_key) {
         Some(existing) if existing.sequence >= deduplication.sequence => {}
@@ -1294,6 +1366,7 @@ fn recover_segment(
             cursor: decoded.cursor,
             frame_digest: decoded.frame_digest,
             message_id: decoded.message_id,
+            ingest_time_ns: decoded.ingest_time_ns,
             segment,
             entry_end,
             frame_offset,
@@ -1420,6 +1493,7 @@ fn decode_entry(body: &[u8]) -> Result<DecodedEntry, ActiveRangeStoreError> {
         frame,
         frame_digest,
         message_id: record.message_id,
+        ingest_time_ns: record.ingest_time_ns,
     })
 }
 
@@ -1688,6 +1762,7 @@ pub(crate) fn seed_committed_history_shaped(
                 },
                 cursor: format!("cursor-{sequence}"),
                 frame_digest: *blake3::hash(&frame).as_bytes(),
+                ingest_time_ns: record.ingest_time_ns,
                 message_id: record.message_id,
                 frame,
             })
@@ -1725,5 +1800,211 @@ mod tests {
         let page = reopened.read_committed(cursor, 1).await.unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].cursor, "cursor-10001");
+    }
+
+    fn test_descriptor() -> ActiveRangeDescriptor {
+        ActiveRangeDescriptor {
+            feed_id: Uuid::from_u128(1),
+            range_id: RangeId::from_uuid(Uuid::from_u128(2)),
+            generation: RangeGeneration::new(1),
+            ownership_epoch: OwnershipEpoch::new(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_ingest_boundary_resolves_within_the_committed_prefix() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        seed_committed_history_shaped(
+            root.path(),
+            &descriptor,
+            10,
+            &|_| b"key".to_vec(),
+            &|sequence| sequence as i64 * 10,
+            0,
+        );
+        let store = FileActiveRangeStore::open(root.path(), descriptor).unwrap();
+        let committed = CommitPosition::new(10);
+
+        // A mid-history threshold lands on the last frame ingested before it.
+        match store
+            .committed_ingest_boundary(45, committed)
+            .await
+            .unwrap()
+        {
+            IngestBoundary::Ordered { position, cursor } => {
+                assert_eq!(position, Some(RangePosition::new(4)));
+                assert_eq!(cursor, "cursor-4");
+            }
+            other => panic!("expected an ordered boundary, got {other:?}"),
+        }
+        // A threshold at-or-before the head resolves to the range-start
+        // marker: no boundary position, empty cursor.
+        match store
+            .committed_ingest_boundary(10, committed)
+            .await
+            .unwrap()
+        {
+            IngestBoundary::Ordered { position, cursor } => {
+                assert_eq!(position, None);
+                assert!(cursor.is_empty());
+            }
+            other => panic!("expected an ordered boundary, got {other:?}"),
+        }
+        // A threshold beyond the tail resolves to the last committed frame.
+        match store
+            .committed_ingest_boundary(1_000, committed)
+            .await
+            .unwrap()
+        {
+            IngestBoundary::Ordered { position, cursor } => {
+                assert_eq!(position, Some(RangePosition::new(10)));
+                assert_eq!(cursor, "cursor-10");
+            }
+            other => panic!("expected an ordered boundary, got {other:?}"),
+        }
+        // The caller's committed boundary clamps the lookup: frames beyond
+        // it are invisible even though they are indexed locally.
+        match store
+            .committed_ingest_boundary(1_000, CommitPosition::new(3))
+            .await
+            .unwrap()
+        {
+            IngestBoundary::Ordered { position, cursor } => {
+                assert_eq!(position, Some(RangePosition::new(3)));
+                assert_eq!(cursor, "cursor-3");
+            }
+            other => panic!("expected an ordered boundary, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn unordered_ingest_history_disables_the_indexed_boundary() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        // A clock step-back inside the committed prefix breaks the
+        // monotonicity the indexed lookup relies on.
+        seed_committed_history_shaped(
+            root.path(),
+            &descriptor,
+            10,
+            &|_| b"key".to_vec(),
+            &|sequence| {
+                if sequence == 5 {
+                    1
+                } else {
+                    sequence as i64 * 10
+                }
+            },
+            0,
+        );
+        let store = FileActiveRangeStore::open(root.path(), descriptor).unwrap();
+        assert_eq!(
+            store
+                .committed_ingest_boundary(45, CommitPosition::new(10))
+                .await
+                .unwrap(),
+            IngestBoundary::Unordered
+        );
+    }
+
+    #[tokio::test]
+    async fn uncommitted_appends_do_not_extend_the_ingest_boundary() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        seed_committed_history_shaped(
+            root.path(),
+            &descriptor,
+            5,
+            &|_| b"key".to_vec(),
+            &|sequence| sequence as i64 * 10,
+            0,
+        );
+        let store = FileActiveRangeStore::open(root.path(), descriptor.clone()).unwrap();
+        for sequence in 6..=7_u64 {
+            let record = StoredRecord {
+                message_id: Uuid::from_u128(500 + sequence as u128),
+                producer_id: Uuid::from_u128(3),
+                producer_sequence: sequence,
+                event_time_ns: sequence as i64,
+                ingest_time_ns: sequence as i64 * 10,
+                key: b"key".to_vec(),
+                payload: Vec::new(),
+                metadata: std::collections::BTreeMap::new(),
+            };
+            store
+                .append(ActiveRangeAppend {
+                    generation: descriptor.generation,
+                    ownership_epoch: descriptor.ownership_epoch,
+                    expected_position: Some(RangePosition::new(sequence)),
+                    identity: AppendIdentity {
+                        writer_session_id: Uuid::from_u128(3),
+                        writer_epoch: 1,
+                        sequence,
+                    },
+                    cursor: format!("cursor-{sequence}"),
+                    frame: crate::codec::encode_record(&record).unwrap(),
+                    pending_effect: None,
+                })
+                .await
+                .unwrap();
+        }
+        // The uncommitted tail exists in the local index but the supplied
+        // committed boundary still clamps the probe.
+        match store
+            .committed_ingest_boundary(1_000, CommitPosition::new(5))
+            .await
+            .unwrap()
+        {
+            IngestBoundary::Ordered { position, cursor } => {
+                assert_eq!(position, Some(RangePosition::new(5)));
+                assert_eq!(cursor, "cursor-5");
+            }
+            other => panic!("expected an ordered boundary, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_step_back_in_an_uncommitted_append_disables_the_indexed_boundary() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        seed_committed_history(root.path(), &descriptor, 5);
+        let store = FileActiveRangeStore::open(root.path(), descriptor.clone()).unwrap();
+        let record = StoredRecord {
+            message_id: Uuid::from_u128(600),
+            producer_id: Uuid::from_u128(3),
+            producer_sequence: 6,
+            event_time_ns: 6,
+            ingest_time_ns: 1,
+            key: b"key".to_vec(),
+            payload: Vec::new(),
+            metadata: std::collections::BTreeMap::new(),
+        };
+        store
+            .append(ActiveRangeAppend {
+                generation: descriptor.generation,
+                ownership_epoch: descriptor.ownership_epoch,
+                expected_position: Some(RangePosition::new(6)),
+                identity: AppendIdentity {
+                    writer_session_id: Uuid::from_u128(3),
+                    writer_epoch: 1,
+                    sequence: 6,
+                },
+                cursor: "cursor-6".to_owned(),
+                frame: crate::codec::encode_record(&record).unwrap(),
+                pending_effect: None,
+            })
+            .await
+            .unwrap();
+        // The committed prefix is still ordered, but the index refuses to
+        // serve while any indexed frame breaks monotonicity; callers fall
+        // back to the committed-only frame scan.
+        assert_eq!(
+            store
+                .committed_ingest_boundary(1_000, CommitPosition::new(5))
+                .await
+                .unwrap(),
+            IngestBoundary::Unordered
+        );
     }
 }

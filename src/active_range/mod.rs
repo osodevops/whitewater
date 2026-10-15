@@ -45,9 +45,9 @@ pub use repair::{
     ReplicaRepairProgress,
 };
 pub use replication::{
-    ReadReplicaEvidence, ReplicaAppendAccepted, ReplicaAppendError, ReplicaAppendErrorCode,
-    ReplicaAppendRequest, ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitAccepted,
-    ReplicaCommitRequest, ReplicaCommitResponse, ReplicaDiscardOutcome,
+    RangeReadSpec, ReadReplicaEvidence, ReplicaAppendAccepted, ReplicaAppendError,
+    ReplicaAppendErrorCode, ReplicaAppendRequest, ReplicaAppendResponse, ReplicaAppendService,
+    ReplicaCommitAccepted, ReplicaCommitRequest, ReplicaCommitResponse, ReplicaDiscardOutcome,
     ReplicaDiscardPendingRequest, ReplicaDiscardPendingResponse, MAX_COMMITTED_READ_BYTES,
     MAX_REPLICA_FRAME_BASE64_BYTES,
 };
@@ -62,5 +62,5 @@ pub use split::{
 pub use store::{
     ActiveRangeAppend, ActiveRangeAppendResult, ActiveRangeDescriptor, ActiveRangeSnapshot,
     ActiveRangeStore, ActiveRangeStoreError, FileActiveRangeStore, FileActiveRangeStoreOptions,
-    PendingDiscardOutcome, PendingEffect, PendingEffectRef, StoredRangeFrame,
+    IngestBoundary, PendingDiscardOutcome, PendingEffect, PendingEffectRef, StoredRangeFrame,
 };
