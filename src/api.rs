@@ -2544,6 +2544,45 @@ async fn resolve_cursor_positions(
     ))
 }
 
+/// Resolve one opaque record Cursor into per-range seek positions. A
+/// single-range source positions exactly: the owner maps the Cursor to its
+/// committed frame and delivery resumes after it. A split Feed keeps the
+/// honest refusal — one Cursor cannot describe every Active Range position.
+async fn resolve_seek_cursor_positions(
+    state: &AppState,
+    range_assignments: &[ActiveRangeAssignment],
+    cursor: &str,
+) -> Result<BTreeMap<RangeId, String>, ApiError> {
+    if range_assignments.len() != 1 {
+        return Err(ApiError::bad_request(
+            "one Cursor cannot describe every Active Range position; seek by beginning, now, or timestamp on a split Feed",
+        ));
+    }
+    let assignment = &range_assignments[0];
+    let page = fetch_range_page(
+        state,
+        ReadRangePageRequest {
+            assignment: assignment.clone(),
+            after: None,
+            expected_commit: None,
+            after_cursor: Some(cursor.to_owned()),
+            tail_count: None,
+            single_range: true,
+            page_limit: Some(1),
+        },
+    )
+    .await?;
+    let resolved = page.resolved_after.ok_or_else(|| {
+        ApiError::bad_request("Cursor did not resolve inside the committed range")
+    })?;
+    if resolved.value() > page.committed.value() {
+        return Err(ApiError::bad_request(
+            "Cursor points beyond the committed range boundary",
+        ));
+    }
+    Ok(BTreeMap::from([(assignment.range_id, cursor.to_owned())]))
+}
+
 /// Resolve per-Range positions so the next delivered record in each Active
 /// Range is the first one accepted at-or-after `threshold` on the ingest
 /// clock. Ingest time is monotonic within a Range, so the scan stops at the
@@ -2581,6 +2620,10 @@ struct SubscriptionSeekRequest {
     /// Decimal-string epoch nanoseconds on the ingest clock; required for
     /// `timestamp` seeks.
     timestamp_ns: Option<String>,
+    /// The opaque record Cursor to resume after; required for `cursor`
+    /// seeks, which resolve only on a single-range source.
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2633,10 +2676,15 @@ async fn subscription_seek(
     // requested position so a replayed request_id with a different seek
     // conflicts instead of impersonating the earlier one.
     let seek_cursor = format!(
-        "seek:{}:{}:{}",
+        "seek:{}:{}:{}{}",
         request.request_id,
         request.position.to_ascii_lowercase(),
-        request.timestamp_ns.as_deref().unwrap_or("")
+        request.timestamp_ns.as_deref().unwrap_or(""),
+        if request.position.eq_ignore_ascii_case("cursor") {
+            format!(":{}", request.cursor.as_deref().unwrap_or(""))
+        } else {
+            String::new()
+        }
     );
     if frontier.request_id == request.request_id {
         if frontier.cursor != seek_cursor {
@@ -2660,6 +2708,7 @@ async fn subscription_seek(
         Beginning,
         Now,
         Timestamp(i64),
+        Cursor(String),
     }
     let position = match request.position.to_ascii_lowercase().as_str() {
         "beginning" => SeekPosition::Beginning,
@@ -2676,14 +2725,17 @@ async fn subscription_seek(
                     )
                 })?,
         ),
-        "cursor" => {
-            return Err(ApiError::bad_request(
-                "one Cursor cannot describe every Active Range position; seek by beginning, now, or timestamp",
-            ))
-        }
+        "cursor" => SeekPosition::Cursor(
+            request
+                .cursor
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| ApiError::bad_request("cursor seeks require a non-empty cursor"))?,
+        ),
         _ => {
             return Err(ApiError::bad_request(
-                "position must be beginning, now, or timestamp",
+                "position must be beginning, now, timestamp, or cursor",
             ))
         }
     };
@@ -2715,6 +2767,9 @@ async fn subscription_seek(
         SeekPosition::Now => resolve_tail_positions(&state, &range_assignments).await?.1,
         SeekPosition::Timestamp(threshold) => {
             resolve_timestamp_positions(&state, &range_assignments, threshold).await?
+        }
+        SeekPosition::Cursor(cursor) => {
+            resolve_seek_cursor_positions(&state, &range_assignments, &cursor).await?
         }
     };
     let mutation = crate::reader::SubscriptionProgressMutation {
@@ -19078,6 +19133,76 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{status}");
         let (status, _) = seek(json!({"subscription": "orders.billing",
             "request_id": Uuid::from_u128(46), "position": "beginning"}))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{status}");
+
+        // A cursor seek resolves the opaque record Cursor through the range
+        // owner and repositions delivery immediately after its frame.
+        let (status, body) = seek(json!({"subscription": "orders.billing",
+            "request_id": Uuid::from_u128(47), "position": "cursor",
+            "cursor": "cursor-8"}))
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["positions"][progress_range.to_string()],
+            json!("cursor-8")
+        );
+        // The same request identity replays the committed reposition.
+        let (status, replay) = seek(json!({"subscription": "orders.billing",
+            "request_id": Uuid::from_u128(47), "position": "cursor",
+            "cursor": "cursor-8"}))
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(replay["cursor"], body["cursor"]);
+        // A different cursor under the same identity conflicts.
+        let (status, _) = seek(json!({"subscription": "orders.billing",
+            "request_id": Uuid::from_u128(47), "position": "cursor",
+            "cursor": "cursor-9"}))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        // A cursor that never committed is refused by the owner, not
+        // translated into a guessed position.
+        let (status, _) = seek(json!({"subscription": "orders.billing",
+            "request_id": Uuid::from_u128(48), "position": "cursor",
+            "cursor": "cursor-does-not-exist"}))
+        .await;
+        assert!(status.is_client_error());
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(49),
+                "member_id": other, "member_epoch": 1, "work_id": work}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let sought_epoch = body["lease"]["lease_epoch"].as_u64().unwrap();
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(50),
+                "member_id": other, "member_epoch": 1, "work_id": work,
+                "lease_epoch": sought_epoch, "limit": 8}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["records"]
+                .as_array()
+                .unwrap()
+                .first()
+                .and_then(|record| record["cursor"].as_str()),
+            Some("cursor-9")
+        );
+        let (status, _) = post(
+            "release",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(51),
+                "work_id": work, "member_id": other, "member_epoch": 1,
+                "lease_epoch": sought_epoch}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{status}");
+        // Restoring the beginning position keeps the remaining legs
+        // independent of the cursor reposition above.
+        let (status, _) = seek(json!({"subscription": "orders.billing",
+            "request_id": Uuid::from_u128(52), "position": "beginning"}))
         .await;
         assert_eq!(status, StatusCode::OK, "{status}");
 

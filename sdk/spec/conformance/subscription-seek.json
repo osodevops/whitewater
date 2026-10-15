@@ -164,10 +164,83 @@
         "lease_epoch": "{{claim2.lease.lease_epoch}}",
         "limit": 3
       },
+      "bind": "tail",
       "expect": {
         "error_status": 200,
         "records[0].cursor": "==delivered.records[1].cursor",
         "records[0].ingest_time_ns": "==delivered.records[1].ingest_time_ns"
+      }
+    },
+    {
+      "op": "member.release",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}",
+        "member_epoch": "{{join.member_epoch}}",
+        "work_id": "{{uuid:work2}}",
+        "lease_epoch": "{{claim2.lease.lease_epoch}}"
+      },
+      "expect": { "error_status": 200 }
+    },
+    {
+      "op": "subscription.seek",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid:seek_cursor}}",
+        "position": "cursor",
+        "cursor": "{{tail.records[0].cursor}}"
+      },
+      "bind": "cursor_seek",
+      "expect": { "error_status": 200, "cursor": "!=null" }
+    },
+    {
+      "op": "subscription.seek",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid:seek_cursor}}",
+        "position": "cursor",
+        "cursor": "{{tail.records[1].cursor}}"
+      },
+      "expect": { "error_status": 409 }
+    },
+    {
+      "op": "subscription.seek",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "position": "cursor",
+        "cursor": "cursor-that-never-committed"
+      },
+      "expect": { "error_status": 400 }
+    },
+    {
+      "op": "member.claim",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}",
+        "member_epoch": "{{join.member_epoch}}",
+        "work_id": "{{uuid:work3}}",
+        "lease_ticks": 60
+      },
+      "bind": "claim3",
+      "expect": { "error_status": 200 }
+    },
+    {
+      "op": "member.fetch",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}",
+        "member_epoch": "{{join.member_epoch}}",
+        "work_id": "{{uuid:work3}}",
+        "lease_epoch": "{{claim3.lease.lease_epoch}}",
+        "limit": 3
+      },
+      "expect": {
+        "error_status": 200,
+        "records[0].cursor": "==tail.records[1].cursor"
       }
     }
   ]

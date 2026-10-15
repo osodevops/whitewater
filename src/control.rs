@@ -5913,12 +5913,6 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             if keyword(1).as_deref() == Some("SUBSCRIPTION") {
                 expect_keyword(&tokens, 3, "TO")?;
                 let start = parse_reader_start(&tokens, 4)?;
-                if matches!(start, ReaderStart::Cursor(_)) {
-                    return Err(ControlError::Syntax(
-                        "Subscription seeks are BEGINNING, NOW, or TIMESTAMP <ns>; one Cursor cannot describe every Active Range position"
-                            .to_owned(),
-                    ));
-                }
                 return Ok(Command::SeekSubscription {
                     name: token(&tokens, 2)?.to_owned(),
                     start,
@@ -9202,9 +9196,9 @@ mod tests {
         ] {
             assert!(parse_wcl(bad).is_err(), "{bad} should refuse");
         }
-        // SEEK SUBSCRIPTION parses for boundary and timestamp targets; a
-        // single Cursor cannot describe a multi-range frontier and refuses
-        // at parse time.
+        // SEEK SUBSCRIPTION parses every start target; the catalog still
+        // refuses at apply with data-plane guidance because it cannot
+        // resolve Active Range positions.
         let commands =
             parse_wcl("SEEK SUBSCRIPTION orders.d TO TIMESTAMP 1700000000000000000;").unwrap();
         match &commands[0] {
@@ -9217,15 +9211,11 @@ mod tests {
         for statement in [
             "SEEK SUBSCRIPTION orders.d TO BEGINNING;",
             "SEEK SUBSCRIPTION orders.d TO NOW;",
+            "SEEK SUBSCRIPTION orders.d TO CURSOR 'cursor-4';",
         ] {
             assert!(parse_wcl(statement).is_ok(), "{statement} should parse");
         }
-        for bad in [
-            "SEEK SUBSCRIPTION orders.d TO CURSOR 'cursor-4';",
-            "SEEK SUBSCRIPTION orders.d;",
-        ] {
-            assert!(parse_wcl(bad).is_err(), "{bad} should refuse");
-        }
+        assert!(parse_wcl("SEEK SUBSCRIPTION orders.d;").is_err());
         // The catalog cannot resolve Active Range positions, so it refuses
         // with data-plane guidance rather than guessing.
         let refused = controller
