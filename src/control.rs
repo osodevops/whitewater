@@ -1284,6 +1284,20 @@ pub enum Command {
         #[serde(default)]
         subscription_translations: Vec<SubscriptionCutoverTranslation>,
     },
+    /// Abandons a staged split plan after its activation path failed, so a
+    /// later attempt can re-prepare instead of blocking on
+    /// `range_operation_pending` forever. `plan_id` fences the removal so a
+    /// stale abandon cannot delete a newer plan.
+    AbandonActiveRangeSplit {
+        feed_id: Uuid,
+        plan_id: Uuid,
+    },
+    /// Abandons a staged merge plan under the same fencing as
+    /// `AbandonActiveRangeSplit`.
+    AbandonActiveRangeMerge {
+        feed_id: Uuid,
+        plan_id: Uuid,
+    },
     /// Removes one pending Subscription frontier translation after the
     /// separate progress quorum committed (or already covered) it. The
     /// `plan_id` guard prevents a stale clear from deleting a newer
@@ -1397,6 +1411,8 @@ impl Command {
                 | Self::ActivateActiveRangeSplit { .. }
                 | Self::RecordActiveRangeMergeStaging { .. }
                 | Self::ActivateActiveRangeMerge { .. }
+                | Self::AbandonActiveRangeSplit { .. }
+                | Self::AbandonActiveRangeMerge { .. }
                 | Self::ClearSubscriptionCutover { .. }
                 | Self::RecordFollowerMoveCatchUp { .. }
                 | Self::ActivateFollowerMove { .. }
@@ -4567,6 +4583,34 @@ impl ControlController {
                     }),
                 ))
             }
+            Command::AbandonActiveRangeSplit { feed_id, plan_id } => {
+                // Fenced removal: a stale abandon or an already-activated
+                // plan is a no-op instead of an error.
+                let removed = match state.range_split_plans.get(&feed_id) {
+                    Some(plan) if plan.plan_id == plan_id => {
+                        state.range_split_plans.remove(&feed_id);
+                        true
+                    }
+                    _ => false,
+                };
+                Ok((
+                    format!("abandoned Active Range split plan {plan_id}"),
+                    json!({ "abandoned": removed }),
+                ))
+            }
+            Command::AbandonActiveRangeMerge { feed_id, plan_id } => {
+                let removed = match state.range_merge_plans.get(&feed_id) {
+                    Some(plan) if plan.plan_id == plan_id => {
+                        state.range_merge_plans.remove(&feed_id);
+                        true
+                    }
+                    _ => false,
+                };
+                Ok((
+                    format!("abandoned Active Range merge plan {plan_id}"),
+                    json!({ "abandoned": removed }),
+                ))
+            }
             Command::ClearSubscriptionCutover {
                 subscription_id,
                 plan_id,
@@ -7548,6 +7592,8 @@ fn command_label(command: &Command) -> String {
         Command::TransferActiveRangeOwnership { .. } => "TRANSFER ACTIVE RANGE OWNERSHIP",
         Command::RecoverActiveRangeOwnership { .. } => "RECOVER ACTIVE RANGE OWNERSHIP",
         Command::PrepareActiveRangeSplit { .. } => "PREPARE ACTIVE RANGE SPLIT",
+        Command::AbandonActiveRangeSplit { .. } => "ABANDON ACTIVE RANGE SPLIT",
+        Command::AbandonActiveRangeMerge { .. } => "ABANDON ACTIVE RANGE MERGE",
         Command::RecordActiveRangeSplitCatchUp { .. } => "RECORD ACTIVE RANGE SPLIT CATCH UP",
         Command::ActivateActiveRangeSplit { .. } => "ACTIVATE ACTIVE RANGE SPLIT",
         Command::PrepareActiveRangeMerge { .. } => "PREPARE ACTIVE RANGE MERGE",

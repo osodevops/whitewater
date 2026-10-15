@@ -105,6 +105,17 @@ impl SplitCutoverControl for LocalSplitControl {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+
+    async fn abandon(&self, plan: &RangeSplitPlan) -> Result<(), String> {
+        self.control
+            .execute_commands(vec![Command::AbandonActiveRangeSplit {
+                feed_id: plan.feed_id,
+                plan_id: plan.plan_id,
+            }])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
 }
 
 #[tokio::test]
@@ -954,4 +965,173 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
         .unwrap();
     assert!(replay.deduplicated);
     assert_eq!(replay.cursor, accepted.cursor);
+}
+
+#[tokio::test]
+async fn failed_split_activation_unfreezes_and_abandons_the_plan() {
+    let directory = TempDir::new().unwrap();
+    let legacy: Arc<dyn LogStore> =
+        Arc::new(FileLogStore::open(directory.path().join("legacy")).unwrap());
+    let control = Arc::new(
+        ControlController::open_with_storage_nodes(
+            directory.path().join("catalog.json"),
+            legacy,
+            vec![node("storage-1"), node("storage-2"), node("storage-3")],
+        )
+        .unwrap(),
+    );
+    let created = control
+        .execute_commands(vec![
+            Command::CreateSpace {
+                name: "orders".to_owned(),
+            },
+            Command::CreateFeed {
+                name: "orders.events".to_owned(),
+            },
+        ])
+        .await
+        .unwrap();
+    let feed_id = serde_json::from_value(created.results[1].data["feed_id"].clone()).unwrap();
+    let source_assignment = control.active_range_assignment(feed_id).await.unwrap();
+    let services = ["storage-1", "storage-2", "storage-3"]
+        .into_iter()
+        .map(|value| {
+            let id = node(value);
+            let service = Arc::new(ReplicaAppendService::new(
+                directory.path().join(value),
+                id.clone(),
+                control.clone(),
+            ));
+            (id, service)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let source = services[&source_assignment.owner].clone();
+    let writer = Uuid::from_u128(902);
+    let record = StoredRecord {
+        message_id: Uuid::from_u128(1_001),
+        producer_id: writer,
+        producer_sequence: 1,
+        event_time_ns: 1,
+        ingest_time_ns: 1,
+        key: b"key-a".to_vec(),
+        payload: b"value-1".to_vec(),
+        metadata: BTreeMap::new(),
+    };
+    let accepted = source
+        .append(ReplicaAppendRequest {
+            feed_id,
+            range_id: source_assignment.range_id,
+            generation: source_assignment.generation,
+            ownership_epoch: source_assignment.ownership_epoch,
+            append_owner: source_assignment.owner.clone(),
+            expected_position: RangePosition::new(1),
+            identity: AppendIdentity {
+                writer_session_id: writer,
+                writer_epoch: 1,
+                sequence: 1,
+            },
+            cursor: "cursor-1".to_owned(),
+            frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            pending_effect: None,
+        })
+        .await
+        .unwrap();
+    source
+        .commit(ReplicaCommitRequest {
+            feed_id,
+            range_id: source_assignment.range_id,
+            generation: source_assignment.generation,
+            ownership_epoch: source_assignment.ownership_epoch,
+            append_owner: source_assignment.owner.clone(),
+            commit_position: CommitPosition::new(1),
+            frame_digest: accepted.frame_digest,
+        })
+        .await
+        .unwrap();
+
+    let prepared = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.events".to_owned(),
+            split_at: KeyToken::from_bytes([0x80; 16]),
+        }])
+        .await
+        .unwrap();
+    let plan: RangeSplitPlan = serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+
+    // mark_ready commits for real, activation fails, abandon runs for real.
+    struct ActivateFailControl {
+        control: Arc<ControlController>,
+    }
+    #[async_trait]
+    impl SplitCutoverControl for ActivateFailControl {
+        async fn mark_ready(
+            &self,
+            feed: &str,
+            plan: &RangeSplitPlan,
+            boundary: &FrozenSplitBoundary,
+        ) -> Result<(), String> {
+            self.control
+                .execute_commands(vec![Command::RecordActiveRangeSplitCatchUp {
+                    feed: feed.to_owned(),
+                    plan_id: plan.plan_id,
+                    source_commit: boundary.final_commit,
+                    source_scanned_through: boundary.staging.source_commit,
+                    right_commit: boundary.staging.right.target_commit,
+                    checksum_verified: true,
+                }])
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+        async fn activate(
+            &self,
+            _feed: &str,
+            _plan: &RangeSplitPlan,
+            _boundary: &FrozenSplitBoundary,
+        ) -> Result<(), String> {
+            Err("injected activation failure".to_owned())
+        }
+        async fn abandon(&self, plan: &RangeSplitPlan) -> Result<(), String> {
+            self.control
+                .execute_commands(vec![Command::AbandonActiveRangeSplit {
+                    feed_id: plan.feed_id,
+                    plan_id: plan.plan_id,
+                }])
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    let failed = orchestrate_split_cutover(
+        &ActivateFailControl {
+            control: control.clone(),
+        },
+        "orders.events",
+        &plan,
+        &source_assignment,
+        source.clone(),
+        &services,
+        2,
+    )
+    .await;
+    assert!(failed.is_err(), "the injected activation failure surfaces");
+    assert!(
+        !source
+            .generation_is_frozen(source_assignment.range_id, source_assignment.generation)
+            .await,
+        "the source range is unfrozen after the failed cutover"
+    );
+
+    // The abandoned plan must not fence a later split attempt.
+    let reprepared = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.events".to_owned(),
+            split_at: KeyToken::from_bytes([0x80; 16]),
+        }])
+        .await
+        .unwrap();
+    let new_plan: RangeSplitPlan =
+        serde_json::from_value(reprepared.results[0].data.clone()).unwrap();
+    assert_ne!(new_plan.plan_id, plan.plan_id);
 }

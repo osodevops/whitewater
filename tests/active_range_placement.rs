@@ -1726,6 +1726,69 @@ async fn activation_commits_pending_subscription_translations_until_applied() {
 }
 
 #[tokio::test]
+async fn abandoning_a_staged_split_plan_releases_the_feed_for_retry() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    create_feed(&control, Uuid::from_u128(92_001)).await;
+
+    let prepared = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            split_at: KeyToken::from_bytes([0x80; 16]),
+        }])
+        .await
+        .unwrap();
+    let plan: RangeSplitPlan = serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+
+    // While the plan is staged the Feed refuses a second range operation.
+    let blocked = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            split_at: KeyToken::from_bytes([0x40; 16]),
+        }])
+        .await;
+    assert!(blocked.is_err(), "a staged plan must fence a second split");
+
+    // A stale plan_id cannot abandon the staged plan.
+    control
+        .execute_commands(vec![Command::AbandonActiveRangeSplit {
+            feed_id: plan.feed_id,
+            plan_id: Uuid::from_u128(92_099),
+        }])
+        .await
+        .unwrap();
+    let still_blocked = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            split_at: KeyToken::from_bytes([0x40; 16]),
+        }])
+        .await;
+    assert!(still_blocked.is_err(), "a stale abandon must be a no-op");
+
+    // The fenced abandon releases the Feed so a later attempt can re-prepare.
+    control
+        .execute_commands(vec![Command::AbandonActiveRangeSplit {
+            feed_id: plan.feed_id,
+            plan_id: plan.plan_id,
+        }])
+        .await
+        .unwrap();
+    let reprepared = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            split_at: KeyToken::from_bytes([0x40; 16]),
+        }])
+        .await
+        .unwrap();
+    let new_plan: RangeSplitPlan =
+        serde_json::from_value(reprepared.results[0].data.clone()).unwrap();
+    assert_ne!(new_plan.plan_id, plan.plan_id);
+}
+
+#[tokio::test]
 async fn draining_a_storage_node_excludes_new_placement_and_survives_restart() {
     let directory = TempDir::new().unwrap();
     let control = controller(

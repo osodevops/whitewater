@@ -175,6 +175,10 @@ pub trait SplitCutoverControl: Send + Sync {
         plan: &RangeSplitPlan,
         boundary: &FrozenSplitBoundary,
     ) -> Result<(), String>;
+
+    /// Abandon the staged plan after the cutover failed so the catalog row
+    /// does not block every later range operation on the Feed.
+    async fn abandon(&self, plan: &RangeSplitPlan) -> Result<(), String>;
 }
 
 #[derive(Clone)]
@@ -229,6 +233,17 @@ impl SplitCutoverControl for ControlPlaneSplitCutover {
             .map(|_| ())
             .map_err(|error| error.to_string())
     }
+
+    async fn abandon(&self, plan: &RangeSplitPlan) -> Result<(), String> {
+        self.control_plane
+            .execute_commands(vec![Command::AbandonActiveRangeSplit {
+                feed_id: plan.feed_id,
+                plan_id: plan.plan_id,
+            }])
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
 }
 
 pub async fn orchestrate_split_cutover(
@@ -250,10 +265,16 @@ pub async fn orchestrate_split_cutover(
     .await?;
     if let Err(error) = control.mark_ready(feed, plan, &boundary).await {
         abort_frozen_split(&source, &boundary).await;
+        if let Err(abandon) = control.abandon(plan).await {
+            tracing::warn!(%abandon, plan_id = %plan.plan_id, "failed split cutover could not abandon its staged plan; later range operations stay fenced");
+        }
         return Err(SplitStagingError::Control(error));
     }
     if let Err(error) = control.activate(feed, plan, &boundary).await {
         abort_frozen_split(&source, &boundary).await;
+        if let Err(abandon) = control.abandon(plan).await {
+            tracing::warn!(%abandon, plan_id = %plan.plan_id, "failed split cutover could not abandon its staged plan; later range operations stay fenced");
+        }
         return Err(SplitStagingError::Control(error));
     }
     Ok(boundary)

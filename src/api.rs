@@ -7795,6 +7795,27 @@ async fn unfreeze_split_nodes(
                 .await;
         }
     }
+    abandon_split_plan(state, plan).await;
+}
+
+/// Removes a staged split plan after its cutover failed. The staged plan
+/// row blocks every later range operation on this Feed while it exists;
+/// the `plan_id` fence keeps a stale rollback from deleting a newer plan.
+/// Best-effort: if the Control Plane is mid-election the row stays for the
+/// next attempt to observe, so the failure is logged for diagnosis.
+async fn abandon_split_plan(state: &AppState, plan: &RangeSplitPlan) {
+    let Some(control_plane) = state.control_plane.as_ref() else {
+        return;
+    };
+    if let Err(error) = control_plane
+        .execute_commands(vec![crate::control::Command::AbandonActiveRangeSplit {
+            feed_id: plan.feed_id,
+            plan_id: plan.plan_id,
+        }])
+        .await
+    {
+        tracing::warn!(%error, plan_id = %plan.plan_id, "failed split cutover could not abandon its staged plan; later range operations stay fenced");
+    }
 }
 
 fn split_freeze_order(assignment: &ActiveRangeAssignment) -> Vec<StorageNodeId> {
@@ -8053,45 +8074,61 @@ async fn admin_split_range(
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let plan: RangeSplitPlan = serde_json::from_value(prepared.results[0].data.clone())
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
-    let source_assignment = state
-        .control
-        .active_range_assignment(plan.feed_id)
-        .await
-        .ok_or_else(|| ApiError::unavailable("source assignment is unavailable"))?;
-    let key = state
-        .internal_key
-        .as_ref()
-        .ok_or_else(|| ApiError::unavailable("internal credential is unavailable"))?;
+    let source_assignment = match state.control.active_range_assignment(plan.feed_id).await {
+        Some(assignment) => assignment,
+        None => {
+            abandon_split_plan(&state, &plan).await;
+            return Err(ApiError::unavailable("source assignment is unavailable"));
+        }
+    };
+    let key = match state.internal_key.as_ref() {
+        Some(key) => key,
+        None => {
+            abandon_split_plan(&state, &plan).await;
+            return Err(ApiError::unavailable("internal credential is unavailable"));
+        }
+    };
     let mut source_commit = CommitPosition::new(0);
     for node in split_freeze_order(&source_assignment) {
-        let endpoint = state
-            .control_endpoints
-            .resolve(&node)
-            .await
-            .ok_or_else(|| {
-                ApiError::unavailable(format!("source replica {node} endpoint is unavailable"))
-            })?;
-        let progress: ReplicaProgressResponse = state
-            .internal_http
-            .post(format!(
-                "{}/internal/active-range/split/freeze-local",
-                endpoint.trim_end_matches('/')
-            ))
-            .header("x-whitewater-control-key", key)
-            .json(&LocalSplitUnfreezeRequest {
-                source_assignment: source_assignment.clone(),
-            })
-            .send()
-            .await
-            .map_err(|error| ApiError::unavailable(error.to_string()))?
-            .json()
-            .await
-            .map_err(|error| ApiError::unavailable(error.to_string()))?;
-        let committed = progress
-            .status
-            .ok_or_else(|| ApiError::unavailable("source freeze returned no progress"))?
-            .committed;
-        source_commit = source_commit.max(committed);
+        // A mid-freeze failure must still roll back: replicas frozen so far
+        // are released and the staged plan is abandoned together.
+        let attempt = async {
+            let endpoint = state
+                .control_endpoints
+                .resolve(&node)
+                .await
+                .ok_or_else(|| {
+                    ApiError::unavailable(format!("source replica {node} endpoint is unavailable"))
+                })?;
+            let progress: ReplicaProgressResponse = state
+                .internal_http
+                .post(format!(
+                    "{}/internal/active-range/split/freeze-local",
+                    endpoint.trim_end_matches('/')
+                ))
+                .header("x-whitewater-control-key", key)
+                .json(&LocalSplitUnfreezeRequest {
+                    source_assignment: source_assignment.clone(),
+                })
+                .send()
+                .await
+                .map_err(|error| ApiError::unavailable(error.to_string()))?
+                .json()
+                .await
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            progress
+                .status
+                .ok_or_else(|| ApiError::unavailable("source freeze returned no progress"))
+                .map(|status| status.committed)
+        }
+        .await;
+        match attempt {
+            Ok(committed) => source_commit = source_commit.max(committed),
+            Err(error) => {
+                unfreeze_split_nodes(&state, &plan, &source_assignment, key).await;
+                return Err(error);
+            }
+        }
     }
     let mut staged = Vec::new();
     for node in plan.right_assignment.replicas.iter() {
@@ -8138,10 +8175,13 @@ async fn admin_split_range(
             }
         }
     }
-    let evidence = staged
-        .first()
-        .cloned()
-        .ok_or_else(|| ApiError::unavailable("no staging evidence"))?;
+    let evidence = match staged.first().cloned() {
+        Some(evidence) => evidence,
+        None => {
+            unfreeze_split_nodes(&state, &plan, &source_assignment, key).await;
+            return Err(ApiError::unavailable("no staging evidence"));
+        }
+    };
     if staged.iter().any(|item| {
         item.source_commit != evidence.source_commit
             || item.left.target_commit != evidence.left.target_commit
@@ -8392,6 +8432,24 @@ async fn unfreeze_merge_nodes(
             }
         }
     }
+    abandon_merge_plan(state, plan).await;
+}
+
+/// Same fenced abandon as the split path: a failed merge must not leave
+/// the plan row blocking every later range operation on this Feed.
+async fn abandon_merge_plan(state: &AppState, plan: &RangeMergePlan) {
+    let Some(control_plane) = state.control_plane.as_ref() else {
+        return;
+    };
+    if let Err(error) = control_plane
+        .execute_commands(vec![crate::control::Command::AbandonActiveRangeMerge {
+            feed_id: plan.feed_id,
+            plan_id: plan.plan_id,
+        }])
+        .await
+    {
+        tracing::warn!(%error, plan_id = %plan.plan_id, "failed merge cutover could not abandon its staged plan; later range operations stay fenced");
+    }
 }
 
 async fn admin_merge_ranges(
@@ -8417,20 +8475,35 @@ async fn admin_merge_ranges(
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let plan: RangeMergePlan = serde_json::from_value(prepared.results[0].data.clone())
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
-    let left = state
+    let left = match state
         .control
         .active_range_assignment_by_id(plan.left_range_id)
         .await
-        .ok_or_else(|| ApiError::unavailable("left assignment unavailable"))?;
-    let right = state
+    {
+        Some(assignment) => assignment,
+        None => {
+            abandon_merge_plan(&state, &plan).await;
+            return Err(ApiError::unavailable("left assignment unavailable"));
+        }
+    };
+    let right = match state
         .control
         .active_range_assignment_by_id(plan.right_range_id)
         .await
-        .ok_or_else(|| ApiError::unavailable("right assignment unavailable"))?;
-    let key = state
-        .internal_key
-        .as_ref()
-        .ok_or_else(|| ApiError::unavailable("internal credential unavailable"))?;
+    {
+        Some(assignment) => assignment,
+        None => {
+            abandon_merge_plan(&state, &plan).await;
+            return Err(ApiError::unavailable("right assignment unavailable"));
+        }
+    };
+    let key = match state.internal_key.as_ref() {
+        Some(key) => key,
+        None => {
+            abandon_merge_plan(&state, &plan).await;
+            return Err(ApiError::unavailable("internal credential unavailable"));
+        }
+    };
     let mut evidence = Vec::new();
     for node in plan.merged_assignment.replicas.iter() {
         let staged = async {
@@ -8472,10 +8545,10 @@ async fn admin_merge_ranges(
             }
         }
     }
-    let staged = evidence
-        .first()
-        .cloned()
-        .ok_or_else(|| ApiError::unavailable("no merge evidence"))?;
+    let Some(staged) = evidence.first().cloned() else {
+        unfreeze_merge_nodes(&state, &plan, &left, &right, key).await;
+        return Err(ApiError::unavailable("no merge evidence"));
+    };
     if evidence.iter().any(|item| {
         item.left_commit != staged.left_commit
             || item.right_commit != staged.right_commit
@@ -18667,6 +18740,17 @@ mod tests {
                     right_writer_sequences: boundary.staging.right.writer_sequences.clone(),
                     reader_translations: Vec::new(),
                     subscription_translations: Vec::new(),
+                }])
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
+
+        async fn abandon(&self, plan: &RangeSplitPlan) -> Result<(), String> {
+            self.control
+                .execute_commands(vec![Command::AbandonActiveRangeSplit {
+                    feed_id: plan.feed_id,
+                    plan_id: plan.plan_id,
                 }])
                 .await
                 .map(|_| ())
