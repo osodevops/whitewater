@@ -3422,6 +3422,18 @@ async fn drive_pipe(
     let delivery_delay_ns = definition.delivery_delay_ns;
     let journal = effect_coordinator_for(state, assignment.clone())?;
     let (progress, _) = member_assignment_coordinator(state, assignment.clone())?;
+    // A Pipe consumes the Subscription frontier without member leases, so the
+    // supervisor drive path must also heal a committed-but-unapplied cutover;
+    // otherwise a Pipe-only Subscription could stall until a member touched it.
+    if state.control_plane.is_some() {
+        if let Some(pending) = state
+            .control
+            .pending_subscription_cutover(subscription_id)
+            .await
+        {
+            apply_pending_subscription_cutover(state, &pending, &progress, &assignment).await?;
+        }
+    }
     let (sink_progress, _) = member_assignment_coordinator(state, assignment.clone())?;
     let sink = LiveEffectApply {
         state,
@@ -17437,6 +17449,104 @@ mod tests {
         let mut stateless = state;
         stateless.storage_node_id = None;
         assert!(drive_local_pipes(&stateless, 4).await.is_empty());
+        control_plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn drive_pipe_applies_a_pending_subscription_cutover_before_driving() {
+        let directory = TempDir::new().unwrap();
+        let (state, control_plane, control, _replica) =
+            internal_replica_test_state(&directory).await;
+        control
+            .execute("CREATE FEED orders.enriched; CREATE PIPE orders.forward FROM SUBSCRIPTION orders.billing TO FEED orders.enriched;")
+            .await
+            .unwrap();
+        let pipe = control.active_pipe_by_name("orders.forward").await.unwrap();
+        let subscription = control
+            .active_subscription_by_name("orders.billing")
+            .await
+            .unwrap();
+
+        // Commit a split activation carrying a pending translation for the
+        // consumed Subscription — the same record the admin handler commits
+        // atomically with the range-map change.
+        let prepared = control
+            .execute_commands(vec![crate::control::Command::PrepareActiveRangeSplit {
+                feed: "orders.events".to_owned(),
+                split_at: KeyToken::from_bytes([0x80; 16]),
+            }])
+            .await
+            .unwrap();
+        let plan: RangeSplitPlan =
+            serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+        control
+            .execute_commands(vec![
+                crate::control::Command::RecordActiveRangeSplitCatchUp {
+                    feed: "orders.events".to_owned(),
+                    plan_id: plan.plan_id,
+                    source_commit: CommitPosition::new(4),
+                    source_scanned_through: CommitPosition::new(4),
+                    right_commit: CommitPosition::new(4),
+                    checksum_verified: true,
+                },
+            ])
+            .await
+            .unwrap();
+        let left_range = plan.left_assignment.as_ref().unwrap().range_id;
+        let right_range = plan.right_assignment.range_id;
+        control
+            .execute_commands(vec![crate::control::Command::ActivateActiveRangeSplit {
+                feed: "orders.events".to_owned(),
+                plan_id: plan.plan_id,
+                left_writer_sequences: Vec::new(),
+                right_writer_sequences: Vec::new(),
+                reader_translations: Vec::new(),
+                subscription_translations: vec![crate::control::SubscriptionCutoverTranslation {
+                    subscription_id: subscription.subscription_id,
+                    feed_id: plan.feed_id,
+                    plan_id: plan.plan_id,
+                    expected_cursor: "frontier-7".to_owned(),
+                    frontier_sequence: 3,
+                    request_id: Uuid::from_u128(77_001),
+                    cursor: format!("cutover:{}", plan.plan_id),
+                    positions: BTreeMap::from([
+                        (left_range, "left-1".to_owned()),
+                        (right_range, "right-2".to_owned()),
+                    ]),
+                    quarantined: BTreeMap::new(),
+                    tick: 5,
+                }],
+            }])
+            .await
+            .unwrap();
+        assert!(control
+            .pending_subscription_cutover(subscription.subscription_id)
+            .await
+            .is_some());
+
+        // The drive path surfaces the pending-apply failure rather than
+        // silently driving a frontier that still names retired ranges, and
+        // the durable pending record survives for the next member/Pipe touch.
+        let assignment = control
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        let error = drive_pipe(
+            &state,
+            &pipe,
+            subscription.subscription_id,
+            assignment.ownership_epoch,
+            4,
+        )
+        .await
+        .unwrap_err();
+        // With no reachable progress quorum the pending apply fails before
+        // the drive; whatever its error, the drive must not proceed past it.
+        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert!(control
+            .pending_subscription_cutover(subscription.subscription_id)
+            .await
+            .is_some());
         control_plane.raft().shutdown().await.unwrap();
     }
 
