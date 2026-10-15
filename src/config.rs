@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::active_range::StorageNodeId;
+use crate::{active_range::StorageNodeId, node::NodeCapabilities};
 
 #[derive(Clone, Debug)]
 pub struct SubscriptionMtlsConfig {
@@ -38,6 +38,19 @@ pub struct NodeConfig {
     /// sets it explicitly to serve as an independently registered storage
     /// Node.
     pub storage_node_id: Option<StorageNodeId>,
+    /// Declared data-plane roles (`WHITEWATER_NODE_CAPABILITIES`, a
+    /// `storage,compute,gateway` subset). Defaults to every role; a burst
+    /// Node should run `compute,gateway` so placement never targets it.
+    pub node_capabilities: NodeCapabilities,
+    /// Voter ids still eligible for storage placement
+    /// (`WHITEWATER_STORAGE_VOTERS`); `None` means every configured voter.
+    /// The same list must be configured on every Node because each Node
+    /// derives eligibility locally — a divergent view would diverge
+    /// placement.
+    pub storage_voters: Option<BTreeSet<u64>>,
+    /// Operator-declared failure domain label reported with capacity
+    /// signals (`WHITEWATER_FAILURE_DOMAIN`).
+    pub failure_domain: String,
     pub subscription_mtls: Option<SubscriptionMtlsConfig>,
 }
 
@@ -85,6 +98,29 @@ impl NodeConfig {
             env::var("WHITEWATER_STORAGE_NODE_ID").ok().as_deref(),
             control_node_id,
         )?;
+        let node_capabilities = match env::var("WHITEWATER_NODE_CAPABILITIES") {
+            Ok(value) => NodeCapabilities::parse_list(&value)
+                .map_err(|error| anyhow::anyhow!("WHITEWATER_NODE_CAPABILITIES: {error}"))?,
+            Err(_) => NodeCapabilities::all(),
+        };
+        let storage_voters = parse_storage_voters(
+            &env::var("WHITEWATER_STORAGE_VOTERS").unwrap_or_default(),
+            &control_nodes,
+        )?;
+        validate_capability_topology(
+            &node_capabilities,
+            control_node_id,
+            storage_voters.as_ref(),
+            env::var("WHITEWATER_STORAGE_NODE_ID").is_ok(),
+            env::var("WHITEWATER_NODE_CAPABILITIES").is_ok(),
+        )?;
+        let failure_domain = env::var("WHITEWATER_FAILURE_DOMAIN")
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if failure_domain.len() > 128 {
+            anyhow::bail!("WHITEWATER_FAILURE_DOMAIN must be at most 128 bytes");
+        }
         let tls = [
             env::var("WHITEWATER_SUBSCRIPTION_MTLS_BIND").ok(),
             env::var("WHITEWATER_SUBSCRIPTION_MTLS_CERT").ok(),
@@ -148,6 +184,9 @@ impl NodeConfig {
             control_nodes,
             control_plane_key,
             storage_node_id,
+            node_capabilities,
+            storage_voters,
+            failure_domain,
             subscription_mtls,
         })
     }
@@ -262,6 +301,85 @@ fn resolve_storage_node_id(
     }
 }
 
+/// Parse `WHITEWATER_STORAGE_VOTERS`: the subset of configured voter ids
+/// still eligible for storage placement. Every Node derives eligibility
+/// from the shared voter list, so this must be identical cluster-wide —
+/// which is why it is a voter-id list rather than a per-Node toggle.
+fn parse_storage_voters(
+    value: &str,
+    control_nodes: &[(u64, String)],
+) -> Result<Option<BTreeSet<u64>>> {
+    let entries: Vec<u64> = value
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(|entry| {
+            entry
+                .parse::<u64>()
+                .with_context(|| format!("invalid WHITEWATER_STORAGE_VOTERS entry: {entry}"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let voters: BTreeSet<u64> = entries.into_iter().collect();
+    for id in &voters {
+        if !control_nodes.iter().any(|(node, _)| node == id) {
+            anyhow::bail!("WHITEWATER_STORAGE_VOTERS entry {id} is not a configured Control Node");
+        }
+    }
+    Ok(Some(voters))
+}
+
+/// A capability declaration must not contradict the placement inputs: a
+/// Node that drops the storage role while remaining placement-eligible
+/// would accept work it refuses to serve, and a registered storage Node
+/// without the storage role is a contradiction outright.
+fn validate_capability_topology(
+    capabilities: &NodeCapabilities,
+    control_node_id: Option<u64>,
+    storage_voters: Option<&BTreeSet<u64>>,
+    explicit_storage_id: bool,
+    explicit_capabilities: bool,
+) -> Result<()> {
+    if capabilities.storage {
+        if explicit_storage_id || control_node_id.is_none() {
+            // A non-voter explicitly declaring storage needs an identity
+            // to be registered under. Default capabilities (env unset)
+            // leave storage inert on a Node with no identity instead of
+            // breaking deployments that never served storage.
+            if control_node_id.is_none() && explicit_capabilities && !explicit_storage_id {
+                anyhow::bail!(
+                    "WHITEWATER_NODE_CAPABILITIES including storage on a non-voter requires WHITEWATER_STORAGE_NODE_ID"
+                );
+            }
+            return Ok(());
+        }
+        let id = control_node_id.expect("checked above");
+        if storage_voters.is_some_and(|voters| !voters.contains(&id)) {
+            anyhow::bail!(
+                "WHITEWATER_NODE_CAPABILITIES declares storage but WHITEWATER_STORAGE_VOTERS excludes voter {id}"
+            );
+        }
+        return Ok(());
+    }
+    if explicit_storage_id {
+        anyhow::bail!(
+            "WHITEWATER_STORAGE_NODE_ID is set but WHITEWATER_NODE_CAPABILITIES omits storage"
+        );
+    }
+    if let Some(id) = control_node_id {
+        let still_eligible = storage_voters.is_none_or(|voters| voters.contains(&id));
+        if still_eligible {
+            anyhow::bail!(
+                "WHITEWATER_NODE_CAPABILITIES omits storage but voter {id} is still storage-eligible; \
+                 also exclude it with WHITEWATER_STORAGE_VOTERS on every Node"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn parse_control_nodes(value: &str) -> Result<Vec<(u64, String)>> {
     value
         .split(',')
@@ -324,6 +442,59 @@ mod tests {
         validate_control_topology(None, &voters, None).unwrap_err();
         validate_control_topology(None, &[], Some("key")).unwrap();
         validate_control_topology(None, &[], None).unwrap();
+    }
+
+    #[test]
+    fn storage_voters_must_be_a_subset_of_configured_voters() {
+        let voters = vec![
+            (1_u64, "control-1:7070".to_owned()),
+            (2_u64, "control-2:7070".to_owned()),
+            (3_u64, "control-3:7070".to_owned()),
+        ];
+        assert!(parse_storage_voters("", &voters).unwrap().is_none());
+        let subset = parse_storage_voters("1,3", &voters).unwrap().unwrap();
+        assert!(subset.contains(&1) && subset.contains(&3) && !subset.contains(&2));
+        // Opting out of storage is shared cluster config: a voter id that
+        // does not exist fails closed rather than silently narrowing.
+        assert!(parse_storage_voters("9", &voters).is_err());
+        assert!(parse_storage_voters("one", &voters).is_err());
+    }
+
+    #[test]
+    fn capability_topology_refuses_contradictions() {
+        // Default: every role on a voter that remains storage-eligible.
+        validate_capability_topology(&NodeCapabilities::all(), Some(1), None, false, true).unwrap();
+        // A voter dropping storage must also leave the shared eligible set.
+        let stateless = NodeCapabilities::stateless();
+        assert!(validate_capability_topology(&stateless, Some(1), None, false, true).is_err());
+        validate_capability_topology(
+            &stateless,
+            Some(1),
+            Some(&BTreeSet::from([2, 3])),
+            false,
+            true,
+        )
+        .unwrap();
+        // A registered storage Node cannot drop the storage role.
+        assert!(validate_capability_topology(&stateless, None, None, true, true).is_err());
+        // A non-voter explicitly declaring storage needs an identity to
+        // register under; default capabilities without an identity stay
+        // inert so existing non-voter deployments keep booting.
+        assert!(
+            validate_capability_topology(&NodeCapabilities::all(), None, None, false, true)
+                .is_err()
+        );
+        validate_capability_topology(&NodeCapabilities::all(), None, None, false, false).unwrap();
+        validate_capability_topology(&NodeCapabilities::all(), None, None, true, true).unwrap();
+        // A voter opted out of placement may not still declare it.
+        assert!(validate_capability_topology(
+            &NodeCapabilities::all(),
+            Some(1),
+            Some(&BTreeSet::from([2])),
+            false,
+            true,
+        )
+        .is_err());
     }
 
     #[test]

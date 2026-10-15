@@ -15,6 +15,7 @@ pub mod index;
 pub mod index_build;
 pub mod internal_plane;
 pub mod membership;
+pub mod node;
 pub mod pipe;
 pub mod reader;
 pub mod sdk;

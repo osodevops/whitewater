@@ -19,6 +19,7 @@ use crate::{
         ACTIVE_RANGE_REPLICA_COUNT,
     },
     index::IndexValue,
+    node::NodeCapabilities,
     reader::SubscriptionProgressAssignment,
     storage::{LogStore, StorageError},
 };
@@ -873,6 +874,11 @@ pub struct StorageNodeRecord {
     /// the internal mTLS plane; empty means no certificate is registered.
     #[serde(default)]
     pub cert_pins: BTreeSet<String>,
+    /// Declared data-plane roles for this Node. Records that predate
+    /// capability descriptors default to every role, matching their
+    /// historical placement behavior.
+    #[serde(default)]
+    pub capabilities: NodeCapabilities,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1460,6 +1466,8 @@ pub enum Command {
         endpoint: String,
         #[serde(default)]
         cert_pins: BTreeSet<String>,
+        #[serde(default)]
+        capabilities: NodeCapabilities,
     },
     RetireStorageNode {
         node: StorageNodeId,
@@ -1737,7 +1745,13 @@ impl ControlController {
     fn storage_pool(&self, state: &CatalogState) -> BTreeSet<StorageNodeId> {
         self.eligible_storage_nodes
             .iter()
-            .chain(state.storage_nodes.keys())
+            .chain(
+                state
+                    .storage_nodes
+                    .iter()
+                    .filter(|(_, record)| record.capabilities.storage)
+                    .map(|(node, _)| node),
+            )
             .filter(|node| !state.retired_storage_nodes.contains(*node))
             .filter(|node| !state.draining_storage_nodes.contains(*node))
             .cloned()
@@ -1748,6 +1762,17 @@ impl ControlController {
         (self.eligible_storage_nodes.contains(node) || state.storage_nodes.contains_key(node))
             && !state.retired_storage_nodes.contains(node)
             && !state.draining_storage_nodes.contains(node)
+            && state
+                .storage_nodes
+                .get(node)
+                .is_none_or(|record| record.capabilities.storage)
+    }
+
+    /// Every storage identity the catalog knows about with the reasons it
+    /// is currently excluded from placement, so operators see *why* the
+    /// pool has its present shape rather than a silent absence.
+    fn storage_eligibility_report(&self, state: &CatalogState) -> Vec<NodeStorageEligibility> {
+        storage_eligibility_report(state, self.eligible_storage_nodes.as_ref())
     }
 
     pub async fn storage_drain_plan(
@@ -4269,7 +4294,13 @@ impl ControlController {
                 node,
                 endpoint,
                 cert_pins,
+                capabilities,
             } => {
+                if !capabilities.storage {
+                    return Err(ControlError::InvalidOperation(
+                        "REGISTER STORAGE NODE must keep the storage capability; a compute/gateway-only Node is never registered for storage".to_owned(),
+                    ));
+                }
                 let mut normalized_pins = BTreeSet::new();
                 for pin in &cert_pins {
                     let lower = pin.to_ascii_lowercase();
@@ -4305,6 +4336,7 @@ impl ControlController {
                     // pin once rotation completes.
                     let mut record = existing.clone();
                     record.cert_pins = normalized_pins;
+                    record.capabilities = capabilities;
                     state.storage_nodes.insert(node.clone(), record.clone());
                     return Ok((format!("re-registered storage Node {node}"), json!(record)));
                 }
@@ -4323,6 +4355,7 @@ impl ControlController {
                     endpoint,
                     registered_at_ns: issued_at_ns,
                     cert_pins: normalized_pins,
+                    capabilities,
                 };
                 state.retired_storage_nodes.remove(&node);
                 state.storage_nodes.insert(node.clone(), record.clone());
@@ -6416,12 +6449,39 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             expect_keyword(&tokens, 2, "NODE")?;
             expect_keyword(&tokens, 4, "AT")?;
             let mut cert_pins = BTreeSet::new();
-            if tokens.len() > 6 {
-                expect_keyword(&tokens, 6, "WITH")?;
-                expect_keyword(&tokens, 7, "CERT")?;
-                expect_keyword(&tokens, 8, "PIN")?;
-                for pin in token(&tokens, 9)?.split('|') {
-                    cert_pins.insert(pin.to_owned());
+            let mut capabilities = NodeCapabilities::default();
+            let mut position = 6;
+            while position < tokens.len() {
+                expect_keyword(&tokens, position, "WITH")?;
+                match token(&tokens, position + 1)?.to_ascii_uppercase().as_str() {
+                    "CERT" => {
+                        expect_keyword(&tokens, position + 2, "PIN")?;
+                        if !cert_pins.is_empty() {
+                            return Err(ControlError::Syntax(
+                                "WITH CERT PIN may appear at most once".to_owned(),
+                            ));
+                        }
+                        for pin in token(&tokens, position + 3)?.split('|') {
+                            cert_pins.insert(pin.to_owned());
+                        }
+                        position += 4;
+                    }
+                    "CAPABILITIES" => {
+                        let mut list = token(&tokens, position + 2)?.to_owned();
+                        position += 3;
+                        while tokens.get(position).map(String::as_str) == Some(",") {
+                            list.push(',');
+                            list.push_str(token(&tokens, position + 1)?);
+                            position += 2;
+                        }
+                        capabilities = NodeCapabilities::parse_list(&list)
+                            .map_err(ControlError::Syntax)?;
+                    }
+                    other => {
+                        return Err(ControlError::Syntax(format!(
+                            "expected WITH CERT PIN or WITH CAPABILITIES, found WITH {other}"
+                        )))
+                    }
                 }
             }
             Ok(Command::RegisterStorageNode {
@@ -6429,6 +6489,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                     .map_err(|error| ControlError::Syntax(error.to_string()))?,
                 endpoint: token(&tokens, 5)?.to_owned(),
                 cert_pins,
+                capabilities,
             })
         }
         Some("RETIRE") => {
@@ -7588,32 +7649,32 @@ fn show_resources(
         ShowKind::Grants => json!(state.grants.values().collect::<Vec<_>>()),
         ShowKind::StorageNodes => {
             let registered: BTreeSet<&StorageNodeId> = state.storage_nodes.keys().collect();
-            json!(configured
-                .iter()
-                .chain(state.storage_nodes.keys())
-                .chain(state.retired_storage_nodes.iter())
-                .collect::<BTreeSet<_>>()
+            json!(storage_eligibility_report(state, configured)
                 .into_iter()
-                .map(|node| {
+                .map(|entry| {
                     json!({
-                        "node": node.as_str(),
+                        "node": entry.node.as_str(),
                         "endpoint": state
                             .storage_nodes
-                            .get(node)
+                            .get(&entry.node)
                             .map(|record| record.endpoint.as_str()),
                         "cert_pins": state
                             .storage_nodes
-                            .get(node)
+                            .get(&entry.node)
                             .map(|record| record.cert_pins.iter().collect::<Vec<_>>())
                             .unwrap_or_default(),
-                        "source": if registered.contains(node) {
+                        "capabilities": state
+                            .storage_nodes
+                            .get(&entry.node)
+                            .map(|record| record.capabilities),
+                        "source": if registered.contains(&entry.node) {
                             "registered"
                         } else {
                             "configured"
                         },
-                        "eligible": !state.retired_storage_nodes.contains(node)
-                            && !state.draining_storage_nodes.contains(node),
-                        "draining": state.draining_storage_nodes.contains(node),
+                        "eligible": entry.eligible,
+                        "exclusions": entry.exclusions,
+                        "draining": state.draining_storage_nodes.contains(&entry.node),
                     })
                 })
                 .collect::<Vec<_>>())
@@ -7735,6 +7796,29 @@ fn storage_node_in_use(state: &CatalogState, node: &StorageNodeId) -> Option<&'s
     None
 }
 
+/// Why a Node is excluded from storage placement.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageExclusion {
+    /// DRAIN STORAGE NODE is set: the Node keeps serving existing replicas
+    /// but nothing new may land on it.
+    Draining,
+    /// RETIRE removed the identity; it must re-register before serving.
+    Retired,
+    /// The registered descriptor does not declare the storage role.
+    StorageUndeclared,
+}
+
+/// One Node's storage-placement eligibility plus the reasons it is
+/// excluded — the observable counterpart of the internal pool filter.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NodeStorageEligibility {
+    pub node: StorageNodeId,
+    pub eligible: bool,
+    #[serde(default)]
+    pub exclusions: Vec<StorageExclusion>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageDrainPlan {
     pub node: StorageNodeId,
@@ -7742,6 +7826,10 @@ pub struct StorageDrainPlan {
     pub moves: Vec<Command>,
     pub unplannable: Vec<String>,
     pub ready_to_retire: bool,
+    /// Placement eligibility for every storage identity the catalog knows
+    /// about, with exclusion reasons, at the moment this plan was built.
+    #[serde(default)]
+    pub storage_pool: Vec<NodeStorageEligibility>,
 }
 
 /// Resolve the lease that currently authorizes driving `pipe_id`: the
@@ -7763,6 +7851,47 @@ fn effective_pipe_compute_lease(state: &CatalogState, pipe_id: Uuid) -> Option<P
         owner: assignment.owner.clone(),
         compute_epoch: assignment.ownership_epoch,
     })
+}
+
+/// Every storage identity the catalog knows about with the reasons it is
+/// currently excluded from placement, so operators see *why* the pool has
+/// its present shape rather than a silent absence.
+fn storage_eligibility_report(
+    state: &CatalogState,
+    configured: &BTreeSet<StorageNodeId>,
+) -> Vec<NodeStorageEligibility> {
+    let nodes: BTreeSet<StorageNodeId> = configured
+        .iter()
+        .chain(state.storage_nodes.keys())
+        .chain(state.draining_storage_nodes.iter())
+        .chain(state.retired_storage_nodes.iter())
+        .cloned()
+        .collect();
+    nodes
+        .into_iter()
+        .map(|node| {
+            let mut exclusions = Vec::new();
+            if state.retired_storage_nodes.contains(&node) {
+                exclusions.push(StorageExclusion::Retired);
+            }
+            if state.draining_storage_nodes.contains(&node) {
+                exclusions.push(StorageExclusion::Draining);
+            }
+            if state
+                .storage_nodes
+                .get(&node)
+                .is_some_and(|record| !record.capabilities.storage)
+            {
+                exclusions.push(StorageExclusion::StorageUndeclared);
+            }
+            let declared = configured.contains(&node) || state.storage_nodes.contains_key(&node);
+            NodeStorageEligibility {
+                node,
+                eligible: declared && exclusions.is_empty(),
+                exclusions,
+            }
+        })
+        .collect()
 }
 
 fn drain_replacement(
@@ -7899,6 +8028,7 @@ fn storage_drain_plan(
         }
     }
     StorageDrainPlan {
+        storage_pool: controller.storage_eligibility_report(state),
         node: node.clone(),
         draining: state.draining_storage_nodes.contains(node),
         moves,
@@ -11535,6 +11665,102 @@ mod tests {
             .moves
             .iter()
             .any(|command| matches!(command, Command::MovePipeComputeLease { .. })));
+    }
+
+    #[tokio::test]
+    async fn registered_nodes_carry_capability_descriptors_and_exclusion_reasons() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        // A registered Node declares its roles; storage must be one of
+        // them because the registration itself is a storage claim.
+        let registered = controller
+            .execute(
+                "REGISTER STORAGE NODE store-4 AT http://store-4:7070 \
+                 WITH CAPABILITIES storage,compute;",
+            )
+            .await
+            .unwrap();
+        let record = &registered.results[0].data;
+        assert_eq!(record["capabilities"]["storage"], true);
+        assert_eq!(record["capabilities"]["compute"], true);
+        assert_eq!(record["capabilities"]["gateway"], false);
+        assert!(controller
+            .execute(
+                "REGISTER STORAGE NODE store-5 AT http://store-5:7070 \
+                 WITH CAPABILITIES gateway;"
+            )
+            .await
+            .is_err());
+        // Re-registration refreshes the descriptor alongside pin rotation.
+        let updated = controller
+            .execute(
+                "REGISTER STORAGE NODE store-4 AT http://store-4:7070 \
+                 WITH CAPABILITIES storage,compute,gateway;",
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.results[0].data["capabilities"]["gateway"], true);
+        // INSPECT DRAIN reports the whole pool: the draining Node carries
+        // its exclusion reason, eligible Nodes carry none.
+        controller
+            .execute(
+                "REGISTER STORAGE NODE store-5 AT http://store-5:7070; \
+                 DRAIN STORAGE NODE store-5;",
+            )
+            .await
+            .unwrap();
+        let inspected = controller
+            .execute("INSPECT DRAIN FOR STORAGE NODE store-5;")
+            .await
+            .unwrap();
+        let pool = inspected.results[0].data["storage_pool"]
+            .as_array()
+            .unwrap();
+        let entry = pool
+            .iter()
+            .find(|entry| entry["node"] == "store-5")
+            .unwrap();
+        assert_eq!(entry["eligible"], false);
+        assert_eq!(entry["exclusions"], json!(["draining"]));
+        let healthy = pool
+            .iter()
+            .find(|entry| entry["node"] == "storage-1")
+            .unwrap();
+        assert_eq!(healthy["eligible"], true);
+        assert_eq!(healthy["exclusions"], json!([]));
+        // A retired Node is still visible with its exclusion until the
+        // identity is re-registered.
+        controller
+            .execute("UNDRAIN STORAGE NODE store-5; RETIRE STORAGE NODE store-5;")
+            .await
+            .unwrap();
+        let inspected = controller
+            .execute("INSPECT DRAIN FOR STORAGE NODE store-4;")
+            .await
+            .unwrap();
+        let pool = inspected.results[0].data["storage_pool"]
+            .as_array()
+            .unwrap();
+        let entry = pool
+            .iter()
+            .find(|entry| entry["node"] == "store-5")
+            .unwrap();
+        assert_eq!(entry["eligible"], false);
+        assert_eq!(entry["exclusions"], json!(["retired"]));
+        // SHOW STORAGE NODES shares the same eligibility report.
+        let shown = controller.execute("SHOW STORAGE NODES;").await.unwrap();
+        let rows = shown.results[0].data.as_array().unwrap();
+        let shown_entry = rows
+            .iter()
+            .find(|entry| entry["node"] == "store-5")
+            .unwrap();
+        assert_eq!(shown_entry["eligible"], false);
+        assert_eq!(shown_entry["exclusions"], json!(["retired"]));
+        let shown4 = rows
+            .iter()
+            .find(|entry| entry["node"] == "store-4")
+            .unwrap();
+        assert_eq!(shown4["capabilities"]["storage"], true);
     }
 
     #[tokio::test]

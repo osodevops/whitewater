@@ -113,6 +113,7 @@ mod tests {
                 node: node(name),
                 endpoint: endpoint.to_owned(),
                 cert_pins: BTreeSet::new(),
+                capabilities: crate::node::NodeCapabilities::all(),
             }])
             .await
             .unwrap();

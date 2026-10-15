@@ -12,11 +12,27 @@ use tokio::{
 };
 use tracing::{debug, info, warn};
 
+use crate::node::{NodeCapabilities, NodeCapacity};
+
+/// Re-samples the local Node's reported capacity; installed by the binary
+/// so each heartbeat advertises current resources rather than the
+/// boot-time measurement.
+pub type CapacityProbe = Arc<dyn Fn() -> NodeCapacity + Send + Sync>;
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MemberAnnouncement {
     pub node_id: String,
     pub api_url: String,
+    /// Legacy relative-capacity hint retained for wire compatibility;
+    /// `resources` is the measured capacity report.
     pub capacity: u32,
+    /// Declared data-plane roles. Absent on peers older than capability
+    /// descriptors; those default to every role.
+    #[serde(default)]
+    pub capabilities: NodeCapabilities,
+    /// Self-reported measured resources; all-zero means unreported.
+    #[serde(default)]
+    pub resources: NodeCapacity,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -24,6 +40,10 @@ pub struct MemberView {
     pub node_id: String,
     pub api_url: String,
     pub capacity: u32,
+    #[serde(default)]
+    pub capabilities: NodeCapabilities,
+    #[serde(default)]
+    pub resources: NodeCapacity,
     pub last_seen_ms: u64,
     pub local: bool,
 }
@@ -37,6 +57,7 @@ pub struct JoinResponse {
 #[derive(Clone)]
 pub struct MembershipService {
     local: MemberAnnouncement,
+    capacity_probe: Option<CapacityProbe>,
     members: Arc<RwLock<HashMap<String, MemberState>>>,
     known_urls: Arc<RwLock<HashSet<String>>>,
     seeds: Arc<Vec<String>>,
@@ -67,6 +88,7 @@ impl MembershipService {
         };
         Self {
             local: local.clone(),
+            capacity_probe: None,
             members: Arc::new(RwLock::new(HashMap::from([(
                 local.node_id.clone(),
                 local_state,
@@ -82,8 +104,30 @@ impl MembershipService {
         }
     }
 
-    pub fn local(&self) -> &MemberAnnouncement {
-        &self.local
+    /// Install the probe that re-measures local resources before every
+    /// heartbeat, so peers see current capacity rather than the boot-time
+    /// sample.
+    pub fn with_capacity_probe(
+        mut self,
+        probe: impl Fn() -> NodeCapacity + Send + Sync + 'static,
+    ) -> Self {
+        self.capacity_probe = Some(Arc::new(probe));
+        self
+    }
+
+    /// The announcement as it should be advertised now: stable identity
+    /// fields plus a freshly sampled capacity report when a probe is
+    /// installed.
+    fn current_local(&self) -> MemberAnnouncement {
+        let mut local = self.local.clone();
+        if let Some(probe) = &self.capacity_probe {
+            local.resources = probe();
+        }
+        local
+    }
+
+    pub fn local(&self) -> MemberAnnouncement {
+        self.current_local()
     }
 
     pub async fn observe(&self, announcement: MemberAnnouncement) {
@@ -118,6 +162,8 @@ impl MembershipService {
                 node_id: state.announcement.node_id.clone(),
                 api_url: state.announcement.api_url.clone(),
                 capacity: state.announcement.capacity,
+                capabilities: state.announcement.capabilities,
+                resources: state.announcement.resources.clone(),
                 last_seen_ms: state.last_seen_ms,
                 local: state.announcement.node_id == self.local.node_id,
             })
@@ -150,7 +196,13 @@ impl MembershipService {
                 continue;
             }
             let endpoint = format!("{}/v1/cluster/join", target.trim_end_matches('/'));
-            match self.client.post(endpoint).json(&self.local).send().await {
+            match self
+                .client
+                .post(endpoint)
+                .json(&self.current_local())
+                .send()
+                .await
+            {
                 Ok(response) if response.status().is_success() => {
                     match response.json::<JoinResponse>().await {
                         Ok(joined) => {
@@ -179,7 +231,7 @@ impl MembershipService {
         members.insert(
             self.local.node_id.clone(),
             MemberState {
-                announcement: self.local.clone(),
+                announcement: self.current_local(),
                 last_seen: Instant::now(),
                 last_seen_ms: unix_ms(),
             },
@@ -258,6 +310,8 @@ mod tests {
             node_id: "one".to_owned(),
             api_url: "http://one:7070".to_owned(),
             capacity: 100,
+            capabilities: NodeCapabilities::all(),
+            resources: NodeCapacity::default(),
         };
         let service = MembershipService::new(
             local,
@@ -270,6 +324,8 @@ mod tests {
                 node_id: "two".to_owned(),
                 api_url: "http://two:7070".to_owned(),
                 capacity: 50,
+                capabilities: NodeCapabilities::all(),
+                resources: NodeCapacity::default(),
             })
             .await;
         assert_eq!(service.members().await.len(), 2);
@@ -278,5 +334,18 @@ mod tests {
         let members = service.members().await;
         assert_eq!(members.len(), 1);
         assert!(members[0].local);
+    }
+
+    #[test]
+    fn legacy_announcements_decode_with_full_capability_defaults() {
+        // Peers that predate capability descriptors ran every data-plane
+        // role; decoding must keep treating them as fully eligible.
+        let decoded: MemberAnnouncement =
+            serde_json::from_str(r#"{"node_id":"n1","api_url":"http://n1:7070","capacity":100}"#)
+                .unwrap();
+        assert!(decoded.capabilities.storage);
+        assert!(decoded.capabilities.compute);
+        assert!(decoded.capabilities.gateway);
+        assert_eq!(decoded.resources, NodeCapacity::default());
     }
 }

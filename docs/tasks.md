@@ -1066,25 +1066,25 @@ Autoscaling must never apply one generic removal procedure to all three cases.
 
 
 
-- [ ] **Decision required:** Are capabilities declared by orchestrator labels, discovered resources, or both?
+- [x] Are capabilities declared by orchestrator labels, discovered resources, or both? **Decided: both, split by authority.** Roles are operator-declared — `WHITEWATER_NODE_CAPABILITIES` locally and `REGISTER STORAGE NODE ... WITH CAPABILITIES` in the catalog — because only the operator can express "this Node must never hold data". Resources are node-discovered and self-reported — `NodeCapacity::sample` measures CPU cores, memory, and volume space on each heartbeat — because labels cannot measure pressure. `voter` is refused as a capability: Control Plane membership derives from voter configuration, never a self-asserted label.
 
-- [ ] **Decision required:** Can a Node change capabilities without restart?
+- [x] Can a Node change capabilities without restart? **Decided: yes for data-plane roles, no for the voter role.** Re-registering a storage Node refreshes its capability descriptor in the same catalog command that rotates certificate pins, and membership gossip re-asserts declared roles each heartbeat. Changing whether a Node is a Control Plane voter is deliberately not a flag: it requires the joint-consensus learner/replacement flow below.
 
-- [ ] **Decision required:** Should burst Nodes default to compute/gateway only?
+- [x] Should burst Nodes default to compute/gateway only? **Decided: yes.** `NodeCapabilities::stateless()` is the burst shape; a Node evaporating mid-drain must never carry durability. Storage requires an explicit durable identity — a non-voter explicitly declaring `storage` without `WHITEWATER_STORAGE_NODE_ID` refuses to start, and config validation rejects a `WHITEWATER_STORAGE_NODE_ID` without the storage capability.
 
-- [ ] **Decision required:** What metrics distinguish storage pressure from compute pressure?
+- [x] What metrics distinguish storage pressure from compute pressure? **Decided: capability-specific signals.** Storage pressure is volume free/total bytes, replicas held, and IO/replication backlog; compute pressure is CPU, processing queue depth, and drive latency; gateway pressure is connections, request concurrency, and bandwidth. `NodeCapacity` now carries the measured resource side over gossip and `DemandMetrics` already tracks the work side (per-Range append/read bytes, replication, Pipe/Subscription activity); joining the two into per-capability pressure readings remains open below.
 
-- [ ] **Decision required:** Is the recommended production Control Plane three or five voters?
+- [x] Is the recommended production Control Plane three or five voters? **Decided: three remains the supported minimum; five is the production recommendation once the learner/replacement flow ships** — five tolerates two simultaneous voter losses and allows non-blocking voter replacement, which three cannot.
 
-- [ ] **Decision required:** Can control voters run without Feed storage in large deployments?
+- [x] Can control voters run without Feed storage in large deployments? **Decided: yes.** `WHITEWATER_STORAGE_VOTERS` is the shared subset of voter ids that stay storage-eligible; it is voter-id config rather than a per-Node toggle because every Node derives eligibility locally and divergent views would diverge placement. A voter dropping the storage role must also leave that subset — config validation refuses the contradictory combination.
 
-- [ ] **Decision required:** How are persistent volumes reattached after container replacement?
+- [x] How are persistent volumes reattached after container replacement? **Decided: durable identity in the volume.** First boot persists `node-identity.json` binding the `StorageNodeId` to the data directory; a replacement container that mounts the same volume resumes the identity even when the environment forgets it, while a configured identity that contradicts the volume's binding fails closed. Endpoint and container identity are ephemeral; the volume binding is not.
 
-- [ ] **Decision required:** When does object storage allow a storage Node to be mostly stateless?
+- [x] When does object storage allow a storage Node to be mostly stateless? **Decided: only for sealed history, once tiering exists.** The active append tail always requires local durable writes — quorum durability cannot round-trip to object storage on the commit path. Object-tiering is not implemented yet.
 
-- [ ] **Decision required:** Which operations may use stale cache replicas?
+- [x] Which operations may use stale cache replicas? **Decided: bounded data-path reads only, and only behind a proven committed watermark.** A stale replica may never serve fencing decisions, quorum evidence, committed-prefix corroboration, recovery, or split/merge cutover lineage. Cache-replica serving is not implemented yet.
 
-- [ ] **Decision required:** How is cost attributed across storage, compute, gateway, cache, and replication work?
+- [x] How is cost attributed across storage, compute, gateway, cache, and replication work? **Decided: per-capability meters rolled up Feed -> Domain -> tenant** — storage bytes held, append/replication IO, compute drive time, and gateway request/bandwidth each metered separately. `DemandMetrics` already tracks most work-side counters; the capability rollup remains open below.
 
 
 
@@ -1092,15 +1092,15 @@ Autoscaling must never apply one generic removal procedure to all three cases.
 
 
 
-- [ ] Add capability descriptors to Node membership.
+- [x] Add capability descriptors to Node membership: `NodeCapabilities { storage, compute, gateway }` rides `MemberAnnouncement`/`MemberView` (serde-defaulted so peers predating descriptors default to every role) and persists on `StorageNodeRecord` through `REGISTER STORAGE NODE ... WITH CAPABILITIES storage,compute[,gateway]` — re-registration refreshes the descriptor alongside pin rotation, and registering without the storage role is refused outright. `WHITEWATER_NODE_CAPABILITIES` declares the local roles (`voter` is rejected as config, not a label) and `validate_capability_topology` refuses contradictions: a voter dropping storage while still placement-eligible, an explicit `WHITEWATER_STORAGE_NODE_ID` without the storage role, or an explicit `storage` claim on a non-voter with no identity. The replica/progress services start only when the storage role and a resolved identity both exist, so a compute/gateway-only Node never accepts replica writes.
 
-- [ ] Add durable-storage identity separate from ephemeral container identity.
+- [x] Add durable-storage identity separate from ephemeral container identity: `node::resolve_durable_identity` binds `StorageNodeId` to the data directory through `node-identity.json` — first boot adopts and persists the configured identity, a remounted volume resumes it without environment help, and a configured identity contradicting the volume binding fails closed. `tests`/unit coverage proves persist-adopt-refuse.
 
-- [ ] Add CPU, memory, disk, network, and failure-domain capacity signals.
+- [~] Add CPU, memory, disk, network, and failure-domain capacity signals: `NodeCapacity::sample` reports logical CPU cores, `/proc/meminfo` total memory, fs2 volume total/free bytes, and the `WHITEWATER_FAILURE_DOMAIN` label; a heartbeat-installed `CapacityProbe` re-samples so peers see current resources rather than the boot measurement. Zero means unreported and consumers must fail toward conservative placement. Network bandwidth/latency signals remain unimplemented.
 
-- [ ] Add placement eligibility and exclusion reasons.
+- [x] Add placement eligibility and exclusion reasons: `storage_pool()` and `storage_eligible()` now filter registered Nodes lacking the storage capability, and the shared `storage_eligibility_report` emits `NodeStorageEligibility { node, eligible, exclusions }` with `StorageExclusion::{draining, retired, storage_undeclared}` reasons. `SHOW STORAGE NODES` rows carry `capabilities`, `eligible`, and `exclusions`; `INSPECT DRAIN` returns a `storage_pool` eligibility report beside the move plan so operators see *why* a replacement did or did not exist rather than a silent `unplannable`.
 
-- [ ] Add capability-specific pressure metrics.
+- [~] Add capability-specific pressure metrics: groundwork only — `NodeCapacity` carries the measured resource side (CPU/memory/disk/failure-domain) and `DemandMetrics` the work side (per-Range append/read/replication bytes, Pipe/Subscription/Reader activity). Joining them into storage-vs-compute-vs-gateway pressure readings per the metrics decision above remains.
 
 - [ ] Add minimum baseline policy.
 

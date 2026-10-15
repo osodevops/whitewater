@@ -138,6 +138,7 @@ async fn unsynced_storage_node_fences_appends_until_the_catalog_arrives() {
             node: node("storage-9"),
             endpoint: "https://storage-9:7271".to_owned(),
             cert_pins: std::collections::BTreeSet::new(),
+            capabilities: whitewater::node::NodeCapabilities::all(),
         }])
         .await
         .unwrap();
@@ -273,6 +274,7 @@ async fn synced_replica_catalog_refuses_local_mutations_but_accepts_snapshots() 
             node: node("storage-10"),
             endpoint: "https://storage-10:7271".to_owned(),
             cert_pins: std::collections::BTreeSet::new(),
+            capabilities: whitewater::node::NodeCapabilities::all(),
         }])
         .await
         .is_err());

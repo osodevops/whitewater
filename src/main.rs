@@ -32,6 +32,7 @@ use whitewater::{
     demand::{isolation_split_boundary, DemandMetrics, HotKeyObservation, HotKeyTracker},
     internal_plane::{CatalogSyncSupervisor, HttpCatalogSnapshotSource, InternalEndpoints},
     membership::{MemberAnnouncement, MembershipService},
+    node::{self, NodeCapacity},
     reader::{
         FjallSubscriptionProgressReplica, SubscriptionPlacementAuthority,
         SubscriptionProgressReplicaService,
@@ -49,7 +50,19 @@ async fn main() -> Result<()> {
         .json()
         .init();
 
-    let config = NodeConfig::from_env()?;
+    let mut config = NodeConfig::from_env()?;
+    // The volume carries the storage identity across container replacement:
+    // adopt a persisted identity when the environment forgot it, and refuse
+    // a configured identity that contradicts the volume's bound owner.
+    config.storage_node_id =
+        node::resolve_durable_identity(&config.data_dir, config.storage_node_id.clone())?;
+    // An announcement may only claim storage the Node can actually serve:
+    // no resolved identity means no replica service, so a non-voter on
+    // default capabilities reports storage as unavailable rather than
+    // advertising a role placement can never reach.
+    if config.storage_node_id.is_none() {
+        config.node_capabilities.storage = false;
+    }
     let admin_auth = AdminAuthenticator::from_env()?;
     let store: Arc<dyn LogStore> = Arc::new(FileLogStore::open(&config.data_dir)?);
     let catalog_file = if config.control_node_id.is_some() {
@@ -60,6 +73,12 @@ async fn main() -> Result<()> {
     let eligible_storage_nodes = config
         .control_nodes
         .iter()
+        .filter(|(node_id, _)| {
+            config
+                .storage_voters
+                .as_ref()
+                .is_none_or(|voters| voters.contains(node_id))
+        })
         .map(|(node_id, _)| StorageNodeId::try_new(format!("control-{node_id}")))
         .collect::<Result<Vec<_>, _>>()?;
     let controller = ControlController::open_with_storage_nodes(
@@ -130,13 +149,20 @@ async fn main() -> Result<()> {
         }
         _ => None,
     };
-    let replica_append = config.storage_node_id.clone().map(|local_node| {
-        Arc::new(ReplicaAppendService::new(
-            config.data_dir.join("active-ranges"),
-            local_node,
-            control.clone(),
-        ))
-    });
+    // A Node that resolved a storage identity for internal-plane auth but
+    // declared no storage capability serves no replica services; placement
+    // already excludes it through the eligible set.
+    let replica_append = config
+        .storage_node_id
+        .clone()
+        .filter(|_| config.node_capabilities.storage)
+        .map(|local_node| {
+            Arc::new(ReplicaAppendService::new(
+                config.data_dir.join("active-ranges"),
+                local_node,
+                control.clone(),
+            ))
+        });
     let subscription_progress = if let Some(local) = &replica_append {
         let path = config.data_dir.join("subscription-progress");
         let replica =
@@ -257,16 +283,23 @@ async fn main() -> Result<()> {
             });
         }
     }
-    let membership = Arc::new(MembershipService::new(
-        MemberAnnouncement {
-            node_id: config.node_id.clone(),
-            api_url: config.advertise_url.clone(),
-            capacity: config.capacity,
-        },
-        config.seeds.clone(),
-        config.heartbeat_interval,
-        config.member_timeout,
-    ));
+    let capacity_dir = config.data_dir.clone();
+    let capacity_domain = config.failure_domain.clone();
+    let membership = Arc::new(
+        MembershipService::new(
+            MemberAnnouncement {
+                node_id: config.node_id.clone(),
+                api_url: config.advertise_url.clone(),
+                capacity: config.capacity,
+                capabilities: config.node_capabilities,
+                resources: NodeCapacity::sample(&capacity_dir, capacity_domain.clone()),
+            },
+            config.seeds.clone(),
+            config.heartbeat_interval,
+            config.member_timeout,
+        )
+        .with_capacity_probe(move || NodeCapacity::sample(&capacity_dir, capacity_domain.clone())),
+    );
     let demand = DemandMetrics::default();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let membership_task = tokio::spawn(membership.clone().run(shutdown_rx));

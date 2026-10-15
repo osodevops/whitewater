@@ -937,6 +937,8 @@ REGISTER STORAGE NODE storage-4 AT https://storage-4:7271;
 
 REGISTER STORAGE NODE storage-4 AT https://storage-4:7271 WITH CERT PIN 0123abcd...|fedcba98...;
 
+REGISTER STORAGE NODE storage-4 AT https://storage-4:7271 WITH CAPABILITIES storage,compute,gateway;
+
 SHOW STORAGE NODES;
 
 RETIRE STORAGE NODE storage-4;
@@ -953,7 +955,11 @@ Configured Control Plane Nodes seed the eligible storage pool, but the pool is n
 
 
 
-`SHOW STORAGE NODES` reports each Node's identity, `source` (`configured` or `registered`), endpoint, and current `eligible` flag. Registered eligible Nodes participate in RF3 Active Range placement, which spreads each new Feed's replicas and Append Owner across the widened pool rather than always taking the first three Nodes.
+`WITH CAPABILITIES` declares the Node's data-plane roles as a comma-separated subset of `storage,compute,gateway` (default: all three when the clause is absent). The `storage` role must be present — a Node without it is never a storage registration — and `voter` is rejected because Control Plane membership is configured voter topology, not a self-asserted capability. Re-registering refreshes the descriptor, so a Node's declared roles can change without a restart.
+
+
+
+`SHOW STORAGE NODES` reports each Node's identity, `source` (`configured` or `registered`), endpoint, declared `capabilities`, current `eligible` flag, and `exclusions` naming why an ineligible Node is excluded (`draining`, `retired`, `storage_undeclared`). Registered eligible Nodes participate in RF3 Active Range placement, which spreads each new Feed's replicas and Append Owner across the widened pool rather than always taking the first three Nodes.
 
 
 
