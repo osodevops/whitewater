@@ -9,6 +9,10 @@ Actions:
   chaos.restart         restart one storage Node (node2) and re-gate on health
   chaos.restart_owner   INSPECT PLACEMENT for the named Feed, restart the
                         Node that currently owns its range, and re-gate
+  chaos.stop_two        stop two of three Nodes, prove the survivor fails
+                        every write closed during the outage (a stale
+                        self-leader still cannot commit without a voter
+                        majority), restart both, and re-gate
 """
 
 import json
@@ -106,9 +110,57 @@ def restart_owner(feed):
     time.sleep(3)
 
 
+def stop_two():
+    # Losing two of three Nodes removes every majority: the survivor must
+    # fail writes closed rather than acknowledge work it cannot commit. A
+    # WCL write is the cleanest probe — even an ambiguous timeout cannot
+    # fabricate a commit without a majority, and a probe that lands late
+    # only creates an inert uniquely-named Domain.
+    subprocess.run(
+        ["docker", "compose", "-f", COMPOSE_FILE, "stop", "node2", "node3"],
+        cwd=ROOT, check=True, timeout=120,
+    )
+    # A lone survivor may keep reporting a stale self-leader — it cannot
+    # commit without a voter majority either way — so the evidence probes
+    # writes directly: every WCL write during the outage must be refused
+    # or drop unacknowledged, never return success.
+    failure = None
+    try:
+        for attempt in range(6):
+            status_code = None
+            try:
+                probe = urllib.request.Request(
+                    f"{ENDPOINTS[0]}/v1/admin/wcl",
+                    data=json.dumps({"script": f"CREATE DOMAIN chaostwo{int(time.time() * 1000)}{attempt};"}).encode(),
+                    headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(probe, timeout=8) as reply:
+                    status_code = reply.status
+            except urllib.error.HTTPError as error:
+                status_code = error.code
+            except Exception:
+                pass  # timeout/reset — no majority existed to commit it
+            if status_code == 200:
+                raise AssertionError("a write committed while two of three Nodes were down")
+            time.sleep(1)
+    except AssertionError as error:
+        failure = error
+    finally:
+        subprocess.run(
+            ["docker", "compose", "-f", COMPOSE_FILE, "start", "node2", "node3"],
+            cwd=ROOT, check=True, timeout=120,
+        )
+    wait_riverbed()
+    time.sleep(3)
+    if failure is not None:
+        raise failure
+
+
 ACTIONS = {
     "chaos.restart": restart,
     "chaos.restart_owner": restart_owner,
+    "chaos.stop_two": stop_two,
 }
 
 

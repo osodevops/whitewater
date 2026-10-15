@@ -100,6 +100,8 @@ installing the chaos hook when `WHITEWATER_CHAOS_CMD` names a command the
 runner invokes as `<cmd> <op>` per `chaos.*` step
 (`scripts/chaos_driver.py` restarts a Node — `chaos.restart_owner`
 resolves the named Feed's current range owner through `INSPECT
-PLACEMENT` — and re-gates on majority-committed WCL). Chaos fixtures
+PLACEMENT` — and re-gates on majority-committed WCL; `chaos.stop_two`
+stops two of three Nodes, requires the survivor to report quorum loss
+and fail a write closed, then restarts both and re-gates). Chaos fixtures
 sort last by convention (`zz-` prefix) since they perturb the shared
 Riverbed.
