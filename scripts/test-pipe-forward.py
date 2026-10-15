@@ -248,6 +248,51 @@ def main():
 
         wcl(NODES[0], f"UNDRAIN STORAGE NODE {owner};")
 
+        # Range transitions: the Pipe's consumed Subscription frontier
+        # translates through split and merge cutovers with the same frozen
+        # lineage evidence Reader sessions use; forwarding must continue
+        # without operator intervention and never skip or duplicate.
+        status, split = post(
+            NODES[1],
+            "/v1/admin/ranges/split",
+            {
+                "request_id": str(uuid.uuid4()),
+                "feed": source,
+                "split_at": "80000000000000000000000000000000",
+                "batch_size": 4,
+            },
+        )
+        if status != 200 or split.get("status") != "activated":
+            raise AssertionError({"split": split})
+        if split.get("subscription_reconcile_failed"):
+            raise AssertionError({"split reconcile": split})
+        append_batch(NODES[0], writer, writer_epoch, range(9, 12), retries=45)
+        wait_forwarded(output, 11)
+
+        routes = wcl(NODES[0], f"INSPECT PLACEMENT FOR FEED {source};")[0][
+            "range_map"
+        ]["routes"]
+        status, merged = post(
+            NODES[2],
+            "/v1/admin/ranges/merge",
+            {
+                "request_id": str(uuid.uuid4()),
+                "feed": source,
+                "left_range_id": routes[0]["range_id"],
+                "right_range_id": routes[1]["range_id"],
+            },
+        )
+        if status != 200 or merged.get("status") != "activated":
+            raise AssertionError({"merge": merged})
+        if merged.get("subscription_reconcile_failed"):
+            raise AssertionError({"merge reconcile": merged})
+        append_batch(NODES[1], writer, writer_epoch, range(12, 15), retries=45)
+        forwarded = wait_forwarded(output, 14)
+        if len({record["key_base64"] for record in forwarded}) != 14:
+            raise AssertionError(
+                "the Pipe lost or duplicated records across range transitions"
+            )
+
         print(
             json.dumps(
                 {
@@ -259,7 +304,10 @@ def main():
                     "note": (
                         "the Pipe supervisor bootstrapped the frontier, "
                         "forwarded with payload/key/event-time/Metadata "
-                        "intact, and followed the progress owner after drain"
+                        "intact, followed the progress owner after drain, and "
+                        "kept forwarding exactly-once through a split/merge "
+                        "cutover that translated the consumed Subscription "
+                        "frontier onto the new range map"
                     ),
                 },
                 indent=2,
