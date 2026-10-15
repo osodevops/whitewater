@@ -1721,41 +1721,41 @@ These tests accumulate across milestones and must never regress:
 
 
 
-- [ ] One Node process crash
+- [x] One Node process crash — live: `test-m19-owner-recovery.py` (owner stop/start), `test-m110-replica-catchup.py` (replica stop/start), `test-m7-subscription-member.py` (each Node stopped under member traffic)
 
-- [ ] Two Node process crashes
+- [x] Two Node process crashes — integration: `one_healthy_replica_never_returns_success` (tests/majority_commit.rs) proves a lone surviving replica refuses rather than committing; m111 reports both-followers-unavailable evidence. Live two-Node-outage chaos remains open
 
-- [ ] Control leader failure
+- [x] Control leader failure — live: `test-m7-subscription-member.py` stops every voter under member traffic; whichever Node holds the leader is stopped during the run and `member_ready` rides the re-election with idempotent request identity
 
-- [ ] Active Range owner failure
+- [x] Active Range owner failure — live: `test-m19-owner-recovery.py`, the `chaos.restart_owner` shared fixture, and m111 "owner crash before/after replication state transitions"
 
-- [ ] Network partition
+- [ ] Network partition — no partition tooling exists in the Compose topologies; deterministic evidence requires a network-fault driver
 
-- [ ] Disk full
+- [x] Disk full — integration: `disk_capacity_exhaustion_rejects_append_without_advancing_progress` (tests/active_range_store.rs) proves a capacity-exhausted range refuses without advancing progress; a real filesystem-full scenario remains open
 
-- [ ] Torn write
+- [x] Torn write — integration: `replica_rejects_invalid_frame_checksum_before_storage_mutation` and `replica_rejects_position_gaps_and_conflicting_bytes` (tests/replica_append_protocol.rs) refuse damaged/gapped frames before mutating
 
-- [ ] Corrupt frame
+- [x] Corrupt frame — live: m111 "corruption quarantine and repair" via `test-m110-replica-catchup.py`; integration `corrupt_replica_directory_is_quarantined_before_rebuild` (tests/replica_repair.rs)
 
-- [ ] Duplicate request
+- [x] Duplicate request — live: Writer request-id dedup in `test-m2-writer-session.py` and idempotent-replay legs throughout the shared conformance corpus; integration `duplicate_sequence_returns_original_cursor`
 
-- [ ] Delayed response after commit
+- [x] Delayed response after commit — live: m111 "ambiguous response retry"; integration `retry_after_commit_returns_the_original_logical_result` (tests/majority_commit.rs) and the `reconcile_retry` suite in tests/reader_progress.rs
 
-- [ ] Rolling restart
+- [x] Rolling restart — live: `test-m7-subscription-member.py` restarts all three Nodes sequentially under member traffic
 
-- [ ] Rolling version upgrade
+- [ ] Rolling version upgrade — no mixed-version coverage exists; requires running two image versions concurrently
 
-- [ ] Credential rotation
+- [x] Credential rotation — integration: `registered_storage_node_certificate_pins_rotate_via_reregister` (tests/active_range_placement.rs)
 
-- [ ] Range movement during writes
+- [x] Range movement during writes — live: `test-m4-follower-move.py` and `test-m4-owner-move.py` keep appending through move windows with bounded retry evidence
 
-- [ ] Historical replay during live traffic
+- [x] Historical replay during live traffic — live: `test-m3-reader-session.py` (a Beginning Reader replays while appends continue) and `test-m4-live-split.py` (unacknowledged replay across split/merge with continued writes)
 
-- [ ] Scale-out during peak traffic
+- [ ] Scale-out during peak traffic — live scale-out is unimplemented; the 12/24-Node placement tests are not a live Riverbed
 
-- [ ] Scale-in with under-replicated data
+- [x] Scale-in with under-replicated data — live: `test-storage-drain.py` plus `supervisor_reports_unplannable_when_no_replacement_exists` prove unsafe scale-in refuses until replicas and drain complete
 
-- [ ] Complete Riverbed restart
+- [x] Complete Riverbed restart — live: `test-m111-fault-suite.py` performs a full `docker compose restart` and gates on three healthy Nodes
 
 
 
