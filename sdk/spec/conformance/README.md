@@ -50,6 +50,11 @@ successfully.
 - `{{uuid:name}}` — a run-unique UUID named `name`; every occurrence in the
   run substitutes the same generated value (use it for `request_id`,
   `member_id`, `work_id` that a later step must repeat).
+- `{{now_ns}}` / `{{now_ns:<signed-offset>}}` — wall-clock Unix epoch
+  nanoseconds as a decimal string, optionally shifted (e.g.
+  `{{now_ns:-250000000}}`). Event-clock surfaces like Window Pipes
+  classify records by `ingest_time - event_time`, so fixture times must
+  stay near the run's real clock.
 - `"bind": "name"` on a step stores its response under `name`.
 - `"{{name.field}}"` in a later step's args substitutes that field's value.
   Nested access: `{{join.member_epoch}}`, `{{fetch.cursor}}`.
@@ -69,6 +74,10 @@ Operators:
 - `"!=null"` — present and non-null
 - `"present"` / `"absent"`
 - `"len>=N"` — array/string length bound
+- `{ "base64_json": {...} }` — decode the actual base64 string as JSON
+  and apply each named expectation recursively to the decoded document
+  (window-emission payloads, opaque envelopes). A value that is not
+  base64 JSON fails the step.
 - `{ "error_code": "..." }` — the step must have failed with this wire
   `code` (e.g. `writer.stale_sequence`, `lease.stale_lease`)
 - `{ "error_status": 401 }` — the step must have failed with this HTTP

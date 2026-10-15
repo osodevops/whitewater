@@ -1,0 +1,63 @@
+{
+  "scenario": "window-pipe",
+  "requires": ["wcl", "writer.append_batch", "feed.records"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN wn{{uniq}}; CREATE FEED wn{{uniq}}.source; CREATE FEED wn{{uniq}}.results; DEFINE STATESTORE wn{{uniq}}.panes KEYS key, pane; CREATE WRITER ww{{uniq}} TO wn{{uniq}}.source; OPEN WRITER SESSION ww{{uniq}}; CREATE SUBSCRIPTION wn{{uniq}}.flow FROM wn{{uniq}}.source START AT BEGINNING; CREATE PIPE wn{{uniq}}.agg FROM SUBSCRIPTION wn{{uniq}}.flow TO STATESTORE wn{{uniq}}.panes WINDOW 8s EVENT MAX_LATE 1s BY JSON 'customer' SUM JSON 'amount' EMIT TO FEED wn{{uniq}}.results;"
+      },
+      "bind": "setup"
+    },
+    {
+      "op": "writer.append_batch",
+      "args": {
+        "records": [
+          {
+            "request_id": "{{uuid:acme}}",
+            "writer": "ww{{uniq}}",
+            "session_epoch": "{{setup.results[5].data.session_epoch}}",
+            "key": {"utf8": "acme"},
+            "payload": {"utf8": "{\"customer\":\"acme\",\"amount\":7}"},
+            "event_time_ns": "{{now_ns}}"
+          },
+          {
+            "request_id": "{{uuid:beta}}",
+            "writer": "ww{{uniq}}",
+            "session_epoch": "{{setup.results[5].data.session_epoch}}",
+            "key": {"utf8": "beta"},
+            "payload": {"utf8": "{\"customer\":\"beta\",\"amount\":9}"},
+            "event_time_ns": "{{now_ns}}"
+          }
+        ]
+      },
+      "expect": {"results": "len>=2", "results[0].cursor": "!=null", "results[1].cursor": "!=null"}
+    },
+    {
+      "op": "feed.records",
+      "args": {"feed": "wn{{uniq}}.results", "limit": 10},
+      "poll": {"times": 25, "interval_ms": 1000},
+      "expect": {
+        "records": "len>=2",
+        "records[0].metadata_base64[\"window.emitted\"]": "dHJ1ZQ==",
+        "records[0].payload_base64": {"base64_json": {
+          "group": "acme",
+          "count": 1,
+          "sum": "7",
+          "pane": "present",
+          "pane_start_ns": "present",
+          "pane_end_ns": "present",
+          "store_seq": "!=null"
+        }},
+        "records[1].metadata_base64[\"window.emitted\"]": "dHJ1ZQ==",
+        "records[1].payload_base64": {"base64_json": {
+          "group": "beta",
+          "count": 1,
+          "sum": "9",
+          "pane": "present",
+          "store_seq": "!=null"
+        }}
+      }
+    }
+  ]
+}

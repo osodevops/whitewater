@@ -420,6 +420,22 @@ impl RunContext {
         if let Some(name) = token.strip_prefix("uuid:") {
             return Some(Value::String(self.named_uuid(name)));
         }
+        if let Some(offset) = token.strip_prefix("now_ns") {
+            // `{{now_ns}}` / `{{now_ns:-250000000}}` — wall-clock epoch
+            // nanoseconds as a decimal string (event-clock fixtures such
+            // as Window Pipes need near-now times to avoid the lateness
+            // bound). An optional signed offset shifts the instant.
+            let base = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64;
+            let shift = match offset.strip_prefix(':') {
+                Some(text) => text.parse::<i64>().unwrap_or(0),
+                None if offset.is_empty() => 0,
+                _ => return None,
+            };
+            return Some(Value::String(base.saturating_add(shift).to_string()));
+        }
         let (binding, path) = token.split_once('.')?;
         self.bindings
             .get(binding)
@@ -666,7 +682,26 @@ fn check_expect(
                         }
                     }
                     _ => {
-                        if actual != Some(expected) {
+                        if let Some(document) =
+                            expected.get("base64_json").and_then(Value::as_object)
+                        {
+                            // `{"base64_json": {...}}` decodes the actual
+                            // base64 string as JSON, then recursively
+                            // applies each named expectation to the
+                            // decoded document — so opaque binary payloads
+                            // (window emissions) assert their contents.
+                            let decoded = actual
+                                .and_then(Value::as_str)
+                                .and_then(|text| STANDARD.decode(text).ok())
+                                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+                            let Some(decoded) = decoded else {
+                                return Err(format!(
+                                    "{path} is not base64 JSON: {actual:?} in {body}"
+                                ));
+                            };
+                            check_expect(document, status, &decoded, bindings)
+                                .map_err(|inner| format!("{path} decoded: {inner}"))?;
+                        } else if actual != Some(expected) {
                             return Err(format!(
                                 "{path} = {actual:?}, expected {expected} in {body}"
                             ));
@@ -940,6 +975,71 @@ mod tests {
         assert!(!failure.unsupported);
         assert_eq!(failure.status, Some(400));
         assert!(failure.message.contains("expected status 200"));
+    }
+
+    #[tokio::test]
+    async fn runner_substitutes_now_ns_and_matches_base64_json_documents() {
+        let emission =
+            STANDARD.encode(br#"{"group":"acme","pane":7,"count":2,"sum":"12","store_seq":"41"}"#);
+        let (runner, transport) = runner(vec![
+            (200, json!({"cursor": "c1"})),
+            (200, json!([{"cursor": "c2", "payload_base64": emission}])),
+        ]);
+        let scenario = json!({
+            "steps": [
+                {
+                    "op": "writer.append",
+                    "args": {
+                        "writer": "w",
+                        "session_epoch": 1,
+                        "event_time_ns": "{{now_ns:-1000}}"
+                    }
+                },
+                {
+                    "op": "feed.records",
+                    "args": {"feed": "d.results"},
+                    "expect": {
+                        "records[0].payload_base64": {"base64_json": {
+                            "group": "acme",
+                            "pane": 7,
+                            "count": 2,
+                            "sum": "12",
+                            "store_seq": "!=null"
+                        }}
+                    }
+                }
+            ]
+        });
+        let report = runner.run_scenario("window", &scenario).await;
+        assert!(report.passed(), "{report:?}");
+        let requests = transport.requests.lock().unwrap();
+        let appended = &requests[0].2;
+        let event_ns: i64 = appended["event_time_ns"].as_str().unwrap().parse().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64;
+        assert!(
+            (now - event_ns).abs() < 30_000_000_000,
+            "{event_ns} vs {now}"
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_reports_base64_json_decode_failures() {
+        let (runner, _) = runner(vec![(200, json!([{"payload_base64": "bm90LWpzb24="}]))]);
+        let report = runner
+            .run_scenario(
+                "bad",
+                &json!({"steps": [{
+                    "op": "feed.records",
+                    "args": {"feed": "d.results"},
+                    "expect": {"records[0].payload_base64": {"base64_json": {"group": "acme"}}}
+                }]}),
+            )
+            .await;
+        let failure = report.failure.expect("decode failure reported");
+        assert!(failure.message.contains("not base64 JSON"));
     }
 
     #[test]
