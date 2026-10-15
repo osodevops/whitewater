@@ -1729,7 +1729,7 @@ These tests accumulate across milestones and must never regress:
 
 - [x] Active Range owner failure — live: `test-m19-owner-recovery.py`, the `chaos.restart_owner` shared fixture, and m111 "owner crash before/after replication state transitions"
 
-- [ ] Network partition — no partition tooling exists in the Compose topologies; deterministic evidence requires a network-fault driver
+- [x] Network partition — live: `zz-chaos-partition.json` via `chaos.partition` in `scripts/chaos_driver.py`; `docker network disconnect` isolates a running Node (container stays Up but unreachable from the published port), the majority side keeps committing writes through the fault, and on reconnect — with the Compose service alias restored, since a plain `network connect` drops it and would leave the Node unresolvable forever — the isolated replica rejoins the Control Plane; the driver re-gates on every Node reporting a leader with applied index converged to a common log tail plus a real corroborated append before the next fixture runs
 
 - [x] Disk full — integration: `disk_capacity_exhaustion_rejects_append_without_advancing_progress` (tests/active_range_store.rs) proves a capacity-exhausted range refuses without advancing progress; a real filesystem-full scenario remains open
 

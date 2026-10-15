@@ -101,7 +101,11 @@ runner invokes as `<cmd> <op>` per `chaos.*` step
 (`scripts/chaos_driver.py` restarts a Node — `chaos.restart_owner`
 resolves the named Feed's current range owner through `INSPECT
 PLACEMENT` — and re-gates on majority-committed WCL; `chaos.stop_two`
-stops two of three Nodes, requires the survivor to report quorum loss
-and fail a write closed, then restarts both and re-gates). Chaos fixtures
-sort last by convention (`zz-` prefix) since they perturb the shared
-Riverbed.
+stops two of three Nodes, requires every write probe to fail closed
+while no majority exists, then restarts both; `chaos.partition` cuts
+one running Node's network interface — the process stays alive but
+unreachable — proves the majority side keeps committing, reconnects
+with the Node's service aliases restored, and re-gates on leader,
+applied-index, and log-tail convergence plus a real append). Chaos
+fixtures sort last by convention (`zz-` prefix) since they perturb the
+shared Riverbed.
