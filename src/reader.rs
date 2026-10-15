@@ -123,10 +123,13 @@ pub fn translate_merge_reader_frontier(
     Ok(translated)
 }
 
-/// The `(positions, quarantine)` pair a cutover translation restates on the
-/// post-transition range map.
-pub type TranslatedSubscriptionFrontier =
-    (BTreeMap<RangeId, String>, BTreeMap<RangeId, Vec<String>>);
+/// The `(positions, quarantine, skipped)` triple a cutover translation
+/// restates on the post-transition range map.
+pub type TranslatedSubscriptionFrontier = (
+    BTreeMap<RangeId, String>,
+    BTreeMap<RangeId, Vec<String>>,
+    BTreeMap<RangeId, Vec<String>>,
+);
 
 /// Restate a committed Subscription frontier's per-range resume positions and
 /// RangeId-keyed quarantine evidence across a committed split. The left child
@@ -142,6 +145,7 @@ pub fn translate_split_subscription_frontier(
     split_at: KeyToken,
     positions: &BTreeMap<RangeId, String>,
     quarantined: &BTreeMap<RangeId, Vec<String>>,
+    skipped: &BTreeMap<RangeId, Vec<String>>,
 ) -> Result<TranslatedSubscriptionFrontier, ReaderFrontierTranslationError> {
     let source_cursor = positions
         .get(&source)
@@ -167,7 +171,21 @@ pub fn translate_split_subscription_frontier(
                 .push(cursor);
         }
     }
-    Ok((translated, translated_quarantined))
+    let mut translated_skipped = skipped.clone();
+    if let Some(cursors) = translated_skipped.remove(&source) {
+        let tokens: BTreeMap<&str, KeyToken> = entries
+            .iter()
+            .map(|entry| (entry.cursor.as_str(), entry.key_token))
+            .collect();
+        for cursor in cursors {
+            let owner = match tokens.get(cursor.as_str()) {
+                Some(token) if *token >= split_at => right,
+                _ => source,
+            };
+            translated_skipped.entry(owner).or_default().push(cursor);
+        }
+    }
+    Ok((translated, translated_quarantined, translated_skipped))
 }
 
 /// Restate a committed Subscription frontier across a committed merge. The
@@ -180,6 +198,7 @@ pub fn translate_merge_subscription_frontier(
     right: RangeId,
     positions: &BTreeMap<RangeId, String>,
     quarantined: &BTreeMap<RangeId, Vec<String>>,
+    skipped: &BTreeMap<RangeId, Vec<String>>,
 ) -> Result<TranslatedSubscriptionFrontier, ReaderFrontierTranslationError> {
     let left_cursor = positions
         .get(&left)
@@ -205,7 +224,11 @@ pub fn translate_merge_subscription_frontier(
             .or_default()
             .extend(cursors);
     }
-    Ok((translated, translated_quarantined))
+    let mut translated_skipped = skipped.clone();
+    if let Some(cursors) = translated_skipped.remove(&right) {
+        translated_skipped.entry(left).or_default().extend(cursors);
+    }
+    Ok((translated, translated_quarantined, translated_skipped))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -502,6 +525,11 @@ pub struct SubscriptionWorkLease {
     pub member_epoch: u64,
     pub lease_epoch: u64,
     pub expires_at_tick: u64,
+    /// Set once this claim's declared exhausted-delivery policy fired; the
+    /// flag resets whenever the lease is reclaimed or transferred because a
+    /// new grant builds a fresh `SubscriptionWorkLease`.
+    #[serde(default)]
+    pub exhausted_applied: bool,
 }
 
 /// One incremental lease handoff: the work item, the current holder's
@@ -522,6 +550,10 @@ pub const SUBSCRIPTION_LEASE_MAX_OPS: usize = 16;
 /// Cumulative quarantined positions a Subscription frontier may carry;
 /// evidence stays explainable instead of growing an unbounded audit row.
 pub const SUBSCRIPTION_QUARANTINE_MAX_POSITIONS: usize = 1024;
+/// Cumulative positions a declared retry budget permanently passed over;
+/// bounded evidence like quarantine, but never releasable — skip is a final
+/// disposition, while explicit SEEK remains the replay mechanism.
+pub const SUBSCRIPTION_SKIP_MAX_POSITIONS: usize = 1024;
 
 /// The quarantine deltas one acknowledgement applies to the cumulative
 /// frontier set: positions newly declared delivered-but-not-processed, and
@@ -575,6 +607,15 @@ pub enum SubscriptionLeaseOp {
         to_member_id: Uuid,
         to_member_epoch: u64,
         lease_ticks: u64,
+    },
+    /// Marks that the claimed work's declared retry budget was exceeded and
+    /// the fetch-time exhausted policy already committed once under this
+    /// grant, so subsequent fetches under the same lease deliver normally.
+    ApplyExhausted {
+        work_id: Uuid,
+        member_id: Uuid,
+        member_epoch: u64,
+        lease_epoch: u64,
     },
 }
 
@@ -692,6 +733,7 @@ impl SubscriptionLeaseTracker {
             member_epoch,
             lease_epoch,
             expires_at_tick,
+            exhausted_applied: false,
         };
         self.leases.insert(work_id, granted.clone());
         self.last_tick = now_tick;
@@ -788,6 +830,7 @@ impl SubscriptionLeaseTracker {
             member_epoch: transfer.to_member_epoch,
             lease_epoch,
             expires_at_tick,
+            exhausted_applied: false,
         };
         self.leases.insert(transfer.work_id, grant.clone());
         self.last_tick = now_tick;
@@ -863,6 +906,7 @@ impl SubscriptionLeaseTracker {
                         member_epoch: *member_epoch,
                         lease_epoch: *lease_epoch,
                         expires_at_tick: 0,
+                        exhausted_applied: false,
                     },
                     now_tick,
                     *lease_ticks,
@@ -879,6 +923,7 @@ impl SubscriptionLeaseTracker {
                 member_epoch: *member_epoch,
                 lease_epoch: *lease_epoch,
                 expires_at_tick: 0,
+                exhausted_applied: false,
             }),
             SubscriptionLeaseOp::Transfer {
                 work_id,
@@ -901,6 +946,49 @@ impl SubscriptionLeaseTracker {
                     SUBSCRIPTION_LEASE_MAX_MEMBER_WORK,
                 )
                 .map(|_| ()),
+            SubscriptionLeaseOp::ApplyExhausted {
+                work_id,
+                member_id,
+                member_epoch,
+                lease_epoch,
+            } => self.apply_exhausted(
+                &SubscriptionWorkLease {
+                    work_id: *work_id,
+                    member_id: *member_id,
+                    member_epoch: *member_epoch,
+                    lease_epoch: *lease_epoch,
+                    expires_at_tick: 0,
+                    exhausted_applied: false,
+                },
+                now_tick,
+            ),
+        }
+    }
+
+    /// Flags the live grant matching the caller's evidence so one exhausted
+    /// disposition commits per claim epoch. The op replays harmlessly — a
+    /// grant already marked returns success — but a stale holder or expired
+    /// lease is fenced like every other member mutation.
+    fn apply_exhausted(
+        &mut self,
+        grant: &SubscriptionWorkLease,
+        now_tick: u64,
+    ) -> Result<(), SubscriptionLeaseError> {
+        if now_tick < self.last_tick {
+            return Err(SubscriptionLeaseError::InvalidClock);
+        }
+        match self.leases.get_mut(&grant.work_id) {
+            Some(current)
+                if current.member_id == grant.member_id
+                    && current.member_epoch == grant.member_epoch
+                    && current.lease_epoch == grant.lease_epoch
+                    && now_tick < current.expires_at_tick =>
+            {
+                current.exhausted_applied = true;
+                self.last_tick = now_tick;
+                Ok(())
+            }
+            _ => Err(SubscriptionLeaseError::StaleLease),
         }
     }
 
@@ -1235,6 +1323,15 @@ pub struct SubscriptionProgressMutation {
     pub quarantine_add: BTreeMap<RangeId, Vec<String>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub quarantine_remove: BTreeMap<RangeId, Vec<String>>,
+    /// Cumulative positions a declared retry budget permanently passed over
+    /// — final-disposition evidence carried through seeks and cutovers.
+    /// Unlike `quarantined`, no member operation releases skipped positions.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skipped: BTreeMap<RangeId, Vec<String>>,
+    /// The positions this mutation newly skipped; kept so an identical
+    /// request replays and a changed one conflicts rather than restating.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skip_add: BTreeMap<RangeId, Vec<String>>,
 }
 
 /// A replica answering with one of these errors is behind the current
@@ -1305,6 +1402,8 @@ fn same_progress_identity(
         && left.quarantined == right.quarantined
         && left.quarantine_add == right.quarantine_add
         && left.quarantine_remove == right.quarantine_remove
+        && left.skipped == right.skipped
+        && left.skip_add == right.skip_add
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1567,6 +1666,18 @@ impl FjallSubscriptionProgressReplica {
                     .quarantined
                     .keys()
                     .all(|range| mutation.positions.contains_key(range))
+                || mutation.skipped.len() > 128
+                || mutation
+                    .skipped
+                    .values()
+                    .flatten()
+                    .any(|value| value.is_empty() || value.len() > 256)
+                || mutation.skipped.values().map(Vec::len).sum::<usize>()
+                    > SUBSCRIPTION_SKIP_MAX_POSITIONS
+                || !mutation
+                    .skipped
+                    .keys()
+                    .all(|range| mutation.positions.contains_key(range))
                 || mutation.expected_cursor.as_ref().is_some_and(|expected| {
                     expected.is_empty()
                         || expected.len() > 256
@@ -1654,6 +1765,18 @@ impl FjallSubscriptionProgressReplica {
                 > SUBSCRIPTION_QUARANTINE_MAX_POSITIONS
             || !mutation
                 .quarantined
+                .keys()
+                .all(|range| mutation.positions.contains_key(range))
+            || mutation.skipped.len() > 128
+            || mutation
+                .skipped
+                .values()
+                .flatten()
+                .any(|value| value.is_empty() || value.len() > 256)
+            || mutation.skipped.values().map(Vec::len).sum::<usize>()
+                > SUBSCRIPTION_SKIP_MAX_POSITIONS
+            || !mutation
+                .skipped
                 .keys()
                 .all(|range| mutation.positions.contains_key(range))
             || mutation.lease_ops.len() > SUBSCRIPTION_LEASE_MAX_OPS
@@ -2485,6 +2608,22 @@ impl SubscriptionPlacementAuthority for crate::control_plane::ControlPlane {
 pub struct SubscriptionProgressCoordinator {
     assignment: SubscriptionProgressAssignment,
     transport: std::sync::Arc<dyn SubscriptionProgressTransport>,
+}
+
+/// The one-shot exhausted-delivery decision `member.fetch` commits when a
+/// claim's durable lease epoch exceeds the declared retry budget: the page's
+/// ending Cursor and positions plus the evidence set it joins.
+#[derive(Clone, Debug)]
+pub struct ExhaustedDelivery {
+    /// The last exhausted record's Cursor — the committed frontier's new head.
+    pub cursor: String,
+    /// Per-range positions advanced past the exhausted page.
+    pub positions: BTreeMap<RangeId, String>,
+    /// The exhausted positions keyed by Active Range, routed to the
+    /// `quarantined` or `skipped` evidence set by `disposition`.
+    pub exhausted: BTreeMap<RangeId, Vec<String>>,
+    /// Whether the evidence parks for release (quarantine) or is final (skip).
+    pub disposition: crate::control::SubscriptionExhaustedDisposition,
 }
 
 impl SubscriptionProgressCoordinator {
@@ -3328,8 +3467,102 @@ impl SubscriptionProgressCoordinator {
             quarantined,
             quarantine_add,
             quarantine_remove,
+            skipped: current.skipped.clone(),
+            skip_add: BTreeMap::new(),
             tick,
             lease_ops: vec![SubscriptionLeaseOp::Release {
+                work_id: grant.work_id,
+                member_id: grant.member_id,
+                member_epoch: grant.member_epoch,
+                lease_epoch: grant.lease_epoch,
+            }],
+        };
+        self.apply(mutation.clone()).await?;
+        Ok(mutation)
+    }
+
+    /// Commits the declared exhausted-delivery disposition for a claim that
+    /// exceeded its Subscription's retry budget: `Quarantine` parks the
+    /// positions in the releasable evidence set while `Skip` records them as
+    /// permanently passed over; either way the frontier advances past them
+    /// exactly once per claim because the mutation rides an `ApplyExhausted`
+    /// lease op fencing the live grant. The lease stays held so the member
+    /// continues on the next page without re-claiming.
+    pub async fn apply_exhausted_delivery(
+        &self,
+        grant: &SubscriptionWorkLease,
+        tick: u64,
+        request_id: Uuid,
+        decision: ExhaustedDelivery,
+    ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
+        let ExhaustedDelivery {
+            cursor,
+            positions,
+            exhausted,
+            disposition,
+        } = decision;
+        let current = self
+            .read_committed()
+            .await?
+            .ok_or(SubscriptionProgressError::Conflict)?;
+        if !exhausted.keys().all(|range| positions.contains_key(range)) {
+            return Err(SubscriptionProgressError::Conflict);
+        }
+        let mut skipped = current.skipped.clone();
+        let mut quarantined = current.quarantined.clone();
+        let mut skip_add = BTreeMap::new();
+        let mut quarantine_add = BTreeMap::new();
+        match disposition {
+            crate::control::SubscriptionExhaustedDisposition::Quarantine => {
+                for (range, cursors) in &exhausted {
+                    let held = quarantined.entry(*range).or_default();
+                    for cursor in cursors {
+                        if !held.contains(cursor) {
+                            held.push(cursor.clone());
+                        }
+                    }
+                }
+                if quarantined.values().map(Vec::len).sum::<usize>()
+                    > SUBSCRIPTION_QUARANTINE_MAX_POSITIONS
+                {
+                    return Err(SubscriptionProgressError::TooLarge);
+                }
+                quarantine_add = exhausted;
+            }
+            crate::control::SubscriptionExhaustedDisposition::Skip => {
+                for (range, cursors) in &exhausted {
+                    let held = skipped.entry(*range).or_default();
+                    for cursor in cursors {
+                        if !held.contains(cursor) {
+                            held.push(cursor.clone());
+                        }
+                    }
+                }
+                if skipped.values().map(Vec::len).sum::<usize>() > SUBSCRIPTION_SKIP_MAX_POSITIONS {
+                    return Err(SubscriptionProgressError::TooLarge);
+                }
+                skip_add = exhausted;
+            }
+        }
+        let mutation = SubscriptionProgressMutation {
+            subscription_id: current.subscription_id,
+            feed_id: current.feed_id,
+            ownership_epoch: current.ownership_epoch,
+            sequence: current
+                .sequence
+                .checked_add(1)
+                .ok_or(SubscriptionProgressError::Sequence)?,
+            request_id,
+            expected_cursor: Some(current.cursor.clone()),
+            cursor,
+            positions,
+            quarantined,
+            quarantine_add,
+            quarantine_remove: BTreeMap::new(),
+            skipped,
+            skip_add,
+            tick,
+            lease_ops: vec![SubscriptionLeaseOp::ApplyExhausted {
                 work_id: grant.work_id,
                 member_id: grant.member_id,
                 member_epoch: grant.member_epoch,
@@ -3455,6 +3688,8 @@ mod tests {
             quarantined: BTreeMap::new(),
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
+            skipped: BTreeMap::new(),
+            skip_add: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -3575,6 +3810,8 @@ mod tests {
             quarantined: BTreeMap::new(),
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
+            skipped: BTreeMap::new(),
+            skip_add: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -3981,6 +4218,8 @@ mod tests {
             quarantined: BTreeMap::new(),
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
+            skipped: BTreeMap::new(),
+            skip_add: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         }
@@ -4615,6 +4854,8 @@ mod tests {
             quarantined: BTreeMap::new(),
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
+            skipped: BTreeMap::new(),
+            skip_add: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -4830,5 +5071,273 @@ mod tests {
             lease_ticks: 10,
         }];
         assert!(replica.prepare(stale_transfer).is_err());
+    }
+
+    #[test]
+    fn apply_exhausted_marks_the_live_grant_once_and_fences_stale_evidence() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let replica = FjallSubscriptionProgressReplica::open(directory.path()).unwrap();
+        let subscription_id = Uuid::from_u128(640);
+        let feed_id = Uuid::from_u128(641);
+        let member = Uuid::from_u128(642);
+        let work = Uuid::from_u128(643);
+
+        let mut join = subscription_progress_mutation(subscription_id, feed_id, 1, 1);
+        join.lease_ops = vec![SubscriptionLeaseOp::Join {
+            member_id: member,
+            member_epoch: 1,
+        }];
+        commit_direct(&replica, &join);
+
+        let mut claim = subscription_progress_mutation(subscription_id, feed_id, 1, 2);
+        claim.expected_cursor = Some(join.cursor.clone());
+        claim.cursor = join.cursor.clone();
+        claim.tick = 10;
+        claim.lease_ops = vec![SubscriptionLeaseOp::Claim {
+            work_id: work,
+            member_id: member,
+            member_epoch: 1,
+            lease_ticks: 30,
+        }];
+        commit_direct(&replica, &claim);
+        assert!(
+            !replica
+                .local_state(subscription_id)
+                .unwrap()
+                .members
+                .leases
+                .get(&work)
+                .unwrap()
+                .exhausted_applied
+        );
+
+        // The policy marker flags the live grant at the same tick the fetch
+        // validated against, so a lease expiring on the boundary still
+        // admits the disposition the member already earned.
+        let mut exhausted = subscription_progress_mutation(subscription_id, feed_id, 1, 3);
+        exhausted.expected_cursor = Some(join.cursor.clone());
+        exhausted.cursor = "rf1_head".to_owned();
+        exhausted.positions = BTreeMap::from([(
+            RangeId::from_uuid(Uuid::from_u128(7_002)),
+            "position-2".to_owned(),
+        )]);
+        exhausted.tick = 10;
+        exhausted.skip_add = BTreeMap::from([(
+            RangeId::from_uuid(Uuid::from_u128(7_002)),
+            vec!["poison-1".to_owned()],
+        )]);
+        exhausted.skipped = exhausted.skip_add.clone();
+        exhausted.lease_ops = vec![SubscriptionLeaseOp::ApplyExhausted {
+            work_id: work,
+            member_id: member,
+            member_epoch: 1,
+            lease_epoch: 1,
+        }];
+        commit_direct(&replica, &exhausted);
+        let state = replica.local_state(subscription_id).unwrap();
+        assert!(state.members.leases.get(&work).unwrap().exhausted_applied);
+        assert_eq!(
+            state.committed.as_ref().unwrap().skipped[&RangeId::from_uuid(Uuid::from_u128(7_002))],
+            vec!["poison-1".to_owned()]
+        );
+
+        // A stale epoch on the marker op refuses; a replayed marked grant is
+        // fine because re-claiming builds a fresh unmarked lease.
+        let mut stale = subscription_progress_mutation(subscription_id, feed_id, 1, 4);
+        stale.expected_cursor = Some("rf1_head".to_owned());
+        stale.cursor = "rf1_head".to_owned();
+        stale.positions = exhausted.positions.clone();
+        stale.tick = 15;
+        stale.lease_ops = vec![SubscriptionLeaseOp::ApplyExhausted {
+            work_id: work,
+            member_id: member,
+            member_epoch: 1,
+            lease_epoch: 9,
+        }];
+        assert!(matches!(
+            replica.prepare(stale),
+            Err(SubscriptionProgressError::Lease(
+                SubscriptionLeaseError::StaleLease
+            ))
+        ));
+
+        // After expiry a reclaim rebuilds the grant unmarked at epoch + 1.
+        let mut reclaim = subscription_progress_mutation(subscription_id, feed_id, 1, 4);
+        reclaim.expected_cursor = Some("rf1_head".to_owned());
+        reclaim.cursor = "rf1_head".to_owned();
+        reclaim.positions = exhausted.positions.clone();
+        reclaim.tick = 50;
+        reclaim.lease_ops = vec![SubscriptionLeaseOp::Claim {
+            work_id: work,
+            member_id: member,
+            member_epoch: 1,
+            lease_ticks: 10,
+        }];
+        commit_direct(&replica, &reclaim);
+        let state = replica.local_state(subscription_id).unwrap();
+        let grant = state.members.leases.get(&work).unwrap();
+        assert_eq!(grant.lease_epoch, 2);
+        assert!(!grant.exhausted_applied);
+    }
+
+    #[test]
+    fn subscription_skip_evidence_stays_bounded_and_durable() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let replica = FjallSubscriptionProgressReplica::open(directory.path()).unwrap();
+        let subscription_id = Uuid::from_u128(650);
+        let feed_id = Uuid::from_u128(651);
+        let range = RangeId::from_uuid(Uuid::from_u128(7_001));
+
+        let mut first = subscription_progress_mutation(subscription_id, feed_id, 1, 1);
+        first.positions = BTreeMap::from([(range, "position-1".to_owned())]);
+        commit_direct(&replica, &first);
+
+        // skipped keys must name ranges the mutation covers.
+        let mut off_range = subscription_progress_mutation(subscription_id, feed_id, 1, 2);
+        off_range.expected_cursor = Some(first.cursor.clone());
+        off_range.positions = first.positions.clone();
+        off_range.skip_add = BTreeMap::from([(
+            RangeId::from_uuid(Uuid::from_u128(9_999)),
+            vec!["gone".to_owned()],
+        )]);
+        off_range.skipped = off_range.skip_add.clone();
+        assert!(matches!(
+            replica.prepare(off_range),
+            Err(SubscriptionProgressError::TooLarge)
+        ));
+
+        // The cumulative set stays inside its bounded evidence budget.
+        let mut over = subscription_progress_mutation(subscription_id, feed_id, 1, 2);
+        over.expected_cursor = Some(first.cursor.clone());
+        over.positions = first.positions.clone();
+        over.skipped = BTreeMap::from([(
+            range,
+            (0..SUBSCRIPTION_SKIP_MAX_POSITIONS + 1)
+                .map(|index| format!("skip-{index}"))
+                .collect(),
+        )]);
+        assert!(matches!(
+            replica.prepare(over),
+            Err(SubscriptionProgressError::TooLarge)
+        ));
+
+        let mut second = subscription_progress_mutation(subscription_id, feed_id, 1, 2);
+        second.expected_cursor = Some(first.cursor.clone());
+        second.positions = first.positions.clone();
+        second.skip_add = BTreeMap::from([(range, vec!["poison".to_owned()])]);
+        second.skipped = second.skip_add.clone();
+        commit_direct(&replica, &second);
+        let state = replica.local_state(subscription_id).unwrap();
+        assert_eq!(
+            state.committed.as_ref().unwrap().skipped[&range],
+            vec!["poison".to_owned()]
+        );
+        drop(replica);
+        let reopened = FjallSubscriptionProgressReplica::open(directory.path()).unwrap();
+        assert_eq!(
+            reopened
+                .local_state(subscription_id)
+                .unwrap()
+                .committed
+                .as_ref()
+                .unwrap()
+                .skipped[&range],
+            vec!["poison".to_owned()]
+        );
+    }
+
+    #[test]
+    fn subscription_skip_evidence_translates_across_split_and_merge() {
+        let source = RangeId::from_uuid(Uuid::from_u128(660));
+        let right = RangeId::from_uuid(Uuid::from_u128(661));
+        let entries = vec![
+            ReaderLineageEntry {
+                range_id: source,
+                position: RangePosition::new(1),
+                cursor: "left-record".to_owned(),
+                key_token: KeyToken::from_bytes([0x10; 16]),
+                ingest_time_ns: 1,
+                message_id: Uuid::from_u128(1),
+            },
+            ReaderLineageEntry {
+                range_id: source,
+                position: RangePosition::new(2),
+                cursor: "right-record".to_owned(),
+                key_token: KeyToken::from_bytes([0x90; 16]),
+                ingest_time_ns: 2,
+                message_id: Uuid::from_u128(2),
+            },
+        ];
+        let positions = BTreeMap::from([(source, "right-record".to_owned())]);
+        let quarantined = BTreeMap::new();
+        let skipped = BTreeMap::from([(
+            source,
+            vec!["left-record".to_owned(), "right-record".to_owned()],
+        )]);
+        let (positions, quarantined, skipped) = translate_split_subscription_frontier(
+            &entries,
+            source,
+            right,
+            KeyToken::from_bytes([0x80; 16]),
+            &positions,
+            &quarantined,
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(skipped[&source], vec!["left-record".to_owned()]);
+        assert_eq!(skipped[&right], vec!["right-record".to_owned()]);
+        assert!(quarantined.is_empty());
+        assert!(positions.contains_key(&right));
+
+        // merge re-keys the retired right child's evidence onto the left.
+        let left_entries = vec![
+            ReaderLineageEntry {
+                range_id: source,
+                position: RangePosition::new(1),
+                cursor: "left-record".to_owned(),
+                key_token: KeyToken::from_bytes([0x10; 16]),
+                ingest_time_ns: 1,
+                message_id: Uuid::from_u128(1),
+            },
+            ReaderLineageEntry {
+                range_id: source,
+                position: RangePosition::new(2),
+                cursor: "left-ack".to_owned(),
+                key_token: KeyToken::from_bytes([0x10; 16]),
+                ingest_time_ns: 3,
+                message_id: Uuid::from_u128(3),
+            },
+        ];
+        let right_entries = vec![ReaderLineageEntry {
+            range_id: right,
+            position: RangePosition::new(1),
+            cursor: "right-record".to_owned(),
+            key_token: KeyToken::from_bytes([0x90; 16]),
+            ingest_time_ns: 2,
+            message_id: Uuid::from_u128(2),
+        }];
+        let positions = BTreeMap::from([
+            (source, "left-ack".to_owned()),
+            (right, "right-record".to_owned()),
+        ]);
+        let skipped = BTreeMap::from([
+            (source, vec!["left-record".to_owned()]),
+            (right, vec!["right-record".to_owned()]),
+        ]);
+        let (_, _, skipped) = translate_merge_subscription_frontier(
+            &left_entries,
+            &right_entries,
+            source,
+            right,
+            &positions,
+            &BTreeMap::new(),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(
+            skipped[&source],
+            vec!["left-record".to_owned(), "right-record".to_owned()]
+        );
+        assert!(!skipped.contains_key(&right));
     }
 }

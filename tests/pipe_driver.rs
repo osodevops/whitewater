@@ -90,6 +90,8 @@ fn frontier_mutation(cursor: &str) -> SubscriptionProgressMutation {
         quarantined: BTreeMap::new(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+        skip_add: BTreeMap::new(),
         tick: 1,
         lease_ops: Vec::new(),
     }
@@ -494,6 +496,8 @@ impl EffectApply for RecordingApply {
             quarantined: BTreeMap::new(),
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
+            skipped: BTreeMap::new(),
+            skip_add: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -877,6 +881,8 @@ async fn pipe_driver_aborts_a_declare_whose_frontier_moved_mid_apply() {
         quarantined: BTreeMap::new(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+        skip_add: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };

@@ -548,9 +548,41 @@ pub struct SubscriptionDefinition {
     /// records keep their positions and never advance the frontier early.
     #[serde(default)]
     pub delivery_delay_ns: Option<u64>,
+    /// The declared retry budget: when a work claim's durable lease epoch —
+    /// advanced on every reclaim or transfer — exceeds
+    /// `max_delivery_attempts`, the positions the claim would deliver are
+    /// exhausted once per claim under `disposition`. `None` retries forever.
+    #[serde(default)]
+    pub exhausted_policy: Option<SubscriptionExhaustedPolicy>,
     pub stage: SubscriptionStage,
     pub status: ResourceStatus,
     pub created_at_ns: i64,
+}
+
+/// What `member.fetch` does to the positions an over-budget claim would
+/// deliver, applied once per claim epoch.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SubscriptionExhaustedDisposition {
+    /// Park the positions in the durable quarantine set: releasable evidence
+    /// a member can return to delivery once resolved.
+    #[default]
+    Quarantine,
+    /// Permanently pass the positions over; the durable `skipped` evidence
+    /// is releasable only through an explicit Subscription SEEK.
+    Skip,
+}
+
+/// The declared per-work retry budget on a Subscription. Attempts are
+/// counted by the claim's durable lease epoch — each expiry or transfer
+/// that regrants the work counts one — so positions parked under an
+/// over-budget claim are the head work that kept failing to acknowledge.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionExhaustedPolicy {
+    pub max_delivery_attempts: u64,
+    #[serde(default)]
+    pub disposition: SubscriptionExhaustedDisposition,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -624,6 +656,11 @@ pub struct SubscriptionCutoverTranslation {
     pub positions: BTreeMap<RangeId, String>,
     #[serde(default)]
     pub quarantined: BTreeMap<RangeId, Vec<String>>,
+    /// Final-disposition evidence carried through the cutover; legacy rows
+    /// decode as empty. Skip is not releasable — only a Subscription SEEK
+    /// replays the positions.
+    #[serde(default)]
+    pub skipped: BTreeMap<RangeId, Vec<String>>,
     pub tick: u64,
 }
 
@@ -1134,6 +1171,10 @@ pub enum Command {
         /// timestamp. Legacy commands decode as `None` (immediate).
         #[serde(default)]
         delivery_delay_ns: Option<u64>,
+        /// Optional declared retry budget for work claimed by members;
+        /// legacy commands decode as `None` (unbounded retries).
+        #[serde(default)]
+        exhausted_policy: Option<SubscriptionExhaustedPolicy>,
     },
     OpenReaderSession {
         reader: String,
@@ -3435,6 +3476,7 @@ impl ControlController {
                 domain,
                 start,
                 delivery_delay_ns,
+                exhausted_policy,
             } => {
                 validate_dotted_name(&name)?;
                 ensure_name_available(
@@ -3454,6 +3496,14 @@ impl ControlController {
                     if delay > i64::MAX as u64 {
                         return Err(ControlError::InvalidOperation(
                             "Subscription DELIVERY DELAY exceeds the supported bound".to_owned(),
+                        ));
+                    }
+                }
+                if let Some(policy) = exhausted_policy {
+                    if policy.max_delivery_attempts == 0 {
+                        return Err(ControlError::InvalidOperation(
+                            "Subscription MAX DELIVERY ATTEMPTS must be greater than zero"
+                                .to_owned(),
                         ));
                     }
                 }
@@ -3537,6 +3587,7 @@ impl ControlController {
                     source,
                     start,
                     delivery_delay_ns,
+                    exhausted_policy,
                     stage: SubscriptionStage::Declared,
                     status: ResourceStatus::Active,
                     created_at_ns: issued_at_ns,
@@ -5922,6 +5973,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 let source_index = if domain_source { 5 } else { 4 };
                 let (start, tail) = if tokens.len() == source_index + 1
                     || keyword(source_index + 1).as_deref() == Some("DELIVERY")
+                    || keyword(source_index + 1).as_deref() == Some("MAX")
                 {
                     (ReaderStart::Beginning, source_index + 1)
                 } else {
@@ -5943,7 +5995,10 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 let name = token(&tokens, 2)?.to_owned();
                 let source = token(&tokens, source_index)?.to_owned();
                 if keyword(1).as_deref() == Some("SUBSCRIPTION") {
-                    let delivery_delay_ns = if tail < tokens.len() {
+                    let mut tail = tail;
+                    let delivery_delay_ns = if tail < tokens.len()
+                        && keyword(tail).as_deref() == Some("DELIVERY")
+                    {
                         expect_keyword(&tokens, tail, "DELIVERY")?;
                         expect_keyword(&tokens, tail + 1, "DELAY")?;
                         if tail + 2 >= tokens.len() {
@@ -5952,12 +6007,54 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             ));
                         }
                         let delay = parse_duration_ns(token(&tokens, tail + 2)?)?;
-                        if tail + 3 != tokens.len() {
+                        tail += 3;
+                        Some(delay)
+                    } else {
+                        None
+                    };
+                    let exhausted_policy = if tail < tokens.len() {
+                        expect_keyword(&tokens, tail, "MAX")?;
+                        expect_keyword(&tokens, tail + 1, "DELIVERY")?;
+                        expect_keyword(&tokens, tail + 2, "ATTEMPTS")?;
+                        let attempts = token(&tokens, tail + 3)
+                            .ok()
+                            .and_then(|token| token.parse::<u64>().ok())
+                            .filter(|attempts| *attempts > 0)
+                            .ok_or_else(|| {
+                                ControlError::Syntax(
+                                    "MAX DELIVERY ATTEMPTS expects a positive integer".to_owned(),
+                                )
+                            })?;
+                        let mut tail = tail + 4;
+                        let disposition = if tail < tokens.len() {
+                            expect_keyword(&tokens, tail, "THEN")?;
+                            let disposition = match token(&tokens, tail + 1)?
+                                .to_ascii_uppercase()
+                                .as_str()
+                            {
+                                "QUARANTINE" => SubscriptionExhaustedDisposition::Quarantine,
+                                "SKIP" => SubscriptionExhaustedDisposition::Skip,
+                                _ => {
+                                    return Err(ControlError::Syntax(
+                                        "MAX DELIVERY ATTEMPTS THEN expects QUARANTINE or SKIP"
+                                            .to_owned(),
+                                    ));
+                                }
+                            };
+                            tail += 2;
+                            disposition
+                        } else {
+                            SubscriptionExhaustedDisposition::Quarantine
+                        };
+                        if tail != tokens.len() {
                             return Err(ControlError::Syntax(
-                                "unexpected tokens after DELIVERY DELAY <duration>".to_owned(),
+                                "unexpected tokens after MAX DELIVERY ATTEMPTS".to_owned(),
                             ));
                         }
-                        Some(delay)
+                        Some(SubscriptionExhaustedPolicy {
+                            max_delivery_attempts: attempts,
+                            disposition,
+                        })
                     } else {
                         None
                     };
@@ -5967,6 +6064,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                         domain: domain_source.then_some(source),
                         start,
                         delivery_delay_ns,
+                        exhausted_policy,
                     })
                 } else {
                     if domain_source {
@@ -6976,6 +7074,17 @@ fn validate_subscription_translations(
             || quarantined_positions > crate::reader::SUBSCRIPTION_QUARANTINE_MAX_POSITIONS
             || translation
                 .quarantined
+                .values()
+                .flatten()
+                .any(|cursor| cursor.is_empty() || cursor.len() > 256)
+            || !translation
+                .skipped
+                .keys()
+                .all(|range| candidate_ranges.contains(range))
+            || translation.skipped.values().map(Vec::len).sum::<usize>()
+                > crate::reader::SUBSCRIPTION_SKIP_MAX_POSITIONS
+            || translation
+                .skipped
                 .values()
                 .flatten()
                 .any(|cursor| cursor.is_empty() || cursor.len() > 256)
@@ -9811,10 +9920,137 @@ mod tests {
         .unwrap();
         match legacy {
             Command::CreateSubscription {
-                delivery_delay_ns, ..
-            } => assert_eq!(delivery_delay_ns, None),
+                delivery_delay_ns,
+                exhausted_policy,
+                ..
+            } => {
+                assert_eq!(delivery_delay_ns, None);
+                assert_eq!(exhausted_policy, None);
+            }
             other => panic!("unexpected command {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn subscription_retry_budget_parses_validates_and_persists() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute("CREATE SPACE orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        // The budget clause parses bare, with a disposition, and combined
+        // with the delivery-delay clause in either clause order.
+        let commands =
+            parse_wcl("CREATE SUBSCRIPTION orders.r FROM orders.events MAX DELIVERY ATTEMPTS 3;")
+                .unwrap();
+        match &commands[0] {
+            Command::CreateSubscription {
+                exhausted_policy, ..
+            } => assert_eq!(
+                *exhausted_policy,
+                Some(SubscriptionExhaustedPolicy {
+                    max_delivery_attempts: 3,
+                    disposition: SubscriptionExhaustedDisposition::Quarantine,
+                })
+            ),
+            other => panic!("unexpected command {other:?}"),
+        }
+        let commands = parse_wcl(
+            "CREATE SUBSCRIPTION orders.r2 FROM orders.events MAX DELIVERY ATTEMPTS 2 THEN SKIP;",
+        )
+        .unwrap();
+        match &commands[0] {
+            Command::CreateSubscription {
+                exhausted_policy, ..
+            } => assert_eq!(
+                *exhausted_policy,
+                Some(SubscriptionExhaustedPolicy {
+                    max_delivery_attempts: 2,
+                    disposition: SubscriptionExhaustedDisposition::Skip,
+                })
+            ),
+            other => panic!("unexpected command {other:?}"),
+        }
+        let commands = parse_wcl(
+            "CREATE SUBSCRIPTION orders.r3 FROM orders.events DELIVERY DELAY 1s \
+             MAX DELIVERY ATTEMPTS 5 THEN QUARANTINE;",
+        )
+        .unwrap();
+        match &commands[0] {
+            Command::CreateSubscription {
+                delivery_delay_ns,
+                exhausted_policy,
+                ..
+            } => {
+                assert_eq!(*delivery_delay_ns, Some(1_000_000_000));
+                assert_eq!(
+                    *exhausted_policy,
+                    Some(SubscriptionExhaustedPolicy {
+                        max_delivery_attempts: 5,
+                        disposition: SubscriptionExhaustedDisposition::Quarantine,
+                    })
+                );
+            }
+            other => panic!("unexpected command {other:?}"),
+        }
+        // The declared policy persists on the definition and describes.
+        controller
+            .execute(
+                "CREATE SUBSCRIPTION orders.r FROM orders.events \
+                 MAX DELIVERY ATTEMPTS 3 THEN SKIP;",
+            )
+            .await
+            .unwrap();
+        let definition = controller
+            .active_subscription_by_name("orders.r")
+            .await
+            .unwrap();
+        assert_eq!(
+            definition.exhausted_policy,
+            Some(SubscriptionExhaustedPolicy {
+                max_delivery_attempts: 3,
+                disposition: SubscriptionExhaustedDisposition::Skip,
+            })
+        );
+        let described = controller
+            .execute("DESCRIBE SUBSCRIPTION orders.r;")
+            .await
+            .unwrap();
+        assert_eq!(
+            described.results[0].data["exhausted_policy"],
+            json!({
+                "max_delivery_attempts": 3,
+                "disposition": "skip"
+            })
+        );
+        for bad in [
+            "CREATE SUBSCRIPTION orders.b FROM orders.events MAX DELIVERY ATTEMPTS;",
+            "CREATE SUBSCRIPTION orders.b FROM orders.events MAX DELIVERY ATTEMPTS 0;",
+            "CREATE SUBSCRIPTION orders.b FROM orders.events MAX DELIVERY ATTEMPTS x;",
+            "CREATE SUBSCRIPTION orders.b FROM orders.events MAX DELIVERY ATTEMPTS 2 THEN;",
+            "CREATE SUBSCRIPTION orders.b FROM orders.events MAX DELIVERY ATTEMPTS 2 THEN DROP;",
+            "CREATE SUBSCRIPTION orders.b FROM orders.events MAX DELIVERY ATTEMPTS 2 EXTRA;",
+            "CREATE SUBSCRIPTION orders.b FROM orders.events MAX ATTEMPTS 2;",
+        ] {
+            assert!(parse_wcl(bad).is_err(), "{bad} should refuse");
+        }
+        // A zero budget is meaningless and also refuses at apply time for
+        // typed commands that bypass WCL.
+        let refused = controller
+            .execute_commands(vec![Command::CreateSubscription {
+                name: "orders.zero".to_owned(),
+                feed: Some("orders.events".to_owned()),
+                domain: None,
+                start: ReaderStart::Beginning,
+                delivery_delay_ns: None,
+                exhausted_policy: Some(SubscriptionExhaustedPolicy {
+                    max_delivery_attempts: 0,
+                    disposition: SubscriptionExhaustedDisposition::Skip,
+                }),
+            }])
+            .await;
+        assert!(refused.is_err());
     }
 
     #[tokio::test]
@@ -9829,6 +10065,7 @@ mod tests {
             domain: None,
             start: ReaderStart::Beginning,
             delivery_delay_ns: None,
+            exhausted_policy: None,
         };
         let first = controller
             .execute_commands_with_request_id(vec![command.clone()], request_id)
@@ -9879,6 +10116,7 @@ mod tests {
                 domain: None,
                 start: ReaderStart::Beginning,
                 delivery_delay_ns: None,
+                exhausted_policy: None,
             }])
             .await
             .is_err());
@@ -9889,6 +10127,7 @@ mod tests {
                 domain: None,
                 start: ReaderStart::Beginning,
                 delivery_delay_ns: None,
+                exhausted_policy: None,
             }])
             .await
             .is_err());
@@ -10359,6 +10598,7 @@ mod tests {
                 domain: None,
                 start: ReaderStart::Beginning,
                 delivery_delay_ns: None,
+                exhausted_policy: None,
             }])
             .await
             .unwrap();
@@ -10377,6 +10617,7 @@ mod tests {
                 domain: Some("orders".to_owned()),
                 start: ReaderStart::Beginning,
                 delivery_delay_ns: None,
+                exhausted_policy: None,
             }])
             .await
             .is_err());
@@ -10387,6 +10628,7 @@ mod tests {
                 domain: None,
                 start: ReaderStart::Beginning,
                 delivery_delay_ns: None,
+                exhausted_policy: None,
             }])
             .await
             .is_err());
@@ -10398,6 +10640,7 @@ mod tests {
                 domain: Some("orders".to_owned()),
                 start: ReaderStart::Beginning,
                 delivery_delay_ns: None,
+                exhausted_policy: None,
             }])
             .await
             .is_err());

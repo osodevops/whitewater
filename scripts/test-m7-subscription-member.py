@@ -92,33 +92,32 @@ def main():
 
     # The first join atomically establishes the beginning frontier and epoch 1.
     join_request = str(uuid.uuid4())
-    status, joined = post(ENDPOINTS[1], f"{members}/join", {"subscription": subscription, "request_id": join_request, "member_id": member})
-    if status != 200 or joined["member_epoch"] != 1: raise AssertionError(joined)
-    status, replay = post(ENDPOINTS[2], f"{members}/join", {"subscription": subscription, "request_id": join_request, "member_id": member})
-    if status != 200 or replay["member_epoch"] != 1: raise AssertionError(f"join replay returned a different epoch: {replay}")
+    joined = member_ready(ENDPOINTS[1], f"{members}/join", {"subscription": subscription, "request_id": join_request, "member_id": member})
+    if joined["member_epoch"] != 1:  raise AssertionError(joined)
+    replay = member_ready(ENDPOINTS[2], f"{members}/join", {"subscription": subscription, "request_id": join_request, "member_id": member})
+    if replay["member_epoch"] != 1:  raise AssertionError(f"join replay returned a different epoch: {replay}")
 
     # A fresh join request fences the earlier member epoch.
-    status, rejoined = post(ENDPOINTS[0], f"{members}/join", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member})
-    if status != 200 or rejoined["member_epoch"] != 2: raise AssertionError(rejoined)
+    rejoined = member_ready(ENDPOINTS[0], f"{members}/join", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member})
+    if rejoined["member_epoch"] != 2:  raise AssertionError(rejoined)
 
     # The fenced epoch cannot claim work.
     status, stale = post(ENDPOINTS[1], f"{members}/claim", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work})
     if status != 409: raise AssertionError(stale)
 
     # The live member claims work and fetches a bounded page after the frontier.
-    status, claimed = post(ENDPOINTS[2], f"{members}/claim", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work, "lease_ticks": 60})
-    if status != 200 or not claimed["lease"]: raise AssertionError(claimed)
+    claimed = member_ready(ENDPOINTS[2], f"{members}/claim", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work, "lease_ticks": 60})
+    if not claimed["lease"]:  raise AssertionError(claimed)
     lease_epoch = claimed["lease"]["lease_epoch"]
-    status, page = post(ENDPOINTS[0], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work, "lease_epoch": lease_epoch, "limit": 3})
-    if status != 200 or len(page["records"]) != 3 or not page["cursor"]: raise AssertionError(page)
+    page = member_ready(ENDPOINTS[0], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work, "lease_epoch": lease_epoch, "limit": 3})
+    if len(page["records"]) != 3 or not page["cursor"]:  raise AssertionError(page)
 
     # A stale lease epoch cannot fetch or acknowledge.
     status, refused = post(ENDPOINTS[1], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work, "lease_epoch": lease_epoch + 99})
     if status != 409: raise AssertionError(refused)
 
     # The valid grant acknowledges the delivered page atomically.
-    status, acked = post(ENDPOINTS[2], f"{members}/ack", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work, "lease_epoch": lease_epoch, "cursor": page["cursor"], "positions": page["positions"]})
-    if status != 200: raise AssertionError(acked)
+    acked = member_ready(ENDPOINTS[2], f"{members}/ack", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work, "lease_epoch": lease_epoch, "cursor": page["cursor"], "positions": page["positions"]})
 
     phase("join/claim/fetch/ack verified")
 
@@ -127,16 +126,16 @@ def main():
     # records are delivered under the source lease, then acknowledged only
     # by the transfer target.
     member_b = str(uuid.uuid4())
-    status, joined_b = post(ENDPOINTS[1], f"{members}/join", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member_b})
-    if status != 200 or joined_b["member_epoch"] != 1: raise AssertionError(joined_b)
+    joined_b = member_ready(ENDPOINTS[1], f"{members}/join", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member_b})
+    if joined_b["member_epoch"] != 1:  raise AssertionError(joined_b)
     work_b = str(uuid.uuid4())
-    status, claimed_b = post(ENDPOINTS[0], f"{members}/claim", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work_b, "lease_ticks": 60})
-    if status != 200 or not claimed_b["lease"]: raise AssertionError(claimed_b)
+    claimed_b = member_ready(ENDPOINTS[0], f"{members}/claim", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work_b, "lease_ticks": 60})
+    if not claimed_b["lease"]:  raise AssertionError(claimed_b)
     lease_b = claimed_b["lease"]["lease_epoch"]
-    status, page_b = post(ENDPOINTS[2], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work_b, "lease_epoch": lease_b})
-    if status != 200 or len(page_b["records"]) != 2: raise AssertionError(page_b)
-    status, moved = post(ENDPOINTS[1], f"{members}/transfer", {"subscription": subscription, "request_id": str(uuid.uuid4()), "work_id": work_b, "member_id": member, "lease_epoch": lease_b, "to_member_id": member_b, "to_member_epoch": joined_b["member_epoch"], "lease_ticks": 60})
-    if status != 200 or not moved["lease"]: raise AssertionError(moved)
+    page_b = member_ready(ENDPOINTS[2], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work_b, "lease_epoch": lease_b})
+    if len(page_b["records"]) != 2:  raise AssertionError(page_b)
+    moved = member_ready(ENDPOINTS[1], f"{members}/transfer", {"subscription": subscription, "request_id": str(uuid.uuid4()), "work_id": work_b, "member_id": member, "lease_epoch": lease_b, "to_member_id": member_b, "to_member_epoch": joined_b["member_epoch"], "lease_ticks": 60})
+    if not moved["lease"]:  raise AssertionError(moved)
     # The fenced holder can neither fetch nor acknowledge with the stale lease.
     status, refused = post(ENDPOINTS[0], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": work_b, "lease_epoch": lease_b})
     if status != 409: raise AssertionError(refused)
@@ -145,17 +144,15 @@ def main():
     # The new holder re-delivers and acknowledges the same unacked page; the
     # released transferred lease cannot fetch again.
     new_lease_b = moved["lease"]["lease_epoch"]
-    status, redelivered = post(ENDPOINTS[2], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member_b, "member_epoch": joined_b["member_epoch"], "work_id": work_b, "lease_epoch": new_lease_b})
-    if status != 200 or len(redelivered["records"]) != 2: raise AssertionError(redelivered)
-    status, acked = post(ENDPOINTS[0], f"{members}/ack", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member_b, "member_epoch": joined_b["member_epoch"], "work_id": work_b, "lease_epoch": new_lease_b, "cursor": redelivered["cursor"], "positions": redelivered["positions"]})
-    if status != 200: raise AssertionError(acked)
+    redelivered = member_ready(ENDPOINTS[2], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member_b, "member_epoch": joined_b["member_epoch"], "work_id": work_b, "lease_epoch": new_lease_b})
+    if len(redelivered["records"]) != 2:  raise AssertionError(redelivered)
+    acked = member_ready(ENDPOINTS[0], f"{members}/ack", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member_b, "member_epoch": joined_b["member_epoch"], "work_id": work_b, "lease_epoch": new_lease_b, "cursor": redelivered["cursor"], "positions": redelivered["positions"]})
     status, released = post(ENDPOINTS[2], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member_b, "member_epoch": joined_b["member_epoch"], "work_id": work_b, "lease_epoch": new_lease_b})
     if status != 409: raise AssertionError(released)
     # A fresh claim reaches the acknowledged end of the Feed.
-    status, tailclaim = post(ENDPOINTS[0], f"{members}/claim", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": str(uuid.uuid4())})
-    if status != 200: raise AssertionError(tailclaim)
-    status, tail = post(ENDPOINTS[2], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": tailclaim["lease"]["work_id"], "lease_epoch": tailclaim["lease"]["lease_epoch"]})
-    if status != 200 or tail["records"]: raise AssertionError(tail)
+    tailclaim = member_ready(ENDPOINTS[0], f"{members}/claim", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": str(uuid.uuid4())})
+    tail = member_ready(ENDPOINTS[2], f"{members}/fetch", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 2, "work_id": tailclaim["lease"]["work_id"], "lease_epoch": tailclaim["lease"]["lease_epoch"]})
+    if tail["records"]:  raise AssertionError(tail)
 
     phase("lease transfer fencing verified")
 
@@ -164,16 +161,15 @@ def main():
     now_sub = f"{domain}.realtime"
     status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {now_sub} FROM {feed} START AT NOW;"})
     if status != 200: raise AssertionError(declared)
-    status, joined = post(ENDPOINTS[1], f"{members}/join", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member})
-    if status != 200 or joined["member_epoch"] != 1: raise AssertionError(joined)
-    status, claimed = post(ENDPOINTS[2], f"{members}/claim", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work})
-    if status != 200: raise AssertionError(claimed)
-    status, page = post(ENDPOINTS[0], f"{members}/fetch", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work, "lease_epoch": claimed["lease"]["lease_epoch"]})
-    if status != 200 or page["records"]: raise AssertionError(f"now Subscription delivered pre-join records: {page}")
+    joined = member_ready(ENDPOINTS[1], f"{members}/join", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member})
+    if joined["member_epoch"] != 1:  raise AssertionError(joined)
+    claimed = member_ready(ENDPOINTS[2], f"{members}/claim", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work})
+    page = member_ready(ENDPOINTS[0], f"{members}/fetch", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work, "lease_epoch": claimed["lease"]["lease_epoch"]})
+    if page["records"]:  raise AssertionError(f"now Subscription delivered pre-join records: {page}")
     status, appended = post(ENDPOINTS[1], "/v1/writers/append", {"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": writer_epoch, "event_time_ns": "6", "key_base64": "aw==", "payload_base64": "dg==", "metadata_base64": {}})
     if status != 200: raise AssertionError(appended)
-    status, page = post(ENDPOINTS[2], f"{members}/fetch", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work, "lease_epoch": claimed["lease"]["lease_epoch"], "wait_ms": 2000})
-    if status != 200 or len(page["records"]) != 1: raise AssertionError(page)
+    page = member_ready(ENDPOINTS[2], f"{members}/fetch", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work, "lease_epoch": claimed["lease"]["lease_epoch"], "wait_ms": 2000})
+    if len(page["records"]) != 1:  raise AssertionError(page)
     phase("now start verified")
 
     # A standalone Reader exposes each record's opaque Cursor and ingest
@@ -195,13 +191,12 @@ def main():
     ts_sub = f"{domain}.timeshifted"
     status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {ts_sub} FROM {feed} START AT TIMESTAMP {threshold};"})
     if status != 200: raise AssertionError(declared)
-    status, joined = post(ENDPOINTS[1], f"{members}/join", {"subscription": ts_sub, "request_id": str(uuid.uuid4()), "member_id": member})
-    if status != 200 or joined["member_epoch"] != 1: raise AssertionError(joined)
-    status, claimed = post(ENDPOINTS[2], f"{members}/claim", {"subscription": ts_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work})
-    if status != 200: raise AssertionError(claimed)
-    status, page = post(ENDPOINTS[0], f"{members}/fetch", {"subscription": ts_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work, "lease_epoch": claimed["lease"]["lease_epoch"], "limit": 10})
+    joined = member_ready(ENDPOINTS[1], f"{members}/join", {"subscription": ts_sub, "request_id": str(uuid.uuid4()), "member_id": member})
+    if joined["member_epoch"] != 1:  raise AssertionError(joined)
+    claimed = member_ready(ENDPOINTS[2], f"{members}/claim", {"subscription": ts_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work})
+    page = member_ready(ENDPOINTS[0], f"{members}/fetch", {"subscription": ts_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work, "lease_epoch": claimed["lease"]["lease_epoch"], "limit": 10})
     expected = [row["event_time_ns"] for row in history if int(row["ingest_time_ns"]) >= threshold]
-    if status != 200 or [row["event_time_ns"] for row in page["records"]] != expected: raise AssertionError(page)
+    if [row["event_time_ns"] for row in page["records"]] != expected: raise AssertionError(page)
     phase("timestamp start verified")
 
     # An explicit-Cursor start resumes each internal Range after the last
@@ -211,14 +206,13 @@ def main():
     cursor_sub = f"{domain}.replaying"
     status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {cursor_sub} FROM {feed} START AT CURSOR '{boundary}';"})
     if status != 200: raise AssertionError(declared)
-    status, joined = post(ENDPOINTS[1], f"{members}/join", {"subscription": cursor_sub, "request_id": str(uuid.uuid4()), "member_id": member})
-    if status != 200 or joined["member_epoch"] != 1: raise AssertionError(joined)
-    status, claimed = post(ENDPOINTS[2], f"{members}/claim", {"subscription": cursor_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work})
-    if status != 200: raise AssertionError(claimed)
-    status, page = post(ENDPOINTS[0], f"{members}/fetch", {"subscription": cursor_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work, "lease_epoch": claimed["lease"]["lease_epoch"], "limit": 10})
+    joined = member_ready(ENDPOINTS[1], f"{members}/join", {"subscription": cursor_sub, "request_id": str(uuid.uuid4()), "member_id": member})
+    if joined["member_epoch"] != 1:  raise AssertionError(joined)
+    claimed = member_ready(ENDPOINTS[2], f"{members}/claim", {"subscription": cursor_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work})
+    page = member_ready(ENDPOINTS[0], f"{members}/fetch", {"subscription": cursor_sub, "request_id": str(uuid.uuid4()), "member_id": member, "member_epoch": 1, "work_id": work, "lease_epoch": claimed["lease"]["lease_epoch"], "limit": 10})
     boundary_index = next(index for index, row in enumerate(history) if row["cursor"] == boundary)
     expected = [row["event_time_ns"] for row in history[boundary_index + 1:]]
-    if status != 200 or [row["event_time_ns"] for row in page["records"]] != expected: raise AssertionError(page)
+    if [row["event_time_ns"] for row in page["records"]] != expected: raise AssertionError(page)
 
     # An unknown or foreign-Feed Cursor fails closed instead of guessing a
     # starting position.

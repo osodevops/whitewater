@@ -1685,6 +1685,7 @@ impl CutoverFrontierTranslation<'_> {
                 plan.split_at,
                 &frontier.positions,
                 &frontier.quarantined,
+                &frontier.skipped,
             ),
             Self::Merge {
                 left_entries,
@@ -1697,6 +1698,7 @@ impl CutoverFrontierTranslation<'_> {
                 plan.right_range_id,
                 &frontier.positions,
                 &frontier.quarantined,
+                &frontier.skipped,
             ),
         }
         .map_err(|error| ApiError::unavailable(error.to_string()))
@@ -1803,6 +1805,8 @@ async fn apply_pending_subscription_cutover(
             quarantined: pending.quarantined.clone(),
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
+            skipped: pending.skipped.clone(),
+            skip_add: BTreeMap::new(),
             tick: pending.tick,
             lease_ops: Vec::new(),
         };
@@ -1864,7 +1868,7 @@ fn subscription_cutover_translations(
     frontiers
         .iter()
         .map(|staged| {
-            let (positions, quarantined) = translation.translate(&staged.frontier)?;
+            let (positions, quarantined, skipped) = translation.translate(&staged.frontier)?;
             let sequence = staged.frontier.sequence.checked_add(1).ok_or_else(|| {
                 ApiError::unavailable("Subscription frontier sequence overflowed")
             })?;
@@ -1882,6 +1886,7 @@ fn subscription_cutover_translations(
                 cursor: format!("cutover:{plan_id}"),
                 positions,
                 quarantined,
+                skipped,
                 tick: staged.frontier.tick,
             })
         })
@@ -2005,7 +2010,10 @@ async fn member_coordinator_recovered(
     // and re-derives the CAS expected epoch, so a CAS that already landed
     // converges through adoption instead of guessing.
     let mut result = Err(SubscriptionProgressError::Unavailable);
-    for attempt in 0..6 {
+    // A restarted voter replays its catalog log before its progress replica
+    // answers current epochs; ride that convergence inside the bounded member
+    // request window rather than surfacing a transient quorum gap.
+    for attempt in 0..20 {
         result = coordinator
             .recover_lost_owner(state.progress_authority.as_ref())
             .await;
@@ -2013,7 +2021,7 @@ async fn member_coordinator_recovered(
             result,
             Err(SubscriptionProgressError::Unavailable) | Err(SubscriptionProgressError::NoQuorum)
         );
-        if !retryable || attempt == 5 {
+        if !retryable || attempt == 19 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
@@ -2269,6 +2277,8 @@ async fn subscription_member_join(
                 quarantined: BTreeMap::new(),
                 quarantine_add: BTreeMap::new(),
                 quarantine_remove: BTreeMap::new(),
+                skipped: BTreeMap::new(),
+                skip_add: BTreeMap::new(),
                 tick: 1,
                 lease_ops: vec![crate::reader::SubscriptionLeaseOp::Join {
                     member_id: request.member_id,
@@ -2562,6 +2572,7 @@ async fn subscription_member_ack(
                 member_epoch: request.member_epoch,
                 lease_epoch: request.lease_epoch,
                 expires_at_tick: 0,
+                exhausted_applied: false,
             };
             let tick = read_member_state(&coordinator)
                 .await?
@@ -2673,6 +2684,20 @@ struct SubscriptionMemberFetchResponse {
     /// Unix epoch nanoseconds (decimal string) at which the earliest
     /// delivery-delayed head becomes eligible; `None` when nothing is parked.
     next_delivery_ns: Option<String>,
+    /// Present when this fetch committed the Subscription's declared
+    /// exhausted-delivery disposition against the head the claim kept
+    /// redelivering: those positions moved to quarantine or the durable
+    /// skipped set, and the returned page is the work after them.
+    exhausted: Option<ExhaustedDeliveryEvidence>,
+}
+
+/// The positions an over-budget claim passed over under its declared
+/// disposition — durable evidence the member can inspect or resolve through
+/// quarantine release or an explicit Subscription SEEK.
+#[derive(Serialize)]
+struct ExhaustedDeliveryEvidence {
+    disposition: crate::control::SubscriptionExhaustedDisposition,
+    positions: BTreeMap<RangeId, Vec<String>>,
 }
 
 /// Delivers the bounded page of records after the shared Subscription frontier
@@ -2725,6 +2750,7 @@ async fn subscription_member_fetch(
         member_epoch: request.member_epoch,
         lease_epoch: request.lease_epoch,
         expires_at_tick: 0,
+        exhausted_applied: false,
     };
     let tracker = crate::reader::SubscriptionLeaseTracker::from_state(
         members.clone(),
@@ -2738,7 +2764,7 @@ async fn subscription_member_fetch(
             code: Some("lease.stale_lease"),
         });
     }
-    let frontier = coordinator
+    let mut frontier = coordinator
         .read_committed()
         .await
         .map_err(subscription_progress_api_error)?
@@ -2748,6 +2774,92 @@ async fn subscription_member_fetch(
     let eligible_ingest_ns = definition
         .delivery_delay_ns
         .map(|delay| unix_ns().saturating_sub(i64::try_from(delay).unwrap_or(i64::MAX)));
+    let mut exhausted: Option<ExhaustedDeliveryEvidence> = None;
+    if let Some(policy) = definition
+        .exhausted_policy
+        .filter(|policy| request.lease_epoch > policy.max_delivery_attempts)
+    {
+        let claim_unmarked = members.leases.get(&request.work_id).is_some_and(|lease| {
+            lease.member_id == request.member_id
+                && lease.member_epoch == request.member_epoch
+                && lease.lease_epoch == request.lease_epoch
+                && !lease.exhausted_applied
+        });
+        if frontier.request_id == request.request_id {
+            // A replayed fetch must surface the disposition its request
+            // committed rather than firing the policy on the next head.
+            if !frontier.lease_ops.iter().any(|op| {
+                matches!(
+                    op,
+                    crate::reader::SubscriptionLeaseOp::ApplyExhausted { work_id, .. }
+                        if *work_id == request.work_id
+                )
+            }) {
+                return Err(ApiError {
+                    status: StatusCode::CONFLICT,
+                    message: "request_id was already used for a different Subscription member                               mutation"
+                        .to_owned(),
+
+                    code: Some("conflict"),
+                });
+            }
+            exhausted = Some(ExhaustedDeliveryEvidence {
+                disposition: policy.disposition,
+                positions: match policy.disposition {
+                    crate::control::SubscriptionExhaustedDisposition::Quarantine => {
+                        frontier.quarantine_add.clone()
+                    }
+                    crate::control::SubscriptionExhaustedDisposition::Skip => {
+                        frontier.skip_add.clone()
+                    }
+                },
+            });
+        } else if claim_unmarked {
+            let (parked, exhausted_positions_map, _) =
+                fetch_frontier_page(&state, &frontier, limit, eligible_ingest_ns).await?;
+            if !parked.is_empty() {
+                let mut exhausted_positions: BTreeMap<RangeId, Vec<String>> = BTreeMap::new();
+                for (range_id, cursor, _) in &parked {
+                    exhausted_positions
+                        .entry(*range_id)
+                        .or_default()
+                        .push(cursor.clone());
+                }
+                let exhausted_cursor = parked
+                    .last()
+                    .map(|(_, cursor, _)| cursor.clone())
+                    .unwrap_or_else(|| frontier.cursor.clone());
+                // The marker lease op rides the same mutation: one commit
+                // both exhausts the positions and flags the claim, so a
+                // retried fetch cannot drain two pages under one epoch.
+                coordinator
+                    .apply_exhausted_delivery(
+                        &grant,
+                        members.last_tick,
+                        request.request_id,
+                        crate::reader::ExhaustedDelivery {
+                            cursor: exhausted_cursor,
+                            positions: exhausted_positions_map,
+                            exhausted: exhausted_positions.clone(),
+                            disposition: policy.disposition,
+                        },
+                    )
+                    .await
+                    .map_err(subscription_progress_api_error)?;
+                frontier = coordinator
+                    .read_committed()
+                    .await
+                    .map_err(subscription_progress_api_error)?
+                    .ok_or_else(|| {
+                        ApiError::unavailable("Subscription progress frontier is not established")
+                    })?;
+                exhausted = Some(ExhaustedDeliveryEvidence {
+                    disposition: policy.disposition,
+                    positions: exhausted_positions,
+                });
+            }
+        }
+    }
     let (delivered, positions, parked_ingest_ns) =
         fetch_frontier_page(&state, &frontier, limit, eligible_ingest_ns).await?;
     let next_delivery_ns =
@@ -2759,11 +2871,11 @@ async fn subscription_member_fetch(
                     .to_string()
             });
     let delivered_records = delivered.len() as u64;
-    let cursor = delivered.last().map(|(cursor, _)| cursor.clone());
+    let cursor = delivered.last().map(|(_, cursor, _)| cursor.clone());
     let source = record_source_by_id(&state, frontier.feed_id).await;
     let records = delivered
         .into_iter()
-        .map(|(frame_cursor, record)| {
+        .map(|(_, frame_cursor, record)| {
             record_response(
                 crate::domain::CursorRecord {
                     cursor: frame_cursor,
@@ -2793,6 +2905,7 @@ async fn subscription_member_fetch(
         ownership_epoch: progress_assignment.ownership_epoch,
         delivery_attempt: request.lease_epoch,
         next_delivery_ns,
+        exhausted,
     }))
 }
 
@@ -3144,6 +3257,8 @@ async fn subscription_seek(
         quarantined: frontier.quarantined.clone(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
+        skipped: frontier.skipped.clone(),
+        skip_add: BTreeMap::new(),
         tick: frontier.tick,
         lease_ops: Vec::new(),
     };
@@ -3190,7 +3305,7 @@ async fn fetch_frontier_page(
     eligible_ingest_ns: Option<i64>,
 ) -> Result<
     (
-        Vec<(String, StoredRecord)>,
+        Vec<(RangeId, String, StoredRecord)>,
         BTreeMap<RangeId, String>,
         Option<i64>,
     ),
@@ -3230,7 +3345,7 @@ async fn fetch_frontier_page(
 
     let mut heads: Vec<Option<((i64, Uuid), StoredRangeFrame)>> =
         (0..streams.len()).map(|_| None).collect();
-    let mut records: Vec<(String, StoredRecord)> = Vec::new();
+    let mut records: Vec<(RangeId, String, StoredRecord)> = Vec::new();
     let mut positions = frontier.positions.clone();
     let mut bytes = 0_usize;
     loop {
@@ -3268,7 +3383,7 @@ async fn fetch_frontier_page(
         let record = decode_record(&frame.frame)
             .map_err(|error| ApiError::unavailable(error.to_string()))?;
         positions.insert(streams[index].0, frame.cursor.clone());
-        records.push((frame.cursor, record));
+        records.push((streams[index].0, frame.cursor, record));
     }
     // The earliest parked head tells the caller when the next record becomes
     // eligible; with no cutoff nothing can be parked.
@@ -3467,10 +3582,10 @@ async fn drive_pipe(
                             .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
                     let cursor = delivered
                         .last()
-                        .map(|(cursor, _)| cursor.clone())
+                        .map(|(_, cursor, _)| cursor.clone())
                         .unwrap_or_else(|| frontier.cursor.clone());
                     let mut records = Vec::with_capacity(delivered.len());
-                    for (_, record) in delivered {
+                    for (_, _, record) in delivered {
                         if let Ok(mut tally) = tally.lock() {
                             tally.fetch_bytes = tally.fetch_bytes.saturating_add(
                                 (record.key.len()
@@ -3771,6 +3886,8 @@ async fn bootstrap_pipe_frontier(
         quarantined: BTreeMap::new(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+        skip_add: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     })
@@ -3900,6 +4017,7 @@ fn subscription_progress_api_error(error: SubscriptionProgressError) -> ApiError
     let status = match error {
         SubscriptionProgressError::Unavailable
         | SubscriptionProgressError::AmbiguousCommit
+        | SubscriptionProgressError::NoQuorum
         | SubscriptionProgressError::Engine(_)
         | SubscriptionProgressError::Serialization(_) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::CONFLICT,
@@ -6716,6 +6834,10 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
                 .map_or_else(BTreeMap::new, |prior| prior.quarantined.clone()),
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
+            skipped: committed
+                .as_ref()
+                .map_or_else(BTreeMap::new, |prior| prior.skipped.clone()),
+            skip_add: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -7227,141 +7349,177 @@ async fn reader_fetch(
         }));
     }
     let limit = pacing.max_records;
-    let timestamp_start = match (&reader.start, &reader.delivered_cursor) {
-        (crate::control::ReaderStart::Timestamp(value), None) => Some(*value),
-        _ => None,
-    };
-    let use_frontier = frontier.is_some()
-        || timestamp_start.is_none()
-            && reader.delivered_cursor.is_none()
-            && matches!(&reader.start, crate::control::ReaderStart::Beginning)
-            && read_placement(&state, reader.feed_id, &feed.name)
-                .await?
-                .len()
-                > 1;
-    let (mut frames, next_frontier) = if use_frontier {
-        let previous = frontier.map(|value| value.delivered).unwrap_or_default();
-        let (frames, progress) =
-            read_reader_frontier(&state, reader.feed_id, &feed.name, &previous, limit).await?;
-        (frames, Some(progress))
-    } else {
-        (
-            read_complete_feed(
-                &state,
-                reader.feed_id,
-                &feed.name,
-                reader.delivered_cursor.as_deref(),
-                if timestamp_start.is_some() {
-                    10_000
-                } else {
-                    limit
-                },
-                false,
-                timestamp_start.is_some(),
-            )
-            .await?,
-            None,
-        )
-    };
-    if let Some(timestamp) = timestamp_start {
-        frames.retain(|item| {
-            decode_record(&item.frame)
-                .map(|record| record.event_time_ns >= timestamp)
-                .unwrap_or(false)
-        });
-        frames.truncate(limit);
-    }
-    let source = record_source_by_id(&state, reader.feed_id).await;
-    let page_bytes = frames
-        .iter()
-        .map(|item| item.frame.len().saturating_add(item.cursor.len()))
-        .sum::<usize>();
-    let records = frames
-        .into_iter()
-        .map(|item| {
-            decode_record(&item.frame).map(|record| {
-                record_response(
-                    CursorRecord {
-                        cursor: item.cursor,
-                        record,
-                    },
-                    source.clone(),
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| ApiError::unavailable(error.to_string()))?;
-    let delivered_cursor = records
-        .last()
-        .map(|record| {
-            if next_frontier.is_some() {
-                reader_frontier_cursor(reader.reader_id, request.session_epoch, request.request_id)
-            } else {
-                record.cursor.clone()
-            }
-        })
-        .or(reader.delivered_cursor.clone());
-    if !records.is_empty() {
-        let cursor = delivered_cursor
-            .clone()
-            .ok_or_else(|| ApiError::unavailable("Reader progress token is unavailable"))?;
-        let expected_frontier = next_frontier.clone();
-        let persisted_token = cursor.clone();
-        let command = if let Some(positions) = next_frontier {
-            crate::control::Command::RecordReaderFrontier {
-                reader: request.reader.clone(),
-                session_epoch: request.session_epoch,
-                cursor,
-                positions,
-                expected_cursor: reader.delivered_cursor.clone(),
-                fence_delivery: true,
-                fetch_request_id: Some(request.request_id),
-                fetch_limit: Some(limit),
-                fetch_retry_after_ms: Some(
-                    pacing.retry_after.as_millis().min(u64::MAX as u128) as u64
-                ),
-            }
-        } else {
-            crate::control::Command::RecordReaderDelivery {
-                reader: request.reader.clone(),
-                session_epoch: request.session_epoch,
-                cursor,
-            }
-        };
-        let execution = match execute_reader_command(&state, command, request.request_id).await {
-            Ok(execution) => execution,
-            Err(error) => {
-                if expected_frontier.is_some() {
-                    // A duplicate racing the same fetch_request_id loses the
-                    // frontier commit after the winner landed; re-derive the
-                    // stored page instead of refusing when it proves identical.
-                    if let Ok(response) =
-                        replay_reader_fetch(&state, &reader, &feed.name, &request).await
-                    {
-                        return Ok(response);
-                    }
-                }
-                return Err(
-                    if expected_frontier.is_some() && error.status == StatusCode::BAD_REQUEST {
-                        ApiError::unavailable(format!(
-                        "Reader progress was not committed; reopen the session to retry safely: {}",
-                        error.message
-                    ))
-                    } else {
-                        error
-                    },
-                );
-            }
-        };
-        if let Some(positions) = expected_frontier {
-            verify_reader_frontier_result(
-                &execution,
-                &persisted_token,
-                &positions,
-                request.request_id,
-            )?;
+    // A sibling fetch committed through another ingress can land on the
+    // replicated catalog before this Node applies it: the delivered-Cursor
+    // CAS then fences our stale expectation. Re-resolve the definition and
+    // frontier and re-derive the page a bounded number of times rather than
+    // reporting a session error for applied-catalog lag; a genuinely
+    // concurrent commit still fences after the bound.
+    let mut stale_delivery_attempts = 0;
+    let (records, delivered_cursor, page_bytes) = loop {
+        let frontier = state.control.active_reader_frontier(reader.reader_id).await;
+        if frontier
+            .as_ref()
+            .and_then(|value| value.last_fetch_request_id)
+            == Some(request.request_id)
+        {
+            return replay_reader_fetch(&state, &reader, &feed.name, &request).await;
         }
-    }
+        if stale_delivery_attempts > 0 {
+            if let Some(fresh) = state.control.active_reader_by_name(&request.reader).await {
+                reader = fresh;
+            }
+        }
+        let timestamp_start = match (&reader.start, &reader.delivered_cursor) {
+            (crate::control::ReaderStart::Timestamp(value), None) => Some(*value),
+            _ => None,
+        };
+        let use_frontier = frontier.is_some()
+            || timestamp_start.is_none()
+                && reader.delivered_cursor.is_none()
+                && matches!(&reader.start, crate::control::ReaderStart::Beginning)
+                && read_placement(&state, reader.feed_id, &feed.name)
+                    .await?
+                    .len()
+                    > 1;
+        let (mut frames, next_frontier) = if use_frontier {
+            let previous = frontier.map(|value| value.delivered).unwrap_or_default();
+            let (frames, progress) =
+                read_reader_frontier(&state, reader.feed_id, &feed.name, &previous, limit).await?;
+            (frames, Some(progress))
+        } else {
+            (
+                read_complete_feed(
+                    &state,
+                    reader.feed_id,
+                    &feed.name,
+                    reader.delivered_cursor.as_deref(),
+                    if timestamp_start.is_some() {
+                        10_000
+                    } else {
+                        limit
+                    },
+                    false,
+                    timestamp_start.is_some(),
+                )
+                .await?,
+                None,
+            )
+        };
+        if let Some(timestamp) = timestamp_start {
+            frames.retain(|item| {
+                decode_record(&item.frame)
+                    .map(|record| record.event_time_ns >= timestamp)
+                    .unwrap_or(false)
+            });
+            frames.truncate(limit);
+        }
+        let source = record_source_by_id(&state, reader.feed_id).await;
+        let page_bytes = frames
+            .iter()
+            .map(|item| item.frame.len().saturating_add(item.cursor.len()))
+            .sum::<usize>();
+        let records = frames
+            .into_iter()
+            .map(|item| {
+                decode_record(&item.frame).map(|record| {
+                    record_response(
+                        CursorRecord {
+                            cursor: item.cursor,
+                            record,
+                        },
+                        source.clone(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        let delivered_cursor = records
+            .last()
+            .map(|record| {
+                if next_frontier.is_some() {
+                    reader_frontier_cursor(
+                        reader.reader_id,
+                        request.session_epoch,
+                        request.request_id,
+                    )
+                } else {
+                    record.cursor.clone()
+                }
+            })
+            .or(reader.delivered_cursor.clone());
+        if !records.is_empty() {
+            let cursor = delivered_cursor
+                .clone()
+                .ok_or_else(|| ApiError::unavailable("Reader progress token is unavailable"))?;
+            let expected_frontier = next_frontier.clone();
+            let persisted_token = cursor.clone();
+            let command = if let Some(positions) = next_frontier {
+                crate::control::Command::RecordReaderFrontier {
+                    reader: request.reader.clone(),
+                    session_epoch: request.session_epoch,
+                    cursor,
+                    positions,
+                    expected_cursor: reader.delivered_cursor.clone(),
+                    fence_delivery: true,
+                    fetch_request_id: Some(request.request_id),
+                    fetch_limit: Some(limit),
+                    fetch_retry_after_ms: Some(
+                        pacing.retry_after.as_millis().min(u64::MAX as u128) as u64,
+                    ),
+                }
+            } else {
+                crate::control::Command::RecordReaderDelivery {
+                    reader: request.reader.clone(),
+                    session_epoch: request.session_epoch,
+                    cursor,
+                }
+            };
+            let execution = match execute_reader_command(&state, command, request.request_id).await
+            {
+                Ok(execution) => execution,
+                Err(error) => {
+                    if expected_frontier.is_some() {
+                        // A duplicate racing the same fetch_request_id loses the
+                        // frontier commit after the winner landed; re-derive the
+                        // stored page instead of refusing when it proves identical.
+                        if let Ok(response) =
+                            replay_reader_fetch(&state, &reader, &feed.name, &request).await
+                        {
+                            return Ok(response);
+                        }
+                    }
+                    if expected_frontier.is_some()
+                        && error.message.contains("delivery advanced concurrently")
+                        && stale_delivery_attempts < 2
+                    {
+                        stale_delivery_attempts += 1;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        continue;
+                    }
+                    return Err(
+                        if expected_frontier.is_some() && error.status == StatusCode::BAD_REQUEST {
+                            ApiError::unavailable(format!(
+                            "Reader progress was not committed; reopen the session to retry safely: {}",
+                            error.message
+                        ))
+                        } else {
+                            error
+                        },
+                    );
+                }
+            };
+            if let Some(positions) = expected_frontier {
+                verify_reader_frontier_result(
+                    &execution,
+                    &persisted_token,
+                    &positions,
+                    request.request_id,
+                )?;
+            }
+        }
+        break (records, delivered_cursor, page_bytes);
+    };
     state.demand.record_read(records.len());
     record_reader_traffic(
         &state,
@@ -10493,6 +10651,7 @@ async fn admin_subscription_progress(
             "ownership_epoch": mutation.ownership_epoch,
             "tick": mutation.tick,
             "quarantined": mutation.quarantined,
+            "skipped": mutation.skipped,
         })
     });
     let member_state = coordinator.member_state().await.ok();
@@ -16385,6 +16544,7 @@ mod tests {
                         domain: None,
                         start: crate::control::ReaderStart::Beginning,
                         delivery_delay_ns: None,
+                        exhausted_policy: None,
                     },
                 ])
                 .await
@@ -16795,6 +16955,8 @@ mod tests {
             quarantined: BTreeMap::new(),
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
+            skipped: BTreeMap::new(),
+            skip_add: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -16928,6 +17090,8 @@ mod tests {
             quarantined: BTreeMap::new(),
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
+            skipped: BTreeMap::new(),
+            skip_add: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -17142,6 +17306,8 @@ mod tests {
             quarantined: BTreeMap::new(),
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
+            skipped: BTreeMap::new(),
+            skip_add: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -18265,6 +18431,7 @@ mod tests {
                         (right_range, "right-2".to_owned()),
                     ]),
                     quarantined: BTreeMap::new(),
+                    skipped: BTreeMap::new(),
                     tick: 5,
                 }],
             }])
@@ -18293,7 +18460,7 @@ mod tests {
         .unwrap_err();
         // With no reachable progress quorum the pending apply fails before
         // the drive; whatever its error, the drive must not proceed past it.
-        assert_eq!(error.status, StatusCode::CONFLICT);
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(control
             .pending_subscription_cutover(subscription.subscription_id)
             .await
@@ -20001,6 +20168,7 @@ mod tests {
                     domain: None,
                     start: crate::control::ReaderStart::Beginning,
                     delivery_delay_ns: None,
+                    exhausted_policy: None,
                 },
                 Command::CreateSubscription {
                     name: "orders.fresh".to_owned(),
@@ -20008,6 +20176,7 @@ mod tests {
                     domain: None,
                     start: crate::control::ReaderStart::Beginning,
                     delivery_delay_ns: None,
+                    exhausted_policy: None,
                 },
                 Command::CreateSubscription {
                     name: "orders.now".to_owned(),
@@ -20015,6 +20184,29 @@ mod tests {
                     domain: None,
                     start: crate::control::ReaderStart::Now,
                     delivery_delay_ns: None,
+                    exhausted_policy: None,
+                },
+                Command::CreateSubscription {
+                    name: "orders.budget".to_owned(),
+                    feed: Some("orders.events".to_owned()),
+                    domain: None,
+                    start: crate::control::ReaderStart::Beginning,
+                    delivery_delay_ns: None,
+                    exhausted_policy: Some(crate::control::SubscriptionExhaustedPolicy {
+                        max_delivery_attempts: 1,
+                        disposition: crate::control::SubscriptionExhaustedDisposition::Quarantine,
+                    }),
+                },
+                Command::CreateSubscription {
+                    name: "orders.skipper".to_owned(),
+                    feed: Some("orders.events".to_owned()),
+                    domain: None,
+                    start: crate::control::ReaderStart::Beginning,
+                    delivery_delay_ns: None,
+                    exhausted_policy: Some(crate::control::SubscriptionExhaustedPolicy {
+                        max_delivery_attempts: 1,
+                        disposition: crate::control::SubscriptionExhaustedDisposition::Skip,
+                    }),
                 },
             ])
             .await
@@ -20202,6 +20394,8 @@ mod tests {
                 quarantined: BTreeMap::new(),
                 quarantine_add: BTreeMap::new(),
                 quarantine_remove: BTreeMap::new(),
+                skipped: BTreeMap::new(),
+                skip_add: BTreeMap::new(),
                 tick: 0,
                 lease_ops: Vec::new(),
             })
@@ -20973,6 +21167,207 @@ mod tests {
             "served reads must attribute egress frame bytes: {read_bytes}"
         );
 
+        // Declared retry budget: a claim reclaimed past its attempt bound
+        // commits the exhausted disposition once — quarantine parks the
+        // head positions durably — then the same fetch serves what follows.
+        let (status, body) = post(
+            "join",
+            json!({"subscription": "orders.budget", "request_id": Uuid::from_u128(60),
+                "member_id": member}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.budget", "request_id": Uuid::from_u128(61),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_ticks": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["lease"]["lease_epoch"], json!(1));
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.budget", "request_id": Uuid::from_u128(62),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_epoch": 1, "limit": 2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["exhausted"].is_null(), "{body}");
+        assert_eq!(
+            body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["cursor"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["cursor-1", "cursor-2"]
+        );
+        // The member never acknowledges; another member op bumps the shared
+        // tick past the 1-tick lease so a reclaim counts a second attempt.
+        let (status, body) = post(
+            "join",
+            json!({"subscription": "orders.budget", "request_id": Uuid::from_u128(63),
+                "member_id": other}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.budget", "request_id": Uuid::from_u128(64),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_ticks": 60}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["lease"]["lease_epoch"], json!(2));
+        assert_eq!(body["lease"]["exhausted_applied"], json!(false));
+        // Attempt 2 exceeds the declared budget of 1: the redelivered head
+        // commits to quarantine in the same mutation that marks the claim,
+        // and the fetch keeps serving the records behind it.
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.budget", "request_id": Uuid::from_u128(65),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_epoch": 2, "limit": 2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["exhausted"]["disposition"], json!("quarantine"));
+        assert_eq!(
+            body["exhausted"]["positions"][progress_range.to_string()],
+            json!(["cursor-1", "cursor-2"])
+        );
+        assert_eq!(
+            body["records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|record| record["cursor"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>(),
+            vec!["cursor-3", "cursor-4"]
+        );
+        // A replayed fetch request replays the recorded disposition rather
+        // than exhausting the next head under the same request identity.
+        let (status, replay) = post(
+            "fetch",
+            json!({"subscription": "orders.budget", "request_id": Uuid::from_u128(65),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_epoch": 2, "limit": 2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["exhausted"], body["exhausted"]);
+        // The marked claim keeps serving without firing again; delivery
+        // is non-destructive, so the same page returns until the member
+        // acknowledges it.
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.budget", "request_id": Uuid::from_u128(66),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_epoch": 2, "limit": 2}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["exhausted"].is_null(), "{body}");
+        assert_eq!(
+            body["records"].as_array().unwrap()[0]["cursor"],
+            json!("cursor-3")
+        );
+        // The durable evidence is visible on the operator progress view.
+        let response = client
+            .get(format!(
+                "{}/v1/admin/subscriptions/progress?subscription=orders.budget",
+                endpoints[&nodes[0]]
+            ))
+            .header("authorization", "Bearer this-is-a-long-development-api-key")
+            .send()
+            .await
+            .unwrap();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["committed"]["quarantined"][progress_range.to_string()],
+            json!(["cursor-1", "cursor-2"])
+        );
+
+        // THEN SKIP is the final-disposition variant: positions advance
+        // permanently into the bounded `skipped` evidence set rather than
+        // the releasable quarantine set.
+        let (status, body) = post(
+            "join",
+            json!({"subscription": "orders.skipper", "request_id": Uuid::from_u128(70),
+                "member_id": member}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.skipper", "request_id": Uuid::from_u128(71),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_ticks": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.skipper", "request_id": Uuid::from_u128(72),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_epoch": 1, "limit": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post(
+            "join",
+            json!({"subscription": "orders.skipper", "request_id": Uuid::from_u128(73),
+                "member_id": other}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = post(
+            "claim",
+            json!({"subscription": "orders.skipper", "request_id": Uuid::from_u128(74),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_ticks": 60}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["lease"]["lease_epoch"], json!(2));
+        let (status, body) = post(
+            "fetch",
+            json!({"subscription": "orders.skipper", "request_id": Uuid::from_u128(75),
+                "member_id": member, "member_epoch": 1, "work_id": work,
+                "lease_epoch": 2, "limit": 1}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["exhausted"]["disposition"], json!("skip"));
+        assert_eq!(
+            body["exhausted"]["positions"][progress_range.to_string()],
+            json!(["cursor-1"])
+        );
+        assert_eq!(
+            body["records"].as_array().unwrap()[0]["cursor"],
+            json!("cursor-2")
+        );
+        let response = client
+            .get(format!(
+                "{}/v1/admin/subscriptions/progress?subscription=orders.skipper",
+                endpoints[&nodes[0]]
+            ))
+            .header("authorization", "Bearer this-is-a-long-development-api-key")
+            .send()
+            .await
+            .unwrap();
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(
+            body["committed"]["skipped"][progress_range.to_string()],
+            json!(["cursor-1"])
+        );
+        assert!(body["committed"]["quarantined"]
+            .as_object()
+            .is_none_or(|held| held.is_empty()));
+
         // A lost progress owner leaves member reads on surviving quorum
         // evidence while the next mutation transparently recovers placement
         // onto an eligible replica.
@@ -21097,6 +21492,8 @@ mod tests {
                 quarantined: BTreeMap::new(),
                 quarantine_add: BTreeMap::new(),
                 quarantine_remove: BTreeMap::new(),
+                skipped: BTreeMap::new(),
+                skip_add: BTreeMap::new(),
                 tick: 0,
                 lease_ops: Vec::new(),
             };

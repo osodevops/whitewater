@@ -274,6 +274,7 @@ impl Fixture {
                 domain: None,
                 start: ReaderStart::Beginning,
                 delivery_delay_ns: None,
+                exhausted_policy: None,
             }])
             .await
             .unwrap();
@@ -685,6 +686,8 @@ async fn drain_executor_vacates_subscription_progress_references() {
             quarantined: BTreeMap::new(),
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
+            skipped: BTreeMap::new(),
+            skip_add: BTreeMap::new(),
             tick: 1,
             lease_ops: Vec::new(),
         })

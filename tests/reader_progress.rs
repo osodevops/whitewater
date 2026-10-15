@@ -216,13 +216,14 @@ fn split_subscription_frontier_rekeys_positions_and_quarantine() {
         ),
         (other, vec!["other-quarantine".to_string()]),
     ]);
-    let (positions, quarantined) = translate_split_subscription_frontier(
+    let (positions, quarantined, _skipped) = translate_split_subscription_frontier(
         &rows,
         source,
         right,
         split_at,
         &positions,
         &quarantined,
+        &BTreeMap::new(),
     )
     .unwrap();
     // Acknowledged cursor-3 acks left through position 3 and right through
@@ -276,13 +277,14 @@ fn merge_subscription_frontier_rekeys_positions_and_quarantine() {
         ),
         (other, vec!["other-quarantine".to_string()]),
     ]);
-    let (positions, quarantined) = translate_merge_subscription_frontier(
+    let (positions, quarantined, _skipped) = translate_merge_subscription_frontier(
         &left_rows,
         &right_rows,
         left,
         right,
         &positions,
         &quarantined,
+        &BTreeMap::new(),
     )
     .unwrap();
     // Ingest ordering interleaves cursor-1 (left pos 1), cursor-2 (right pos
@@ -328,6 +330,7 @@ fn subscription_frontier_translation_rejects_missing_ranges_and_stale_lineage() 
             right,
             split_at,
             &no_positions,
+            &no_quarantine,
             &no_quarantine
         ),
         Err(ReaderFrontierTranslationError::InvalidSources)
@@ -339,6 +342,7 @@ fn subscription_frontier_translation_rejects_missing_ranges_and_stale_lineage() 
             left,
             right,
             &no_positions,
+            &no_quarantine,
             &no_quarantine
         ),
         Err(ReaderFrontierTranslationError::InvalidSources)
@@ -346,7 +350,15 @@ fn subscription_frontier_translation_rejects_missing_ranges_and_stale_lineage() 
     // A Cursor absent from the frozen lineage must not translate.
     let stale = BTreeMap::from([(left, "not-in-history".to_string())]);
     assert!(matches!(
-        translate_split_subscription_frontier(&rows, left, right, split_at, &stale, &no_quarantine),
+        translate_split_subscription_frontier(
+            &rows,
+            left,
+            right,
+            split_at,
+            &stale,
+            &no_quarantine,
+            &no_quarantine
+        ),
         Err(ReaderFrontierTranslationError::MissingCursor)
     ));
     // Gapped or duplicated lineage stays a hard refusal through the
@@ -361,6 +373,7 @@ fn subscription_frontier_translation_rejects_missing_ranges_and_stale_lineage() 
             right,
             split_at,
             &frontier,
+            &no_quarantine,
             &no_quarantine
         ),
         Err(ReaderFrontierTranslationError::InvalidHistory)
@@ -375,6 +388,7 @@ fn subscription_frontier_translation_rejects_missing_ranges_and_stale_lineage() 
             left,
             right,
             &merge_frontier,
+            &no_quarantine,
             &no_quarantine
         ),
         Err(ReaderFrontierTranslationError::InvalidHistory)
@@ -744,6 +758,8 @@ async fn subscription_coordinator_uses_private_catalog_placement_and_refuses_leg
         quarantined: BTreeMap::new(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+        skip_add: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -821,6 +837,8 @@ async fn quorum_subscription_read_fails_closed_on_loss_disagreement_and_ambiguou
         quarantined: BTreeMap::new(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+        skip_add: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -937,6 +955,8 @@ async fn ambiguous_subscription_retry_reconciles_after_restart_without_guessing(
         quarantined: BTreeMap::new(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+        skip_add: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -1040,6 +1060,8 @@ async fn progress_coordinator_refuses_replies_claiming_another_replica() {
         quarantined: BTreeMap::new(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+        skip_add: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -1109,6 +1131,8 @@ async fn subscription_progress_coordinator_requires_matching_prepare_and_commit_
         quarantined: BTreeMap::new(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+        skip_add: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -1213,6 +1237,8 @@ async fn subscription_progress_coordinator_refuses_contradictory_replica_evidenc
         quarantined: BTreeMap::new(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+        skip_add: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -1260,6 +1286,8 @@ fn prepared_subscription_progress_remains_invisible_after_replica_restart() {
         quarantined: BTreeMap::new(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+        skip_add: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -1540,6 +1568,8 @@ fn progress_mutation(
         quarantined: BTreeMap::new(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+        skip_add: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     }
@@ -2593,6 +2623,7 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
         member_epoch: 1,
         lease_epoch: lease.lease_epoch,
         expires_at_tick: lease.expires_at_tick,
+        exhausted_applied: false,
     };
     assert_eq!(grant.expires_at_tick, 40);
     assert!(coordinator.can_member_ack(&grant, 20).await.unwrap());
@@ -2686,6 +2717,7 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
         member_epoch: 1,
         lease_epoch: members.leases[&work].lease_epoch,
         expires_at_tick: members.leases[&work].expires_at_tick,
+        exhausted_applied: false,
     };
     assert!(!coordinator
         .can_member_ack(&renewed_grant, 36)
@@ -3058,6 +3090,7 @@ async fn subscription_acks_carry_a_bounded_quarantine_set() {
         member_epoch: 1,
         lease_epoch: lease.lease_epoch,
         expires_at_tick: lease.expires_at_tick,
+        exhausted_applied: false,
     };
 
     // An ack may only quarantine positions inside the ranges it commits;
@@ -3129,6 +3162,7 @@ async fn subscription_acks_carry_a_bounded_quarantine_set() {
     let grant = SubscriptionWorkLease {
         lease_epoch: lease.lease_epoch,
         expires_at_tick: lease.expires_at_tick,
+        exhausted_applied: false,
         ..grant
     };
     let acked = coordinator

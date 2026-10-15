@@ -339,6 +339,17 @@ CREATE SUBSCRIPTION orders.delayed
 
 A not-yet-eligible record stays parked: it never advances the frontier early and cannot be overtaken within its own key order, while already-eligible records continue to deliver. Member fetches and declared Pipes honor the same delay, the member fetch response reports `next_delivery_ns` when work is parked, and a zero duration is refused.
 
+An optional `MAX DELIVERY ATTEMPTS <n> THEN QUARANTINE|SKIP` tail bounds redelivery of a stuck head. A claim's durable delivery-attempt count is its work-lease epoch — it only advances when abandoned work is genuinely reclaimed (expiry or member transfer), never on a clean acknowledge:
+
+```sql
+CREATE SUBSCRIPTION orders.payments
+  FROM orders.created
+  START AT BEGINNING
+  MAX DELIVERY ATTEMPTS 5 THEN QUARANTINE;
+```
+
+When a claim arrives at an attempt beyond the budget, the fetch commits the declared disposition against the would-be page and serves the records behind it in the same response — `THEN QUARANTINE` moves the head positions into the releasable quarantine evidence set for later SEEK/reprocessing, while `THEN SKIP` records them in the bounded `skipped` set as a final disposition. The decision commits atomically with the frontier mutation and a once-only marker on the claim, so a retried fetch replays the recorded disposition rather than draining a second page, and a stale member or expired lease is fenced. The fetch response reports the committed `exhausted` evidence (`disposition` plus the per-range positions passed over), and the admin progress view exposes the durable `skipped` set alongside `quarantined`. A zero budget is refused.
+
 Either way the Subscription remains `declared` until member delivery lands: it does not create an internal Feed, permit joining members, or establish shared Cursor progress yet — member Feeds attach in the same catalog commit that creates them (existing Feeds honor the declared start, newly discovered Feeds start at their first retained record), a Feed moved to another Domain drains its fenced membership rather than silently discarding pending work, and `DESCRIBE SUBSCRIPTION` reports per-Feed `member_feeds` states; member join itself stays refused honestly until shared delivery lands. Existing named Readers remain independent and are not silently converted into shared Subscriptions.
 
 
