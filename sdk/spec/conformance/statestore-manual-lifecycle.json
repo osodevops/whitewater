@@ -5,7 +5,8 @@
     "statestore.mutate",
     "statestore.lookup",
     "statestore.get_by",
-    "statestore.iterate"
+    "statestore.iterate",
+    "statestore.clear"
   ],
   "steps": [
     {
@@ -77,6 +78,49 @@
       "args": {
         "store": "ss{{uniq}}.profiles",
         "key": {"utf8": "emp-1"},
+        "wait_ms": 5000
+      },
+      "expect": {"found": false}
+    },
+    {
+      "op": "statestore.mutate",
+      "args": {
+        "store": "ss{{uniq}}.profiles",
+        "mutation_id": "{{uuid:put2}}",
+        "kind": "put_row",
+        "key": {"utf8": "emp-2"},
+        "payload": {"utf8": "bob"},
+        "named": [{"name": "department", "values": [{"kind": "text", "value": "ops"}]}]
+      },
+      "expect": {"deduplicated": false}
+    },
+    {
+      "op": "statestore.clear",
+      "args": {
+        "store": "ss{{uniq}}.profiles",
+        "mutation_id": "{{uuid:clear1}}"
+      },
+      "bind": "clear",
+      "expect": {"deduplicated": false, "sequence": "present"}
+    },
+    {
+      "op": "statestore.clear",
+      "args": {
+        "store": "ss{{uniq}}.profiles",
+        "mutation_id": "{{uuid:clear1}}"
+      },
+      "expect": {"deduplicated": true, "sequence": "==clear.sequence"}
+    },
+    {
+      "op": "statestore.iterate",
+      "args": {"store": "ss{{uniq}}.profiles", "limit": 10},
+      "expect": {"rows[0]": "absent"}
+    },
+    {
+      "op": "statestore.lookup",
+      "args": {
+        "store": "ss{{uniq}}.profiles",
+        "key": {"utf8": "emp-2"},
         "wait_ms": 5000
       },
       "expect": {"found": false}
