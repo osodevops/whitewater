@@ -10,10 +10,11 @@ use whitewater::{
     active_range::{KeyToken, RangeId, RangePosition, ReplicaSet, StorageNodeId},
     control::{Command, ControlController},
     reader::{
-        translate_merge_reader_frontier, translate_split_reader_frontier, FjallReaderProgressStore,
-        FjallSubscriptionProgressReplica, ReaderDeliveryMutation, ReaderDeliveryReceipt,
-        ReaderFrontierTranslationError, ReaderLineageEntry, ReaderPacingController,
-        ReaderPressureSample, ReaderProgressEngine, ReaderProgressError,
+        translate_merge_reader_frontier, translate_merge_subscription_frontier,
+        translate_split_reader_frontier, translate_split_subscription_frontier,
+        FjallReaderProgressStore, FjallSubscriptionProgressReplica, ReaderDeliveryMutation,
+        ReaderDeliveryReceipt, ReaderFrontierTranslationError, ReaderLineageEntry,
+        ReaderPacingController, ReaderPressureSample, ReaderProgressEngine, ReaderProgressError,
         SubscriptionCommitEvidence, SubscriptionMemberState, SubscriptionPrepareVote,
         SubscriptionProgressAssignment, SubscriptionProgressCoordinator, SubscriptionProgressError,
         SubscriptionProgressInspection, SubscriptionProgressMutation,
@@ -178,6 +179,204 @@ fn frontier_translation_rejects_ambiguous_and_oversized_source_history() {
     conflicting_right[0].cursor = left_rows[0].cursor.clone();
     assert!(matches!(
         translate_merge_reader_frontier(&left_rows, &conflicting_right, left, right, "", ""),
+        Err(ReaderFrontierTranslationError::InvalidHistory)
+    ));
+}
+
+#[test]
+fn split_subscription_frontier_rekeys_positions_and_quarantine() {
+    let source = RangeId::from_uuid(Uuid::from_u128(601));
+    let right = RangeId::from_uuid(Uuid::from_u128(602));
+    let other = RangeId::from_uuid(Uuid::from_u128(603));
+    let split_at = KeyToken::from_bytes([0x80; 16]);
+    // Odd positions fall below the split token (left child keeps `source`),
+    // even positions move to `right`.
+    let rows = (1..=4)
+        .map(|position| ReaderLineageEntry {
+            range_id: source,
+            position: RangePosition::new(position),
+            cursor: format!("cursor-{position}"),
+            key_token: KeyToken::from_bytes([if position % 2 == 0 { 0xf0 } else { 0x10 }; 16]),
+            ingest_time_ns: position as i64,
+            message_id: Uuid::from_u128(position as u128),
+        })
+        .collect::<Vec<_>>();
+    let positions = BTreeMap::from([
+        (source, "cursor-3".to_string()),
+        (other, "other-cursor".to_string()),
+    ]);
+    let quarantined = BTreeMap::from([
+        (
+            source,
+            vec![
+                "cursor-1".to_string(),
+                "cursor-4".to_string(),
+                "outside-lineage".to_string(),
+            ],
+        ),
+        (other, vec!["other-quarantine".to_string()]),
+    ]);
+    let (positions, quarantined) = translate_split_subscription_frontier(
+        &rows,
+        source,
+        right,
+        split_at,
+        &positions,
+        &quarantined,
+    )
+    .unwrap();
+    // Acknowledged cursor-3 acks left through position 3 and right through
+    // position 2; untouched ranges pass through unchanged.
+    assert_eq!(positions[&source], "cursor-3");
+    assert_eq!(positions[&right], "cursor-2");
+    assert_eq!(positions[&other], "other-cursor");
+    assert_eq!(positions.len(), 3);
+    assert_eq!(
+        quarantined[&source],
+        vec!["cursor-1".to_string(), "outside-lineage".to_string()]
+    );
+    assert_eq!(quarantined[&right], vec!["cursor-4".to_string()]);
+    assert_eq!(quarantined[&other], vec!["other-quarantine".to_string()]);
+}
+
+#[test]
+fn merge_subscription_frontier_rekeys_positions_and_quarantine() {
+    let left = RangeId::from_uuid(Uuid::from_u128(701));
+    let right = RangeId::from_uuid(Uuid::from_u128(702));
+    let other = RangeId::from_uuid(Uuid::from_u128(703));
+    let build = |range_id: RangeId, positions: &[u64]| {
+        positions
+            .iter()
+            .enumerate()
+            .map(|(index, position)| ReaderLineageEntry {
+                range_id,
+                position: RangePosition::new(index as u64 + 1),
+                cursor: format!("cursor-{position}"),
+                key_token: KeyToken::from_bytes([0x10; 16]),
+                ingest_time_ns: *position as i64,
+                message_id: Uuid::from_u128(*position as u128),
+            })
+            .collect::<Vec<_>>()
+    };
+    let left_rows = build(left, &[1, 3]);
+    let right_rows = build(right, &[2, 4]);
+    let positions = BTreeMap::from([
+        (left, "cursor-1".to_string()),
+        (right, "cursor-2".to_string()),
+        (other, "other-cursor".to_string()),
+    ]);
+    let quarantined = BTreeMap::from([
+        (left, vec!["left-quarantine".to_string()]),
+        (
+            right,
+            vec![
+                "right-quarantine-a".to_string(),
+                "right-quarantine-b".to_string(),
+            ],
+        ),
+        (other, vec!["other-quarantine".to_string()]),
+    ]);
+    let (positions, quarantined) = translate_merge_subscription_frontier(
+        &left_rows,
+        &right_rows,
+        left,
+        right,
+        &positions,
+        &quarantined,
+    )
+    .unwrap();
+    // Ingest ordering interleaves cursor-1 (left pos 1), cursor-2 (right pos
+    // 1), then cursor-3 (left pos 2) which sits beyond the acknowledged left
+    // boundary, so the merged frontier stops at cursor-2.
+    assert_eq!(positions[&left], "cursor-2");
+    assert_eq!(positions[&other], "other-cursor");
+    assert!(!positions.contains_key(&right));
+    assert_eq!(
+        quarantined[&left],
+        vec![
+            "left-quarantine".to_string(),
+            "right-quarantine-a".to_string(),
+            "right-quarantine-b".to_string()
+        ]
+    );
+    assert!(!quarantined.contains_key(&right));
+    assert_eq!(quarantined[&other], vec!["other-quarantine".to_string()]);
+}
+
+#[test]
+fn subscription_frontier_translation_rejects_missing_ranges_and_stale_lineage() {
+    let left = RangeId::from_uuid(Uuid::from_u128(801));
+    let right = RangeId::from_uuid(Uuid::from_u128(802));
+    let split_at = KeyToken::from_bytes([0x80; 16]);
+    let rows = (1..=2)
+        .map(|position| ReaderLineageEntry {
+            range_id: left,
+            position: RangePosition::new(position),
+            cursor: format!("cursor-{position}"),
+            key_token: KeyToken::from_bytes([0x10; 16]),
+            ingest_time_ns: position as i64,
+            message_id: Uuid::from_u128(position as u128),
+        })
+        .collect::<Vec<_>>();
+    let no_positions: BTreeMap<RangeId, String> = BTreeMap::new();
+    let no_quarantine: BTreeMap<RangeId, Vec<String>> = BTreeMap::new();
+    // A frontier that never covered the splitting range cannot be guessed.
+    assert!(matches!(
+        translate_split_subscription_frontier(
+            &rows,
+            left,
+            right,
+            split_at,
+            &no_positions,
+            &no_quarantine
+        ),
+        Err(ReaderFrontierTranslationError::InvalidSources)
+    ));
+    assert!(matches!(
+        translate_merge_subscription_frontier(
+            &rows,
+            &rows,
+            left,
+            right,
+            &no_positions,
+            &no_quarantine
+        ),
+        Err(ReaderFrontierTranslationError::InvalidSources)
+    ));
+    // A Cursor absent from the frozen lineage must not translate.
+    let stale = BTreeMap::from([(left, "not-in-history".to_string())]);
+    assert!(matches!(
+        translate_split_subscription_frontier(&rows, left, right, split_at, &stale, &no_quarantine),
+        Err(ReaderFrontierTranslationError::MissingCursor)
+    ));
+    // Gapped or duplicated lineage stays a hard refusal through the
+    // Subscription wrapper, identical to the Reader path.
+    let mut gapped = rows.clone();
+    gapped[1].position = RangePosition::new(3);
+    let frontier = BTreeMap::from([(left, "cursor-1".to_string())]);
+    assert!(matches!(
+        translate_split_subscription_frontier(
+            &gapped,
+            left,
+            right,
+            split_at,
+            &frontier,
+            &no_quarantine
+        ),
+        Err(ReaderFrontierTranslationError::InvalidHistory)
+    ));
+    let mut duplicated = rows.clone();
+    duplicated[1].cursor = duplicated[0].cursor.clone();
+    let merge_frontier = BTreeMap::from([(left, "cursor-1".to_string()), (right, String::new())]);
+    assert!(matches!(
+        translate_merge_subscription_frontier(
+            &duplicated,
+            &rows,
+            left,
+            right,
+            &merge_frontier,
+            &no_quarantine
+        ),
         Err(ReaderFrontierTranslationError::InvalidHistory)
     ));
 }

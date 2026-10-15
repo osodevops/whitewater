@@ -1583,6 +1583,245 @@ fn member_assignment_coordinator(
     ))
 }
 
+/// A Subscription's committed progress frontier staged for an Active Range
+/// cutover; captured before activation so missing or stale lineage refuses
+/// the transition rather than stranding acknowledged positions on a retired
+/// range map.
+struct SubscriptionCutoverFrontier {
+    definition: crate::control::SubscriptionDefinition,
+    frontier: crate::reader::SubscriptionProgressMutation,
+}
+
+/// Load every Feed-scoped Subscription on `feed_id` that holds committed
+/// progress. Declared Subscriptions without a frontier or a progress
+/// placement have nothing to translate and never block a range transition;
+/// Domain-scoped sources cannot hold per-Feed progress yet.
+async fn subscription_cutover_frontiers(
+    state: &AppState,
+    feed_id: Uuid,
+) -> Result<Vec<SubscriptionCutoverFrontier>, ApiError> {
+    let mut frontiers = Vec::new();
+    for definition in state.control.active_subscriptions().await {
+        if definition.source.feed_id() != Some(feed_id) {
+            continue;
+        }
+        let Some(assignment) = state
+            .control
+            .active_subscription_progress_assignment_by_id(definition.subscription_id)
+            .await
+        else {
+            continue;
+        };
+        let (coordinator, _) = member_assignment_coordinator(state, assignment)?;
+        // A freshly declared Subscription's progress placement can still be
+        // propagating to its replicas when the cutover probes them; retry the
+        // transient refusal codes briefly, then fail the transition closed —
+        // a committed frontier that cannot be read must not be stranded on
+        // the retired range map.
+        let mut frontier = None;
+        for attempt in 0..10_u8 {
+            match coordinator.read_committed().await {
+                Ok(result) => {
+                    frontier = Some(result);
+                    break;
+                }
+                Err(
+                    crate::reader::SubscriptionProgressError::Unavailable
+                    | crate::reader::SubscriptionProgressError::NoQuorum
+                    | crate::reader::SubscriptionProgressError::AmbiguousCommit
+                    | crate::reader::SubscriptionProgressError::InvalidAssignment,
+                ) if attempt < 9 => {
+                    tokio::time::sleep(Duration::from_millis(75)).await;
+                }
+                Err(error) => return Err(subscription_progress_api_error(error)),
+            }
+        }
+        if let Some(frontier) = frontier.flatten() {
+            frontiers.push(SubscriptionCutoverFrontier {
+                definition,
+                frontier,
+            });
+        }
+    }
+    Ok(frontiers)
+}
+
+/// The committed-lineage evidence a cutover reuses to restate Subscription
+/// frontiers on the new range map — identical inputs to the Reader-session
+/// translations so both move at the same frozen boundary.
+enum CutoverFrontierTranslation<'a> {
+    Split {
+        entries: &'a [crate::reader::ReaderLineageEntry],
+        plan: &'a RangeSplitPlan,
+    },
+    Merge {
+        left_entries: &'a [crate::reader::ReaderLineageEntry],
+        right_entries: &'a [crate::reader::ReaderLineageEntry],
+        plan: &'a RangeMergePlan,
+    },
+}
+
+impl CutoverFrontierTranslation<'_> {
+    fn feed_id(&self) -> Uuid {
+        match self {
+            Self::Split { plan, .. } => plan.feed_id,
+            Self::Merge { plan, .. } => plan.feed_id,
+        }
+    }
+
+    fn translate(
+        &self,
+        frontier: &crate::reader::SubscriptionProgressMutation,
+    ) -> Result<crate::reader::TranslatedSubscriptionFrontier, ApiError> {
+        match *self {
+            Self::Split { entries, plan } => crate::reader::translate_split_subscription_frontier(
+                entries,
+                plan.source_range_id,
+                plan.right_assignment.range_id,
+                plan.split_at,
+                &frontier.positions,
+                &frontier.quarantined,
+            ),
+            Self::Merge {
+                left_entries,
+                right_entries,
+                plan,
+            } => crate::reader::translate_merge_subscription_frontier(
+                left_entries,
+                right_entries,
+                plan.left_range_id,
+                plan.right_range_id,
+                &frontier.positions,
+                &frontier.quarantined,
+            ),
+        }
+        .map_err(|error| ApiError::unavailable(error.to_string()))
+    }
+}
+
+/// A deterministic reconcile identity per (cutover plan, Subscription,
+/// target sequence): a retry after an ambiguous commit replays the same
+/// mutation through the progress shard's request dedup instead of forking a
+/// second transition.
+fn subscription_reconcile_request_id(plan_id: Uuid, subscription_id: Uuid, sequence: u64) -> Uuid {
+    let digest = blake3::hash(
+        format!("whitewater-subscription-cutover:{plan_id}:{subscription_id}:{sequence}")
+            .as_bytes(),
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
+}
+
+/// Commit a translated Subscription frontier to its RF3 progress shard after
+/// the Active Range cutover has activated. The progress shard is a separate
+/// quorum from the catalog, so this cannot ride inside the activation
+/// command; bounded compare-and-set retries absorb member acks racing the
+/// transition, and a frontier already covering the current range map needs
+/// no write. In-flight deliveries fence on the frontier Cursor CAS — a
+/// pre-transition page can never commit positions for the retired map — and
+/// their leases expire on the normal tick.
+async fn reconcile_subscription_frontier(
+    state: &AppState,
+    staged: &SubscriptionCutoverFrontier,
+    translation: &CutoverFrontierTranslation<'_>,
+    plan_id: Uuid,
+) -> Result<&'static str, ApiError> {
+    let Some(assignment) = state
+        .control
+        .active_subscription_progress_assignment_by_id(staged.definition.subscription_id)
+        .await
+    else {
+        return Ok("no_placement");
+    };
+    let (coordinator, assignment) = member_assignment_coordinator(state, assignment)?;
+    for attempt in 0..12_u8 {
+        let current: std::collections::BTreeSet<RangeId> = state
+            .control
+            .active_range_assignments_for_feed(translation.feed_id())
+            .await
+            .iter()
+            .map(|assignment| assignment.range_id)
+            .collect();
+        let frontier = match coordinator.read_committed().await {
+            Ok(frontier) => frontier,
+            Err(
+                crate::reader::SubscriptionProgressError::Unavailable
+                | crate::reader::SubscriptionProgressError::NoQuorum
+                | crate::reader::SubscriptionProgressError::AmbiguousCommit
+                | crate::reader::SubscriptionProgressError::InvalidAssignment,
+            ) if attempt < 11 => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(error) => return Err(subscription_progress_api_error(error)),
+        };
+        let Some(frontier) = frontier else {
+            return Ok("declared");
+        };
+        if frontier
+            .positions
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<RangeId>>()
+            == current
+        {
+            return Ok("current");
+        }
+        let (positions, quarantined) = translation.translate(&frontier)?;
+        if positions
+            .keys()
+            .copied()
+            .collect::<std::collections::BTreeSet<RangeId>>()
+            != current
+        {
+            return Err(ApiError::unavailable(
+                "Subscription frontier reconcile raced another range transition",
+            ));
+        }
+        let sequence = frontier
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| ApiError::unavailable("Subscription frontier sequence overflowed"))?;
+        let mutation = crate::reader::SubscriptionProgressMutation {
+            subscription_id: staged.definition.subscription_id,
+            feed_id: frontier.feed_id,
+            ownership_epoch: assignment.ownership_epoch,
+            sequence,
+            request_id: subscription_reconcile_request_id(
+                plan_id,
+                staged.definition.subscription_id,
+                sequence,
+            ),
+            expected_cursor: Some(frontier.cursor.clone()),
+            cursor: format!("cutover:{plan_id}"),
+            positions,
+            quarantined,
+            quarantine_add: BTreeMap::new(),
+            quarantine_remove: BTreeMap::new(),
+            tick: frontier.tick,
+            lease_ops: Vec::new(),
+        };
+        match coordinator.apply(mutation).await {
+            Ok(_) => return Ok("reconciled"),
+            Err(
+                crate::reader::SubscriptionProgressError::Conflict
+                | crate::reader::SubscriptionProgressError::Sequence
+                | crate::reader::SubscriptionProgressError::AmbiguousCommit
+                | crate::reader::SubscriptionProgressError::Unavailable
+                | crate::reader::SubscriptionProgressError::NoQuorum
+                | crate::reader::SubscriptionProgressError::InvalidAssignment,
+            ) if attempt < 11 => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => return Err(subscription_progress_api_error(error)),
+        }
+    }
+    Err(ApiError::unavailable(
+        "Subscription frontier reconcile exhausted its retries",
+    ))
+}
+
 async fn member_coordinator_recovering(
     state: &AppState,
     subscription: &str,
@@ -7799,19 +8038,32 @@ async fn admin_split_range(
         .control
         .active_reader_cutover_snapshots(plan.feed_id)
         .await;
+    let subscription_frontiers = match subscription_cutover_frontiers(&state, plan.feed_id).await {
+        Ok(frontiers) => frontiers,
+        Err(error) => {
+            unfreeze_split_nodes(&state, &plan, &source_assignment, key).await;
+            return Err(error);
+        }
+    };
+    let source = if snapshots.is_empty() && subscription_frontiers.is_empty() {
+        Vec::new()
+    } else {
+        match read_cutover_lineage(&state, &source_assignment, source_commit).await {
+            Ok(entries) => entries,
+            Err(error) => {
+                unfreeze_split_nodes(&state, &plan, &source_assignment, key).await;
+                return Err(error);
+            }
+        }
+    };
     let reader_translations = if snapshots.is_empty() {
         Vec::new()
     } else {
-        let calculated = async {
-            let source = read_cutover_lineage(&state, &source_assignment, source_commit).await?;
-            let assignments = state
-                .control
-                .active_range_assignments_for_feed(plan.feed_id)
-                .await;
-            split_reader_translations(&snapshots, &assignments, &plan, &source)
-        }
-        .await;
-        match calculated {
+        let assignments = state
+            .control
+            .active_range_assignments_for_feed(plan.feed_id)
+            .await;
+        match split_reader_translations(&snapshots, &assignments, &plan, &source) {
             Ok(translations) => translations,
             Err(error) => {
                 unfreeze_split_nodes(&state, &plan, &source_assignment, key).await;
@@ -7819,6 +8071,16 @@ async fn admin_split_range(
             }
         }
     };
+    let subscription_translation = CutoverFrontierTranslation::Split {
+        entries: &source,
+        plan: &plan,
+    };
+    for staged in &subscription_frontiers {
+        if let Err(error) = subscription_translation.translate(&staged.frontier) {
+            unfreeze_split_nodes(&state, &plan, &source_assignment, key).await;
+            return Err(error);
+        }
+    }
     if let Err(error) = control_plane
         .execute_commands(vec![
             crate::control::Command::RecordActiveRangeSplitCatchUp {
@@ -7848,12 +8110,39 @@ async fn admin_split_range(
         unfreeze_split_nodes(&state, &plan, &source_assignment, key).await;
         return Err(ApiError::unavailable(error.to_string()));
     }
+    // The progress shards are a separate quorum, so committed Subscription
+    // frontiers reconcile immediately after activation rather than inside the
+    // same catalog command; a failure stalls that Subscription fail-closed
+    // (member fetches conflict) instead of silently skipping history.
+    let mut subscription_reconcile = Vec::new();
+    let mut subscription_reconcile_failed = false;
+    for staged in &subscription_frontiers {
+        match reconcile_subscription_frontier(
+            &state,
+            staged,
+            &subscription_translation,
+            plan.plan_id,
+        )
+        .await
+        {
+            Ok(status) => subscription_reconcile
+                .push(json!({ "subscription": staged.definition.name, "status": status })),
+            Err(error) => {
+                subscription_reconcile_failed = true;
+                subscription_reconcile.push(
+                    json!({ "subscription": staged.definition.name, "status": "failed", "error": error.message }),
+                );
+            }
+        }
+    }
     Ok(Json(json!({
         "status": "activated",
         "source_commit": source_commit,
         "left_commit": evidence.left.target_commit,
         "right_commit": evidence.right.target_commit,
-        "range_map": plan.candidate_map
+        "range_map": plan.candidate_map,
+        "subscription_frontiers": subscription_reconcile,
+        "subscription_reconcile_failed": subscription_reconcile_failed,
     })))
 }
 
@@ -8038,20 +8327,39 @@ async fn admin_merge_ranges(
         .control
         .active_reader_cutover_snapshots(plan.feed_id)
         .await;
-    let reader_translations = if snapshots.is_empty() {
-        Vec::new()
+    let subscription_frontiers = match subscription_cutover_frontiers(&state, plan.feed_id).await {
+        Ok(frontiers) => frontiers,
+        Err(error) => {
+            unfreeze_merge_nodes(&state, &plan, &left, &right, key).await;
+            return Err(error);
+        }
+    };
+    let (left_rows, right_rows) = if snapshots.is_empty() && subscription_frontiers.is_empty() {
+        (Vec::new(), Vec::new())
     } else {
         let calculated = async {
-            let left_rows = read_cutover_lineage(&state, &left, staged.left_commit).await?;
-            let right_rows = read_cutover_lineage(&state, &right, staged.right_commit).await?;
-            let assignments = state
-                .control
-                .active_range_assignments_for_feed(plan.feed_id)
-                .await;
-            merge_reader_translations(&snapshots, &assignments, &plan, &left_rows, &right_rows)
+            Ok::<_, ApiError>((
+                read_cutover_lineage(&state, &left, staged.left_commit).await?,
+                read_cutover_lineage(&state, &right, staged.right_commit).await?,
+            ))
         }
         .await;
         match calculated {
+            Ok(rows) => rows,
+            Err(error) => {
+                unfreeze_merge_nodes(&state, &plan, &left, &right, key).await;
+                return Err(error);
+            }
+        }
+    };
+    let reader_translations = if snapshots.is_empty() {
+        Vec::new()
+    } else {
+        let assignments = state
+            .control
+            .active_range_assignments_for_feed(plan.feed_id)
+            .await;
+        match merge_reader_translations(&snapshots, &assignments, &plan, &left_rows, &right_rows) {
             Ok(translations) => translations,
             Err(error) => {
                 unfreeze_merge_nodes(&state, &plan, &left, &right, key).await;
@@ -8059,6 +8367,17 @@ async fn admin_merge_ranges(
             }
         }
     };
+    let subscription_translation = CutoverFrontierTranslation::Merge {
+        left_entries: &left_rows,
+        right_entries: &right_rows,
+        plan: &plan,
+    };
+    for staged in &subscription_frontiers {
+        if let Err(error) = subscription_translation.translate(&staged.frontier) {
+            unfreeze_merge_nodes(&state, &plan, &left, &right, key).await;
+            return Err(error);
+        }
+    }
     control_plane
         .execute_commands(vec![
             crate::control::Command::RecordActiveRangeMergeStaging {
@@ -8081,8 +8400,33 @@ async fn admin_merge_ranges(
         }])
         .await
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    // Same post-activation reconcile as the split path: Subscription progress
+    // shards are a separate quorum, so translated frontiers commit after the
+    // catalog cutover with Cursor-CAS fencing, and failures stall the named
+    // Subscription fail-closed rather than skipping history.
+    let mut subscription_reconcile = Vec::new();
+    let mut subscription_reconcile_failed = false;
+    for staged in &subscription_frontiers {
+        match reconcile_subscription_frontier(
+            &state,
+            staged,
+            &subscription_translation,
+            plan.plan_id,
+        )
+        .await
+        {
+            Ok(status) => subscription_reconcile
+                .push(json!({ "subscription": staged.definition.name, "status": status })),
+            Err(error) => {
+                subscription_reconcile_failed = true;
+                subscription_reconcile.push(
+                    json!({ "subscription": staged.definition.name, "status": "failed", "error": error.message }),
+                );
+            }
+        }
+    }
     Ok(Json(
-        json!({ "status": "activated", "range_map": plan.candidate_map, "merged_commit": staged.merged_commit }),
+        json!({ "status": "activated", "range_map": plan.candidate_map, "merged_commit": staged.merged_commit, "subscription_frontiers": subscription_reconcile, "subscription_reconcile_failed": subscription_reconcile_failed }),
     ))
 }
 

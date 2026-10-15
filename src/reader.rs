@@ -123,6 +123,91 @@ pub fn translate_merge_reader_frontier(
     Ok(translated)
 }
 
+/// The `(positions, quarantine)` pair a cutover translation restates on the
+/// post-transition range map.
+pub type TranslatedSubscriptionFrontier =
+    (BTreeMap<RangeId, String>, BTreeMap<RangeId, Vec<String>>);
+
+/// Restate a committed Subscription frontier's per-range resume positions and
+/// RangeId-keyed quarantine evidence across a committed split. The left child
+/// retains the source RangeId, `right` is new, and positions are source
+/// Cursor literals that the children inherit unchanged. Quarantined Cursors
+/// follow their frame's KeyToken to the owning child; a Cursor absent from the
+/// bounded lineage stays under the surviving left id, which can at worst lose
+/// replay dedup evidence and never skips records.
+pub fn translate_split_subscription_frontier(
+    entries: &[ReaderLineageEntry],
+    source: RangeId,
+    right: RangeId,
+    split_at: KeyToken,
+    positions: &BTreeMap<RangeId, String>,
+    quarantined: &BTreeMap<RangeId, Vec<String>>,
+) -> Result<TranslatedSubscriptionFrontier, ReaderFrontierTranslationError> {
+    let source_cursor = positions
+        .get(&source)
+        .ok_or(ReaderFrontierTranslationError::InvalidSources)?;
+    let children =
+        translate_split_reader_frontier(entries, source, source, right, split_at, source_cursor)?;
+    let mut translated = positions.clone();
+    translated.extend(children);
+    let mut translated_quarantined = quarantined.clone();
+    if let Some(cursors) = translated_quarantined.remove(&source) {
+        let tokens: BTreeMap<&str, KeyToken> = entries
+            .iter()
+            .map(|entry| (entry.cursor.as_str(), entry.key_token))
+            .collect();
+        for cursor in cursors {
+            let owner = match tokens.get(cursor.as_str()) {
+                Some(token) if *token >= split_at => right,
+                _ => source,
+            };
+            translated_quarantined
+                .entry(owner)
+                .or_default()
+                .push(cursor);
+        }
+    }
+    Ok((translated, translated_quarantined))
+}
+
+/// Restate a committed Subscription frontier across a committed merge. The
+/// merged range keeps the left RangeId and stores source Cursor literals, so
+/// the right child's positions and quarantine evidence re-key to it verbatim.
+pub fn translate_merge_subscription_frontier(
+    left_entries: &[ReaderLineageEntry],
+    right_entries: &[ReaderLineageEntry],
+    left: RangeId,
+    right: RangeId,
+    positions: &BTreeMap<RangeId, String>,
+    quarantined: &BTreeMap<RangeId, Vec<String>>,
+) -> Result<TranslatedSubscriptionFrontier, ReaderFrontierTranslationError> {
+    let left_cursor = positions
+        .get(&left)
+        .ok_or(ReaderFrontierTranslationError::InvalidSources)?;
+    let right_cursor = positions
+        .get(&right)
+        .ok_or(ReaderFrontierTranslationError::InvalidSources)?;
+    let merged = translate_merge_reader_frontier(
+        left_entries,
+        right_entries,
+        left,
+        right,
+        left_cursor,
+        right_cursor,
+    )?;
+    let mut translated = positions.clone();
+    translated.remove(&right);
+    translated.insert(left, merged);
+    let mut translated_quarantined = quarantined.clone();
+    if let Some(cursors) = translated_quarantined.remove(&right) {
+        translated_quarantined
+            .entry(left)
+            .or_default()
+            .extend(cursors);
+    }
+    Ok((translated, translated_quarantined))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReaderRetryPolicy {
     pub max_attempts: usize,
