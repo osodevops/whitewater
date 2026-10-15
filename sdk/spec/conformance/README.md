@@ -30,7 +30,7 @@ successfully.
 | `writer.append_batch` | `writer.append_batch` | `records: [...]` same fields |
 | `reader.open` / `reader.fetch` / `reader.ack` / `reader.close` | reader ops | `reader`, `session_epoch`/`cursor`/`limit`/`capacity` |
 | `reader.temporary_fetch` | temporary fetch | `feed`, `after`, `limit`, `new_only`, `tail` |
-| `member.join` / `member.claim` / `member.renew` / `member.release` / `member.fetch` / `member.ack` | subscription member ops | `subscription`, `member_id`, `member_epoch`, `work_id`, `lease_epoch`, `limit`, `lease_ticks` |
+| `member.join` / `member.claim` / `member.renew` / `member.release` / `member.transfer` / `member.fetch` / `member.ack` | subscription member ops | `subscription`, `member_id`, `member_epoch`, `work_id`, `lease_epoch`, `limit`, `lease_ticks`; `member.transfer` also takes `to_member_id` + `to_member_epoch` (the recipient's fencing evidence) |
 | `subscription.seek` | `POST /v1/subscriptions/seek` | `subscription`, `request_id`, `position` (`beginning`/`now`/`timestamp`/`cursor`), `timestamp_ns` (decimal string, ingest clock, first delivered record is at/after it), `cursor` (opaque record Cursor; resolves through the range owner on a single-range source only — split Feeds refuse 400, unknown/uncommitted/foreign Cursors refuse 400); refused 409 while a member work lease is active, replays idempotently on the same `request_id`, conflicts a different `position` under a reused `request_id` |
 | `feed.append` | `feed.append` | `feed`, `request_id`, `writer_session_id`, `writer_epoch`, `sequence`, `key`, `payload`, `event_time_ns` |
 | `feed.records` | `feed.records` | `feed`, `limit`, `after` |

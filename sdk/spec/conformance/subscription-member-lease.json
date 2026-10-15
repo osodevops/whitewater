@@ -1,0 +1,139 @@
+{
+  "scenario": "member lease renewal extends a held work lease and transfer moves it under epoch fencing",
+  "requires": [
+    "wcl",
+    "writer.append_batch",
+    "member.join",
+    "member.claim",
+    "member.renew",
+    "member.transfer",
+    "member.fetch",
+    "member.ack"
+  ],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN sdk{{uniq}}; CREATE FEED sdk{{uniq}}.events; CREATE WRITER wr{{uniq}} TO sdk{{uniq}}.events; OPEN WRITER SESSION wr{{uniq}}; CREATE SUBSCRIPTION sdk{{uniq}}.sub FROM sdk{{uniq}}.events START AT BEGINNING;"
+      },
+      "bind": "setup",
+      "expect": { "error_status": 200 }
+    },
+    {
+      "op": "writer.append_batch",
+      "args": {
+        "records": [
+          { "request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "k1"}, "payload": {"utf8": "m1"}, "event_time_ns": 1700000000000000001, "metadata_base64": {} },
+          { "request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "k2"}, "payload": {"utf8": "m2"}, "event_time_ns": 1700000000000000002, "metadata_base64": {} },
+          { "request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "k3"}, "payload": {"utf8": "m3"}, "event_time_ns": 1700000000000000003, "metadata_base64": {} }
+        ]
+      },
+      "expect": { "error_status": 200, "results": "len>=3" }
+    },
+    {
+      "op": "member.join",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}"
+      },
+      "bind": "join1",
+      "expect": { "error_status": 200, "member_epoch": "!=null" }
+    },
+    {
+      "op": "member.join",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member2}}"
+      },
+      "bind": "join2",
+      "expect": { "error_status": 200, "member_epoch": "!=null" }
+    },
+    {
+      "op": "member.claim",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}",
+        "member_epoch": "{{join1.member_epoch}}",
+        "work_id": "{{uuid:work1}}",
+        "lease_ticks": 60
+      },
+      "bind": "claim",
+      "expect": { "error_status": 200, "lease.lease_epoch": "!=null" }
+    },
+    {
+      "op": "member.renew",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}",
+        "member_epoch": "{{join1.member_epoch}}",
+        "work_id": "{{uuid:work1}}",
+        "lease_epoch": "{{claim.lease.lease_epoch}}",
+        "lease_ticks": 60
+      },
+      "expect": {
+        "error_status": 200,
+        "lease.lease_epoch": "==claim.lease.lease_epoch"
+      }
+    },
+    {
+      "op": "member.transfer",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "work_id": "{{uuid:work1}}",
+        "member_id": "{{uuid:member1}}",
+        "lease_epoch": "{{claim.lease.lease_epoch}}",
+        "to_member_id": "{{uuid:member2}}",
+        "to_member_epoch": "{{join2.member_epoch}}",
+        "lease_ticks": 60
+      },
+      "bind": "transfer",
+      "expect": { "error_status": 200, "lease.lease_epoch": "!=null" }
+    },
+    {
+      "op": "member.fetch",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}",
+        "member_epoch": "{{join1.member_epoch}}",
+        "work_id": "{{uuid:work1}}",
+        "lease_epoch": "{{claim.lease.lease_epoch}}",
+        "limit": 4
+      },
+      "expect": { "error_status": 409, "error_code": "lease.stale_lease" }
+    },
+    {
+      "op": "member.fetch",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member2}}",
+        "member_epoch": "{{join2.member_epoch}}",
+        "work_id": "{{uuid:work1}}",
+        "lease_epoch": "{{transfer.lease.lease_epoch}}",
+        "limit": 4
+      },
+      "bind": "delivered",
+      "expect": { "error_status": 200, "records": "len>=1" }
+    },
+    {
+      "op": "member.ack",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member2}}",
+        "member_epoch": "{{join2.member_epoch}}",
+        "work_id": "{{uuid:work1}}",
+        "lease_epoch": "{{transfer.lease.lease_epoch}}",
+        "cursor": "{{delivered.cursor}}",
+        "positions": "{{delivered.positions}}"
+      },
+      "expect": { "error_status": 200 }
+    }
+  ]
+}
