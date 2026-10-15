@@ -1,0 +1,174 @@
+{
+  "scenario": "subscription seek repositions the shared frontier under one committed mutation",
+  "requires": [
+    "wcl",
+    "writer.append_batch",
+    "member.join",
+    "member.claim",
+    "member.fetch",
+    "member.release",
+    "subscription.seek"
+  ],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN sdk{{uniq}}; CREATE FEED sdk{{uniq}}.events; CREATE WRITER wr{{uniq}} TO sdk{{uniq}}.events; OPEN WRITER SESSION wr{{uniq}}; CREATE SUBSCRIPTION sdk{{uniq}}.sub FROM sdk{{uniq}}.events START AT BEGINNING;"
+      },
+      "bind": "setup",
+      "expect": { "error_status": 200 }
+    },
+    {
+      "op": "writer.append_batch",
+      "args": {
+        "records": [
+          { "request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "k1"}, "payload": {"utf8": "m1"}, "event_time_ns": 1700000000000000001, "metadata_base64": {} },
+          { "request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "k1"}, "payload": {"utf8": "m2"}, "event_time_ns": 1700000000000000002, "metadata_base64": {} },
+          { "request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "k1"}, "payload": {"utf8": "m3"}, "event_time_ns": 1700000000000000003, "metadata_base64": {} },
+          { "request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "k1"}, "payload": {"utf8": "m4"}, "event_time_ns": 1700000000000000004, "metadata_base64": {} },
+          { "request_id": "{{uuid}}", "writer": "wr{{uniq}}", "session_epoch": "{{setup.results[3].data.session_epoch}}", "key": {"utf8": "k1"}, "payload": {"utf8": "m5"}, "event_time_ns": 1700000000000000005, "metadata_base64": {} }
+        ]
+      },
+      "expect": { "error_status": 200, "results": "len>=5" }
+    },
+    {
+      "op": "member.join",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}"
+      },
+      "bind": "join",
+      "expect": { "error_status": 200, "member_epoch": "!=null" }
+    },
+    {
+      "op": "member.claim",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}",
+        "member_epoch": "{{join.member_epoch}}",
+        "work_id": "{{uuid:work1}}",
+        "lease_ticks": 60
+      },
+      "bind": "claim",
+      "expect": { "error_status": 200 }
+    },
+    {
+      "op": "subscription.seek",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "position": "beginning"
+      },
+      "expect": { "error_status": 409 }
+    },
+    {
+      "op": "member.fetch",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}",
+        "member_epoch": "{{join.member_epoch}}",
+        "work_id": "{{uuid:work1}}",
+        "lease_epoch": "{{claim.lease.lease_epoch}}",
+        "limit": 2
+      },
+      "bind": "delivered",
+      "expect": {
+        "error_status": 200,
+        "records": "len>=2",
+        "cursor": "!=null",
+        "positions": "!=null"
+      }
+    },
+    {
+      "op": "member.release",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}",
+        "member_epoch": "{{join.member_epoch}}",
+        "work_id": "{{uuid:work1}}",
+        "lease_epoch": "{{claim.lease.lease_epoch}}"
+      },
+      "expect": { "error_status": 200 }
+    },
+    {
+      "op": "subscription.seek",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid:seek1}}",
+        "position": "beginning"
+      },
+      "bind": "seek",
+      "expect": {
+        "error_status": 200,
+        "cursor": "!=null",
+        "positions": "!=null",
+        "ownership_epoch": "!=null"
+      }
+    },
+    {
+      "op": "subscription.seek",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid:seek1}}",
+        "position": "beginning"
+      },
+      "expect": {
+        "error_status": 200,
+        "cursor": "==seek.cursor"
+      }
+    },
+    {
+      "op": "subscription.seek",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid:seek1}}",
+        "position": "now"
+      },
+      "expect": { "error_status": 409 }
+    },
+    {
+      "op": "subscription.seek",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "position": "timestamp",
+        "timestamp_ns": "{{delivered.records[1].ingest_time_ns}}"
+      },
+      "expect": { "error_status": 200, "cursor": "!=null" }
+    },
+    {
+      "op": "member.claim",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}",
+        "member_epoch": "{{join.member_epoch}}",
+        "work_id": "{{uuid:work2}}",
+        "lease_ticks": 60
+      },
+      "bind": "claim2",
+      "expect": { "error_status": 200 }
+    },
+    {
+      "op": "member.fetch",
+      "args": {
+        "subscription": "sdk{{uniq}}.sub",
+        "request_id": "{{uuid}}",
+        "member_id": "{{uuid:member1}}",
+        "member_epoch": "{{join.member_epoch}}",
+        "work_id": "{{uuid:work2}}",
+        "lease_epoch": "{{claim2.lease.lease_epoch}}",
+        "limit": 3
+      },
+      "expect": {
+        "error_status": 200,
+        "records[0].cursor": "==delivered.records[1].cursor",
+        "records[0].ingest_time_ns": "==delivered.records[1].ingest_time_ns"
+      }
+    }
+  ]
+}

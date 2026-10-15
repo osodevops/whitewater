@@ -510,7 +510,7 @@ fn wire_record_fields(body: &mut Value) {
             .unwrap_or_default();
         map.insert("metadata_base64".to_owned(), Value::Object(encoded));
     }
-    for field in ["event_time_ns", "after_event_time_ns"] {
+    for field in ["event_time_ns", "after_event_time_ns", "timestamp_ns"] {
         if let Some(number) = map.get(field).and_then(Value::as_i64) {
             map.insert(field.to_owned(), Value::String(number.to_string()));
         }
@@ -536,6 +536,7 @@ fn endpoint(op: &str) -> Option<(&'static str, &'static str)> {
         "member.transfer" => ("POST", "/v1/subscriptions/members/transfer"),
         "member.fetch" => ("POST", "/v1/subscriptions/members/fetch"),
         "member.ack" => ("POST", "/v1/subscriptions/members/ack"),
+        "subscription.seek" => ("POST", "/v1/subscriptions/seek"),
         "statestore.lookup" => ("POST", "/v1/state-stores/lookup"),
         "statestore.get_by" => ("POST", "/v1/state-stores/get-by"),
         "statestore.iterate" => ("POST", "/v1/state-stores/iterate"),

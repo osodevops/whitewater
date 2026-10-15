@@ -31,6 +31,7 @@ successfully.
 | `reader.open` / `reader.fetch` / `reader.ack` / `reader.close` | reader ops | `reader`, `session_epoch`/`cursor`/`limit`/`capacity` |
 | `reader.temporary_fetch` | temporary fetch | `feed`, `after`, `limit`, `new_only`, `tail` |
 | `member.join` / `member.claim` / `member.renew` / `member.release` / `member.fetch` / `member.ack` | subscription member ops | `subscription`, `member_id`, `member_epoch`, `work_id`, `lease_epoch`, `limit`, `lease_ticks` |
+| `subscription.seek` | `POST /v1/subscriptions/seek` | `subscription`, `request_id`, `position` (`beginning`/`now`/`timestamp`), `timestamp_ns` (decimal string, ingest clock, first delivered record is at/after it); refused 409 while a member work lease is active, replays idempotently on the same `request_id`, conflicts a different `position` under a reused `request_id` |
 | `feed.append` | `feed.append` | `feed`, `request_id`, `writer_session_id`, `writer_epoch`, `sequence`, `key`, `payload`, `event_time_ns` |
 | `feed.records` | `feed.records` | `feed`, `limit`, `after` |
 | `statestore.mutate` | `POST /v1/state-stores/mutate` | `store`, `mutation_id`, `kind` (`put_row`/`delete_row`), `key`, `payload`, `named` — flat `key`/`payload` lower to base64 inside `op` |
