@@ -34,12 +34,12 @@ use uuid::Uuid;
 use crate::{
     active_range::{
         stage_candidate_ranges_local, stage_merged_range_local, ActiveRangeAssignment,
-        AppendIdentity, CandidateSplitStagingResult, CommitPosition, ControlPlaneFollowerMove,
-        DrainMoveDriver, FollowerMoveControl, FollowerMoveCopyResult, KeyToken,
-        MajorityAppendCoordinator, MajorityAppendError, MergeStagingResult, OwnerMoveEvidence,
-        RangeId, RangePosition, ReadReplicaEvidence, RepairExportRequest, RepairExportResponse,
-        RepairFrame, ReplicaAppendRequest, ReplicaAppendResponse, ReplicaAppendService,
-        ReplicaCommitRequest, ReplicaCommitResponse, ReplicaProgressRequest,
+        AppendIdentity, CandidateSplitStagingResult, CommitPosition, CommitProofSink,
+        ControlPlaneFollowerMove, DrainMoveDriver, FollowerMoveControl, FollowerMoveCopyResult,
+        KeyToken, MajorityAppendCoordinator, MajorityAppendError, MergeStagingResult,
+        OwnerMoveEvidence, RangeId, RangePosition, ReadReplicaEvidence, RepairExportRequest,
+        RepairExportResponse, RepairFrame, ReplicaAppendRequest, ReplicaAppendResponse,
+        ReplicaAppendService, ReplicaCommitRequest, ReplicaCommitResponse, ReplicaProgressRequest,
         ReplicaProgressResponse, ReplicaReconcileRequest, ReplicaReconcileResponse, StorageNodeId,
         StoredRangeFrame, MAX_COMMITTED_READ_BYTES, MAX_REPLICA_FRAME_BASE64_BYTES,
     },
@@ -48,9 +48,9 @@ use crate::{
     codec::{decode_record, MAX_FRAME_BYTES},
     config::SubscriptionMtlsConfig,
     control::{
-        ControlController, ControlError, PermissionAction, RangeMergePlan, RangeMovePlan,
-        RangeMoveStage, RangeOwnerMovePlan, RangeSplitPlan, ReaderCutoverSnapshot,
-        ReaderFrontierTranslation, ReplicatedCommand,
+        commit_proof_request_id, ControlController, ControlError, PermissionAction,
+        RangeCommitProof, RangeMergePlan, RangeMovePlan, RangeMoveStage, RangeOwnerMovePlan,
+        RangeSplitPlan, ReaderCutoverSnapshot, ReaderFrontierTranslation, ReplicatedCommand,
     },
     control_plane::{
         ControlNodeId, ControlPlane, ControlPlaneError, ControlTypeConfig, FullSnapshotRequest,
@@ -12254,24 +12254,42 @@ fn require_read_quorum(
     position: CommitPosition,
     owner: &ReadReplicaEvidence,
     followers: &[ReadReplicaEvidence],
+    proof: Option<&RangeCommitProof>,
 ) -> Result<(), ApiError> {
+    // When corroboration fails, a persisted quorum-commit proof that
+    // outruns every reachable replica's claimed frontier is positive
+    // evidence that committed history is gone — not merely lagging —
+    // and must be reported as such.
+    let provable = std::iter::once(owner.committed)
+        .chain(followers.iter().map(|evidence| evidence.committed))
+        .max()
+        .unwrap_or_default();
+    let lost_history = proof
+        .filter(|proof| proof.position > provable)
+        .map(|proof| {
+            format!(
+                "; durable committed-frontier proof records position {} committed on a replica quorum while reachable replicas can show at most {} — committed history may be permanently lost until the replica set is repaired",
+                proof.position.value(),
+                provable.value(),
+            )
+        })
+        .unwrap_or_default();
+    let fail = |message: &str| ApiError::unavailable(format!("{message}{lost_history}"));
     if owner.node != assignment.owner
         || owner.committed < position
         || position.value() > 0 && owner.digest.is_none()
     {
-        return Err(ApiError::unavailable(
+        return Err(fail(
             "Append Owner cannot prove its committed read boundary",
         ));
     }
     let mut confirmed = false;
     for follower in followers {
         if follower.node == owner.node || !assignment.replicas.contains(&follower.node) {
-            return Err(ApiError::unavailable(
-                "read evidence came from a non-replica Node",
-            ));
+            return Err(fail("read evidence came from a non-replica Node"));
         }
         if follower.committed > owner.committed {
-            return Err(ApiError::unavailable(
+            return Err(fail(
                 "Append Owner is behind another committed replica; retry after repair or recovery",
             ));
         }
@@ -12280,7 +12298,7 @@ fn require_read_quorum(
         }
     }
     if !confirmed {
-        return Err(ApiError::unavailable(
+        return Err(fail(
             "no other replica confirms the committed prefix and digest; retry after catch-up",
         ));
     }
@@ -12338,7 +12356,52 @@ async fn verify_read_quorum(
     .into_iter()
     .flatten()
     .collect::<Vec<_>>();
-    require_read_quorum(assignment, position, &owner, &followers)
+    let proof = state.control.range_commit_proof(assignment.range_id).await;
+    require_read_quorum(assignment, position, &owner, &followers, proof.as_ref())
+}
+
+/// Persists committed-frontier proofs into the replicated catalog so
+/// they survive loss of a Range's replica majority.
+pub struct CatalogCommitProofSink {
+    control: Arc<ControlController>,
+    control_plane: Option<Arc<ControlPlane>>,
+}
+
+impl CatalogCommitProofSink {
+    pub fn new(control: Arc<ControlController>, control_plane: Option<Arc<ControlPlane>>) -> Self {
+        Self {
+            control,
+            control_plane,
+        }
+    }
+}
+
+#[async_trait]
+impl CommitProofSink for CatalogCommitProofSink {
+    async fn record(&self, proof: RangeCommitProof) -> Result<(), String> {
+        let request_id = commit_proof_request_id(&proof);
+        let command = crate::control::Command::RecordRangeCommitProof {
+            feed_id: proof.feed_id,
+            range_id: proof.range_id,
+            position: proof.position,
+            frame_digest: proof.frame_digest,
+            evidence: proof.evidence,
+            reporter: proof.reporter,
+        };
+        match &self.control_plane {
+            Some(control_plane) => control_plane
+                .execute_commands_with_request_id(vec![command], request_id)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            None => self
+                .control
+                .execute_commands_with_request_id(vec![command], request_id)
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+        }
+    }
 }
 
 async fn read_owned_range_page(
@@ -14164,7 +14227,8 @@ mod tests {
             &assignment,
             CommitPosition::new(5),
             &owner,
-            std::slice::from_ref(&caught_up)
+            std::slice::from_ref(&caught_up),
+            None
         )
         .is_ok());
         let lost = evidence(nodes[0].clone(), 0, None);
@@ -14173,7 +14237,8 @@ mod tests {
             &assignment,
             CommitPosition::new(0),
             &lost,
-            &[caught_up.clone(), ahead]
+            &[caught_up.clone(), ahead],
+            None
         )
         .is_err());
         let ahead = evidence(nodes[2].clone(), 6, Some([8; 32]));
@@ -14181,7 +14246,8 @@ mod tests {
             &assignment,
             CommitPosition::new(5),
             &owner,
-            &[caught_up.clone(), ahead]
+            &[caught_up.clone(), ahead],
+            None
         )
         .is_err());
         let divergent = evidence(nodes[1].clone(), 5, Some([9; 32]));
@@ -14190,10 +14256,88 @@ mod tests {
             &assignment,
             CommitPosition::new(5),
             &owner,
-            &[divergent, behind]
+            &[divergent, behind],
+            None
         )
         .is_err());
-        assert!(require_read_quorum(&assignment, CommitPosition::new(5), &owner, &[]).is_err());
+        assert!(
+            require_read_quorum(&assignment, CommitPosition::new(5), &owner, &[], None).is_err()
+        );
+    }
+
+    #[test]
+    fn read_quorum_reports_provably_lost_committed_history() {
+        let nodes = ["storage-1", "storage-2", "storage-3"]
+            .map(|name| StorageNodeId::try_new(name).unwrap());
+        let feed_id = Uuid::from_u128(1);
+        let range_id = RangeId::from_uuid(Uuid::from_u128(2));
+        let assignment = ActiveRangeAssignment::try_new(
+            feed_id,
+            range_id,
+            RangeGeneration::new(1),
+            nodes[0].clone(),
+            ReplicaSet::try_new(nodes.clone()).unwrap(),
+            OwnershipEpoch::new(1),
+        )
+        .unwrap();
+        let evidence =
+            |node: StorageNodeId, committed: u64, digest: Option<[u8; 32]>| ReadReplicaEvidence {
+                node,
+                committed: CommitPosition::new(committed),
+                digest,
+            };
+        // The owner lost its tail: it claims committed=3 while the read
+        // needs position 5 and no replica confirms.
+        let shrunken_owner = evidence(nodes[0].clone(), 3, Some([7; 32]));
+        let proof = RangeCommitProof {
+            feed_id,
+            range_id,
+            position: CommitPosition::new(9),
+            frame_digest: [7; 32],
+            recorded_at_ns: 0,
+            evidence: nodes.to_vec(),
+            reporter: nodes[0].clone(),
+        };
+        let error = require_read_quorum(
+            &assignment,
+            CommitPosition::new(5),
+            &shrunken_owner,
+            &[],
+            Some(&proof),
+        )
+        .unwrap_err();
+        assert!(error
+            .message
+            .contains("committed-frontier proof records position 9"));
+        assert!(error.message.contains("permanently lost"));
+
+        // A proof at-or-below the provable frontier means the replicas
+        // are lagging, not that committed history is gone — the message
+        // must not claim loss.
+        let lagging = RangeCommitProof {
+            position: CommitPosition::new(3),
+            ..proof.clone()
+        };
+        let error = require_read_quorum(
+            &assignment,
+            CommitPosition::new(5),
+            &shrunken_owner,
+            &[],
+            Some(&lagging),
+        )
+        .unwrap_err();
+        assert!(!error.message.contains("permanently lost"));
+
+        // No proof at all keeps the plain corroboration failure.
+        let error = require_read_quorum(
+            &assignment,
+            CommitPosition::new(5),
+            &shrunken_owner,
+            &[],
+            None,
+        )
+        .unwrap_err();
+        assert!(!error.message.contains("permanently lost"));
     }
 
     #[test]

@@ -5,13 +5,14 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::control::ControlController;
+use crate::control::{unix_ns, ControlController, RangeCommitProof};
 
 use super::{
-    CommitPosition, ReplicaAppendAccepted, ReplicaAppendErrorCode, ReplicaAppendRequest,
-    ReplicaAppendResponse, ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest,
-    ReplicaCommitResponse, ReplicaDiscardPendingRequest, ReplicaDiscardPendingResponse,
-    StorageNodeId, ACTIVE_RANGE_COMMIT_QUORUM,
+    commit_proof::CommitProofReporter, CommitPosition, ReplicaAppendAccepted,
+    ReplicaAppendErrorCode, ReplicaAppendRequest, ReplicaAppendResponse, ReplicaAppendService,
+    ReplicaCommitAccepted, ReplicaCommitRequest, ReplicaCommitResponse,
+    ReplicaDiscardPendingRequest, ReplicaDiscardPendingResponse, StorageNodeId,
+    ACTIVE_RANGE_COMMIT_QUORUM,
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,6 +101,7 @@ pub struct MajorityAppendCoordinator {
     control: Arc<ControlController>,
     transport: Arc<dyn ReplicaTransport>,
     append_lock: Arc<Mutex<()>>,
+    proofs: Option<Arc<CommitProofReporter>>,
 }
 
 impl MajorityAppendCoordinator {
@@ -113,7 +115,39 @@ impl MajorityAppendCoordinator {
             control,
             transport,
             append_lock: Arc::new(Mutex::new(())),
+            proofs: None,
         }
+    }
+
+    /// Report a durable committed-frontier proof through `reporter` after
+    /// each quorum commit, so loss of two local copies can be told apart
+    /// from replica lag when only the majority-replicated catalog
+    /// survives.
+    pub fn with_commit_proofs(mut self, reporter: Arc<CommitProofReporter>) -> Self {
+        self.proofs = Some(reporter);
+        self
+    }
+
+    fn report_commit_proof(
+        &self,
+        feed_id: Uuid,
+        range_id: super::RangeId,
+        position: CommitPosition,
+        frame_digest: [u8; 32],
+        evidence: Vec<StorageNodeId>,
+    ) {
+        let Some(reporter) = &self.proofs else {
+            return;
+        };
+        reporter.report(RangeCommitProof {
+            feed_id,
+            range_id,
+            position,
+            frame_digest,
+            recorded_at_ns: unix_ns(),
+            evidence,
+            reporter: self.local.local_node().clone(),
+        });
     }
 
     pub async fn next_position(
@@ -354,6 +388,13 @@ impl MajorityAppendCoordinator {
         evidence.push(self.local.local_node().clone());
         durable.sort();
         evidence.sort();
+        self.report_commit_proof(
+            request.feed_id,
+            request.range_id,
+            CommitPosition::new(local.position.value()),
+            local.frame_digest,
+            evidence.clone(),
+        );
         Ok(MajorityAppendResult {
             message_id: local.message_id,
             cursor: local.cursor,
@@ -491,6 +532,7 @@ impl MajorityAppendCoordinator {
             ));
         }
         let released = commit_request.commit_position;
+        let released_digest = commit_request.frame_digest;
         self.local.commit(commit_request).await.map_err(|error| {
             self.error(
                 MajorityAppendErrorCode::LocalStorageFailure,
@@ -500,7 +542,15 @@ impl MajorityAppendCoordinator {
                 evidence.clone(),
             )
         })?;
+        evidence.push(self.local.local_node().clone());
         evidence.sort();
+        self.report_commit_proof(
+            request.feed_id,
+            request.range_id,
+            released,
+            released_digest,
+            evidence.clone(),
+        );
         Ok(PendingReleaseOutcome::Released {
             commit_position: released,
         })

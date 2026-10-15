@@ -1,3 +1,4 @@
+pub mod commit_proof;
 pub mod drain;
 pub mod majority;
 pub mod merge;
@@ -9,6 +10,7 @@ pub mod routing;
 pub mod split;
 pub mod store;
 
+pub use commit_proof::{CommitProofReporter, CommitProofSink};
 pub use drain::{
     DrainCommandAuthority, DrainMoveDriver, DrainProgressDriver, LocalDrainDriver,
     StorageDrainError, StorageDrainExecutor, StorageDrainOutcome, StorageDrainReport,

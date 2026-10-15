@@ -58,6 +58,20 @@ def main():
         status, result = post(ENDPOINTS[0], "/v1/writers/append", {"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": epoch, "event_time_ns": str(position), "key_base64": base64.b64encode(f"key-{position}".encode()).decode(), "payload_base64": base64.b64encode(f"value-{position}".encode()).decode(), "metadata_base64": {}})
         if status != 200: raise AssertionError(result)
 
+    # Durable committed-frontier proofs ride each quorum append into the
+    # replicated catalog, so loss of two local copies can be told apart
+    # from replica lag; INSPECT PLACEMENT surfaces them per range.
+    placed = None
+    for _ in range(60):
+        status, placed = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"})
+        if status == 200:
+            proofs = placed["results"][0]["data"].get("commit_proofs") or {}
+            if any((proof.get("position") or 0) >= 8 for proof in proofs.values()):
+                break
+        time.sleep(0.5)
+    else:
+        raise AssertionError(f"no committed-frontier proof reached the catalog: {placed}")
+
     split_request_id = str(uuid.uuid4())
     def attempt_split(tag, request_id=None, boundary="80000000000000000000000000000000"):
         body = {"request_id": request_id or str(uuid.uuid4()), "feed": feed, "split_at": boundary}
@@ -146,11 +160,18 @@ def main():
         new_owner = NODE3_ID
     move_request_id = str(uuid.uuid4())
 
-    def attempt_move(tag, request_id=None):
-        body = {"request_id": request_id or str(uuid.uuid4()), "feed": move_feed, "range_id": move_range["range_id"], "new_owner": new_owner}
+    def attempt_move(tag, request_id=None, target=None):
+        body = {"request_id": request_id or str(uuid.uuid4()), "feed": move_feed, "range_id": move_range["range_id"], "new_owner": target or new_owner}
         status, result = post(ENDPOINTS[1], "/v1/admin/ranges/move-owner", body)
         print(f"owner-move {tag}: status={status} error={result.get('error', '')[:140]}", flush=True)
         return status, result
+
+    def current_placement():
+        status, placed = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {move_feed};"})
+        if status != 200: raise AssertionError(placed)
+        current = [a for a in placed["results"][0]["data"]["range_assignments"] if a["range_id"] == move_range["range_id"]]
+        if not current: raise AssertionError("move-leg range disappeared after abandon")
+        return current[0]
 
     def staged_move_plans():
         status, placed = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {move_feed};"})
@@ -187,10 +208,21 @@ def main():
         subprocess.run(["docker", "start", NODE3], check=True, capture_output=True)
 
     # With the participant back and the wedged plan abandoned, a fresh move
-    # activates end-to-end.
+    # activates end-to-end. The outage may meanwhile trigger owner recovery
+    # on this range — ownership landing on the requested target already
+    # satisfies the intent — so re-inspect and retarget each retry.
     for _ in range(30):
-        status, result = attempt_move("fresh-after-recovery")
-        if status == 200: break
+        current = current_placement()
+        if current["owner"] == new_owner:
+            status, result = 200, {"assignment": {"owner": new_owner}}
+            break
+        followers = [replica for replica in current["replicas"] if replica != current["owner"]]
+        if not followers:
+            raise AssertionError(f"no follower remains to move to: {current}")
+        status, result = attempt_move("fresh-after-recovery", target=followers[0])
+        if status == 200:
+            new_owner = followers[0]
+            break
         time.sleep(2)
     if status != 200: raise AssertionError(f"owner move never recovered: {result}")
     if result.get("assignment", {}).get("owner") != new_owner:

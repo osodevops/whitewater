@@ -15,14 +15,15 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use whitewater::{
     active_range::{
-        cold_adjacent_pairs, ColdRangeTracker, HttpRecoveryTransport, HttpReplicaTransport,
-        LocalRepairSupervisor, MajorityAppendCoordinator, RecoverySupervisor, ReplicaAppendService,
-        SplitPressureTracker, StorageDrainStatus, StorageDrainSupervisor, StorageNodeId,
+        cold_adjacent_pairs, ColdRangeTracker, CommitProofReporter, HttpRecoveryTransport,
+        HttpReplicaTransport, LocalRepairSupervisor, MajorityAppendCoordinator, RecoverySupervisor,
+        ReplicaAppendService, SplitPressureTracker, StorageDrainStatus, StorageDrainSupervisor,
+        StorageNodeId,
     },
     admin::AdminAuthenticator,
     api::{
-        internal_mtls_router, router, AdminDrainDriver, AppState, InternalMtlsMaterial,
-        SubscriptionTlsServer,
+        internal_mtls_router, router, AdminDrainDriver, AppState, CatalogCommitProofSink,
+        InternalMtlsMaterial, SubscriptionTlsServer,
     },
     autoscale::AutoscaleController,
     config::NodeConfig,
@@ -200,11 +201,14 @@ async fn main() -> Result<()> {
                 key,
                 build_internal_client(Duration::from_secs(2))?,
             )?);
-            Some(Arc::new(MajorityAppendCoordinator::new(
-                local,
+            let proofs = CommitProofReporter::new(Arc::new(CatalogCommitProofSink::new(
                 control.clone(),
-                transport,
-            )))
+                control_plane.clone(),
+            )));
+            Some(Arc::new(
+                MajorityAppendCoordinator::new(local, control.clone(), transport)
+                    .with_commit_proofs(proofs),
+            ))
         }
         _ => None,
     };

@@ -806,6 +806,27 @@ pub struct RangeOwnerMovePlan {
     pub checksum_verified: bool,
 }
 
+/// A durable proof that one Range committed history through `position`
+/// on a replica quorum. The Append Owner reports it through the
+/// majority-replicated Control Plane after each quorum commit, so the
+/// proof survives loss of two local copies; per-read replica
+/// corroboration can then distinguish a lagging replica set from
+/// committed history that is provably gone. Proofs are advance-only:
+/// a stale position is a no-op, and a conflicting digest at the same
+/// position is fork evidence and refused.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RangeCommitProof {
+    pub feed_id: Uuid,
+    pub range_id: RangeId,
+    pub position: CommitPosition,
+    pub frame_digest: [u8; 32],
+    pub recorded_at_ns: i64,
+    /// Replicas that persisted CommitPosition evidence for this boundary.
+    pub evidence: Vec<StorageNodeId>,
+    /// Append Owner that reported the proof.
+    pub reporter: StorageNodeId,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StorageNodeRecord {
     pub node: StorageNodeId,
@@ -878,6 +899,8 @@ struct CatalogState {
     #[serde(default)]
     draining_storage_nodes: BTreeSet<StorageNodeId>,
     #[serde(default)]
+    range_commit_proofs: BTreeMap<RangeId, RangeCommitProof>,
+    #[serde(default)]
     applied_requests: BTreeMap<Uuid, ReplicatedCommandResult>,
 }
 
@@ -928,6 +951,7 @@ impl Default for CatalogState {
             completed_move_plans: BTreeMap::new(),
             owner_move_plans: BTreeMap::new(),
             completed_owner_move_plans: BTreeMap::new(),
+            range_commit_proofs: BTreeMap::new(),
             applied_requests: BTreeMap::new(),
         }
     }
@@ -1359,6 +1383,16 @@ pub enum Command {
         feed: String,
         plan_id: Uuid,
     },
+    /// Advance the durable committed-frontier proof for a Range.
+    /// Internal: reported by the Append Owner after a quorum commit.
+    RecordRangeCommitProof {
+        feed_id: Uuid,
+        range_id: RangeId,
+        position: CommitPosition,
+        frame_digest: [u8; 32],
+        evidence: Vec<StorageNodeId>,
+        reporter: StorageNodeId,
+    },
     RecoverSubscriptionProgressOwner {
         subscription_id: Uuid,
         expected_ownership_epoch: u64,
@@ -1413,6 +1447,16 @@ impl Command {
         )
     }
 
+    /// Whether the command's own data carries its idempotency: an
+    /// advance-only committed-frontier proof can re-apply harmlessly
+    /// (same position and digest is a no-op, a conflicting digest must
+    /// refuse), so caching its response in the unbounded
+    /// `applied_requests` map would grow the catalog without bound under
+    /// sustained appends.
+    pub fn caches_applied_response(&self) -> bool {
+        !matches!(self, Self::RecordRangeCommitProof { .. })
+    }
+
     pub fn requires_internal_replica_authority(&self) -> bool {
         matches!(
             self,
@@ -1427,6 +1471,7 @@ impl Command {
                 | Self::AbandonActiveRangeMerge { .. }
                 | Self::AbandonFollowerMove { .. }
                 | Self::AbandonOwnerMove { .. }
+                | Self::RecordRangeCommitProof { .. }
                 | Self::ClearSubscriptionCutover { .. }
                 | Self::RecordFollowerMoveCatchUp { .. }
                 | Self::ActivateFollowerMove { .. }
@@ -1942,6 +1987,7 @@ impl ControlController {
             fixed_state_store,
         } = request;
         let statement = command_label(&command);
+        let cache_response = command.caches_applied_response();
         let response = match self
             .apply(
                 &mut state,
@@ -1974,7 +2020,9 @@ impl ControlController {
                 error: Some(error.to_string()),
             },
         };
-        state.applied_requests.insert(request_id, response.clone());
+        if cache_response {
+            state.applied_requests.insert(request_id, response.clone());
+        }
         if let Err(error) = persist_state(&self.path, &state) {
             *state = previous_state;
             // The view must follow the restored state, never the
@@ -2419,6 +2467,34 @@ impl ControlController {
             .range_move_plans
             .get(&range_id)
             .cloned()
+    }
+
+    /// The durable committed-frontier proof recorded for a Range, if any.
+    pub async fn range_commit_proof(&self, range_id: RangeId) -> Option<RangeCommitProof> {
+        self.state
+            .lock()
+            .await
+            .range_commit_proofs
+            .get(&range_id)
+            .cloned()
+    }
+
+    /// Committed-frontier proofs for every Range this Feed's map routes.
+    pub async fn feed_commit_proofs(&self, feed_id: Uuid) -> BTreeMap<RangeId, RangeCommitProof> {
+        let state = self.state.lock().await;
+        let Some(map) = state.range_maps.get(&feed_id) else {
+            return BTreeMap::new();
+        };
+        map.routes()
+            .iter()
+            .filter_map(|route| {
+                state
+                    .range_commit_proofs
+                    .get(&route.range_id)
+                    .cloned()
+                    .map(|proof| (route.range_id, proof))
+            })
+            .collect()
     }
 
     /// The staged split plan blocking this Feed's next range operation, if
@@ -3902,6 +3978,23 @@ impl ControlController {
                                 .collect::<Vec<_>>())
                             .unwrap_or_default()),
                     );
+                    object.insert(
+                        "commit_proofs".to_owned(),
+                        json!(state
+                            .range_maps
+                            .get(&feed_id)
+                            .map(|map| map
+                                .routes()
+                                .iter()
+                                .filter_map(|route| {
+                                    state
+                                        .range_commit_proofs
+                                        .get(&route.range_id)
+                                        .map(|proof| (route.range_id.to_string(), json!(proof)))
+                                })
+                                .collect::<serde_json::Map<_, _>>())
+                            .unwrap_or_default()),
+                    );
                 }
                 Ok((format!("inspected placement for Feed {feed}"), data))
             }
@@ -4689,6 +4782,65 @@ impl ControlController {
                 Ok((
                     format!("abandoned Active Range merge plan {plan_id}"),
                     json!({ "abandoned": removed }),
+                ))
+            }
+            Command::RecordRangeCommitProof {
+                feed_id,
+                range_id,
+                position,
+                frame_digest,
+                evidence,
+                reporter,
+            } => {
+                if !state.feeds.values().any(|feed| feed.feed_id == feed_id) {
+                    return Err(ControlError::NotFound(format!(
+                        "Feed {feed_id} for committed-frontier proof"
+                    )));
+                }
+                let existing = state.range_commit_proofs.get(&range_id);
+                if let Some(existing) = existing {
+                    if existing.position > position {
+                        return Ok((
+                            format!(
+                                "retained newer committed-frontier proof for Range {range_id}"
+                            ),
+                            json!(existing),
+                        ));
+                    }
+                    if existing.position == position && existing.frame_digest != frame_digest {
+                        return Err(ControlError::InvalidOperation(format!(
+                            "conflicting committed-frontier proof for Range {range_id} at position {}: fork evidence",
+                            position.value()
+                        )));
+                    }
+                }
+                let mut merged = evidence.clone();
+                if let Some(existing) = existing {
+                    for node in &existing.evidence {
+                        if !merged.contains(node) {
+                            merged.push(node.clone());
+                        }
+                    }
+                }
+                merged.sort();
+                let proof = RangeCommitProof {
+                    feed_id,
+                    range_id,
+                    position,
+                    frame_digest,
+                    recorded_at_ns: issued_at_ns,
+                    evidence: merged,
+                    reporter,
+                };
+                state
+                    .range_commit_proofs
+                    .insert(range_id, proof.clone());
+                Ok((
+                    format!(
+                        "recorded committed-frontier proof for Range {range_id} at position {}",
+                        position.value()
+                    ),
+                    json!(proof),
                 ))
             }
             Command::AbandonFollowerMove { feed_id, plan_id } => {
@@ -7661,6 +7813,18 @@ pub fn derive_command_request_id(batch_request_id: Uuid, command_index: usize) -
     uuid_from_hash(hasher.finalize())
 }
 
+/// Deterministic request identity for a committed-frontier proof
+/// report: retries of the same (Range, position, digest) dedup through
+/// `applied_requests`, and each newer position is a fresh command.
+pub fn commit_proof_request_id(proof: &RangeCommitProof) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"range-commit-proof");
+    hasher.update(proof.range_id.as_uuid().as_bytes());
+    hasher.update(&proof.position.value().to_be_bytes());
+    hasher.update(&proof.frame_digest);
+    uuid_from_hash(hasher.finalize())
+}
+
 fn derived_resource_id(request_id: Uuid, resource_type: &str) -> Uuid {
     let mut hasher = blake3::Hasher::new();
     hasher.update(request_id.as_bytes());
@@ -7677,7 +7841,7 @@ fn uuid_from_hash(hash: blake3::Hash) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-fn unix_ns() -> i64 {
+pub fn unix_ns() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -7739,6 +7903,7 @@ fn command_label(command: &Command) -> String {
         Command::AbandonActiveRangeMerge { .. } => "ABANDON ACTIVE RANGE MERGE",
         Command::AbandonFollowerMove { .. } => "ABANDON FOLLOWER MOVE",
         Command::AbandonOwnerMove { .. } => "ABANDON OWNER MOVE",
+        Command::RecordRangeCommitProof { .. } => "RECORD RANGE COMMIT PROOF",
         Command::RecordActiveRangeSplitCatchUp { .. } => "RECORD ACTIVE RANGE SPLIT CATCH UP",
         Command::ActivateActiveRangeSplit { .. } => "ACTIVATE ACTIVE RANGE SPLIT",
         Command::PrepareActiveRangeMerge { .. } => "PREPARE ACTIVE RANGE MERGE",
@@ -11521,5 +11686,115 @@ mod tests {
         };
         assert!(clear.requires_internal_replica_authority());
         assert_eq!(command_label(&clear), "CLEAR SUBSCRIPTION CUTOVER");
+    }
+
+    #[tokio::test]
+    async fn committed_frontier_proofs_advance_only_and_refuse_fork_evidence() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute("CREATE SPACE orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        let feed_id = controller
+            .active_feed_by_name("orders.events")
+            .await
+            .unwrap()
+            .feed_id;
+        let assignment = controller
+            .active_range_assignments_for_feed(feed_id)
+            .await
+            .pop()
+            .unwrap();
+        let reporter = assignment.owner.clone();
+        let proof = |position: u64, digest: u8, request_id: u128| {
+            (
+                Command::RecordRangeCommitProof {
+                    feed_id,
+                    range_id: assignment.range_id,
+                    position: CommitPosition::new(position),
+                    frame_digest: [digest; 32],
+                    evidence: assignment.replicas.iter().cloned().collect(),
+                    reporter: reporter.clone(),
+                },
+                Uuid::from_u128(request_id),
+            )
+        };
+
+        // First report records the quorum-committed frontier.
+        let (command, request_id) = proof(5, 7, 1);
+        controller
+            .execute_commands_with_request_id(vec![command], request_id)
+            .await
+            .unwrap();
+        let recorded = controller
+            .range_commit_proof(assignment.range_id)
+            .await
+            .unwrap();
+        assert_eq!(recorded.position, CommitPosition::new(5));
+        assert_eq!(recorded.frame_digest, [7; 32]);
+
+        // A replayed request dedups instead of reapplying.
+        let (command, request_id) = proof(5, 7, 1);
+        let replay = controller
+            .execute_commands_with_request_id(vec![command], request_id)
+            .await
+            .unwrap();
+        assert_eq!(replay.results[0].data["position"], 5);
+
+        // A stale position is a no-op that keeps the newer proof.
+        let (command, request_id) = proof(3, 9, 2);
+        controller
+            .execute_commands_with_request_id(vec![command], request_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            controller
+                .range_commit_proof(assignment.range_id)
+                .await
+                .unwrap()
+                .position,
+            CommitPosition::new(5)
+        );
+
+        // A different digest at the same position is fork evidence.
+        let (command, request_id) = proof(5, 9, 3);
+        let conflict = controller
+            .execute_commands_with_request_id(vec![command], request_id)
+            .await
+            .unwrap_err();
+        assert!(conflict.to_string().contains("fork evidence"));
+
+        // A newer position advances and unions quorum evidence.
+        let (command, request_id) = proof(9, 11, 4);
+        controller
+            .execute_commands_with_request_id(vec![command], request_id)
+            .await
+            .unwrap();
+        let recorded = controller
+            .range_commit_proof(assignment.range_id)
+            .await
+            .unwrap();
+        assert_eq!(recorded.position, CommitPosition::new(9));
+        assert_eq!(recorded.frame_digest, [11; 32]);
+
+        // Internal authority only: the public command batch refuses it.
+        let (command, _) = proof(12, 13, 5);
+        assert!(command.requires_internal_replica_authority());
+
+        // A proof for a Feed the catalog never knew is refused, not
+        // recorded as phantom history.
+        let phantom = Command::RecordRangeCommitProof {
+            feed_id: Uuid::from_u128(99_999),
+            range_id: assignment.range_id,
+            position: CommitPosition::new(1),
+            frame_digest: [1; 32],
+            evidence: vec![reporter.clone()],
+            reporter,
+        };
+        assert!(controller
+            .execute_commands_with_request_id(vec![phantom], Uuid::from_u128(6))
+            .await
+            .is_err());
     }
 }
