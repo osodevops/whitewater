@@ -968,7 +968,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
 }
 
 #[tokio::test]
-async fn failed_split_activation_unfreezes_and_abandons_the_plan() {
+async fn failed_split_activation_unfreezes_and_retains_the_plan() {
     let directory = TempDir::new().unwrap();
     let legacy: Arc<dyn LogStore> =
         Arc::new(FileLogStore::open(directory.path().join("legacy")).unwrap());
@@ -1058,7 +1058,8 @@ async fn failed_split_activation_unfreezes_and_abandons_the_plan() {
         .unwrap();
     let plan: RangeSplitPlan = serde_json::from_value(prepared.results[0].data.clone()).unwrap();
 
-    // mark_ready commits for real, activation fails, abandon runs for real.
+    // mark_ready commits for real, activation fails; the staged plan stays
+    // resumable and unfrozen rather than being deleted.
     struct ActivateFailControl {
         control: Arc<ControlController>,
     }
@@ -1123,7 +1124,50 @@ async fn failed_split_activation_unfreezes_and_abandons_the_plan() {
         "the source range is unfrozen after the failed cutover"
     );
 
-    // The abandoned plan must not fence a later split attempt.
+    // The staged plan stays resumable: a retry of the same logical split
+    // under a fresh request ID replays the staged plan, while a different
+    // boundary fences behind `range_operation_pending`.
+    assert_eq!(
+        control
+            .range_split_plan(feed_id)
+            .await
+            .map(|staged| staged.plan_id),
+        Some(plan.plan_id),
+        "the staged plan survives the failure as resumable state"
+    );
+    let conflict = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.events".to_owned(),
+            split_at: KeyToken::from_bytes([0x40; 16]),
+        }])
+        .await;
+    assert!(
+        conflict.is_err(),
+        "a different boundary fences while the plan is staged"
+    );
+    let resumed = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.events".to_owned(),
+            split_at: KeyToken::from_bytes([0x80; 16]),
+        }])
+        .await
+        .unwrap();
+    let resumed_plan: RangeSplitPlan =
+        serde_json::from_value(resumed.results[0].data.clone()).unwrap();
+    assert_eq!(
+        resumed_plan.plan_id, plan.plan_id,
+        "the same logical split resumes the staged plan"
+    );
+
+    // The deliberate operator abandon removes the staged plan so a fresh
+    // split can stage.
+    control
+        .execute_commands(vec![Command::AbandonActiveRangeSplit {
+            feed_id: plan.feed_id,
+            plan_id: plan.plan_id,
+        }])
+        .await
+        .unwrap();
     let reprepared = control
         .execute_commands(vec![Command::PrepareActiveRangeSplit {
             feed: "orders.events".to_owned(),

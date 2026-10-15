@@ -1298,6 +1298,18 @@ pub enum Command {
         feed_id: Uuid,
         plan_id: Uuid,
     },
+    /// Abandons a staged follower-move plan after its cutover path failed,
+    /// under the same `feed_id`/`plan_id` fencing.
+    AbandonFollowerMove {
+        feed_id: Uuid,
+        plan_id: Uuid,
+    },
+    /// Abandons a staged owner-move plan after its cutover path failed,
+    /// under the same `feed_id`/`plan_id` fencing.
+    AbandonOwnerMove {
+        feed_id: Uuid,
+        plan_id: Uuid,
+    },
     /// Removes one pending Subscription frontier translation after the
     /// separate progress quorum committed (or already covered) it. The
     /// `plan_id` guard prevents a stale clear from deleting a newer
@@ -1413,6 +1425,8 @@ impl Command {
                 | Self::ActivateActiveRangeMerge { .. }
                 | Self::AbandonActiveRangeSplit { .. }
                 | Self::AbandonActiveRangeMerge { .. }
+                | Self::AbandonFollowerMove { .. }
+                | Self::AbandonOwnerMove { .. }
                 | Self::ClearSubscriptionCutover { .. }
                 | Self::RecordFollowerMoveCatchUp { .. }
                 | Self::ActivateFollowerMove { .. }
@@ -2424,6 +2438,28 @@ impl ControlController {
             .await
             .range_merge_plans
             .get(&feed_id)
+            .cloned()
+    }
+
+    /// The staged follower-move plan blocking this Feed's next range
+    /// operation, if any; move plans are keyed by RangeId, so this scans.
+    pub async fn feed_follower_move_plan(&self, feed_id: Uuid) -> Option<RangeMovePlan> {
+        self.state
+            .lock()
+            .await
+            .range_move_plans
+            .values()
+            .find(|plan| plan.feed_id == feed_id)
+            .cloned()
+    }
+
+    pub async fn feed_owner_move_plan(&self, feed_id: Uuid) -> Option<RangeOwnerMovePlan> {
+        self.state
+            .lock()
+            .await
+            .owner_move_plans
+            .values()
+            .find(|plan| plan.feed_id == feed_id)
             .cloned()
     }
 
@@ -4209,6 +4245,18 @@ impl ControlController {
             }
             Command::PrepareActiveRangeSplit { feed, split_at } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
+                // A retry of the same logical split under a fresh request ID
+                // resumes the staged plan rather than fencing on itself; a
+                // different boundary or operation kind still fences so two
+                // conflicting cutovers can never interleave.
+                if let Some(plan) = state.range_split_plans.get(&feed_id) {
+                    if plan.split_at == split_at {
+                        return Ok((
+                            format!("replayed staged Active Range split for Feed {feed}"),
+                            json!(plan),
+                        ));
+                    }
+                }
                 if range_operation_pending(state, feed_id) {
                     return Err(ControlError::AlreadyExists(format!(
                         "range operation for Feed {feed}"
@@ -4441,6 +4489,18 @@ impl ControlController {
                 right_range_id,
             } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
+                // Same-shape merge retries resume the staged plan; a
+                // different pair or operation kind still fences.
+                if let Some(plan) = state.range_merge_plans.get(&feed_id) {
+                    if plan.left_range_id == left_range_id
+                        && plan.right_range_id == right_range_id
+                    {
+                        return Ok((
+                            format!("replayed staged Active Range merge for Feed {feed}"),
+                            json!(plan),
+                        ));
+                    }
+                }
                 if range_operation_pending(state, feed_id) {
                     return Err(ControlError::AlreadyExists(format!(
                         "range operation for Feed {feed}"
@@ -4631,6 +4691,45 @@ impl ControlController {
                     json!({ "abandoned": removed }),
                 ))
             }
+            Command::AbandonFollowerMove { feed_id, plan_id } => {
+                // Move plans are keyed by RangeId; fence removal on the
+                // stored plan's Feed and plan identities so a stale abandon
+                // cannot delete a newer plan.
+                let range_id = state
+                    .range_move_plans
+                    .iter()
+                    .find(|(_, plan)| plan.feed_id == feed_id && plan.plan_id == plan_id)
+                    .map(|(range_id, _)| *range_id);
+                let removed = match range_id {
+                    Some(range_id) => {
+                        state.range_move_plans.remove(&range_id);
+                        true
+                    }
+                    None => false,
+                };
+                Ok((
+                    format!("abandoned follower move plan {plan_id}"),
+                    json!({ "abandoned": removed }),
+                ))
+            }
+            Command::AbandonOwnerMove { feed_id, plan_id } => {
+                let range_id = state
+                    .owner_move_plans
+                    .iter()
+                    .find(|(_, plan)| plan.feed_id == feed_id && plan.plan_id == plan_id)
+                    .map(|(range_id, _)| *range_id);
+                let removed = match range_id {
+                    Some(range_id) => {
+                        state.owner_move_plans.remove(&range_id);
+                        true
+                    }
+                    None => false,
+                };
+                Ok((
+                    format!("abandoned owner move plan {plan_id}"),
+                    json!({ "abandoned": removed }),
+                ))
+            }
             Command::ClearSubscriptionCutover {
                 subscription_id,
                 plan_id,
@@ -4656,6 +4755,16 @@ impl ControlController {
                 new_owner,
             } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
+                // Same-target owner-move retries resume the staged plan; a
+                // different target or operation kind still fences.
+                if let Some(plan) = state.owner_move_plans.get(&range_id) {
+                    if plan.feed_id == feed_id && plan.candidate_assignment.owner == new_owner {
+                        return Ok((
+                            format!("replayed staged owner movement for Feed {feed}"),
+                            json!(plan),
+                        ));
+                    }
+                }
                 if range_operation_pending(state, feed_id) {
                     return Err(ControlError::AlreadyExists(format!(
                         "range operation for Feed {feed}"
@@ -4813,6 +4922,20 @@ impl ControlController {
                 replacement_replica,
             } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
+                // Same-replacement follower-move retries resume the staged
+                // plan; a different replica choice or operation kind still
+                // fences.
+                if let Some(plan) = state.range_move_plans.get(&range_id) {
+                    if plan.feed_id == feed_id
+                        && plan.removed_replica == removed_replica
+                        && plan.replacement_replica == replacement_replica
+                    {
+                        return Ok((
+                            format!("replayed staged follower movement for Feed {feed}"),
+                            json!(plan),
+                        ));
+                    }
+                }
                 if range_operation_pending(state, feed_id) {
                     return Err(ControlError::AlreadyExists(format!(
                         "range operation for Feed {feed}"
@@ -7614,6 +7737,8 @@ fn command_label(command: &Command) -> String {
         Command::PrepareActiveRangeSplit { .. } => "PREPARE ACTIVE RANGE SPLIT",
         Command::AbandonActiveRangeSplit { .. } => "ABANDON ACTIVE RANGE SPLIT",
         Command::AbandonActiveRangeMerge { .. } => "ABANDON ACTIVE RANGE MERGE",
+        Command::AbandonFollowerMove { .. } => "ABANDON FOLLOWER MOVE",
+        Command::AbandonOwnerMove { .. } => "ABANDON OWNER MOVE",
         Command::RecordActiveRangeSplitCatchUp { .. } => "RECORD ACTIVE RANGE SPLIT CATCH UP",
         Command::ActivateActiveRangeSplit { .. } => "ACTIVATE ACTIVE RANGE SPLIT",
         Command::PrepareActiveRangeMerge { .. } => "PREPARE ACTIVE RANGE MERGE",

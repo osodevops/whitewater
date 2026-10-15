@@ -176,8 +176,9 @@ pub trait SplitCutoverControl: Send + Sync {
         boundary: &FrozenSplitBoundary,
     ) -> Result<(), String>;
 
-    /// Abandon the staged plan after the cutover failed so the catalog row
-    /// does not block every later range operation on the Feed.
+    /// Deliberately abandon a staged plan whose cutover can never resume —
+    /// the operator remedy for a permanently wedged operation. Failure paths
+    /// keep the staged row instead so a retry can resume it.
     async fn abandon(&self, plan: &RangeSplitPlan) -> Result<(), String>;
 }
 
@@ -263,18 +264,16 @@ pub async fn orchestrate_split_cutover(
         batch_size,
     )
     .await?;
+    // Failure paths unfreeze the source but keep the staged plan: a retry of
+    // the same logical split resumes it, a conflicting operation stays fenced
+    // behind `range_operation_pending`, and an operator abandons a permanently
+    // wedged plan explicitly.
     if let Err(error) = control.mark_ready(feed, plan, &boundary).await {
         abort_frozen_split(&source, &boundary).await;
-        if let Err(abandon) = control.abandon(plan).await {
-            tracing::warn!(%abandon, plan_id = %plan.plan_id, "failed split cutover could not abandon its staged plan; later range operations stay fenced");
-        }
         return Err(SplitStagingError::Control(error));
     }
     if let Err(error) = control.activate(feed, plan, &boundary).await {
         abort_frozen_split(&source, &boundary).await;
-        if let Err(abandon) = control.abandon(plan).await {
-            tracing::warn!(%abandon, plan_id = %plan.plan_id, "failed split cutover could not abandon its staged plan; later range operations stay fenced");
-        }
         return Err(SplitStagingError::Control(error));
     }
     Ok(boundary)

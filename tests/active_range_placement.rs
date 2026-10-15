@@ -5,8 +5,9 @@ use uuid::Uuid;
 use whitewater::{
     active_range::{CommitPosition, KeyToken, StorageNodeId},
     control::{
-        Command, ControlController, ControlError, RangeMergePlan, RangeSplitPlan, RangeSplitStage,
-        ReaderFrontierTranslation, ReaderStart,
+        Command, ControlController, ControlError, RangeMergePlan, RangeMovePlan,
+        RangeOwnerMovePlan, RangeSplitPlan, RangeSplitStage, ReaderFrontierTranslation,
+        ReaderStart,
     },
     storage::{FileLogStore, LogStore},
 };
@@ -770,22 +771,44 @@ async fn follower_move_rejects_owner_replacement_ineligible_node_and_conflicting
             .await
             .is_err());
     }
+    let removed = non_owner_replica(&current);
+    let replacement = non_member(&pool, &current);
     let prepared = control
         .execute_commands(vec![Command::PrepareFollowerMove {
             feed: "orders.created".to_owned(),
             range_id,
-            removed_replica: non_owner_replica(&current),
-            replacement_replica: non_member(&pool, &current),
+            removed_replica: removed.clone(),
+            replacement_replica: replacement.clone(),
         }])
         .await
         .unwrap();
     let plan_id = serde_json::from_value(prepared.results[0].data["plan_id"].clone()).unwrap();
+    // A retry of the same logical move resumes the staged plan instead of
+    // fencing on itself.
+    let resumed = control
+        .execute_commands(vec![Command::PrepareFollowerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            removed_replica: removed.clone(),
+            replacement_replica: replacement.clone(),
+        }])
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_value::<Uuid>(resumed.results[0].data["plan_id"].clone()).unwrap(),
+        plan_id
+    );
+    // A conflicting move — a different removed follower — must still fence.
+    let other_follower = placed_replicas(&current)
+        .into_iter()
+        .find(|node| *node != placed_owner(&current) && *node != removed)
+        .unwrap();
     assert!(control
         .execute_commands(vec![Command::PrepareFollowerMove {
             feed: "orders.created".to_owned(),
             range_id,
-            removed_replica: non_owner_replica(&current),
-            replacement_replica: non_member(&pool, &current),
+            removed_replica: other_follower,
+            replacement_replica: replacement,
         }])
         .await
         .is_err());
@@ -1784,6 +1807,209 @@ async fn abandoning_a_staged_split_plan_releases_the_feed_for_retry() {
         .await
         .unwrap();
     let new_plan: RangeSplitPlan =
+        serde_json::from_value(reprepared.results[0].data.clone()).unwrap();
+    assert_ne!(new_plan.plan_id, plan.plan_id);
+}
+#[tokio::test]
+async fn abandoning_a_staged_owner_move_plan_releases_the_feed_for_retry() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    create_feed(&control, Uuid::from_u128(92_010)).await;
+    let current = placement(&control).await;
+    let range_id = serde_json::from_value(current["range_id"].clone()).unwrap();
+    let new_owner = non_owner_replica(&current);
+
+    let prepared = control
+        .execute_commands(vec![Command::PrepareOwnerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            new_owner: new_owner.clone(),
+        }])
+        .await
+        .unwrap();
+    let plan: RangeOwnerMovePlan =
+        serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+
+    // While the plan is staged the Feed refuses a second range operation.
+    let blocked = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            split_at: KeyToken::from_bytes([0x40; 16]),
+        }])
+        .await;
+    assert!(blocked.is_err(), "a staged move must fence a later split");
+
+    // A retry of the same move under a fresh request ID resumes the staged
+    // plan rather than fencing on itself.
+    let resumed = control
+        .execute_commands(vec![Command::PrepareOwnerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            new_owner: new_owner.clone(),
+        }])
+        .await
+        .unwrap();
+    let resumed_plan: RangeOwnerMovePlan =
+        serde_json::from_value(resumed.results[0].data.clone()).unwrap();
+    assert_eq!(
+        resumed_plan.plan_id, plan.plan_id,
+        "the same owner move resumes the staged plan"
+    );
+
+    // A move toward a different target still fences.
+    let other_target = placed_replicas(&current)
+        .into_iter()
+        .find(|node| *node != placed_owner(&current) && *node != new_owner)
+        .unwrap();
+    let conflict = control
+        .execute_commands(vec![Command::PrepareOwnerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            new_owner: other_target,
+        }])
+        .await;
+    assert!(conflict.is_err(), "a different owner target must fence");
+
+    // A stale plan_id cannot abandon the staged plan.
+    control
+        .execute_commands(vec![Command::AbandonOwnerMove {
+            feed_id: plan.feed_id,
+            plan_id: Uuid::from_u128(92_099),
+        }])
+        .await
+        .unwrap();
+    let still_blocked = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            split_at: KeyToken::from_bytes([0x40; 16]),
+        }])
+        .await;
+    assert!(still_blocked.is_err(), "a stale abandon must be a no-op");
+
+    // The fenced abandon releases the Feed so a later attempt can re-prepare.
+    control
+        .execute_commands(vec![Command::AbandonOwnerMove {
+            feed_id: plan.feed_id,
+            plan_id: plan.plan_id,
+        }])
+        .await
+        .unwrap();
+    let reprepared = control
+        .execute_commands(vec![Command::PrepareOwnerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            new_owner,
+        }])
+        .await
+        .unwrap();
+    let new_plan: RangeOwnerMovePlan =
+        serde_json::from_value(reprepared.results[0].data.clone()).unwrap();
+    assert_ne!(new_plan.plan_id, plan.plan_id);
+}
+
+#[tokio::test]
+async fn abandoning_a_staged_follower_move_plan_releases_the_feed_for_retry() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3", "storage-4"]),
+    );
+    create_feed(&control, Uuid::from_u128(92_020)).await;
+    let current = placement(&control).await;
+    let range_id = serde_json::from_value(current["range_id"].clone()).unwrap();
+    let removed = non_owner_replica(&current);
+    let replacement = StorageNodeId::try_new("storage-4").unwrap();
+
+    let prepared = control
+        .execute_commands(vec![Command::PrepareFollowerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            removed_replica: removed.clone(),
+            replacement_replica: replacement.clone(),
+        }])
+        .await
+        .unwrap();
+    let plan: RangeMovePlan = serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+
+    // While the plan is staged the Feed refuses a second range operation.
+    let blocked = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            split_at: KeyToken::from_bytes([0x40; 16]),
+        }])
+        .await;
+    assert!(blocked.is_err(), "a staged move must fence a later split");
+
+    // A retry of the same move under a fresh request ID resumes the staged
+    // plan rather than fencing on itself.
+    let resumed = control
+        .execute_commands(vec![Command::PrepareFollowerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            removed_replica: removed.clone(),
+            replacement_replica: replacement.clone(),
+        }])
+        .await
+        .unwrap();
+    let resumed_plan: RangeMovePlan =
+        serde_json::from_value(resumed.results[0].data.clone()).unwrap();
+    assert_eq!(
+        resumed_plan.plan_id, plan.plan_id,
+        "the same follower move resumes the staged plan"
+    );
+
+    // A move removing the other follower still fences.
+    let other_removed = placed_replicas(&current)
+        .into_iter()
+        .find(|node| *node != placed_owner(&current) && *node != removed)
+        .unwrap();
+    let conflict = control
+        .execute_commands(vec![Command::PrepareFollowerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            removed_replica: other_removed,
+            replacement_replica: replacement.clone(),
+        }])
+        .await;
+    assert!(conflict.is_err(), "a different follower choice must fence");
+
+    // A stale plan_id cannot abandon the staged plan.
+    control
+        .execute_commands(vec![Command::AbandonFollowerMove {
+            feed_id: plan.feed_id,
+            plan_id: Uuid::from_u128(92_099),
+        }])
+        .await
+        .unwrap();
+    let still_blocked = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            split_at: KeyToken::from_bytes([0x40; 16]),
+        }])
+        .await;
+    assert!(still_blocked.is_err(), "a stale abandon must be a no-op");
+
+    // The fenced abandon releases the Feed so a later attempt can re-prepare.
+    control
+        .execute_commands(vec![Command::AbandonFollowerMove {
+            feed_id: plan.feed_id,
+            plan_id: plan.plan_id,
+        }])
+        .await
+        .unwrap();
+    let reprepared = control
+        .execute_commands(vec![Command::PrepareFollowerMove {
+            feed: "orders.created".to_owned(),
+            range_id,
+            removed_replica: removed,
+            replacement_replica: replacement,
+        }])
+        .await
+        .unwrap();
+    let new_plan: RangeMovePlan =
         serde_json::from_value(reprepared.results[0].data.clone()).unwrap();
     assert_ne!(new_plan.plan_id, plan.plan_id);
 }

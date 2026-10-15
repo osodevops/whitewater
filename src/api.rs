@@ -4901,13 +4901,15 @@ async fn state_store_lookup(
     Json(request): Json<StateStoreLookupApiRequest>,
 ) -> Result<Json<StateStoreLookupApiResponse>, ApiError> {
     authenticate_credential(&state, &headers)?;
-    let store = state
-        .control
-        .declared_state_store_by_name(&request.store)
-        .await
-        .ok_or_else(|| {
-            ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
-        })?;
+    let store = state_store_when_applied(
+        &state.control,
+        &request.store,
+        state.control_plane.is_some(),
+    )
+    .await
+    .ok_or_else(|| {
+        ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
+    })?;
     authorize_namespace(&state, &headers, &store.name, PermissionAction::Read)?;
     let assignment = state
         .control
@@ -5091,13 +5093,15 @@ async fn state_store_get_by(
     Json(request): Json<StateStoreGetByRequest>,
 ) -> Result<Json<StateStoreGetByResponse>, ApiError> {
     authenticate_credential(&state, &headers)?;
-    let store = state
-        .control
-        .declared_state_store_by_name(&request.store)
-        .await
-        .ok_or_else(|| {
-            ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
-        })?;
+    let store = state_store_when_applied(
+        &state.control,
+        &request.store,
+        state.control_plane.is_some(),
+    )
+    .await
+    .ok_or_else(|| {
+        ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
+    })?;
     authorize_namespace(&state, &headers, &store.name, PermissionAction::Read)?;
     if !store
         .named_keys
@@ -5228,13 +5232,15 @@ async fn state_store_iterate(
     Json(request): Json<StateStoreIterateRequest>,
 ) -> Result<Json<StateStoreIterateResponse>, ApiError> {
     authenticate_credential(&state, &headers)?;
-    let store = state
-        .control
-        .declared_state_store_by_name(&request.store)
-        .await
-        .ok_or_else(|| {
-            ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
-        })?;
+    let store = state_store_when_applied(
+        &state.control,
+        &request.store,
+        state.control_plane.is_some(),
+    )
+    .await
+    .ok_or_else(|| {
+        ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
+    })?;
     authorize_namespace(&state, &headers, &store.name, PermissionAction::Read)?;
     let assignment = state
         .control
@@ -5330,13 +5336,15 @@ async fn state_store_clear(
     Json(request): Json<StateStoreClearRequest>,
 ) -> Result<Json<StateStoreMutateResponse>, ApiError> {
     authenticate_credential(&state, &headers)?;
-    let store = state
-        .control
-        .declared_state_store_by_name(&request.store)
-        .await
-        .ok_or_else(|| {
-            ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
-        })?;
+    let store = state_store_when_applied(
+        &state.control,
+        &request.store,
+        state.control_plane.is_some(),
+    )
+    .await
+    .ok_or_else(|| {
+        ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
+    })?;
     authorize_namespace(&state, &headers, &store.name, PermissionAction::Write)?;
     if !matches!(store.source, crate::control::StateStoreSource::Manual) {
         return Err(ApiError::bad_request(
@@ -5853,13 +5861,15 @@ async fn state_store_mutate(
     Json(request): Json<StateStoreMutateRequest>,
 ) -> Result<Json<StateStoreMutateResponse>, ApiError> {
     authenticate_credential(&state, &headers)?;
-    let store = state
-        .control
-        .declared_state_store_by_name(&request.store)
-        .await
-        .ok_or_else(|| {
-            ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
-        })?;
+    let store = state_store_when_applied(
+        &state.control,
+        &request.store,
+        state.control_plane.is_some(),
+    )
+    .await
+    .ok_or_else(|| {
+        ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
+    })?;
     authorize_namespace(&state, &headers, &store.name, PermissionAction::Write)?;
     if !matches!(store.source, crate::control::StateStoreSource::Manual) {
         return Err(ApiError::bad_request(
@@ -6072,9 +6082,7 @@ async fn feed_derived_store(
     state: &AppState,
     name: &str,
 ) -> Result<crate::control::StateStoreDefinition, ApiError> {
-    let store = state
-        .control
-        .declared_state_store_by_name(name)
+    let store = state_store_when_applied(&state.control, name, state.control_plane.is_some())
         .await
         .ok_or_else(|| ApiError::bad_request(format!("StateStore does not exist: {name}")))?;
     if !matches!(store.source, crate::control::StateStoreSource::Feed { .. }) {
@@ -7792,7 +7800,7 @@ async fn unfreeze_split_nodes(
     plan: &RangeSplitPlan,
     source_assignment: &ActiveRangeAssignment,
     key: &str,
-) -> bool {
+) {
     for node in plan.right_assignment.replicas.iter() {
         if let Some(endpoint) = state.control_endpoints.resolve(node).await {
             let _ = state
@@ -7809,7 +7817,6 @@ async fn unfreeze_split_nodes(
                 .await;
         }
     }
-    abandon_split_plan(state, plan).await
 }
 
 /// Removes a staged split plan after its cutover failed. The staged plan
@@ -8092,19 +8099,48 @@ async fn admin_split_range(
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let plan: RangeSplitPlan = serde_json::from_value(prepared.results[0].data.clone())
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    // A replayed request ID may name a plan that already activated, or one
+    // an operator abandoned while it was wedged — only drive the cutover
+    // while this Node's catalog still holds the staged row.
+    let mut staged_visible = false;
+    for _ in 0..150 {
+        if state
+            .control
+            .active_range_assignment_by_id(plan.right_assignment.range_id)
+            .await
+            .is_some()
+        {
+            return Ok(Json(
+                json!({ "status": "activated", "plan_id": plan.plan_id }),
+            ));
+        }
+        match state.control.range_split_plan(plan.feed_id).await {
+            Some(staged) if staged.plan_id == plan.plan_id => {
+                staged_visible = true;
+                break;
+            }
+            Some(staged) => {
+                return Err(ApiError::conflict(format!(
+                    "Feed {} holds a different staged plan {}; re-inspect before resubmitting",
+                    request.feed, staged.plan_id
+                )));
+            }
+            None => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    if !staged_visible {
+        return Err(ApiError::conflict(format!(
+            "staged split plan {} for Feed {} never applied or was abandoned; resubmit with a new request ID",
+            plan.plan_id, request.feed
+        )));
+    }
     let source_assignment = match state.control.active_range_assignment(plan.feed_id).await {
         Some(assignment) => assignment,
-        None => {
-            abandon_split_plan(&state, &plan).await;
-            return Err(ApiError::unavailable("source assignment is unavailable"));
-        }
+        None => return Err(ApiError::unavailable("source assignment is unavailable")),
     };
     let key = match state.internal_key.as_ref() {
         Some(key) => key,
-        None => {
-            abandon_split_plan(&state, &plan).await;
-            return Err(ApiError::unavailable("internal credential is unavailable"));
-        }
+        None => return Err(ApiError::unavailable("internal credential is unavailable")),
     };
     let mut source_commit = CommitPosition::new(0);
     for node in split_freeze_order(&source_assignment) {
@@ -8431,7 +8467,7 @@ async fn unfreeze_merge_nodes(
     left: &ActiveRangeAssignment,
     right: &ActiveRangeAssignment,
     key: &str,
-) -> bool {
+) {
     for node in plan.merged_assignment.replicas.iter() {
         if let Some(endpoint) = state.control_endpoints.resolve(node).await {
             for assignment in [left, right] {
@@ -8450,7 +8486,6 @@ async fn unfreeze_merge_nodes(
             }
         }
     }
-    abandon_merge_plan(state, plan).await
 }
 
 /// Same fenced abandon as the split path: a failed merge must not leave
@@ -8469,6 +8504,46 @@ async fn abandon_merge_plan(state: &AppState, plan: &RangeMergePlan) -> bool {
         Ok(_) => true,
         Err(error) => {
             tracing::warn!(%error, plan_id = %plan.plan_id, "failed merge cutover could not abandon its staged plan; later range operations stay fenced");
+            false
+        }
+    }
+}
+
+/// Same fenced abandon for a staged follower-move plan.
+async fn abandon_follower_move_plan(state: &AppState, plan: &RangeMovePlan) -> bool {
+    let Some(control_plane) = state.control_plane.as_ref() else {
+        return false;
+    };
+    match control_plane
+        .execute_commands(vec![crate::control::Command::AbandonFollowerMove {
+            feed_id: plan.feed_id,
+            plan_id: plan.plan_id,
+        }])
+        .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(%error, plan_id = %plan.plan_id, "failed follower move could not abandon its staged plan; later range operations stay fenced");
+            false
+        }
+    }
+}
+
+/// Same fenced abandon for a staged owner-move plan.
+async fn abandon_owner_move_plan(state: &AppState, plan: &RangeOwnerMovePlan) -> bool {
+    let Some(control_plane) = state.control_plane.as_ref() else {
+        return false;
+    };
+    match control_plane
+        .execute_commands(vec![crate::control::Command::AbandonOwnerMove {
+            feed_id: plan.feed_id,
+            plan_id: plan.plan_id,
+        }])
+        .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(%error, plan_id = %plan.plan_id, "failed owner move could not abandon its staged plan; later range operations stay fenced");
             false
         }
     }
@@ -8515,7 +8590,8 @@ async fn admin_abandon_range_operation(
             key,
         ) {
             (Some(source_assignment), Some(key)) => {
-                unfreeze_split_nodes(&state, &plan, &source_assignment, key).await
+                unfreeze_split_nodes(&state, &plan, &source_assignment, key).await;
+                abandon_split_plan(&state, &plan).await
             }
             _ => abandon_split_plan(&state, &plan).await,
         };
@@ -8548,7 +8624,8 @@ async fn admin_abandon_range_operation(
             .await;
         let cleared = match (left, right, key) {
             (Some(left), Some(right), Some(key)) => {
-                unfreeze_merge_nodes(&state, &plan, &left, &right, key).await
+                unfreeze_merge_nodes(&state, &plan, &left, &right, key).await;
+                abandon_merge_plan(&state, &plan).await
             }
             _ => abandon_merge_plan(&state, &plan).await,
         };
@@ -8559,6 +8636,82 @@ async fn admin_abandon_range_operation(
             )));
         }
         abandoned.push(json!({ "kind": "merge", "plan_id": plan.plan_id }));
+    }
+
+    if let Some(plan) = state.control.feed_follower_move_plan(feed.feed_id).await {
+        if plan.plan_id != request.plan_id {
+            return Err(ApiError::conflict(format!(
+                "Feed {} holds a different staged plan {}; re-inspect before abandoning",
+                request.feed, plan.plan_id
+            )));
+        }
+        let plan_request = MovePlanRequest {
+            plan_id: plan.plan_id,
+            range_id: plan.source_assignment.range_id,
+        };
+        // Best-effort unfreeze of the source owner, then the fenced abandon.
+        if let (Some(endpoint), Some(key)) = (
+            state
+                .control_endpoints
+                .resolve(&plan.source_assignment.owner)
+                .await,
+            key,
+        ) {
+            let _ = unfreeze_move(&state, &endpoint, key, &plan_request).await;
+        }
+        let cleared = abandon_follower_move_plan(&state, &plan).await;
+        if !cleared
+            || state
+                .control
+                .feed_follower_move_plan(feed.feed_id)
+                .await
+                .is_some()
+        {
+            return Err(ApiError::unavailable(format!(
+                "staged follower move plan {} could not be abandoned yet; retry the remedy",
+                plan.plan_id
+            )));
+        }
+        abandoned.push(json!({ "kind": "follower-move", "plan_id": plan.plan_id }));
+    }
+
+    if let Some(plan) = state.control.feed_owner_move_plan(feed.feed_id).await {
+        if plan.plan_id != request.plan_id {
+            return Err(ApiError::conflict(format!(
+                "Feed {} holds a different staged plan {}; re-inspect before abandoning",
+                request.feed, plan.plan_id
+            )));
+        }
+        let plan_request = MovePlanRequest {
+            plan_id: plan.plan_id,
+            range_id: plan.source_assignment.range_id,
+        };
+        if let Some(key) = key {
+            // Best-effort unfreeze of both cutover participants wherever they
+            // are still reachable.
+            for node in [
+                &plan.source_assignment.owner,
+                &plan.candidate_assignment.owner,
+            ] {
+                if let Some(endpoint) = state.control_endpoints.resolve(node).await {
+                    let _ = unfreeze_owner_move(&state, &endpoint, key, &plan_request).await;
+                }
+            }
+        }
+        let cleared = abandon_owner_move_plan(&state, &plan).await;
+        if !cleared
+            || state
+                .control
+                .feed_owner_move_plan(feed.feed_id)
+                .await
+                .is_some()
+        {
+            return Err(ApiError::unavailable(format!(
+                "staged owner move plan {} could not be abandoned yet; retry the remedy",
+                plan.plan_id
+            )));
+        }
+        abandoned.push(json!({ "kind": "owner-move", "plan_id": plan.plan_id }));
     }
 
     if abandoned.is_empty() {
@@ -8595,16 +8748,48 @@ async fn admin_merge_ranges(
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let plan: RangeMergePlan = serde_json::from_value(prepared.results[0].data.clone())
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    // Same replay/abandon guard as the split path: a merged assignment means
+    // the cutover already activated, a matching staged row means resume, and
+    // a missing or different row refuses honestly.
+    let mut staged_visible = false;
+    for _ in 0..150 {
+        if state
+            .control
+            .active_range_assignment_by_id(plan.merged_assignment.range_id)
+            .await
+            == Some(plan.merged_assignment.clone())
+        {
+            return Ok(Json(
+                json!({ "status": "activated", "plan_id": plan.plan_id }),
+            ));
+        }
+        match state.control.range_merge_plan(plan.feed_id).await {
+            Some(staged) if staged.plan_id == plan.plan_id => {
+                staged_visible = true;
+                break;
+            }
+            Some(staged) => {
+                return Err(ApiError::conflict(format!(
+                    "Feed {} holds a different staged plan {}; re-inspect before resubmitting",
+                    request.feed, staged.plan_id
+                )));
+            }
+            None => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    if !staged_visible {
+        return Err(ApiError::conflict(format!(
+            "staged merge plan {} for Feed {} never applied or was abandoned; resubmit with a new request ID",
+            plan.plan_id, request.feed
+        )));
+    }
     let left = match state
         .control
         .active_range_assignment_by_id(plan.left_range_id)
         .await
     {
         Some(assignment) => assignment,
-        None => {
-            abandon_merge_plan(&state, &plan).await;
-            return Err(ApiError::unavailable("left assignment unavailable"));
-        }
+        None => return Err(ApiError::unavailable("left assignment unavailable")),
     };
     let right = match state
         .control
@@ -8612,17 +8797,11 @@ async fn admin_merge_ranges(
         .await
     {
         Some(assignment) => assignment,
-        None => {
-            abandon_merge_plan(&state, &plan).await;
-            return Err(ApiError::unavailable("right assignment unavailable"));
-        }
+        None => return Err(ApiError::unavailable("right assignment unavailable")),
     };
     let key = match state.internal_key.as_ref() {
         Some(key) => key,
-        None => {
-            abandon_merge_plan(&state, &plan).await;
-            return Err(ApiError::unavailable("internal credential unavailable"));
-        }
+        None => return Err(ApiError::unavailable("internal credential unavailable")),
     };
     let mut evidence = Vec::new();
     for node in plan.merged_assignment.replicas.iter() {
@@ -8872,7 +9051,7 @@ async fn active_move_plan(
     state: &AppState,
     request: &MovePlanRequest,
 ) -> Result<RangeMovePlan, ApiError> {
-    for _ in 0..30 {
+    for _ in 0..150 {
         if let Some(plan) = state.control.follower_move_plan(request.range_id).await {
             if plan.plan_id == request.plan_id {
                 return Ok(plan);
@@ -9281,6 +9460,50 @@ async fn unfreeze_move(
     ))
 }
 
+/// Unfreezes a possibly-frozen source after a failed follower move while the
+/// staged plan stays resumable: the same `request_id` replays the prepared
+/// plan and drives the cutover again, while a conflicting operation fences
+/// behind `range_operation_pending` until an operator abandons it. Returns
+/// the unfreeze error when it failed, otherwise the cutover error.
+async fn rollback_follower_move(
+    state: &AppState,
+    source_endpoint: &str,
+    key: &str,
+    plan_request: &MovePlanRequest,
+    error: ApiError,
+) -> ApiError {
+    let unfreeze_error = unfreeze_move(state, source_endpoint, key, plan_request)
+        .await
+        .err();
+    unfreeze_error.unwrap_or(error)
+}
+
+/// Waits for the staged plan row a Prepare returned to be visible in this
+/// Node's applied catalog. A request-ID replay can name a plan an operator
+/// abandoned while it was wedged, or a newer staged plan can hold the Feed —
+/// either way the handler must refuse honestly instead of driving a ghost
+/// cutover. `fetch` yields the currently staged plan ID for the operation.
+async fn await_staged_plan<F, Fut>(mut fetch: F, plan_id: Uuid, kind: &str) -> Result<(), ApiError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Option<Uuid>>,
+{
+    for _ in 0..150 {
+        match fetch().await {
+            Some(staged) if staged == plan_id => return Ok(()),
+            Some(staged) => {
+                return Err(ApiError::conflict(format!(
+                    "a different staged {kind} plan {staged} holds this Feed; re-inspect before resubmitting"
+                )));
+            }
+            None => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    Err(ApiError::conflict(format!(
+        "staged {kind} plan {plan_id} never applied or was abandoned; resubmit with a new request ID"
+    )))
+}
+
 async fn admin_move_follower(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -9305,20 +9528,31 @@ async fn admin_move_follower(
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let plan: RangeMovePlan = serde_json::from_value(prepared.results[0].data.clone())
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
-    let source_endpoint = state
+    // A post-Prepare failure retains the staged plan as resumable state:
+    // the same `request_id` replays the prepared plan and drives the cutover
+    // again, a conflicting operation fences behind `range_operation_pending`,
+    // and an operator abandons a permanently wedged plan explicitly.
+    let source_endpoint = match state
         .control_endpoints
         .resolve(&plan.source_assignment.owner)
         .await
-        .ok_or_else(|| ApiError::unavailable("source endpoint unavailable"))?;
-    let target_endpoint = state
+    {
+        Some(endpoint) => endpoint,
+        None => return Err(ApiError::unavailable("source endpoint unavailable")),
+    };
+    let target_endpoint = match state
         .control_endpoints
         .resolve(&plan.replacement_replica)
         .await
-        .ok_or_else(|| ApiError::unavailable("replacement endpoint unavailable"))?;
-    let key = state
-        .internal_key
-        .as_ref()
-        .ok_or_else(|| ApiError::unavailable("internal credential unavailable"))?;
+    {
+        Some(endpoint) => endpoint,
+        None => {
+            return Err(ApiError::unavailable("replacement endpoint unavailable"));
+        }
+    };
+    let Some(key) = state.internal_key.clone() else {
+        return Err(ApiError::unavailable("internal credential unavailable"));
+    };
     let plan_request = MovePlanRequest {
         plan_id: plan.plan_id,
         range_id: plan.source_assignment.range_id,
@@ -9329,15 +9563,29 @@ async fn admin_move_follower(
         .await
         == Some(plan.candidate_assignment.clone())
     {
-        unfreeze_move(&state, &source_endpoint, key, &plan_request).await?;
+        unfreeze_move(&state, &source_endpoint, &key, &plan_request).await?;
         return Ok(Json(
             json!({ "status": "activated", "assignment": plan.candidate_assignment }),
         ));
     }
+    // A replayed request ID may name a plan an operator abandoned while it
+    // was wedged; only drive the cutover while the staged row still exists.
+    await_staged_plan(
+        || async {
+            state
+                .control
+                .follower_move_plan(plan_request.range_id)
+                .await
+                .map(|staged| staged.plan_id)
+        },
+        plan.plan_id,
+        "follower move",
+    )
+    .await?;
     post_move_request(
         &state,
         &target_endpoint,
-        key,
+        &key,
         "/internal/active-range/move/stage",
         &MoveStageRequest {
             plan_id: plan.plan_id,
@@ -9346,25 +9594,44 @@ async fn admin_move_follower(
         },
     )
     .await?;
-    let frozen = post_move_request(
+    let frozen = match post_move_request(
         &state,
         &source_endpoint,
-        key,
+        &key,
         "/internal/active-range/move/freeze",
         &plan_request,
     )
-    .await?;
+    .await
+    {
+        Ok(frozen) => frozen,
+        Err(error) => {
+            return Err(rollback_follower_move(
+                &state,
+                &source_endpoint,
+                &key,
+                &plan_request,
+                error,
+            )
+            .await);
+        }
+    };
     let boundary: CommitPosition = match serde_json::from_value(frozen["source_commit"].clone()) {
         Ok(commit) => commit,
         Err(error) => {
-            unfreeze_move(&state, &source_endpoint, key, &plan_request).await?;
-            return Err(ApiError::unavailable(error.to_string()));
+            return Err(rollback_follower_move(
+                &state,
+                &source_endpoint,
+                &key,
+                &plan_request,
+                ApiError::unavailable(error.to_string()),
+            )
+            .await);
         }
     };
     let final_copy = post_move_request(
         &state,
         &target_endpoint,
-        key,
+        &key,
         "/internal/active-range/move/stage",
         &MoveStageRequest {
             plan_id: plan.plan_id,
@@ -9377,30 +9644,58 @@ async fn admin_move_follower(
         Ok(data) => match serde_json::from_value(data) {
             Ok(copied) => copied,
             Err(error) => {
-                unfreeze_move(&state, &source_endpoint, key, &plan_request).await?;
-                return Err(ApiError::unavailable(error.to_string()));
+                return Err(rollback_follower_move(
+                    &state,
+                    &source_endpoint,
+                    &key,
+                    &plan_request,
+                    ApiError::unavailable(error.to_string()),
+                )
+                .await);
             }
         },
         Err(error) => {
-            unfreeze_move(&state, &source_endpoint, key, &plan_request).await?;
-            return Err(error);
+            return Err(rollback_follower_move(
+                &state,
+                &source_endpoint,
+                &key,
+                &plan_request,
+                error,
+            )
+            .await);
         }
     };
     if !copied.ready || copied.source_commit != boundary || copied.target_commit != boundary {
-        unfreeze_move(&state, &source_endpoint, key, &plan_request).await?;
-        return Err(ApiError::unavailable(
-            "replacement did not commit the frozen source prefix",
-        ));
+        return Err(rollback_follower_move(
+            &state,
+            &source_endpoint,
+            &key,
+            &plan_request,
+            ApiError::unavailable("replacement did not commit the frozen source prefix"),
+        )
+        .await);
     }
     let cutover = ControlPlaneFollowerMove::new(control_plane.clone());
-    cutover
-        .record_ready(&request.feed, &plan, &copied)
-        .await
-        .map_err(ApiError::unavailable)?;
-    cutover
-        .activate(&request.feed, &plan)
-        .await
-        .map_err(ApiError::unavailable)?;
+    if let Err(error) = cutover.record_ready(&request.feed, &plan, &copied).await {
+        return Err(rollback_follower_move(
+            &state,
+            &source_endpoint,
+            &key,
+            &plan_request,
+            ApiError::unavailable(error),
+        )
+        .await);
+    }
+    if let Err(error) = cutover.activate(&request.feed, &plan).await {
+        return Err(rollback_follower_move(
+            &state,
+            &source_endpoint,
+            &key,
+            &plan_request,
+            ApiError::unavailable(error),
+        )
+        .await);
+    }
     if let Some(feed) =
         feed_when_applied(&state.control, &request.feed, state.control_plane.is_some()).await
     {
@@ -9411,7 +9706,7 @@ async fn admin_move_follower(
             copied.skipped_records,
         );
     }
-    unfreeze_move(&state, &source_endpoint, key, &plan_request).await?;
+    unfreeze_move(&state, &source_endpoint, &key, &plan_request).await?;
     Ok(Json(
         json!({ "status": "activated", "assignment": plan.candidate_assignment,
         "committed_position": copied.target_commit, "transferred_records": copied.transferred_records,
@@ -9423,7 +9718,7 @@ async fn active_owner_move_plan(
     state: &AppState,
     request: &MovePlanRequest,
 ) -> Result<RangeOwnerMovePlan, ApiError> {
-    for _ in 0..30 {
+    for _ in 0..150 {
         if let Some(plan) = state.control.owner_move_plan(request.range_id).await {
             if plan.plan_id == request.plan_id {
                 return Ok(plan);
@@ -9865,6 +10160,28 @@ impl DrainMoveDriver for AdminDrainDriver {
     }
 }
 
+/// Unfreezes both cutover participants after a failed owner move while the
+/// staged plan stays resumable: the same `request_id` replays the prepared
+/// plan and drives the cutover again, while a conflicting operation fences
+/// behind `range_operation_pending` until an operator abandons it. Returns
+/// the first unfreeze error when either failed, otherwise the cutover error.
+async fn rollback_owner_move(
+    state: &AppState,
+    source_endpoint: &str,
+    target_endpoint: &str,
+    key: &str,
+    plan_request: &MovePlanRequest,
+    error: ApiError,
+) -> ApiError {
+    let source_error = unfreeze_owner_move(state, source_endpoint, key, plan_request)
+        .await
+        .err();
+    let target_error = unfreeze_owner_move(state, target_endpoint, key, plan_request)
+        .await
+        .err();
+    source_error.or(target_error).unwrap_or(error)
+}
+
 async fn admin_move_owner(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -9888,20 +10205,35 @@ async fn admin_move_owner(
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
     let plan: RangeOwnerMovePlan = serde_json::from_value(prepared.results[0].data.clone())
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
-    let source_endpoint = state
+    // A post-Prepare failure retains the staged plan as resumable state:
+    // the same `request_id` replays the prepared plan and drives the cutover
+    // again, a conflicting operation fences behind `range_operation_pending`,
+    // and an operator abandons a permanently wedged plan explicitly.
+    let source_endpoint = match state
         .control_endpoints
         .resolve(&plan.source_assignment.owner)
         .await
-        .ok_or_else(|| ApiError::unavailable("source owner endpoint unavailable"))?;
-    let target_endpoint = state
+    {
+        Some(endpoint) => endpoint,
+        None => {
+            return Err(ApiError::unavailable("source owner endpoint unavailable"));
+        }
+    };
+    let target_endpoint = match state
         .control_endpoints
         .resolve(&plan.candidate_assignment.owner)
         .await
-        .ok_or_else(|| ApiError::unavailable("candidate owner endpoint unavailable"))?;
-    let key = state
-        .internal_key
-        .as_ref()
-        .ok_or_else(|| ApiError::unavailable("internal credential unavailable"))?;
+    {
+        Some(endpoint) => endpoint,
+        None => {
+            return Err(ApiError::unavailable(
+                "candidate owner endpoint unavailable",
+            ));
+        }
+    };
+    let Some(key) = state.internal_key.clone() else {
+        return Err(ApiError::unavailable("internal credential unavailable"));
+    };
     let plan_request = MovePlanRequest {
         plan_id: plan.plan_id,
         range_id: plan.source_assignment.range_id,
@@ -9912,16 +10244,30 @@ async fn admin_move_owner(
         .await
         == Some(plan.candidate_assignment.clone())
     {
-        unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
-        unfreeze_owner_move(&state, &target_endpoint, key, &plan_request).await?;
+        unfreeze_owner_move(&state, &source_endpoint, &key, &plan_request).await?;
+        unfreeze_owner_move(&state, &target_endpoint, &key, &plan_request).await?;
         return Ok(Json(
             json!({ "status": "activated", "assignment": plan.candidate_assignment }),
         ));
     }
+    // A replayed request ID may name a plan an operator abandoned while it
+    // was wedged; only drive the cutover while the staged row still exists.
+    await_staged_plan(
+        || async {
+            state
+                .control
+                .owner_move_plan(plan_request.range_id)
+                .await
+                .map(|staged| staged.plan_id)
+        },
+        plan.plan_id,
+        "owner move",
+    )
+    .await?;
     let frozen = match post_move_request(
         &state,
         &source_endpoint,
-        key,
+        &key,
         "/internal/active-range/owner-move/freeze",
         &plan_request,
     )
@@ -9929,21 +10275,35 @@ async fn admin_move_owner(
     {
         Ok(frozen) => frozen,
         Err(error) => {
-            unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
-            return Err(error);
+            return Err(rollback_owner_move(
+                &state,
+                &source_endpoint,
+                &target_endpoint,
+                &key,
+                &plan_request,
+                error,
+            )
+            .await);
         }
     };
     let boundary: CommitPosition = match serde_json::from_value(frozen["source_commit"].clone()) {
         Ok(commit) => commit,
         Err(error) => {
-            unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
-            return Err(ApiError::unavailable(error.to_string()));
+            return Err(rollback_owner_move(
+                &state,
+                &source_endpoint,
+                &target_endpoint,
+                &key,
+                &plan_request,
+                ApiError::unavailable(error.to_string()),
+            )
+            .await);
         }
     };
     let evidence = post_move_request(
         &state,
         &target_endpoint,
-        key,
+        &key,
         "/internal/active-range/owner-move/verify",
         &OwnerMoveVerifyRequest {
             plan_id: plan.plan_id,
@@ -9956,25 +10316,41 @@ async fn admin_move_owner(
         Ok(data) => match serde_json::from_value(data) {
             Ok(evidence) => evidence,
             Err(error) => {
-                unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
-                unfreeze_owner_move(&state, &target_endpoint, key, &plan_request).await?;
-                return Err(ApiError::unavailable(error.to_string()));
+                return Err(rollback_owner_move(
+                    &state,
+                    &source_endpoint,
+                    &target_endpoint,
+                    &key,
+                    &plan_request,
+                    ApiError::unavailable(error.to_string()),
+                )
+                .await);
             }
         },
         Err(error) => {
-            unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
-            unfreeze_owner_move(&state, &target_endpoint, key, &plan_request).await?;
-            return Err(error);
+            return Err(rollback_owner_move(
+                &state,
+                &source_endpoint,
+                &target_endpoint,
+                &key,
+                &plan_request,
+                error,
+            )
+            .await);
         }
     };
     if !evidence.ready || evidence.source_commit != boundary || evidence.target_commit != boundary {
-        unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
-        unfreeze_owner_move(&state, &target_endpoint, key, &plan_request).await?;
-        return Err(ApiError::unavailable(
-            "candidate owner is not verified through frozen source boundary",
-        ));
+        return Err(rollback_owner_move(
+            &state,
+            &source_endpoint,
+            &target_endpoint,
+            &key,
+            &plan_request,
+            ApiError::unavailable("candidate owner is not verified through frozen source boundary"),
+        )
+        .await);
     }
-    control_plane
+    if let Err(error) = control_plane
         .execute_commands(vec![crate::control::Command::RecordOwnerMoveCatchUp {
             feed: request.feed.clone(),
             plan_id: plan.plan_id,
@@ -9983,16 +10359,36 @@ async fn admin_move_owner(
             checksum_verified: evidence.ready,
         }])
         .await
-        .map_err(|error| ApiError::unavailable(error.to_string()))?;
-    control_plane
+    {
+        return Err(rollback_owner_move(
+            &state,
+            &source_endpoint,
+            &target_endpoint,
+            &key,
+            &plan_request,
+            ApiError::unavailable(error.to_string()),
+        )
+        .await);
+    }
+    if let Err(error) = control_plane
         .execute_commands(vec![crate::control::Command::ActivateOwnerMove {
             feed: request.feed.clone(),
             plan_id: plan.plan_id,
         }])
         .await
-        .map_err(|error| ApiError::unavailable(error.to_string()))?;
-    unfreeze_owner_move(&state, &source_endpoint, key, &plan_request).await?;
-    unfreeze_owner_move(&state, &target_endpoint, key, &plan_request).await?;
+    {
+        return Err(rollback_owner_move(
+            &state,
+            &source_endpoint,
+            &target_endpoint,
+            &key,
+            &plan_request,
+            ApiError::unavailable(error.to_string()),
+        )
+        .await);
+    }
+    unfreeze_owner_move(&state, &source_endpoint, &key, &plan_request).await?;
+    unfreeze_owner_move(&state, &target_endpoint, &key, &plan_request).await?;
     // An owner move verifies the staged replica rather than copying outside
     // replication, so the event records zero transfer bytes — the data
     // arrived through replicated_frames/wire_bytes already attributed.
@@ -10816,6 +11212,24 @@ async fn feed_when_applied(
         }
     }
     feed
+}
+
+async fn state_store_when_applied(
+    control: &ControlController,
+    name: &str,
+    wait_for_replication: bool,
+) -> Option<crate::control::StateStoreDefinition> {
+    let mut store = control.declared_state_store_by_name(name).await;
+    if store.is_none() && wait_for_replication {
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            store = control.declared_state_store_by_name(name).await;
+            if store.is_some() {
+                break;
+            }
+        }
+    }
+    store
 }
 
 async fn writer_when_applied(
@@ -21601,5 +22015,78 @@ mod tests {
         assert_eq!(uncommitted.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(uncommitted.message.contains("could not be abandoned"));
         assert!(control.range_split_plan(feed.feed_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn admin_abandon_fences_a_staged_owner_move_plan() {
+        let directory = TempDir::new().unwrap();
+        let (state, _plane, control, _replica) = internal_replica_test_state(&directory).await;
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        // The fixture's Feed is RF3 over control-1/2/3; stage an owner move
+        // to a follower through the local catalog.
+        let inspected = control
+            .execute_commands(vec![Command::InspectPlacement {
+                feed: "orders.events".to_owned(),
+            }])
+            .await
+            .unwrap();
+        let assignments = inspected.results[0].data["range_assignments"].clone();
+        let owner = assignments[0]["owner"].as_str().unwrap().to_owned();
+        let range_id: RangeId = serde_json::from_value(assignments[0]["range_id"].clone()).unwrap();
+        let new_owner = assignments[0]["replicas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|replica| replica.as_str().unwrap().to_owned())
+            .find(|replica| replica != &owner)
+            .unwrap();
+        let prepared = control
+            .execute_commands(vec![Command::PrepareOwnerMove {
+                feed: "orders.events".to_owned(),
+                range_id,
+                new_owner: crate::active_range::StorageNodeId::try_new(new_owner).unwrap(),
+            }])
+            .await
+            .unwrap();
+        let plan: RangeOwnerMovePlan =
+            serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer this-is-a-long-development-api-key".parse().unwrap(),
+        );
+
+        // A different staged plan id refuses without touching the plan.
+        let mismatched = admin_abandon_range_operation(
+            State(state.clone()),
+            headers.clone(),
+            Json(AdminAbandonRangeRequest {
+                request_id: Uuid::from_u128(7101),
+                feed: "orders.events".to_owned(),
+                plan_id: Uuid::from_u128(7199),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatched.status, StatusCode::CONFLICT);
+        assert!(control.feed_owner_move_plan(feed.feed_id).await.is_some());
+
+        // Without a leader the fenced abandon cannot commit; the endpoint
+        // reports the retryable failure instead of claiming removal.
+        let uncommitted = admin_abandon_range_operation(
+            State(state.clone()),
+            headers,
+            Json(AdminAbandonRangeRequest {
+                request_id: Uuid::from_u128(7102),
+                feed: "orders.events".to_owned(),
+                plan_id: plan.plan_id,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(uncommitted.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(uncommitted.message.contains("could not be abandoned"));
+        assert!(control.feed_owner_move_plan(feed.feed_id).await.is_some());
     }
 }
