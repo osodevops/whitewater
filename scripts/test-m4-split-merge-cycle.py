@@ -45,7 +45,11 @@ def main():
 
     cursors = []
     def append(tag, endpoint):
-        status, result = post(endpoint, "/v1/writers/append", {"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": epoch, "event_time_ns": str(len(cursors)), "key_base64": base64.b64encode(f"{tag}-{len(cursors)}".encode()).decode(), "payload_base64": base64.b64encode(f"value-{len(cursors)}".encode()).decode(), "metadata_base64": {}})
+        # Three shared Keys per cycle so the merged committed order proves
+        # per-Key ordering survives every split/merge transition, not just
+        # aggregate feed order.
+        key = f"{tag}-key-{len(cursors) % 3}"
+        status, result = post(endpoint, "/v1/writers/append", {"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": epoch, "event_time_ns": str(len(cursors)), "key_base64": base64.b64encode(key.encode()).decode(), "payload_base64": base64.b64encode(f"value-{len(cursors)}".encode()).decode(), "metadata_base64": {}})
         if status != 200: raise AssertionError(result)
         cursors.append(result["cursor"])
 

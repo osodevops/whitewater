@@ -1395,7 +1395,7 @@ Definition of Done:
 
 - [ ] Clients receive no topology-change callback.
 
-- [ ] Same-Key order survives split, move, merge, and owner failure.
+- [x] Same-Key order survives split, move, merge, and owner failure. `scripts/test-m4-split-merge-cycle.py` rotates three shared Keys per cycle and asserts the merged committed order across three split/merge transitions; `scripts/test-m4-owner-move.py` and `scripts/test-m4-follower-move.py` write every record under one Key and assert the full order across the cutover; the `zz-chaos-owner-loss` conformance fixture asserts the ordered same-Key pair across an owner restart.
 
 
 
