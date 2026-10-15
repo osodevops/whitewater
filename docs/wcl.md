@@ -1080,11 +1080,13 @@ SEEK SUBSCRIPTION orders.billing TO NOW;
 
 SEEK SUBSCRIPTION orders.billing TO TIMESTAMP 1700000000000000000;
 
+SEEK SUBSCRIPTION orders.billing TO CURSOR 'a1b2c3';
+
 ```
 
 
 
-A Subscription seek repositions the shared durable frontier so the next delivery to any member or declared Pipe starts from the new position — the operational primitive for reprocessing and recovery. A single Cursor cannot describe the frontier's per-range positions, so seeks are boundary- or timestamp-based; `TIMESTAMP <ns>` targets ingest (acceptance) time, matching delivery order. The catalog refuses `SEEK SUBSCRIPTION` with guidance because repositioning resolves real record positions — the data-plane Subscription seek endpoint (`POST /v1/subscriptions/seek`, admin-authenticated) commits it as one fenced progress mutation. It is refused while any member work lease is active (release or let leases expire first), replays idempotently on its request identity, and conflicts when a racing acknowledgement moves the frontier first.
+A Subscription seek repositions the shared durable frontier so the next delivery to any member or declared Pipe starts from the new position — the operational primitive for reprocessing and recovery. `TIMESTAMP <ns>` targets ingest (acceptance) time, matching delivery order. `TO CURSOR <c>` resumes immediately after a delivered record Cursor: it resolves through the range owner, so it works on a single-range source while a split Feed refuses it (one Cursor cannot describe every Active Range position), and an unknown, uncommitted, or foreign-Feed Cursor fails closed. The catalog refuses `SEEK SUBSCRIPTION` with guidance because repositioning resolves real record positions — the data-plane Subscription seek endpoint (`POST /v1/subscriptions/seek`, admin-authenticated) commits it as one fenced progress mutation. It is refused while any member work lease is active (release or let leases expire first), replays idempotently on its request identity, and conflicts when a racing acknowledgement moves the frontier first.
 
 
 
