@@ -709,6 +709,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/commands", post(execute_admin_commands))
         .route("/v1/admin/ranges/split", post(admin_split_range))
         .route("/v1/admin/ranges/merge", post(admin_merge_ranges))
+        .route(
+            "/v1/admin/ranges/abandon",
+            post(admin_abandon_range_operation),
+        )
         .route("/v1/admin/ranges/move-follower", post(admin_move_follower))
         .route("/v1/admin/ranges/move-owner", post(admin_move_owner))
         .route(
@@ -7713,6 +7717,16 @@ pub struct AdminSplitRangeRequest {
     pub batch_size: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AdminAbandonRangeRequest {
+    pub request_id: Uuid,
+    pub feed: String,
+    /// Must equal the staged plan's id from `INSPECT PLACEMENT FOR FEED` —
+    /// an explicit confirmation that the operator is abandoning the exact
+    /// wedged operation they inspected rather than a newer in-flight one.
+    pub plan_id: Uuid,
+}
+
 async fn reconcile_split_node(
     state: &AppState,
     endpoint: &str,
@@ -7778,7 +7792,7 @@ async fn unfreeze_split_nodes(
     plan: &RangeSplitPlan,
     source_assignment: &ActiveRangeAssignment,
     key: &str,
-) {
+) -> bool {
     for node in plan.right_assignment.replicas.iter() {
         if let Some(endpoint) = state.control_endpoints.resolve(node).await {
             let _ = state
@@ -7795,7 +7809,7 @@ async fn unfreeze_split_nodes(
                 .await;
         }
     }
-    abandon_split_plan(state, plan).await;
+    abandon_split_plan(state, plan).await
 }
 
 /// Removes a staged split plan after its cutover failed. The staged plan
@@ -7803,18 +7817,22 @@ async fn unfreeze_split_nodes(
 /// the `plan_id` fence keeps a stale rollback from deleting a newer plan.
 /// Best-effort: if the Control Plane is mid-election the row stays for the
 /// next attempt to observe, so the failure is logged for diagnosis.
-async fn abandon_split_plan(state: &AppState, plan: &RangeSplitPlan) {
+async fn abandon_split_plan(state: &AppState, plan: &RangeSplitPlan) -> bool {
     let Some(control_plane) = state.control_plane.as_ref() else {
-        return;
+        return false;
     };
-    if let Err(error) = control_plane
+    match control_plane
         .execute_commands(vec![crate::control::Command::AbandonActiveRangeSplit {
             feed_id: plan.feed_id,
             plan_id: plan.plan_id,
         }])
         .await
     {
-        tracing::warn!(%error, plan_id = %plan.plan_id, "failed split cutover could not abandon its staged plan; later range operations stay fenced");
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(%error, plan_id = %plan.plan_id, "failed split cutover could not abandon its staged plan; later range operations stay fenced");
+            false
+        }
     }
 }
 
@@ -8413,7 +8431,7 @@ async fn unfreeze_merge_nodes(
     left: &ActiveRangeAssignment,
     right: &ActiveRangeAssignment,
     key: &str,
-) {
+) -> bool {
     for node in plan.merged_assignment.replicas.iter() {
         if let Some(endpoint) = state.control_endpoints.resolve(node).await {
             for assignment in [left, right] {
@@ -8432,24 +8450,126 @@ async fn unfreeze_merge_nodes(
             }
         }
     }
-    abandon_merge_plan(state, plan).await;
+    abandon_merge_plan(state, plan).await
 }
 
 /// Same fenced abandon as the split path: a failed merge must not leave
 /// the plan row blocking every later range operation on this Feed.
-async fn abandon_merge_plan(state: &AppState, plan: &RangeMergePlan) {
+async fn abandon_merge_plan(state: &AppState, plan: &RangeMergePlan) -> bool {
     let Some(control_plane) = state.control_plane.as_ref() else {
-        return;
+        return false;
     };
-    if let Err(error) = control_plane
+    match control_plane
         .execute_commands(vec![crate::control::Command::AbandonActiveRangeMerge {
             feed_id: plan.feed_id,
             plan_id: plan.plan_id,
         }])
         .await
     {
-        tracing::warn!(%error, plan_id = %plan.plan_id, "failed merge cutover could not abandon its staged plan; later range operations stay fenced");
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(%error, plan_id = %plan.plan_id, "failed merge cutover could not abandon its staged plan; later range operations stay fenced");
+            false
+        }
     }
+}
+
+/// Operator remedy for a wedged range operation: when a cutover fails in a
+/// way the automatic rollback cannot cover (for example the driving Node
+/// crashed between prepare and activation), the staged plan row fences every
+/// later split/merge on the Feed. This endpoint unfreezes the plan's source
+/// replicas and commits the fenced Abandon command so a fresh attempt can
+/// re-prepare. The caller must name the exact `plan_id` shown by
+/// `INSPECT PLACEMENT FOR FEED`, so an inspected-but-stale remedy cannot
+/// remove a newer plan staged after the inspection.
+async fn admin_abandon_range_operation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AdminAbandonRangeRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let feed = state
+        .control
+        .active_feed_by_name(&request.feed)
+        .await
+        .ok_or_else(|| ApiError::bad_request(format!("Feed {} is unknown", request.feed)))?;
+    let key = state.internal_key.as_deref();
+    let mut abandoned = Vec::new();
+
+    if let Some(plan) = state.control.range_split_plan(feed.feed_id).await {
+        if plan.plan_id != request.plan_id {
+            return Err(ApiError::conflict(format!(
+                "Feed {} holds a different staged plan {}; re-inspect before abandoning",
+                request.feed, plan.plan_id
+            )));
+        }
+        // Unfreeze the source replicas wherever they are still reachable,
+        // then commit the fenced abandon (both happen inside
+        // `unfreeze_split_nodes`). A source that is no longer assigned still
+        // abandons so the catalog row clears.
+        let cleared = match (
+            state
+                .control
+                .active_range_assignment_by_id(plan.source_range_id)
+                .await,
+            key,
+        ) {
+            (Some(source_assignment), Some(key)) => {
+                unfreeze_split_nodes(&state, &plan, &source_assignment, key).await
+            }
+            _ => abandon_split_plan(&state, &plan).await,
+        };
+        // The remedy reports honestly: a plan still staged after the fenced
+        // abandon attempt means the Control Plane could not commit — retry
+        // the remedy rather than believing the Feed is clear.
+        if !cleared || state.control.range_split_plan(feed.feed_id).await.is_some() {
+            return Err(ApiError::unavailable(format!(
+                "staged split plan {} could not be abandoned yet; retry the remedy",
+                plan.plan_id
+            )));
+        }
+        abandoned.push(json!({ "kind": "split", "plan_id": plan.plan_id }));
+    }
+
+    if let Some(plan) = state.control.range_merge_plan(feed.feed_id).await {
+        if plan.plan_id != request.plan_id {
+            return Err(ApiError::conflict(format!(
+                "Feed {} holds a different staged plan {}; re-inspect before abandoning",
+                request.feed, plan.plan_id
+            )));
+        }
+        let left = state
+            .control
+            .active_range_assignment_by_id(plan.left_range_id)
+            .await;
+        let right = state
+            .control
+            .active_range_assignment_by_id(plan.right_range_id)
+            .await;
+        let cleared = match (left, right, key) {
+            (Some(left), Some(right), Some(key)) => {
+                unfreeze_merge_nodes(&state, &plan, &left, &right, key).await
+            }
+            _ => abandon_merge_plan(&state, &plan).await,
+        };
+        if !cleared || state.control.range_merge_plan(feed.feed_id).await.is_some() {
+            return Err(ApiError::unavailable(format!(
+                "staged merge plan {} could not be abandoned yet; retry the remedy",
+                plan.plan_id
+            )));
+        }
+        abandoned.push(json!({ "kind": "merge", "plan_id": plan.plan_id }));
+    }
+
+    if abandoned.is_empty() {
+        return Err(ApiError::bad_request(format!(
+            "Feed {} has no staged range operation matching plan {}",
+            request.feed, request.plan_id
+        )));
+    }
+    Ok(Json(
+        json!({ "status": "abandoned", "operations": abandoned }),
+    ))
 }
 
 async fn admin_merge_ranges(
@@ -21419,5 +21539,67 @@ mod tests {
         // Only sentinel-pane accumulate deltas count: real pane rows and
         // non-accumulate ops carry no refused records.
         assert_eq!(window_sentinel_refusals(&[real_pane, keycap, malformed]), 5);
+    }
+
+    #[tokio::test]
+    async fn admin_abandon_fences_plan_id_and_reports_uncommitted_removals() {
+        let directory = TempDir::new().unwrap();
+        let (state, _plane, control, _replica) = internal_replica_test_state(&directory).await;
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        // Stage through the local catalog — this fixture's three-voter
+        // Control Plane cannot elect without peers, which is exactly the
+        // condition under which the remedy must report honestly.
+        let prepared = control
+            .execute_commands(vec![Command::PrepareActiveRangeSplit {
+                feed: "orders.events".to_owned(),
+                split_at: KeyToken::from_bytes([0x80; 16]),
+            }])
+            .await
+            .unwrap();
+        let plan: RangeSplitPlan =
+            serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer this-is-a-long-development-api-key".parse().unwrap(),
+        );
+
+        // Naming a different plan id refuses instead of removing the staged
+        // plan the operator did not inspect.
+        let mismatched = admin_abandon_range_operation(
+            State(state.clone()),
+            headers.clone(),
+            Json(AdminAbandonRangeRequest {
+                request_id: Uuid::from_u128(7001),
+                feed: "orders.events".to_owned(),
+                plan_id: Uuid::from_u128(7099),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(mismatched.status, StatusCode::CONFLICT);
+        assert!(
+            control.range_split_plan(feed.feed_id).await.is_some(),
+            "a mismatched abandon must leave the staged plan untouched"
+        );
+
+        // The fenced abandon cannot commit without a leader: the endpoint
+        // must fail closed with a retryable explanation rather than report a
+        // removal that never happened.
+        let uncommitted = admin_abandon_range_operation(
+            State(state.clone()),
+            headers.clone(),
+            Json(AdminAbandonRangeRequest {
+                request_id: Uuid::from_u128(7002),
+                feed: "orders.events".to_owned(),
+                plan_id: plan.plan_id,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(uncommitted.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(uncommitted.message.contains("could not be abandoned"));
+        assert!(control.range_split_plan(feed.feed_id).await.is_some());
     }
 }

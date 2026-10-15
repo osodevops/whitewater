@@ -2407,6 +2407,26 @@ impl ControlController {
             .cloned()
     }
 
+    /// The staged split plan blocking this Feed's next range operation, if
+    /// any — the operator-facing counterpart of `INSPECT PLACEMENT` output.
+    pub async fn range_split_plan(&self, feed_id: Uuid) -> Option<RangeSplitPlan> {
+        self.state
+            .lock()
+            .await
+            .range_split_plans
+            .get(&feed_id)
+            .cloned()
+    }
+
+    pub async fn range_merge_plan(&self, feed_id: Uuid) -> Option<RangeMergePlan> {
+        self.state
+            .lock()
+            .await
+            .range_merge_plans
+            .get(&feed_id)
+            .cloned()
+    }
+
     pub async fn completed_follower_move(&self, range_id: RangeId) -> Option<RangeMovePlan> {
         self.state
             .lock()
