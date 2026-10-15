@@ -939,6 +939,8 @@ REGISTER STORAGE NODE storage-4 AT https://storage-4:7271 WITH CERT PIN 0123abcd
 
 REGISTER STORAGE NODE storage-4 AT https://storage-4:7271 WITH CAPABILITIES storage,compute,gateway;
 
+REPORT STORAGE NODE storage-4 CAPACITY cpu_cores=8, memory_bytes=17179869184, disk_total_bytes=1099511627776, disk_free_bytes=549755813888, network_mbps=10000, failure_domain='zone-a';
+
 SHOW STORAGE NODES;
 
 RETIRE STORAGE NODE storage-4;
@@ -959,7 +961,9 @@ Configured Control Plane Nodes seed the eligible storage pool, but the pool is n
 
 
 
-`SHOW STORAGE NODES` reports each Node's identity, `source` (`configured` or `registered`), endpoint, declared `capabilities`, current `eligible` flag, and `exclusions` naming why an ineligible Node is excluded (`draining`, `retired`, `storage_undeclared`). Registered eligible Nodes participate in RF3 Active Range placement, which spreads each new Feed's replicas and Append Owner across the widened pool rather than always taking the first three Nodes.
+`REPORT STORAGE NODE <id> CAPACITY key=value, ...` commits a Node's self-measured resources into the catalog (fields: `cpu_cores`, `memory_bytes`, `disk_total_bytes`, `disk_free_bytes`, `network_mbps`, `failure_domain`). Nodes emit these automatically on an interval; the command exists for interface parity and testing. Reports for identities the catalog does not know are refused, and a replayed or out-of-order report can never roll the committed measurement backwards.
+
+`SHOW STORAGE NODES` reports each Node's identity, `source` (`configured` or `registered`), endpoint, declared `capabilities`, last committed `capacity` report, current `eligible` flag, and `exclusions` naming why an ineligible Node is excluded (`draining`, `retired`, `storage_undeclared`, `capacity_unreported`, `capacity_stale`, `below_baseline`). Registered eligible Nodes participate in RF3 Active Range placement, which spreads each new Feed's replicas and Append Owner across the widened pool rather than always taking the first three Nodes.
 
 
 

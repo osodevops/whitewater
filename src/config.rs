@@ -51,6 +51,19 @@ pub struct NodeConfig {
     /// Operator-declared failure domain label reported with capacity
     /// signals (`WHITEWATER_FAILURE_DOMAIN`).
     pub failure_domain: String,
+    /// How often this Node commits its measured capacity into the
+    /// catalog (`WHITEWATER_CAPACITY_REPORT_MS`, default 15s). Reports
+    /// only matter while a baseline policy is enabled.
+    pub capacity_report_interval: Duration,
+    /// Maximum age of a committed capacity report before the Node is
+    /// excluded from placement (`WHITEWATER_CAPACITY_REPORT_MAX_AGE_MS`,
+    /// default 0 = disabled). Must be identical on every Node because
+    /// eligibility is derived inside deterministic apply.
+    pub capacity_report_max_age: Duration,
+    /// Minimum disk headroom a Node's committed report must show before
+    /// placement may target it (`WHITEWATER_STORAGE_MIN_DISK_FREE_BYTES`,
+    /// default 0 = disabled). Same shared-config requirement.
+    pub min_disk_free_bytes: u64,
     pub subscription_mtls: Option<SubscriptionMtlsConfig>,
 }
 
@@ -121,6 +134,11 @@ impl NodeConfig {
         if failure_domain.len() > 128 {
             anyhow::bail!("WHITEWATER_FAILURE_DOMAIN must be at most 128 bytes");
         }
+        let capacity_report_interval =
+            Duration::from_millis(parse_env("WHITEWATER_CAPACITY_REPORT_MS", 15_000)?);
+        let capacity_report_max_age =
+            Duration::from_millis(parse_env("WHITEWATER_CAPACITY_REPORT_MAX_AGE_MS", 0)?);
+        let min_disk_free_bytes = parse_env("WHITEWATER_STORAGE_MIN_DISK_FREE_BYTES", 0)?;
         let tls = [
             env::var("WHITEWATER_SUBSCRIPTION_MTLS_BIND").ok(),
             env::var("WHITEWATER_SUBSCRIPTION_MTLS_CERT").ok(),
@@ -187,6 +205,9 @@ impl NodeConfig {
             node_capabilities,
             storage_voters,
             failure_domain,
+            capacity_report_interval,
+            capacity_report_max_age,
+            min_disk_free_bytes,
             subscription_mtls,
         })
     }

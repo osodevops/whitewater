@@ -237,6 +237,43 @@ def main():
         if not registered or not registered[0].get("eligible", True):
             raise AssertionError({"storage_nodes": shown})
 
+        # Capacity evidence: the catalog accepts an explicit report for
+        # the registered Node and SHOW exposes the committed measurement.
+        wcl_retry(
+            VOTERS[0],
+            f"REPORT STORAGE NODE {STORAGE_NODE} CAPACITY cpu_cores=4, "
+            f"memory_bytes=8589934592, disk_total_bytes=107374182400, "
+            f"disk_free_bytes=53687091200, network_mbps=10000, "
+            f"failure_domain='join-a';",
+        )
+        shown = wcl_retry(VOTERS[0], "SHOW STORAGE NODES;")[0]
+        rows = shown["nodes"] if isinstance(shown, dict) else shown
+        reported = [row for row in rows if row.get("node") == STORAGE_NODE]
+        # storage-1's own CapacityReporter may legitimately overwrite the
+        # explicit report on its next tick, so assert the committed
+        # measurement exists rather than pinning its values.
+        if not reported or not isinstance(reported[0].get("capacity"), dict):
+            raise AssertionError({"capacity_report": shown})
+
+        # Voters run the CapacityReporter on an interval: their committed
+        # self-reports appear without any operator command.
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            shown = wcl_retry(VOTERS[0], "SHOW STORAGE NODES;")[0]
+            rows = shown["nodes"] if isinstance(shown, dict) else shown
+            voter_rows = [
+                row for row in rows if row.get("node", "").startswith("control-")
+            ]
+            if voter_rows and all(
+                isinstance(row.get("capacity"), dict)
+                and row["capacity"].get("cpu_cores", 0) > 0
+                for row in voter_rows
+            ):
+                break
+            time.sleep(3)
+        else:
+            raise AssertionError({"self_reported_capacity": shown})
+
         suffix = f"sj{uuid.uuid4().hex[:12]}"
         feeds = [f"{suffix}.events{index}" for index in range(8)]
         script = "; ".join(

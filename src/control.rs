@@ -19,7 +19,7 @@ use crate::{
         ACTIVE_RANGE_REPLICA_COUNT,
     },
     index::IndexValue,
-    node::NodeCapabilities,
+    node::{NodeCapabilities, NodeCapacity},
     reader::SubscriptionProgressAssignment,
     storage::{LogStore, StorageError},
 };
@@ -881,6 +881,37 @@ pub struct StorageNodeRecord {
     pub capabilities: NodeCapabilities,
 }
 
+/// One committed self-reported capacity measurement for a storage
+/// identity. `reported_at_ns` is stamped from the command's committed
+/// issue time so replays and out-of-order reports never roll a newer
+/// measurement backwards.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapacityReport {
+    pub capacity: NodeCapacity,
+    pub reported_at_ns: i64,
+}
+
+/// The shared minimum-baseline policy: which capacity evidence a Node
+/// must commit before placement may target it. Both bounds default off;
+/// enabling either makes a *missing* report an exclusion as well —
+/// unmeasured Nodes fail closed once measurement is required. The policy
+/// is static config that must be identical cluster-wide because
+/// eligibility is derived inside deterministic apply.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CapacityPolicy {
+    /// Maximum age of a committed report, in nanoseconds, before the
+    /// Node is treated as unmeasured. `None` disables freshness checks.
+    pub report_max_age_ns: Option<i64>,
+    /// Minimum `disk_free_bytes` a reporting Node must show; 0 disables.
+    pub min_disk_free_bytes: u64,
+}
+
+impl CapacityPolicy {
+    pub fn active(&self) -> bool {
+        self.report_max_age_ns.is_some() || self.min_disk_free_bytes > 0
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CatalogState {
     schema_version: u32,
@@ -941,6 +972,11 @@ struct CatalogState {
     retired_storage_nodes: BTreeSet<StorageNodeId>,
     #[serde(default)]
     draining_storage_nodes: BTreeSet<StorageNodeId>,
+    /// Committed self-reported capacity per storage identity. Reports
+    /// live in catalog state rather than gossip so eligibility checks
+    /// inside apply read identical data on every replica.
+    #[serde(default)]
+    capacity_reports: BTreeMap<StorageNodeId, CapacityReport>,
     #[serde(default)]
     range_commit_proofs: BTreeMap<RangeId, RangeCommitProof>,
     #[serde(default)]
@@ -988,6 +1024,7 @@ impl Default for CatalogState {
             storage_nodes: BTreeMap::new(),
             retired_storage_nodes: BTreeSet::new(),
             draining_storage_nodes: BTreeSet::new(),
+            capacity_reports: BTreeMap::new(),
             range_split_plans: BTreeMap::new(),
             range_merge_plans: BTreeMap::new(),
             range_move_plans: BTreeMap::new(),
@@ -1481,6 +1518,12 @@ pub enum Command {
     InspectStorageDrain {
         node: StorageNodeId,
     },
+    /// A Node's self-reported measured capacity, committed so every
+    /// replica's eligibility evaluation reads identical data.
+    ReportStorageNodeCapacity {
+        node: StorageNodeId,
+        capacity: NodeCapacity,
+    },
 }
 
 impl Command {
@@ -1503,7 +1546,10 @@ impl Command {
     /// `applied_requests` map would grow the catalog without bound under
     /// sustained appends.
     pub fn caches_applied_response(&self) -> bool {
-        !matches!(self, Self::RecordRangeCommitProof { .. })
+        !matches!(
+            self,
+            Self::RecordRangeCommitProof { .. } | Self::ReportStorageNodeCapacity { .. }
+        )
     }
 
     pub fn requires_internal_replica_authority(&self) -> bool {
@@ -1635,6 +1681,7 @@ pub struct ControlController {
     path: Arc<PathBuf>,
     state: Arc<Mutex<CatalogState>>,
     eligible_storage_nodes: Arc<BTreeSet<StorageNodeId>>,
+    capacity_policy: CapacityPolicy,
     /// Request-time authorization view of issued API-key digests,
     /// recomputed from catalog state on load, snapshot install, and
     /// every applied command so leader and replicas converge.
@@ -1664,9 +1711,18 @@ impl ControlController {
             path: Arc::new(path),
             state: Arc::new(Mutex::new(state)),
             eligible_storage_nodes: Arc::new(eligible_storage_nodes.into_iter().collect()),
+            capacity_policy: CapacityPolicy::default(),
             issued_api_keys: Arc::new(std::sync::RwLock::new(issued_api_keys)),
             synced_replica: false,
         })
+    }
+
+    /// Install the shared minimum-baseline policy. Static config, like
+    /// `eligible_storage_nodes`: every Node derives eligibility locally,
+    /// so the policy must be identical cluster-wide.
+    pub fn with_capacity_policy(mut self, policy: CapacityPolicy) -> Self {
+        self.capacity_policy = policy;
+        self
     }
 
     /// Marks this catalog as a synced replica: a Node without a Control
@@ -1695,7 +1751,7 @@ impl ControlController {
             ..
         } = &command
         {
-            if !self.storage_eligible(&state, replacement_replica) {
+            if !self.storage_eligible(&state, replacement_replica, issued_at_ns) {
                 return Err(ControlError::InvalidOperation(format!(
                     "replacement Node {replacement_replica} is not eligible for storage"
                 )));
@@ -1712,7 +1768,7 @@ impl ControlController {
                 }
                 _ => derived_resource_id(request_id, "active-range"),
             };
-            self.select_fixed_active_range(&state, &seed)
+            self.select_fixed_active_range(&state, &seed, issued_at_ns)
         })
         .transpose()?;
         let fixed_subscription_progress = matches!(&command, Command::CreateSubscription { .. })
@@ -1720,6 +1776,7 @@ impl ControlController {
                 self.select_fixed_subscription_progress(
                     &state,
                     derived_resource_id(request_id, "subscription"),
+                    issued_at_ns,
                 )
             })
             .transpose()?;
@@ -1728,6 +1785,7 @@ impl ControlController {
                 self.select_fixed_state_store(
                     &state,
                     derived_resource_id(request_id, "state-store"),
+                    issued_at_ns,
                 )
             })
             .transpose()?;
@@ -1742,7 +1800,7 @@ impl ControlController {
         })
     }
 
-    fn storage_pool(&self, state: &CatalogState) -> BTreeSet<StorageNodeId> {
+    fn storage_pool(&self, state: &CatalogState, now_ns: i64) -> BTreeSet<StorageNodeId> {
         self.eligible_storage_nodes
             .iter()
             .chain(
@@ -1754,11 +1812,24 @@ impl ControlController {
             )
             .filter(|node| !state.retired_storage_nodes.contains(*node))
             .filter(|node| !state.draining_storage_nodes.contains(*node))
+            .filter(|node| self.capacity_exclusion(state, node, now_ns).is_none())
             .cloned()
             .collect()
     }
 
-    fn storage_eligible(&self, state: &CatalogState, node: &StorageNodeId) -> bool {
+    /// The capacity-policy reason a Node is excluded, if any. `now_ns`
+    /// is the evaluation instant: committed `issued_at_ns` inside apply
+    /// (deterministic across replicas) and wall time on advisory reads.
+    fn capacity_exclusion(
+        &self,
+        state: &CatalogState,
+        node: &StorageNodeId,
+        now_ns: i64,
+    ) -> Option<StorageExclusion> {
+        capacity_exclusion(state, node, &self.capacity_policy, now_ns)
+    }
+
+    fn storage_eligible(&self, state: &CatalogState, node: &StorageNodeId, now_ns: i64) -> bool {
         (self.eligible_storage_nodes.contains(node) || state.storage_nodes.contains_key(node))
             && !state.retired_storage_nodes.contains(node)
             && !state.draining_storage_nodes.contains(node)
@@ -1766,13 +1837,7 @@ impl ControlController {
                 .storage_nodes
                 .get(node)
                 .is_none_or(|record| record.capabilities.storage)
-    }
-
-    /// Every storage identity the catalog knows about with the reasons it
-    /// is currently excluded from placement, so operators see *why* the
-    /// pool has its present shape rather than a silent absence.
-    fn storage_eligibility_report(&self, state: &CatalogState) -> Vec<NodeStorageEligibility> {
-        storage_eligibility_report(state, self.eligible_storage_nodes.as_ref())
+            && self.capacity_exclusion(state, node, now_ns).is_none()
     }
 
     pub async fn storage_drain_plan(
@@ -1838,9 +1903,10 @@ impl ControlController {
         &self,
         state: &CatalogState,
         seed: &Uuid,
+        now_ns: i64,
     ) -> Result<FixedActiveRangePlacement, ControlError> {
         let mut ranked = self
-            .storage_pool(state)
+            .storage_pool(state, now_ns)
             .into_iter()
             .map(|node| {
                 let mut hash = blake3::Hasher::new();
@@ -1876,9 +1942,10 @@ impl ControlController {
         &self,
         state: &CatalogState,
         subscription_id: Uuid,
+        now_ns: i64,
     ) -> Result<FixedSubscriptionProgressPlacement, ControlError> {
         let mut ranked = self
-            .storage_pool(state)
+            .storage_pool(state, now_ns)
             .into_iter()
             .map(|node| {
                 let mut hash = blake3::Hasher::new();
@@ -1909,9 +1976,10 @@ impl ControlController {
         &self,
         state: &CatalogState,
         store_id: Uuid,
+        now_ns: i64,
     ) -> Result<FixedStateStorePlacement, ControlError> {
         let mut ranked = self
-            .storage_pool(state)
+            .storage_pool(state, now_ns)
             .into_iter()
             .map(|node| {
                 let mut hash = blake3::Hasher::new();
@@ -3298,7 +3366,7 @@ impl ControlController {
                     .subscription_progress_assignments
                     .get(&subscription.subscription_id)
                     .map(|assignment| assignment.owner.clone())
-                    .or_else(|| self.storage_pool(state).into_iter().next())
+                    .or_else(|| self.storage_pool(state, issued_at_ns).into_iter().next())
                     .ok_or_else(|| {
                         ControlError::InvalidOperation(
                             "no storage-eligible Node can hold the Pipe compute lease".to_owned(),
@@ -3795,7 +3863,12 @@ impl ControlController {
             Command::Drop { kind, name } => self.drop_resource(state, kind, &name),
             Command::Show { kind } => Ok((
                 format!("showing {}", show_name(&kind)),
-                show_resources(state, kind, &self.eligible_storage_nodes),
+                show_resources(
+                    state,
+                    kind,
+                    &self.eligible_storage_nodes,
+                    &self.capacity_policy,
+                ),
             )),
             Command::Describe { kind, name } => Ok((
                 format!("described {} {name}", resource_name(&kind)),
@@ -4136,7 +4209,7 @@ impl ControlController {
                         "replacement owner {new_owner} is not a member of the Subscription progress replica set"
                     )));
                 }
-                if !self.storage_eligible(state, &new_owner) {
+                if !self.storage_eligible(state, &new_owner, issued_at_ns) {
                     return Err(ControlError::InvalidOperation(format!(
                         "replacement owner {new_owner} is not eligible for storage"
                     )));
@@ -4200,7 +4273,7 @@ impl ControlController {
                         "replacement Node {replacement} is already a Subscription progress replica"
                     )));
                 }
-                if !self.storage_eligible(state, &replacement) {
+                if !self.storage_eligible(state, &replacement, issued_at_ns) {
                     return Err(ControlError::InvalidOperation(format!(
                         "replacement Node {replacement} is not eligible for storage"
                     )));
@@ -4265,7 +4338,7 @@ impl ControlController {
                         "{new_owner} already owns the compute lease for Pipe {pipe}"
                     )));
                 }
-                if !self.storage_eligible(state, &new_owner) {
+                if !self.storage_eligible(state, &new_owner, issued_at_ns) {
                     return Err(ControlError::InvalidOperation(format!(
                         "compute lease target {new_owner} is not eligible for storage"
                     )));
@@ -4418,6 +4491,34 @@ impl ControlController {
                 Ok((
                     format!("inspected drain for storage Node {node}"),
                     json!(plan),
+                ))
+            }
+            Command::ReportStorageNodeCapacity { node, capacity } => {
+                let known = state.storage_nodes.contains_key(&node)
+                    || self.eligible_storage_nodes.contains(&node);
+                if !known {
+                    return Err(ControlError::NotFound(format!(
+                        "capacity report rejected for unknown storage Node {node}"
+                    )));
+                }
+                // issued_at_ns is the committed instant: replayed or
+                // out-of-order reports never roll the record backwards.
+                let fresh = state
+                    .capacity_reports
+                    .get(&node)
+                    .is_none_or(|existing| existing.reported_at_ns < issued_at_ns);
+                if fresh {
+                    state.capacity_reports.insert(
+                        node.clone(),
+                        CapacityReport {
+                            capacity,
+                            reported_at_ns: issued_at_ns,
+                        },
+                    );
+                }
+                Ok((
+                    format!("recorded capacity report for storage Node {node}"),
+                    json!(state.capacity_reports.get(&node)),
                 ))
             }
             Command::PrepareActiveRangeSplit { feed, split_at } => {
@@ -6516,6 +6617,69 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                     .map_err(|error| ControlError::Syntax(error.to_string()))?,
             })
         }
+        Some("REPORT") => {
+            // REPORT STORAGE NODE <id> CAPACITY cpu_cores=N,
+            // memory_bytes=N, disk_total_bytes=N, disk_free_bytes=N,
+            // network_mbps=N, failure_domain='zone' — committed so every
+            // replica's eligibility evaluation sees identical evidence.
+            expect_keyword(&tokens, 1, "STORAGE")?;
+            expect_keyword(&tokens, 2, "NODE")?;
+            expect_keyword(&tokens, 4, "CAPACITY")?;
+            let mut capacity = NodeCapacity::default();
+            let mut position = 5;
+            let mut declared = false;
+            while position < tokens.len() {
+                let key = token(&tokens, position)?.to_ascii_lowercase();
+                expect_keyword(&tokens, position + 1, "=")?;
+                let value = token(&tokens, position + 2)?;
+                let parse_u64 = |what: &str| {
+                    value.parse::<u64>().map_err(|_| {
+                        ControlError::Syntax(format!(
+                            "{what} must be an unsigned integer, found {value:?}"
+                        ))
+                    })
+                };
+                match key.as_str() {
+                    "cpu_cores" => {
+                        capacity.cpu_cores =
+                            u32::try_from(parse_u64("cpu_cores")?).map_err(|_| {
+                                ControlError::Syntax(
+                                    "cpu_cores exceeds u32".to_owned(),
+                                )
+                            })?;
+                    }
+                    "memory_bytes" => capacity.memory_bytes = parse_u64("memory_bytes")?,
+                    "disk_total_bytes" => {
+                        capacity.disk_total_bytes = parse_u64("disk_total_bytes")?
+                    }
+                    "disk_free_bytes" => {
+                        capacity.disk_free_bytes = parse_u64("disk_free_bytes")?
+                    }
+                    "network_mbps" => capacity.network_mbps = parse_u64("network_mbps")?,
+                    "failure_domain" => capacity.failure_domain = value.to_owned(),
+                    other => {
+                        return Err(ControlError::Syntax(format!(
+                            "unknown capacity field {other:?}"
+                        )))
+                    }
+                }
+                declared = true;
+                position += 3;
+                if tokens.get(position).map(String::as_str) == Some(",") {
+                    position += 1;
+                }
+            }
+            if !declared {
+                return Err(ControlError::Syntax(
+                    "REPORT STORAGE NODE CAPACITY requires at least one field".to_owned(),
+                ));
+            }
+            Ok(Command::ReportStorageNodeCapacity {
+                node: StorageNodeId::try_new(token(&tokens, 3)?.to_owned())
+                    .map_err(|error| ControlError::Syntax(error.to_string()))?,
+                capacity,
+            })
+        }
         Some("DESCRIBE") => Ok(Command::Describe {
             kind: parse_resource_kind(token(&tokens, 1)?)?,
             name: token(&tokens, 2)?.to_owned(),
@@ -7573,6 +7737,7 @@ fn show_resources(
     state: &CatalogState,
     kind: ShowKind,
     configured: &BTreeSet<StorageNodeId>,
+    policy: &CapacityPolicy,
 ) -> Value {
     match kind {
         ShowKind::Domains | ShowKind::Spaces => json!(state
@@ -7649,35 +7814,45 @@ fn show_resources(
         ShowKind::Grants => json!(state.grants.values().collect::<Vec<_>>()),
         ShowKind::StorageNodes => {
             let registered: BTreeSet<&StorageNodeId> = state.storage_nodes.keys().collect();
-            json!(storage_eligibility_report(state, configured)
-                .into_iter()
-                .map(|entry| {
-                    json!({
-                        "node": entry.node.as_str(),
-                        "endpoint": state
-                            .storage_nodes
-                            .get(&entry.node)
-                            .map(|record| record.endpoint.as_str()),
-                        "cert_pins": state
-                            .storage_nodes
-                            .get(&entry.node)
-                            .map(|record| record.cert_pins.iter().collect::<Vec<_>>())
-                            .unwrap_or_default(),
-                        "capabilities": state
-                            .storage_nodes
-                            .get(&entry.node)
-                            .map(|record| record.capabilities),
-                        "source": if registered.contains(&entry.node) {
-                            "registered"
-                        } else {
-                            "configured"
-                        },
-                        "eligible": entry.eligible,
-                        "exclusions": entry.exclusions,
-                        "draining": state.draining_storage_nodes.contains(&entry.node),
+            json!(
+                storage_eligibility_report(state, configured, policy, unix_ns(),)
+                    .into_iter()
+                    .map(|entry| {
+                        json!({
+                            "node": entry.node.as_str(),
+                            "endpoint": state
+                                .storage_nodes
+                                .get(&entry.node)
+                                .map(|record| record.endpoint.as_str()),
+                            "cert_pins": state
+                                .storage_nodes
+                                .get(&entry.node)
+                                .map(|record| record.cert_pins.iter().collect::<Vec<_>>())
+                                .unwrap_or_default(),
+                            "capabilities": state
+                                .storage_nodes
+                                .get(&entry.node)
+                                .map(|record| record.capabilities),
+                            "capacity": state
+                                .capacity_reports
+                                .get(&entry.node)
+                                .map(|report| report.capacity.clone()),
+                            "capacity_reported_at_ns": state
+                                .capacity_reports
+                                .get(&entry.node)
+                                .map(|report| report.reported_at_ns.to_string()),
+                            "source": if registered.contains(&entry.node) {
+                                "registered"
+                            } else {
+                                "configured"
+                            },
+                            "eligible": entry.eligible,
+                            "exclusions": entry.exclusions,
+                            "draining": state.draining_storage_nodes.contains(&entry.node),
+                        })
                     })
-                })
-                .collect::<Vec<_>>())
+                    .collect::<Vec<_>>()
+            )
         }
     }
 }
@@ -7807,6 +7982,15 @@ pub enum StorageExclusion {
     Retired,
     /// The registered descriptor does not declare the storage role.
     StorageUndeclared,
+    /// The baseline policy requires measured evidence but the Node has
+    /// committed no capacity report.
+    CapacityUnreported,
+    /// The last committed report is older than the configured freshness
+    /// bound, so its evidence can no longer be trusted.
+    CapacityStale,
+    /// The committed report shows disk headroom below the configured
+    /// minimum baseline.
+    BelowBaseline,
 }
 
 /// One Node's storage-placement eligibility plus the reasons it is
@@ -7853,12 +8037,43 @@ fn effective_pipe_compute_lease(state: &CatalogState, pipe_id: Uuid) -> Option<P
     })
 }
 
+/// The capacity-policy reason a Node is excluded, if any. `now_ns` is
+/// the evaluation instant: committed `issued_at_ns` inside apply
+/// (deterministic across replicas) and wall time on advisory reads.
+fn capacity_exclusion(
+    state: &CatalogState,
+    node: &StorageNodeId,
+    policy: &CapacityPolicy,
+    now_ns: i64,
+) -> Option<StorageExclusion> {
+    if !policy.active() {
+        return None;
+    }
+    let Some(report) = state.capacity_reports.get(node) else {
+        return Some(StorageExclusion::CapacityUnreported);
+    };
+    if policy
+        .report_max_age_ns
+        .is_some_and(|max_age| now_ns.saturating_sub(report.reported_at_ns) > max_age)
+    {
+        return Some(StorageExclusion::CapacityStale);
+    }
+    if policy.min_disk_free_bytes > 0
+        && report.capacity.disk_free_bytes < policy.min_disk_free_bytes
+    {
+        return Some(StorageExclusion::BelowBaseline);
+    }
+    None
+}
+
 /// Every storage identity the catalog knows about with the reasons it is
 /// currently excluded from placement, so operators see *why* the pool has
 /// its present shape rather than a silent absence.
 fn storage_eligibility_report(
     state: &CatalogState,
     configured: &BTreeSet<StorageNodeId>,
+    policy: &CapacityPolicy,
+    now_ns: i64,
 ) -> Vec<NodeStorageEligibility> {
     let nodes: BTreeSet<StorageNodeId> = configured
         .iter()
@@ -7884,6 +8099,9 @@ fn storage_eligibility_report(
             {
                 exclusions.push(StorageExclusion::StorageUndeclared);
             }
+            if let Some(exclusion) = capacity_exclusion(state, &node, policy, now_ns) {
+                exclusions.push(exclusion);
+            }
             let declared = configured.contains(&node) || state.storage_nodes.contains_key(&node);
             NodeStorageEligibility {
                 node,
@@ -7899,9 +8117,10 @@ fn drain_replacement(
     controller: &ControlController,
     excluded: &BTreeSet<StorageNodeId>,
     seed: &Uuid,
+    now_ns: i64,
 ) -> Option<StorageNodeId> {
     let mut ranked = controller
-        .storage_pool(state)
+        .storage_pool(state, now_ns)
         .into_iter()
         .filter(|node| !excluded.contains(node))
         .map(|node| {
@@ -7921,6 +8140,7 @@ fn storage_drain_plan(
     controller: &ControlController,
     node: &StorageNodeId,
 ) -> StorageDrainPlan {
+    let now_ns = unix_ns();
     let mut moves = Vec::new();
     let mut unplannable = Vec::new();
     for (range_id, assignment) in state.range_assignments.iter() {
@@ -7954,7 +8174,7 @@ fn storage_drain_plan(
             }
         }
         let excluded: BTreeSet<StorageNodeId> = assignment.replicas.iter().cloned().collect();
-        match drain_replacement(state, controller, &excluded, &range_id.as_uuid()) {
+        match drain_replacement(state, controller, &excluded, &range_id.as_uuid(), now_ns) {
             Some(replacement) => moves.push(Command::PrepareFollowerMove {
                 feed,
                 range_id: *range_id,
@@ -7995,7 +8215,7 @@ fn storage_drain_plan(
             }
         }
         let excluded: BTreeSet<StorageNodeId> = assignment.replicas.iter().cloned().collect();
-        match drain_replacement(state, controller, &excluded, subscription_id) {
+        match drain_replacement(state, controller, &excluded, subscription_id, now_ns) {
             Some(replacement) => moves.push(Command::MoveSubscriptionProgressReplica {
                 subscription_id: *subscription_id,
                 expected_ownership_epoch: epoch,
@@ -8015,7 +8235,7 @@ fn storage_drain_plan(
             continue;
         };
         let excluded: BTreeSet<StorageNodeId> = [node.clone()].into_iter().collect();
-        match drain_replacement(state, controller, &excluded, pipe_id) {
+        match drain_replacement(state, controller, &excluded, pipe_id, now_ns) {
             Some(replacement) => moves.push(Command::MovePipeComputeLease {
                 pipe: pipe.name.clone(),
                 new_owner: replacement,
@@ -8028,7 +8248,12 @@ fn storage_drain_plan(
         }
     }
     StorageDrainPlan {
-        storage_pool: controller.storage_eligibility_report(state),
+        storage_pool: storage_eligibility_report(
+            state,
+            controller.eligible_storage_nodes.as_ref(),
+            &controller.capacity_policy,
+            now_ns,
+        ),
         node: node.clone(),
         draining: state.draining_storage_nodes.contains(node),
         moves,
@@ -8165,6 +8390,7 @@ fn command_label(command: &Command) -> String {
         Command::DrainStorageNode { .. } => "DRAIN STORAGE NODE",
         Command::UndrainStorageNode { .. } => "UNDRAIN STORAGE NODE",
         Command::InspectStorageDrain { .. } => "INSPECT DRAIN",
+        Command::ReportStorageNodeCapacity { .. } => "REPORT STORAGE NODE CAPACITY",
     }
     .to_owned()
 }
@@ -9932,12 +10158,12 @@ mod tests {
             let id = Uuid::from_u128(6000 + index);
             let left_state = first.state.lock().await;
             let left = first
-                .select_fixed_subscription_progress(&left_state, id)
+                .select_fixed_subscription_progress(&left_state, id, unix_ns())
                 .unwrap();
             drop(left_state);
             let right_state = second.state.lock().await;
             let right = second
-                .select_fixed_subscription_progress(&right_state, id)
+                .select_fixed_subscription_progress(&right_state, id, unix_ns())
                 .unwrap();
             drop(right_state);
             assert_eq!(left, right);
@@ -11665,6 +11891,108 @@ mod tests {
             .moves
             .iter()
             .any(|command| matches!(command, Command::MovePipeComputeLease { .. })));
+    }
+
+    #[tokio::test]
+    async fn capacity_reports_drive_baseline_exclusions() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory).with_capacity_policy(CapacityPolicy {
+            report_max_age_ns: None,
+            min_disk_free_bytes: 1_000,
+        });
+        // With the policy enabled a Node without a committed report is
+        // unmeasured and excluded; the report itself lifts the exclusion.
+        let shown = controller.execute("SHOW STORAGE NODES;").await.unwrap();
+        let rows = shown.results[0].data.as_array().unwrap();
+        let entry = rows
+            .iter()
+            .find(|entry| entry["node"] == "storage-1")
+            .unwrap();
+        assert_eq!(entry["eligible"], false);
+        assert_eq!(entry["exclusions"], json!(["capacity_unreported"]));
+        let reported = controller
+            .execute(
+                "REPORT STORAGE NODE storage-1 CAPACITY cpu_cores=4,                  memory_bytes=1024, disk_total_bytes=5000, disk_free_bytes=4000,                  network_mbps=10000, failure_domain='zone-a';",
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reported.results[0].data["capacity"]["disk_free_bytes"],
+            4000
+        );
+        let shown = controller.execute("SHOW STORAGE NODES;").await.unwrap();
+        let rows = shown.results[0].data.as_array().unwrap();
+        let entry = rows
+            .iter()
+            .find(|entry| entry["node"] == "storage-1")
+            .unwrap();
+        assert_eq!(entry["eligible"], true);
+        assert_eq!(entry["exclusions"], json!([]));
+        assert_eq!(entry["capacity"]["cpu_cores"], 4);
+        assert_eq!(entry["capacity"]["failure_domain"], "zone-a");
+        assert!(entry["capacity_reported_at_ns"].is_string());
+        // A Node reporting below the configured floor is excluded.
+        controller
+            .execute("REPORT STORAGE NODE storage-2 CAPACITY disk_free_bytes=10;")
+            .await
+            .unwrap();
+        let shown = controller.execute("SHOW STORAGE NODES;").await.unwrap();
+        let rows = shown.results[0].data.as_array().unwrap();
+        let entry = rows
+            .iter()
+            .find(|entry| entry["node"] == "storage-2")
+            .unwrap();
+        assert_eq!(entry["eligible"], false);
+        assert_eq!(entry["exclusions"], json!(["below_baseline"]));
+        // Reports for identities the catalog does not know are refused.
+        assert!(controller
+            .execute("REPORT STORAGE NODE ghost-9 CAPACITY disk_free_bytes=9999;")
+            .await
+            .is_err());
+        // Unknown fields and missing values are syntax errors.
+        assert!(controller
+            .execute("REPORT STORAGE NODE storage-1 CAPACITY bogus=1;")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_capacity_reports_exclude_under_the_freshness_bound() {
+        let directory = TempDir::new().unwrap();
+        // One-nanosecond freshness: a committed report is stale by the
+        // time the next command's issued_at lands.
+        let controller = new_controller(&directory).with_capacity_policy(CapacityPolicy {
+            report_max_age_ns: Some(1),
+            min_disk_free_bytes: 0,
+        });
+        controller
+            .execute("REPORT STORAGE NODE storage-1 CAPACITY disk_free_bytes=4000;")
+            .await
+            .unwrap();
+        let shown = controller.execute("SHOW STORAGE NODES;").await.unwrap();
+        let entry = shown.results[0]
+            .data
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["node"] == "storage-1")
+            .unwrap();
+        assert_eq!(entry["eligible"], false);
+        assert_eq!(entry["exclusions"], json!(["capacity_stale"]));
+        // With no policy configured, capacity evidence is advisory only:
+        // the same unreported Node stays eligible.
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        let shown = controller.execute("SHOW STORAGE NODES;").await.unwrap();
+        let entry = shown.results[0]
+            .data
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["node"] == "storage-1")
+            .unwrap();
+        assert_eq!(entry["eligible"], true);
+        assert_eq!(entry["exclusions"], json!([]));
     }
 
     #[tokio::test]

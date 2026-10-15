@@ -27,10 +27,12 @@ use whitewater::{
     },
     autoscale::AutoscaleController,
     config::NodeConfig,
-    control::ControlController,
+    control::{CapacityPolicy, ControlController},
     control_plane::ControlPlane,
     demand::{isolation_split_boundary, DemandMetrics, HotKeyObservation, HotKeyTracker},
-    internal_plane::{CatalogSyncSupervisor, HttpCatalogSnapshotSource, InternalEndpoints},
+    internal_plane::{
+        CapacityReporter, CatalogSyncSupervisor, HttpCatalogSnapshotSource, InternalEndpoints,
+    },
     membership::{MemberAnnouncement, MembershipService},
     node::{self, NodeCapacity},
     reader::{
@@ -85,7 +87,12 @@ async fn main() -> Result<()> {
         config.data_dir.join(catalog_file),
         store.clone(),
         eligible_storage_nodes,
-    )?;
+    )?
+    .with_capacity_policy(CapacityPolicy {
+        report_max_age_ns: (config.capacity_report_max_age > Duration::ZERO)
+            .then_some(config.capacity_report_max_age.as_nanos() as i64),
+        min_disk_free_bytes: config.min_disk_free_bytes,
+    });
     let control = Arc::new(
         if config.control_node_id.is_none() && !config.control_nodes.is_empty() {
             controller.into_synced_replica()
@@ -302,6 +309,35 @@ async fn main() -> Result<()> {
     );
     let demand = DemandMetrics::default();
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // A storage-capable Node re-commits its measured capacity on an
+    // interval so a configured baseline policy reads fresh committed
+    // evidence instead of gossip. No configured voters means nothing
+    // authoritative to report to, so local-prototype Nodes stay silent.
+    let capacity_reporter_task = if config.node_capabilities.storage
+        && !configured_endpoints.is_empty()
+    {
+        config.storage_node_id.clone().map(|identity| {
+            let reporter = CapacityReporter::new(
+                identity,
+                config.data_dir.clone(),
+                config.failure_domain.clone(),
+                configured_endpoints.values().cloned().collect(),
+                config.control_plane_key.clone(),
+                match build_internal_client(Duration::from_secs(10)) {
+                    Ok(client) => client,
+                    Err(error) => {
+                        tracing::warn!(%error, "capacity reporter disabled: internal client failed to build");
+                        return tokio::spawn(std::future::pending());
+                    }
+                },
+                config.capacity_report_interval,
+            );
+            let shutdown = shutdown_tx.subscribe();
+            tokio::spawn(async move { reporter.run(shutdown).await })
+        })
+    } else {
+        None
+    };
     let membership_task = tokio::spawn(membership.clone().run(shutdown_rx));
     let recovery_task = recovery_supervisor.map(|supervisor| {
         let mut shutdown = shutdown_tx.subscribe();
@@ -850,6 +886,9 @@ async fn main() -> Result<()> {
         }
     } else {
         public.await?;
+    }
+    if let Some(task) = capacity_reporter_task {
+        task.abort();
     }
     let _ = membership_task.await;
     if let Some(recovery_task) = recovery_task {

@@ -103,6 +103,11 @@ pub struct NodeCapacity {
     pub disk_total_bytes: u64,
     /// Bytes currently free on that volume.
     pub disk_free_bytes: u64,
+    /// Sum of physical interface link rates in megabits per second
+    /// (sysfs `speed`); 0 means the platform did not report. A link's
+    /// measured throughput belongs to pressure, not capacity.
+    #[serde(default)]
+    pub network_mbps: u64,
     /// Operator-declared failure domain (zone/rack/host label); empty means
     /// unknown, in which case placement must treat every Node as sharing a
     /// domain.
@@ -121,9 +126,31 @@ impl NodeCapacity {
             memory_bytes: total_memory_bytes(),
             disk_total_bytes: fs2::total_space(data_dir).unwrap_or(0),
             disk_free_bytes: fs2::free_space(data_dir).unwrap_or(0),
+            network_mbps: total_link_mbps(),
             failure_domain,
         }
     }
+}
+
+/// `/sys/class/net/*/speed` reports each link's negotiated rate in Mb/s;
+/// virtual and down links report `-1` or nothing and are skipped.
+#[cfg(target_os = "linux")]
+fn total_link_mbps() -> u64 {
+    fs::read_dir("/sys/class/net")
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let speed = fs::read_to_string(entry.path().join("speed")).ok()?;
+            speed.trim().parse::<u64>().ok()
+        })
+        .sum()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn total_link_mbps() -> u64 {
+    0
 }
 
 /// `/proc/meminfo` reports MemTotal in kibibytes.

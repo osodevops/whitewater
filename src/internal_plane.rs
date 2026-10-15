@@ -1,10 +1,15 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use uuid::Uuid;
 
 use crate::active_range::StorageNodeId;
-use crate::control::ControlController;
+use crate::control::{Command, ControlController};
+use crate::control_plane::{InternalCommandsRequest, InternalCommandsResponse};
+use crate::node::NodeCapacity;
 
 /// Resolves the internal Node-to-Node endpoint for a storage Node.
 ///
@@ -76,6 +81,102 @@ impl From<Arc<BTreeMap<StorageNodeId, String>>> for InternalEndpoints {
         Self {
             configured,
             control: None,
+        }
+    }
+}
+
+/// Periodically commits this Node's measured capacity into the
+/// replicated catalog. Capacity consulted by placement must be committed
+/// state — not gossip — because eligibility is evaluated inside
+/// deterministic apply on every replica. Reports flow through the same
+/// authenticated internal commands channel operators use: a follower
+/// forwards them to the leader automatically, so the reporter simply
+/// retries the next configured voter when one is unreachable.
+pub struct CapacityReporter {
+    node: StorageNodeId,
+    data_dir: PathBuf,
+    failure_domain: String,
+    endpoints: Vec<String>,
+    key: Option<String>,
+    client: reqwest::Client,
+    interval: Duration,
+}
+
+impl CapacityReporter {
+    pub fn new(
+        node: StorageNodeId,
+        data_dir: PathBuf,
+        failure_domain: String,
+        endpoints: Vec<String>,
+        key: Option<String>,
+        client: reqwest::Client,
+        interval: Duration,
+    ) -> Self {
+        Self {
+            node,
+            data_dir,
+            failure_domain,
+            endpoints,
+            key,
+            client,
+            interval,
+        }
+    }
+
+    /// Commit one capacity report. Returns once any voter accepts it;
+    /// unreachable or erroring voters are skipped so a later tick or a
+    /// new leader still carries the next measurement.
+    pub async fn report_once(&self) {
+        let request = InternalCommandsRequest {
+            request_id: Uuid::new_v4(),
+            commands: vec![Command::ReportStorageNodeCapacity {
+                node: self.node.clone(),
+                capacity: NodeCapacity::sample(&self.data_dir, self.failure_domain.clone()),
+            }],
+        };
+        for endpoint in &self.endpoints {
+            let url = format!(
+                "{}/internal/control-plane/commands",
+                endpoint.trim_end_matches('/')
+            );
+            let mut request_builder = self.client.post(&url).json(&request);
+            if let Some(key) = &self.key {
+                request_builder = request_builder.header("x-whitewater-control-key", key);
+            }
+            let Ok(response) = request_builder.send().await else {
+                continue;
+            };
+            if !response.status().is_success() {
+                continue;
+            }
+            match response.json::<InternalCommandsResponse>().await {
+                Ok(InternalCommandsResponse {
+                    execution: Some(_), ..
+                }) => {
+                    tracing::debug!(node = %self.node, "committed capacity report");
+                    return;
+                }
+                Ok(InternalCommandsResponse { error, .. }) => {
+                    tracing::debug!(node = %self.node, ?error, "capacity report rejected");
+                    return;
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "capacity report response unreadable");
+                    continue;
+                }
+            }
+        }
+    }
+
+    pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+        let mut interval = tokio::time::interval(self.interval);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => self.report_once().await,
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { break; }
+                }
+            }
         }
     }
 }
