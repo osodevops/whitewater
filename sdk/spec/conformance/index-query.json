@@ -1,0 +1,64 @@
+{
+  "scenario": "index-query",
+  "requires": ["wcl", "admin.commands", "feed.append"],
+  "steps": [
+    {
+      "op": "wcl",
+      "args": {
+        "script": "CREATE DOMAIN ix{{uniq}}; CREATE FEED ix{{uniq}}.events;"
+      },
+      "expect": {"authority": "control_plane"}
+    },
+    {
+      "op": "admin.commands",
+      "args": {
+        "commands": [
+          {
+            "command": "define_index",
+            "name": "ix{{uniq}}.events.by.key",
+            "feed": "ix{{uniq}}.events",
+            "fields": [{"kind": "key"}]
+          }
+        ]
+      },
+      "expect": {"authority": "control_plane"}
+    },
+    {
+      "op": "feed.append",
+      "args": {
+        "request_id": "{{uuid:rec1}}",
+        "feed": "ix{{uniq}}.events",
+        "writer_session_id": "{{uuid:iw}}",
+        "writer_epoch": 1,
+        "sequence": 1,
+        "key": {"utf8": "user-1"},
+        "payload": {"utf8": "payload-1"},
+        "event_time_ns": "1700000000000000001"
+      },
+      "expect": {"cursor": "!=null", "deduplicated": false}
+    },
+    {
+      "op": "wcl",
+      "args": {"script": "REBUILD INDEX ix{{uniq}}.events.by.key;"},
+      "expect": {"authority": "control_plane"}
+    },
+    {
+      "op": "wcl",
+      "args": {"script": "GET INDEX ix{{uniq}}.events.by.key EQ B64 dXNlci0x;"},
+      "poll": {"times": 30, "interval_ms": 1000},
+      "expect": {
+        "results[0].data.rows": "len>=1",
+        "results[0].data.rows[0].key_base64": "dXNlci0x",
+        "results[0].data.rows[0].payload_base64": "cGF5bG9hZC0x",
+        "results[0].data.applied_cursor": "!=null",
+        "results[0].data.served_by": "present"
+      }
+    },
+    {
+      "op": "wcl",
+      "args": {"script": "GET INDEX ix{{uniq}}.events.by.key EQ B64 YWJzZW50;"},
+      "poll": {"times": 15, "interval_ms": 1000},
+      "expect": {"results[0].data.rows": []}
+    }
+  ]
+}

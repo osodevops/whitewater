@@ -73,11 +73,26 @@ def main():
             raise AssertionError("ownership did not transfer after sustained owner failure")
         if recovered["ownership_epoch"] != original["ownership_epoch"] + 1:
             raise AssertionError("ownership epoch did not increase exactly once")
-        result = post(survivors[0], "/v1/feeds/append", {
-            "request_id": str(uuid.uuid4()), "feed": feed,
-            "writer_session_id": str(uuid.uuid4()), "writer_epoch": 1, "sequence": 1,
-            "event_time_ns": "1", "key_base64": "aw==", "payload_base64": "dg==", "metadata_base64": {},
-        })
+        # The placement view flips to the new owner before that owner's
+        # append path finishes adopting the range; a brief window of 409s
+        # is the same transient class the connection retries above cover.
+        result = None
+        last_error = None
+        for _ in range(30):
+            try:
+                result = post(survivors[0], "/v1/feeds/append", {
+                    "request_id": str(uuid.uuid4()), "feed": feed,
+                    "writer_session_id": str(uuid.uuid4()), "writer_epoch": 1, "sequence": 1,
+                    "event_time_ns": "1", "key_base64": "aw==", "payload_base64": "dg==", "metadata_base64": {},
+                })
+                break
+            except urllib.error.HTTPError as error:
+                if error.code not in (409, 503):
+                    raise
+                last_error = error
+                time.sleep(2)
+        if result is None:
+            raise last_error
         if result["durability"] != "majority_committed":
             raise AssertionError("append did not resume with majority durability")
         print(json.dumps({"status": "ok", "feed": feed, "old_owner": old_owner, "new_owner": recovered["owner"], "ownership_epoch": recovered["ownership_epoch"], "message_id": result["message_id"]}, indent=2))
