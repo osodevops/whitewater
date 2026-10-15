@@ -70,9 +70,21 @@ def main():
     subscription = f"{space}.billing"
     status, created = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {subscription} FROM {feed} START AT BEGINNING;"})
     if status != 200: raise AssertionError(created)
-    status, joined = post(ENDPOINTS[1], "/v1/subscriptions/members/join", {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": str(uuid.uuid4())})
+    # The join can land while progress replicas still install the fresh
+    # placement: a transient no_quorum/unavailable conflict is the same
+    # post-cutover class other legs tolerate, and the same request_id makes
+    # the retry idempotent.
+    join_body = {"subscription": subscription, "request_id": str(uuid.uuid4()), "member_id": str(uuid.uuid4())}
+    for _ in range(30):
+        status, joined = post(ENDPOINTS[1], "/v1/subscriptions/members/join", join_body)
+        if status == 200 or joined.get("code") not in {"no_quorum", "unavailable", "ambiguous_commit", "invalid_assignment"}: break
+        time.sleep(0.5)
     if status != 200: raise AssertionError(joined)
-    status, refused = post(ENDPOINTS[2], "/v1/subscriptions/seek", {"subscription": subscription, "request_id": str(uuid.uuid4()), "position": "cursor", "cursor": cursors[0]})
+    seek_refused = {"subscription": subscription, "request_id": str(uuid.uuid4()), "position": "cursor", "cursor": cursors[0]}
+    for _ in range(30):
+        status, refused = post(ENDPOINTS[2], "/v1/subscriptions/seek", seek_refused)
+        if status == 400 or refused.get("code") not in {"no_quorum", "unavailable", "ambiguous_commit", "invalid_assignment"}: break
+        time.sleep(0.5)
     if status != 400: raise AssertionError(f"split Feed accepted a one-Cursor Subscription seek: {refused}")
     status, stale = post(ENDPOINTS[0], "/v1/readers/ack", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": reader_epoch, "cursor": unacknowledged["delivered_cursor"]})
     if status == 200: raise AssertionError(f"split accepted stale Reader acknowledgement: {stale}")
@@ -96,7 +108,11 @@ def main():
     status, merged = post(ENDPOINTS[1], "/v1/admin/ranges/merge", {"request_id": str(uuid.uuid4()), "feed": feed, "left_range_id": routes[0]["range_id"], "right_range_id": routes[1]["range_id"]})
     if status != 200 or merged.get("status") != "activated": raise AssertionError(f"merge with branched Writer sequences was refused: {merged}")
     merge_status = "activated"
-    status, sought = post(ENDPOINTS[2], "/v1/subscriptions/seek", {"subscription": subscription, "request_id": str(uuid.uuid4()), "position": "cursor", "cursor": cursors[0]})
+    seek_body = {"subscription": subscription, "request_id": str(uuid.uuid4()), "position": "cursor", "cursor": cursors[0]}
+    for _ in range(30):
+        status, sought = post(ENDPOINTS[2], "/v1/subscriptions/seek", seek_body)
+        if status == 200 or sought.get("code") not in {"no_quorum", "unavailable", "ambiguous_commit", "invalid_assignment"}: break
+        time.sleep(0.5)
     if status != 200 or list(sought["positions"].values()) != [cursors[0]]: raise AssertionError(f"merged Feed refused a one-Cursor Subscription seek: {sought}")
     status, stale = post(ENDPOINTS[0], "/v1/readers/ack", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": split_epoch, "cursor": pending["delivered_cursor"]})
     if status == 200: raise AssertionError(f"merge accepted stale Reader acknowledgement: {stale}")

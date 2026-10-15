@@ -1988,6 +1988,18 @@ impl ControlController {
             .collect()
     }
 
+    /// Every active Reader definition.
+    pub async fn active_readers(&self) -> Vec<ReaderDefinition> {
+        self.state
+            .lock()
+            .await
+            .readers
+            .values()
+            .filter(|reader| reader.status == ResourceStatus::Active)
+            .cloned()
+            .collect()
+    }
+
     pub async fn active_subscription_by_name(&self, name: &str) -> Option<SubscriptionDefinition> {
         self.state
             .lock()

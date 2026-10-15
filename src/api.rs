@@ -725,6 +725,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/admin/demand/subscriptions",
             get(admin_subscription_demand),
         )
+        .route("/v1/admin/demand/readers", get(admin_reader_demand))
         .route("/v1/admin/demand/indexes", get(admin_index_demand))
         .route("/v1/admin/demand/feeds", get(admin_feed_demand))
         .route("/v1/admin/control-plane", get(control_plane_status))
@@ -6641,7 +6642,32 @@ async fn reader_open(
     let reader: crate::control::ReaderDefinition =
         serde_json::from_value(execution.results[0].data.clone())
             .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    record_reader_traffic(
+        &state,
+        reader.reader_id,
+        crate::demand::ReaderTrafficOp::Open,
+        0,
+    );
     Ok(Json(reader_session_response(reader)))
+}
+
+/// Fold one served named-Reader session request into Node-local demand
+/// attribution. Replays count as served demand, matching the Subscription
+/// contract: the replay still costs a committed-frontier read.
+fn record_reader_traffic(
+    state: &AppState,
+    reader_id: Uuid,
+    op: crate::demand::ReaderTrafficOp,
+    records: usize,
+) {
+    state.demand.record_reader_op(
+        reader_id,
+        crate::demand::ReaderTrafficSample {
+            op,
+            records: records as u64,
+            sampled_at_ns: unix_ns(),
+        },
+    );
 }
 
 fn verify_reader_frontier_result(
@@ -6727,6 +6753,12 @@ async fn replay_reader_fetch(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     state.demand.record_read(records.len());
+    record_reader_traffic(
+        state,
+        reader.reader_id,
+        crate::demand::ReaderTrafficOp::Fetch,
+        records.len(),
+    );
     // A replay serves the identical page, so it reports the advice that
     // page was paced under: both values come from the persisted frontier
     // rather than a Node-local plan that may describe a sibling fetch on
@@ -6807,6 +6839,12 @@ async fn reader_fetch(
         // The delivered-byte budget is exhausted or records exceed it:
         // defer delivery honestly through the response advice instead
         // of silently shrinking the page or erroring the session.
+        record_reader_traffic(
+            &state,
+            reader.reader_id,
+            crate::demand::ReaderTrafficOp::Fetch,
+            0,
+        );
         return Ok(Json(ReaderFetchResponse {
             records: Vec::new(),
             delivered_cursor: reader.delivered_cursor.clone(),
@@ -6952,6 +6990,12 @@ async fn reader_fetch(
         }
     }
     state.demand.record_read(records.len());
+    record_reader_traffic(
+        &state,
+        reader.reader_id,
+        crate::demand::ReaderTrafficOp::Fetch,
+        records.len(),
+    );
     state
         .reader_pacing
         .record_page(reader.reader_id, records.len(), page_bytes, limit);
@@ -6992,6 +7036,12 @@ async fn reader_ack(
         serde_json::from_value(execution.results[0].data.clone())
             .map_err(|error| ApiError::unavailable(error.to_string()))?;
     state.reader_pacing.observe_ack(reader.reader_id);
+    record_reader_traffic(
+        &state,
+        reader.reader_id,
+        crate::demand::ReaderTrafficOp::Ack,
+        0,
+    );
     Ok(Json(reader_session_response(reader)))
 }
 
@@ -7022,6 +7072,12 @@ async fn reader_close(
         serde_json::from_value(execution.results[0].data.clone())
             .map_err(|error| ApiError::unavailable(error.to_string()))?;
     state.reader_pacing.remove(reader.reader_id);
+    record_reader_traffic(
+        &state,
+        reader.reader_id,
+        crate::demand::ReaderTrafficOp::Close,
+        0,
+    );
     Ok(Json(reader_session_response(reader)))
 }
 
@@ -9640,6 +9696,71 @@ async fn admin_subscription_demand(
         "node": state.storage_node_id,
         "scope": "node-local since process start; a progress-placement move restarts attribution on the new owner",
         "subscriptions": rows,
+        "domains": domains,
+    })))
+}
+
+/// Per-Reader session attribution on this Node. Counters are Node-local
+/// since process start: an open session can fetch through any ingress,
+/// so each row reports demand where it was served rather than on a fixed
+/// owning Node.
+async fn admin_reader_demand(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let readers = state.control.active_readers().await;
+    let live: std::collections::BTreeSet<Uuid> =
+        readers.iter().map(|reader| reader.reader_id).collect();
+    state.demand.prune_reader_traffic(&live);
+    let telemetry = state.demand.reader_traffic();
+    let mut domains: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut rows = Vec::with_capacity(readers.len());
+    for reader in &readers {
+        let feed = state.control.active_feed_by_id(reader.feed_id).await;
+        let (feed_name, domain) = match &feed {
+            Some(feed) => (
+                feed.name.clone(),
+                state
+                    .control
+                    .active_domain_name(feed.space_id)
+                    .await
+                    .unwrap_or_else(|| feed.space_id.to_string()),
+            ),
+            None => (reader.feed_id.to_string(), String::new()),
+        };
+        let row = json!({
+            "reader": reader.name,
+            "domain": domain,
+            "feed": feed_name,
+            "status": reader.status,
+            "telemetry": telemetry.get(&reader.reader_id),
+        });
+        let rollup = domains.entry(domain).or_insert_with(|| {
+            json!({
+                "readers": 0, "requests": 0, "opens": 0, "fetches": 0,
+                "fetch_records": 0, "acks": 0, "closes": 0,
+            })
+        });
+        rollup["readers"] = json!(rollup["readers"].as_u64().unwrap_or(0) + 1);
+        if let Some(t) = telemetry.get(&reader.reader_id) {
+            for (field, value) in [
+                ("requests", t.requests),
+                ("opens", t.opens),
+                ("fetches", t.fetches),
+                ("fetch_records", t.fetch_records),
+                ("acks", t.acks),
+                ("closes", t.closes),
+            ] {
+                rollup[field] = json!(rollup[field].as_u64().unwrap_or(0) + value);
+            }
+        }
+        rows.push(row);
+    }
+    Ok(Json(json!({
+        "node": state.storage_node_id,
+        "scope": "node-local since process start; each row attributes demand where it was served",
+        "readers": rows,
         "domains": domains,
     })))
 }

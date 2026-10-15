@@ -88,6 +88,17 @@ def main():
     if widened["session_epoch"] != epoch + 2: raise AssertionError(widened)
     status, third = post(ENDPOINTS[2], "/v1/readers/fetch", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": widened["session_epoch"]})
     if status != 200 or len(third["records"]) != 3 or third["recommended_capacity"] != 3: raise AssertionError(third)
+    # Per-Reader demand attribution is Node-local per serving ingress: merged
+    # across the Riverbed, the session's ops report exactly — three opens,
+    # three fetches delivering six records, one ack.
+    merged = {"opens": 0, "fetches": 0, "fetch_records": 0, "acks": 0}
+    for endpoint in ENDPOINTS:
+        with urllib.request.urlopen(urllib.request.Request(f"{endpoint}/v1/admin/demand/readers", headers={"authorization": f"Bearer {KEY}"}), timeout=30) as response:
+            demand = json.loads(response.read())
+        for row in demand["readers"]:
+            if row["reader"] == reader and row["telemetry"]:
+                for field in merged: merged[field] += row["telemetry"].get(field, 0)
+    if merged != {"opens": 3, "fetches": 3, "fetch_records": 6, "acks": 1}: raise AssertionError(f"Reader demand attribution drifted: {merged}")
     print(json.dumps({"status": "ok", "reader": reader, "first_delivery": 2, "resumed_delivery": 1, "rebaselined_delivery": len(third["records"]), "temporary_new_only_delivery": 1, "tail_records": 2, "acknowledged_cursor": delivered}, indent=2))
 
 if __name__ == "__main__":

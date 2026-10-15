@@ -28,6 +28,7 @@ struct DemandCounters {
     hot_keys: Mutex<BTreeMap<RangeId, (HotKeyEvidence, std::time::Instant)>>,
     pipe_drives: Mutex<BTreeMap<uuid::Uuid, PipeDriveTelemetry>>,
     subscription_traffic: Mutex<BTreeMap<uuid::Uuid, SubscriptionTrafficTelemetry>>,
+    reader_traffic: Mutex<BTreeMap<uuid::Uuid, ReaderTrafficTelemetry>>,
     index_queries: Mutex<BTreeMap<uuid::Uuid, IndexQueryTelemetry>>,
     range_reads: Mutex<BTreeMap<RangeId, RangeReadTotals>>,
     range_replication: Mutex<BTreeMap<RangeId, RangeReplicationTotals>>,
@@ -316,6 +317,44 @@ impl DemandMetrics {
     pub fn prune_subscription_traffic(&self, live: &std::collections::BTreeSet<uuid::Uuid>) {
         if let Ok(mut traffic) = self.inner.subscription_traffic.lock() {
             traffic.retain(|subscription_id, _| live.contains(subscription_id));
+        }
+    }
+
+    /// Fold one successfully served Reader session request into the
+    /// Node-local attribution row. A replayed fetch identity counts too:
+    /// the replay still costs a committed-frontier read.
+    pub fn record_reader_op(&self, reader_id: uuid::Uuid, sample: ReaderTrafficSample) {
+        let Ok(mut traffic) = self.inner.reader_traffic.lock() else {
+            return;
+        };
+        let telemetry = traffic.entry(reader_id).or_default();
+        telemetry.requests = telemetry.requests.saturating_add(1);
+        match sample.op {
+            ReaderTrafficOp::Open => telemetry.opens = telemetry.opens.saturating_add(1),
+            ReaderTrafficOp::Fetch => {
+                telemetry.fetches = telemetry.fetches.saturating_add(1);
+                telemetry.fetch_records = telemetry.fetch_records.saturating_add(sample.records);
+            }
+            ReaderTrafficOp::Ack => telemetry.acks = telemetry.acks.saturating_add(1),
+            ReaderTrafficOp::Close => telemetry.closes = telemetry.closes.saturating_add(1),
+        }
+        telemetry.last_op = Some(sample.op.label());
+        telemetry.last_op_at_ns = Some(sample.sampled_at_ns);
+    }
+
+    /// A consistent snapshot of per-Reader attribution rows on this Node.
+    pub fn reader_traffic(&self) -> BTreeMap<uuid::Uuid, ReaderTrafficTelemetry> {
+        self.inner
+            .reader_traffic
+            .lock()
+            .map(|traffic| traffic.clone())
+            .unwrap_or_default()
+    }
+
+    /// Drop attribution rows for Readers that no longer exist.
+    pub fn prune_reader_traffic(&self, live: &std::collections::BTreeSet<uuid::Uuid>) {
+        if let Ok(mut traffic) = self.inner.reader_traffic.lock() {
+            traffic.retain(|reader_id, _| live.contains(reader_id));
         }
     }
 
@@ -612,6 +651,52 @@ pub struct SubscriptionTrafficTelemetry {
     pub released_quarantined_records: u64,
     pub seeks: u64,
     pub members_active: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_op: Option<&'static str>,
+    pub last_op_at_ns: Option<i64>,
+}
+
+/// One served Reader session request — the op plus the evidence that
+/// rides it (delivered records on a fetch).
+pub struct ReaderTrafficSample {
+    pub op: ReaderTrafficOp,
+    pub records: u64,
+    pub sampled_at_ns: i64,
+}
+
+/// The session verbs a named Reader serves.
+#[derive(Clone, Copy, Debug)]
+pub enum ReaderTrafficOp {
+    Open,
+    Fetch,
+    Ack,
+    Close,
+}
+
+impl ReaderTrafficOp {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Fetch => "fetch",
+            Self::Ack => "ack",
+            Self::Close => "close",
+        }
+    }
+}
+
+/// Per-Reader session-traffic attribution on this Node since process
+/// start — the honest scope, because an open session may fetch through
+/// any ingress and each request is attributed where it was served.
+/// `requests` counts every successfully served session request, including
+/// fetch replays that return the original page.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct ReaderTrafficTelemetry {
+    pub requests: u64,
+    pub opens: u64,
+    pub fetches: u64,
+    pub fetch_records: u64,
+    pub acks: u64,
+    pub closes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_op: Option<&'static str>,
     pub last_op_at_ns: Option<i64>,
@@ -1340,6 +1425,42 @@ mod tests {
         metrics.prune_subscription_traffic(&live);
         let telemetry = metrics.subscription_traffic();
         assert!(telemetry.contains_key(&subscription));
+        assert!(!telemetry.contains_key(&dropped));
+    }
+
+    #[test]
+    fn reader_traffic_aggregates_ops_and_prunes_dropped_readers() {
+        let metrics = DemandMetrics::default();
+        let reader = uuid::Uuid::from_u128(7_001);
+        let dropped = uuid::Uuid::from_u128(7_002);
+        let sample = |op, records| crate::demand::ReaderTrafficSample {
+            op,
+            records,
+            sampled_at_ns: 55,
+        };
+        metrics.record_reader_op(reader, sample(ReaderTrafficOp::Open, 0));
+        metrics.record_reader_op(reader, sample(ReaderTrafficOp::Fetch, 12));
+        metrics.record_reader_op(reader, sample(ReaderTrafficOp::Fetch, 8));
+        metrics.record_reader_op(reader, sample(ReaderTrafficOp::Ack, 0));
+        metrics.record_reader_op(reader, sample(ReaderTrafficOp::Close, 0));
+        metrics.record_reader_op(dropped, sample(ReaderTrafficOp::Open, 0));
+
+        let telemetry = metrics.reader_traffic();
+        let row = telemetry.get(&reader).unwrap();
+        assert_eq!(row.requests, 5);
+        assert_eq!(row.opens, 1);
+        assert_eq!(row.fetches, 2);
+        assert_eq!(row.fetch_records, 20);
+        assert_eq!(row.acks, 1);
+        assert_eq!(row.closes, 1);
+        assert_eq!(row.last_op, Some("close"));
+        assert_eq!(row.last_op_at_ns, Some(55));
+
+        // Dropped Readers leave no attribution residue.
+        let live = std::collections::BTreeSet::from([reader]);
+        metrics.prune_reader_traffic(&live);
+        let telemetry = metrics.reader_traffic();
+        assert!(telemetry.contains_key(&reader));
         assert!(!telemetry.contains_key(&dropped));
     }
 
