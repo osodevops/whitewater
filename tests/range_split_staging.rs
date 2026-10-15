@@ -66,6 +66,7 @@ impl SplitCutoverControl for LocalSplitControl {
                     left_writer_sequences: boundary.staging.left.writer_sequences.clone(),
                     right_writer_sequences: boundary.staging.right.writer_sequences.clone(),
                     reader_translations: Vec::new(),
+                    subscription_translations: Vec::new(),
                 }])
                 .await
                 .is_ok()
@@ -83,6 +84,7 @@ impl SplitCutoverControl for LocalSplitControl {
                     left_writer_sequences: boundary.staging.left.writer_sequences.clone(),
                     right_writer_sequences: boundary.staging.right.writer_sequences.clone(),
                     reader_translations: vec![stale],
+                    subscription_translations: Vec::new(),
                 }])
                 .await
                 .is_ok()
@@ -97,6 +99,7 @@ impl SplitCutoverControl for LocalSplitControl {
                 left_writer_sequences: boundary.staging.left.writer_sequences.clone(),
                 right_writer_sequences: boundary.staging.right.writer_sequences.clone(),
                 reader_translations: self.reader_translations.clone(),
+                subscription_translations: Vec::new(),
             }])
             .await
             .map(|_| ())
@@ -504,6 +507,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
                 expected_has_frontier: true,
                 acknowledged: BTreeMap::from([(merge_plan.left_range_id, "cursor-2".to_owned())]),
             }],
+            subscription_translations: Vec::new(),
         }])
         .await
         .unwrap();
@@ -794,6 +798,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
             plan_id: merge_plan.plan_id,
             writer_sequences: merge_staged.writer_sequences.clone(),
             reader_translations: Vec::new(),
+            subscription_translations: Vec::new(),
         }])
         .await
         .unwrap();

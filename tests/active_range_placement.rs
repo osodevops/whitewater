@@ -1137,6 +1137,7 @@ async fn split_plan_is_consensus_persisted_but_cannot_change_authoritative_routi
             left_writer_sequences: Vec::new(),
             right_writer_sequences: Vec::new(),
             reader_translations: Vec::new(),
+            subscription_translations: Vec::new(),
         }])
         .await
         .unwrap();
@@ -1377,6 +1378,7 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
             left_writer_sequences: Vec::new(),
             right_writer_sequences: Vec::new(),
             reader_translations: vec![audit_translation.clone()],
+            subscription_translations: Vec::new(),
         }])
         .await
         .is_err());
@@ -1390,6 +1392,7 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
             left_writer_sequences: Vec::new(),
             right_writer_sequences: Vec::new(),
             reader_translations: vec![stale, metrics_translation.clone()],
+            subscription_translations: Vec::new(),
         }])
         .await
         .is_err());
@@ -1403,6 +1406,7 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
             left_writer_sequences: Vec::new(),
             right_writer_sequences: Vec::new(),
             reader_translations: vec![uncovered, metrics_translation.clone()],
+            subscription_translations: Vec::new(),
         }])
         .await
         .is_err());
@@ -1423,6 +1427,7 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
             left_writer_sequences: Vec::new(),
             right_writer_sequences: Vec::new(),
             reader_translations: vec![audit_translation, metrics_translation],
+            subscription_translations: Vec::new(),
         }])
         .await
         .unwrap();
@@ -1510,6 +1515,7 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
             plan_id: merge_plan.plan_id,
             writer_sequences: Vec::new(),
             reader_translations: vec![audit_merge, metrics_merge],
+            subscription_translations: Vec::new(),
         }])
         .await
         .unwrap();
@@ -1545,6 +1551,178 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
         .unwrap();
     assert_eq!(reopened.results[0].data["session_epoch"], 4);
     assert_eq!(reopened.results[0].data["delivered_cursor"], "ack-token-1");
+}
+
+#[tokio::test]
+async fn activation_commits_pending_subscription_translations_until_applied() {
+    let directory = TempDir::new().unwrap();
+    let control = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    create_feed(&control, Uuid::from_u128(91_001)).await;
+    control
+        .execute("CREATE SUBSCRIPTION orders.billing FROM orders.created START AT BEGINNING;")
+        .await
+        .unwrap();
+    let subscription = control
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let feed_id = subscription.source.feed_id().unwrap();
+
+    let prepared = control
+        .execute_commands(vec![Command::PrepareActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            split_at: KeyToken::from_bytes([0x80; 16]),
+        }])
+        .await
+        .unwrap();
+    let plan: RangeSplitPlan = serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+    let left_range = plan.left_assignment.as_ref().unwrap().range_id;
+    let right_range = plan.right_assignment.range_id;
+    control
+        .execute_commands(vec![Command::RecordActiveRangeSplitCatchUp {
+            feed: "orders.created".to_owned(),
+            plan_id: plan.plan_id,
+            source_commit: CommitPosition::new(4),
+            source_scanned_through: CommitPosition::new(4),
+            right_commit: CommitPosition::new(4),
+            checksum_verified: true,
+        }])
+        .await
+        .unwrap();
+
+    let staged = || whitewater::control::SubscriptionCutoverTranslation {
+        subscription_id: subscription.subscription_id,
+        feed_id,
+        plan_id: plan.plan_id,
+        expected_cursor: "frontier-7".to_owned(),
+        frontier_sequence: 3,
+        request_id: Uuid::from_u128(91_002),
+        cursor: format!("cutover:{}", plan.plan_id),
+        positions: BTreeMap::from([
+            (left_range, "left-1".to_owned()),
+            (right_range, "right-2".to_owned()),
+        ]),
+        quarantined: BTreeMap::from([(right_range, vec!["poison-1".to_owned()])]),
+        tick: 11,
+    };
+
+    // A translation missing a candidate range is refused before activation.
+    let mut uncovered = staged();
+    uncovered.positions.remove(&right_range);
+    assert!(control
+        .execute_commands(vec![Command::ActivateActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            plan_id: plan.plan_id,
+            left_writer_sequences: Vec::new(),
+            right_writer_sequences: Vec::new(),
+            reader_translations: Vec::new(),
+            subscription_translations: vec![uncovered],
+        }])
+        .await
+        .is_err());
+    // Evidence bound to a different plan id cannot ride this activation.
+    let mut stale_plan = staged();
+    stale_plan.plan_id = Uuid::from_u128(91_003);
+    assert!(control
+        .execute_commands(vec![Command::ActivateActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            plan_id: plan.plan_id,
+            left_writer_sequences: Vec::new(),
+            right_writer_sequences: Vec::new(),
+            reader_translations: Vec::new(),
+            subscription_translations: vec![stale_plan],
+        }])
+        .await
+        .is_err());
+    // Quarantine evidence on a range the candidate map does not route is
+    // refused rather than silently dropped.
+    let mut stray_quarantine = staged();
+    stray_quarantine.quarantined.insert(
+        whitewater::active_range::RangeId::from_uuid(Uuid::from_u128(91_004)),
+        vec!["x".to_owned()],
+    );
+    assert!(control
+        .execute_commands(vec![Command::ActivateActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            plan_id: plan.plan_id,
+            left_writer_sequences: Vec::new(),
+            right_writer_sequences: Vec::new(),
+            reader_translations: Vec::new(),
+            subscription_translations: vec![stray_quarantine],
+        }])
+        .await
+        .is_err());
+    assert!(control
+        .pending_subscription_cutover(subscription.subscription_id)
+        .await
+        .is_none());
+
+    let translation = staged();
+    control
+        .execute_commands(vec![Command::ActivateActiveRangeSplit {
+            feed: "orders.created".to_owned(),
+            plan_id: plan.plan_id,
+            left_writer_sequences: Vec::new(),
+            right_writer_sequences: Vec::new(),
+            reader_translations: Vec::new(),
+            subscription_translations: vec![translation.clone()],
+        }])
+        .await
+        .unwrap();
+    assert_eq!(
+        control
+            .pending_subscription_cutover(subscription.subscription_id)
+            .await,
+        Some(translation.clone())
+    );
+    assert_eq!(
+        control
+            .pending_subscription_cutovers_for_feed(feed_id)
+            .await
+            .len(),
+        1
+    );
+
+    // The pending record is durable replicated state: a reopened catalog
+    // still holds the evidence for a lazy retry.
+    drop(control);
+    let reopened = controller(
+        &directory,
+        storage_nodes(&["storage-1", "storage-2", "storage-3"]),
+    );
+    assert_eq!(
+        reopened
+            .pending_subscription_cutover(subscription.subscription_id)
+            .await,
+        Some(translation.clone())
+    );
+
+    // A clear naming a different plan cannot delete this transition's record.
+    reopened
+        .execute_commands(vec![Command::ClearSubscriptionCutover {
+            subscription_id: subscription.subscription_id,
+            plan_id: Uuid::from_u128(91_005),
+        }])
+        .await
+        .unwrap();
+    assert!(reopened
+        .pending_subscription_cutover(subscription.subscription_id)
+        .await
+        .is_some());
+    reopened
+        .execute_commands(vec![Command::ClearSubscriptionCutover {
+            subscription_id: subscription.subscription_id,
+            plan_id: plan.plan_id,
+        }])
+        .await
+        .unwrap();
+    assert!(reopened
+        .pending_subscription_cutover(subscription.subscription_id)
+        .await
+        .is_none());
 }
 
 #[tokio::test]

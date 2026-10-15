@@ -1,7 +1,12 @@
 import base64, json, os, sys, time, urllib.error, urllib.parse, urllib.request, uuid
 
 BASE_PORT = int(os.environ.get("WHITEWATER_TEST_BASE_PORT", "7071"))
-ENDPOINTS = [f"http://localhost:{BASE_PORT + offset}" for offset in range(3)]
+# WHITEWATER_TEST_ENDPOINTS overrides the default localhost base-port
+# derivation so the script can run inside a Compose network; it is separate
+# from the SDK's WHITEWATER_ENDPOINTS so a developer environment can never
+# redirect this fault test at a real Riverbed.
+_endpoints_env = os.environ.get("WHITEWATER_TEST_ENDPOINTS")
+ENDPOINTS = [entry if "://" in entry else f"http://{entry}" for entry in _endpoints_env.split(",")] if _endpoints_env else [f"http://localhost:{BASE_PORT + offset}" for offset in range(3)]
 KEY = "whitewater-local-development-admin-key"
 MEMBERS = "/v1/subscriptions/members"
 TRANSIENT = {"no_quorum", "unavailable", "ambiguous_commit", "invalid_assignment"}
@@ -111,6 +116,11 @@ def main():
         member_drain()
         status, split = post(ENDPOINTS[1], "/v1/admin/ranges/split", {"request_id": str(uuid.uuid4()), "feed": feed, "split_at": boundary, "batch_size": 4})
         if status != 200 or split.get("status") != "activated": raise AssertionError(f"cycle {cycle} split: {split}")
+        # The translated frontier rode inside the activation command as
+        # durable pending evidence; the post-activation apply must have
+        # committed it to the progress shard.
+        statuses = [entry.get("status") for entry in split.get("subscription_frontiers", []) if entry.get("subscription") == subscription]
+        if split.get("subscription_reconcile_failed") or statuses != ["reconciled"]: raise AssertionError(f"cycle {cycle} split did not apply the pending Subscription translation: {split}")
         if len(placement_routes()) != 2: raise AssertionError(f"cycle {cycle} did not leave two Active Ranges")
         # The pre-transition Reader epoch is fenced — a stale ack must refuse.
         stale = {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": reader_epoch, "cursor": "AAAA"}
@@ -125,13 +135,18 @@ def main():
         routes = placement_routes()
         status, merged = post(ENDPOINTS[2], "/v1/admin/ranges/merge", {"request_id": str(uuid.uuid4()), "feed": feed, "left_range_id": routes[0]["range_id"], "right_range_id": routes[1]["range_id"]})
         if status != 200 or merged.get("status") != "activated": raise AssertionError(f"cycle {cycle} merge: {merged}")
+        statuses = [entry.get("status") for entry in merged.get("subscription_frontiers", []) if entry.get("subscription") == subscription]
+        if merged.get("subscription_reconcile_failed") or statuses != ["reconciled"]: raise AssertionError(f"cycle {cycle} merge did not apply the pending Subscription translation: {merged}")
         if len(placement_routes()) != 1: raise AssertionError(f"cycle {cycle} did not restore one Active Range")
         reader_drain()
         member_drain()
 
     encoded = urllib.parse.quote(feed, safe="")
-    with urllib.request.urlopen(urllib.request.Request(f"{ENDPOINTS[0]}/v1/feeds/records?feed={encoded}&limit=200", headers={"authorization": f"Bearer {KEY}"}), timeout=30) as response:
-        records = json.loads(response.read())
+    @_retried
+    def read_history():
+        with urllib.request.urlopen(urllib.request.Request(f"{ENDPOINTS[0]}/v1/feeds/records?feed={encoded}&limit=200", headers={"authorization": f"Bearer {KEY}"}), timeout=30) as response:
+            return json.loads(response.read())
+    records = read_history()
     if [record["cursor"] for record in records] != cursors: raise AssertionError("repeated split/merge cycles lost or reordered immutable Feed history")
     if member_delivered != cursors: raise AssertionError("the Subscription frontier did not drain every record exactly once across three transitions")
     print(json.dumps({

@@ -593,6 +593,40 @@ pub struct ReaderFrontierTranslation {
     pub acknowledged: BTreeMap<RangeId, String>,
 }
 
+/// A Subscription progress frontier already translated onto a cutover's
+/// candidate range map, committed inside the same activation command that
+/// changes routing. Subscription progress lives on a separate RF3 quorum, so
+/// the catalog cannot apply it directly; instead the command persists the
+/// translation as durable pending evidence (`pending_subscription_cutovers`)
+/// that the post-activation reconcile — or any later member operation —
+/// applies deterministically through the frontier's Cursor compare-and-set.
+/// A member acknowledgement that advanced the frontier after staging fails
+/// the CAS rather than being silently overwritten, keeping the Subscription
+/// fail-closed until an operator reconciles it with SEEK SUBSCRIPTION.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct SubscriptionCutoverTranslation {
+    pub subscription_id: Uuid,
+    pub feed_id: Uuid,
+    pub plan_id: Uuid,
+    /// The committed frontier Cursor staged when the translation was
+    /// computed; the pending apply refuses when the frontier has since moved.
+    pub expected_cursor: String,
+    /// The staged frontier's sequence — the applied mutation commits at
+    /// `frontier_sequence + 1`, keeping progress-shard sequence fencing.
+    pub frontier_sequence: u64,
+    /// Deterministic mutation identity derived from the plan and target
+    /// sequence, so a replayed apply deduplicates instead of forking a
+    /// second transition.
+    pub request_id: Uuid,
+    /// The Cursor the applied frontier carries — `cutover:{plan_id}`.
+    pub cursor: String,
+    pub positions: BTreeMap<RangeId, String>,
+    #[serde(default)]
+    pub quarantined: BTreeMap<RangeId, Vec<String>>,
+    pub tick: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RoleDefinition {
     pub role_id: Uuid,
@@ -801,6 +835,12 @@ struct CatalogState {
     subscriptions: BTreeMap<Uuid, SubscriptionDefinition>,
     #[serde(default)]
     subscription_progress_assignments: BTreeMap<Uuid, SubscriptionProgressAssignment>,
+    /// Translated Subscription frontiers committed by Active Range
+    /// activations but not yet applied to the separate RF3 progress quorum —
+    /// durable replayable evidence so an interrupted reconcile heals on the
+    /// next member operation instead of stranding the Subscription.
+    #[serde(default)]
+    pending_subscription_cutovers: BTreeMap<Uuid, SubscriptionCutoverTranslation>,
     #[serde(default)]
     pipe_compute_leases: BTreeMap<Uuid, PipeComputeLease>,
     #[serde(default)]
@@ -868,6 +908,7 @@ impl Default for CatalogState {
             readers: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
             subscription_progress_assignments: BTreeMap::new(),
+            pending_subscription_cutovers: BTreeMap::new(),
             pipe_compute_leases: BTreeMap::new(),
             subscription_feed_memberships: BTreeMap::new(),
             state_store_assignments: BTreeMap::new(),
@@ -1212,6 +1253,11 @@ pub enum Command {
         right_writer_sequences: Vec<StagedWriterSequence>,
         #[serde(default)]
         reader_translations: Vec<ReaderFrontierTranslation>,
+        /// Translated Subscription frontiers committed as pending cutover
+        /// evidence with this activation; empty for logs written before
+        /// Subscription translations rode the command.
+        #[serde(default)]
+        subscription_translations: Vec<SubscriptionCutoverTranslation>,
     },
     PrepareActiveRangeMerge {
         feed: String,
@@ -1232,6 +1278,19 @@ pub enum Command {
         writer_sequences: Vec<StagedWriterSequence>,
         #[serde(default)]
         reader_translations: Vec<ReaderFrontierTranslation>,
+        /// Translated Subscription frontiers committed as pending cutover
+        /// evidence with this activation; empty for logs written before
+        /// Subscription translations rode the command.
+        #[serde(default)]
+        subscription_translations: Vec<SubscriptionCutoverTranslation>,
+    },
+    /// Removes one pending Subscription frontier translation after the
+    /// separate progress quorum committed (or already covered) it. The
+    /// `plan_id` guard prevents a stale clear from deleting a newer
+    /// transition's evidence.
+    ClearSubscriptionCutover {
+        subscription_id: Uuid,
+        plan_id: Uuid,
     },
     PrepareFollowerMove {
         feed: String,
@@ -1338,6 +1397,7 @@ impl Command {
                 | Self::ActivateActiveRangeSplit { .. }
                 | Self::RecordActiveRangeMergeStaging { .. }
                 | Self::ActivateActiveRangeMerge { .. }
+                | Self::ClearSubscriptionCutover { .. }
                 | Self::RecordFollowerMoveCatchUp { .. }
                 | Self::ActivateFollowerMove { .. }
                 | Self::PrepareOwnerMove { .. }
@@ -2029,6 +2089,35 @@ impl ControlController {
             assignment.ownership_epoch,
         )
         .ok()
+    }
+
+    /// One Subscription's committed-but-unapplied cutover translation, if an
+    /// Active Range activation left it pending for the progress quorum.
+    pub async fn pending_subscription_cutover(
+        &self,
+        subscription_id: Uuid,
+    ) -> Option<SubscriptionCutoverTranslation> {
+        self.state
+            .lock()
+            .await
+            .pending_subscription_cutovers
+            .get(&subscription_id)
+            .cloned()
+    }
+
+    /// Every pending Subscription cutover translation for one Feed.
+    pub async fn pending_subscription_cutovers_for_feed(
+        &self,
+        feed_id: Uuid,
+    ) -> Vec<SubscriptionCutoverTranslation> {
+        self.state
+            .lock()
+            .await
+            .pending_subscription_cutovers
+            .values()
+            .filter(|pending| pending.feed_id == feed_id)
+            .cloned()
+            .collect()
     }
 
     /// The RF3 mutation-journal placement of a still-active StateStore.
@@ -4229,6 +4318,7 @@ impl ControlController {
                 left_writer_sequences,
                 right_writer_sequences,
                 reader_translations,
+                subscription_translations,
             } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
                 let plan = state
@@ -4253,6 +4343,13 @@ impl ControlController {
                     feed_id,
                     &plan.candidate_map,
                     &reader_translations,
+                )?;
+                validate_subscription_translations(
+                    state,
+                    feed_id,
+                    &plan.candidate_map,
+                    plan.plan_id,
+                    &subscription_translations,
                 )?;
                 for (range_id, progress) in [
                     (left_assignment.range_id, left_writer_sequences),
@@ -4287,6 +4384,11 @@ impl ControlController {
                 );
                 state.active_ranges.insert(feed_id, left_assignment);
                 install_reader_translations(state, reader_translations);
+                for translation in subscription_translations {
+                    state
+                        .pending_subscription_cutovers
+                        .insert(translation.subscription_id, translation);
+                }
                 state.range_split_plans.remove(&feed_id);
                 Ok((
                     format!("activated Active Range split for Feed {feed}"),
@@ -4397,6 +4499,7 @@ impl ControlController {
                 plan_id,
                 writer_sequences,
                 reader_translations,
+                subscription_translations,
             } => {
                 let feed_id = active_feed(state, &feed)?.feed_id;
                 let plan = state
@@ -4416,6 +4519,13 @@ impl ControlController {
                     feed_id,
                     &plan.candidate_map,
                     &reader_translations,
+                )?;
+                validate_subscription_translations(
+                    state,
+                    feed_id,
+                    &plan.candidate_map,
+                    plan.plan_id,
+                    &subscription_translations,
                 )?;
                 for progress in writer_sequences {
                     if let Some(writer) = state.writers.get_mut(&progress.writer_session_id) {
@@ -4442,6 +4552,11 @@ impl ControlController {
                     .active_ranges
                     .insert(feed_id, plan.merged_assignment.clone());
                 install_reader_translations(state, reader_translations);
+                for translation in subscription_translations {
+                    state
+                        .pending_subscription_cutovers
+                        .insert(translation.subscription_id, translation);
+                }
                 state.range_merge_plans.remove(&feed_id);
                 Ok((
                     format!("activated Active Range merge for Feed {feed}"),
@@ -4450,6 +4565,25 @@ impl ControlController {
                         "merged_assignment": plan.merged_assignment,
                         "retired_range_id": plan.right_range_id
                     }),
+                ))
+            }
+            Command::ClearSubscriptionCutover {
+                subscription_id,
+                plan_id,
+            } => {
+                let cleared = match state
+                    .pending_subscription_cutovers
+                    .get(&subscription_id)
+                {
+                    Some(pending) if pending.plan_id == plan_id => state
+                        .pending_subscription_cutovers
+                        .remove(&subscription_id)
+                        .is_some(),
+                    _ => false,
+                };
+                Ok((
+                    format!("cleared pending Subscription cutover {subscription_id}"),
+                    json!({ "cleared": cleared }),
                 ))
             }
             Command::PrepareOwnerMove {
@@ -5049,6 +5183,7 @@ impl ControlController {
                 state
                     .subscription_progress_assignments
                     .remove(&subscription_id);
+                state.pending_subscription_cutovers.remove(&subscription_id);
                 state.subscription_feed_memberships.remove(&subscription_id);
                 Ok(result)
             }
@@ -6441,6 +6576,80 @@ fn ensure_name_available<'a>(
     }
 }
 
+/// Validates the Subscription frontier translations committed with an Active
+/// Range activation. The catalog cannot compare `expected_cursor` against the
+/// committed frontier — progress lives on a separate quorum — so validation
+/// proves only catalog-visible consistency: the Subscription is an active
+/// Feed-scoped member of this Feed, the translation names this plan, and the
+/// translated positions cover exactly the candidate range map under the same
+/// bounds the progress shard enforces.
+fn validate_subscription_translations(
+    state: &CatalogState,
+    feed_id: Uuid,
+    candidate: &RangeMap,
+    plan_id: Uuid,
+    translations: &[SubscriptionCutoverTranslation],
+) -> Result<(), ControlError> {
+    let candidate_ranges: BTreeSet<RangeId> = candidate
+        .routes()
+        .iter()
+        .map(|route| route.range_id)
+        .collect();
+    if translations.len() > 1024 || serde_json::to_vec(translations)?.len() > 512 * 1024 {
+        return Err(ControlError::InvalidOperation(
+            "Subscription frontier cutover exceeds its bounded budget".to_owned(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    for translation in translations {
+        let subscription = state
+            .subscriptions
+            .get(&translation.subscription_id)
+            .filter(|item| item.status == ResourceStatus::Active)
+            .ok_or_else(|| {
+                ControlError::InvalidOperation(
+                    "Subscription cutover references an unknown Subscription".to_owned(),
+                )
+            })?;
+        let positions: BTreeSet<RangeId> = translation.positions.keys().copied().collect();
+        let quarantined_positions = translation
+            .quarantined
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
+        if !seen.insert(translation.subscription_id)
+            || subscription.source.feed_id() != Some(feed_id)
+            || translation.feed_id != feed_id
+            || translation.plan_id != plan_id
+            || translation.expected_cursor.is_empty()
+            || translation.expected_cursor.len() > 256
+            || translation.cursor.len() > 256
+            || translation.frontier_sequence.checked_add(1).is_none()
+            || positions != candidate_ranges
+            || translation
+                .positions
+                .values()
+                .any(|cursor| cursor.len() > 256)
+            || !translation
+                .quarantined
+                .keys()
+                .all(|range| candidate_ranges.contains(range))
+            || quarantined_positions > crate::reader::SUBSCRIPTION_QUARANTINE_MAX_POSITIONS
+            || translation
+                .quarantined
+                .values()
+                .flatten()
+                .any(|cursor| cursor.is_empty() || cursor.len() > 256)
+        {
+            return Err(ControlError::InvalidOperation(
+                "Subscription frontier translation is inconsistent with the candidate range map"
+                    .to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_reader_translations(
     state: &CatalogState,
     feed_id: Uuid,
@@ -7344,6 +7553,7 @@ fn command_label(command: &Command) -> String {
         Command::PrepareActiveRangeMerge { .. } => "PREPARE ACTIVE RANGE MERGE",
         Command::RecordActiveRangeMergeStaging { .. } => "RECORD ACTIVE RANGE MERGE STAGING",
         Command::ActivateActiveRangeMerge { .. } => "ACTIVATE ACTIVE RANGE MERGE",
+        Command::ClearSubscriptionCutover { .. } => "CLEAR SUBSCRIPTION CUTOVER",
         Command::PrepareFollowerMove { .. } => "PREPARE FOLLOWER MOVE",
         Command::RecordFollowerMoveCatchUp { .. } => "RECORD FOLLOWER MOVE CATCH UP",
         Command::ActivateFollowerMove { .. } => "ACTIVATE FOLLOWER MOVE",
@@ -11075,5 +11285,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(explained.results[0].data["allowed"], true);
+    }
+
+    #[test]
+    fn activate_commands_deserialize_without_subscription_translations() {
+        // Log entries written before translations rode the activation must
+        // still replay: the field defaults to an empty pending set.
+        let split: Command = serde_json::from_value(json!({
+            "command": "activate_active_range_split",
+            "feed": "orders.created",
+            "plan_id": Uuid::nil(),
+            "left_writer_sequences": [],
+            "right_writer_sequences": [],
+            "reader_translations": []
+        }))
+        .unwrap();
+        assert!(matches!(
+            split,
+            Command::ActivateActiveRangeSplit {
+                subscription_translations,
+                ..
+            } if subscription_translations.is_empty()
+        ));
+        let merge: Command = serde_json::from_value(json!({
+            "command": "activate_active_range_merge",
+            "feed": "orders.created",
+            "plan_id": Uuid::nil(),
+            "writer_sequences": [],
+            "reader_translations": []
+        }))
+        .unwrap();
+        assert!(matches!(
+            merge,
+            Command::ActivateActiveRangeMerge {
+                subscription_translations,
+                ..
+            } if subscription_translations.is_empty()
+        ));
+        // The pending-clear command is internal cutover machinery: it must be
+        // unreachable from the public command batch endpoint.
+        let clear = Command::ClearSubscriptionCutover {
+            subscription_id: Uuid::nil(),
+            plan_id: Uuid::nil(),
+        };
+        assert!(clear.requires_internal_replica_authority());
+        assert_eq!(command_label(&clear), "CLEAR SUBSCRIPTION CUTOVER");
     }
 }

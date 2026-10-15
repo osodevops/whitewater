@@ -223,6 +223,7 @@ impl SplitCutoverControl for ControlPlaneSplitCutover {
                 left_writer_sequences: boundary.staging.left.writer_sequences.clone(),
                 right_writer_sequences: boundary.staging.right.writer_sequences.clone(),
                 reader_translations: Vec::new(),
+                subscription_translations: Vec::new(),
             }])
             .await
             .map(|_| ())
