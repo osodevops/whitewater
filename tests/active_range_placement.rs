@@ -1290,6 +1290,7 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(90_002)),
             fetch_limit: None,
+            fetch_retry_after_ms: None,
         }])
         .await
         .unwrap();
@@ -1312,6 +1313,7 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(90_003)),
             fetch_limit: None,
+            fetch_retry_after_ms: None,
         }])
         .await
         .unwrap();
@@ -1447,6 +1449,7 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(90_004)),
             fetch_limit: None,
+            fetch_retry_after_ms: None,
         }])
         .await
         .is_err());
@@ -1529,6 +1532,7 @@ async fn split_and_merge_install_reader_translations_and_fence_stale_sessions() 
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(90_005)),
             fetch_limit: None,
+            fetch_retry_after_ms: None,
         }])
         .await
         .is_err());

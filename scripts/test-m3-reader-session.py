@@ -54,6 +54,10 @@ def main():
     epoch = opened["session_epoch"]
     status, first = post(ENDPOINTS[2], "/v1/readers/fetch", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": epoch})
     if status != 200 or len(first["records"]) != 2: raise AssertionError(first)
+    # Per-Reader pacing advice is honest on the wire: a session opens trusted
+    # at its declared capacity, so the first page reports the full grant with
+    # no backoff.
+    if first["recommended_capacity"] != 2 or first["retry_after_ms"] != 0: raise AssertionError(first)
     delivered = first["delivered_cursor"]
     status, acknowledged = post(ENDPOINTS[0], "/v1/readers/ack", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": epoch, "cursor": delivered})
     if status != 200 or acknowledged["acknowledged_cursor"] != delivered: raise AssertionError(acknowledged)
@@ -73,7 +77,18 @@ def main():
     if status != 200 or len(tail["records"]) != 2: raise AssertionError(tail)
     status, timestamped = post(ENDPOINTS[0], "/v1/readers/temporary/fetch", {"feed": feed, "after_event_time_ns": "3", "limit": 10})
     if status != 200 or len(timestamped["records"]) != 2: raise AssertionError(timestamped)
-    print(json.dumps({"status": "ok", "reader": reader, "first_delivery": 2, "resumed_delivery": 1, "temporary_new_only_delivery": 1, "tail_records": 2, "acknowledged_cursor": delivered}, indent=2))
+    # Reopening with a different declared capacity re-baselines the pacing
+    # plan instead of trapping the Reader at its first grant: the earlier
+    # sessions declared 2, so a capacity-3 session must fetch a full 3-record
+    # page and report the larger advice.
+    records = [{"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": writer_epoch, "event_time_ns": str(index), "key_base64": "aw==", "payload_base64": "dg==", "metadata_base64": {}} for index in range(10, 14)]
+    status, batch = post(ENDPOINTS[1], "/v1/writers/append-batch", {"records": records})
+    if status != 200 or len(batch["results"]) != 4: raise AssertionError(batch)
+    status, widened = post(ENDPOINTS[2], "/v1/readers/open", {"request_id": str(uuid.uuid4()), "reader": reader, "capacity": 3})
+    if widened["session_epoch"] != epoch + 2: raise AssertionError(widened)
+    status, third = post(ENDPOINTS[2], "/v1/readers/fetch", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": widened["session_epoch"]})
+    if status != 200 or len(third["records"]) != 3 or third["recommended_capacity"] != 3: raise AssertionError(third)
+    print(json.dumps({"status": "ok", "reader": reader, "first_delivery": 2, "resumed_delivery": 1, "rebaselined_delivery": len(third["records"]), "temporary_new_only_delivery": 1, "tail_records": 2, "acknowledged_cursor": delivered}, indent=2))
 
 if __name__ == "__main__":
     try: main()

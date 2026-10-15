@@ -234,6 +234,11 @@ def main():
         })
         if status != 200 or replayed["records"] != first_page["records"] or replayed["delivered_cursor"] != first_page["delivered_cursor"]:
             raise AssertionError(f"replayed fetch returned a different page: {replayed}")
+        # The replay also reports the advice the original page was paced
+        # under; an ingress that never saw the fetch falls back to the
+        # persisted page bound, so the values agree either way.
+        if replayed["recommended_capacity"] != first_page["recommended_capacity"]:
+            raise AssertionError(f"replayed fetch reported different pacing advice: {replayed}")
         status, continued = post(ingress, "/v1/readers/fetch", {
             "request_id": str(uuid.uuid4()), "reader": second_name,
             "session_epoch": second_open["session_epoch"], "limit": 5,

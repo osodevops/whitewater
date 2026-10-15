@@ -6673,9 +6673,9 @@ async fn replay_reader_fetch(
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     state.demand.record_read(records.len());
     // A replay serves the identical page, so it reports the advice that
-    // page was paced under; an ingress that never saw the original
-    // fetch falls back to the persisted page bound.
-    let replayed_plan = state.reader_pacing.last_plan(reader.reader_id);
+    // page was paced under: both values come from the persisted frontier
+    // rather than a Node-local plan that may describe a sibling fetch on
+    // this ingress.
     Ok(Json(ReaderFetchResponse {
         records,
         delivered_cursor: Some(reader_frontier_cursor(
@@ -6684,12 +6684,8 @@ async fn replay_reader_fetch(
             request.request_id,
         )),
         acknowledged_cursor: fresh.acknowledged_cursor,
-        recommended_capacity: replayed_plan
-            .map(|plan| plan.max_records)
-            .unwrap_or(frontier.last_fetch_limit),
-        retry_after_ms: replayed_plan
-            .map(|plan| plan.retry_after.as_millis().min(u64::MAX as u128) as u64)
-            .unwrap_or(0),
+        recommended_capacity: frontier.last_fetch_limit,
+        retry_after_ms: frontier.last_fetch_retry_after_ms,
     }))
 }
 
@@ -6855,6 +6851,9 @@ async fn reader_fetch(
                 fence_delivery: true,
                 fetch_request_id: Some(request.request_id),
                 fetch_limit: Some(limit),
+                fetch_retry_after_ms: Some(
+                    pacing.retry_after.as_millis().min(u64::MAX as u128) as u64
+                ),
             }
         } else {
             crate::control::Command::RecordReaderDelivery {
@@ -12907,6 +12906,7 @@ mod tests {
             fence_delivery: true,
             fetch_request_id: Some(request_id),
             fetch_limit: None,
+            fetch_retry_after_ms: None,
         };
         let applied = control
             .execute_commands_with_request_id(vec![delivery(first.clone())], request_id)
@@ -17727,6 +17727,7 @@ mod tests {
                         fence_delivery: true,
                         fetch_request_id: Some(Uuid::new_v4()),
                         fetch_limit: None,
+                        fetch_retry_after_ms: None,
                     }],
                 })
                 .unwrap(),

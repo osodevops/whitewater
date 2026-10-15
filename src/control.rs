@@ -566,6 +566,10 @@ pub(crate) struct ReaderFrontier {
     /// provable under the identical bound.
     #[serde(default)]
     pub last_fetch_limit: usize,
+    /// The backoff advice the last delivered page was paced under; replay
+    /// reports the identical value on any ingress Node.
+    #[serde(default)]
+    pub last_fetch_retry_after_ms: u64,
     #[serde(default)]
     pub last_fetch_request_id: Option<Uuid>,
 }
@@ -1090,6 +1094,10 @@ pub enum Command {
         /// a duplicate request can replay provably identical records.
         #[serde(default)]
         fetch_limit: Option<usize>,
+        /// The retry backoff the page was paced under — persisted so a
+        /// replay reports the identical advice on any ingress Node.
+        #[serde(default)]
+        fetch_retry_after_ms: Option<u64>,
     },
     AcknowledgeReader {
         reader: String,
@@ -3359,6 +3367,7 @@ impl ControlController {
                 fence_delivery,
                 fetch_request_id,
                 fetch_limit,
+                fetch_retry_after_ms,
             } => {
                 let (reader_id, feed_id) = {
                     let definition = active_reader_mut(state, &reader)?;
@@ -3395,6 +3404,7 @@ impl ControlController {
                     positions.clone(),
                 );
                 frontier.last_fetch_limit = fetch_limit.unwrap_or(0);
+                frontier.last_fetch_retry_after_ms = fetch_retry_after_ms.unwrap_or(0);
                 frontier.last_fetch_request_id = fetch_request_id;
                 let definition = active_reader_mut(state, &reader)?;
                 definition.delivered_cursor = Some(cursor);
@@ -6522,6 +6532,7 @@ fn install_reader_translations(
                         delivered: translation.acknowledged,
                         previous: BTreeMap::new(),
                         last_fetch_limit: 0,
+                        last_fetch_retry_after_ms: 0,
                         last_fetch_request_id: None,
                     },
                 );
@@ -7665,6 +7676,7 @@ mod tests {
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(8_001)),
             fetch_limit: None,
+            fetch_retry_after_ms: None,
         };
         let request_id = Uuid::from_u128(7_001);
         assert!(delivery.requires_internal_replica_authority());
@@ -7727,6 +7739,7 @@ mod tests {
                 fence_delivery: true,
                 fetch_request_id: Some(Uuid::from_u128(8_002)),
                 fetch_limit: None,
+                fetch_retry_after_ms: None,
             }])
             .await
             .is_err());
@@ -7743,6 +7756,7 @@ mod tests {
                 fence_delivery: true,
                 fetch_request_id: Some(Uuid::from_u128(8_003)),
                 fetch_limit: None,
+                fetch_retry_after_ms: None,
             }])
             .await
             .is_err());
@@ -7778,22 +7792,25 @@ mod tests {
             .await
             .unwrap();
         let deliver =
-            |event: &str, fetch_id: u128, limit: Option<usize>| Command::RecordReaderFrontier {
-                reader: "audit".to_owned(),
-                session_epoch: 1,
-                cursor: format!("rf_{fetch_id}"),
-                positions: BTreeMap::from([(range_id, event.to_owned())]),
-                expected_cursor: None,
-                fence_delivery: false,
-                fetch_request_id: Some(Uuid::from_u128(fetch_id)),
-                fetch_limit: limit,
+            |event: &str, fetch_id: u128, limit: Option<usize>, retry_after_ms: Option<u64>| {
+                Command::RecordReaderFrontier {
+                    reader: "audit".to_owned(),
+                    session_epoch: 1,
+                    cursor: format!("rf_{fetch_id}"),
+                    positions: BTreeMap::from([(range_id, event.to_owned())]),
+                    expected_cursor: None,
+                    fence_delivery: false,
+                    fetch_request_id: Some(Uuid::from_u128(fetch_id)),
+                    fetch_limit: limit,
+                    fetch_retry_after_ms: retry_after_ms,
+                }
             };
         controller
-            .execute_commands(vec![deliver("event-1", 7, Some(64))])
+            .execute_commands(vec![deliver("event-1", 7, Some(64), Some(0))])
             .await
             .unwrap();
         controller
-            .execute_commands(vec![deliver("event-2", 8, Some(64))])
+            .execute_commands(vec![deliver("event-2", 8, Some(32), Some(50))])
             .await
             .unwrap();
         let frontier = controller
@@ -7801,10 +7818,12 @@ mod tests {
             .await
             .unwrap();
         // The replay evidence is exactly what re-reading must reproduce:
-        // the pre-delivery positions and the bound the fetch used.
+        // the pre-delivery positions, the bound the fetch used, and the
+        // advice the page was paced under.
         assert_eq!(frontier.delivered[&range_id], "event-2");
         assert_eq!(frontier.previous[&range_id], "event-1");
-        assert_eq!(frontier.last_fetch_limit, 64);
+        assert_eq!(frontier.last_fetch_limit, 32);
+        assert_eq!(frontier.last_fetch_retry_after_ms, 50);
         assert_eq!(frontier.last_fetch_request_id, Some(Uuid::from_u128(8)));
 
         drop(controller);
@@ -7814,7 +7833,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(frontier.previous[&range_id], "event-1");
-        assert_eq!(frontier.last_fetch_limit, 64);
+        assert_eq!(frontier.last_fetch_limit, 32);
+        assert_eq!(frontier.last_fetch_retry_after_ms, 50);
     }
 
     #[tokio::test]
@@ -7852,6 +7872,7 @@ mod tests {
                 fence_delivery: true,
                 fetch_request_id: Some(Uuid::from_u128(fetch_id)),
                 fetch_limit: None,
+                fetch_retry_after_ms: None,
             };
         controller
             .execute_commands(vec![deliver("audit", "rf1_a", "event-a", 1, None)])

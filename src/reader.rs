@@ -256,7 +256,6 @@ struct ReaderPacingEntry {
     unacknowledged_bytes: usize,
     average_record_bytes: usize,
     backlog_hint: bool,
-    last_plan: ReaderPacingPlan,
 }
 
 /// Node-local advisory pacing state per ReaderId. Delivery correctness
@@ -322,7 +321,6 @@ impl ReaderPacingTable {
                     unacknowledged_bytes: 0,
                     average_record_bytes: 1,
                     backlog_hint: false,
-                    last_plan: fallback,
                 },
             );
         }
@@ -344,7 +342,7 @@ impl ReaderPacingTable {
             )
             .with_initial_grant(capacity);
         }
-        let plan = entry.controller.observe(
+        entry.controller.observe(
             ReaderPressureSample {
                 // A page that filled its bound is the honest signal that
                 // more history waits behind it; the merge does not price
@@ -360,18 +358,7 @@ impl ReaderPacingTable {
                 replica_ready: true,
             },
             client_capacity,
-        );
-        entry.last_plan = plan;
-        plan
-    }
-
-    /// The plan issued for the in-flight page, so a replayed fetch
-    /// reports the same advice instead of a fresh observation.
-    pub fn last_plan(&self, reader_id: Uuid) -> Option<ReaderPacingPlan> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|map| map.get(&reader_id).map(|entry| entry.last_plan))
+        )
     }
 
     /// Record a served page: byte volume feeds the unacknowledged-byte
@@ -3643,7 +3630,7 @@ mod tests {
         assert_eq!(oversized.max_records, 0);
     }
     #[test]
-    fn pacing_table_isolates_readers_and_replays_advice() {
+    fn pacing_table_isolates_readers_and_resets_on_close() {
         let table = ReaderPacingTable::default();
         let slow = Uuid::from_u128(1);
         let healthy = Uuid::from_u128(2);
@@ -3660,15 +3647,14 @@ mod tests {
         let unaffected = table.plan(healthy, 64, 64, 0.0, 1024);
         assert_eq!(unaffected.max_records, 64);
         assert_eq!(unaffected.retry_after, Duration::ZERO);
-        // A replay reports the deferred advice, not a fresh observation.
-        assert_eq!(table.last_plan(slow), Some(deferred));
         // An ack retires the byte budget; the halved grant reopens flow
         // cautiously rather than bouncing straight back to capacity.
         table.observe_ack(slow);
         let reopened = table.plan(slow, 64, 64, 0.0, 1024);
         assert!(reopened.max_records < warm.max_records && reopened.max_records > 0);
         table.remove(slow);
-        assert_eq!(table.last_plan(slow), None);
+        // Removal drops every signal: the next plan is a fresh trusted grant.
+        assert_eq!(table.plan(slow, 64, 64, 0.0, 1024).max_records, 64);
     }
 
     #[test]

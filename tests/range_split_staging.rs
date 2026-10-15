@@ -230,6 +230,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(8001)),
             fetch_limit: None,
+            fetch_retry_after_ms: None,
         }])
         .await
         .unwrap();
@@ -251,6 +252,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(8002)),
             fetch_limit: None,
+            fetch_retry_after_ms: None,
         }])
         .await
         .unwrap();
@@ -556,6 +558,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             fence_delivery: true,
             fetch_request_id: Some(Uuid::from_u128(8003)),
             fetch_limit: None,
+            fetch_retry_after_ms: None,
         }])
         .await
         .unwrap();
