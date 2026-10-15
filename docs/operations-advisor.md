@@ -8,6 +8,18 @@ Whitewater aims to make scaling, balancing, recovery, retries, and Reader delive
 
 The Advisor correlates Whitewater signals with relevant Kubernetes and network context, identifies likely causes, proposes bounded remedies, and—only where a separate policy permits it—requests a pre-approved action. It should help a developer answer “why is this Writer retrying?” and an operator answer “is this Node safe to drain?” without either person learning internal range placement. Its default mode is **read-only advice**.
 
+## AI Assist through any Node — planned access model
+
+AI Assist is intended to be accessible through any available Whitewater Node to an authorized caller. A developer investigating Writer retries or an operator investigating delayed delivery should not have to locate the data owner, a particular Control Plane Node, or a special troubleshooting host before asking a question.
+
+The contacted Node provides a consistent authenticated entry point to the Advisor service. It routes a bounded investigation over the relevant authoritative diagnostics, with the caller's permitted Riverbed/Domain/Feed scope preserved at every step. This does not grant visibility into other tenants or turn one Node's local observations into a complete Riverbed diagnosis.
+
+“Any Node” defines the access contract, not the inference deployment topology. The Advisor/model may run separately according to deployment and data-egress policy; inference and diagnostic collection must not block the Writer/Reader hot path or require orchestrator credentials on data Nodes. No endpoint, embedded-model requirement, or completed failover implementation is implied by this proposal.
+
+An answer identifies observed symptoms, affected resources, likely causes, supporting evidence and freshness, automatic recovery already attempted, and safe next steps. Missing Nodes, stale data, conflicting reports, or an unavailable model must yield an explicit limited/unavailable diagnosis rather than fabricated certainty. Access through another available Node should retain the same authorization and diagnostic semantics without promising identical model wording.
+
+Acceptance must include equivalent scoped access through every Node in a supported three-Node Riverbed and through a newly registered Node; cross-Node evidence collection without leaking unauthorized resource identities; timeouts, stale evidence, and contacted-Node/model failure; bounded concurrent investigations under load; and unchanged core streaming availability when AI Assist is disabled. Diagnosis starts read-only; the action policy below remains the only path toward supported mutations.
+
 ## Roles and authority
 
 ```text

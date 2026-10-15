@@ -1,6 +1,6 @@
-# Why Whitewater
+# Why Whitewater: partition-free streaming and a database from the outset
 
-> Whitewater is a clean-sheet distributed database and streaming platform: a self-managing, partitionless event platform built around durable feeds, key-defined ordering, opaque cursors, first-class indexes, secure defaults, and incremental elasticity.
+> No partitions to create, count, assign, or repartition. Whitewater is a Rust-based, partition-free streaming platform and distributed database built around durable Feeds, business Keys, opaque Cursors, and first-class queryable state.
 
 ## Document status
 
@@ -13,6 +13,28 @@
 - **Implementation:** Rust
 
 This document explains why Whitewater exists, how it differs from Kafka, and how familiar Kafka concepts translate into the Whitewater model. It distinguishes committed principles from areas that still require prototyping and benchmarking.
+
+## Partition-free is the starting point
+
+**A Whitewater Feed has no user-defined partitions.** Creating a Feed does not ask how many partitions the application might need next year. Writing an event does not require choosing a partition. Reading and processing do not require assigning workers to numbered partitions or storing topic/partition/offset tuples.
+
+This is not Kafka partition management behind a simpler screen. Whitewater removes partitions from the public resource model:
+
+```text
+riverbed -> domain -> feed -> key -> cursor -> subscription
+```
+
+- **Create a Feed, not a partition plan.** There is no public partition count to size or increase later.
+- **Choose a business Key, not a partitioning strategy.** Same-Feed/same-Key accepted order is the contract; unrelated Keys may proceed independently.
+- **Keep a Cursor, not a physical address.** Applications pass opaque progress tokens back to the platform instead of calculating storage positions.
+- **Add service capacity, not partitions.** The design puts storage placement and work distribution inside the Riverbed, without changing the Feed/Key API as capacity grows.
+- **Use logical state, not co-partitioning plans.** StateStores and Pipes are designed around business lookups and processing, not application-managed alignment of physical storage.
+
+Operators still choose capacity, retention, durability intent, and access policies. They should not need a partition assignment or repartitioning project for every Feed. For the side-by-side experience, see [Whitewater vs Kafka](whitewater-vs-kafka.md).
+
+Partition-free does not mean the engine has no internal divisions. Whitewater uses **Active Ranges** to organize, replicate, and move storage beneath stable Feed identities. Those ranges are implementation details, not partitions that application teams must configure. Authorized diagnostics can explain their placement without making it part of the client contract. The [technical comparison](#kafka-partitions-versus-whitewater-active-ranges) below explains this distinction.
+
+The partition-free public model is the foundation; complete automatic placement, scaling, and stateful-processing guarantees still depend on their delivery and fault-test evidence. It does not promise a total order across a Feed or unlimited throughput for one strictly ordered hot Key.
 
 ## A database and a streaming platform
 
@@ -62,8 +84,8 @@ That coupling forces application teams to make permanent infrastructure decision
 Whitewater keeps only the useful public guarantee:
 
 ```text
-Events with the same key are observed in accepted order.
-Unrelated keys may proceed independently.
+Events in the same Feed with the same Key are observed in accepted order.
+Unrelated Keys may proceed independently.
 ```
 
 Physical ranges, replicas, files, and placement are internal. They may split, merge, or move without changing a Feed or its client contract. The [partition-versus-range comparison](#kafka-partitions-versus-whitewater-active-ranges) below explains the mechanism and current implementation boundaries.
@@ -185,7 +207,11 @@ minimum active replicas: 3
 normal write quorum:      2 of 3
 ```
 
-These are baseline invariants rather than per-Feed tuning. A future Durability Policy may request more replicas or geographic copies, but not fewer than the safe baseline.
+These are baseline invariants rather than per-Feed tuning. **The RF3 minimum is fixed at two matching durable copies, with no user-configurable `min.insync` argument.** The owner attempts replication to both followers: all three contribute durable/commit evidence when healthy, either owner-plus-follower pair can succeed if the other follower is unavailable, and one replica alone cannot succeed. Frames on multiple replicas are not enough without sufficient durable commit evidence.
+
+This behavior is covered by [majority_commit.rs](../tests/majority_commit.rs), including `three_healthy_replicas_commit_with_three_matching_evidence_records`, `either_follower_can_form_a_two_of_three_majority_with_the_owner`, `one_healthy_replica_never_returns_success`, and `frame_majority_without_commit_majority_returns_retryable_ambiguous_failure`. [replica_append_protocol.rs](../tests/replica_append_protocol.rs) covers committed-only visibility, checksums, fencing, and replica retry evidence. The focused review run passed all 23 majority-commit and 12 replica-protocol tests; this is not a claim that all live/SDK acceptance passed. See the [tested durability summary](whitewater-vs-kafka.md#what-the-durability-tests-demonstrate).
+
+A future Durability Policy may request more replicas or geographic copies, but not fewer than the safe baseline. Additional ACK policy names or overrides must be specified and tested separately; the existing evidence does not establish a configurable ACK ALL mode or require all three replicas for every successful write.
 
 Development also runs three Nodes. Three containers on one laptop validate topology and failure logic but do not create three physical failure domains. Production placement must spread replicas across machines and, where available, zones.
 
