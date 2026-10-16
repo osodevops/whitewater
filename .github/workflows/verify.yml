@@ -32,11 +32,19 @@ jobs:
     env:
       COMPOSE_FILE: compose.verify.yml
       WHITEWATER_TEST_BASE_PORT: "7371"
+      # Hosted runners throttle under load — give owner recovery headroom.
+      MANY_READERS_OWNER_RECOVERY_TIMEOUT: "360"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Runners arrive with a large pre-cached image set; reclaim it before
+      # the suite builds images and stacks container layers on the same disk.
+      - name: Reclaim Docker disk space
+        run: |
+          docker system prune --all --volumes --force || true
+          docker system df
       - name: Live acceptance suite
         run: python scripts/run-acceptance.py
       - name: Upload acceptance diagnostics

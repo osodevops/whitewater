@@ -19,6 +19,7 @@ Run from the repository root: ``python scripts/test-many-readers.py``.
 
 import base64
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -36,6 +37,9 @@ MEMBER_COUNT = 12
 PAGE = 25
 LEASE_TICKS = 600
 DEADLINE_SECONDS = 300
+# How long membership may take to move the progress owner onto a
+# surviving replica; CI overrides when runners are under load.
+OWNER_RECOVERY_SECONDS = int(os.environ.get("MANY_READERS_OWNER_RECOVERY_TIMEOUT", "240"))
 
 
 def compose(*args):
@@ -497,13 +501,26 @@ def main():
         for thread in threads:
             thread.start()
 
-        # Mid-drain: stop the progress owner; member operations recover it.
+        # Mid-drain: kill the progress owner; member operations recover it.
+        # SIGKILL, not stop: a graceful stop can linger on shutdown hooks and
+        # never leave membership, while a kill is the crash the test means to
+        # exercise — the container must be gone before recovery is polled.
         time.sleep(1.5)
-        returncode, output = compose("stop", owner_before)
+        returncode, output = compose("kill", owner_before)
         assert returncode == 0, output
+        _, ps_out = compose("ps", owner_before)
+        _, owner_logs = compose("logs", owner_before, "--no-color", "--tail", "100")
+        print(f"killed owner {owner_before}; ps:\n{ps_out}", file=sys.stderr)
+        print(owner_logs, file=sys.stderr)
+        _, still_running = compose("ps", "--status", "running", "-q", owner_before)
+        if still_running.strip():
+            # Compose reports success even when a container lingers; force it
+            # out so membership sees the loss and `up -d` below recreates it.
+            returncode, output = compose("rm", "-f", owner_before)
+            assert returncode == 0, output
         recovered = None
         last_view = None
-        deadline = time.time() + 240
+        deadline = time.time() + OWNER_RECOVERY_SECONDS
         while time.time() < deadline:
             try:
                 view = progress(subscription)
@@ -520,8 +537,8 @@ def main():
                 break
             time.sleep(1)
         assert recovered, (
-            "progress owner never recovered after stop (waited 240s); "
-            f"last progress view: {last_view}"
+            "progress owner never recovered after kill "
+            f"(waited {OWNER_RECOVERY_SECONDS}s); last progress view: {last_view}"
         )
         owner_after = recovered["assignment"]["owner"]
         epoch_after = recovered["assignment"]["ownership_epoch"]
@@ -532,9 +549,9 @@ def main():
         )
         assert dead_replica["reachable"] is False, dead_replica
 
-        # Bring the drained owner back; the cluster converges while members
-        # finish, then restart a surviving non-owner Node mid-drain.
-        returncode, output = compose("start", owner_before)
+        # Bring the killed owner back; `up -d` restarts the container when it
+        # exists and recreates it when the lingering-kill fallback removed it.
+        returncode, output = compose("up", "-d", owner_before)
         assert returncode == 0, output
         restart_target = next(
             node for node in NODES if node != owner_after and node != owner_before
@@ -582,7 +599,7 @@ def main():
                 "12 members cooperatively drained 300 records across three "
                 "ingress Nodes; the fetch limit clamped at 256, lease bounds "
                 "and per-member work caps held, contested claims returned "
-                "busy, a progress-owner stop and a replica restart did not "
+                "busy, a progress-owner kill and a replica restart did not "
                 "lose acknowledged progress, and every seeded record was "
                 "delivered before the shared frontier reached the tail"
             ),
