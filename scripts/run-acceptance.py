@@ -23,6 +23,7 @@ never disrupt the development Riverbed on 7071-7073.
 import json
 import os
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -95,6 +96,13 @@ def collect_diagnostics(label: str, env: dict) -> None:
             except (OSError, subprocess.TimeoutExpired) as error:
                 output = f"Diagnostic collection failed: {error}\n"
             (directory / f"{label}-{project}-{kind}.log").write_text(output, encoding="utf-8")
+    for kind, command in (("df", ["df", "-h", str(ROOT)]), ("docker-df", ["docker", "system", "df"])):
+        try:
+            result = subprocess.run(command, cwd=ROOT, check=False, capture_output=True, text=True, timeout=15)
+            output = result.stdout + result.stderr
+        except (OSError, subprocess.TimeoutExpired) as error:
+            output = f"Diagnostic collection failed: {error}\n"
+        (directory / f"{label}-host-{kind}.log").write_text(output, encoding="utf-8")
     print(f"--- diagnostics saved to {directory}", flush=True)
 
 
@@ -176,6 +184,26 @@ def wait_control_plane(deadline: float) -> None:
     raise AssertionError("verification Control Plane did not converge: leader or applied index missing")
 
 
+def preflight(env: dict) -> None:
+    """Log host disk state; on CI runners prune unused Docker objects when the
+    suite would otherwise run out of disk mid-run. The prune is gated on CI —
+    `docker system prune` is destructive on a developer machine."""
+    for command in (["df", "-h", str(ROOT)], ["docker", "system", "df"]):
+        try:
+            subprocess.run(command, check=False)
+        except OSError:
+            pass
+    if os.environ.get("CI") != "true":
+        return
+    free_bytes = shutil.disk_usage(ROOT).free
+    if free_bytes < 8 * 1024**3:
+        print("--- low disk on CI runner; pruning unused Docker objects", flush=True)
+        try:
+            subprocess.run(["docker", "system", "prune", "-af"], cwd=ROOT, env=env, check=False)
+        except OSError:
+            pass
+
+
 def main() -> int:
     busy = ports_free()
     if busy:
@@ -193,6 +221,7 @@ def main() -> int:
         WHITEWATER_TEST_BASE_PORT=str(BASE_PORT),
         PYTHONUNBUFFERED="1",
     )
+    preflight(env)
     scripts = test_scripts()
     results: dict[str, str] = {}
     try:

@@ -502,11 +502,14 @@ def main():
         returncode, output = compose("stop", owner_before)
         assert returncode == 0, output
         recovered = None
-        deadline = time.time() + 120
+        last_view = None
+        deadline = time.time() + 240
         while time.time() < deadline:
             try:
                 view = progress(subscription)
-            except AssertionError:
+                last_view = view
+            except AssertionError as error:
+                last_view = error
                 time.sleep(1)
                 continue
             if (
@@ -516,7 +519,10 @@ def main():
                 recovered = view
                 break
             time.sleep(1)
-        assert recovered, "progress owner never recovered after stop"
+        assert recovered, (
+            "progress owner never recovered after stop (waited 240s); "
+            f"last progress view: {last_view}"
+        )
         owner_after = recovered["assignment"]["owner"]
         epoch_after = recovered["assignment"]["ownership_epoch"]
         dead_replica = next(

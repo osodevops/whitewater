@@ -137,6 +137,13 @@ def generate_certificates():
             "WW_CERTS_NODES=" + ",".join(NODES),
             "-e",
             "WW_CERTS_PORT=7271",
+            # Cargo runs as the container's root user; keep its build cache in
+            # a Docker-managed volume so it never leaves a root-owned target/
+            # in the host workspace (which breaks the runner's own cargo).
+            "-e",
+            "CARGO_TARGET_DIR=/tmp/ww-certgen-target",
+            "-v",
+            "whitewater-certgen-target:/tmp/ww-certgen-target",
             "rust:1.90-bookworm",
             "bash",
             "-c",

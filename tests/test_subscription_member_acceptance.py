@@ -49,14 +49,16 @@ class AcceptanceDiagnosticTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, patch.object(runner, "ROOT", Path(directory)), patch.object(runner, "compose_file_projects", return_value=[("compose.verify.yml", "whitewater-verification")]), patch.object(runner.subprocess, "run", return_value=result) as run:
             runner.collect_diagnostics("failed/test", {})
             files = sorted((Path(directory) / "acceptance-logs").glob("*.log"))
-            self.assertEqual(len(files), 2)
+            self.assertEqual(len(files), 4)
             self.assertTrue(all(file.read_text() == "node logsdiagnostic warning" for file in files))
-            self.assertTrue(all("whitewater-verification" in item.args[0] for item in run.call_args_list))
+            compose_calls = [item for item in run.call_args_list if "compose" in item.args[0]]
+            self.assertEqual(len(compose_calls), 2)
+            self.assertTrue(all("whitewater-verification" in item.args[0] for item in compose_calls))
             self.assertTrue(all("down" not in item.args[0] for item in run.call_args_list))
 
     def test_failed_script_collects_diagnostics_before_cleanup(self):
         order = []
-        with patch.object(runner, "ports_free", return_value=[]), patch.object(runner, "test_scripts", return_value=["test-m7-subscription-member.py"]), patch.object(runner, "compose"), patch.object(runner, "wait_healthy"), patch.object(runner.subprocess, "run", side_effect=subprocess.CalledProcessError(1, ["python"])), patch.object(runner, "collect_diagnostics", side_effect=lambda *args: order.append("diagnostics")), patch.object(runner, "sweep", side_effect=lambda *args: order.append("cleanup")):
+        with patch.object(runner, "ports_free", return_value=[]), patch.object(runner, "preflight"), patch.object(runner, "test_scripts", return_value=["test-m7-subscription-member.py"]), patch.object(runner, "compose"), patch.object(runner, "wait_healthy"), patch.object(runner.subprocess, "run", side_effect=subprocess.CalledProcessError(1, ["python"])), patch.object(runner, "collect_diagnostics", side_effect=lambda *args: order.append("diagnostics")), patch.object(runner, "sweep", side_effect=lambda *args: order.append("cleanup")):
             self.assertEqual(runner.main(), 1)
         self.assertEqual(order, ["diagnostics", "cleanup"])
 
