@@ -158,6 +158,108 @@ env-substituted base, e.g. `${WW_M4_PORT_BASE:-7171}`) so m4-move and
 storage-join scripts can overlap. Larger blast radius — only if measurements
 say the zone dominates.
 
+## GitHub Actions — how the lanes actually run in CI
+
+Two deployment shapes; pick per environment.
+
+### Shape 1: matrix jobs (preferred for CI — least parametrization)
+
+`verify.yml` splits `live-acceptance` into a `strategy.matrix`, one leg per
+lane. **Each leg is a separate VM with its own Docker daemon** — this is the
+crucial property:
+
+- Ports do **not** need remapping across legs — `7371` on leg A and `7371`
+  on leg B are different hosts. The phase-2 port work disappears entirely.
+- The hardcoded `name: whitewater-verification` does **not** collide —
+  different daemons. No `WHITEWATER_VERIFY_LANE` suffix needed.
+- `WHITEWATER_VERIFY_SUBNET` can stay `10.250.247.0/24` on every leg.
+- Concurrent `up --build` races cannot happen — one build per VM.
+- Per-leg logs, timeouts, artifacts, and the residue check are natural.
+- The fault suite gets a VM to itself — strongest possible isolation.
+
+What the runner still needs: a **lane selector** (`--lane NAME` arg or
+`WHITEWATER_ACCEPTANCE_LANE` env) so each matrix leg runs only its script
+list and only provisions the fixture it needs (verify lanes bring up
+`compose.verify.yml`; the pipe/hotkeys/isolated legs don't).
+
+```yaml
+live-acceptance:
+  needs: rust-gate
+  runs-on: ubuntu-latest
+  timeout-minutes: 40
+  strategy:
+    fail-fast: false                    # a failed leg must NOT cancel the
+                                        # others — they are the coverage
+    matrix:
+      lane: [verify-mutating, verify-reads-a, verify-reads-b, isolated-zone, pipe, hotkeys]
+  env:
+    COMPOSE_FILE: compose.verify.yml
+    WHITEWATER_TEST_BASE_PORT: "7371"   # fine: identical across legs, separate VMs
+    MANY_READERS_OWNER_RECOVERY_TIMEOUT: "360"
+  steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with: { python-version: "3.12" }
+    - name: Reclaim Docker disk space   # still per-leg, keep it
+      run: docker system prune --all --volumes --force || true; docker system df
+    - name: Live acceptance suite
+      run: python scripts/run-acceptance.py
+      env: { WHITEWATER_ACCEPTANCE_LANE: "${{ matrix.lane }}" }
+    - name: Upload acceptance diagnostics
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: acceptance-diagnostics-${{ matrix.lane }}   # REQUIRED: unique
+        path: acceptance-logs/                            # name per leg —
+        if-no-files-found: warn                           # v4 rejects same-name
+                                                          # uploads across legs
+    - name: Verify no test residue
+      if: always()
+      run: docker ps -a; docker volume ls
+```
+
+Matrix-specific pitfalls:
+
+- **`fail-fast: false` is mandatory.** Default `true` cancels all in-flight
+  legs on the first failure — you'd lose coverage evidence *and* diagnostics.
+- **Artifact names must embed `${{ matrix.lane}}`.** `upload-artifact@v4`
+  errors on same-name uploads from parallel legs. Don't aggregate.
+- **Check names change.** A matrix job reports as `live-acceptance (verify-mutating)`,
+  etc. If branch protection requires `live-acceptance`, the required check
+  breaks — either update protection or add a fan-in rollup:
+  ```yaml
+  acceptance-gate:
+    needs: live-acceptance          # waits for ALL legs; fails if any leg fails
+    runs-on: ubuntu-latest
+    steps: [{ run: "true" }]
+  ```
+  and require `acceptance-gate` instead.
+- **N image builds.** Each leg rebuilds the node image. Wall-clock still wins
+  (builds run in parallel), but add a `type=gha` layer cache via
+  `docker/setup-buildx-action` + `cache-from/cache-to: type=gha` if build
+  time dominates. Legs never share a cache *writer* problem — the gha cache
+  backend is designed for concurrent writers.
+- **Timeout is per-leg** — set per the slowest leg, not the old 50min serial
+  total. Most legs should fit in ~20min; keep 40 for the mutating leg.
+- **`concurrency: group: verify-${{ github.ref }}`** already serializes runs
+  per ref — matrix legs inside one run are unaffected, no change needed.
+- The **residue check stays** — cheap, and catches leaked containers even
+  though the VM is disposable (a leak means the sweep missed a project).
+
+### Shape 2: in-runner threading (for local dev-loop, or if jobs are precious)
+
+The phase-1/2 lane plan above as written: one job, `WHITEWATER_ACCEPTANCE_LANES=N`,
+`ThreadPoolExecutor` inside the runner. This is where the port/subnet/
+project-name parametrization is *required* — all lanes share one Docker
+daemon. Use it for `run-acceptance.py` on a dev box; on CI it buys less than
+a matrix (4 vCPU/16 GB shared by 6-12 containers + parallel `cargo` builds)
+while carrying all the collision work.
+
+Honest recommendation: **matrix for CI, in-runner lanes for local** — both
+consume the same lane definitions (`LANES = {"verify-mutating": [...], ...}`)
+so the mapping lives in one place. Serial `run-acceptance.py` with no lane
+env stays the regression default and runs every lane's union.
+
 ## Invariants that must not break
 
 - A script's failure must produce `acceptance-logs/<script>-<project>-*.log`
@@ -179,17 +281,26 @@ say the zone dominates.
 
 1. `python -m unittest discover -s tests -p "test_*acceptance.py"` — extend
    `AcceptanceDiagnosticTests` to cover lane scheduling (mock subprocess;
-   assert lane envs carry distinct base ports/subnets and fault suite ordering).
-2. `python scripts/run-acceptance.py` with `WHITEWATER_ACCEPTANCE_LANES=1`
-   must reproduce today's behaviour exactly (regression gate).
-3. Full parallel run locally with lanes=3 on a clean Docker host; then on CI.
-   Compare wall-clock and confirm no port/subnet/name collisions in the sweep
-   step's `docker ps`/`docker volume ls` residue check (verify.yml already
-   asserts a clean host at the end).
-4. Report measured per-script times so lane weights can be rebalanced.
+   assert lane envs carry distinct base ports/subnets, fault suite ordering,
+   and that `--lane`/`WHITEWATER_ACCEPTANCE_LANE` selects exactly the mapped
+   scripts — nothing dropped, nothing double-run).
+2. `python scripts/run-acceptance.py` with no lane env must reproduce today's
+   serial behaviour exactly (regression gate: union of all lanes ≡ current
+   script list, fault suite last).
+3. For the in-runner path: full parallel run locally with lanes=3 on a clean
+   Docker host; confirm no port/subnet/name collisions via the sweep step's
+   `docker ps`/`docker volume ls` residue check.
+4. For the matrix path: a CI run on the PR itself is the proof — check every
+   leg uploads `acceptance-diagnostics-<lane>` on failure, `fail-fast: false`
+   holds (a forced failing leg doesn't cancel siblings), and the required
+   check name still gates merges.
+5. Report measured per-script times so lane weights can be rebalanced.
 
 ## Rollback
 
-Everything sits behind `WHITEWATER_ACCEPTANCE_LANES` (default 1 = current
-serial behaviour). The CI workflow opts in via env; reverting the env var
-restores serial execution without a code change.
+Two independent off-switches:
+
+- Runner: no lane env / `--lane` arg → serial, today's exact script order.
+- Workflow: matrix is additive — reverting `verify.yml` to a single
+  `live-acceptance` job that calls `run-acceptance.py` plainly restores the
+  serial gate with no code change.
