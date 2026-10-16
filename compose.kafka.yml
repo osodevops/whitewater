@@ -1,0 +1,70 @@
+name: whitewater-kafka-bench
+
+# Ad-hoc Kafka comparison cluster for scripts/bench-kafka.py — three
+# combined broker/controller KRaft Nodes on apache/kafka:3.8.0, matching
+# the RF3 durability shape a Whitewater verification Riverbed provides.
+# Host listeners publish on 19092-19094; producer/consumer perf tooling
+# runs inside the brokers over the internal PLAINTEXT listener.
+#
+# Volumes are disposable: bench-kafka.py tears this project down with
+# `down -v` after every run.
+
+x-kafka: &kafka
+  image: apache/kafka:3.8.0
+  environment: &kafka-environment
+    CLUSTER_ID: 5L6gEXnH3nWp0c3V6g0pAg
+    KAFKA_PROCESS_ROLES: broker,controller
+    KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+    KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+    KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+    KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker1:29093,2@broker2:29093,3@broker3:29093
+    KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+    KAFKA_LOG_DIRS: /var/lib/kafka/data
+    KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 3
+    KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 2
+    KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+    KAFKA_NUM_PARTITIONS: 3
+    KAFKA_DEFAULT_REPLICATION_FACTOR: 3
+    KAFKA_MIN_INSYNC_REPLICAS: 2
+    KAFKA_OFFSETS_TOPIC_MIN_ISR: 2
+
+services:
+  broker1:
+    <<: *kafka
+    environment:
+      <<: *kafka-environment
+      KAFKA_NODE_ID: 1
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker1:29092,PLAINTEXT_HOST://localhost:19092
+    ports:
+      - "19092:9092"
+    volumes:
+      - broker1-data:/var/lib/kafka/data
+
+  broker2:
+    <<: *kafka
+    environment:
+      <<: *kafka-environment
+      KAFKA_NODE_ID: 2
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker2:29092,PLAINTEXT_HOST://localhost:19093
+    ports:
+      - "19093:9092"
+    volumes:
+      - broker2-data:/var/lib/kafka/data
+
+  broker3:
+    <<: *kafka
+    environment:
+      <<: *kafka-environment
+      KAFKA_NODE_ID: 3
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker3:29092,PLAINTEXT_HOST://localhost:19094
+    ports:
+      - "19094:9092"
+    volumes:
+      - broker3-data:/var/lib/kafka/data
+
+volumes:
+  broker1-data:
+  broker2-data:
+  broker3-data:

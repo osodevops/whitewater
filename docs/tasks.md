@@ -1112,7 +1112,7 @@ Autoscaling must never apply one generic removal procedure to all three cases.
 
 - [ ] Add SLO-aware movement budgets.
 
-- [ ] Build 100k-to-200k records/second scaling benchmark.
+- [~] Build 100k-to-200k records/second scaling benchmark. The ad-hoc harness shipped: `scripts/bench-feed.py` (Whitewater WriterSession appends + full-Feed replay against a disposable `compose.verify.yml` fixture on ports 7771-7773), `compose.kafka.yml` + `scripts/bench-kafka.py` (three-broker KRaft RF3, stock producer/consumer perf tools), and `examples/BenchFeed.java` in whitewater-java — all emitting one `BENCH_RESULT` JSON contract (records/s, MiB/s, p50/p95/p99). Methodology and comparability caveats are in `docs/performance-testing.md`. First-run baseline on a dev Docker host (BENCH_RECORDS=2000, BENCH_BYTES=1024, 4 writers, batch 50): the quorum append path is consensus-bound — healthy-window 50-record batches commit at p50 ≈ 37ms (~0.7ms/record) but sustained load hits replica-currency stalls (`append is durable on fewer than two current replicas`) with ~1 Control Plane write per record, so sustained WriterSession throughput measures ~5-10 records/s end-to-end, while committed-Feed replay measures ~10.7k records/s. The 100k-200k target is therefore unmet by orders of magnitude; the benchmark now exists to track progress toward it. `tests/test_bench_acceptance.py` covers the shared metric math, Kafka output parsing, and lane wiring.
 
 - [ ] Prove scale-out helps the constrained resource rather than merely increasing Node count.
 
@@ -1731,7 +1731,7 @@ These tests accumulate across milestones and must never regress:
 
 - [x] Network partition — live: `zz-chaos-partition.json` via `chaos.partition` in `scripts/chaos_driver.py`; `docker network disconnect` isolates a running Node (container stays Up but unreachable from the published port), the majority side keeps committing writes through the fault, and on reconnect — with the Compose service alias restored, since a plain `network connect` drops it and would leave the Node unresolvable forever — the isolated replica rejoins the Control Plane; the driver re-gates on every Node reporting a leader with applied index converged to a common log tail plus a real corroborated append before the next fixture runs
 
-- [x] Disk full — integration: `disk_capacity_exhaustion_rejects_append_without_advancing_progress` (tests/active_range_store.rs) proves a capacity-exhausted range refuses without advancing progress; a real filesystem-full scenario remains open
+- [x] Disk full — integration: `disk_capacity_exhaustion_rejects_append_without_advancing_progress` (tests/active_range_store.rs) proves a capacity-exhausted range refuses without advancing progress; live: `test-disk-full.py` fills a real tmpfs volume to 100% on one Node mid-run (`compose.disk-full.yml`), the surviving two-Node quorum keeps every append committing (0 refused), every acknowledged record remains readable, and after the Node is recreated with a clean volume the Riverbed reconverges and takes new writes
 
 - [x] Torn write — integration: `replica_rejects_invalid_frame_checksum_before_storage_mutation` and `replica_rejects_position_gaps_and_conflicting_bytes` (tests/replica_append_protocol.rs) refuse damaged/gapped frames before mutating
 

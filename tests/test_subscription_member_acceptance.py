@@ -63,6 +63,136 @@ class AcceptanceDiagnosticTests(unittest.TestCase):
         self.assertEqual(order, ["diagnostics", "cleanup"])
 
 
+class AcceptanceLaneTests(unittest.TestCase):
+    def test_lane_union_covers_every_test_script_exactly_once(self):
+        all_scripts = sorted(item.name for item in (runner.ROOT / "scripts").glob("test-*.py"))
+        self.assertEqual(sorted(runner.test_scripts([])), all_scripts)
+        for count in (2, 3, 4, 5):
+            lanes = runner.lane_catalog(count)
+            scripts = [script for lane in lanes for script in lane.scripts]
+            self.assertEqual(sorted(scripts), all_scripts)
+            self.assertEqual(len(scripts), len(set(scripts)))
+
+    def test_fault_suite_is_last_on_the_mutating_lane_and_only_there(self):
+        for lane in runner.lane_catalog():
+            if lane.name == "verify-mutating":
+                self.assertEqual(lane.scripts[:-1], runner.VERIFY_MUTATING)
+                self.assertEqual(lane.scripts[-1], runner.FAULT_SUITE)
+            else:
+                self.assertNotIn(runner.FAULT_SUITE, lane.scripts)
+
+    def test_verify_lanes_have_disjoint_ports_subnets_and_projects(self):
+        lanes = [lane for lane in runner.lane_catalog() if lane.fixture]
+        for values in (
+            [lane.base_port for lane in lanes],
+            [lane.subnet for lane in lanes],
+            [lane.project for lane in lanes],
+        ):
+            self.assertEqual(len(values), len(set(values)), values)
+        # Lane port blocks must stay clear of every hardcoded compose.*.yml
+        # range (7171-7175, 7271-7273, 7471-7473, 7571-7575, 7971-7973).
+        reserved = set().union(*[range(7171, 7176), range(7271, 7274), range(7471, 7474), range(7571, 7576), range(7971, 7974)])
+        for lane in lanes:
+            self.assertFalse(reserved.intersection(range(lane.base_port, lane.base_port + 3)), lane.name)
+
+    def test_extra_verify_lane_env_carries_lane_identity(self):
+        lane = next(lane for lane in runner.lane_catalog() if lane.name == "verify-reads-a")
+        env = lane.env({})
+        self.assertEqual(lane.nodes, ["http://localhost:7871", "http://localhost:7872", "http://localhost:7873"])
+        self.assertEqual(env["WHITEWATER_TEST_BASE_PORT"], "7871")
+        self.assertEqual(env["WHITEWATER_VERIFY_PORT_1"], "7871")
+        self.assertEqual(env["WHITEWATER_VERIFY_PORT_2"], "7872")
+        self.assertEqual(env["WHITEWATER_VERIFY_PORT_3"], "7873")
+        self.assertEqual(env["WHITEWATER_VERIFY_SUBNET"], "10.250.248.0/24")
+        self.assertEqual(env["COMPOSE_PROJECT_NAME"], "whitewater-verification-a")
+        self.assertEqual(env["WHITEWATER_TEST_NODE3"], "whitewater-verification-a-node3-1")
+
+    def test_primary_verify_lane_keeps_legacy_names(self):
+        lane = next(lane for lane in runner.lane_catalog() if lane.name == "verify-mutating")
+        env = lane.env({})
+        self.assertEqual(lane.project, "whitewater-verification")
+        self.assertEqual(env["WHITEWATER_TEST_BASE_PORT"], str(runner.BASE_PORT))
+        self.assertNotIn("COMPOSE_PROJECT_NAME", env)
+        self.assertNotIn("WHITEWATER_TEST_NODE3", env)
+
+    def test_shifted_subnet_derives_next_24_and_refuses_wider_networks(self):
+        self.assertEqual(runner.shifted_subnet("10.250.247.0/24", 1), "10.250.248.0/24")
+        self.assertEqual(runner.shifted_subnet("10.250.247.0/24", 2), "10.250.249.0/24")
+        with self.assertRaises(ValueError):
+            runner.shifted_subnet("10.250.0.0/16", 1)
+
+    def test_lane_env_selection_picks_exactly_its_scripts(self):
+        lanes, _ = runner.parse_invocation([], {"WHITEWATER_ACCEPTANCE_LANE": "hotkeys"})
+        self.assertEqual([lane.name for lane in lanes], ["hotkeys"])
+        self.assertEqual(lanes[0].scripts, runner.HOTKEYS)
+        lanes, _ = runner.parse_invocation(["--lane", "pipe"], {})
+        self.assertEqual([lane.name for lane in lanes], ["pipe"])
+        self.assertEqual(lanes[0].scripts, runner.PIPE)
+
+    def test_unknown_lane_error_names_every_candidate(self):
+        with self.assertRaisesRegex(ValueError, "isolated-zone"):
+            runner.parse_invocation(["--lane", "bogus"], {})
+
+    def test_lanes_count_splits_verify_scripts_across_verify_lanes(self):
+        lanes, _ = runner.parse_invocation(["--lanes", "2"], {})
+        self.assertEqual(
+            [lane.name for lane in lanes],
+            ["verify-mutating", "verify-reads-a", "isolated-zone", "pipe", "hotkeys", "disk-full"],
+        )
+        self.assertEqual(lanes[1].scripts, runner.VERIFY_READS)
+        lanes, _ = runner.parse_invocation([], {"WHITEWATER_ACCEPTANCE_LANES": "3"})
+        self.assertEqual(len(lanes), 7)
+        self.assertEqual(lanes[1].scripts + lanes[2].scripts, runner.VERIFY_READS)
+
+    def test_no_lane_selector_is_the_serial_legacy_mode(self):
+        lanes, positionals = runner.parse_invocation([], {})
+        self.assertIsNone(lanes)
+        lanes, _ = runner.parse_invocation([], {"WHITEWATER_ACCEPTANCE_LANES": "1"})
+        self.assertIsNone(lanes)
+        lanes, positionals = runner.parse_invocation(["test-x.py"], {})
+        self.assertIsNone(lanes)
+        self.assertEqual(positionals, ["test-x.py"])
+
+    def test_lane_selectors_reject_mixed_invocations(self):
+        with self.assertRaises(ValueError):
+            runner.parse_invocation(["--lane", "pipe", "test-x.py"], {})
+        with self.assertRaises(ValueError):
+            runner.parse_invocation(["--lanes", "3", "test-x.py"], {})
+        with self.assertRaises(ValueError):
+            runner.parse_invocation(["--lane"], {})
+
+    def test_project_map_adds_lane_projects_to_the_static_sweep(self):
+        verify_projects = [
+            project for file, project in runner.project_map(runner.lane_catalog())
+            if file == runner.COMPOSE_FILE
+        ]
+        self.assertEqual(
+            verify_projects,
+            ["whitewater-verification", "whitewater-verification-a", "whitewater-verification-b"],
+        )
+
+    def test_fixture_lane_provisions_before_running_scripts(self):
+        lane = runner.Lane("verify-mutating", ("test-x.py",), fixture=True)
+        order = []
+        with patch.object(runner, "compose", side_effect=lambda *args, **kwargs: order.append("compose")), \
+            patch.object(runner, "wait_healthy", side_effect=lambda **kwargs: order.append("healthy")), \
+            patch.object(runner, "run_script", side_effect=lambda *args, **kwargs: order.append("script") or "ok"):
+            results = runner.run_lane(lane, {}, [])
+        self.assertEqual(order, ["compose", "compose", "healthy", "script"])
+        self.assertEqual(results, {"test-x.py": "ok"})
+
+    def test_fixture_failure_marks_every_lane_script_and_collects_diagnostics(self):
+        lane = runner.Lane("verify-reads-a", ("test-x.py", "test-y.py"), fixture=True, project_suffix="-a")
+        with patch.object(runner, "compose", side_effect=subprocess.CalledProcessError(1, ["docker"])), \
+            patch.object(runner, "collect_diagnostics") as diagnostics, \
+            patch.object(runner, "run_script") as run_script:
+            results = runner.run_lane(lane, {}, [])
+        self.assertEqual(sorted(results), ["test-x.py", "test-y.py"])
+        self.assertTrue(all(outcome.startswith("fixture not ready") for outcome in results.values()))
+        diagnostics.assert_called_once()
+        run_script.assert_not_called()
+
+
 many_path = path.with_name("test-many-readers.py")
 many_spec = importlib.util.spec_from_file_location("many_reader_acceptance", many_path)
 many = importlib.util.module_from_spec(many_spec)

@@ -5,6 +5,48 @@ Handoff document for an implementation session. Goal: cut wall-clock time of
 independent scripts concurrently, without weakening coverage or breaking the
 fixture invariants the suite relies on.
 
+## Implementation status — landed
+
+Implemented and verified locally. Deviations from the draft below:
+
+- **Project naming uses `COMPOSE_PROJECT_NAME`, not a templated `name:`** —
+  `compose.verify.yml` keeps `name: whitewater-verification` so the sweep's
+  file parse stays static; each extra lane exports `COMPOSE_PROJECT_NAME`
+  (`whitewater-verification-a`, `-b`, ...), which overrides `name:` for the
+  runner's own `compose` calls *and* the bare `docker compose` calls inside
+  mutating scripts and `chaos_driver.py`.
+- **Ports use `WHITEWATER_VERIFY_PORT_1/2/3`** (Compose interpolation has no
+  arithmetic, so three env vars replace the three hardcoded mappings; defaults
+  stay `7371`–`7373`). The runner derives them from each lane's base port;
+  shared-fixture scripts still key off `WHITEWATER_TEST_BASE_PORT`.
+- **Subnets derive from `WHITEWATER_VERIFY_SUBNET`** — lane *i* gets the *i*-th
+  `/24` after the base subnet (base must be IPv4 `/24` when extra lanes run).
+- **`image: whitewater-verify-node:latest`** is pinned in `compose.verify.yml`
+  so the runner's one upfront `compose build` serves every lane; lane
+  `up -d` never races a build.
+- **Selectors:** `--lane NAME` / `WHITEWATER_ACCEPTANCE_LANE` run one lane
+  (CI matrix legs); `--lanes N` / `WHITEWATER_ACCEPTANCE_LANES` runs the full
+  catalog concurrently on one Docker host. No selector → today's exact serial
+  behaviour; positional script args still work in serial mode only.
+- **Sweep gap fixed:** `compose_file_projects` now also sweeps
+  `whitewater-join` (test-storage-node-join's `-p` override).
+- **CI:** `live-acceptance` is a seven-leg matrix (`verify-mutating`,
+  `verify-reads-a`, `verify-reads-b`, `isolated-zone`, `pipe`, `hotkeys`,
+  `disk-full`) with `fail-fast: false`, per-leg diagnostic artifacts, pinned
+  Rust toolchain + `rust-cache` (sdk legs `cargo test` on the host), and an
+  `acceptance-gate` fan-in job that fails explicitly when any leg fails —
+  require that name in branch protection. Legs share ports/subnet defaults
+  freely: separate VMs.
+- Verified locally: `--lane hotkeys` and `--lane verify-reads-a` run green
+  end-to-end (chaos steps in `sdk-conformance` correctly restarted only
+  `whitewater-verification-a-*` containers), `--lanes 3` runs all six lanes
+  concurrently on one Docker host, unit tests cover lane decomposition in
+  `tests/test_subscription_member_acceptance.py::AcceptanceLaneTests`.
+- **Later addition:** the `disk-full` lane (`test-disk-full.py`,
+  `compose.disk-full.yml`, project `whitewater-disk-full`, 7671-7673) is a
+  seventh self-provisioning lane — a real tmpfs filesystem-full fault on
+  node3, disjoint port block so it parallelises with every other lane.
+
 ## Current architecture (verified facts)
 
 `scripts/run-acceptance.py` is a sequential runner. It:
@@ -42,6 +84,8 @@ Compose file → project name → host ports:
 | compose.storage-join.yml | whitewater-storage-join | 7171-7174 HTTP + 7571-7574 TLS + storage 7175 + cert env 7271 | test-storage-node-join, test-window-pipe-4n |
 | compose.m4-move.yml | whitewater-m4-move-test | 7171-7175 (4 nodes) | test-m4-cross-node-read, test-m4-follower-move, test-storage-drain |
 | compose.m4-owner.yml | whitewater-m4-owner-test | 7271-7273 | test-m4-owner-move |
+| compose.disk-full.yml | whitewater-disk-full | 7671-7673 (node3 tmpfs) | test-disk-full |
+| compose.kafka.yml | whitewater-kafka-bench | 19092-19094 | bench-kafka.py (ad-hoc, not in the suite) |
 
 **Shared-fixture scripts** (endpoints from `WHITEWATER_TEST_BASE_PORT`, no own
 compose file). Split into *read-only* and *fixture-mutating*:
@@ -106,33 +150,36 @@ ports — **but** three things block it today:
 
 1. **Project name is hardcoded** (`name: whitewater-verification` in
    compose.verify.yml, line 1) → identical container names across lanes, and
-   `test-m4-split-rollback`'s `NODE3` default resolves per name. Parametrize:
-   `name: whitewater-verification${WHITEWATER_VERIFY_LANE:-}` — empty default
-   keeps today's names exactly; lane B sets `WHITEWATER_VERIFY_LANE=-b` giving
-   `whitewater-verification-b-node3-1`. Mutating scripts that take container
-   names already have env overrides (`WHITEWATER_TEST_NODE3`); lane B passes
-   the `-b`-suffixed name.
+   `test-m4-split-rollback`'s `NODE3` default resolves per name. *As landed:*
+   keep `name:` static and export `COMPOSE_PROJECT_NAME` per lane (env beats
+   `name:` for every compose call, including the bare ones inside mutating
+   scripts and `chaos_driver.py`), plus `WHITEWATER_TEST_NODE3=<lane>-node3-1`
+   for the raw `docker stop` path. Lane A exports neither and keeps today's
+   names exactly.
 
 2. **Subnet collides** — `compose.verify.yml` line ~66:
-   `${WHITEWATER_VERIFY_SUBNET:-10.250.247.0/24}`. Assign each lane its own:
-   lane B → `10.250.248.0/24`, lane C → `10.250.249.0/24`. (AGENTS.md already
-   requires this env for CI.)
+   `${WHITEWATER_VERIFY_SUBNET:-10.250.247.0/24}`. *As landed:* each lane *i*
+   derives `subnet_base + i` (lane B → `10.250.248.0/24`, lane C →
+   `10.250.249.0/24`); the base stays env-overridable for Docker-pool
+   exhaustion, and must be IPv4 `/24` when extra lanes run.
 
-3. **Concurrent `up --build` races** on the same Dockerfile/tag. Pre-build
-   once before lanes start (`docker compose -f compose.verify.yml build`), then
-   lanes `up -d` without `--build`. The isolated projects still self-build;
+3. **Concurrent `up --build` races** on the same Dockerfile/tag. *As landed:*
+   `image: whitewater-verify-node:latest` is pinned so one upfront
+   `compose build` serves all lane projects, then lanes `up -d` without
+   `--build`. The isolated projects still self-build inside their scripts;
    `docker build` layer-caches make concurrent builds correct but slower —
    acceptable, or serialize a build phase upfront for every compose file.
 
 Lane split suggestion (weight by measured per-script times from CI logs —
-each `--- script: ok (Ns)` line; rebalance freely):
+each `--- script: ok (Ns)` line; rebalance freely). *As landed* the catalog
+is `verify-mutating`, `verify-reads-a`, `verify-reads-b`:
 
-- **Lane A** (7371, `WHITEWATER_VERIFY_LANE` unset — keeps names): mutating +
-  slow scripts. e.g. m110-replica-catchup, m4-split-rollback, m19-owner-recovery,
+- **Lane A** (7371, no suffix — keeps names): mutating + slow scripts. e.g.
+  m110-replica-catchup, m4-split-rollback, m19-owner-recovery,
   m7-subscription-member, then fault suite last.
-- **Lane B** (7871, `-b`): read-only group A — concurrent-append, m17, m2, m3,
+- **Lane B** (7871, `-a`): read-only group A — concurrent-append, m17, m2, m3,
   sdk-conformance.
-- **Lane C** (7891, `-c`): read-only group B — m4-auto-split, m4-live-split,
+- **Lane C** (7891, `-b`): read-only group B — m4-auto-split, m4-live-split,
   m4-split-merge-cycle, sdk-rust, wcl-cli-write.
 
 Verify ports chosen (7871/7891) are free of every mapped range; check again
@@ -193,13 +240,13 @@ live-acceptance:
     matrix:
       lane: [verify-mutating, verify-reads-a, verify-reads-b, isolated-zone, pipe, hotkeys]
   env:
-    COMPOSE_FILE: compose.verify.yml
-    WHITEWATER_TEST_BASE_PORT: "7371"   # fine: identical across legs, separate VMs
     MANY_READERS_OWNER_RECOVERY_TIMEOUT: "360"
   steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
       with: { python-version: "3.12" }
+    - uses: dtolnay/rust-toolchain@1.90.0    # sdk legs run cargo test on host
+    - uses: Swatinem/rust-cache@v2
     - name: Reclaim Docker disk space   # still per-leg, keep it
       run: docker system prune --all --volumes --force || true; docker system df
     - name: Live acceptance suite
@@ -279,10 +326,10 @@ env stays the regression default and runs every lane's union.
 
 ## Verification before merging
 
-1. `python -m unittest discover -s tests -p "test_*acceptance.py"` — extend
-   `AcceptanceDiagnosticTests` to cover lane scheduling (mock subprocess;
-   assert lane envs carry distinct base ports/subnets, fault suite ordering,
-   and that `--lane`/`WHITEWATER_ACCEPTANCE_LANE` selects exactly the mapped
+1. `python -m unittest discover -s tests -p "test_*acceptance.py"` —
+   `AcceptanceLaneTests` covers lane scheduling (distinct base
+   ports/subnets/projects per verify lane, fault-suite ordering, and that
+   `--lane`/`WHITEWATER_ACCEPTANCE_LANE` selects exactly the mapped
    scripts — nothing dropped, nothing double-run).
 2. `python scripts/run-acceptance.py` with no lane env must reproduce today's
    serial behaviour exactly (regression gate: union of all lanes ≡ current

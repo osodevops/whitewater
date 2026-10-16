@@ -1,6 +1,11 @@
 name: whitewater-verification
 
 x-node: &node
+  # A fixed tag shared by every service and every acceptance lane project
+  # (lane projects are selected through COMPOSE_PROJECT_NAME): the runner
+  # builds the Node image once and each lane's `up -d` reuses it instead of
+  # racing parallel builds of the same Dockerfile.
+  image: whitewater-verify-node:latest
   build:
     context: .
   environment: &node-environment
@@ -21,7 +26,7 @@ services:
   node1:
     <<: *node
     ports:
-      - "7371:7070"
+      - "${WHITEWATER_VERIFY_PORT_1:-7371}:7070"
     environment:
       <<: *node-environment
       WHITEWATER_NODE_ID: whitewater-verification-node1
@@ -33,7 +38,7 @@ services:
   node2:
     <<: *node
     ports:
-      - "7372:7070"
+      - "${WHITEWATER_VERIFY_PORT_2:-7372}:7070"
     environment:
       <<: *node-environment
       WHITEWATER_NODE_ID: whitewater-verification-node2
@@ -45,7 +50,7 @@ services:
   node3:
     <<: *node
     ports:
-      - "7373:7070"
+      - "${WHITEWATER_VERIFY_PORT_3:-7373}:7070"
     environment:
       <<: *node-environment
       WHITEWATER_NODE_ID: whitewater-verification-node3

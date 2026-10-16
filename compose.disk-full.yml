@@ -1,0 +1,67 @@
+name: whitewater-disk-full
+
+# Real filesystem-full fault scenario for scripts/test-disk-full.py.
+# node3's data directory is a small tmpfs: the test fills it with real
+# bytes so the store path takes a genuine ENOSPC (unlike the integration
+# test's synthetic max_range_bytes cap). Nodes 1-2 keep durable quorum
+# storage. Recreating node3 (`up -d --force-recreate`) gives it a fresh
+# empty tmpfs — the "disk replaced" recovery leg.
+
+x-node: &node
+  image: whitewater-verify-node:latest
+  build:
+    context: .
+  environment: &node-environment
+    WHITEWATER_SEEDS: node1:7070,node2:7070,node3:7070
+    WHITEWATER_NODE_CAPACITY: 100
+    WHITEWATER_ADMIN_API_KEY: ${WHITEWATER_ADMIN_API_KEY:-whitewater-local-development-admin-key}
+    WHITEWATER_CONTROL_NODES: 1@node1:7070,2@node2:7070,3@node3:7070
+    WHITEWATER_CONTROL_PLANE_KEY: ${WHITEWATER_CONTROL_PLANE_KEY:-whitewater-local-development-control-key}
+
+services:
+  node1:
+    <<: *node
+    ports:
+      - "7671:7070"
+    environment:
+      <<: *node-environment
+      WHITEWATER_NODE_ID: whitewater-disk-full-node1
+      WHITEWATER_CONTROL_NODE_ID: 1
+      WHITEWATER_ADVERTISE_URL: http://node1:7070
+    volumes:
+      - node1-data:/var/lib/whitewater
+
+  node2:
+    <<: *node
+    ports:
+      - "7672:7070"
+    environment:
+      <<: *node-environment
+      WHITEWATER_NODE_ID: whitewater-disk-full-node2
+      WHITEWATER_CONTROL_NODE_ID: 2
+      WHITEWATER_ADVERTISE_URL: http://node2:7070
+    volumes:
+      - node2-data:/var/lib/whitewater
+
+  node3:
+    <<: *node
+    ports:
+      - "7673:7070"
+    environment:
+      <<: *node-environment
+      WHITEWATER_NODE_ID: whitewater-disk-full-node3
+      WHITEWATER_CONTROL_NODE_ID: 3
+      WHITEWATER_ADVERTISE_URL: http://node3:7070
+    volumes:
+      # tmpfs mounts root:root by default; the Node runs as uid 10001, so
+      # the fault volume needs a world-writable mode to let the Node fill
+      # it (and then fail on it) instead of refusing at mount time.
+      - type: tmpfs
+        target: /var/lib/whitewater
+        tmpfs:
+          size: 67108864
+          mode: 0o1777
+
+volumes:
+  node1-data:
+  node2-data:

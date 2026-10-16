@@ -25,13 +25,18 @@ jobs:
       - run: cargo test --all-targets
       - run: python3 -m unittest discover -s tests -p "test_*acceptance.py"
 
+  # Each lane is a separate VM with its own Docker daemon, so verify legs
+  # share ports/subnets without colliding; see docs/parallel-acceptance-testing.md.
   live-acceptance:
     needs: rust-gate
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 40
+    strategy:
+      # A failed leg must not cancel the others — they are the coverage.
+      fail-fast: false
+      matrix:
+        lane: [verify-mutating, verify-reads-a, verify-reads-b, isolated-zone, pipe, hotkeys, disk-full]
     env:
-      COMPOSE_FILE: compose.verify.yml
-      WHITEWATER_TEST_BASE_PORT: "7371"
       # Hosted runners throttle under load — give owner recovery headroom.
       MANY_READERS_OWNER_RECOVERY_TIMEOUT: "360"
     steps:
@@ -39,6 +44,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # sdk legs run `cargo test` on the host; pin the toolchain and cache
+      # the build so every leg is not a cold Rust compile.
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
       # Runners arrive with a large pre-cached image set; reclaim it before
       # the suite builds images and stacks container layers on the same disk.
       - name: Reclaim Docker disk space
@@ -47,11 +56,15 @@ jobs:
           docker system df
       - name: Live acceptance suite
         run: python scripts/run-acceptance.py
+        env:
+          WHITEWATER_ACCEPTANCE_LANE: ${{ matrix.lane }}
       - name: Upload acceptance diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: acceptance-diagnostics
+          # Artifact names must be unique per leg — upload-artifact@v4
+          # rejects same-name uploads from parallel jobs.
+          name: acceptance-diagnostics-${{ matrix.lane }}
           path: acceptance-logs/
           if-no-files-found: warn
       - name: Verify no test residue
@@ -61,3 +74,18 @@ jobs:
           echo "volumes: $(docker volume ls -q | wc -l)"
           docker ps -a --format "table {{.Names}}\t{{.Status}}"
           docker volume ls
+
+  # Fan-in rollup so branch protection can require one stable check name —
+  # a matrix job reports as `live-acceptance (<lane>)` per leg. `if: always()`
+  # plus an explicit result check turns a failed leg into a gate failure
+  # instead of a skipped (pending) required check.
+  acceptance-gate:
+    needs: live-acceptance
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate on every acceptance leg
+        run: |
+          result="${{ needs.live-acceptance.result }}"
+          echo "live-acceptance result: ${result}"
+          test "${result}" = "success"
