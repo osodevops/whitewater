@@ -32,7 +32,10 @@ COMPOSE = "compose.disk-full.yml"
 ENDPOINTS = ["http://localhost:7671", "http://localhost:7672", "http://localhost:7673"]
 KEY = "whitewater-local-development-admin-key"
 BASELINE_RECORDS = 20
-DEGRADED_RECORDS = 40
+# The degraded phase keeps offering batches until the surviving quorum
+# accepts one; owner recovery off a live-but-full Node is fast locally but
+# must not be raced on a loaded CI runner.
+DEGRADED_DEADLINE = 180
 RECOVERY_DEADLINE = 240
 
 
@@ -245,11 +248,15 @@ def main():
         # any refusal is honest, but an acknowledged record may never vanish.
         # `sent` is every key ever offered; `acknowledged` only keys whose
         # batch returned 200 (refused batches may still appear in reads —
-        # ambiguous commits are legal, silent loss is not).
+        # ambiguous commits are legal, silent loss is not). The quorum
+        # recovers by moving range ownership off the full Node, which takes
+        # seconds locally but can take tens of seconds on a loaded CI
+        # runner — the contract is deadline-bounded, not attempt-bounded.
         sent = set(acknowledged)
         refused_batches = 0
         index = BASELINE_RECORDS
-        for _ in range(DEGRADED_RECORDS // 10):
+        degraded_deadline = time.monotonic() + DEGRADED_DEADLINE
+        while time.monotonic() < degraded_deadline and len(acknowledged) == BASELINE_RECORDS:
             offered = {f"diskfull-{index + i:06d}" for i in range(10)}
             sent |= offered
             acked = append_batch(writer_name, epoch, index, 10)
@@ -262,9 +269,13 @@ def main():
             f"degraded appends: {refused_batches} refused batches, "
             f"{len(acknowledged)} acknowledged records"
         )
+        if len(acknowledged) <= BASELINE_RECORDS:
+            code, out = compose("logs", "--tail", "3000")
+            print(f"node logs at stall:\n{out[-60000:]}")
         assert len(acknowledged) > BASELINE_RECORDS, (
-            "a single full disk stalled all writes — the surviving quorum "
-            "must keep the Feed writable"
+            f"a single full disk stalled all writes for "
+            f"{DEGRADED_DEADLINE}s — the surviving quorum must keep the "
+            f"Feed writable"
         )
 
         # Phase 4 — the committed prefix is uncorrupted: every acknowledged
