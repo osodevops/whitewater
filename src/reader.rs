@@ -2571,7 +2571,10 @@ impl SubscriptionPlacementAuthority for crate::control::ControlController {
         self.execute_commands(commands)
             .await
             .map(|_| ())
-            .map_err(|_| SubscriptionProgressError::Unavailable)
+            .map_err(|error| {
+                tracing::warn!(%error, "Subscription progress placement command failed");
+                SubscriptionProgressError::Unavailable
+            })
     }
 
     async fn progress_assignment(
@@ -2592,7 +2595,10 @@ impl SubscriptionPlacementAuthority for crate::control_plane::ControlPlane {
         self.execute_commands(commands)
             .await
             .map(|_| ())
-            .map_err(|_| SubscriptionProgressError::Unavailable)
+            .map_err(|error| {
+                tracing::warn!(%error, "Subscription progress placement command failed");
+                SubscriptionProgressError::Unavailable
+            })
     }
 
     async fn progress_assignment(

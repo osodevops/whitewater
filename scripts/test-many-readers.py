@@ -151,8 +151,15 @@ class Stats:
     def record_error(self, path, status, body):
         with self.lock:
             self.errors += 1
-            if len(self.error_samples) < 10:
-                self.error_samples.add(f"{path}: HTTP {status} {body.get('code')} {str(body.get('error', ''))[:300]}")
+            self._sample(path, status, body)
+
+    def record_sample(self, path, status, body):
+        with self.lock:
+            self._sample(path, status, body)
+
+    def _sample(self, path, status, body):
+        if len(self.error_samples) < 10:
+            self.error_samples.add(f"{path}: HTTP {status} {body.get('code')} {str(body.get('error', ''))[:300]}")
 
     def record_fetch(self, records):
         with self.lock:
@@ -171,6 +178,11 @@ def member_post(endpoint, path, body, stats, stop):
             result = (0, {"error": str(error)})
         status, response = result
         if status != 0 and status < 500 and not (status == 409 and response.get("code") == "no_quorum"):
+            # A persistent non-5xx refusal (e.g. a 409 wedge) is not retried
+            # but is diagnostic gold; routine lease contention stays in the
+            # worker's conflict counters instead.
+            if response.get("code") not in ("lease.busy", "lease.stale_lease"):
+                stats.record_sample(path, status, response)
             return result
         stats.record_error(path, status, response)
         if stop.wait(delay):

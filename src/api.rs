@@ -93,6 +93,7 @@ pub struct AppState {
     pub internal_http: reqwest::Client,
     pub internal_mtls: Option<Arc<InternalMtlsMaterial>>,
     pub admin_auth: AdminAuthenticator,
+    pub subscription_recovery_gates: Arc<SubscriptionRecoveryGates>,
 }
 
 pub struct SubscriptionTlsServer {
@@ -1972,6 +1973,47 @@ async fn member_coordinator_inner(
     Ok((coordinator, assignment, definition))
 }
 
+/// Serializes Subscription progress owner recovery per Subscription so racing
+/// member operations do not stampede the placement authority with concurrent
+/// ownership CASes: the first member request through the gate drives recovery
+/// while waiters recheck the live placement under the gate before deciding to
+/// CAS again. Without it, twelve concurrent members each run their own
+/// inspect/CAS/adopt storm, ratcheting the ownership epoch while the owner
+/// stays lost and drowning a leaderless Control Plane in internal traffic.
+#[derive(Default)]
+pub struct SubscriptionRecoveryGates {
+    gates: std::sync::Mutex<BTreeMap<Uuid, std::sync::Weak<Mutex<()>>>>,
+}
+
+impl SubscriptionRecoveryGates {
+    /// Acquires the per-Subscription recovery gate, waiting for any in-flight
+    /// recovery to finish. Weak entries keep the map bounded by live waiters:
+    /// idle gates are reclaimed once no recovery holds them.
+    async fn acquire(&self, subscription_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+        let gate = {
+            let mut gates = self
+                .gates
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if gates.len() > 256 {
+                gates.retain(|_, gate| gate.strong_count() > 0);
+            }
+            match gates
+                .get(&subscription_id)
+                .and_then(std::sync::Weak::upgrade)
+            {
+                Some(gate) => gate,
+                None => {
+                    let gate = Arc::new(Mutex::new(()));
+                    gates.insert(subscription_id, Arc::downgrade(&gate));
+                    gate
+                }
+            }
+        };
+        gate.lock_owned().await
+    }
+}
+
 /// True when reachable replicas hold divergent committed progress or member
 /// state: recovery must advance the ownership epoch and adopt the recovered
 /// frontier so lagging replicas heal before further mutations.
@@ -2002,6 +2044,51 @@ async fn member_coordinator_recovered(
     ),
     ApiError,
 > {
+    // Serialize owner recovery per Subscription: every member request that
+    // observes the lost owner would otherwise drive its own inspect/CAS/adopt
+    // storm, and concurrent CASes ratchet the ownership epoch while the owner
+    // stays lost.
+    let _gate = state
+        .subscription_recovery_gates
+        .acquire(definition.subscription_id)
+        .await;
+
+    // A racing recovery may already have moved ownership while this request
+    // waited on the gate; recheck the live placement before CASing again.
+    let current = state
+        .control
+        .active_subscription_progress_assignment_by_id(definition.subscription_id)
+        .await
+        .unwrap_or_else(|| coordinator.assignment().clone());
+    let (current_coordinator, current_assignment) = member_assignment_coordinator(state, current)?;
+    if let Ok(evidence) = current_coordinator.inspect_evidence().await {
+        if evidence
+            .iter()
+            .any(|(node, _)| node == &current_assignment.owner)
+            && !subscription_placement_diverged(&evidence)
+        {
+            let placement_stale = evidence.iter().any(|(_, inspection)| {
+                [&inspection.committed, &inspection.prepared]
+                    .into_iter()
+                    .flatten()
+                    .any(|mutation| mutation.ownership_epoch != current_assignment.ownership_epoch)
+            });
+            if placement_stale {
+                // A placement CAS landed while adoption missed at least one
+                // replica: heal its stale rows at the live epoch rather than
+                // ratcheting ownership again.
+                let outcome = current_coordinator
+                    .synchronize_placement()
+                    .await
+                    .map_err(subscription_progress_api_error)?;
+                let (coordinator, assignment) =
+                    member_assignment_coordinator(state, outcome.assignment)?;
+                return Ok((coordinator, assignment, definition));
+            }
+            return Ok((current_coordinator, current_assignment, definition));
+        }
+    }
+
     // The ownership CAS must replicate through the placement authority (the
     // Control Plane when configured); a local-catalog write would strand the
     // new epoch on the serving Node only. While a killed voter leaves the
@@ -2014,7 +2101,19 @@ async fn member_coordinator_recovered(
     // answers current epochs; ride that convergence inside the bounded member
     // request window rather than surfacing a transient quorum gap.
     for attempt in 0..20 {
-        result = coordinator
+        // The coordinator's assignment is fixed at build time, but a CAS
+        // that lands — this attempt's or a racing recovery's — advances the
+        // ownership epoch. Retrying on a stale assignment would keep
+        // inspecting replicas and CASing an expected epoch the catalog has
+        // already moved past, so rebuild the coordinator from the live
+        // placement each attempt.
+        let current = state
+            .control
+            .active_subscription_progress_assignment_by_id(definition.subscription_id)
+            .await
+            .unwrap_or_else(|| coordinator.assignment().clone());
+        let (attempt_coordinator, _) = member_assignment_coordinator(state, current)?;
+        result = attempt_coordinator
             .recover_lost_owner(state.progress_authority.as_ref())
             .await;
         let retryable = matches!(
@@ -2025,6 +2124,13 @@ async fn member_coordinator_recovered(
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+    }
+    if let Err(error) = &result {
+        tracing::warn!(
+            %error,
+            subscription = %definition.subscription_id,
+            "Subscription progress owner recovery failed within the member request window"
+        );
     }
     let outcome = result.map_err(subscription_progress_api_error)?;
     let (coordinator, assignment) = member_assignment_coordinator(state, outcome.assignment)?;
@@ -14504,6 +14610,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn subscription_recovery_gates_serialize_per_subscription() {
+        let gates = Arc::new(SubscriptionRecoveryGates::default());
+        let subscription = Uuid::from_u128(1);
+        let other = Uuid::from_u128(2);
+
+        let held = gates.acquire(subscription).await;
+
+        // A second waiter on the same Subscription blocks until the gate frees.
+        let waiter = {
+            let gates = gates.clone();
+            tokio::spawn(async move { gates.acquire(subscription).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        // Other Subscriptions recover independently.
+        let _independent = gates.acquire(other).await;
+
+        drop(held);
+        waiter.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn subscription_recovery_gates_reclaim_idle_locks() {
+        let gates = Arc::new(SubscriptionRecoveryGates::default());
+        for index in 0..300u32 {
+            let held = gates.acquire(Uuid::from_u128(index as u128)).await;
+            drop(held);
+        }
+        let map = gates.gates.lock().unwrap();
+        // Released gates leave dead Weak entries that are swept on the next
+        // acquire once the map grows, so the map stays bounded rather than
+        // accumulating one entry per Subscription ever seen.
+        assert!(map.len() <= 257);
+        assert!(map.values().all(|gate| gate.strong_count() == 0));
+    }
+
     #[test]
     fn read_quorum_reports_provably_lost_committed_history() {
         let nodes = ["storage-1", "storage-2", "storage-3"]
@@ -14807,6 +14951,7 @@ mod tests {
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,
+                subscription_recovery_gates: Default::default(),
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))
@@ -15014,6 +15159,7 @@ mod tests {
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,
+                subscription_recovery_gates: Default::default(),
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))
@@ -15245,6 +15391,7 @@ mod tests {
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,
+                subscription_recovery_gates: Default::default(),
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))
@@ -15452,6 +15599,7 @@ mod tests {
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,
+                subscription_recovery_gates: Default::default(),
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))
@@ -15767,6 +15915,7 @@ mod tests {
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,
+                subscription_recovery_gates: Default::default(),
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))
@@ -16059,6 +16208,7 @@ mod tests {
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,
+                subscription_recovery_gates: Default::default(),
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))
@@ -16380,6 +16530,7 @@ mod tests {
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,
+                subscription_recovery_gates: Default::default(),
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))
@@ -16727,6 +16878,7 @@ mod tests {
             internal_key: None,
             internal_http: reqwest::Client::new(),
             internal_mtls: None,
+            subscription_recovery_gates: Default::default(),
             admin_auth: AdminAuthenticator::new(Some(
                 "this-is-a-long-development-api-key".to_owned(),
             ))
@@ -16830,6 +16982,7 @@ mod tests {
             internal_key: None,
             internal_http: reqwest::Client::new(),
             internal_mtls: None,
+            subscription_recovery_gates: Default::default(),
             admin_auth: AdminAuthenticator::new(Some(
                 "this-is-a-long-development-api-key".to_owned(),
             ))
@@ -16952,6 +17105,7 @@ mod tests {
                 internal_key: Some("this-is-a-long-control-plane-key".to_owned()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,
+                subscription_recovery_gates: Default::default(),
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))
@@ -19923,6 +20077,7 @@ mod tests {
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,
+                subscription_recovery_gates: Default::default(),
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))
@@ -20504,6 +20659,7 @@ mod tests {
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,
+                subscription_recovery_gates: Default::default(),
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))
@@ -21901,6 +22057,7 @@ mod tests {
                 internal_key: Some(control_key.clone()),
                 internal_http: reqwest::Client::new(),
                 internal_mtls: None,
+                subscription_recovery_gates: Default::default(),
                 admin_auth: AdminAuthenticator::new(Some(
                     "this-is-a-long-development-api-key".to_owned(),
                 ))

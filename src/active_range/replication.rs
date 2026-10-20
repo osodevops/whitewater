@@ -377,15 +377,11 @@ impl ReplicaAppendService {
         &self,
         assignment: &ActiveRangeAssignment,
     ) -> Result<super::ReplicaRecoveryStatus, ReplicaAppendError> {
-        let snapshot = self
-            .store_for(assignment)
-            .await?
-            .snapshot()
-            .await
-            .map_err(map_store_error)?;
+        let store = self.store_for(assignment).await?;
+        let snapshot = store.snapshot().await.map_err(map_store_error)?;
         Ok(super::ReplicaRecoveryStatus {
             node: self.local_node.clone(),
-            healthy: true,
+            healthy: !store.persistence_failure(),
             appended: snapshot.progress.appended(),
             committed: snapshot.progress.commit_position(),
         })
@@ -483,15 +479,11 @@ impl ReplicaAppendService {
                     format!("no committed Active Range assignment exists for Feed {feed_id}"),
                 )
             })?;
-        let snapshot = self
-            .store_for(&assignment)
-            .await?
-            .snapshot()
-            .await
-            .map_err(map_store_error)?;
+        let store = self.store_for(&assignment).await?;
+        let snapshot = store.snapshot().await.map_err(map_store_error)?;
         Ok(super::ReplicaRecoveryStatus {
             node: self.local_node.clone(),
-            healthy: true,
+            healthy: !store.persistence_failure(),
             appended: snapshot.progress.appended(),
             committed: snapshot.progress.commit_position(),
         })

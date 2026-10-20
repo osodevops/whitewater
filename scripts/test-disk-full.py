@@ -216,7 +216,9 @@ def fill_node3_disk():
 
 
 def main():
-    code, out = compose("up", "-d", "--build")
+    # A cold Node image build far exceeds the default compose timeout on a
+    # fresh CI runner; the bring-up is bounded by the build, not readiness.
+    code, out = compose("up", "-d", "--build", timeout=1200)
     assert code == 0, out
     try:
         wait_ready()

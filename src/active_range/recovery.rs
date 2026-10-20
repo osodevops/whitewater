@@ -253,7 +253,8 @@ async fn probe_active_owners(
             let healthy = transport
                 .progress(&assignment.owner, assignment.feed_id)
                 .await
-                .is_ok();
+                .map(|status| status.healthy)
+                .unwrap_or(false);
             (feed_name, assignment, healthy)
         })
         .buffer_unordered(16)
@@ -504,5 +505,60 @@ mod tests {
         let results = task.await.unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|(_, _, healthy)| !healthy));
+    }
+
+    struct UnhealthyProbe;
+
+    #[async_trait]
+    impl RecoveryTransport for UnhealthyProbe {
+        async fn progress(
+            &self,
+            node: &StorageNodeId,
+            _feed_id: Uuid,
+        ) -> Result<ReplicaRecoveryStatus, String> {
+            Ok(ReplicaRecoveryStatus {
+                node: node.clone(),
+                healthy: false,
+                appended: RangePosition::new(3),
+                committed: CommitPosition::new(2),
+            })
+        }
+
+        async fn reconcile(
+            &self,
+            _node: &StorageNodeId,
+            _request: ReplicaReconcileRequest,
+        ) -> Result<u64, String> {
+            Err("reconcile is not used by a health probe".to_owned())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reachable_owner_reporting_persistence_failure_is_unhealthy() {
+        // A live-but-full Node still answers read probes; the probe must
+        // carry the replica's reported write health rather than treating a
+        // response alone as healthy.
+        let owner = StorageNodeId::try_new("storage-1").unwrap();
+        let assignment = ActiveRangeAssignment::try_new(
+            Uuid::from_u128(9),
+            RangeId::from_uuid(Uuid::new_v4()),
+            RangeGeneration::new(1),
+            owner.clone(),
+            ReplicaSet::try_new([
+                owner,
+                StorageNodeId::try_new("storage-2").unwrap(),
+                StorageNodeId::try_new("storage-3").unwrap(),
+            ])
+            .unwrap(),
+            OwnershipEpoch::new(1),
+        )
+        .unwrap();
+        let results = probe_active_owners(
+            &UnhealthyProbe,
+            [("feed".to_owned(), assignment)].into_iter().collect(),
+        )
+        .await;
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].2);
     }
 }

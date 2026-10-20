@@ -732,6 +732,7 @@ async fn main() -> Result<()> {
         internal_http: build_internal_client(Duration::from_secs(5))?,
         internal_mtls: internal_mtls.clone(),
         admin_auth,
+        subscription_recovery_gates: Default::default(),
     };
     let tls_router = config
         .subscription_mtls

@@ -293,6 +293,11 @@ struct FileActiveRangeStoreInner {
     directory: PathBuf,
     options: FileActiveRangeStoreOptions,
     loaded: Mutex<LoadedRange>,
+    /// Set when a mutating store operation fails at the persistence layer —
+    /// I/O, worker, or integrity errors — and cleared by the next successful
+    /// mutation. Recovery probes read it as replica write health: a replica
+    /// that cannot durably accept writes must not remain an Append Owner.
+    persistence_failure: std::sync::atomic::AtomicBool,
 }
 
 struct LoadedRange {
@@ -459,6 +464,7 @@ impl FileActiveRangeStore {
             inner: Arc::new(FileActiveRangeStoreInner {
                 directory,
                 options,
+                persistence_failure: std::sync::atomic::AtomicBool::new(false),
                 loaded: Mutex::new(LoadedRange {
                     persisted,
                     active_file,
@@ -482,6 +488,56 @@ impl FileActiveRangeStore {
             .await
             .map_err(|error| ActiveRangeStoreError::Worker(error.to_string()))?
     }
+
+    /// Runs a mutating store operation and records replica write health: a
+    /// persistence-level failure marks the replica unable to durably accept
+    /// writes until some mutation succeeds again, while logical rejections
+    /// never degrade it.
+    async fn blocking_mutation<T, F>(&self, operation: F) -> Result<T, ActiveRangeStoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&FileActiveRangeStoreInner) -> Result<T, ActiveRangeStoreError> + Send + 'static,
+    {
+        let result = self.blocking(operation).await;
+        match &result {
+            Ok(_) => self
+                .inner
+                .persistence_failure
+                .store(false, std::sync::atomic::Ordering::Relaxed),
+            Err(error) if store_error_is_persistence_failure(error) => self
+                .inner
+                .persistence_failure
+                .store(true, std::sync::atomic::Ordering::Relaxed),
+            Err(_) => {}
+        }
+        result
+    }
+
+    /// True when the last mutating store operation failed at the persistence
+    /// layer and no mutation has succeeded since.
+    pub fn persistence_failure(&self) -> bool {
+        self.inner
+            .persistence_failure
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Errors that mean the replica cannot durably accept writes — disk
+/// failures, worker failures, or integrity violations — as opposed to
+/// logical rejections such as stale epochs, sequence gaps, fencing, or
+/// declared bounds, which say nothing about the replica's ability to persist
+/// and must not make it unhealthy. `DiskCapacityExceeded` stays logical: it
+/// also fires when one oversized frame exceeds the bound on an empty range,
+/// which is request poison rather than replica sickness.
+fn store_error_is_persistence_failure(error: &ActiveRangeStoreError) -> bool {
+    matches!(
+        error,
+        ActiveRangeStoreError::Io(_)
+            | ActiveRangeStoreError::Worker(_)
+            | ActiveRangeStoreError::CorruptSegment { .. }
+            | ActiveRangeStoreError::UncommittedSealedSegment
+            | ActiveRangeStoreError::InvalidState(_)
+    )
 }
 
 #[async_trait]
@@ -501,7 +557,7 @@ impl ActiveRangeStore for FileActiveRangeStore {
         &self,
         request: ActiveRangeAppend,
     ) -> Result<ActiveRangeAppendResult, ActiveRangeStoreError> {
-        self.blocking(move |inner| append(inner, request, false))
+        self.blocking_mutation(move |inner| append(inner, request, false))
             .await
     }
 
@@ -509,7 +565,7 @@ impl ActiveRangeStore for FileActiveRangeStore {
         &self,
         request: ActiveRangeAppend,
     ) -> Result<ActiveRangeAppendResult, ActiveRangeStoreError> {
-        self.blocking(move |inner| append(inner, request, true))
+        self.blocking_mutation(move |inner| append(inner, request, true))
             .await
     }
 
@@ -519,7 +575,7 @@ impl ActiveRangeStore for FileActiveRangeStore {
         ownership_epoch: OwnershipEpoch,
         position: CommitPosition,
     ) -> Result<(), ActiveRangeStoreError> {
-        self.blocking(move |inner| commit(inner, generation, ownership_epoch, position))
+        self.blocking_mutation(move |inner| commit(inner, generation, ownership_epoch, position))
             .await
     }
 
@@ -613,8 +669,10 @@ impl ActiveRangeStore for FileActiveRangeStore {
         generation: RangeGeneration,
         ownership_epoch: OwnershipEpoch,
     ) -> Result<u64, ActiveRangeStoreError> {
-        self.blocking(move |inner| truncate_uncommitted(inner, generation, ownership_epoch))
-            .await
+        self.blocking_mutation(move |inner| {
+            truncate_uncommitted(inner, generation, ownership_epoch)
+        })
+        .await
     }
 
     async fn pending_effect(&self) -> Result<Option<PendingEffect>, ActiveRangeStoreError> {
@@ -634,7 +692,7 @@ impl ActiveRangeStore for FileActiveRangeStore {
         ownership_epoch: OwnershipEpoch,
         identity: PendingEffectRef,
     ) -> Result<PendingDiscardOutcome, ActiveRangeStoreError> {
-        self.blocking(move |inner| {
+        self.blocking_mutation(move |inner| {
             {
                 let loaded = inner
                     .loaded
@@ -665,7 +723,7 @@ impl ActiveRangeStore for FileActiveRangeStore {
         current_epoch: OwnershipEpoch,
         new_epoch: OwnershipEpoch,
     ) -> Result<(), ActiveRangeStoreError> {
-        self.blocking(move |inner| {
+        self.blocking_mutation(move |inner| {
             let mut loaded = inner
                 .loaded
                 .lock()
@@ -2006,5 +2064,69 @@ mod tests {
                 .unwrap(),
             IngestBoundary::Unordered
         );
+    }
+
+    #[tokio::test]
+    async fn persistence_failures_mark_the_replica_unhealthy_until_a_mutation_succeeds() {
+        let root = tempfile::TempDir::new().unwrap();
+        let store = FileActiveRangeStore::open(root.path(), test_descriptor()).unwrap();
+        assert!(!store.persistence_failure());
+
+        store
+            .blocking_mutation(|_| -> Result<(), ActiveRangeStoreError> {
+                Err(ActiveRangeStoreError::Io(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    "no space left on device",
+                )))
+            })
+            .await
+            .unwrap_err();
+        assert!(store.persistence_failure());
+
+        // A logical rejection leaves the degraded state untouched: fencing
+        // and sequencing errors say nothing about the replica's ability to
+        // persist, so they neither set nor clear write health.
+        store
+            .blocking_mutation(|_| -> Result<(), ActiveRangeStoreError> {
+                Err(ActiveRangeStoreError::OwnershipEpochDidNotAdvance)
+            })
+            .await
+            .unwrap_err();
+        assert!(store.persistence_failure());
+
+        // The next successful mutation proves the replica persists again.
+        store
+            .blocking_mutation(|_| -> Result<(), ActiveRangeStoreError> { Ok(()) })
+            .await
+            .unwrap();
+        assert!(!store.persistence_failure());
+    }
+
+    #[tokio::test]
+    async fn logical_rejections_do_not_degrade_a_healthy_replica() {
+        let root = tempfile::TempDir::new().unwrap();
+        let store = FileActiveRangeStore::open(root.path(), test_descriptor()).unwrap();
+
+        store
+            .blocking_mutation(|_| -> Result<(), ActiveRangeStoreError> {
+                Err(ActiveRangeStoreError::StaleOwnershipEpoch {
+                    current: OwnershipEpoch::new(2),
+                    supplied: OwnershipEpoch::new(1),
+                })
+            })
+            .await
+            .unwrap_err();
+        assert!(!store.persistence_failure());
+
+        store
+            .blocking_mutation(|_| -> Result<(), ActiveRangeStoreError> {
+                Err(ActiveRangeStoreError::PositionGap {
+                    expected: RangePosition::new(7),
+                    supplied: RangePosition::new(9),
+                })
+            })
+            .await
+            .unwrap_err();
+        assert!(!store.persistence_failure());
     }
 }
