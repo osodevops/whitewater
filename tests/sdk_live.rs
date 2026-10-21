@@ -12,6 +12,33 @@ use std::sync::Arc;
 
 use whitewater::sdk::{Client, HttpTransport, SdkError};
 
+/// Drive an SDK call to settlement against a live Riverbed: `retryable()`
+/// conditions (transient quorum/commit windows, election churn) retry the
+/// identical request — every call site passes a stable identity so a replay
+/// dedupes or returns the original outcome — while refusal/stale/fencing
+/// errors panic at once so semantic assertions still observe real rejections.
+macro_rules! settle {
+    ($call:expr, $context:expr) => {{
+        let mut attempts = 0_u32;
+        loop {
+            match { $call }.await {
+                Ok(value) => break value,
+                Err(error) if error.retryable() => {
+                    attempts += 1;
+                    if attempts > 120 {
+                        panic!(
+                            "{} stayed retryable through 120 attempts: {error:?}",
+                            $context
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+                Err(error) => panic!("{}: {error:?}", $context),
+            }
+        }
+    }};
+}
+
 fn live_client() -> Option<Client> {
     let nodes = std::env::var("WHITEWATER_SDK_NODES").ok()?;
     let bases: Vec<String> = nodes
@@ -39,11 +66,8 @@ async fn sdk_roundtrip_against_a_live_riverbed() {
         eprintln!("WHITEWATER_SDK_NODES unset — skipping live SDK acceptance");
         return;
     };
-    client.check_compatible().await.expect("protocol major");
-    let limits = client
-        .transport_limits()
-        .await
-        .expect("advertised transport bounds");
+    settle!(client.check_compatible(), "protocol major");
+    let limits = settle!(client.transport_limits(), "advertised transport bounds");
     assert_eq!(limits.max_frame_bytes, 64 * 1024 * 1024);
     assert!(limits.member_fetch_max_limit >= 1);
 
@@ -54,55 +78,52 @@ async fn sdk_roundtrip_against_a_live_riverbed() {
         format!("{domain}.rd"),
         format!("{domain}.sub"),
     );
-    let results = client
-        .wcl(&format!(
+    let results = settle!(
+        client.wcl(&format!(
             "CREATE DOMAIN {domain}; \
              CREATE FEED {feed}; \
              CREATE WRITER {writer} TO {feed}; \
              CREATE READER {reader} FROM {feed} START AT BEGINNING; \
              CREATE SUBSCRIPTION {subscription} FROM {feed} START AT BEGINNING;"
-        ))
-        .await
-        .expect("setup WCL");
+        )),
+        "setup WCL"
+    );
     assert_eq!(results.len(), 5, "every statement reported: {results:?}");
 
     // Writer: bind a session, append, then retry the identical request —
     // the durable record must dedupe rather than commit twice.
-    let mut writer = client.writer(&writer).await.expect("writer session");
+    let mut writer = settle!(client.writer(&writer), "writer session");
     assert!(writer.session_epoch() >= 1);
     let request_id = uuid::Uuid::new_v4();
-    let outcome = writer
-        .append(
+    let outcome = settle!(
+        writer.append(
             request_id,
             b"order-42",
             b"{\"total\":17}",
             1_700_000_000_000_000_001,
             BTreeMap::from([("source".to_owned(), b"sdk-live".to_vec())]),
-        )
-        .await
-        .expect("append");
+        ),
+        "append"
+    );
     assert!(!outcome.deduplicated);
     assert!(!outcome.cursor.is_empty(), "opaque Cursor returned");
-    let retry = writer
-        .append(
+    let retry = settle!(
+        writer.append(
             request_id,
             b"order-42",
             b"{\"total\":17}",
             1_700_000_000_000_000_001,
             BTreeMap::from([("source".to_owned(), b"sdk-live".to_vec())]),
-        )
-        .await
-        .expect("identical retry settles");
+        ),
+        "identical retry settles"
+    );
     assert!(retry.deduplicated, "same request_id dedupes server-side");
     assert_eq!(retry.message_id, outcome.message_id);
-    writer
-        .reopen()
-        .await
-        .expect("session reopens to a new epoch");
+    settle!(writer.reopen(), "session reopens to a new epoch");
 
     // Reader: fetch the record, ack the page's delivered cursor.
-    let mut reader = client.reader(&reader, 16).await.expect("reader open");
-    let page = reader.fetch(16).await.expect("reader fetch");
+    let mut reader = settle!(client.reader(&reader, 16), "reader open");
+    let page = settle!(reader.fetch(16), "reader fetch");
     assert_eq!(page.records.len(), 1, "page: {page:?}");
     assert_eq!(page.records[0].key, b"order-42");
     assert_eq!(page.records[0].event_time_ns, 1_700_000_000_000_000_001);
@@ -110,7 +131,7 @@ async fn sdk_roundtrip_against_a_live_riverbed() {
         page.records[0].metadata.get("source").map(Vec::as_slice),
         Some(b"sdk-live".as_slice())
     );
-    reader.ack().await.expect("ack delivered cursor");
+    settle!(reader.ack(), "ack delivered cursor");
     assert_eq!(
         reader.acknowledged_cursor(),
         page.delivered_cursor.as_deref(),
@@ -119,21 +140,21 @@ async fn sdk_roundtrip_against_a_live_riverbed() {
     reader.close().await.expect("close");
 
     // Subscription member: claim work, fetch its page, ack progress.
-    let member = client.member(&subscription).await.expect("member join");
-    let work = member.claim().await.expect("claim");
+    let member = settle!(client.member(&subscription), "member join");
+    let work = settle!(member.claim(), "claim");
     assert!(work.lease_epoch >= 1);
-    let work_page = member.fetch(&work, 16).await.expect("member fetch");
+    let work_page = settle!(member.fetch(&work, 16), "member fetch");
     assert_eq!(work_page.records.len(), 1, "member page: {work_page:?}");
     // The page reports its delivering claim's attempt number — the
     // durable per-work delivery counter retry budgets count against.
     assert_eq!(work_page.delivery_attempt, work.lease_epoch);
-    member.ack(&work, &work_page).await.expect("member ack");
+    settle!(member.ack(&work, &work_page), "member ack");
     // The ack consumes the lease: releasing it now must fence stale, not
     // silently succeed — the durable frontier already moved.
     assert_eq!(member.release(&work).await, Err(SdkError::LeaseStale));
 
     // Opaque-Cursor read straight off the Feed.
-    let records = client.records(&feed, None, 10).await.expect("feed records");
+    let records = settle!(client.records(&feed, None, 10), "feed records");
     assert!(
         records.iter().any(|record| record.key == b"order-42"),
         "feed read surfaces the appended record"
@@ -143,51 +164,40 @@ async fn sdk_roundtrip_against_a_live_riverbed() {
     // describe reports the live catalog row, pause/resume hold and
     // restart drives, and drop retires the declaration.
     let (out_feed, relay) = (format!("{domain}.out"), format!("{domain}.relay"));
-    client
-        .wcl(&format!(
+    settle!(
+        client.wcl(&format!(
             "CREATE FEED {out_feed}; \
              CREATE PIPE {relay} FROM SUBSCRIPTION {subscription} TO FEED {out_feed};"
-        ))
-        .await
-        .expect("pipe setup WCL");
-    let described = client.pipe(&relay).describe().await.expect("pipe describe");
+        )),
+        "pipe setup WCL"
+    );
+    let described = settle!(client.pipe(&relay).describe(), "pipe describe");
     assert_eq!(described.name, relay);
     assert_eq!(described.stage, "declared");
     assert_eq!(
         described.subscription_id,
-        client
-            .wcl(&format!("DESCRIBE SUBSCRIPTION {subscription};"))
-            .await
-            .expect("subscription describe")[0]
-            .pointer("/data/subscription_id")
-            .and_then(|v| v.as_str())
-            .expect("subscription id")
-            .parse::<uuid::Uuid>()
-            .expect("uuid")
+        settle!(
+            client.wcl(&format!("DESCRIBE SUBSCRIPTION {subscription};")),
+            "subscription describe"
+        )[0]
+        .pointer("/data/subscription_id")
+        .and_then(|v| v.as_str())
+        .expect("subscription id")
+        .parse::<uuid::Uuid>()
+        .expect("uuid")
     );
     assert_eq!(described.operation["operation"], "forward");
     assert!(described.output_feed_id.is_some());
-    assert!(client
-        .pipes()
-        .await
-        .expect("list pipes")
+    assert!(settle!(client.pipes(), "list pipes")
         .iter()
         .any(|pipe| pipe.name == relay));
-    client.pipe(&relay).pause().await.expect("pause");
-    let paused = client
-        .pipe(&relay)
-        .describe()
-        .await
-        .expect("paused describe");
+    settle!(client.pipe(&relay).pause(), "pause");
+    let paused = settle!(client.pipe(&relay).describe(), "paused describe");
     assert_eq!(paused.stage, "paused");
-    client.pipe(&relay).resume().await.expect("resume");
-    let resumed = client
-        .pipe(&relay)
-        .describe()
-        .await
-        .expect("resumed describe");
+    settle!(client.pipe(&relay).resume(), "resume");
+    let resumed = settle!(client.pipe(&relay).describe(), "resumed describe");
     assert_eq!(resumed.stage, "declared");
-    client.pipe(&relay).drop().await.expect("drop");
+    settle!(client.pipe(&relay).drop(), "drop");
     assert!(
         client.pipe(&relay).describe().await.is_err(),
         "dropped pipe refuses describe"
@@ -210,24 +220,24 @@ async fn state_store_index_and_temporary_facades_live() {
         format!("sdk{run}.kv"),
         format!("sdk{run}.bykey"),
     );
-    client
-        .wcl(&format!(
+    settle!(
+        client.wcl(&format!(
             "CREATE DOMAIN {domain}; \
              CREATE FEED {feed}; \
              CREATE WRITER {writer} TO {feed}; \
              OPEN WRITER SESSION {writer}; \
              DEFINE STATESTORE {store} KEYS region; \
              CREATE INDEX {index} ON {feed} FIELDS KEY, METADATA 'tenant';"
-        ))
-        .await
-        .expect("setup WCL");
+        )),
+        "setup WCL"
+    );
 
     // Manual StateStore: put -> strict lookup -> named get_by -> iterate
     // -> delete -> clear, with an identical mutation replay deduped.
     let store_api = client.state_store(&store);
     let mutation = uuid::Uuid::new_v4();
-    let outcome = store_api
-        .put_row(
+    let outcome = settle!(
+        store_api.put_row(
             mutation,
             b"acct-1",
             b"{\"tier\":\"gold\"}",
@@ -235,12 +245,12 @@ async fn state_store_index_and_temporary_facades_live() {
                 "region".to_owned(),
                 vec![TypedValue::Text("emea".to_owned())],
             )],
-        )
-        .await
-        .expect("put_row");
+        ),
+        "put_row"
+    );
     assert!(!outcome.deduplicated);
-    let replay = store_api
-        .put_row(
+    let replay = settle!(
+        store_api.put_row(
             mutation,
             b"acct-1",
             b"{\"tier\":\"gold\"}",
@@ -248,59 +258,61 @@ async fn state_store_index_and_temporary_facades_live() {
                 "region".to_owned(),
                 vec![TypedValue::Text("emea".to_owned())],
             )],
-        )
-        .await
-        .expect("identical retry");
+        ),
+        "identical retry"
+    );
     assert!(replay.deduplicated, "same mutation_id dedupes");
 
-    let lookup = store_api.lookup(b"acct-1", true).await.expect("lookup");
+    let lookup = settle!(store_api.lookup(b"acct-1", true), "lookup");
     assert_eq!(
         lookup.row.as_ref().map(|row| row.payload.as_slice()),
         Some(b"{\"tier\":\"gold\"}".as_slice())
     );
-    let page = store_api
-        .get_by(
+    let page = settle!(
+        store_api.get_by(
             "region",
             &[TypedValue::Text("emea".to_owned())],
             Some(10),
             false,
-        )
-        .await
-        .expect("get_by");
+        ),
+        "get_by"
+    );
     assert_eq!(page.rows.len(), 1);
-    let walk = store_api.iterate(None, Some(10)).await.expect("iterate");
+    let walk = settle!(store_api.iterate(None, Some(10)), "iterate");
     assert_eq!(walk.rows.len(), 1);
     assert_eq!(walk.next_key, None);
-    store_api
-        .delete_row(uuid::Uuid::new_v4(), b"acct-1")
-        .await
-        .expect("delete_row");
-    assert!(store_api
-        .lookup(b"acct-1", true)
-        .await
-        .expect("lookup after delete")
-        .row
-        .is_none());
-    store_api.clear(uuid::Uuid::new_v4()).await.expect("clear");
+    let delete_mutation = uuid::Uuid::new_v4();
+    settle!(
+        store_api.delete_row(delete_mutation, b"acct-1"),
+        "delete_row"
+    );
+    assert!(
+        settle!(store_api.lookup(b"acct-1", true), "lookup after delete")
+            .row
+            .is_none()
+    );
+    let clear_mutation = uuid::Uuid::new_v4();
+    settle!(store_api.clear(clear_mutation), "clear");
 
     // Writer append lands in retained history, then REBUILD INDEX runs
     // the shadow build; bounded-poll the query until activation posts
     // the row (builds are asynchronous by design).
-    let writer_api = client.writer(&writer).await.expect("writer session");
-    writer_api
-        .append(
-            uuid::Uuid::new_v4(),
+    let writer_api = settle!(client.writer(&writer), "writer session");
+    let index_append_id = uuid::Uuid::new_v4();
+    settle!(
+        writer_api.append(
+            index_append_id,
             b"order-7",
             b"created",
             1_700_000_000_000_000_010,
             BTreeMap::from([("tenant".to_owned(), b"acme".to_vec())]),
-        )
-        .await
-        .expect("append");
-    client
-        .wcl(&format!("REBUILD INDEX {index};"))
-        .await
-        .expect("rebuild index");
+        ),
+        "append"
+    );
+    settle!(
+        client.wcl(&format!("REBUILD INDEX {index};")),
+        "rebuild index"
+    );
 
     // The shadow build activates asynchronously — wait on the catalog
     // lifecycle (`stage=active`) rather than racing query errors.
@@ -322,8 +334,8 @@ async fn state_store_index_and_temporary_facades_live() {
 
     // `strict` bounded-waits for the serving checkpoint to reach the
     // activation frontier — the posting must be visible now.
-    let page = client
-        .query_index(
+    let page = settle!(
+        client.query_index(
             &index,
             IndexQuery::Exact(vec![
                 TypedValue::Bytes(b"order-7".to_vec()),
@@ -332,28 +344,28 @@ async fn state_store_index_and_temporary_facades_live() {
             ]),
             Some(10),
             true,
-        )
-        .await
-        .expect("index query after activation");
+        ),
+        "index query after activation"
+    );
     assert_eq!(page.rows.len(), 1, "exact posting: {page:?}");
 
     // Temporary fetch: bounded read off the same Feed.
-    let page = client
-        .temporary_fetch(
+    let page = settle!(
+        client.temporary_fetch(
             &feed,
             whitewater::sdk::TemporaryFetch {
                 limit: 10,
                 wait_ms: Some(500),
                 ..whitewater::sdk::TemporaryFetch::default()
             },
-        )
-        .await
-        .expect("temporary fetch");
+        ),
+        "temporary fetch"
+    );
     assert!(page.records.iter().any(|record| record.key == b"order-7"));
 
     // Range mode wire shape end-to-end (empty results are valid evidence).
-    let _ = client
-        .query_index(
+    let _ = settle!(
+        client.query_index(
             &index,
             IndexQuery::Range {
                 leading: vec![],
@@ -368,9 +380,9 @@ async fn state_store_index_and_temporary_facades_live() {
             },
             Some(10),
             false,
-        )
-        .await
-        .expect("range query");
+        ),
+        "range query"
+    );
 
     // Index demand attribution: every served query lands on the answering
     // replica's Node-local row — merge across the endpoint pool since the
@@ -378,10 +390,10 @@ async fn state_store_index_and_temporary_facades_live() {
     let mut queries = 0_u64;
     let mut rows_returned = 0_u64;
     for _ in 0..3 {
-        let reply = client
-            .wire("GET", "/v1/admin/demand/indexes", None)
-            .await
-            .expect("index demand telemetry");
+        let reply = settle!(
+            client.wire("GET", "/v1/admin/demand/indexes", None),
+            "index demand telemetry"
+        );
         for row in reply.body["indexes"].as_array().into_iter().flatten() {
             if row["index"] == index {
                 let telemetry = &row["telemetry"];
@@ -409,16 +421,16 @@ async fn stale_member_epoch_fences_as_typed_errors() {
         format!("wr{run}"),
         format!("sdk{run}.sub"),
     );
-    client
-        .wcl(&format!(
+    settle!(
+        client.wcl(&format!(
             "CREATE DOMAIN {domain}; \
              CREATE FEED {feed}; \
              CREATE WRITER {writer} TO {feed}; \
              OPEN WRITER SESSION {writer}; \
              CREATE SUBSCRIPTION {subscription} FROM {feed} START AT BEGINNING;"
-        ))
-        .await
-        .expect("setup WCL");
+        )),
+        "setup WCL"
+    );
 
     // A member whose epoch was never joined (or went stale) must be
     // fenced by the wire contract, not silently admitted.

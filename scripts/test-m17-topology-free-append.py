@@ -31,8 +31,20 @@ def _retried(operation):
 
     return wrapped
 
-@_retried
 def request(endpoint, path, body, authenticated=True):
+    # Transient 5xx retries keep the same body â€” request_id identities
+    # inside the payload make the retry idempotent; refusals return.
+    for _ in range(120):
+        status, result = _request_once(endpoint, path, body, authenticated)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+
+@_retried
+def _request_once(endpoint, path, body, authenticated=True):
     headers = {"content-type": "application/json"}
     if authenticated:
         headers["authorization"] = f"Bearer {ADMIN_KEY}"
@@ -48,10 +60,19 @@ def request(endpoint, path, body, authenticated=True):
     except urllib.error.HTTPError as error:
         payload = json.loads(error.read() or b"{}")
         return error.code, payload
-
-
+    except OSError:
+        return 0, {}
 @_retried
 def get(endpoint, path):
+    for _ in range(120):
+        status, result = _get_once(endpoint, path)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _get_once(endpoint, path):
     request_value = urllib.request.Request(
         f"{endpoint}{path}",
         headers={"authorization": f"Bearer {ADMIN_KEY}"},
@@ -77,7 +98,7 @@ def main():
     status, created = request(
         ENDPOINTS["control-1"],
         "/v1/admin/wcl",
-        {"script": f"CREATE SPACE {space}; CREATE FEED {feed}; INSPECT PLACEMENT FOR FEED {feed};"},
+        {"request_id": str(uuid.uuid4()), "script": f"CREATE SPACE {space}; CREATE FEED {feed}; INSPECT PLACEMENT FOR FEED {feed};"},
     )
     assert_equal(status, 200, "Feed creation")
     placement = created["results"][-1]["data"]

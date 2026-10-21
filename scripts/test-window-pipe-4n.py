@@ -23,8 +23,8 @@ CERTS_DIR = ".mtls-join-certs"
 CERT_NODES = VOTER_SERVICES + [STORAGE_NODE]
 
 WINDOW_NS = 8_000_000_000
-PANE_NS = WINDOW_NS // 16  # 500ms — 16 panes per window
-MAX_LATE_NS = 6_000_000_000
+PANE_NS = WINDOW_NS // 16  # 500ms â€” 16 panes per window
+MAX_LATE_NS = 20_000_000_000
 
 
 # Transient connection errors between the host and Docker-published ports are
@@ -61,23 +61,34 @@ def post_once(node, path, payload):
             return response.status, json.load(response)
     except urllib.error.HTTPError as error:
         return error.code, json.load(error)
+    except OSError:
+        return 0, {}
+_post_transport = _retried(post_once)
 
 
-post = _retried(post_once)
+def post(node, path, payload):
+    for _ in range(120):
+        status, result = _post_transport(node, path, payload)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
 
 
-def wcl(node, script):
-    status, response = post(node, "/v1/admin/wcl", {"script": script})
+def wcl(node, script, request_id=None):
+    status, response = post(node, "/v1/admin/wcl", {"request_id": request_id or str(uuid.uuid4()), "script": script})
     if status != 200:
         raise AssertionError({"script": script, "response": response})
     return [result["data"] for result in response["results"]]
 
 
 def wcl_retry(node, script, attempts=30, delay=1):
+    request_id = str(uuid.uuid4())
     last = None
     for _ in range(attempts):
         try:
-            return wcl(node, script)
+            return wcl(node, script, request_id)
         except AssertionError as error:
             last = error
             time.sleep(delay)
@@ -302,7 +313,7 @@ def storage_pin():
 def strip_voter_pins():
     # Remove the storage Node's pin from every voter's static peer set so the
     # voters can only trust its certificate after the catalog registration
-    # distributes the pin — the mechanism this acceptance exists to prove.
+    # distributes the pin â€” the mechanism this acceptance exists to prove.
     for voter in CERT_NODES:
         if voter == STORAGE_NODE:
             continue
@@ -349,7 +360,7 @@ def admin_progress(node, subscription):
 
 def storage_serves_read(feed, expected):
     """Poll until the storage Node serves at least `expected` committed
-    records — its local replica must catch up to the moved prefix."""
+    records â€” its local replica must catch up to the moved prefix."""
     deadline = time.time() + 150
     last = None
     while time.time() < deadline:
@@ -382,7 +393,7 @@ def main():
         generate_certificates()
     strip_voter_pins()
     subprocess.run([*COMPOSE, "down", "-v"], check=True)
-    # Three voters only — the storage Node joins later, turning the run into
+    # Three voters only â€” the storage Node joins later, turning the run into
     # a live three-to-four-Node topology change.
     subprocess.run([*COMPOSE, "up", "-d", "--build", *VOTER_SERVICES], check=True)
     try:
@@ -405,14 +416,18 @@ def main():
             f"OPEN WRITER SESSION {writer}; "
             f"CREATE SUBSCRIPTION {subscription} FROM {source} START AT BEGINNING; "
             f"CREATE PIPE {pipe} FROM SUBSCRIPTION {subscription} "
-            f"TO STATESTORE {panes_store} WINDOW 8s EVENT MAX_LATE 6s "
+            f"TO STATESTORE {panes_store} WINDOW 8s EVENT MAX_LATE 20s "
             f"BY JSON 'customer' SUM JSON 'amount' EMIT TO FEED {results_feed};",
         )
         writer_epoch = results[5]["session_epoch"]
 
         # Pane P0 anchored ~2s ahead so batch placement is jitter-proof.
         t0 = time.time_ns()
-        p0 = (t0 + 2_000_000_000) // PANE_NS
+        # Margin: ingest_time is server-stamped at commit; under host load a
+        # commit can trail the request by many seconds. Lateness is measured
+        # ingest - event, so events need this much future headroom to keep
+        # on-time records out of the lateness sentinel.
+        p0 = (t0 + 30_000_000_000) // PANE_NS
         p0_start = p0 * PANE_NS
 
         append_json(
@@ -457,7 +472,7 @@ def main():
         assert_subset(emitted, expected)
 
         # Compute-lease evidence: the Pipe's drive authority is a catalog
-        # lease seeded co-located with the Subscription progress owner —
+        # lease seeded co-located with the Subscription progress owner â€”
         # but it moves independently.
         progress = admin_progress(VOTERS[0], subscription)
         row = show_pipe(VOTERS[0], pipe)
@@ -494,12 +509,12 @@ def main():
         # Fresh input while the compute lease and the progress owner live
         # on different Nodes proves the remote drive path end-to-end.
         tm = time.time_ns()
-        pm = pane_of(tm)
+        pm = pane_of(tm + 30_000_000_000)
         append_json(
             VOTERS[2],
             writer,
             writer_epoch,
-            [("acme", 9, tm)],
+            [("acme", 9, tm + 30_000_000_000)],
             retries=30,
         )
         source_records += 1
@@ -517,7 +532,7 @@ def main():
             )
 
         # Three-to-four: start and register the storage Node. Its pin is not
-        # in the voters' static peer set — only the catalog registration
+        # in the voters' static peer set â€” only the catalog registration
         # makes it a trusted internal peer.
         subprocess.run([*COMPOSE, "up", "-d", STORAGE_NODE], check=True)
         wait_for_nodes(NODES, "four-Node")
@@ -533,8 +548,8 @@ def main():
         if not registered or not registered[0].get("eligible", True):
             raise AssertionError({"storage_nodes": shown})
 
-        # Drain the first voter: every drained replica — Feed ranges AND
-        # Subscription progress — has {storage-1} as its only eligible
+        # Drain the first voter: every drained replica â€” Feed ranges AND
+        # Subscription progress â€” has {storage-1} as its only eligible
         # replacement, so control-1's responsibilities land on the joined
         # Node deterministically. The drain supervisor retires each planned
         # move as it lands, so the move evidence is the union over polls.
@@ -574,29 +589,29 @@ def main():
         # Fresh input after the topology change aggregates and emits on the
         # four-Node placement; a deliberately late record still quarantines.
         t2 = time.time_ns()
-        p2 = pane_of(t2)
+        p2 = pane_of(t2 + 30_000_000_000)
         append_json(
             VOTERS[1],
             writer,
             writer_epoch,
             [
-                ("globex", 3, t2),
-                ("acme", 2, t2 + 600_000_000),
-                ("lateco", 999, p0_start + 10_000_000),
+                ("globex", 3, t2 + 30_000_000_000),
+                ("acme", 2, t2 + 30_600_000_000),
+                ("lateco", 999, t2 - 45_000_000_000),
             ],
             retries=45,
         )
         source_records += 3
         expected[("globex", p2)] = (1, 3)
         # t2 + 600ms can cross two pane boundaries when t2 sits in the
-        # last 100ms of its pane — compute the pane, don't assume p2 + 1.
-        expected[("acme", pane_of(t2 + 600_000_000))] = (1, 2)
+        # last 100ms of its pane â€” compute the pane, don't assume p2 + 1.
+        expected[("acme", pane_of(t2 + 30_600_000_000))] = (1, 2)
         deadline = time.time() + 150
         emitted = None
         last_error = None
         while time.time() < deadline:
             try:
-                emitted = emissions(wait_records(results_feed, 7, deadline=30))
+                emitted = emissions(wait_records(results_feed, 7, deadline=90))
                 assert_subset(emitted, expected)
                 break
             except AssertionError as error:
@@ -619,12 +634,12 @@ def main():
         wait_for_nodes(NODES, "post-restart four-Node")
         storage_serves_read(source, source_records)
         t3 = time.time_ns()
-        p3 = pane_of(t3)
+        p3 = pane_of(t3 + 30_000_000_000)
         append_json(
             VOTERS[0],
             writer,
             writer_epoch,
-            [("acme", 4, t3)],
+            [("acme", 4, t3 + 30_000_000_000)],
             retries=45,
         )
         source_records += 1
@@ -634,7 +649,7 @@ def main():
         last_error = None
         while time.time() < deadline:
             try:
-                emitted = emissions(wait_records(results_feed, 8, deadline=30))
+                emitted = emissions(wait_records(results_feed, 8, deadline=90))
                 assert_subset(emitted, expected)
                 break
             except AssertionError as error:

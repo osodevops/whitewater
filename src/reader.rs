@@ -3167,11 +3167,31 @@ impl SubscriptionProgressCoordinator {
         &self,
         control: &A,
     ) -> Result<SubscriptionRecoveryOutcome, SubscriptionProgressError> {
-        let evidence = self.inspect_evidence().await?;
-        let (recovered, member_state) = Self::recovered_committed(&evidence)?;
-        let proposed_owner = self.recovery_owner(&evidence, recovered.as_ref())?;
+        let stage = |stage: &'static str| {
+            move |error: SubscriptionProgressError| {
+                tracing::warn!(
+                    %error,
+                    stage,
+                    subscription = %self.assignment.subscription_id,
+                    owner = %self.assignment.owner,
+                    ownership_epoch = self.assignment.ownership_epoch,
+                    "Subscription progress owner recovery attempt failed"
+                );
+                error
+            }
+        };
+        let evidence = self
+            .inspect_evidence()
+            .await
+            .map_err(stage("inspect_evidence"))?;
+        let (recovered, member_state) =
+            Self::recovered_committed(&evidence).map_err(stage("recovered_committed"))?;
+        let proposed_owner = self
+            .recovery_owner(&evidence, recovered.as_ref())
+            .map_err(stage("recovery_owner"))?;
         self.commit_owner_move(control, proposed_owner, recovered, member_state)
             .await
+            .map_err(stage("commit_owner_move"))
     }
 
     /// Moves Subscription progress ownership to a caller-chosen replica while

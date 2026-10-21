@@ -11,6 +11,10 @@ x-node: &node
     WHITEWATER_CONTROL_PLANE_KEY: ${WHITEWATER_CONTROL_PLANE_KEY:-whitewater-local-development-control-key}
     WHITEWATER_AUTO_SPLIT_APPEND_RATE: 1000000000
     WHITEWATER_AUTO_MERGE_SUSTAINED_SAMPLES: 1000000000
+    # Fault lanes kill Control Plane voters; openraft election/leader-transition
+    # logs are the difference between "CAS never attempted" and "raft stayed
+    # leaderless" in the captured diagnostics.
+    RUST_LOG: whitewater=info,openraft=info,tower_http=info
 
 services:
   control-1:

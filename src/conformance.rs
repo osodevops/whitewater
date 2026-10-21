@@ -55,6 +55,7 @@ impl ScenarioReport {
 pub struct ConformanceRunner {
     client: Client,
     chaos_hook: Option<ChaosHook>,
+    transient_attempts: u64,
 }
 
 /// Driver-injected fault action: `chaos.<action>` steps call it with
@@ -69,7 +70,17 @@ impl ConformanceRunner {
         Self {
             client,
             chaos_hook: None,
+            transient_attempts: 120,
         }
+    }
+
+    /// Bound the infrastructure-transient retry budget (transport errors
+    /// and 5xx unavailability) independently of a step's `poll` window —
+    /// tests shrink it, live drivers keep the 120-attempt (~60s) default.
+    /// Retries preserve the step's original request body verbatim.
+    pub fn with_transient_attempts(mut self, transient_attempts: u64) -> Self {
+        self.transient_attempts = transient_attempts;
+        self
     }
 
     /// Install the driver-provided fault executor for `chaos.*` steps.
@@ -178,7 +189,15 @@ impl ConformanceRunner {
                     }),
                 };
             }
-            let args = context.substitute(&step.get("args").cloned().unwrap_or_else(|| json!({})));
+            // Args are substituted per dispatch attempt: `{{now_ns}}`
+            // stamps each send so a retried request's event time does not
+            // go stale across a transient stall and quarantine under the
+            // declared lateness bound. Request identity stays stable —
+            // named `{{uuid:name}}` tokens memoize on the context and
+            // anonymous `{{uuid}}` occurrences bind to synthetic names
+            // once per step below.
+            let mut args_template = step.get("args").cloned().unwrap_or_else(|| json!({}));
+            bind_anonymous_uuids(&mut args_template, index);
             // `poll` re-dispatches the step until `expect` passes (or
             // dispatch stops erroring): asynchronous surfaces — Pipe
             // drives, index builds, replica catch-up — settle on their
@@ -198,10 +217,24 @@ impl ConformanceRunner {
                 .unwrap_or(500)
                 .min(10_000);
             let mut attempt = 0u64;
+            // A separate budget for infrastructure transients — transport
+            // errors and 5xx unavailability — so an `expect`-driven `poll`
+            // window is not spent retrying the Riverbed's own retryable
+            // conditions, and unpollable steps still ride out a bounded
+            // commit/election window instead of reporting a flaky step.
+            let mut transient_attempts = 0u64;
             let (_status, body) = loop {
-                attempt += 1;
+                let args = context.substitute(&args_template);
                 match dispatch(&client, &op, &args).await {
                     Err(message) => {
+                        if message.starts_with("transport:")
+                            && transient_attempts < self.transient_attempts
+                        {
+                            transient_attempts += 1;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue;
+                        }
+                        attempt += 1;
                         if attempt < poll_times {
                             tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
                             continue;
@@ -218,6 +251,12 @@ impl ConformanceRunner {
                         };
                     }
                     Ok((status, body)) => {
+                        if status >= 500 && transient_attempts < self.transient_attempts {
+                            transient_attempts += 1;
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            continue;
+                        }
+                        attempt += 1;
                         if let Some(expect) = step.get("expect").and_then(Value::as_object) {
                             // Literal expectations can carry tokens
                             // (`"sdk{{uniq}}.events"`); operator strings
@@ -305,6 +344,38 @@ impl ConformanceRunner {
 /// themselves contain dots (enriched-record metadata such as
 /// `enrich.matched`). A malformed bracket fails the path rather than
 /// silently resolving to the field alone.
+/// Rewrite each anonymous `{{uuid}}` occurrence to a deterministic
+/// `{{uuid:anon-{step}-{ordinal}}}` so re-substituted retries reuse one
+/// minted identity per occurrence instead of drifting — JSON traversal
+/// order makes the ordinal stable across attempts.
+fn bind_anonymous_uuids(value: &mut Value, step: usize) {
+    let mut ordinal = 0usize;
+    bind_anonymous_uuids_inner(value, step, &mut ordinal);
+}
+
+fn bind_anonymous_uuids_inner(value: &mut Value, step: usize, ordinal: &mut usize) {
+    match value {
+        Value::String(text) => {
+            while text.contains("{{uuid}}") {
+                let bound = format!("{{{{uuid:anon-{step}-{ordinal}}}}}");
+                *ordinal += 1;
+                *text = text.replacen("{{uuid}}", &bound, 1);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                bind_anonymous_uuids_inner(item, step, ordinal);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values_mut() {
+                bind_anonymous_uuids_inner(item, step, ordinal);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn get_path<'v>(value: &'v Value, path: &str) -> Option<&'v Value> {
     // Dots inside `["..."]` brackets belong to the key, not a separator.
     let mut segments = Vec::new();
@@ -955,6 +1026,111 @@ mod tests {
         assert!(!failure.unsupported);
         assert_eq!(failure.step, 0);
         assert_eq!(failure.status, Some(200));
+    }
+
+    #[tokio::test]
+    async fn runner_retries_transient_5xx_without_spending_poll_attempts() {
+        // A step with no `poll` declaration still rides out transient
+        // unavailability (election/commit windows) on the separate
+        // transient budget; the eventual definitive response is what
+        // `expect` evaluates.
+        let (runner, transport) = runner(vec![
+            (
+                503,
+                json!({"error": "Control Plane is unavailable: majority commit timed out"}),
+            ),
+            (503, json!({"error": "leader election in progress"})),
+            (
+                200,
+                json!({"records": [{"payload_base64": "Zm9yd2FyZGVk"}]}),
+            ),
+        ]);
+        let report = runner
+            .run_scenario(
+                "transient",
+                &json!({"steps": [
+                    {
+                        "op": "feed.records",
+                        "args": {"feed": "t.events"},
+                        "expect": {"records[0].payload_base64": "Zm9yd2FyZGVk"}
+                    }
+                ]}),
+            )
+            .await;
+        assert!(report.passed(), "{report:?}");
+        assert_eq!(transport.requests.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn runner_preserves_request_identity_across_transient_retries() {
+        // Anonymous `{{uuid}}` request identities bind once per step:
+        // a transient retry re-sends the same identity (server dedup
+        // replays the committed result rather than double-applying)
+        // while clock tokens re-resolve per send.
+        let (runner, transport) = runner(vec![
+            (503, json!({"error": "majority commit timed out"})),
+            (200, json!({"cursor": "c1", "deduplicated": true})),
+        ]);
+        let report = runner
+            .run_scenario(
+                "identity",
+                &json!({"steps": [
+                    {
+                        "op": "writer.append",
+                        "args": {
+                            "request_id": "{{uuid}}",
+                            "writer": "w1",
+                            "session_epoch": "1",
+                            "key": {"utf8": "k"},
+                            "payload": {"utf8": "v"},
+                            "event_time_ns": "{{now_ns}}"
+                        },
+                        "expect": {"cursor": "!=null"}
+                    }
+                ]}),
+            )
+            .await;
+        assert!(report.passed(), "{report:?}");
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let id_of = |body: &Value| {
+            body.get("request_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        let first = id_of(&requests[0].2).expect("request_id present");
+        assert_eq!(Some(first.as_str()), id_of(&requests[1].2).as_deref());
+        assert!(!first.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runner_reports_5xx_after_transient_budget_exhausts() {
+        // Once the transient budget is spent, the still-transient
+        // response is handed to `expect` and reported — the runner never
+        // retries infrastructure unavailability forever.
+        let (runner, transport) = runner(vec![
+            (503, json!({"error": "majority commit timed out"})),
+            (503, json!({"error": "majority commit timed out"})),
+            (503, json!({"error": "majority commit timed out"})),
+        ]);
+        let report = runner
+            .with_transient_attempts(2)
+            .run_scenario(
+                "transient-exhausted",
+                &json!({"steps": [
+                    {
+                        "op": "feed.records",
+                        "args": {"feed": "t.events"},
+                        "expect": {"records": "len>=1"}
+                    }
+                ]}),
+            )
+            .await;
+        let failure = report
+            .failure
+            .expect("exhausted transient budget reports the last 5xx");
+        assert_eq!(failure.status, Some(503));
+        assert_eq!(transport.requests.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

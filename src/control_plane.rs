@@ -608,9 +608,17 @@ impl ControlPlane {
         let config = Arc::new(
             Config {
                 cluster_name: "whitewater-control-plane".to_owned(),
-                heartbeat_interval: 500,
-                election_timeout_min: 1_500,
-                election_timeout_max: 3_000,
+                // openraft hard-times every AppendEntries RPC — heartbeats and
+                // log replication alike — at `heartbeat_interval`. On a
+                // CPU-starved host the internal HTTP round trip exceeds
+                // 500ms easily, which starves the commit quorum: reads keep
+                // succeeding (they need no commit) while every write stalls.
+                // Two seconds of RPC headroom plus a four-to-eight-second
+                // election window keeps leader failover inside single-digit
+                // seconds without mistaking a busy peer for a dead one.
+                heartbeat_interval: 2_000,
+                election_timeout_min: 4_000,
+                election_timeout_max: 8_000,
                 snapshot_policy: openraft::SnapshotPolicy::LogsSinceLast(500),
                 max_in_snapshot_log_to_keep: 100,
                 ..Default::default()
@@ -699,7 +707,7 @@ impl ControlPlane {
         let issued_at_ns = unix_ns();
         for (index, command) in commands.into_iter().enumerate() {
             if command.is_read_only() {
-                tokio::time::timeout(Duration::from_secs(5), self.raft.ensure_linearizable())
+                tokio::time::timeout(Duration::from_secs(15), self.raft.ensure_linearizable())
                     .await
                     .map_err(|_| {
                         ControlPlaneError::Unavailable(
@@ -828,7 +836,7 @@ impl ControlPlane {
         &self,
         command: ReplicatedCommand,
     ) -> Result<ReplicatedCommandResult, ControlPlaneError> {
-        tokio::time::timeout(Duration::from_secs(5), self.raft.client_write(command))
+        tokio::time::timeout(Duration::from_secs(15), self.raft.client_write(command))
             .await
             .map_err(|_| {
                 ControlPlaneError::Unavailable(

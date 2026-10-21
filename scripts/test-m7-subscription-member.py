@@ -23,22 +23,46 @@ def _retried(operation):
 
 @_retried
 def post(endpoint, path, body):
+    # Transient unavailability (election windows, quorum stalls, restart
+    # gaps) retries with the same body â€” stable request_id values in the
+    # payload keep the retry idempotent. Refusals (4xx) return at once
+    # for the caller to assert.
+    for _ in range(120):
+        status, result = _post_once(endpoint, path, body)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _post_once(endpoint, path, body):
     request = urllib.request.Request(endpoint + path, data=json.dumps(body).encode(), headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=30) as response: return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error: return error.code, json.loads(error.read() or b"{}")
-
+    except OSError:
+        return 0, {}
 @_retried
 def get(endpoint, path):
+    for _ in range(120):
+        status, result = _get_once(endpoint, path)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _get_once(endpoint, path):
     request = urllib.request.Request(endpoint + path, headers={"authorization": f"Bearer {KEY}"})
     try:
         with urllib.request.urlopen(request, timeout=30) as response: return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error: return error.code, json.loads(error.read() or b"{}")
-
+    except OSError:
+        return 0, {}
 def wait_ready():
     for _ in range(60):
         try:
-            status, _ = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": "SHOW DOMAINS;"})
+            status, _ = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": "SHOW DOMAINS;"})
             if status == 200:
                 return
         except (ConnectionError, urllib.error.URLError, TimeoutError):
@@ -50,7 +74,7 @@ def wait_ready():
 def member_ready(endpoint, path, body):
     # Stopping a voter can drop the Control Plane leader; the survivor must
     # finish re-electing before member mutations succeed again. Ride out the
-    # election window — every retry replays the same request_id, so repeats
+    # election window â€” every retry replays the same request_id, so repeats
     # are idempotent.
     delay = 0.25
     for attempt in range(45):
@@ -75,7 +99,7 @@ def main():
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:6]}"
     domain, feed, writer = f"m7{suffix}", f"m7{suffix}.events", f"writer{suffix}"
     subscription = f"{domain}.billing"
-    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE DOMAIN {domain}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer}; CREATE SUBSCRIPTION {subscription} FROM {feed} START AT BEGINNING;"})
+    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE DOMAIN {domain}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer}; CREATE SUBSCRIPTION {subscription} FROM {feed} START AT BEGINNING;"})
     if status != 200: raise AssertionError(setup)
     writer_epoch = setup["results"][3]["data"]["session_epoch"]
     records = [{"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": writer_epoch, "event_time_ns": str(index), "key_base64": "aw==", "payload_base64": "dg==", "metadata_base64": {}} for index in range(1, 6)]
@@ -159,7 +183,7 @@ def main():
     # A `now` Subscription pins the committed tail at first join: earlier
     # records are skipped and only post-join appends are delivered.
     now_sub = f"{domain}.realtime"
-    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {now_sub} FROM {feed} START AT NOW;"})
+    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE SUBSCRIPTION {now_sub} FROM {feed} START AT NOW;"})
     if status != 200: raise AssertionError(declared)
     joined = member_ready(ENDPOINTS[1], f"{members}/join", {"subscription": now_sub, "request_id": str(uuid.uuid4()), "member_id": member})
     if joined["member_epoch"] != 1:  raise AssertionError(joined)
@@ -176,7 +200,7 @@ def main():
     # timestamp; explicit-Cursor and timestamp Subscription starts resolve
     # them into internal per-Range positions at first join.
     timeline_reader = f"m7timeline{suffix}"
-    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE READER {timeline_reader} FROM {feed} START AT BEGINNING;"})
+    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE READER {timeline_reader} FROM {feed} START AT BEGINNING;"})
     if status != 200: raise AssertionError(declared)
     status, opened = post(ENDPOINTS[0], "/v1/readers/open", {"request_id": str(uuid.uuid4()), "reader": timeline_reader, "capacity": 10})
     if status != 200: raise AssertionError(opened)
@@ -189,7 +213,7 @@ def main():
     # at-or-after it on the ingest clock.
     threshold = int(history[3]["ingest_time_ns"])
     ts_sub = f"{domain}.timeshifted"
-    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {ts_sub} FROM {feed} START AT TIMESTAMP {threshold};"})
+    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE SUBSCRIPTION {ts_sub} FROM {feed} START AT TIMESTAMP {threshold};"})
     if status != 200: raise AssertionError(declared)
     joined = member_ready(ENDPOINTS[1], f"{members}/join", {"subscription": ts_sub, "request_id": str(uuid.uuid4()), "member_id": member})
     if joined["member_epoch"] != 1:  raise AssertionError(joined)
@@ -201,10 +225,10 @@ def main():
 
     # An explicit-Cursor start resumes each internal Range after the last
     # frame it contributed to the merged-order prefix at-or-before the
-    # Cursor — the same skip a Reader `after` read applies.
+    # Cursor â€” the same skip a Reader `after` read applies.
     boundary = history[2]["cursor"]
     cursor_sub = f"{domain}.replaying"
-    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {cursor_sub} FROM {feed} START AT CURSOR '{boundary}';"})
+    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE SUBSCRIPTION {cursor_sub} FROM {feed} START AT CURSOR '{boundary}';"})
     if status != 200: raise AssertionError(declared)
     joined = member_ready(ENDPOINTS[1], f"{members}/join", {"subscription": cursor_sub, "request_id": str(uuid.uuid4()), "member_id": member})
     if joined["member_epoch"] != 1:  raise AssertionError(joined)
@@ -217,7 +241,7 @@ def main():
     # An unknown or foreign-Feed Cursor fails closed instead of guessing a
     # starting position.
     bogus_sub = f"{domain}.bogus"
-    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {bogus_sub} FROM {feed} START AT CURSOR 'not-a-feed-cursor';"})
+    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE SUBSCRIPTION {bogus_sub} FROM {feed} START AT CURSOR 'not-a-feed-cursor';"})
     if status != 200: raise AssertionError(declared)
     status, refused = post(ENDPOINTS[1], f"{members}/join", {"subscription": bogus_sub, "request_id": str(uuid.uuid4()), "member_id": member})
     if status != 400: raise AssertionError(refused)
@@ -289,7 +313,7 @@ def main():
             subprocess.run(["docker", "compose", "start", service], check=True)
             for _ in range(60):
                 try:
-                    status, _ = post(ENDPOINTS[index], "/v1/admin/wcl", {"script": "SHOW DOMAINS;"})
+                    status, _ = post(ENDPOINTS[index], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": "SHOW DOMAINS;"})
                     if status == 200: break
                 except (urllib.error.URLError, TimeoutError, ConnectionError): pass
                 time.sleep(1)

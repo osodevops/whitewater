@@ -63,6 +63,19 @@ def _retried(operation):
 
 @_retried
 def post(endpoint, path, body, timeout=30):
+    # Transient unavailability (election windows, quorum stalls, restart
+    # gaps) retries with the same body â€” stable request_id values in the
+    # payload keep the retry idempotent. Refusals (4xx) return at once
+    # for the caller to assert.
+    for _ in range(120):
+        status, result = _post_once(endpoint, path, body, timeout)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _post_once(endpoint, path, body, timeout=30):
     request = urllib.request.Request(
         endpoint + path,
         data=json.dumps(body).encode(),
@@ -83,6 +96,15 @@ def post(endpoint, path, body, timeout=30):
 
 @_retried
 def get(endpoint, path, timeout=15):
+    for _ in range(120):
+        status, result = _get_once(endpoint, path, timeout)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _get_once(endpoint, path, timeout=15):
     request = urllib.request.Request(
         endpoint + path, headers={"authorization": f"Bearer {KEY}"}
     )
@@ -96,8 +118,9 @@ def get(endpoint, path, timeout=15):
 
 
 def wcl(script):
+    request_id = str(uuid.uuid4())
     for _ in range(30):
-        status, body = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": script})
+        status, body = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": request_id, "script": script})
         if status == 200:
             return body
         # A 400 means the script itself was rejected (partial execution may
@@ -238,7 +261,7 @@ def main():
         driver = Driver(feed, writers[: Driver.WORKERS], hot_key)
         driver.start()
         try:
-            # Phase 1 — sustained dominance flags the Key on its owner.
+            # Phase 1 â€” sustained dominance flags the Key on its owner.
             deadline = time.time() + DETECT_DEADLINE
             flagged = []
             isolated = []
@@ -248,7 +271,7 @@ def main():
                 # observed in the window, so the flag alone is not enough.
                 # A split can also commit between polls: a child range that
                 # starts exactly at the Key's token is the same isolation
-                # already landed — and the flag re-landed on the owning
+                # already landed â€” and the flag re-landed on the owning
                 # range, which Phase 2's feedback probe needs. Phase 3 then
                 # still confirms the split edge.
                 isolated = [
@@ -267,7 +290,7 @@ def main():
             )
             # Prefer the boundary-bearing flag, then the child whose start is
             # the Key's token (the flag already re-landed on the owning
-            # range — Phase 2's feedback probe needs it live there).
+            # range â€” Phase 2's feedback probe needs it live there).
             evidence = sorted(
                 isolated,
                 key=lambda e: (
@@ -285,7 +308,7 @@ def main():
             ), evidence
             first_range = evidence["range_id"]
 
-            # Phase 2 — Writer feedback carries the flag and tightens only
+            # Phase 2 â€” Writer feedback carries the flag and tightens only
             # for the hot Key.
             def one_append(key):
                 probe_writer, probe_epoch = writers[Driver.WORKERS]

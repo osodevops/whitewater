@@ -23,27 +23,41 @@ def _retried(operation):
 
 @_retried
 def post(endpoint, path, body):
+    # Transient unavailability (election windows, quorum stalls, restart
+    # gaps) retries with the same body â€” stable request_id values in the
+    # payload keep the retry idempotent. Refusals (4xx) return at once
+    # for the caller to assert.
+    for _ in range(120):
+        status, result = _post_once(endpoint, path, body)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _post_once(endpoint, path, body):
     request = urllib.request.Request(endpoint + path, data=json.dumps(body).encode(), headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=10) as response: return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error: return error.code, json.loads(error.read() or b"{}")
-
+    except OSError:
+        return 0, {}
 def main():
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:6]}"
     domain, feed, writer, reader = f"m3{suffix}", f"m3{suffix}.events", f"writer{suffix}", f"reader{suffix}"
-    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE DOMAIN {domain}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer}; CREATE READER {reader} FROM {feed} START AT BEGINNING;"})
+    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE DOMAIN {domain}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer}; CREATE READER {reader} FROM {feed} START AT BEGINNING;"})
     if status != 200: raise AssertionError(setup)
-    status, domains = post(ENDPOINTS[2], "/v1/admin/wcl", {"script": f"SHOW DOMAINS; DESCRIBE DOMAIN {domain};"})
+    status, domains = post(ENDPOINTS[2], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"SHOW DOMAINS; DESCRIBE DOMAIN {domain};"})
     if status != 200 or domains["results"][1]["data"]["space_id"] != setup["results"][0]["data"]["space_id"]: raise AssertionError(domains)
     writer_epoch = setup["results"][3]["data"]["session_epoch"]
     subscription = f"{domain}.billing"
-    status, before = post(ENDPOINTS[1], "/v1/admin/wcl", {"script": "SHOW FEEDS;"})
+    status, before = post(ENDPOINTS[1], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": "SHOW FEEDS;"})
     if status != 200: raise AssertionError(before)
-    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {subscription} FROM {feed};"})
+    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE SUBSCRIPTION {subscription} FROM {feed};"})
     if status != 200 or declared["results"][0]["data"]["stage"] != "declared": raise AssertionError(declared)
-    status, after = post(ENDPOINTS[2], "/v1/admin/wcl", {"script": "SHOW FEEDS;"})
+    status, after = post(ENDPOINTS[2], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": "SHOW FEEDS;"})
     if status != 200 or {row["feed_id"] for row in after["results"][0]["data"]} != {row["feed_id"] for row in before["results"][0]["data"]}: raise AssertionError("Subscription created an application-visible Feed")
-    status, described = post(ENDPOINTS[2], "/v1/admin/wcl", {"script": f"DESCRIBE SUBSCRIPTION {subscription};"})
+    status, described = post(ENDPOINTS[2], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"DESCRIBE SUBSCRIPTION {subscription};"})
     if status != 200 or described["results"][0]["data"]["subscription_id"] != declared["results"][0]["data"]["subscription_id"]: raise AssertionError(described)
     status, unsupported = post(ENDPOINTS[2], "/v1/readers/open", {"request_id": str(uuid.uuid4()), "reader": subscription, "capacity": 1})
     if status == 200: raise AssertionError(f"declared Subscription unexpectedly allowed a Reader session: {unsupported}")
@@ -89,7 +103,7 @@ def main():
     status, third = post(ENDPOINTS[2], "/v1/readers/fetch", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": widened["session_epoch"]})
     if status != 200 or len(third["records"]) != 3 or third["recommended_capacity"] != 3: raise AssertionError(third)
     # Per-Reader demand attribution is Node-local per serving ingress: merged
-    # across the Riverbed, the session's ops report exactly — three opens,
+    # across the Riverbed, the session's ops report exactly â€” three opens,
     # three fetches delivering six records, one ack.
     merged = {"opens": 0, "fetches": 0, "fetch_records": 0, "acks": 0}
     for endpoint in ENDPOINTS:

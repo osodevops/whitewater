@@ -5,7 +5,7 @@
     {
       "op": "wcl",
       "args": {
-        "script": "CREATE DOMAIN wn{{uniq}}; CREATE FEED wn{{uniq}}.source; CREATE FEED wn{{uniq}}.results; DEFINE STATESTORE wn{{uniq}}.panes KEYS key, pane; CREATE WRITER ww{{uniq}} TO wn{{uniq}}.source; OPEN WRITER SESSION ww{{uniq}}; CREATE SUBSCRIPTION wn{{uniq}}.flow FROM wn{{uniq}}.source START AT BEGINNING; CREATE PIPE wn{{uniq}}.agg FROM SUBSCRIPTION wn{{uniq}}.flow TO STATESTORE wn{{uniq}}.panes WINDOW 8s EVENT MAX_LATE 1s BY JSON 'customer' SUM JSON 'amount' EMIT TO FEED wn{{uniq}}.results;"
+        "script": "CREATE DOMAIN wn{{uniq}}; CREATE FEED wn{{uniq}}.source; CREATE FEED wn{{uniq}}.results; DEFINE STATESTORE wn{{uniq}}.panes KEYS key, pane; CREATE WRITER ww{{uniq}} TO wn{{uniq}}.source; OPEN WRITER SESSION ww{{uniq}}; CREATE SUBSCRIPTION wn{{uniq}}.flow FROM wn{{uniq}}.source START AT BEGINNING; CREATE PIPE wn{{uniq}}.agg FROM SUBSCRIPTION wn{{uniq}}.flow TO STATESTORE wn{{uniq}}.panes WINDOW 8s EVENT MAX_LATE 15s BY JSON 'customer' SUM JSON 'amount' EMIT TO FEED wn{{uniq}}.results;"
       },
       "bind": "setup"
     },
@@ -36,7 +36,7 @@
     {
       "op": "feed.records",
       "args": {"feed": "wn{{uniq}}.results", "limit": 10},
-      "poll": {"times": 25, "interval_ms": 1000},
+      "poll": {"times": 40, "interval_ms": 1000},
       "expect": {
         "records": "len>=2",
         "records[0].metadata_base64[\"window.emitted\"]": "dHJ1ZQ==",

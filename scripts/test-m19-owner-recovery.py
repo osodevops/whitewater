@@ -29,8 +29,23 @@ def _retried(operation):
 
     return wrapped
 
-@_retried
 def post(endpoint, path, body):
+    # Transient unavailability (election windows, quorum stalls, restart
+    # gaps) retries with the same body â€” stable request_id values in the
+    # payload keep the retry idempotent. Refusals (4xx) return at once
+    # for the caller to assert.
+    for _ in range(120):
+        try:
+            return _post_once(endpoint, path, body)
+        except urllib.error.HTTPError as error:
+            if error.code < 500:
+                raise
+            time.sleep(0.5)
+        except (ConnectionError, urllib.error.URLError, TimeoutError, OSError):
+            time.sleep(0.5)
+    return _post_once(endpoint, path, body)
+
+def _post_once(endpoint, path, body):
     request = urllib.request.Request(
         endpoint + path,
         data=json.dumps(body).encode(),
@@ -42,14 +57,14 @@ def post(endpoint, path, body):
 
 
 def inspect(endpoint, feed):
-    return post(endpoint, "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"})["results"][0]["data"]
+    return post(endpoint, "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {feed};"})["results"][0]["data"]
 
 
 def main():
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:6]}"
     space = f"m19{suffix}"
     feed = f"{space}.events"
-    created = post(ENDPOINTS["control-1"], "/v1/admin/wcl", {"script": f"CREATE SPACE {space}; CREATE FEED {feed}; INSPECT PLACEMENT FOR FEED {feed};"})
+    created = post(ENDPOINTS["control-1"], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE SPACE {space}; CREATE FEED {feed}; INSPECT PLACEMENT FOR FEED {feed};"})
     original = created["results"][-1]["data"]
     old_owner = original["owner"]
     service = f"node{old_owner.removeprefix('control-')}"
@@ -78,7 +93,7 @@ def main():
         # is the same transient class the connection retries above cover.
         result = None
         last_error = None
-        for _ in range(30):
+        for _ in range(90):
             try:
                 result = post(survivors[0], "/v1/feeds/append", {
                     "request_id": str(uuid.uuid4()), "feed": feed,
@@ -89,6 +104,9 @@ def main():
             except urllib.error.HTTPError as error:
                 if error.code not in (409, 503):
                     raise
+                last_error = error
+                time.sleep(2)
+            except OSError as error:
                 last_error = error
                 time.sleep(2)
         if result is None:

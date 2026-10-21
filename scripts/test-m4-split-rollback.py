@@ -29,11 +29,25 @@ def _retried(operation):
 
 @_retried
 def post(endpoint, path, body):
+    # Transient unavailability (election windows, quorum stalls, restart
+    # gaps) retries with the same body â€” stable request_id values in the
+    # payload keep the retry idempotent. Refusals (4xx) return at once
+    # for the caller to assert.
+    for _ in range(120):
+        status, result = _post_once(endpoint, path, body)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _post_once(endpoint, path, body):
     request = urllib.request.Request(endpoint + path, data=json.dumps(body).encode(), headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=60) as response: return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error: return error.code, json.loads(error.read() or b"{}")
-
+    except OSError:
+        return 0, {}
 # The stopped Node may hold raft leadership when it dies: Prepare then fails
 # before staging anything and read-only WCL forward to the dead leader until
 # the survivors elect a new one. Wait for the quorum to answer before
@@ -42,7 +56,7 @@ def wait_control_plane(endpoint, timeout=90):
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
-        status, result = post(endpoint, "/v1/admin/wcl", {"script": "SHOW STORAGE NODES;"})
+        status, result = _post_once(endpoint, "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": "SHOW STORAGE NODES;"})
         if status == 200: return
         last = result
         time.sleep(1)
@@ -51,7 +65,7 @@ def wait_control_plane(endpoint, timeout=90):
 def main():
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:6]}"
     domain, feed, writer = f"rbk{suffix}", f"rbk{suffix}.events", f"rbkw{suffix}"
-    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE DOMAIN {domain}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer};"})
+    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE DOMAIN {domain}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer};"})
     if status != 200: raise AssertionError(setup)
     epoch = setup["results"][3]["data"]["session_epoch"]
     for position in range(1, 9):
@@ -63,7 +77,7 @@ def main():
     # from replica lag; INSPECT PLACEMENT surfaces them per range.
     placed = None
     for _ in range(60):
-        status, placed = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"})
+        status, placed = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {feed};"})
         if status == 200:
             proofs = placed["results"][0]["data"].get("commit_proofs") or {}
             if any((proof.get("position") or 0) >= 8 for proof in proofs.values()):
@@ -75,18 +89,18 @@ def main():
     split_request_id = str(uuid.uuid4())
     def attempt_split(tag, request_id=None, boundary="80000000000000000000000000000000"):
         body = {"request_id": request_id or str(uuid.uuid4()), "feed": feed, "split_at": boundary}
-        status, result = post(ENDPOINTS[1], "/v1/admin/ranges/split", body)
+        status, result = _post_once(ENDPOINTS[1], "/v1/admin/ranges/split", body)
         print(f"split {tag}: status={status} error={result.get('error', '')[:140]}", flush=True)
         return status, result
 
     def staged_split_plan():
-        status, placed = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"})
+        status, placed = _post_once(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {feed};"})
         if status != 200: raise AssertionError(placed)
         return placed["results"][0]["data"].get("range_split_plan")
 
     # Fail the cutover mid-staging: a replica is unreachable. The staged plan
     # must be retained as resumable state (the same request ID resumes it) and
-    # the frozen replicas released — never silently deleted, which would break
+    # the frozen replicas released â€” never silently deleted, which would break
     # the dedup replay contract.
     subprocess.run(["docker", "stop", NODE3], check=True, capture_output=True)
     try:
@@ -101,7 +115,7 @@ def main():
         if not plan: raise AssertionError("staged split plan was deleted on failure instead of retained for resume")
 
         # A retry of the same request ID resumes the staged plan and fails the
-        # same way — never a ghost cutover, never a pending fence against itself.
+        # same way â€” never a ghost cutover, never a pending fence against itself.
         status, result = attempt_split("same-id-during-outage", request_id=split_request_id)
         if status == 200: raise AssertionError("split unexpectedly activated on same-ID retry")
         error = result.get("error", "")
@@ -130,7 +144,7 @@ def main():
     if status != 200: raise AssertionError(f"feed stayed frozen after refused split: {result}")
 
     # With the replica back, replaying the original request ID resumes the
-    # staged plan and activates it — the durable resume contract.
+    # staged plan and activates it â€” the durable resume contract.
     for _ in range(30):
         status, result = attempt_split("same-id-after-recovery", request_id=split_request_id)
         if status == 200: break
@@ -142,10 +156,10 @@ def main():
     # Owner-move leg: same retain-and-resume contract, plus the explicit
     # operator abandon for a permanently wedged plan and honest stale replay.
     move_feed = f"rbk{suffix}.moves"
-    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE FEED {move_feed};"})
+    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE FEED {move_feed};"})
     if status != 200: raise AssertionError(setup)
     NODE3_ID = os.environ.get("WHITEWATER_TEST_NODE3_ID", "control-3")
-    status, placed = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {move_feed};"})
+    status, placed = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {move_feed};"})
     if status != 200: raise AssertionError(placed)
     assignments = placed["results"][0]["data"]["range_assignments"]
     if len(assignments) != 1: raise AssertionError(f"expected one range for the move leg: {assignments}")
@@ -162,19 +176,19 @@ def main():
 
     def attempt_move(tag, request_id=None, target=None):
         body = {"request_id": request_id or str(uuid.uuid4()), "feed": move_feed, "range_id": move_range["range_id"], "new_owner": target or new_owner}
-        status, result = post(ENDPOINTS[1], "/v1/admin/ranges/move-owner", body)
+        status, result = _post_once(ENDPOINTS[1], "/v1/admin/ranges/move-owner", body)
         print(f"owner-move {tag}: status={status} error={result.get('error', '')[:140]}", flush=True)
         return status, result
 
     def current_placement():
-        status, placed = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {move_feed};"})
+        status, placed = _post_once(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {move_feed};"})
         if status != 200: raise AssertionError(placed)
         current = [a for a in placed["results"][0]["data"]["range_assignments"] if a["range_id"] == move_range["range_id"]]
         if not current: raise AssertionError("move-leg range disappeared after abandon")
         return current[0]
 
     def staged_move_plans():
-        status, placed = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {move_feed};"})
+        status, placed = _post_once(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {move_feed};"})
         if status != 200: raise AssertionError(placed)
         return placed["results"][0]["data"].get("owner_move_plans") or []
 
@@ -200,7 +214,7 @@ def main():
         if status != 200: raise AssertionError(f"fenced abandon rejected the inspected plan: {result}")
         if staged_move_plans(): raise AssertionError("owner-move plan row survived a committed abandon")
 
-        # Replaying the abandoned request ID must now fail honestly — the
+        # Replaying the abandoned request ID must now fail honestly â€” the
         # staged row it names is gone.
         status, result = attempt_move("stale-replay-after-abandon", request_id=move_request_id)
         if status == 200: raise AssertionError("abandoned move unexpectedly activated on stale replay")
@@ -209,8 +223,8 @@ def main():
 
     # With the participant back and the wedged plan abandoned, a fresh move
     # activates end-to-end. The outage may meanwhile trigger owner recovery
-    # on this range — ownership landing on the requested target already
-    # satisfies the intent — so re-inspect and retarget each retry.
+    # on this range â€” ownership landing on the requested target already
+    # satisfies the intent â€” so re-inspect and retarget each retry.
     for _ in range(30):
         current = current_placement()
         if current["owner"] == new_owner:

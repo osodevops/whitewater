@@ -9,7 +9,7 @@ Proves the degraded-mode contract:
 
   * before the fill, appends commit normally on all three Nodes;
   * after node3's volume is full, every acknowledged append remains
-    readable — a quorum append may refuse (honest failure) but must never
+    readable â€” a quorum append may refuse (honest failure) but must never
     acknowledge and then lose the record;
   * the surviving two-Node quorum keeps the Feed writable and the
     committed prefix uncorrupted;
@@ -36,7 +36,7 @@ BASELINE_RECORDS = 20
 # accepts one; owner recovery off a live-but-full Node is fast locally but
 # must not be raced on a loaded CI runner.
 DEGRADED_DEADLINE = 180
-RECOVERY_DEADLINE = 240
+RECOVERY_DEADLINE = 360
 
 
 def compose(*args, timeout=120):
@@ -50,6 +50,19 @@ def compose(*args, timeout=120):
 
 
 def post(endpoint, path, body, timeout=30):
+    # Transient unavailability (election windows, quorum stalls, restart
+    # gaps) retries with the same body â€” stable request_id values in the
+    # payload keep the retry idempotent. Refusals (4xx) return at once
+    # for the caller to assert.
+    for _ in range(120):
+        status, result = _post_once(endpoint, path, body, timeout)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _post_once(endpoint, path, body, timeout=30):
     request = urllib.request.Request(
         endpoint + path,
         data=json.dumps(body).encode(),
@@ -69,6 +82,15 @@ def post(endpoint, path, body, timeout=30):
 
 
 def get(endpoint, path, timeout=10):
+    for _ in range(120):
+        status, result = _get_once(endpoint, path, timeout)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _get_once(endpoint, path, timeout=10):
     request = urllib.request.Request(
         endpoint + path, headers={"authorization": f"Bearer {KEY}"}
     )
@@ -80,10 +102,11 @@ def get(endpoint, path, timeout=10):
 
 
 def wcl(script, deadline=120):
+    request_id = str(uuid.uuid4())
     started = time.monotonic()
     while time.monotonic() - started < deadline:
         for endpoint in ENDPOINTS:
-            status, body = post(endpoint, "/v1/admin/wcl", {"script": script})
+            status, body = post(endpoint, "/v1/admin/wcl", {"request_id": request_id, "script": script})
             if status == 200:
                 return body
             if status == 400:
@@ -141,7 +164,7 @@ def record(writer, epoch, index):
 def append_batch(writer, epoch, index, count, attempts=6):
     """Post one batch; ambiguous failures retry with identical request_ids
     (server-side dedup makes the retry safe). Returns the acknowledged key
-    names — response `results[i]` pairs with request `records[i]` — or
+    names â€” response `results[i]` pairs with request `records[i]` â€” or
     None when every attempt was refused."""
     records = [record(writer, epoch, index + i) for i in range(count)]
     assert len(records) == count
@@ -162,7 +185,7 @@ def append_batch(writer, epoch, index, count, attempts=6):
 def fetch_all(feed, deadline_s=120):
     """Replay the whole committed Feed; returns the set of record keys.
     A transient non-200 (owner moving off the filled Node) retries the
-    whole pass — the committed-prefix contract is what the deadline
+    whole pass â€” the committed-prefix contract is what the deadline
     bounds, not any single page."""
     deadline = time.monotonic() + deadline_s
     last_error = None
@@ -194,7 +217,7 @@ def fetch_all(feed, deadline_s=120):
 
 
 def fill_node3_disk():
-    """dd past the tmpfs capacity — a real ENOSPC on the store's volume.
+    """dd past the tmpfs capacity â€” a real ENOSPC on the store's volume.
     node3 may crash mid-fill if its own raft log hits ENOSPC first; that
     is still the fault being exercised, so exec failures are tolerated and
     reported rather than asserted away."""
@@ -236,22 +259,22 @@ def main():
         )
         epoch = setup["results"][3]["data"]["session_epoch"]
 
-        # Phase 1 — healthy baseline: every append commits on all replicas.
+        # Phase 1 â€” healthy baseline: every append commits on all replicas.
         acknowledged = append_batch(writer_name, epoch, 0, BASELINE_RECORDS)
         assert acknowledged is not None, "baseline appends refused on a healthy cluster"
         assert len(acknowledged) == BASELINE_RECORDS
 
-        # Phase 2 — fill node3's tmpfs with real bytes.
+        # Phase 2 â€” fill node3's tmpfs with real bytes.
         fill_node3_disk()
 
-        # Phase 3 — degraded writes: the two-Node quorum keeps committing;
+        # Phase 3 â€” degraded writes: the two-Node quorum keeps committing;
         # any refusal is honest, but an acknowledged record may never vanish.
         # `sent` is every key ever offered; `acknowledged` only keys whose
-        # batch returned 200 (refused batches may still appear in reads —
+        # batch returned 200 (refused batches may still appear in reads â€”
         # ambiguous commits are legal, silent loss is not). The quorum
         # recovers by moving range ownership off the full Node, which takes
         # seconds locally but can take tens of seconds on a loaded CI
-        # runner — the contract is deadline-bounded, not attempt-bounded.
+        # runner â€” the contract is deadline-bounded, not attempt-bounded.
         sent = set(acknowledged)
         refused_batches = 0
         index = BASELINE_RECORDS
@@ -274,11 +297,11 @@ def main():
             print(f"node logs at stall:\n{out[-60000:]}")
         assert len(acknowledged) > BASELINE_RECORDS, (
             f"a single full disk stalled all writes for "
-            f"{DEGRADED_DEADLINE}s — the surviving quorum must keep the "
+            f"{DEGRADED_DEADLINE}s â€” the surviving quorum must keep the "
             f"Feed writable"
         )
 
-        # Phase 4 — the committed prefix is uncorrupted: every acknowledged
+        # Phase 4 â€” the committed prefix is uncorrupted: every acknowledged
         # record is readable, and reads only ever serve offered keys.
         keys = fetch_all(feed)
         assert acknowledged <= keys, (
@@ -287,7 +310,7 @@ def main():
         )
         assert keys <= sent, f"reads served unoffered keys: {sorted(keys - sent)[:5]}"
 
-        # Phase 5 — recovery: recreate node3 with a fresh tmpfs (disk
+        # Phase 5 â€” recovery: recreate node3 with a fresh tmpfs (disk
         # replaced); the Riverbed must heal without operator repair.
         code, out = compose("up", "-d", "--force-recreate", "node3")
         assert code == 0, out

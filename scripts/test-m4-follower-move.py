@@ -32,6 +32,17 @@ def _retried(operation):
 
 @_retried
 def post(node, path, payload):
+    # Same retry posture as the other acceptance scripts: 5xx/transport
+    # transients retry with the same request identity; refusals return.
+    for _ in range(120):
+        status, result = _post_once(node, path, payload)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _post_once(node, path, payload):
     request = urllib.request.Request(
         f"{node}{path}",
         data=json.dumps(payload).encode(),
@@ -43,8 +54,8 @@ def post(node, path, payload):
             return response.status, json.load(response)
     except urllib.error.HTTPError as error:
         return error.code, json.load(error)
-
-
+    except OSError:
+        return 0, {}
 def read(node, feed, after=None):
     query = urllib.parse.urlencode({"feed": feed, "limit": 100, **({"after": after} if after else {})})
     request = urllib.request.Request(
@@ -65,7 +76,7 @@ def get_json(node, path):
 
 
 def placement(node, feed):
-    status, response = post(node, "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"})
+    status, response = post(node, "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {feed};"})
     if status != 200:
         raise AssertionError(response)
     return response["results"][0]["data"]
@@ -90,8 +101,11 @@ def main():
         suffix = f"mv{uuid.uuid4().hex[:12]}"
         feed, writer = f"{suffix}.events", f"writer{suffix}"
         script = f"CREATE SPACE {suffix}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer};"
+        # A stable request_id makes a retried batch replay the committed result
+        # instead of wedging on 'already exists' after a timed-out commit.
+        setup_id = str(uuid.uuid4())
         for _ in range(30):
-            status, result = post(NODES[0], "/v1/admin/wcl", {"script": script})
+            status, result = post(NODES[0], "/v1/admin/wcl", {"request_id": setup_id, "script": script})
             if status == 200:
                 break
             time.sleep(1)
@@ -155,9 +169,13 @@ def main():
         deadline = time.time() + 45
         while True:
             try:
-                status, unavailable = post(live, "/v1/admin/ranges/move-follower", move)
-                probe_status, probe = post(
-                    live, "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"}
+                # Raw probes: a refused move may take seconds per response
+                # while a staged cutover rolls back against the stopped Node;
+                # the deadline must observe each refusal rather than park
+                # inside a status-retrying call.
+                status, unavailable = _post_once(live, "/v1/admin/ranges/move-follower", move)
+                probe_status, probe = _post_once(
+                    live, "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {feed};"}
                 )
                 if status == 200:
                     raise AssertionError(unavailable)
@@ -208,7 +226,7 @@ def main():
         if counters.get("moves", 0) < 1:
             raise AssertionError(f"moves {counters}")
         # The staged copy either transferred records or resumed past the
-        # already-replicated prefix — either way the covered span is copy
+        # already-replicated prefix â€” either way the covered span is copy
         # evidence, not an inferred cost.
         covered = counters.get("moved_records", 0) + counters.get("moved_skipped_records", 0)
         if covered < 1:
@@ -233,6 +251,9 @@ def main():
                 if error.code != 503:
                     raise
                 last_error = error.read().decode()
+                time.sleep(0.5)
+            except OSError as error:
+                last_error = str(error)
                 time.sleep(0.5)
         if resumed is None or [record["cursor"] for record in resumed] != cursors[6:]:
             raise AssertionError(f"replacement lost committed Cursor history after restart: {last_error}")

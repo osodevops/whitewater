@@ -1941,7 +1941,14 @@ async fn member_coordinator_inner(
         Err(SubscriptionProgressError::NoQuorum) => {
             return member_coordinator_recovered(state, &coordinator, definition).await;
         }
-        Err(error) => return Err(subscription_progress_api_error(error)),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                subscription = %definition.subscription_id,
+                "Subscription progress replica evidence read failed"
+            );
+            return Err(subscription_progress_api_error(error));
+        }
     };
     if !evidence.iter().any(|(node, _)| node == &assignment.owner)
         || subscription_placement_diverged(&evidence)
@@ -1986,10 +1993,11 @@ pub struct SubscriptionRecoveryGates {
 }
 
 impl SubscriptionRecoveryGates {
-    /// Acquires the per-Subscription recovery gate, waiting for any in-flight
-    /// recovery to finish. Weak entries keep the map bounded by live waiters:
-    /// idle gates are reclaimed once no recovery holds them.
-    async fn acquire(&self, subscription_id: Uuid) -> tokio::sync::OwnedMutexGuard<()> {
+    /// Returns the gate when no recovery is in flight, `None` while another
+    /// member operation still owns it. Waiters fail fast instead of queueing
+    /// behind a bounded retry loop: a queued member request adds no recovery
+    /// progress and keeps its caller parked while the leaderless window ages.
+    fn try_acquire(&self, subscription_id: Uuid) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         let gate = {
             let mut gates = self
                 .gates
@@ -2010,7 +2018,7 @@ impl SubscriptionRecoveryGates {
                 }
             }
         };
-        gate.lock_owned().await
+        gate.try_lock_owned().ok()
     }
 }
 
@@ -2047,11 +2055,17 @@ async fn member_coordinator_recovered(
     // Serialize owner recovery per Subscription: every member request that
     // observes the lost owner would otherwise drive its own inspect/CAS/adopt
     // storm, and concurrent CASes ratchet the ownership epoch while the owner
-    // stays lost.
-    let _gate = state
+    // stays lost. Requests that arrive while another recovery is in flight
+    // fail fast and retry later rather than queueing behind a bounded retry
+    // loop that may outlast their own client timeout.
+    let Some(_gate) = state
         .subscription_recovery_gates
-        .acquire(definition.subscription_id)
-        .await;
+        .try_acquire(definition.subscription_id)
+    else {
+        return Err(ApiError::unavailable(
+            "Subscription progress owner recovery is already in flight",
+        ));
+    };
 
     // A racing recovery may already have moved ownership while this request
     // waited on the gate; recheck the live placement before CASing again.
@@ -2096,6 +2110,12 @@ async fn member_coordinator_recovered(
     // retrying is safe because every attempt re-inspects replica evidence
     // and re-derives the CAS expected epoch, so a CAS that already landed
     // converges through adoption instead of guessing.
+    tracing::info!(
+        subscription = %definition.subscription_id,
+        owner = %coordinator.assignment().owner,
+        ownership_epoch = coordinator.assignment().ownership_epoch,
+        "Subscription progress owner lost; driving recovery"
+    );
     let mut result = Err(SubscriptionProgressError::Unavailable);
     // A restarted voter replays its catalog log before its progress replica
     // answers current epochs; ride that convergence inside the bounded member
@@ -7235,7 +7255,7 @@ async fn execute_reader_command(
         Some(control_plane) => control_plane
             .execute_commands_with_request_id(vec![command], request_id)
             .await
-            .map_err(|error| ApiError::bad_request(error.to_string())),
+            .map_err(ApiError::from),
         None => state
             .control
             .execute_commands_with_request_id(vec![command], request_id)
@@ -8388,7 +8408,7 @@ async fn admin_split_range(
             request.request_id,
         )
         .await
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        .map_err(ApiError::from)?;
     let plan: RangeSplitPlan = serde_json::from_value(prepared.results[0].data.clone())
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     // A replayed request ID may name a plan that already activated, or one
@@ -9037,7 +9057,7 @@ async fn admin_merge_ranges(
             request.request_id,
         )
         .await
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        .map_err(ApiError::from)?;
     let plan: RangeMergePlan = serde_json::from_value(prepared.results[0].data.clone())
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     // Same replay/abandon guard as the split path: a merged assignment means
@@ -9817,7 +9837,7 @@ async fn admin_move_follower(
             request.request_id,
         )
         .await
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        .map_err(ApiError::from)?;
     let plan: RangeMovePlan = serde_json::from_value(prepared.results[0].data.clone())
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     // A post-Prepare failure retains the staged plan as resumable state:
@@ -10494,7 +10514,7 @@ async fn admin_move_owner(
             request.request_id,
         )
         .await
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        .map_err(ApiError::from)?;
     let plan: RangeOwnerMovePlan = serde_json::from_value(prepared.results[0].data.clone())
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     // A post-Prepare failure retains the staged plan as resumable state:
@@ -11709,7 +11729,7 @@ async fn session_append_with_sequence(
         Some(control_plane) => control_plane
             .execute_commands_with_request_id(commands, allocation_request_id)
             .await
-            .map_err(|error| ApiError::bad_request(error.to_string()))?,
+            .map_err(ApiError::from)?,
         None => {
             state
                 .control
@@ -11838,6 +11858,7 @@ async fn route_append_to_owner(
         code: match response.code.as_deref() {
             Some("writer.stale_sequence") => Some("writer.stale_sequence"),
             Some("writer.sequence_gap") => Some("writer.sequence_gap"),
+            Some("writer.sequence_conflict") => Some("writer.sequence_conflict"),
             _ => None,
         },
     })
@@ -12355,6 +12376,31 @@ async fn owner_append_local(
                     message: error.message,
                     code: Some("writer.sequence_gap"),
                 }
+            } else if error.code
+                == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
+                && error.message.contains("different record bytes")
+            {
+                ApiError {
+                    status: StatusCode::CONFLICT,
+                    message: error.message,
+                    code: Some("writer.sequence_conflict"),
+                }
+            } else if error.code
+                == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
+                && error
+                    .message
+                    .contains("Cursor already belongs to another position")
+            {
+                // A request_id reuse whose bytes differ from the committed
+                // record is request poison, not persistence sickness: the
+                // Cursor binds the original request identity, so refuse the
+                // mismatched retry as a client conflict rather than a
+                // retryable storage failure.
+                ApiError {
+                    status: StatusCode::CONFLICT,
+                    message: error.message,
+                    code: None,
+                }
             } else {
                 majority_api_error(error)
             };
@@ -12389,6 +12435,21 @@ fn writer_sequence_boundary(error: &ApiError) -> Option<u64> {
     }
     if error.code == Some("writer.stale_sequence")
         || (error.code.is_none() && error.message.contains("is stale; latest accepted sequence"))
+    {
+        return error
+            .message
+            .rsplit(' ')
+            .next()?
+            .parse::<u64>()
+            .ok()?
+            .checked_add(1);
+    }
+    // A sequence conflict means the allocated number collided with bytes a
+    // different request already owns — the allocator drifted past a consumed
+    // or rewound slot. Landing the record at latest+1 keeps committed order
+    // without surfacing an internal bookkeeping edge to the caller.
+    if error.code == Some("writer.sequence_conflict")
+        || (error.code.is_none() && error.message.contains("different record bytes"))
     {
         return error
             .message
@@ -14616,28 +14677,24 @@ mod tests {
         let subscription = Uuid::from_u128(1);
         let other = Uuid::from_u128(2);
 
-        let held = gates.acquire(subscription).await;
+        let held = gates.try_acquire(subscription).unwrap();
 
-        // A second waiter on the same Subscription blocks until the gate frees.
-        let waiter = {
-            let gates = gates.clone();
-            tokio::spawn(async move { gates.acquire(subscription).await })
-        };
-        tokio::task::yield_now().await;
-        assert!(!waiter.is_finished());
+        // A second member on the same Subscription fails fast rather than
+        // queueing behind the in-flight recovery loop.
+        assert!(gates.try_acquire(subscription).is_none());
 
         // Other Subscriptions recover independently.
-        let _independent = gates.acquire(other).await;
+        assert!(gates.try_acquire(other).is_some());
 
         drop(held);
-        waiter.await.unwrap();
+        assert!(gates.try_acquire(subscription).is_some());
     }
 
     #[tokio::test]
     async fn subscription_recovery_gates_reclaim_idle_locks() {
         let gates = Arc::new(SubscriptionRecoveryGates::default());
         for index in 0..300u32 {
-            let held = gates.acquire(Uuid::from_u128(index as u128)).await;
+            let held = gates.try_acquire(Uuid::from_u128(index as u128)).unwrap();
             drop(held);
         }
         let map = gates.gates.lock().unwrap();
@@ -14646,6 +14703,24 @@ mod tests {
         // accumulating one entry per Subscription ever seen.
         assert!(map.len() <= 257);
         assert!(map.values().all(|gate| gate.strong_count() == 0));
+    }
+
+    #[test]
+    fn control_plane_errors_keep_availability_distinct_from_rejection() {
+        // A transient quorum/commit failure must surface as a retryable 503 —
+        // never a 4xx that an SDK or acceptance client treats as terminal.
+        let unavailable = ApiError::from(crate::control_plane::ControlPlaneError::Unavailable(
+            "majority commit timed out; the Control Plane may have lost quorum".to_owned(),
+        ));
+        assert_eq!(unavailable.status, StatusCode::SERVICE_UNAVAILABLE);
+        let storage = ApiError::from(crate::control_plane::ControlPlaneError::Storage(
+            "disk error".to_owned(),
+        ));
+        assert_eq!(storage.status, StatusCode::SERVICE_UNAVAILABLE);
+        let rejected = ApiError::from(crate::control_plane::ControlPlaneError::Rejected(
+            "invalid name".to_owned(),
+        ));
+        assert_eq!(rejected.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -22837,6 +22912,33 @@ mod tests {
             status: StatusCode::CONFLICT,
             message: "Writer sequence 9 has a gap; expected soon".to_owned(),
             code: Some("writer.sequence_gap"),
+        };
+        assert_eq!(writer_sequence_boundary(&malformed), None);
+    }
+
+    #[test]
+    fn writer_sequence_boundary_parses_conflict_refusals() {
+        // An allocated sequence colliding with different bytes reports the
+        // stream's latest accepted sequence; the retry lands at latest+1.
+        let tagged = ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Writer sequence was reused with different record bytes; latest accepted sequence is 19"
+                .to_owned(),
+            code: Some("writer.sequence_conflict"),
+        };
+        assert_eq!(writer_sequence_boundary(&tagged), Some(20));
+        let untagged = ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Writer sequence was reused with different record bytes; latest accepted sequence is 7"
+                .to_owned(),
+            code: None,
+        };
+        assert_eq!(writer_sequence_boundary(&untagged), Some(8));
+        // A conflict without a parseable boundary stays non-healable.
+        let malformed = ApiError {
+            status: StatusCode::CONFLICT,
+            message: "Writer sequence was reused with different record bytes".to_owned(),
+            code: Some("writer.sequence_conflict"),
         };
         assert_eq!(writer_sequence_boundary(&malformed), None);
     }

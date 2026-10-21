@@ -32,6 +32,17 @@ def _retried(operation):
 
 @_retried
 def post(node, path, payload):
+    # Same retry posture as the other acceptance scripts: 5xx/transport
+    # transients retry with the same request identity; refusals return.
+    for _ in range(120):
+        status, result = _post_once(node, path, payload)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _post_once(node, path, payload):
     request = urllib.request.Request(
         node + path,
         data=json.dumps(payload).encode(),
@@ -43,8 +54,8 @@ def post(node, path, payload):
             return response.status, json.load(response)
     except urllib.error.HTTPError as error:
         return error.code, json.load(error)
-
-
+    except OSError:
+        return 0, {}
 def read(node, feed, after=None):
     query = urllib.parse.urlencode({"feed": feed, "limit": 100, **({"after": after} if after else {})})
     request = urllib.request.Request(
@@ -55,10 +66,10 @@ def read(node, feed, after=None):
             return response.status, json.load(response)
     except urllib.error.HTTPError as error:
         return error.code, json.load(error)
-
-
+    except OSError:
+        return 0, {}
 def placement(node, feed):
-    status, response = post(node, "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"})
+    status, response = post(node, "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {feed};"})
     if status != 200:
         raise AssertionError(response)
     return response["results"][0]["data"]
@@ -85,7 +96,7 @@ def main():
         feed, writer = f"{suffix}.events", f"writer{suffix}"
         script = f"CREATE SPACE {suffix}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer};"
         for _ in range(30):
-            status, created = post(NODES["control-1"], "/v1/admin/wcl", {"script": script})
+            status, created = post(NODES["control-1"], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": script})
             if status == 200:
                 break
             time.sleep(1)
@@ -142,6 +153,7 @@ def main():
         if status != 400:
             raise AssertionError(f"unknown Cursor was not rejected: {unknown}")
         status, reader = post(ingress, "/v1/admin/wcl", {
+            "request_id": str(uuid.uuid4()),
             "script": f"CREATE READER reader{suffix} FROM {feed} START AT BEGINNING;"
         })
         if status != 200:
@@ -188,6 +200,7 @@ def main():
             raise AssertionError(f"Reader redelivered acknowledged history: {empty}")
         second_name = f"readersecond{suffix}"
         status, second_created = post(ingress, "/v1/admin/wcl", {
+            "request_id": str(uuid.uuid4()),
             "script": f"CREATE READER {second_name} FROM {feed} START AT BEGINNING;"
         })
         if status != 200:
@@ -218,8 +231,8 @@ def main():
         if status != 200 or [row["cursor"] for row in second_next["records"]] != cursors[5:10]:
             raise AssertionError(f"second Reader did not continue independently: {second_next}")
         # A retried fetch carrying the same request_id replays the identical
-        # page and deterministic progress token — even on a different ingress
-        # Node — instead of forcing a session reopen after an ambiguous
+        # page and deterministic progress token â€” even on a different ingress
+        # Node â€” instead of forcing a session reopen after an ambiguous
         # transport failure.
         replay_id = str(uuid.uuid4())
         status, first_page = post(ingress, "/v1/readers/fetch", {

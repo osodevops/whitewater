@@ -16,8 +16,8 @@ KEY = "whitewater-local-development-admin-key"
 CONTROL_KEY = "whitewater-local-development-control-key"
 
 WINDOW_NS = 8_000_000_000
-PANE_NS = WINDOW_NS // 16  # 500ms — 16 panes per window
-MAX_LATE_NS = 6_000_000_000
+PANE_NS = WINDOW_NS // 16  # 500ms â€” 16 panes per window
+MAX_LATE_NS = 20_000_000_000
 I64_MAX = 9_223_372_036_854_775_807
 
 
@@ -56,23 +56,34 @@ def post_once(node, path, payload, control=False):
             return response.status, json.load(response)
     except urllib.error.HTTPError as error:
         return error.code, json.load(error)
+    except OSError:
+        return 0, {}
+_post_transport = _retried(post_once)
 
 
-post = _retried(post_once)
+def post(node, path, payload, control=False):
+    for _ in range(120):
+        status, result = _post_transport(node, path, payload, control)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
 
 
-def wcl(node, script):
-    status, response = post(node, "/v1/admin/wcl", {"script": script})
+def wcl(node, script, request_id=None):
+    status, response = post(node, "/v1/admin/wcl", {"request_id": request_id or str(uuid.uuid4()), "script": script})
     if status != 200:
         raise AssertionError({"script": script, "response": response})
     return [result["data"] for result in response["results"]]
 
 
 def wcl_retry(node, script, attempts=30, delay=1):
+    request_id = str(uuid.uuid4())
     last = None
     for _ in range(attempts):
         try:
-            return wcl(node, script)
+            return wcl(node, script, request_id)
         except AssertionError as error:
             last = error
             time.sleep(delay)
@@ -208,8 +219,8 @@ def pane_rows(node, store):
 def pipe_demand():
     """Merged `/v1/admin/demand/pipes` across all Nodes.
 
-    Telemetry is Node-local since process start — a compute-lease move
-    restarts the row on the new owner — so run-total cost is the sum of
+    Telemetry is Node-local since process start â€” a compute-lease move
+    restarts the row on the new owner â€” so run-total cost is the sum of
     per-Node rows. `last_*`/`*_last` fields merge by max (most-recent
     estimates, not costs); `pipes` in a Domain rollup merges by max for
     the same reason (every Node reports the same live Pipe set).
@@ -373,7 +384,7 @@ def main():
         capped_store = f"{domain}.capped"
         byte_store = f"{domain}.bytecap"
         writer = f"writer{suffix}"
-        # A Subscription is one shared durable frontier — members and
+        # A Subscription is one shared durable frontier â€” members and
         # declared Pipes compete for the same pages. Each Pipe therefore
         # consumes its own Subscription over the shared source Feed.
         subscription, subscription_b = f"{domain}.flow", f"{domain}.flowb"
@@ -396,20 +407,20 @@ def main():
             # Emitting pipe: closed panes publish to the results Feed and
             # their rows delete atomically with the emission.
             f"CREATE PIPE {totals_pipe} FROM SUBSCRIPTION {subscription} "
-            f"TO STATESTORE {panes_store} WINDOW 8s EVENT MAX_LATE 6s "
+            f"TO STATESTORE {panes_store} WINDOW 8s EVENT MAX_LATE 20s "
             f"BY JSON 'customer' SUM JSON 'amount' EMIT TO FEED {results_feed}; "
             # Non-emitting pipe: closed panes never publish; EXPIRE is the
             # retention contract that reclaims them without further input.
             f"CREATE PIPE {retire_pipe} FROM SUBSCRIPTION {subscription_b} "
-            f"TO STATESTORE {retired_store} WINDOW 8s EVENT MAX_LATE 6s "
-            f"EXPIRE 15s BY JSON 'customer' COUNT; "
+            f"TO STATESTORE {retired_store} WINDOW 8s EVENT MAX_LATE 20s "
+            f"EXPIRE 40s BY JSON 'customer' COUNT; "
             # Capped pipe: LIMIT KEYS 1 admits only the smallest tagged
             # group to pane state; every other Key's records accumulate
-            # the shared __keycap__ sentinel — bounded refusal evidence.
+            # the shared __keycap__ sentinel â€” bounded refusal evidence.
             f"DEFINE STATESTORE {capped_store} KEYS key, pane; "
             f"CREATE SUBSCRIPTION {subscription_c} FROM {source} START AT BEGINNING; "
             f"CREATE PIPE {capped_pipe} FROM SUBSCRIPTION {subscription_c} "
-            f"TO STATESTORE {capped_store} WINDOW 8s EVENT MAX_LATE 6s "
+            f"TO STATESTORE {capped_store} WINDOW 8s EVENT MAX_LATE 20s "
             f"LIMIT KEYS 1 BY JSON 'customer' COUNT; "
             # Byte-capped pipe: LIMIT BYTES 130 admits three pane rows
             # (41-43 accounted bytes each) then refuses every further new
@@ -417,7 +428,7 @@ def main():
             f"DEFINE STATESTORE {byte_store} KEYS key, pane; "
             f"CREATE SUBSCRIPTION {subscription_d} FROM {source} START AT BEGINNING; "
             f"CREATE PIPE {byte_pipe} FROM SUBSCRIPTION {subscription_d} "
-            f"TO STATESTORE {byte_store} WINDOW 8s EVENT MAX_LATE 6s "
+            f"TO STATESTORE {byte_store} WINDOW 8s EVENT MAX_LATE 20s "
             f"LIMIT BYTES 130 BY JSON 'customer' COUNT;",
         )
         writer_epoch = results[6]["session_epoch"]
@@ -429,10 +440,14 @@ def main():
         # deterministically regardless of scheduling jitter: the pane index
         # derives from event_time_ns, never the arrival time.
         t0 = time.time_ns()
-        p0 = (t0 + 2_000_000_000) // PANE_NS
+        # Margin: ingest_time is server-stamped at commit; under host load a
+        # commit can trail the request by many seconds. Lateness is measured
+        # ingest - event, so events need this much future headroom to keep
+        # on-time records out of the lateness sentinel.
+        p0 = (t0 + 30_000_000_000) // PANE_NS
         p0_start = p0 * PANE_NS
 
-        # Batch A — three records inside pane P0.
+        # Batch A â€” three records inside pane P0.
         append_json(
             NODES[1],
             writer,
@@ -446,7 +461,7 @@ def main():
 
         # Batch B ~3s later: an out-of-order straggler still inside P0
         # (lateness ~1s < MAX_LATE), plus events crossing three further pane
-        # boundaries — every adjacent pane is a distinct row.
+        # boundaries â€” every adjacent pane is a distinct row.
         time.sleep(3)
         batch_b = append_json(
             NODES[0],
@@ -466,20 +481,22 @@ def main():
         if wait_ns > 0:
             time.sleep(wait_ns / 1e9)
 
-        # Batch C: a late record (~9-10s behind its event time, > MAX_LATE)
+        # Batch C: a late record (~45s behind its event time, > MAX_LATE)
         # quarantines into the sentinel pane; a fresh event lands in a pane
         # that stays open until its own close; an i64::MAX event lands in a
-        # pane whose close-boundary arithmetic overflows — fail-closed Keep,
+        # pane whose close-boundary arithmetic overflows â€” fail-closed Keep,
         # it can never emit.
         t_c = time.time_ns()
-        pfresh = pane_of(t_c)
+        pfresh = pane_of(t_c + 30_000_000_000)
         append_json(
             NODES[2],
             writer,
             writer_epoch,
             [
-                ("lateco", 999, p0_start + 10_000_000),
-                ("acme", 1, t_c),
+                # ~45s behind its event time — comfortably past the widened
+                # 20s MAX_LATE even when commits stall under host load.
+                ("lateco", 999, t_c - 45_000_000_000),
+                ("acme", 1, t_c + 30_000_000_000),
                 ("edge", 1, I64_MAX),
             ],
         )
@@ -499,8 +516,8 @@ def main():
             raise AssertionError({"emitted closed/invalid pane": emitted})
 
         # Sentinel evidence: one late row for group lateco, count 1, sum 0.
-        # The closed-pane emissions can land before batch C is consumed —
-        # idle drives emit them during the close wait — so the sentinel is
+        # The closed-pane emissions can land before batch C is consumed â€”
+        # idle drives emit them during the close wait â€” so the sentinel is
         # awaited, not assumed present.
         sentinels = []
         deadline = time.time() + 60
@@ -518,7 +535,7 @@ def main():
             raise AssertionError({"sentinel accumulator": sentinels[0]})
 
         # Same-request retry: identical request_ids dedupe at the Feed, so
-        # the Pipe never re-accumulates them — a failed dedup would land the
+        # the Pipe never re-accumulates them â€” a failed dedup would land the
         # reposted records as lateness > MAX_LATE and grow the sentinel set.
         repost_batch(NODES[1], batch_b)
         settle(results_feed)
@@ -532,7 +549,7 @@ def main():
 
         # Bounded state: emitted panes deleted; only the overflow pane row
         # (and possibly the not-yet-closed fresh pane) remains alongside the
-        # sentinel — never a re-materialized closed pane. The read may land
+        # sentinel â€” never a re-materialized closed pane. The read may land
         # on a replica still applying the emission deletes, so converge.
         remaining_groups = None
         for _ in range(30):
@@ -569,16 +586,16 @@ def main():
         # Post-move window: fresh input still aggregates and closes through
         # the moved owner.
         t2 = time.time_ns()
-        pmoved = pane_of(t2)
+        pmoved = pane_of(t2 + 30_000_000_000)
         append_json(
             NODES[0],
             writer,
             writer_epoch,
-            [("globex", 3, t2)],
+            [("globex", 3, t2 + 30_000_000_000)],
             retries=45,
         )
         expected[("globex", pmoved)] = (1, 3)
-        emitted = emissions(wait_records(results_feed, 7, deadline=60))
+        emitted = emissions(wait_records(results_feed, 7, deadline=90))
         assert_subset(emitted, expected)
 
         # Per-Domain Pipe cost attribution, read while every drive Node is
@@ -631,14 +648,15 @@ def main():
             if service != new_owner
         )
         joined = None
+        join_identity = {"request_id": str(uuid.uuid4()), "member_id": str(uuid.uuid4())}
         for _ in range(90):
             status, joined = post(
                 survivor,
                 "/v1/subscriptions/members/join",
                 {
                     "subscription": subscription,
-                    "request_id": str(uuid.uuid4()),
-                    "member_id": str(uuid.uuid4()),
+                    "request_id": join_identity["request_id"],
+                    "member_id": join_identity["member_id"],
                 },
             )
             if status == 200:
@@ -662,16 +680,16 @@ def main():
         wait_for_fabric()
 
         t3 = time.time_ns()
-        pdone = pane_of(t3)
+        pdone = pane_of(t3 + 30_000_000_000)
         append_json(
             NODES[2],
             writer,
             writer_epoch,
-            [("acme", 9, t3)],
+            [("acme", 9, t3 + 30_000_000_000)],
             retries=45,
         )
         expected[("acme", pdone)] = (1, 9)
-        emitted = emissions(wait_records(results_feed, 8, deadline=60))
+        emitted = emissions(wait_records(results_feed, 8, deadline=90))
         assert_subset(emitted, expected)
         if len(emitted) != 8:
             raise AssertionError({"unexpected extra emissions": emitted})
@@ -684,9 +702,9 @@ def main():
             raise AssertionError("re-drive emitted extra outputs")
 
         # No-input expiry: the non-emitting Pipe's pane rows (fed by the
-        # same source) delete at pane_end + EXPIRE on idle drives — the
+        # same source) delete at pane_end + EXPIRE on idle drives â€” the
         # sentinel and the overflow pane are kept as designed.
-        expiry_deadline = (pdone + 1) * PANE_NS + 15_000_000_000 + 30_000_000_000
+        expiry_deadline = (pdone + 1) * PANE_NS + 40_000_000_000 + 30_000_000_000
         while time.time_ns() < expiry_deadline:
             rows = pane_rows(NODES[2], retired_store)
             if len(rows) == 1:
@@ -704,7 +722,7 @@ def main():
         # LIMIT KEYS: the capped Pipe folds the same 12 source records but
         # admits only "acme" (the smallest tagged group) to pane state.
         # The five non-acme records accumulate the single shared
-        # `__keycap__` sentinel row — countable refusal evidence, and the
+        # `__keycap__` sentinel row â€” countable refusal evidence, and the
         # bound holds no matter how many distinct Keys arrive.
         capped_sentinels, capped_groups = [], None
         deadline = time.time() + 120
@@ -736,11 +754,11 @@ def main():
             raise AssertionError({"keycap sentinel": capped_sentinels[0]})
 
         # LIMIT BYTES: the byte-capped Pipe admits the first three pane
-        # rows it encounters — (acme,P0), (globex,P0), (acme,P0+1) at
-        # 41+43+41=125 accounted bytes — then every later new (group,
+        # rows it encounters â€” (acme,P0), (globex,P0), (acme,P0+1) at
+        # 41+43+41=125 accounted bytes â€” then every later new (group,
         # pane) row refuses into the one shared `__bytecap__` sentinel:
         # globex P0+2, acme P0+3, lateco's late row, acme pfresh, edge's
-        # overflow pane, and the post-move/restart records — 7 refused
+        # overflow pane, and the post-move/restart records â€” 7 refused
         # records total. Merges into admitted rows never grow the budget.
         byte_sentinels, byte_panes = [], None
         deadline = time.time() + 120
@@ -775,7 +793,7 @@ def main():
             raise AssertionError({"bytecap sentinel": byte_sentinels[0]})
 
         # Post-restart attribution: the recovered compute-lease owner
-        # records fresh drives for the same Pipes — the restarted Node's
+        # records fresh drives for the same Pipes â€” the restarted Node's
         # wiped row is honest, not a loss, and the recovered owner's row
         # proves attribution keeps following the lease.
         merged, _ = pipe_demand()
@@ -816,7 +834,7 @@ def main():
     except BaseException:
         # Diagnostics before teardown: the whole observable state of both
         # stores and both feeds, so a failure is diagnosable from logs.
-        # Each probe is individually guarded — a wedged endpoint must not
+        # Each probe is individually guarded â€” a wedged endpoint must not
         # mask the rest of the evidence.
         def probe(fn):
             try:

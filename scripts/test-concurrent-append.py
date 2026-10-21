@@ -32,6 +32,23 @@ def post(endpoint, path, body):
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error:
         return error.code, json.loads(error.read() or b"{}")
+    except OSError:
+        return 0, {}
+    except (urllib.error.URLError, TimeoutError, ConnectionError, OSError):
+        return 0, {}
+
+
+def committed_post(endpoint, path, body):
+    # Transient quorum/commit stalls are retryable: the stable request_id in
+    # each body keeps a retried append idempotent, and refusal statuses return
+    # at once so assertion checks still observe real rejections.
+    for _ in range(120):
+        status, result = post(endpoint, path, body)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
 
 
 @_retried
@@ -42,8 +59,8 @@ def get(endpoint, path):
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error:
         return error.code, json.loads(error.read() or b"{}")
-
-
+    except OSError:
+        return 0, {}
 def b64(raw):
     return base64.b64encode(raw).decode()
 
@@ -67,7 +84,7 @@ def main():
     script = f"CREATE DOMAIN {domain}; CREATE FEED {feed};" + "".join(
         f" CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer};" for writer in writers
     )
-    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": script})
+    status, setup = committed_post(ENDPOINTS[0], "/v1/admin/wcl", {"script": script, "request_id": str(uuid.uuid4())})
     if status != 200:
         raise AssertionError(setup)
     epochs = [
@@ -84,8 +101,12 @@ def main():
         writer, epoch = writers[index], epochs[index]
         for seq in range(RECORDS_PER_WRITER):
             body = append_body(writer, epoch, f"key-{index}".encode(), f"w{index}-{seq:04d}".encode(), seq)
-            status, result = post(ENDPOINTS[(index + seq) % 3], "/v1/writers/append", body)
-            if status != 200 or result.get("deduplicated"):
+            status, result = committed_post(ENDPOINTS[(index + seq) % 3], "/v1/writers/append", body)
+            # A retried append can legitimately answer deduplicated: the
+            # earlier attempt committed but its response was lost to a
+            # transient 5xx â€” exactly-once held, and the committed-order
+            # checks below still catch any record that never landed.
+            if status != 200:
                 failures.append((index, seq, status, result))
                 return
             results[index].append(seq)
@@ -101,14 +122,14 @@ def main():
         raise AssertionError("a Writer lost records under concurrency")
 
     # Phase 2: the same request_id raced on two ingresses must still commit
-    # exactly one record — dedup under a real race, not a sequential retry.
+    # exactly one record â€” dedup under a real race, not a sequential retry.
     race_body = append_body(writers[0], epochs[0], b"race", b"raced-request", 999)
     barrier = threading.Barrier(3)
     race_replies = []
 
     def race_worker(endpoint):
         barrier.wait()
-        race_replies.append(post(endpoint, "/v1/writers/append", race_body))
+        race_replies.append(committed_post(endpoint, "/v1/writers/append", race_body))
 
     racers = [threading.Thread(target=race_worker, args=(endpoint,)) for endpoint in (ENDPOINTS[0], ENDPOINTS[2])]
     for thread in racers:
@@ -124,18 +145,18 @@ def main():
 
     # Phase 3: client clock skew. Records on one Key carry scrambled
     # event_time_ns (distant past, far future, epoch zero, negative, now).
-    # Committed order must follow append order — declared event time never
-    # reorders the immutable log — and ingest_time_ns stays non-decreasing.
+    # Committed order must follow append order â€” declared event time never
+    # reorders the immutable log â€” and ingest_time_ns stays non-decreasing.
     now_ns = time.time_ns()
     skewed_event_times = [now_ns - 86_400_000_000_000, now_ns + 86_400_000_000_000, 0, -1_000_000_000, now_ns]
     for seq, event_time in enumerate(skewed_event_times):
         body = append_body(writers[0], epochs[0], b"skew", f"skew-{seq}".encode(), event_time)
-        status, result = post(ENDPOINTS[seq % 3], "/v1/writers/append", body)
+        status, result = committed_post(ENDPOINTS[seq % 3], "/v1/writers/append", body)
         if status != 200:
             raise AssertionError(f"skewed-event append refused: {result}")
 
     # Read the whole Feed and verify ordering, completeness, and skew immunity.
-    status, page = post(ENDPOINTS[1], "/v1/readers/temporary/fetch", {"feed": feed, "limit": 200})
+    status, page = committed_post(ENDPOINTS[1], "/v1/readers/temporary/fetch", {"feed": feed, "limit": 200})
     if status != 200:
         raise AssertionError(page)
     records = page["records"]

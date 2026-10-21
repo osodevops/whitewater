@@ -159,7 +159,7 @@ async fn a_resequenced_retry_with_the_same_cursor_returns_the_original_position(
     forged.cursor = first.cursor.clone();
     assert!(matches!(
         store.append(forged).await,
-        Err(ActiveRangeStoreError::WriterSequenceConflict)
+        Err(ActiveRangeStoreError::WriterSequenceConflict { .. })
     ));
 
     // A forged reuse of the same Cursor at the next stream position fails
@@ -557,7 +557,7 @@ async fn writer_sequence_conflicts_gaps_and_stale_retries_are_rejected() {
 
     assert!(matches!(
         store.append(append(4, b"different")).await,
-        Err(ActiveRangeStoreError::WriterSequenceConflict)
+        Err(ActiveRangeStoreError::WriterSequenceConflict { .. })
     ));
     assert!(matches!(
         store.append(append(6, b"gap")).await,
@@ -745,11 +745,15 @@ async fn imported_merge_branches_deduplicate_colliding_sequences_by_frame_digest
     let replay = store.append(live_retry_left).await.unwrap();
     assert!(replay.deduplicated);
     assert_eq!(replay.position, RangePosition::new(1));
-    // Distinct payloads reusing a committed sequence still fail closed.
-    assert!(matches!(
-        store.append(append(3, b"different")).await,
-        Err(ActiveRangeStoreError::WriterSequenceConflict)
-    ));
+    // Distinct payloads reusing a committed sequence still fail closed, and
+    // the refusal carries the stream's latest sequence so the session append
+    // path can re-land the record at the boundary.
+    match store.append(append(3, b"different")).await {
+        Err(ActiveRangeStoreError::WriterSequenceConflict { latest }) => {
+            assert_eq!(latest, 3);
+        }
+        other => panic!("expected WriterSequenceConflict, got {other:?}"),
+    }
     assert!(matches!(
         store.append(append(2, b"different")).await,
         Err(ActiveRangeStoreError::StaleWriterSequence { .. })
@@ -763,7 +767,7 @@ async fn imported_merge_branches_deduplicate_colliding_sequences_by_frame_digest
     assert_eq!(replay.cursor, "right-2");
     assert!(matches!(
         reopened.append(append(3, b"another")).await,
-        Err(ActiveRangeStoreError::WriterSequenceConflict)
+        Err(ActiveRangeStoreError::WriterSequenceConflict { .. })
     ));
 }
 

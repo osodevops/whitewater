@@ -50,23 +50,34 @@ def post_once(node, path, payload, control=False):
             return response.status, json.load(response)
     except urllib.error.HTTPError as error:
         return error.code, json.load(error)
+    except OSError:
+        return 0, {}
+_post_transport = _retried(post_once)
 
 
-post = _retried(post_once)
+def post(node, path, payload, control=False):
+    for _ in range(120):
+        status, result = _post_transport(node, path, payload, control)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
 
 
-def wcl(node, script):
-    status, response = post(node, "/v1/admin/wcl", {"script": script})
+def wcl(node, script, request_id=None):
+    status, response = post(node, "/v1/admin/wcl", {"request_id": request_id or str(uuid.uuid4()), "script": script})
     if status != 200:
         raise AssertionError({"script": script, "response": response})
     return [result["data"] for result in response["results"]]
 
 
 def wcl_retry(node, script, attempts=30, delay=1):
+    request_id = str(uuid.uuid4())
     last = None
     for _ in range(attempts):
         try:
-            return wcl(node, script)
+            return wcl(node, script, request_id)
         except AssertionError as error:
             last = error
             time.sleep(delay)
@@ -403,14 +414,15 @@ def main():
             if service != new_owner
         )
         joined = None
+        join_identity = {"request_id": str(uuid.uuid4()), "member_id": str(uuid.uuid4())}
         for _ in range(90):
             status, joined = post(
                 survivor,
                 "/v1/subscriptions/members/join",
                 {
                     "subscription": subscription,
-                    "request_id": str(uuid.uuid4()),
-                    "member_id": str(uuid.uuid4()),
+                    "request_id": join_identity["request_id"],
+                    "member_id": join_identity["member_id"],
                 },
             )
             if status == 200:

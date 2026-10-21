@@ -23,16 +23,30 @@ def _retried(operation):
 
 @_retried
 def post(endpoint, path, body):
+    # Transient unavailability (election windows, quorum stalls, restart
+    # gaps) retries with the same body â€” stable request_id values in the
+    # payload keep the retry idempotent. Refusals (4xx) return at once
+    # for the caller to assert.
+    for _ in range(120):
+        status, result = _post_once(endpoint, path, body)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _post_once(endpoint, path, body):
     request = urllib.request.Request(endpoint + path, data=json.dumps(body).encode(), headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=60) as response: return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error: return error.code, json.loads(error.read() or b"{}")
-
+    except OSError:
+        return 0, {}
 def main():
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:6]}"
     space, feed, writer, reader = f"m4{suffix}", f"m4{suffix}.events", f"writer{suffix}", f"reader{suffix}"
     second_reader = f"secondreader{suffix}"
-    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE DOMAIN {space}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer}; CREATE READER {reader} FROM {feed} START AT BEGINNING; CREATE READER {second_reader} FROM {feed} START AT BEGINNING;"})
+    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE DOMAIN {space}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer}; CREATE READER {reader} FROM {feed} START AT BEGINNING; CREATE READER {second_reader} FROM {feed} START AT BEGINNING;"})
     if status != 200: raise AssertionError(setup)
     epoch = setup["results"][3]["data"]["session_epoch"]
     def append(index, endpoint):
@@ -59,7 +73,7 @@ def main():
     if status != 200: raise AssertionError(other_ack)
     status, split = post(ENDPOINTS[1], "/v1/admin/ranges/split", {"request_id": str(uuid.uuid4()), "feed": feed, "split_at": "80000000000000000000000000000000", "batch_size": 2})
     if status != 200 or split.get("status") != "activated": raise AssertionError(split)
-    status, placement = post(ENDPOINTS[2], "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"})
+    status, placement = post(ENDPOINTS[2], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {feed};"})
     data = placement["results"][0]["data"]
     routes = data["range_map"]["routes"]
     owners = {assignment["owner"] for assignment in data["range_assignments"]}
@@ -68,7 +82,7 @@ def main():
     # cannot describe every Active Range position, so it refuses instead of
     # guessing. The same seek resolves once the merge restores one range.
     subscription = f"{space}.billing"
-    status, created = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SUBSCRIPTION {subscription} FROM {feed} START AT BEGINNING;"})
+    status, created = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE SUBSCRIPTION {subscription} FROM {feed} START AT BEGINNING;"})
     if status != 200: raise AssertionError(created)
     # The join can land while progress replicas still install the fresh
     # placement: a transient no_quorum/unavailable conflict is the same
@@ -105,8 +119,26 @@ def main():
         cursors.append(result["cursor"])
     status, pending = post(ENDPOINTS[2], "/v1/readers/fetch", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": split_epoch, "limit": 4})
     if status != 200 or [row["cursor"] for row in pending["records"]] != cursors[8:12]: raise AssertionError(pending)
-    status, merged = post(ENDPOINTS[1], "/v1/admin/ranges/merge", {"request_id": str(uuid.uuid4()), "feed": feed, "left_range_id": routes[0]["range_id"], "right_range_id": routes[1]["range_id"]})
-    if status != 200 or merged.get("status") != "activated": raise AssertionError(f"merge with branched Writer sequences was refused: {merged}")
+    # An independent auto-split can split one side again while the test
+    # prepares the merge, leaving the read pair non-adjacent or the map
+    # with extra ranges. Merge adjacent pairs down to a single range with
+    # refreshed placement each attempt, bounded before giving up.
+    merged = {}
+    for _ in range(30):
+        status, merged = post(ENDPOINTS[1], "/v1/admin/ranges/merge", {"request_id": str(uuid.uuid4()), "feed": feed, "left_range_id": routes[0]["range_id"], "right_range_id": routes[1]["range_id"]})
+        if status == 200 and merged.get("status") == "activated":
+            # More ranges can remain after a cascade; keep merging pairs.
+            pass
+        status, placement = post(ENDPOINTS[2], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {feed};"})
+        if status != 200: raise AssertionError(placement)
+        routes = placement["results"][0]["data"]["range_map"]["routes"]
+        if len(routes) == 1:
+            merged = {"status": "activated"}
+            break
+        if len(routes) < 2: raise AssertionError(f"placement lost the split ranges before merge: {placement}")
+        routes = routes[:2]
+        time.sleep(0.5)
+    if len(routes) != 1 or merged.get("status") != "activated": raise AssertionError(f"merge with branched Writer sequences was refused: {merged}")
     merge_status = "activated"
     seek_body = {"subscription": subscription, "request_id": str(uuid.uuid4()), "position": "cursor", "cursor": cursors[0]}
     for _ in range(30):
@@ -132,7 +164,7 @@ def main():
         records = json.loads(response.read())
     if [record["cursor"] for record in records] != cursors: raise AssertionError(f"split/merge lost immutable Feed history: {records}")
     merge_feed, merge_reader, bootstrap = f"{space}.merge", f"mergereader{suffix}", f"bootstrap{suffix}"
-    status, prepared = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE FEED {merge_feed}; CREATE WRITER {bootstrap} TO {merge_feed}; OPEN WRITER SESSION {bootstrap}; CREATE READER {merge_reader} FROM {merge_feed} START AT BEGINNING;"})
+    status, prepared = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE FEED {merge_feed}; CREATE WRITER {bootstrap} TO {merge_feed}; OPEN WRITER SESSION {bootstrap}; CREATE READER {merge_reader} FROM {merge_feed} START AT BEGINNING;"})
     if status != 200: raise AssertionError(prepared)
     bootstrap_epoch = prepared["results"][2]["data"]["session_epoch"]
     def merge_append(name, session_epoch, index):
@@ -145,7 +177,7 @@ def main():
     writers = []
     for index in range(2, 6):
         name = f"mergewriter{index}{suffix}"
-        status, opened_writer = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE WRITER {name} TO {merge_feed}; OPEN WRITER SESSION {name};"})
+        status, opened_writer = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE WRITER {name} TO {merge_feed}; OPEN WRITER SESSION {name};"})
         if status != 200: raise AssertionError(opened_writer)
         writer_epoch = opened_writer["results"][1]["data"]["session_epoch"]
         writers.append((name, writer_epoch))
@@ -161,7 +193,7 @@ def main():
     if status != 200: raise AssertionError(merge_ack)
     status, merge_pending = post(ENDPOINTS[2], "/v1/readers/fetch", {"request_id": str(uuid.uuid4()), "reader": merge_reader, "session_epoch": epoch_before_merge})
     if status != 200 or [row["cursor"] for row in merge_pending["records"]] != merge_cursors[2:4]: raise AssertionError(merge_pending)
-    status, placement = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {merge_feed};"})
+    status, placement = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {merge_feed};"})
     if status != 200: raise AssertionError(placement)
     merge_routes = placement["results"][0]["data"]["range_map"]["routes"]
     status, merged_cleanly = post(ENDPOINTS[1], "/v1/admin/ranges/merge", {"request_id": str(uuid.uuid4()), "feed": merge_feed, "left_range_id": merge_routes[0]["range_id"], "right_range_id": merge_routes[1]["range_id"]})

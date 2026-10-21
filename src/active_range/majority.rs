@@ -291,23 +291,38 @@ impl MajorityAppendCoordinator {
         ];
         let mut durable_followers = Vec::new();
         for (node, result) in follower_results {
-            if let Ok(accepted) = result {
-                if accepted.position != local.position
-                    || accepted.frame_digest != local.frame_digest
-                {
-                    return Err(self.error(
-                        MajorityAppendErrorCode::FrameConflict,
-                        format!("replica {node} acknowledged different bytes or position"),
-                        false,
-                        durable,
-                        vec![],
-                    ));
+            match result {
+                Ok(accepted) => {
+                    if accepted.position != local.position
+                        || accepted.frame_digest != local.frame_digest
+                    {
+                        return Err(self.error(
+                            MajorityAppendErrorCode::FrameConflict,
+                            format!("replica {node} acknowledged different bytes or position"),
+                            false,
+                            durable,
+                            vec![],
+                        ));
+                    }
+                    durable.push(node.clone());
+                    durable_followers.push(node);
                 }
-                durable.push(node.clone());
-                durable_followers.push(node);
+                Err(error) => {
+                    tracing::warn!(
+                        replica = %node,
+                        feed_id = %request.feed_id,
+                        retryable = error.retryable,
+                        error = %error.message,
+                        "Active Range replica append refused by follower"
+                    );
+                }
             }
         }
         if durable.len() < ACTIVE_RANGE_COMMIT_QUORUM {
+            // The owner cannot commit: mark the range so recovery probes
+            // report it unhealthy and ownership can move to a replica that
+            // can form quorum instead of refusing appends indefinitely.
+            self.local.note_owner_quorum_blocked(request.range_id).await;
             return Err(self.error(
                 MajorityAppendErrorCode::NoDurableMajority,
                 "append is durable on fewer than two current replicas",
@@ -316,6 +331,9 @@ impl MajorityAppendCoordinator {
                 vec![],
             ));
         }
+        self.local
+            .note_owner_quorum_restored(request.range_id)
+            .await;
         if request.pending_effect.is_some() {
             // Deferred commit: the frame is durable on a quorum of replicas
             // but stays fenced behind the committed boundary. The effect

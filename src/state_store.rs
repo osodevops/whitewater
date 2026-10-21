@@ -1001,7 +1001,15 @@ impl FjallStateStoreMutationJournal {
                 .map(|bytes| serde_json::from_slice::<StateStoreMutation>(&bytes))
                 .transpose()?
                 .ok_or(StateStoreMutationError::Sequence)?;
-            return if committed == mutation {
+            // A retried request arrives with a fresh request_id, a new
+            // issued_at_ns and an unallocated sequence (0); it is the same
+            // mutation when the committed-significant fields match. Reused
+            // identity carrying different content is a true conflict.
+            let same = committed.store_id == mutation.store_id
+                && committed.ownership_epoch == mutation.ownership_epoch
+                && committed.op == mutation.op
+                && (mutation.sequence == 0 || mutation.sequence == committed.sequence);
+            return if same {
                 Ok(StateStorePrepareVote {
                     store_id: committed.store_id,
                     mutation_id: committed.mutation_id,
@@ -2935,6 +2943,26 @@ mod tests {
             journal.prepare(changed),
             Err(StateStoreMutationError::Conflict)
         ));
+    }
+
+    #[test]
+    fn committed_mutation_dedupes_retry_with_fresh_request_envelope() {
+        // A client retry after an ambiguous commit reuses only the
+        // mutation_id: the server mints a new request_id and the incoming
+        // mutation carries an unallocated sequence. The journal must still
+        // recognise the committed entry instead of reporting a conflict.
+        let directory = TempDir::new().unwrap();
+        let journal = FjallStateStoreMutationJournal::open(directory.path()).unwrap();
+        let store_id = Uuid::new_v4();
+        let placement = assignment(store_id);
+        let vote = journal.prepare(mutation(store_id, 0, "row")).unwrap();
+        journal
+            .commit_with_quorum(store_id, 1, &evidence(&vote.mutation, &placement))
+            .unwrap();
+        let mut retry = mutation(store_id, 0, "row");
+        retry.mutation_id = vote.mutation.mutation_id;
+        let revote = journal.prepare(retry).unwrap();
+        assert_eq!(revote.mutation, vote.mutation);
     }
 
     #[test]

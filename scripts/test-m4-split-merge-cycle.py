@@ -34,12 +34,29 @@ def post(endpoint, path, body):
     try:
         with urllib.request.urlopen(request, timeout=60) as response: return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error: return error.code, json.loads(error.read() or b"{}")
-
+    except OSError:
+        return 0, {}
 def main():
+    # Fresh cutovers can take a moment to propagate progress placements and
+    # session registration; identical request_id retries stay idempotent.
+    # Connection failures and 5xx unavailability retry alongside the typed
+    # transient codes; other refusals return at once for the caller to assert.
+    def retried_post(endpoint, path, body):
+        for _ in range(120):
+            status, result = post(endpoint, path, body)
+            if status == 200 or (
+                status
+                and status < 500
+                and result.get("code") not in TRANSIENT
+            ):
+                return status, result
+            time.sleep(0.5)
+        return status, result
+
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:6]}"
     domain, feed, writer, reader = f"cyc{suffix}", f"cyc{suffix}.events", f"cycw{suffix}", f"cyr{suffix}"
     subscription = f"{domain}.drain"
-    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE DOMAIN {domain}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer}; CREATE READER {reader} FROM {feed} START AT BEGINNING; CREATE SUBSCRIPTION {subscription} FROM {feed} START AT BEGINNING;"})
+    status, setup = retried_post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE DOMAIN {domain}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer}; CREATE READER {reader} FROM {feed} START AT BEGINNING; CREATE SUBSCRIPTION {subscription} FROM {feed} START AT BEGINNING;"})
     if status != 200: raise AssertionError(setup)
     epoch = setup["results"][3]["data"]["session_epoch"]
 
@@ -49,38 +66,28 @@ def main():
         # per-Key ordering survives every split/merge transition, not just
         # aggregate feed order.
         key = f"{tag}-key-{len(cursors) % 3}"
-        status, result = post(endpoint, "/v1/writers/append", {"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": epoch, "event_time_ns": str(len(cursors)), "key_base64": base64.b64encode(key.encode()).decode(), "payload_base64": base64.b64encode(f"value-{len(cursors)}".encode()).decode(), "metadata_base64": {}})
+        status, result = retried_post(endpoint, "/v1/writers/append", {"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": epoch, "event_time_ns": str(len(cursors)), "key_base64": base64.b64encode(key.encode()).decode(), "payload_base64": base64.b64encode(f"value-{len(cursors)}".encode()).decode(), "metadata_base64": {}})
         if status != 200: raise AssertionError(result)
         cursors.append(result["cursor"])
 
     def placement_routes():
-        status, placement = post(ENDPOINTS[2], "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"})
+        status, placement = retried_post(ENDPOINTS[2], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {feed};"})
         if status != 200: raise AssertionError(placement)
         return placement["results"][0]["data"]["range_map"]["routes"]
-
-    # Fresh cutovers can take a moment to propagate progress placements and
-    # session registration; identical request_id retries stay idempotent.
-    def retried_post(endpoint, path, body):
-        for _ in range(30):
-            status, result = post(endpoint, path, body)
-            if status == 200 or result.get("code") not in TRANSIENT:
-                return status, result
-            time.sleep(0.5)
-        return status, result
 
     reader_epoch = None
     reader_acked = 0
     def reader_drain(limit=64):
         nonlocal reader_epoch, reader_acked
-        status, opened = post(ENDPOINTS[0], "/v1/readers/open", {"request_id": str(uuid.uuid4()), "reader": reader, "capacity": limit})
+        status, opened = retried_post(ENDPOINTS[0], "/v1/readers/open", {"request_id": str(uuid.uuid4()), "reader": reader, "capacity": limit})
         if status != 200: raise AssertionError(opened)
         reader_epoch = opened["session_epoch"]
-        status, page = post(ENDPOINTS[1], "/v1/readers/fetch", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": reader_epoch, "limit": limit})
+        status, page = retried_post(ENDPOINTS[1], "/v1/readers/fetch", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": reader_epoch, "limit": limit})
         if status != 200: raise AssertionError(page)
         expected = cursors[reader_acked:reader_acked + limit]
         if [row["cursor"] for row in page["records"]] != expected: raise AssertionError(f"Reader diverged from committed history: {page}")
         if page["records"]:
-            status, ack = post(ENDPOINTS[2], "/v1/readers/ack", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": reader_epoch, "cursor": page["delivered_cursor"]})
+            status, ack = retried_post(ENDPOINTS[2], "/v1/readers/ack", {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": reader_epoch, "cursor": page["delivered_cursor"]})
             if status != 200: raise AssertionError(ack)
             reader_acked += len(page["records"])
         return len(page["records"])
@@ -118,7 +125,7 @@ def main():
             append(f"c{cycle}", ENDPOINTS[index % 3])
         reader_drain()
         member_drain()
-        status, split = post(ENDPOINTS[1], "/v1/admin/ranges/split", {"request_id": str(uuid.uuid4()), "feed": feed, "split_at": boundary, "batch_size": 4})
+        status, split = retried_post(ENDPOINTS[1], "/v1/admin/ranges/split", {"request_id": str(uuid.uuid4()), "feed": feed, "split_at": boundary, "batch_size": 4})
         if status != 200 or split.get("status") != "activated": raise AssertionError(f"cycle {cycle} split: {split}")
         # The translated frontier rode inside the activation command as
         # durable pending evidence; the post-activation apply must have
@@ -126,7 +133,7 @@ def main():
         statuses = [entry.get("status") for entry in split.get("subscription_frontiers", []) if entry.get("subscription") == subscription]
         if split.get("subscription_reconcile_failed") or statuses != ["reconciled"]: raise AssertionError(f"cycle {cycle} split did not apply the pending Subscription translation: {split}")
         if len(placement_routes()) != 2: raise AssertionError(f"cycle {cycle} did not leave two Active Ranges")
-        # The pre-transition Reader epoch is fenced — a stale ack must refuse.
+        # The pre-transition Reader epoch is fenced â€” a stale ack must refuse.
         stale = {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": reader_epoch, "cursor": "AAAA"}
         status, refused = post(ENDPOINTS[0], "/v1/readers/ack", stale)
         if status == 200: raise AssertionError(f"cycle {cycle} accepted a stale-epoch Reader ack: {refused}")
@@ -137,7 +144,7 @@ def main():
             append(f"c{cycle}s", ENDPOINTS[index % 3])
         reader_drain()
         routes = placement_routes()
-        status, merged = post(ENDPOINTS[2], "/v1/admin/ranges/merge", {"request_id": str(uuid.uuid4()), "feed": feed, "left_range_id": routes[0]["range_id"], "right_range_id": routes[1]["range_id"]})
+        status, merged = retried_post(ENDPOINTS[2], "/v1/admin/ranges/merge", {"request_id": str(uuid.uuid4()), "feed": feed, "left_range_id": routes[0]["range_id"], "right_range_id": routes[1]["range_id"]})
         if status != 200 or merged.get("status") != "activated": raise AssertionError(f"cycle {cycle} merge: {merged}")
         statuses = [entry.get("status") for entry in merged.get("subscription_frontiers", []) if entry.get("subscription") == subscription]
         if merged.get("subscription_reconcile_failed") or statuses != ["reconciled"]: raise AssertionError(f"cycle {cycle} merge did not apply the pending Subscription translation: {merged}")
@@ -146,10 +153,18 @@ def main():
         member_drain()
 
     encoded = urllib.parse.quote(feed, safe="")
-    @_retried
     def read_history():
-        with urllib.request.urlopen(urllib.request.Request(f"{ENDPOINTS[0]}/v1/feeds/records?feed={encoded}&limit=200", headers={"authorization": f"Bearer {KEY}"}), timeout=30) as response:
-            return json.loads(response.read())
+        for _ in range(60):
+            try:
+                with urllib.request.urlopen(urllib.request.Request(f"{ENDPOINTS[0]}/v1/feeds/records?feed={encoded}&limit=200", headers={"authorization": f"Bearer {KEY}"}), timeout=30) as response:
+                    return json.loads(response.read())
+            except urllib.error.HTTPError as error:
+                if error.code < 500:
+                    raise
+            except (ConnectionError, urllib.error.URLError, TimeoutError, OSError):
+                pass
+            time.sleep(0.5)
+        raise AssertionError("Feed history stayed unavailable through the transient-retry window")
     records = read_history()
     if [record["cursor"] for record in records] != cursors: raise AssertionError("repeated split/merge cycles lost or reordered immutable Feed history")
     if member_delivered != cursors: raise AssertionError("the Subscription frontier did not drain every record exactly once across three transitions")

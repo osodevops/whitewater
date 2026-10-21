@@ -70,6 +70,19 @@ def _retried(operation):
 
 @_retried
 def post(endpoint, path, body, timeout=30):
+    # Transient unavailability (election windows, quorum stalls, restart
+    # gaps) retries with the same body â€” stable request_id values in the
+    # payload keep the retry idempotent. Refusals (4xx) return at once
+    # for the caller to assert.
+    for _ in range(120):
+        status, result = _post_once(endpoint, path, body, timeout)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _post_once(endpoint, path, body, timeout=30):
     request = urllib.request.Request(
         endpoint + path,
         data=json.dumps(body).encode(),
@@ -90,6 +103,15 @@ def post(endpoint, path, body, timeout=30):
 
 @_retried
 def get(endpoint, path, timeout=30):
+    for _ in range(120):
+        status, result = _get_once(endpoint, path, timeout)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _get_once(endpoint, path, timeout=30):
     request = urllib.request.Request(
         endpoint + path, headers={"authorization": f"Bearer {KEY}"}
     )
@@ -103,8 +125,9 @@ def get(endpoint, path, timeout=30):
 
 
 def wcl(script):
+    request_id = str(uuid.uuid4())
     for attempt in range(30):
-        status, body = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": script})
+        status, body = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": request_id, "script": script})
         if status == 200:
             return body
         time.sleep(1)
@@ -329,12 +352,23 @@ def main():
                 }
                 for index in range(batch_start, min(batch_start + 50, RECORD_COUNT))
             ]
-            status, batch = post(
-                ENDPOINTS[batch_start // 50 % 3],
-                "/v1/writers/append-batch",
-                {"records": records},
-            )
-            assert status == 200 and len(batch["results"]) == len(records), batch
+            batch = None
+            for attempt in range(30):
+                status, batch = post(
+                    ENDPOINTS[batch_start // 50 % 3],
+                    "/v1/writers/append-batch",
+                    {"records": records},
+                )
+                if status == 200 and len(batch["results"]) == len(records):
+                    break
+                # A saturated runner can stall an append quorum briefly; the
+                # writer keeps identity, so a retry is idempotent.
+                if status >= 500 or status == 0:
+                    time.sleep(2)
+                    continue
+                raise AssertionError(batch)
+            else:
+                raise AssertionError(f"seed batch {batch_start} never committed: {batch}")
             for index, result in enumerate(batch["results"]):
                 seeded.add(result["cursor"])
                 seeded_index[result["cursor"]] = batch_start + index
@@ -516,7 +550,7 @@ def main():
         # Mid-drain: kill the progress owner; member operations recover it.
         # SIGKILL, not stop: a graceful stop can linger on shutdown hooks and
         # never leave membership, while a kill is the crash the test means to
-        # exercise — the container must be gone before recovery is polled.
+        # exercise â€” the container must be gone before recovery is polled.
         time.sleep(1.5)
         returncode, output = compose("kill", owner_before)
         assert returncode == 0, output

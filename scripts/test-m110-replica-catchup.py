@@ -21,8 +21,7 @@ def _retried(operation):
 
     return wrapped
 
-@_retried
-def call(endpoint, path, body=None):
+def _call_once(endpoint, path, body=None):
     headers = {"authorization": f"Bearer {KEY}"}
     data = None
     method = "GET"
@@ -33,6 +32,29 @@ def call(endpoint, path, body=None):
     request = urllib.request.Request(endpoint + path, data=data, headers=headers, method=method)
     with urllib.request.urlopen(request, timeout=10) as response:
         return json.loads(response.read())
+
+
+def call(endpoint, path, body=None):
+    # Transient failures (election/quorum/restart windows plus the
+    # NotCurrentOwner-shaped 409s a moving placement produces) retry
+    # with the same body — request_id identities keep mutations idempotent.
+    last = None
+    for _ in range(120):
+        try:
+            return _call_once(endpoint, path, body)
+        except urllib.error.HTTPError as error:
+            body = error.read() or b"{}"
+            if error.code < 500:
+                # Ownership transitions surface a NotCurrentOwner-shaped
+                # 409 while placement settles; bounded retries ride it
+                # out, but log the body so real conflicts stay visible.
+                print(f"transient {error.code}: {body[:300]}", file=sys.stderr)
+            last = error
+            time.sleep(0.5)
+        except OSError as error:
+            last = error
+            time.sleep(0.5)
+    raise last
 
 def main():
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:6]}"

@@ -25,20 +25,34 @@ def _retried(operation):
 
 @_retried
 def post(endpoint, path, body):
+    # Transient unavailability (election windows, quorum stalls, restart
+    # gaps) retries with the same body â€” stable request_id values in the
+    # payload keep the retry idempotent. Refusals (4xx) return at once
+    # for the caller to assert.
+    for _ in range(120):
+        status, result = _post_once(endpoint, path, body)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _post_once(endpoint, path, body):
     request = urllib.request.Request(endpoint + path, data=json.dumps(body).encode(), headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error:
         return error.code, json.loads(error.read() or b"{}")
-
+    except OSError:
+        return 0, {}
 def wait_ready(endpoint):
     for _ in range(120):
         try:
             with urllib.request.urlopen(f"{endpoint}/health", timeout=3) as response:
                 if response.status != 200:
                     raise ConnectionError("unhealthy")
-            status, _ = post(endpoint, "/v1/admin/wcl", {"script": "SHOW DOMAINS;"})
+            status, _ = post(endpoint, "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": "SHOW DOMAINS;"})
             if status == 200:
                 return
         except Exception:
@@ -55,14 +69,14 @@ def wcl_cli(*arguments):
 def main():
     powershell = shutil.which("powershell")
     if not powershell:
-        print(json.dumps({"status": "skipped", "reason": "powershell not on PATH — wcl-cli is a Windows PowerShell host tool"}))
+        print(json.dumps({"status": "skipped", "reason": "powershell not on PATH â€” wcl-cli is a Windows PowerShell host tool"}))
         return
     for endpoint in ENDPOINTS:
         wait_ready(endpoint)
 
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:6]}"
     domain, feed, writer = f"pscli{suffix}", f"pscli{suffix}.events", f"writer{suffix}"
-    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE DOMAIN {domain}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer};"})
+    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE DOMAIN {domain}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer};"})
     if status != 200:
         raise AssertionError(setup)
     epoch = setup["results"][3]["data"]["session_epoch"]
@@ -83,7 +97,7 @@ def main():
     if not appended.get("cursor"):
         raise AssertionError(f"append response lacks a cursor: {appended}")
 
-    # Identical request_id replays deduplicate at the data API — the same
+    # Identical request_id replays deduplicate at the data API â€” the same
     # ambiguity contract the SDKs rely on after an unknown outcome.
     replay = wcl_cli(
         "write", "-Endpoints", f"127.0.0.1:{BASE_PORT + 1}", "-ApiKey", KEY,
@@ -100,7 +114,7 @@ def main():
         raise AssertionError(f"identical request_id did not deduplicate: {deduplicated}")
 
     # The appended record is visible through the data read path with exact
-    # bytes — the CLI never invents payloads or drops Metadata.
+    # bytes â€” the CLI never invents payloads or drops Metadata.
     status, fetched = post(ENDPOINTS[2], "/v1/readers/temporary/fetch", {"feed": feed, "limit": 10})
     if status != 200:
         raise AssertionError(fetched)

@@ -23,11 +23,25 @@ def _retried(operation):
 
 @_retried
 def post(endpoint, path, body):
+    # Transient unavailability (election windows, quorum stalls, restart
+    # gaps) retries with the same body â€” stable request_id values in the
+    # payload keep the retry idempotent. Refusals (4xx) return at once
+    # for the caller to assert.
+    for _ in range(120):
+        status, result = _post_once(endpoint, path, body)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _post_once(endpoint, path, body):
     request = urllib.request.Request(endpoint + path, data=json.dumps(body).encode(), headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=60) as response: return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error: return error.code, json.loads(error.read() or b"{}")
-
+    except OSError:
+        return 0, {}
 def main():
     env = os.environ.copy()
     env.update({"WHITEWATER_AUTO_SPLIT_INTERVAL_MS": "500", "WHITEWATER_AUTO_SPLIT_APPEND_RATE": "2", "WHITEWATER_AUTO_SPLIT_SUSTAINED_SAMPLES": "1", "WHITEWATER_AUTO_SPLIT_COOLDOWN_SAMPLES": "20"})
@@ -36,7 +50,7 @@ def main():
         time.sleep(5)
         suffix = f"auto{int(time.time())}{uuid.uuid4().hex[:6]}"
         space, feed, writer = suffix, f"{suffix}.events", f"writer{suffix}"
-        status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SPACE {space}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer};"})
+        status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE SPACE {space}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer};"})
         if status != 200: raise AssertionError(setup)
         epoch = setup["results"][-1]["data"]["session_epoch"]
         split_started = False
@@ -59,7 +73,7 @@ def main():
             time.sleep(0.1)
         placement = None
         for _ in range(40):
-            status, response = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"INSPECT PLACEMENT FOR FEED {feed};"})
+            status, response = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"INSPECT PLACEMENT FOR FEED {feed};"})
             if status == 200:
                 placement = response["results"][0]["data"]
                 if len(placement["range_map"]["routes"]) >= 2: break

@@ -23,17 +23,31 @@ def _retried(operation):
 
 @_retried
 def post(endpoint, path, body):
+    # Transient unavailability (election windows, quorum stalls, restart
+    # gaps) retries with the same body â€” stable request_id values in the
+    # payload keep the retry idempotent. Refusals (4xx) return at once
+    # for the caller to assert.
+    for _ in range(120):
+        status, result = _post_once(endpoint, path, body)
+        if status == 0 or status >= 500:
+            time.sleep(0.5)
+            continue
+        return status, result
+    return status, result
+
+def _post_once(endpoint, path, body):
     request = urllib.request.Request(endpoint + path, data=json.dumps(body).encode(), headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error:
         return error.code, json.loads(error.read() or b"{}")
-
+    except OSError:
+        return 0, {}
 def main():
     suffix = f"{int(time.time())}{uuid.uuid4().hex[:6]}"
     space, feed, writer = f"m2{suffix}", f"m2{suffix}.events", f"writer{suffix}"
-    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"CREATE SPACE {space}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer};"})
+    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE SPACE {space}; CREATE FEED {feed}; CREATE WRITER {writer} TO {feed}; OPEN WRITER SESSION {writer};"})
     if status != 200: raise AssertionError(setup)
     epoch = setup["results"][-1]["data"]["session_epoch"]
     append = {"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": epoch, "event_time_ns": "1", "key_base64": "aw==", "payload_base64": "dg==", "metadata_base64": {}}
@@ -63,12 +77,12 @@ def main():
     status, page = post(ENDPOINTS[2], "/v1/readers/temporary/fetch", {"feed": feed, "limit": 20})
     if status != 200 or len(page["records"]) != 8: raise AssertionError(page)
     if [record["payload_base64"] for record in page["records"]][-4:] != [payload] * 4: raise AssertionError("compression changed application payloads")
-    status, opened = post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"OPEN WRITER SESSION {writer};"})
+    status, opened = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"OPEN WRITER SESSION {writer};"})
     new_epoch = opened["results"][0]["data"]["session_epoch"]
     stale = dict(append); stale["request_id"] = str(uuid.uuid4())
     status, _ = post(ENDPOINTS[1], "/v1/writers/append", stale)
     if status == 200: raise AssertionError("stale Writer epoch was accepted")
-    post(ENDPOINTS[0], "/v1/admin/wcl", {"script": f"REVOKE WRITER SESSION {writer} EPOCH {new_epoch};"})
+    post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"REVOKE WRITER SESSION {writer} EPOCH {new_epoch};"})
     revoked = dict(append); revoked.update({"request_id": str(uuid.uuid4()), "session_epoch": new_epoch})
     status, _ = post(ENDPOINTS[2], "/v1/writers/append", revoked)
     if status == 200: raise AssertionError("revoked Writer session was accepted")

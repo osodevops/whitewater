@@ -230,6 +230,11 @@ pub struct ReplicaAppendService {
     stores: Arc<RwLock<HashMap<(RangeId, RangeGeneration), FileActiveRangeStore>>>,
     store_open_gate: Arc<Mutex<()>>,
     frozen_generations: Arc<RwLock<HashSet<(RangeId, RangeGeneration)>>>,
+    /// Ranges whose owner-side appends last failed to reach a durable quorum
+    /// (the local frame landed but the followers rejected). In-memory like
+    /// `frozen_generations`; `recovery_status` reports such an owner as
+    /// unhealthy so ownership moves instead of writes stalling forever.
+    quorum_blocked_ranges: Arc<RwLock<HashSet<RangeId>>>,
     append_gate: Arc<Mutex<()>>,
 }
 
@@ -246,6 +251,7 @@ impl ReplicaAppendService {
             stores: Arc::new(RwLock::new(HashMap::new())),
             store_open_gate: Arc::new(Mutex::new(())),
             frozen_generations: Arc::new(RwLock::new(HashSet::new())),
+            quorum_blocked_ranges: Arc::new(RwLock::new(HashSet::new())),
             append_gate: Arc::new(Mutex::new(())),
         }
     }
@@ -278,6 +284,16 @@ impl ReplicaAppendService {
             .read()
             .await
             .contains(&(range_id, generation))
+    }
+
+    /// Owner-side signal: the local frame landed but durable quorum failed.
+    pub async fn note_owner_quorum_blocked(&self, range_id: RangeId) {
+        self.quorum_blocked_ranges.write().await.insert(range_id);
+    }
+
+    /// Clears the quorum-blocked mark after a successful quorum append.
+    pub async fn note_owner_quorum_restored(&self, range_id: RangeId) {
+        self.quorum_blocked_ranges.write().await.remove(&range_id);
     }
 
     pub async fn next_position(
@@ -481,9 +497,17 @@ impl ReplicaAppendService {
             })?;
         let store = self.store_for(&assignment).await?;
         let snapshot = store.snapshot().await.map_err(map_store_error)?;
+        // A stale quorum mark left on a replica that stopped owning the range
+        // must not degrade it: the flag only counts while this Node is owner.
+        let quorum_blocked = assignment.owner == self.local_node
+            && self
+                .quorum_blocked_ranges
+                .read()
+                .await
+                .contains(&assignment.range_id);
         Ok(super::ReplicaRecoveryStatus {
             node: self.local_node.clone(),
-            healthy: !store.persistence_failure(),
+            healthy: !store.persistence_failure() && !quorum_blocked,
             appended: snapshot.progress.appended(),
             committed: snapshot.progress.commit_position(),
         })
@@ -1226,7 +1250,7 @@ fn map_store_error(error: ActiveRangeStoreError) -> ReplicaAppendError {
             ReplicaAppendErrorCode::PositionConflict,
             error.to_string(),
         ),
-        ActiveRangeStoreError::WriterSequenceConflict
+        ActiveRangeStoreError::WriterSequenceConflict { .. }
         | ActiveRangeStoreError::StaleWriterSequence { .. }
         | ActiveRangeStoreError::WriterSequenceGap { .. } => ReplicaAppendError::rejected(
             ReplicaAppendErrorCode::WriterSequenceConflict,
@@ -1249,7 +1273,76 @@ fn map_store_error(error: ActiveRangeStoreError) -> ReplicaAppendError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::active_range::ReplicaSet;
+    use crate::{
+        active_range::ReplicaSet,
+        control::Command,
+        storage::{FileLogStore, LogStore},
+    };
+
+    #[tokio::test]
+    async fn owner_quorum_block_marks_recovery_status_unhealthy_until_restored() {
+        let root = tempfile::TempDir::new().unwrap();
+        let nodes = ["storage-1", "storage-2", "storage-3"]
+            .map(|node| StorageNodeId::try_new(node).unwrap());
+        let legacy: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(root.path().join("legacy")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                root.path().join("catalog.json"),
+                legacy,
+                nodes.to_vec(),
+            )
+            .unwrap(),
+        );
+        let created = control
+            .execute_commands(vec![
+                Command::CreateSpace {
+                    name: "orders".to_owned(),
+                },
+                Command::CreateFeed {
+                    name: "orders.events".to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+        let feed_id: Uuid =
+            serde_json::from_value(created.results[1].data["feed_id"].clone()).unwrap();
+        let assignment = control.active_range_assignment(feed_id).await.unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        let owner_root = root.path().join("owner");
+        let peer_root = root.path().join("peer");
+        crate::active_range::store::seed_committed_history(&owner_root, &descriptor, 7);
+        crate::active_range::store::seed_committed_history(&peer_root, &descriptor, 7);
+        let owner =
+            ReplicaAppendService::new(&owner_root, assignment.owner.clone(), control.clone());
+        let peer_id = assignment
+            .replicas
+            .iter()
+            .find(|node| **node != assignment.owner)
+            .unwrap()
+            .clone();
+        let peer = ReplicaAppendService::new(&peer_root, peer_id, control.clone());
+
+        assert!(owner.recovery_status(feed_id).await.unwrap().healthy);
+
+        // Owner appended locally but followers refused: the range must probe
+        // unhealthy so ownership can move off the stalled owner.
+        owner.note_owner_quorum_blocked(assignment.range_id).await;
+        assert!(!owner.recovery_status(feed_id).await.unwrap().healthy);
+
+        // The same mark on a replica that does not own the range must not
+        // degrade it.
+        peer.note_owner_quorum_blocked(assignment.range_id).await;
+        assert!(peer.recovery_status(feed_id).await.unwrap().healthy);
+
+        owner.note_owner_quorum_restored(assignment.range_id).await;
+        assert!(owner.recovery_status(feed_id).await.unwrap().healthy);
+    }
 
     #[test]
     fn a_partially_local_multi_range_feed_cannot_appear_complete() {

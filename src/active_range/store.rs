@@ -154,8 +154,8 @@ pub enum ActiveRangeStoreError {
     StaleWriterSequence { actual: u64, latest: u64 },
     #[error("Writer sequence {actual} has a gap; expected {expected}")]
     WriterSequenceGap { actual: u64, expected: u64 },
-    #[error("Writer sequence was reused with different record bytes")]
-    WriterSequenceConflict,
+    #[error("Writer sequence was reused with different record bytes; latest accepted sequence is {latest}")]
+    WriterSequenceConflict { latest: u64 },
     #[error("Cursor is too large")]
     CursorTooLarge,
     #[error("RangePosition counter overflow")]
@@ -945,11 +945,15 @@ fn append(
                         .entries
                         .iter()
                         .find(|entry| entry.position == previous.position)
-                        .ok_or(ActiveRangeStoreError::WriterSequenceConflict)?;
+                        .ok_or(ActiveRangeStoreError::WriterSequenceConflict {
+                            latest: previous.sequence,
+                        })?;
                     let existing_frame = read_indexed_frame(&inner.directory, existing)?;
                     let existing_record = decode_record(&existing_frame.frame)?;
                     if !same_request_record(&existing_record, &record) {
-                        return Err(ActiveRangeStoreError::WriterSequenceConflict);
+                        return Err(ActiveRangeStoreError::WriterSequenceConflict {
+                            latest: previous.sequence,
+                        });
                     }
                 }
                 return Ok(ActiveRangeAppendResult {
