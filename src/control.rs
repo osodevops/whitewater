@@ -2303,6 +2303,34 @@ impl ControlController {
         .ok()
     }
 
+    /// Every active Subscription's current progress placement — the recovery
+    /// supervisor's scan input. Declared Subscriptions without a placement
+    /// have nothing to recover and are absent.
+    pub async fn active_subscription_progress_assignments(
+        &self,
+    ) -> Vec<SubscriptionProgressAssignment> {
+        let state = self.state.lock().await;
+        state
+            .subscription_progress_assignments
+            .iter()
+            .filter(|(subscription_id, _)| {
+                state
+                    .subscriptions
+                    .get(*subscription_id)
+                    .is_some_and(|item| item.status == ResourceStatus::Active)
+            })
+            .filter_map(|(subscription_id, assignment)| {
+                SubscriptionProgressAssignment::try_new(
+                    *subscription_id,
+                    assignment.owner.clone(),
+                    assignment.replicas.clone(),
+                    assignment.ownership_epoch,
+                )
+                .ok()
+            })
+            .collect()
+    }
+
     /// One Subscription's committed-but-unapplied cutover translation, if an
     /// Active Range activation left it pending for the progress quorum.
     pub async fn pending_subscription_cutover(

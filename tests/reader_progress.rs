@@ -15,9 +15,9 @@ use whitewater::{
         FjallReaderProgressStore, FjallSubscriptionProgressReplica, ReaderDeliveryMutation,
         ReaderDeliveryReceipt, ReaderFrontierTranslationError, ReaderLineageEntry,
         ReaderPacingController, ReaderPressureSample, ReaderProgressEngine, ReaderProgressError,
-        SubscriptionCommitEvidence, SubscriptionMemberState, SubscriptionPrepareVote,
-        SubscriptionProgressAssignment, SubscriptionProgressCoordinator, SubscriptionProgressError,
-        SubscriptionProgressInspection, SubscriptionProgressMutation,
+        SubscriptionCommitEvidence, SubscriptionMemberState, SubscriptionPlacementAuthority,
+        SubscriptionPrepareVote, SubscriptionProgressAssignment, SubscriptionProgressCoordinator,
+        SubscriptionProgressError, SubscriptionProgressInspection, SubscriptionProgressMutation,
         SubscriptionProgressTransport, SubscriptionReplicaReply,
     },
     storage::{FileLogStore, LogStore},
@@ -1836,12 +1836,22 @@ async fn subscription_progress_handoff_owner_vacates_a_healthy_owner_and_adopts_
         );
     }
 
-    // A retry after the placement CAS already landed converges through
-    // adoption at the live epoch rather than erroring or bumping again.
-    let retried = coordinator
-        .handoff_owner(&controller, &target)
-        .await
-        .unwrap();
+    // A retry on the stale coordinator reports Unavailable: the CAS's
+    // expected epoch already moved, and the outcome is unknowable from this
+    // vantage. Rebuilding on the live placement converges the same handoff
+    // through adoption at the live epoch — no second CAS, no epoch bump.
+    assert!(matches!(
+        coordinator.handoff_owner(&controller, &target).await,
+        Err(SubscriptionProgressError::Unavailable)
+    ));
+    let fresh = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let retried = fresh.handoff_owner(&controller, &target).await.unwrap();
     assert_eq!(retried.assignment.ownership_epoch, 2);
     assert_eq!(retried.assignment.owner, target);
     assert_eq!(retried.adopted.len(), 3);
@@ -2061,7 +2071,23 @@ async fn subscription_progress_recovery_adopts_latest_committed_under_raced_move
         .await
         .unwrap();
 
-    let outcome = coordinator.recover_lost_owner(&controller).await.unwrap();
+    // The racing move's CAS already committed: this coordinator still holds
+    // epoch 1, so its own CAS is refused and reports Unavailable rather than
+    // adopting possibly-superseded content at the winner's epoch.
+    assert!(matches!(
+        coordinator.recover_lost_owner(&controller).await,
+        Err(SubscriptionProgressError::Unavailable)
+    ));
+    // A coordinator rebuilt on the live placement converges by adopting the
+    // latest committed frontier at the live epoch — no second CAS.
+    let fresh = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let outcome = fresh.synchronize_placement().await.unwrap();
     assert_eq!(outcome.assignment.ownership_epoch, 2);
     assert_eq!(outcome.assignment.owner, nodes[1]);
     let committed = outcome.committed.unwrap();
@@ -3180,4 +3206,212 @@ async fn subscription_acks_carry_a_bounded_quarantine_set() {
         .await
         .unwrap();
     assert_eq!(acked.quarantined[&range], vec!["poison-2".to_owned()]);
+}
+
+/// A placement authority that fails a bounded number of CAS attempts before
+/// delegating to the real catalog — exercises the inconclusive-error branch
+/// of `commit_owner_move` where the outcome is unknowable to the caller.
+struct FlakyPlacementAuthority {
+    inner: ControlController,
+    fail_first: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SubscriptionPlacementAuthority for FlakyPlacementAuthority {
+    async fn execute_placement_commands(
+        &self,
+        commands: Vec<Command>,
+    ) -> Result<(), SubscriptionProgressError> {
+        if self
+            .fail_first
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            return Err(SubscriptionProgressError::Unavailable);
+        }
+        self.inner.execute_placement_commands(commands).await
+    }
+
+    async fn progress_assignment(
+        &self,
+        subscription_id: Uuid,
+    ) -> Option<SubscriptionProgressAssignment> {
+        self.inner.progress_assignment(subscription_id).await
+    }
+}
+
+#[tokio::test]
+async fn subscription_progress_recovery_reports_unavailable_on_failed_cas_then_converges() {
+    // Regression: a failed placement CAS used to drive adoption of the
+    // attempt's recovered state at whatever epoch the catalog reported —
+    // fencing replicas on content a racing recovery already wrote at that
+    // epoch. The CAS error must surface as Unavailable so the caller rebuilds
+    // on the live placement; a following attempt converges cleanly.
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let owner = coordinator.assignment().owner.clone();
+    let first = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        1,
+    );
+    coordinator.apply(first.clone()).await.unwrap();
+    for set in [
+        &transport.prepare_down,
+        &transport.commit_down,
+        &transport.read_down,
+        &transport.inspect_down,
+        &transport.adopt_down,
+    ] {
+        set.lock().unwrap().insert(owner.clone());
+    }
+
+    // The first CAS attempt fails; recovery must report Unavailable rather
+    // than adopting recovered content at an unknown catalog epoch.
+    let authority = FlakyPlacementAuthority {
+        inner: controller,
+        fail_first: std::sync::atomic::AtomicUsize::new(1),
+    };
+    let result = coordinator.recover_lost_owner(&authority).await;
+    assert!(matches!(
+        result,
+        Err(SubscriptionProgressError::Unavailable)
+    ));
+    assert_eq!(
+        authority
+            .inner
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap()
+            .ownership_epoch,
+        1,
+        "a failed CAS must not advance the ownership epoch"
+    );
+
+    // The retried attempt commits normally and adopts the recovered frontier.
+    let outcome = coordinator.recover_lost_owner(&authority).await.unwrap();
+    assert_eq!(outcome.assignment.ownership_epoch, 2);
+    assert_ne!(outcome.assignment.owner, owner);
+    assert!(outcome.adopted.contains(&outcome.assignment.owner));
+}
+
+#[tokio::test]
+async fn subscription_progress_recovery_lost_cas_race_returns_unavailable() {
+    // When a racing recovery wins the CAS, the losing attempt must report
+    // Unavailable — not adopt its own recovered state at the winner's epoch,
+    // which would conflict with the winner's already-adopted content.
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events;").await.unwrap();
+    let subscription = controller
+        .active_subscription_by_name("orders.billing")
+        .await
+        .unwrap();
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let owner = coordinator.assignment().owner.clone();
+    let first = progress_mutation(
+        subscription.subscription_id,
+        subscription.source.feed_id().unwrap(),
+        1,
+        1,
+    );
+    coordinator.apply(first.clone()).await.unwrap();
+    for set in [
+        &transport.prepare_down,
+        &transport.commit_down,
+        &transport.read_down,
+        &transport.inspect_down,
+        &transport.adopt_down,
+    ] {
+        set.lock().unwrap().insert(owner.clone());
+    }
+
+    // The racing CAS lands first: the live placement is already epoch 2 with
+    // a surviving owner while this coordinator still holds epoch 1.
+    let winner = controller
+        .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+        .await
+        .unwrap()
+        .replicas
+        .iter()
+        .find(|node| *node != &owner)
+        .unwrap()
+        .clone();
+    controller
+        .execute_placement_commands(vec![Command::RecoverSubscriptionProgressOwner {
+            subscription_id: subscription.subscription_id,
+            expected_ownership_epoch: 1,
+            new_owner: winner.clone(),
+        }])
+        .await
+        .unwrap();
+
+    // The losing attempt's CAS is refused (expected epoch 1 is stale); it
+    // must report Unavailable instead of adopting stale content at epoch 2.
+    let result = coordinator.recover_lost_owner(&controller).await;
+    assert!(
+        matches!(result, Err(SubscriptionProgressError::Unavailable)),
+        "losing CAS must report Unavailable, got {result:?}"
+    );
+
+    // The retried attempt on the live placement converges: the winner's owner
+    // answers, the coordinator heals stale rows through adoption.
+    let recovered = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(recovered.assignment().ownership_epoch, 2);
+    let healed = recovered.synchronize_placement().await.unwrap();
+    assert_eq!(healed.assignment.owner, winner);
+    assert_eq!(healed.assignment.ownership_epoch, 2);
+    assert_eq!(healed.committed.unwrap().cursor, first.cursor);
+}
+
+#[tokio::test]
+async fn control_lists_every_active_subscription_progress_placement() {
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE SUBSCRIPTION orders.billing FROM orders.events; CREATE SUBSCRIPTION orders.shipping FROM orders.events;").await.unwrap();
+    let assignments = controller.active_subscription_progress_assignments().await;
+    assert_eq!(assignments.len(), 2);
+    assert!(assignments
+        .iter()
+        .all(|assignment| assignment.ownership_epoch == 1));
 }

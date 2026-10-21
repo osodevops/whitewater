@@ -438,8 +438,33 @@ def main():
                 "limit": 99999,
             },
         )
-        assert status == 200, page
-        assert len(page["records"]) == 256, len(page["records"])
+        # The fetch is read-only and left unacknowledged, so it can repeat:
+        # the last seed batch may have committed durably while the merged
+        # read's corroborated watermark is still a frame behind on a loaded
+        # runner. Poll briefly for the full 256-record page instead of
+        # asserting on the first post-commit read.
+        deadline = time.time() + 60
+        while True:
+            if status == 200 and len(page["records"]) == 256:
+                break
+            assert time.time() < deadline, (
+                f"fetch never returned the seeded 256-record page; last status {status}, "
+                f"size {len(page.get('records', []))}, body {page}"
+            )
+            time.sleep(0.5)
+            status, page = post(
+                ENDPOINTS[1],
+                f"{members}/fetch",
+                {
+                    "subscription": subscription,
+                    "request_id": str(uuid.uuid4()),
+                    "member_id": first,
+                    "member_epoch": 1,
+                    "work_id": first_work,
+                    "lease_epoch": first_lease,
+                    "limit": 99999,
+                },
+            )
         # The page is deliberately left unacknowledged: the worker pool below
         # must see every seeded record, so the frontier stays at the start.
 

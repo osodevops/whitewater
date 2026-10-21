@@ -606,7 +606,7 @@ async fn ownership_epoch_update_is_durable_and_fences_the_previous_epoch() {
     let directory = TempDir::new().unwrap();
     let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
     store
-        .update_ownership_epoch(
+        .adopt_ownership_epoch(
             RangeGeneration::new(1),
             OwnershipEpoch::new(1),
             OwnershipEpoch::new(2),
@@ -630,6 +630,57 @@ async fn ownership_epoch_update_is_durable_and_fences_the_previous_epoch() {
         reopened.snapshot().await.unwrap().ownership_epoch,
         OwnershipEpoch::new(2)
     );
+}
+
+#[tokio::test]
+async fn a_validated_frame_overwrites_an_uncommitted_tail_but_never_committed() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    store.append(append(1, b"committed")).await.unwrap();
+    store
+        .commit(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            CommitPosition::new(1),
+        )
+        .await
+        .unwrap();
+    // Position 2 holds a superseded-epoch orphan left uncommitted.
+    store.append(append(2, b"orphan")).await.unwrap();
+    // Different bytes at the committed boundary still refuse.
+    let mut forged = append(1, b"committed");
+    forged.expected_position = Some(RangePosition::new(1));
+    forged.frame = encode_record(&StoredRecord {
+        message_id: Uuid::from_u128(900),
+        producer_id: forged.identity.writer_session_id,
+        producer_sequence: forged.identity.sequence,
+        event_time_ns: 1,
+        ingest_time_ns: 2,
+        key: b"account-1".to_vec(),
+        payload: b"forged".to_vec(),
+        metadata: BTreeMap::new(),
+    })
+    .unwrap();
+    assert!(matches!(
+        store.append(forged).await,
+        Err(ActiveRangeStoreError::PositionConflict(position)) if position.value() == 1
+    ));
+    // Different bytes from the placement-validated owner at an uncommitted
+    // position truncate the orphan and land instead of wedging.
+    let mut successor = append(2, b"successor");
+    successor.expected_position = Some(RangePosition::new(2));
+    let accepted = store.append(successor).await.unwrap();
+    assert_eq!(accepted.position, RangePosition::new(2));
+    assert!(!accepted.deduplicated);
+    let frames = store.read_uncommitted(None, 10).await.unwrap();
+    assert_eq!(frames.len(), 2);
+    assert_eq!(
+        decode_record(&frames[1].frame).unwrap().payload,
+        b"successor"
+    );
+    let snapshot = store.snapshot().await.unwrap();
+    assert_eq!(snapshot.progress.appended().value(), 2);
+    assert_eq!(snapshot.progress.commit_position().value(), 1);
 }
 
 #[tokio::test]

@@ -1,6 +1,7 @@
 use std::{fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -8,9 +9,9 @@ use uuid::Uuid;
 use crate::control::{unix_ns, ControlController, RangeCommitProof};
 
 use super::{
-    commit_proof::CommitProofReporter, CommitPosition, ReplicaAppendAccepted,
-    ReplicaAppendErrorCode, ReplicaAppendRequest, ReplicaAppendResponse, ReplicaAppendService,
-    ReplicaCommitAccepted, ReplicaCommitRequest, ReplicaCommitResponse,
+    commit_proof::CommitProofReporter, CommitPosition, RangePosition, ReplicaAppendAccepted,
+    ReplicaAppendError, ReplicaAppendErrorCode, ReplicaAppendRequest, ReplicaAppendResponse,
+    ReplicaAppendService, ReplicaCommitAccepted, ReplicaCommitRequest, ReplicaCommitResponse,
     ReplicaDiscardPendingRequest, ReplicaDiscardPendingResponse, StorageNodeId,
     ACTIVE_RANGE_COMMIT_QUORUM,
 };
@@ -62,6 +63,33 @@ impl std::error::Error for MajorityAppendError {}
 pub struct ReplicaTransportError {
     pub message: String,
     pub retryable: bool,
+    /// The replica's refusal code, when the failure was a replica verdict
+    /// rather than a transport failure.
+    pub code: Option<ReplicaAppendErrorCode>,
+    /// The replica's next expected RangePosition on a `PositionGap` verdict.
+    pub expected_position: Option<u64>,
+}
+
+impl ReplicaTransportError {
+    /// A transport-layer failure: the replica's verdict is unknown.
+    pub fn transport(message: impl Into<String>, retryable: bool) -> Self {
+        Self {
+            message: message.into(),
+            retryable,
+            code: None,
+            expected_position: None,
+        }
+    }
+
+    /// A refusal the replica returned with a structured verdict.
+    pub fn replica(error: ReplicaAppendError) -> Self {
+        Self {
+            message: error.message,
+            retryable: error.retryable,
+            code: Some(error.code),
+            expected_position: error.expected_position,
+        }
+    }
 }
 
 impl fmt::Display for ReplicaTransportError {
@@ -265,7 +293,7 @@ impl MajorityAppendCoordinator {
         }
         let local = self.local.append(request.clone()).await.map_err(|error| {
             if error.code == ReplicaAppendErrorCode::PendingEffectOccupied {
-                return self.occupied_error(error.pending_effect);
+                return self.occupied_error(error.pending_effect.map(|boxed| *boxed));
             }
             self.error(
                 MajorityAppendErrorCode::LocalStorageFailure,
@@ -275,6 +303,10 @@ impl MajorityAppendCoordinator {
                 vec![],
             )
         })?;
+        // The frame's true position is where the local append landed it; a
+        // retried request deduplicates to an earlier position than the
+        // pre-allocation tip, and replicas must be offered that position.
+        request.expected_position = local.position;
         let mut durable = vec![self.local.local_node().clone()];
         let followers = assignment
             .replicas
@@ -291,6 +323,22 @@ impl MajorityAppendCoordinator {
         ];
         let mut durable_followers = Vec::new();
         for (node, result) in follower_results {
+            let result = match result {
+                Err(error) if error.code == Some(ReplicaAppendErrorCode::PositionGap) => match self
+                    .fill_replica_gap(
+                        &assignment,
+                        &request,
+                        &node,
+                        error.expected_position,
+                        local.position,
+                    )
+                    .await
+                {
+                    Ok(()) => self.transport.append(&node, request.clone()).await,
+                    Err(fill_error) => Err(fill_error),
+                },
+                other => other,
+            };
             match result {
                 Ok(accepted) => {
                     if accepted.position != local.position
@@ -311,6 +359,11 @@ impl MajorityAppendCoordinator {
                     tracing::warn!(
                         replica = %node,
                         feed_id = %request.feed_id,
+                        expected_position = request.expected_position.value(),
+                        ownership_epoch = ?request.ownership_epoch,
+                        writer_session = %request.identity.writer_session_id,
+                        writer_epoch = request.identity.writer_epoch,
+                        writer_sequence = request.identity.sequence,
                         retryable = error.retryable,
                         error = %error.message,
                         "Active Range replica append refused by follower"
@@ -398,7 +451,10 @@ impl MajorityAppendCoordinator {
             self.error(
                 MajorityAppendErrorCode::LocalStorageFailure,
                 error.to_string(),
-                error.retryable,
+                // A PositionGap here means the local tail was truncated by
+                // a landing ownership move; the frame deduplicates safely on
+                // the client's retry wherever it committed.
+                error.retryable || error.code == ReplicaAppendErrorCode::PositionGap,
                 durable.clone(),
                 evidence.clone(),
             )
@@ -422,6 +478,78 @@ impl MajorityAppendCoordinator {
             commit_evidence: evidence,
             deduplicated: local.deduplicated,
         })
+    }
+
+    /// Re-drive the positions a lagging replica never stored so the caller
+    /// can retry the current frame. A replica that missed an earlier push
+    /// refuses every later position as a gap; replaying the owner's
+    /// appended log into it restores quorum inside the request instead of
+    /// waiting on background repair.
+    async fn fill_replica_gap(
+        &self,
+        assignment: &super::ActiveRangeAssignment,
+        request: &ReplicaAppendRequest,
+        replica: &StorageNodeId,
+        replica_next: Option<u64>,
+        upto: RangePosition,
+    ) -> Result<(), ReplicaTransportError> {
+        let Some(next) = replica_next else {
+            return Err(ReplicaTransportError::transport(
+                "replica reported a position gap without its next expected position",
+                true,
+            ));
+        };
+        let next = RangePosition::new(next);
+        if next.value() >= upto.value() {
+            return Ok(());
+        }
+        let after = next.value().checked_sub(1).map(RangePosition::new);
+        let frames = self
+            .local
+            .read_assignment_uncommitted(assignment, after, (upto.value() - next.value()) as usize)
+            .await
+            .map_err(|error| {
+                ReplicaTransportError::transport(
+                    format!(
+                        "owner could not re-drive missing positions: {}",
+                        error.message
+                    ),
+                    true,
+                )
+            })?;
+        for frame in frames {
+            if frame.position.value() >= upto.value() {
+                break;
+            }
+            let accepted = self
+                .transport
+                .append(
+                    replica,
+                    ReplicaAppendRequest {
+                        feed_id: request.feed_id,
+                        range_id: request.range_id,
+                        generation: request.generation,
+                        ownership_epoch: request.ownership_epoch,
+                        append_owner: request.append_owner.clone(),
+                        expected_position: frame.position,
+                        identity: frame.identity,
+                        cursor: frame.cursor.clone(),
+                        frame_base64: STANDARD.encode(&frame.frame),
+                        pending_effect: None,
+                    },
+                )
+                .await?;
+            if accepted.position != frame.position {
+                return Err(ReplicaTransportError::transport(
+                    format!(
+                        "replica {replica} landed re-driven frame at RangePosition {}",
+                        accepted.position
+                    ),
+                    true,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// The pending marker currently holding a range's uncommitted tail.
@@ -754,10 +882,7 @@ impl HttpReplicaTransport {
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .build()
-            .map_err(|error| ReplicaTransportError {
-                message: error.to_string(),
-                retryable: true,
-            })?;
+            .map_err(|error| ReplicaTransportError::transport(error.to_string(), true))?;
         Self::with_client(endpoints, key, http)
     }
 
@@ -783,14 +908,12 @@ impl HttpReplicaTransport {
         Request: Serialize + Sync,
         Response: for<'de> Deserialize<'de>,
     {
-        let endpoint =
-            self.endpoints
-                .resolve(replica)
-                .await
-                .ok_or_else(|| ReplicaTransportError {
-                    message: format!("replica {replica} has no configured endpoint"),
-                    retryable: false,
-                })?;
+        let endpoint = self.endpoints.resolve(replica).await.ok_or_else(|| {
+            ReplicaTransportError::transport(
+                format!("replica {replica} has no configured endpoint"),
+                false,
+            )
+        })?;
         let response = self
             .http
             .post(format!("{}{}", endpoint.trim_end_matches('/'), path))
@@ -798,23 +921,17 @@ impl HttpReplicaTransport {
             .json(request)
             .send()
             .await
-            .map_err(|error| ReplicaTransportError {
-                message: error.to_string(),
-                retryable: true,
-            })?;
+            .map_err(|error| ReplicaTransportError::transport(error.to_string(), true))?;
         if !response.status().is_success() {
-            return Err(ReplicaTransportError {
-                message: format!("replica {replica} returned HTTP {}", response.status()),
-                retryable: response.status().is_server_error(),
-            });
+            return Err(ReplicaTransportError::transport(
+                format!("replica {replica} returned HTTP {}", response.status()),
+                response.status().is_server_error(),
+            ));
         }
         response
             .json()
             .await
-            .map_err(|error| ReplicaTransportError {
-                message: error.to_string(),
-                retryable: true,
-            })
+            .map_err(|error| ReplicaTransportError::transport(error.to_string(), true))
     }
 }
 
@@ -830,14 +947,11 @@ impl ReplicaTransport for HttpReplicaTransport {
             .await?;
         match (response.result, response.error) {
             (Some(result), _) => Ok(result),
-            (None, Some(error)) => Err(ReplicaTransportError {
-                message: error.message,
-                retryable: error.retryable,
-            }),
-            (None, None) => Err(ReplicaTransportError {
-                message: "replica returned no append result".to_owned(),
-                retryable: true,
-            }),
+            (None, Some(error)) => Err(ReplicaTransportError::replica(error)),
+            (None, None) => Err(ReplicaTransportError::transport(
+                "replica returned no append result",
+                true,
+            )),
         }
     }
 
@@ -851,14 +965,11 @@ impl ReplicaTransport for HttpReplicaTransport {
             .await?;
         match (response.result, response.error) {
             (Some(result), _) => Ok(result),
-            (None, Some(error)) => Err(ReplicaTransportError {
-                message: error.message,
-                retryable: error.retryable,
-            }),
-            (None, None) => Err(ReplicaTransportError {
-                message: "replica returned no commit result".to_owned(),
-                retryable: true,
-            }),
+            (None, Some(error)) => Err(ReplicaTransportError::replica(error)),
+            (None, None) => Err(ReplicaTransportError::transport(
+                "replica returned no commit result",
+                true,
+            )),
         }
     }
 
@@ -876,14 +987,14 @@ impl ReplicaTransport for HttpReplicaTransport {
             .await?;
         match (response.outcome.as_ref(), response.error.as_ref()) {
             (Some(_), _) => Ok(response),
-            (None, Some(error)) => Err(ReplicaTransportError {
-                message: error.message.clone(),
-                retryable: error.retryable,
-            }),
-            (None, None) => Err(ReplicaTransportError {
-                message: "replica returned no discard outcome".to_owned(),
-                retryable: true,
-            }),
+            (None, Some(error)) => Err(ReplicaTransportError::transport(
+                error.message.clone(),
+                error.retryable,
+            )),
+            (None, None) => Err(ReplicaTransportError::transport(
+                "replica returned no discard outcome",
+                true,
+            )),
         }
     }
 }

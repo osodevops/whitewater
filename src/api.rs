@@ -1950,32 +1950,39 @@ async fn member_coordinator_inner(
             return Err(subscription_progress_api_error(error));
         }
     };
-    if !evidence.iter().any(|(node, _)| node == &assignment.owner)
-        || subscription_placement_diverged(&evidence)
-    {
-        // The owner is unreachable, or reachable replicas hold divergent
-        // committed/member state. Recovery advances the ownership epoch
+    if !evidence.iter().any(|(node, _)| node == &assignment.owner) {
+        // The owner is unreachable. Recovery advances the ownership epoch
         // (possibly keeping the same owner) and adopts the recovered
         // frontier under the new epoch, which heals lagging replicas.
         return member_coordinator_recovered(state, &coordinator, definition).await;
     }
-    if evidence.iter().any(|(_, inspection)| {
-        [&inspection.committed, &inspection.prepared]
-            .into_iter()
-            .flatten()
-            .any(|mutation| mutation.ownership_epoch != assignment.ownership_epoch)
-    }) {
-        // A placement CAS landed while adoption missed at least one replica:
-        // its rows still carry an older epoch, so every committed read fences
-        // them as stale and quorum never forms. Re-adopt the recovered
-        // frontier at the live epoch; committing another ownership move here
-        // would only ratchet the epoch while the same rows stay behind.
-        let outcome = coordinator
-            .synchronize_placement()
-            .await
-            .map_err(subscription_progress_api_error)?;
-        let (coordinator, assignment) = member_assignment_coordinator(state, outcome.assignment)?;
-        return Ok((coordinator, assignment, definition));
+    let placement_diverged = subscription_placement_diverged(&evidence);
+    if placement_diverged
+        || evidence.iter().any(|(_, inspection)| {
+            [&inspection.committed, &inspection.prepared]
+                .into_iter()
+                .flatten()
+                .any(|mutation| mutation.ownership_epoch != assignment.ownership_epoch)
+        })
+    {
+        // Heal drift at the live epoch before ratcheting ownership: a
+        // lagging or partially-adopted replica re-adopts the corroborated
+        // frontier without an ownership CAS. Only a genuine committed fork —
+        // adoption refusing the corroborated content — falls through to
+        // recovery, which fences the contradiction under a new epoch.
+        match coordinator.synchronize_placement().await {
+            Ok(outcome) => {
+                let (coordinator, assignment) =
+                    member_assignment_coordinator(state, outcome.assignment)?;
+                return Ok((coordinator, assignment, definition));
+            }
+            Err(error) if !placement_diverged => {
+                return Err(subscription_progress_api_error(error));
+            }
+            Err(_) => {
+                return member_coordinator_recovered(state, &coordinator, definition).await;
+            }
+        }
     }
     Ok((coordinator, assignment, definition))
 }
@@ -2022,6 +2029,106 @@ impl SubscriptionRecoveryGates {
     }
 }
 
+/// Leader-driven backstop for Subscription progress owner recovery. Member
+/// operations drive recovery opportunistically inside their request window,
+/// but that path depends on live member traffic: a Subscription whose
+/// members are idle, exhausted, or blocked behind client timeouts would
+/// otherwise sit with a dead owner until the next request arrives. The
+/// Control Plane leader alone runs the tick — one driver per Riverbed keeps
+/// the ownership CAS single-flight even when member traffic also recovers.
+/// A dead owner must persist across consecutive probes before the
+/// supervisor moves it, so a slow replica that still answers fences itself
+/// without an unnecessary move.
+pub struct SubscriptionProgressRecoverySupervisor {
+    threshold: u32,
+    failures: std::sync::Mutex<BTreeMap<Uuid, (crate::active_range::StorageNodeId, u32)>>,
+}
+
+impl SubscriptionProgressRecoverySupervisor {
+    pub fn new(threshold: u32) -> Self {
+        Self {
+            threshold: threshold.max(1),
+            failures: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub async fn tick(&self, state: &AppState) {
+        let Some(plane) = &state.control_plane else {
+            return;
+        };
+        if plane.status().await.state != "leader" {
+            return;
+        }
+        for assignment in state
+            .control
+            .active_subscription_progress_assignments()
+            .await
+        {
+            // A member request already recovering this Subscription owns the
+            // gate; its attempt converges or reports without duplication.
+            let Some(_gate) = state
+                .subscription_recovery_gates
+                .try_acquire(assignment.subscription_id)
+            else {
+                continue;
+            };
+            let Ok((coordinator, assignment)) = member_assignment_coordinator(state, assignment)
+            else {
+                continue;
+            };
+            let alive = coordinator.owner_available().await;
+            let should_recover = {
+                let mut failures = self
+                    .failures
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if alive {
+                    failures.remove(&assignment.subscription_id);
+                    false
+                } else {
+                    let entry = failures
+                        .entry(assignment.subscription_id)
+                        .or_insert_with(|| (assignment.owner.clone(), 0));
+                    if entry.0 != assignment.owner {
+                        *entry = (assignment.owner.clone(), 0);
+                    }
+                    entry.1 = entry.1.saturating_add(1);
+                    entry.1 >= self.threshold
+                }
+            };
+            if !should_recover {
+                continue;
+            }
+            match coordinator
+                .recover_lost_owner(state.progress_authority.as_ref())
+                .await
+            {
+                Ok(outcome) => {
+                    self.failures
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&assignment.subscription_id);
+                    tracing::info!(
+                        subscription = %assignment.subscription_id,
+                        owner = %outcome.assignment.owner,
+                        ownership_epoch = outcome.assignment.ownership_epoch,
+                        "Subscription progress owner recovered"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        subscription = %assignment.subscription_id,
+                        owner = %assignment.owner,
+                        ownership_epoch = assignment.ownership_epoch,
+                        "background Subscription progress owner recovery attempt failed"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// True when reachable replicas hold divergent committed progress or member
 /// state: recovery must advance the ownership epoch and adopt the recovered
 /// frontier so lagging replicas heal before further mutations.
@@ -2037,6 +2144,56 @@ fn subscription_placement_diverged(
     match states.next() {
         None => false,
         Some(first) => states.any(|state| state != first),
+    }
+}
+
+/// Whether the live placement's owner already answers evidence probes: a
+/// committed CAS — this window's or a racing recovery's — makes another
+/// ownership move pure churn. When the owner answers but at least one
+/// replica still carries a prior-epoch row, adoption at the live epoch
+/// heals the drift without ratcheting ownership. The returned flag marks
+/// convergence so the caller can stop instead of CASing again.
+async fn progress_owner_converged(
+    state: &AppState,
+    coordinator: crate::reader::SubscriptionProgressCoordinator,
+    assignment: crate::reader::SubscriptionProgressAssignment,
+) -> Result<
+    (
+        crate::reader::SubscriptionProgressCoordinator,
+        crate::reader::SubscriptionProgressAssignment,
+        bool,
+    ),
+    ApiError,
+> {
+    let evidence = match coordinator.inspect_evidence().await {
+        Ok(evidence) => evidence,
+        Err(_) => return Ok((coordinator, assignment, false)),
+    };
+    if !evidence.iter().any(|(node, _)| node == &assignment.owner) {
+        return Ok((coordinator, assignment, false));
+    }
+    let placement_diverged = subscription_placement_diverged(&evidence);
+    let placement_stale = evidence.iter().any(|(_, inspection)| {
+        [&inspection.committed, &inspection.prepared]
+            .into_iter()
+            .flatten()
+            .any(|mutation| mutation.ownership_epoch != assignment.ownership_epoch)
+    });
+    if !placement_diverged && !placement_stale {
+        return Ok((coordinator, assignment, true));
+    }
+    match coordinator.synchronize_placement().await {
+        Ok(outcome) => {
+            let (coordinator, assignment) =
+                member_assignment_coordinator(state, outcome.assignment)?;
+            Ok((coordinator, assignment, true))
+        }
+        // A divergent replica set that refuses adoption holds a committed
+        // fork: only a new ownership epoch can fence it, so the caller should
+        // still drive recovery. A merely stale replica set surfaces its own
+        // adoption error unchanged.
+        Err(_) if placement_diverged => Ok((coordinator, assignment, false)),
+        Err(error) => Err(subscription_progress_api_error(error)),
     }
 }
 
@@ -2075,32 +2232,10 @@ async fn member_coordinator_recovered(
         .await
         .unwrap_or_else(|| coordinator.assignment().clone());
     let (current_coordinator, current_assignment) = member_assignment_coordinator(state, current)?;
-    if let Ok(evidence) = current_coordinator.inspect_evidence().await {
-        if evidence
-            .iter()
-            .any(|(node, _)| node == &current_assignment.owner)
-            && !subscription_placement_diverged(&evidence)
-        {
-            let placement_stale = evidence.iter().any(|(_, inspection)| {
-                [&inspection.committed, &inspection.prepared]
-                    .into_iter()
-                    .flatten()
-                    .any(|mutation| mutation.ownership_epoch != current_assignment.ownership_epoch)
-            });
-            if placement_stale {
-                // A placement CAS landed while adoption missed at least one
-                // replica: heal its stale rows at the live epoch rather than
-                // ratcheting ownership again.
-                let outcome = current_coordinator
-                    .synchronize_placement()
-                    .await
-                    .map_err(subscription_progress_api_error)?;
-                let (coordinator, assignment) =
-                    member_assignment_coordinator(state, outcome.assignment)?;
-                return Ok((coordinator, assignment, definition));
-            }
-            return Ok((current_coordinator, current_assignment, definition));
-        }
+    let (current_coordinator, current_assignment, converged) =
+        progress_owner_converged(state, current_coordinator, current_assignment).await?;
+    if converged {
+        return Ok((current_coordinator, current_assignment, definition));
     }
 
     // The ownership CAS must replicate through the placement authority (the
@@ -2132,7 +2267,13 @@ async fn member_coordinator_recovered(
             .active_subscription_progress_assignment_by_id(definition.subscription_id)
             .await
             .unwrap_or_else(|| coordinator.assignment().clone());
-        let (attempt_coordinator, _) = member_assignment_coordinator(state, current)?;
+        let (attempt_coordinator, attempt_assignment) =
+            member_assignment_coordinator(state, current)?;
+        let (attempt_coordinator, attempt_assignment, converged) =
+            progress_owner_converged(state, attempt_coordinator, attempt_assignment).await?;
+        if converged {
+            return Ok((attempt_coordinator, attempt_assignment, definition));
+        }
         result = attempt_coordinator
             .recover_lost_owner(state.progress_authority.as_ref())
             .await;
@@ -22437,10 +22578,7 @@ mod tests {
             self.services[replica]
                 .append(request)
                 .await
-                .map_err(|error| crate::active_range::ReplicaTransportError {
-                    message: error.message,
-                    retryable: error.retryable,
-                })
+                .map_err(crate::active_range::ReplicaTransportError::replica)
         }
 
         async fn commit(
@@ -22454,10 +22592,7 @@ mod tests {
             self.services[replica]
                 .commit(request)
                 .await
-                .map_err(|error| crate::active_range::ReplicaTransportError {
-                    message: error.message,
-                    retryable: error.retryable,
-                })
+                .map_err(crate::active_range::ReplicaTransportError::replica)
         }
 
         async fn discard_pending(
@@ -22471,10 +22606,7 @@ mod tests {
             self.services[replica]
                 .discard_pending(request)
                 .await
-                .map_err(|error| crate::active_range::ReplicaTransportError {
-                    message: error.message,
-                    retryable: error.retryable,
-                })
+                .map_err(crate::active_range::ReplicaTransportError::replica)
         }
     }
 
@@ -23112,5 +23244,31 @@ mod tests {
         assert_eq!(uncommitted.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(uncommitted.message.contains("could not be abandoned"));
         assert!(control.feed_owner_move_plan(feed.feed_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn subscription_progress_supervisor_stays_idle_until_this_node_leads() {
+        // The test control plane cannot win an election: its peers are
+        // unreachable. The supervisor must leave the assignment untouched —
+        // only the Control Plane leader may drive ownership recovery, or
+        // every Node would race the same placement CAS independently.
+        let directory = TempDir::new().unwrap();
+        let (state, _plane, control, _replica) = internal_replica_test_state(&directory).await;
+        let subscription = control
+            .active_subscription_by_name("orders.billing")
+            .await
+            .unwrap();
+        let before = control
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        let supervisor = SubscriptionProgressRecoverySupervisor::new(2);
+        supervisor.tick(&state).await;
+        let after = control
+            .active_subscription_progress_assignment_by_id(subscription.subscription_id)
+            .await
+            .unwrap();
+        assert_eq!(after.owner, before.owner);
+        assert_eq!(after.ownership_epoch, before.ownership_epoch);
     }
 }

@@ -853,6 +853,29 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // Member operations recover a lost Subscription progress owner inside
+    // their own request window, but that path needs live member traffic. The
+    // leader-driven supervisor is the backstop: it probes placements even
+    // when no member request is arriving, so a dead owner cannot wait for
+    // traffic that may already have drained or stopped retrying.
+    let subscription_recovery_task = if app_state.control_plane.is_some() {
+        let state = app_state.clone();
+        let supervisor = whitewater::api::SubscriptionProgressRecoverySupervisor::new(3);
+        let mut shutdown = shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => supervisor.tick(&state).await,
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
     let app = router(app_state).layer(TraceLayer::new_for_http());
     let listener = TcpListener::bind(config.bind_addr).await?;
     let tls_task = match (subscription_tls, tls_router, &config.subscription_mtls) {
@@ -906,6 +929,9 @@ async fn main() -> Result<()> {
     }
     if let Some(pipe_task) = pipe_task {
         let _ = pipe_task.await;
+    }
+    if let Some(task) = subscription_recovery_task {
+        let _ = task.await;
     }
     if let Some(task) = state_store_replay_task {
         let _ = task.await;

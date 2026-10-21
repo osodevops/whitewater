@@ -64,21 +64,14 @@ pub fn plan_owner_recovery(
     if healthy.len() < ACTIVE_RANGE_COMMIT_QUORUM {
         return Err(OwnerRecoveryError::NoHealthyMajority);
     }
-    let mut candidates = healthy
+    // A replica only advances its CommitPosition from verified quorum
+    // commit evidence, so even a single live replica reporting a position
+    // proves it was committed. The prefix must be the maximum reported:
+    // understating it would let the new owner allocate over a committed
+    // tail whose marker survived on just one replica.
+    let committed_prefix = healthy
         .iter()
         .map(|status| status.committed.value())
-        .collect::<Vec<_>>();
-    candidates.sort_unstable();
-    candidates.dedup();
-    let committed_prefix = candidates
-        .into_iter()
-        .filter(|position| {
-            healthy
-                .iter()
-                .filter(|status| status.committed.value() >= *position)
-                .count()
-                >= ACTIVE_RANGE_COMMIT_QUORUM
-        })
         .max()
         .unwrap_or(0);
     let new_owner = healthy

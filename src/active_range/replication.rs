@@ -79,8 +79,14 @@ pub struct ReplicaAppendError {
     pub message: String,
     pub retryable: bool,
     /// The effect holding the tail when `code` is `PendingEffectOccupied`.
+    /// Boxed to keep the error type small enough for hot paths.
     #[serde(default)]
-    pub pending_effect: Option<super::store::PendingEffect>,
+    pub pending_effect: Option<Box<super::store::PendingEffect>>,
+    /// The replica's next expected RangePosition when `code` is
+    /// `PositionGap`; the Append Owner uses it to re-drive the missing
+    /// positions instead of abandoning the replica.
+    #[serde(default)]
+    pub expected_position: Option<u64>,
 }
 
 impl ReplicaAppendError {
@@ -90,6 +96,7 @@ impl ReplicaAppendError {
             message: message.into(),
             retryable: false,
             pending_effect: None,
+            expected_position: None,
         }
     }
 
@@ -99,6 +106,7 @@ impl ReplicaAppendError {
             message: message.into(),
             retryable: true,
             pending_effect: None,
+            expected_position: None,
         }
     }
 
@@ -114,7 +122,8 @@ impl ReplicaAppendError {
                 occupant.effect_id
             ),
             retryable: true,
-            pending_effect: Some(occupant),
+            pending_effect: Some(Box::new(occupant)),
+            expected_position: None,
         }
     }
 }
@@ -539,12 +548,20 @@ impl ReplicaAppendService {
         }
         let store = self.store_for(&assignment).await?;
         let snapshot = store.snapshot().await.map_err(map_store_error)?;
-        if snapshot.progress.commit_position() < committed_prefix {
+        // A replica behind the verified prefix cannot commit frames it does
+        // not hold: promote the prefix it has and let committed repair
+        // import the remainder instead of failing the recovery attempt.
+        let promotable = CommitPosition::new(
+            committed_prefix
+                .value()
+                .min(snapshot.progress.appended().value()),
+        );
+        if snapshot.progress.commit_position() < promotable {
             store
                 .commit(
                     assignment.generation,
                     assignment.ownership_epoch,
-                    committed_prefix,
+                    promotable,
                 )
                 .await
                 .map_err(map_store_error)?;
@@ -564,6 +581,22 @@ impl ReplicaAppendService {
         self.store_for(assignment)
             .await?
             .read_committed(after, limit)
+            .await
+            .map_err(map_store_error)
+    }
+
+    /// Frames through the appended tip, including uncommitted positions.
+    /// The Append Owner replays these to replicas that report a position
+    /// gap so a missed frame does not wedge the replica permanently.
+    pub async fn read_assignment_uncommitted(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        after: Option<RangePosition>,
+        limit: usize,
+    ) -> Result<Vec<super::StoredRangeFrame>, ReplicaAppendError> {
+        self.store_for(assignment)
+            .await?
+            .read_uncommitted(after, limit)
             .await
             .map_err(map_store_error)
     }
@@ -1059,16 +1092,25 @@ impl ReplicaAppendService {
         }
         let store = self.store_for(&assignment).await?;
         let position = RangePosition::new(request.commit_position.value());
-        let local_digest = store
+        let local_digest = match store
             .frame_digest(position)
             .await
             .map_err(map_store_error)?
-            .ok_or_else(|| {
-                ReplicaAppendError::rejected(
+        {
+            Some(digest) => digest,
+            None => {
+                let mut error = ReplicaAppendError::rejected(
                     ReplicaAppendErrorCode::PositionGap,
                     format!("RangePosition {position} is not durable on this replica"),
-                )
-            })?;
+                );
+                error.expected_position = store
+                    .snapshot()
+                    .await
+                    .ok()
+                    .map(|snapshot| snapshot.progress.appended().value().saturating_add(1));
+                return Err(error);
+            }
+        };
         if local_digest != request.frame_digest {
             return Err(ReplicaAppendError::rejected(
                 ReplicaAppendErrorCode::PositionConflict,
@@ -1201,7 +1243,7 @@ async fn synchronize_store_epoch(
     }
     if snapshot.ownership_epoch < assignment.ownership_epoch {
         store
-            .update_ownership_epoch(
+            .adopt_ownership_epoch(
                 assignment.generation,
                 snapshot.ownership_epoch,
                 assignment.ownership_epoch,
@@ -1243,8 +1285,13 @@ fn map_store_error(error: ActiveRangeStoreError) -> ReplicaAppendError {
         ActiveRangeStoreError::Codec(_) | ActiveRangeStoreError::WriterIdentityMismatch => {
             ReplicaAppendError::rejected(ReplicaAppendErrorCode::InvalidFrame, error.to_string())
         }
-        ActiveRangeStoreError::PositionGap { .. } => {
-            ReplicaAppendError::rejected(ReplicaAppendErrorCode::PositionGap, error.to_string())
+        ActiveRangeStoreError::PositionGap { expected, .. } => {
+            let mut mapped = ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::PositionGap,
+                error.to_string(),
+            );
+            mapped.expected_position = Some(expected.value());
+            mapped
         }
         ActiveRangeStoreError::PositionConflict(_) => ReplicaAppendError::rejected(
             ReplicaAppendErrorCode::PositionConflict,

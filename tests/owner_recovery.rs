@@ -126,6 +126,49 @@ async fn recovery_refuses_a_healthy_owner_or_loss_of_replica_majority() {
 }
 
 #[tokio::test]
+async fn recovery_boundary_follows_the_highest_verified_commit_marker() {
+    // A CommitPosition is only advanced from verified quorum commit
+    // evidence, so a marker surviving on one replica still proves the
+    // position committed. Bounding the prefix at quorum agreement would
+    // let the new owner allocate over that committed tail.
+    let (_directory, _controller, assignment) = fixture().await;
+    let owner = assignment.owner.clone();
+    let followers = assignment
+        .replicas
+        .iter()
+        .filter(|node| **node != owner)
+        .cloned()
+        .collect::<Vec<_>>();
+    let marker_holder = followers[0].clone();
+    let plan = plan_owner_recovery(
+        &assignment,
+        &[
+            ReplicaRecoveryStatus {
+                node: owner.clone(),
+                healthy: false,
+                appended: RangePosition::new(6),
+                committed: CommitPosition::new(6),
+            },
+            ReplicaRecoveryStatus {
+                node: marker_holder.clone(),
+                healthy: true,
+                appended: RangePosition::new(6),
+                committed: CommitPosition::new(6),
+            },
+            ReplicaRecoveryStatus {
+                node: followers[1].clone(),
+                healthy: true,
+                appended: RangePosition::new(4),
+                committed: CommitPosition::new(4),
+            },
+        ],
+    )
+    .unwrap();
+    assert_eq!(plan.committed_prefix.value(), 6);
+    assert_eq!(plan.new_owner, marker_holder);
+}
+
+#[tokio::test]
 async fn consensus_recovery_command_is_compare_and_set_and_fences_old_owner() {
     let (_directory, controller, assignment) = fixture().await;
     controller
@@ -260,6 +303,10 @@ async fn recovered_replicas_advance_epoch_preserve_commit_and_truncate_tail() {
         services[&followers[0]].clone(),
         services[&followers[1]].clone(),
     ] {
+        // The replicas adopted the newer committed epoch when the command
+        // landed, but adoption only stamps the epoch: the reconcile promote
+        // commits position 1 and the truncate drops the superseded epoch's
+        // uncommitted tail frame.
         assert_eq!(
             service
                 .reconcile_recovery(assignment.feed_id, CommitPosition::new(1))

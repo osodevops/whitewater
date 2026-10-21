@@ -46,18 +46,12 @@ impl ReplicaTransport for DirectTransport {
         request: ReplicaAppendRequest,
     ) -> Result<ReplicaAppendAccepted, ReplicaTransportError> {
         if self.append_down.contains(replica) {
-            return Err(ReplicaTransportError {
-                message: "append unavailable".to_owned(),
-                retryable: true,
-            });
+            return Err(ReplicaTransportError::transport("append unavailable", true));
         }
         let mut accepted = self.services[replica]
             .append(request)
             .await
-            .map_err(|error| ReplicaTransportError {
-                message: error.message,
-                retryable: error.retryable,
-            })?;
+            .map_err(ReplicaTransportError::replica)?;
         if self.corrupt_digest.as_ref() == Some(replica) {
             accepted.frame_digest[0] ^= 0xff;
         }
@@ -70,10 +64,7 @@ impl ReplicaTransport for DirectTransport {
         request: ReplicaCommitRequest,
     ) -> Result<ReplicaCommitAccepted, ReplicaTransportError> {
         if self.commit_down.contains(replica) {
-            return Err(ReplicaTransportError {
-                message: "commit unavailable".to_owned(),
-                retryable: true,
-            });
+            return Err(ReplicaTransportError::transport("commit unavailable", true));
         }
         if let Some(pause) = self
             .commit_pause
@@ -86,10 +77,7 @@ impl ReplicaTransport for DirectTransport {
         self.services[replica]
             .commit(request)
             .await
-            .map_err(|error| ReplicaTransportError {
-                message: error.message,
-                retryable: error.retryable,
-            })
+            .map_err(ReplicaTransportError::replica)
     }
 
     async fn discard_pending(
@@ -100,10 +88,7 @@ impl ReplicaTransport for DirectTransport {
         self.services[replica]
             .discard_pending(request)
             .await
-            .map_err(|error| ReplicaTransportError {
-                message: error.message,
-                retryable: error.retryable,
-            })
+            .map_err(ReplicaTransportError::replica)
     }
 }
 
@@ -1616,4 +1601,142 @@ async fn discard_pending_effect_fences_a_stale_ownership_epoch() {
     stale.ownership_epoch = OwnershipEpoch::new(9);
     let error = coordinator.discard_pending_effect(stale).await.unwrap_err();
     assert_eq!(error.code, MajorityAppendErrorCode::NotCurrentOwner);
+}
+
+#[tokio::test]
+async fn retried_append_repushes_the_deduplicated_position_to_lagging_followers() {
+    let fixture = Fixture::new().await;
+    // The owner stored the frame; both followers missed the original push.
+    fixture.services[&fixture.owner]
+        .append(fixture.request.clone())
+        .await
+        .unwrap();
+    // The retry deduplicates on the owner at position 1: replicas must be
+    // offered that position rather than the post-allocation tip.
+    let coordinator = fixture.coordinator(&[], &[], None);
+    let result = coordinator.append(fixture.request.clone()).await.unwrap();
+    assert_eq!(result.position.value(), 1);
+    assert!(result.deduplicated);
+    assert_eq!(result.durable_replicas.len(), 3);
+    for node in fixture.non_owner_nodes() {
+        let status = fixture.services[&node]
+            .recovery_status(fixture.request.feed_id)
+            .await
+            .unwrap();
+        assert!(status.healthy);
+        assert_eq!(status.committed.value(), 1);
+        assert_eq!(status.appended.value(), 1);
+    }
+}
+
+#[tokio::test]
+async fn position_gap_repushes_the_missing_owner_frames_before_the_current_one() {
+    let fixture = Fixture::new().await;
+    // Frame 1 landed only on the owner; the followers never stored it.
+    fixture.services[&fixture.owner]
+        .append(fixture.request.clone())
+        .await
+        .unwrap();
+    // Frame 2 is a fresh append: the followers are a position behind, so
+    // the coordinator must re-drive position 1 before frame 2 can land.
+    let mut second = fixture.request.clone();
+    second.identity.sequence = 2;
+    second.cursor = "cursor-2".to_owned();
+    second.frame_base64 = STANDARD.encode(
+        encode_record(&StoredRecord {
+            message_id: Uuid::from_u128(702),
+            producer_id: second.identity.writer_session_id,
+            producer_sequence: 2,
+            event_time_ns: 3,
+            ingest_time_ns: 4,
+            key: b"customer-2".to_vec(),
+            payload: b"shipped".to_vec(),
+            metadata: BTreeMap::new(),
+        })
+        .unwrap(),
+    );
+    let coordinator = fixture.coordinator(&[], &[], None);
+    let result = coordinator.append(second).await.unwrap();
+    assert_eq!(result.position.value(), 2);
+    assert!(!result.deduplicated);
+    assert_eq!(result.durable_replicas.len(), 3);
+    for node in fixture.non_owner_nodes() {
+        let status = fixture.services[&node]
+            .recovery_status(fixture.request.feed_id)
+            .await
+            .unwrap();
+        assert_eq!(status.appended.value(), 2);
+        assert_eq!(status.committed.value(), 2);
+    }
+}
+
+#[tokio::test]
+async fn validated_owner_frame_truncates_the_superseded_uncommitted_tail() {
+    let fixture = Fixture::new().await;
+    let coordinator = fixture.coordinator(&[], &[], None);
+    coordinator.append(fixture.request.clone()).await.unwrap();
+    let replica = fixture.non_owner_nodes()[0].clone();
+    // The replica holds an old-epoch uncommitted orphan at position 2,
+    // left behind by the previous owner's abandoned tail.
+    let mut orphan = fixture.request.clone();
+    orphan.identity.sequence = 2;
+    orphan.expected_position = RangePosition::new(2);
+    orphan.cursor = "cursor-2".to_owned();
+    orphan.frame_base64 = STANDARD.encode(
+        encode_record(&StoredRecord {
+            message_id: Uuid::from_u128(703),
+            producer_id: orphan.identity.writer_session_id,
+            producer_sequence: 2,
+            event_time_ns: 5,
+            ingest_time_ns: 6,
+            key: b"customer-3".to_vec(),
+            payload: b"orphaned".to_vec(),
+            metadata: BTreeMap::new(),
+        })
+        .unwrap(),
+    );
+    fixture.services[&replica].append(orphan).await.unwrap();
+    // Ownership moves to the replica under a newer epoch.
+    fixture
+        .control
+        .execute_commands(vec![Command::RecoverActiveRangeOwnership {
+            feed: "orders.events".to_owned(),
+            expected_owner: fixture.owner.clone(),
+            expected_epoch: OwnershipEpoch::new(1),
+            new_owner: replica.clone(),
+        }])
+        .await
+        .unwrap();
+    // The new owner's epoch-2 frame claims the orphaned position: the
+    // placement-validated frame is authoritative for the uncommitted tail,
+    // so the append drops the orphan rather than reporting a permanent
+    // conflict.
+    let mut successor = fixture.request.clone();
+    successor.ownership_epoch = OwnershipEpoch::new(2);
+    successor.append_owner = replica.clone();
+    successor.identity.writer_session_id = Uuid::from_u128(704);
+    successor.expected_position = RangePosition::new(2);
+    successor.cursor = "cursor-successor".to_owned();
+    successor.frame_base64 = STANDARD.encode(
+        encode_record(&StoredRecord {
+            message_id: Uuid::from_u128(705),
+            producer_id: successor.identity.writer_session_id,
+            producer_sequence: 1,
+            event_time_ns: 7,
+            ingest_time_ns: 8,
+            key: b"customer-4".to_vec(),
+            payload: b"adopted".to_vec(),
+            metadata: BTreeMap::new(),
+        })
+        .unwrap(),
+    );
+    let accepted = fixture.services[&replica].append(successor).await.unwrap();
+    assert_eq!(accepted.position.value(), 2);
+    assert!(!accepted.deduplicated);
+    let status = fixture.services[&replica]
+        .recovery_status(fixture.request.feed_id)
+        .await
+        .unwrap();
+    assert_eq!(status.appended.value(), 2);
+    assert_eq!(status.committed.value(), 1);
 }

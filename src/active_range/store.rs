@@ -241,6 +241,14 @@ pub trait ActiveRangeStore: Send + Sync {
         limit: usize,
         max_bytes: usize,
     ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError>;
+    /// Read frames through the appended tip, including positions that have
+    /// not committed. The Append Owner uses this to re-drive positions a
+    /// replica never stored.
+    async fn read_uncommitted(
+        &self,
+        after: Option<RangePosition>,
+        limit: usize,
+    ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError>;
     async fn committed_position_for_cursor(
         &self,
         cursor: &str,
@@ -276,7 +284,13 @@ pub trait ActiveRangeStore: Send + Sync {
         ownership_epoch: OwnershipEpoch,
         identity: PendingEffectRef,
     ) -> Result<PendingDiscardOutcome, ActiveRangeStoreError>;
-    async fn update_ownership_epoch(
+    /// Adopt a newer committed OwnershipEpoch and stamp it durably. The
+    /// uncommitted tail is left in place on purpose: it may hold frames a
+    /// replica quorum already committed under the previous owner, which the
+    /// recovery reconcile promotes to the verified committed prefix. A
+    /// validated owner frame that conflicts with an orphaned uncommitted
+    /// position truncates the rest of the tail instead.
+    async fn adopt_ownership_epoch(
         &self,
         generation: RangeGeneration,
         current_epoch: OwnershipEpoch,
@@ -598,6 +612,32 @@ impl ActiveRangeStore for FileActiveRangeStore {
             .await
     }
 
+    async fn read_uncommitted(
+        &self,
+        after: Option<RangePosition>,
+        limit: usize,
+    ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
+        self.blocking(move |inner| {
+            let loaded = inner
+                .loaded
+                .lock()
+                .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+            let after = after.map_or(0, RangePosition::value);
+            let start = loaded
+                .entries
+                .partition_point(|entry| entry.position.value() <= after);
+            loaded
+                .entries
+                .iter()
+                .skip(start)
+                .take_while(|entry| entry.position.value() <= loaded.persisted.appended)
+                .take(limit.clamp(1, 10_000))
+                .map(|entry| read_indexed_frame(&inner.directory, entry))
+                .collect()
+        })
+        .await
+    }
+
     async fn committed_position_for_cursor(
         &self,
         cursor: &str,
@@ -717,21 +757,41 @@ impl ActiveRangeStore for FileActiveRangeStore {
         .await
     }
 
-    async fn update_ownership_epoch(
+    async fn adopt_ownership_epoch(
         &self,
         generation: RangeGeneration,
         current_epoch: OwnershipEpoch,
         new_epoch: OwnershipEpoch,
     ) -> Result<(), ActiveRangeStoreError> {
         self.blocking_mutation(move |inner| {
+            {
+                let loaded = inner
+                    .loaded
+                    .lock()
+                    .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+                if loaded.persisted.generation != generation {
+                    return Err(ActiveRangeStoreError::WrongGeneration {
+                        current: loaded.persisted.generation,
+                        supplied: generation,
+                    });
+                }
+                if loaded.persisted.ownership_epoch == new_epoch {
+                    return Ok(());
+                }
+                if loaded.persisted.ownership_epoch != current_epoch {
+                    return Err(ActiveRangeStoreError::StaleOwnershipEpoch {
+                        current: loaded.persisted.ownership_epoch,
+                        supplied: current_epoch,
+                    });
+                }
+            }
+            if new_epoch <= current_epoch {
+                return Err(ActiveRangeStoreError::OwnershipEpochDidNotAdvance);
+            }
             let mut loaded = inner
                 .loaded
                 .lock()
                 .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
-            validate_generation_and_epoch(&loaded.persisted, generation, current_epoch)?;
-            if new_epoch <= current_epoch {
-                return Err(ActiveRangeStoreError::OwnershipEpochDidNotAdvance);
-            }
             let mut next = loaded.persisted.clone();
             next.ownership_epoch = new_epoch;
             persist_state(&inner.directory, &next)?;
@@ -889,6 +949,28 @@ fn append(
         request.generation,
         request.ownership_epoch,
     )?;
+    // A different frame already occupying a supplied uncommitted position
+    // is a superseded-epoch orphan: the caller passed the committed
+    // placement's owner/generation/epoch validation, so its frame is
+    // authoritative for the uncommitted tail. Dropping the tail here lets
+    // the checks below replay the frame instead of wedging the replica;
+    // occupants at or below the committed boundary still refuse through
+    // PositionConflict.
+    if let Some(supplied) = request.expected_position {
+        if supplied.value() > loaded.persisted.committed
+            && loaded.entries.iter().any(|entry| {
+                entry.position == supplied
+                    && (entry.identity != request.identity || entry.frame_digest != frame_digest)
+            })
+        {
+            truncate_uncommitted_locked(
+                inner,
+                &mut loaded,
+                request.generation,
+                request.ownership_epoch,
+            )?;
+        }
+    }
     let next_position = RangePosition::new(
         loaded
             .persisted
@@ -904,6 +986,20 @@ fn append(
                 .find(|entry| entry.position == supplied)
                 .ok_or(ActiveRangeStoreError::PositionConflict(supplied))?;
             if existing.identity != request.identity || existing.frame_digest != frame_digest {
+                tracing::warn!(
+                    position = supplied.value(),
+                    committed = loaded.persisted.committed,
+                    ownership_epoch = ?request.ownership_epoch,
+                    supplied_session = %request.identity.writer_session_id,
+                    supplied_epoch = request.identity.writer_epoch,
+                    supplied_sequence = request.identity.sequence,
+                    supplied_digest = ?frame_digest,
+                    occupant_session = %existing.identity.writer_session_id,
+                    occupant_epoch = existing.identity.writer_epoch,
+                    occupant_sequence = existing.identity.sequence,
+                    occupant_digest = ?existing.frame_digest,
+                    "Active Range position conflict detail"
+                );
                 return Err(ActiveRangeStoreError::PositionConflict(supplied));
             }
             return Ok(ActiveRangeAppendResult {
@@ -1245,6 +1341,15 @@ fn truncate_uncommitted(
         .loaded
         .lock()
         .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+    truncate_uncommitted_locked(inner, &mut loaded, generation, ownership_epoch)
+}
+
+fn truncate_uncommitted_locked(
+    inner: &FileActiveRangeStoreInner,
+    loaded: &mut LoadedRange,
+    generation: RangeGeneration,
+    ownership_epoch: OwnershipEpoch,
+) -> Result<u64, ActiveRangeStoreError> {
     validate_generation_and_epoch(&loaded.persisted, generation, ownership_epoch)?;
     let committed = loaded.persisted.committed;
     if loaded.entries.iter().any(|entry| {

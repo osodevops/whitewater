@@ -46,10 +46,10 @@ impl ReplicaTransport for UnusedTransport {
         _replica: &StorageNodeId,
         _request: ReplicaAppendRequest,
     ) -> Result<ReplicaAppendAccepted, ReplicaTransportError> {
-        Err(ReplicaTransportError {
-            message: "transport is not used during drain".to_owned(),
-            retryable: false,
-        })
+        Err(ReplicaTransportError::transport(
+            "transport is not used during drain",
+            false,
+        ))
     }
 
     async fn commit(
@@ -57,10 +57,10 @@ impl ReplicaTransport for UnusedTransport {
         _replica: &StorageNodeId,
         _request: ReplicaCommitRequest,
     ) -> Result<ReplicaCommitAccepted, ReplicaTransportError> {
-        Err(ReplicaTransportError {
-            message: "transport is not used during drain".to_owned(),
-            retryable: false,
-        })
+        Err(ReplicaTransportError::transport(
+            "transport is not used during drain",
+            false,
+        ))
     }
 
     async fn discard_pending(
@@ -68,10 +68,10 @@ impl ReplicaTransport for UnusedTransport {
         _replica: &StorageNodeId,
         _request: ReplicaDiscardPendingRequest,
     ) -> Result<ReplicaDiscardPendingResponse, ReplicaTransportError> {
-        Err(ReplicaTransportError {
-            message: "transport is not used during drain".to_owned(),
-            retryable: false,
-        })
+        Err(ReplicaTransportError::transport(
+            "transport is not used during drain",
+            false,
+        ))
     }
 }
 

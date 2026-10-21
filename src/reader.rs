@@ -3230,7 +3230,14 @@ impl SubscriptionProgressCoordinator {
             .ownership_epoch
             .checked_add(1)
             .ok_or(SubscriptionProgressError::Sequence)?;
-        let (owner, ownership_epoch) = match control
+        // A failed CAS is inconclusive: the placement may have committed
+        // ambiguously, or a racing recovery already advanced the epoch.
+        // Adopting this attempt's recovered state at whichever epoch the
+        // catalog now holds would fence replicas on content a racing adoption
+        // already replaced at that epoch, so report Unavailable and let the
+        // caller rebuild on the live placement: the next attempt converges
+        // through inspection and adoption instead of guessing.
+        control
             .execute_placement_commands(vec![
                 crate::control::Command::RecoverSubscriptionProgressOwner {
                     subscription_id: self.assignment.subscription_id,
@@ -3239,28 +3246,16 @@ impl SubscriptionProgressCoordinator {
                 },
             ])
             .await
-        {
-            Ok(_) => (proposed_owner, next_epoch),
-            Err(_) => {
-                let current = control
-                    .progress_assignment(self.assignment.subscription_id)
-                    .await
-                    .ok_or(SubscriptionProgressError::InvalidAssignment)?;
-                if current.ownership_epoch <= self.assignment.ownership_epoch {
-                    return Err(SubscriptionProgressError::Unavailable);
-                }
-                (current.owner.clone(), current.ownership_epoch)
-            }
-        };
+            .map_err(|_| SubscriptionProgressError::Unavailable)?;
         let committed = recovered.map(|mut mutation| {
-            mutation.ownership_epoch = ownership_epoch;
+            mutation.ownership_epoch = next_epoch;
             mutation
         });
         let adopted = self
             .adopt_all(
                 self.assignment.replicas.as_array(),
-                &owner,
-                ownership_epoch,
+                &proposed_owner,
+                next_epoch,
                 committed.clone(),
                 &member_state,
             )
@@ -3268,9 +3263,9 @@ impl SubscriptionProgressCoordinator {
         Ok(SubscriptionRecoveryOutcome {
             assignment: SubscriptionProgressAssignment {
                 subscription_id: self.assignment.subscription_id,
-                owner,
+                owner: proposed_owner,
                 replicas: self.assignment.replicas.clone(),
-                ownership_epoch,
+                ownership_epoch: next_epoch,
             },
             committed,
             members: member_state,
@@ -3312,7 +3307,11 @@ impl SubscriptionProgressCoordinator {
             .map_err(|_| SubscriptionProgressError::InvalidAssignment)?;
         let evidence = self.inspect_evidence().await?;
         let (recovered, member_state) = Self::recovered_committed(&evidence)?;
-        let (replicas, owner, ownership_epoch) = match control
+        // Same inconclusive-error rule as the owner move: a failed CAS may
+        // have committed ambiguously or lost to a racing move, and adopting
+        // this attempt's recovered state at the catalog's newer epoch would
+        // fence replicas on superseded content.
+        control
             .execute_placement_commands(vec![
                 crate::control::Command::MoveSubscriptionProgressReplica {
                     subscription_id: self.assignment.subscription_id,
@@ -3322,32 +3321,16 @@ impl SubscriptionProgressCoordinator {
                 },
             ])
             .await
-        {
-            Ok(_) => (new_replicas, self.assignment.owner.clone(), next_epoch),
-            Err(_) => {
-                let current = control
-                    .progress_assignment(self.assignment.subscription_id)
-                    .await
-                    .ok_or(SubscriptionProgressError::InvalidAssignment)?;
-                if current.ownership_epoch <= self.assignment.ownership_epoch {
-                    return Err(SubscriptionProgressError::Unavailable);
-                }
-                (
-                    current.replicas.clone(),
-                    current.owner,
-                    current.ownership_epoch,
-                )
-            }
-        };
+            .map_err(|_| SubscriptionProgressError::Unavailable)?;
         let committed = recovered.map(|mut mutation| {
-            mutation.ownership_epoch = ownership_epoch;
+            mutation.ownership_epoch = next_epoch;
             mutation
         });
         let adopted = self
             .adopt_all(
-                replicas.as_array(),
-                &owner,
-                ownership_epoch,
+                new_replicas.as_array(),
+                &self.assignment.owner,
+                next_epoch,
                 committed.clone(),
                 &member_state,
             )
@@ -3355,9 +3338,9 @@ impl SubscriptionProgressCoordinator {
         Ok(SubscriptionRecoveryOutcome {
             assignment: SubscriptionProgressAssignment {
                 subscription_id: self.assignment.subscription_id,
-                owner,
-                replicas,
-                ownership_epoch,
+                owner: self.assignment.owner.clone(),
+                replicas: new_replicas,
+                ownership_epoch: next_epoch,
             },
             committed,
             members: member_state,

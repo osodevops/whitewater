@@ -225,13 +225,28 @@ async fn a_commit_retry_inside_the_committed_prefix_reports_existing_evidence() 
 async fn replica_rejects_position_gaps_and_conflicting_bytes() {
     let fixture = Fixture::new().await;
     let service = fixture.service("storage-2");
-    service.append(fixture.request(1, 1, b"one")).await.unwrap();
+    let first = service.append(fixture.request(1, 1, b"one")).await.unwrap();
 
     let gap = service
         .append(fixture.request(3, 2, b"three"))
         .await
         .unwrap_err();
     assert_eq!(gap.code, ReplicaAppendErrorCode::PositionGap);
+    // A byte conflict refuses only inside the committed prefix: uncommitted
+    // occupants are superseded-epoch orphans the placement-validated owner
+    // overwrites. Commit position 1 so the conflict lands on the boundary.
+    service
+        .commit(whitewater::active_range::ReplicaCommitRequest {
+            feed_id: fixture.feed_id,
+            range_id: fixture.range_id,
+            generation: RangeGeneration::new(1),
+            ownership_epoch: whitewater::active_range::OwnershipEpoch::new(1),
+            append_owner: fixture.owner.clone(),
+            commit_position: whitewater::active_range::CommitPosition::new(1),
+            frame_digest: first.frame_digest,
+        })
+        .await
+        .unwrap();
     let conflict = service
         .append(fixture.request(1, 2, b"different"))
         .await
