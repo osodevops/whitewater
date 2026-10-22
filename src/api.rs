@@ -4976,7 +4976,7 @@ struct IndexQueryResponse {
     applied_cursor: Option<String>,
     /// Frontier the catalog committed when the generation activated.
     target_cursor: Option<String>,
-    /// True when the serving Node's postings lag the activation frontier.
+    /// True when the serving Node's postings lag the committed frontier.
     behind: bool,
     /// True when `limit` cut the result; callers narrow the predicate.
     truncated: bool,
@@ -5044,6 +5044,7 @@ async fn index_query_local(
         .as_ref()
         .and_then(|service| service.index_store())
         .ok_or_else(|| ApiError::unavailable("this Node does not materialize Index postings"))?;
+    use crate::state_store::FeedReplaySource;
     let field_count = definition.fields.len();
     match predicate {
         crate::control::IndexQueryPredicate::Exact { values } if values.len() != field_count => {
@@ -5074,12 +5075,27 @@ async fn index_query_local(
         }
     };
     let shadow = crate::index::shadow_index_id(definition.index_id, generation);
-    let target = definition.applied_cursor.clone();
     let wait_ms = wait_ms.min(INDEX_QUERY_MAX_WAIT_MS);
-    // Under strict, bounded-wait for this Node's checkpoint to reach the
-    // activation frontier before reading — the catalog committed the target
-    // cursor, so a materializing Node converges there.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
+    // Freshness is measured against the live committed frontier, not the
+    // frozen activation cursor: commit-boundary applies keep advancing
+    // `last_applied` as new records land, so "behind" means committed
+    // records exist that this Node's shadow has not applied. The catalog's
+    // `applied_cursor` stays reported as the generation's activation
+    // target.
+    let next_unapplied = |applied: Option<String>| {
+        let replay = CommittedFeedReplaySource {
+            state: state.clone(),
+        };
+        async move {
+            replay
+                .read_committed_records(definition.feed_id, applied.as_deref(), 1)
+                .await
+                .map(|records| records.into_iter().next().map(|record| record.cursor))
+                .map_err(|error| {
+                    ApiError::unavailable(format!("committed-frontier probe failed: {error}"))
+                })
+        }
+    };
     let index_read = index.clone();
     let predicate = predicate.clone();
     let query_mode = match &predicate {
@@ -5087,17 +5103,17 @@ async fn index_query_local(
         crate::control::IndexQueryPredicate::Prefix { .. } => crate::demand::IndexQueryMode::Prefix,
         crate::control::IndexQueryPredicate::Range { .. } => crate::demand::IndexQueryMode::Range,
     };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
     if strict {
-        // Bounded-wait for the checkpoint; filesystem reads stay off the
-        // Tokio executor.
-        let index_wait = index.clone();
+        // Bounded-wait until no committed record sits beyond the applied
+        // frontier; filesystem reads stay off the Tokio executor.
         loop {
-            let index_wait = index_wait.clone();
+            let index_wait = index.clone();
             let frontier = tokio::task::spawn_blocking(move || index_wait.last_applied(shadow))
                 .await
                 .map_err(|_| ApiError::unavailable("Index freshness check did not complete"))?
                 .map_err(index_store_api_error)?;
-            if frontier.as_deref() == target.as_deref() || std::time::Instant::now() >= deadline {
+            if next_unapplied(frontier).await?.is_none() || std::time::Instant::now() >= deadline {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -5135,7 +5151,13 @@ async fn index_query_local(
     .map_err(|_| ApiError::unavailable("Index query task did not complete"))?
     .map_err(index_store_api_error)?;
     let frontier = index.last_applied(shadow).map_err(index_store_api_error)?;
-    let behind = frontier.as_deref() != target.as_deref();
+    // Freshness is measured against the live committed frontier, not the
+    // catalog's frozen activation cursor: commit-boundary apply keeps
+    // pushing past it, so `behind` = a committed record still unapplied
+    // and `target_cursor` = the next record the index is chasing.
+    let chasing = next_unapplied(frontier.clone()).await?;
+    let behind = chasing.is_some();
+    let target_cursor = chasing.or_else(|| frontier.clone());
     state.demand.record_index_query(
         definition.index_id,
         crate::demand::IndexQuerySample {
@@ -5159,7 +5181,7 @@ async fn index_query_local(
             })
             .collect(),
         applied_cursor: frontier,
-        target_cursor: target,
+        target_cursor,
         behind,
         served_by: state
             .storage_node_id
@@ -5249,7 +5271,7 @@ async fn post_internal_index_query(
 /// `POST /v1/indexes/query` — logical GET/exact/prefix/range against the
 /// active Index generation. The local Node answers when it materializes the
 /// postings; under `strict` a still-catching-up Node forwards (bounded) to
-/// peers until one reaches the activation frontier, else `index_behind`.
+/// peers until one reaches the live committed frontier, else `index_behind`.
 async fn index_query(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5333,11 +5355,11 @@ async fn run_index_query(
             return Err(last_error);
         }
     };
-    // Strict path: local postings lag the activation frontier. Try bounded
+    // Strict path: local postings lag the committed frontier. Try bounded
     // peer reads; a peer waits its own bound and may answer fresh.
     let mut last_error = ApiError {
         status: StatusCode::CONFLICT,
-        message: "no Node materialized the Index at its activation frontier".to_owned(),
+        message: "no Node materialized the Index at the committed frontier".to_owned(),
         code: Some("index_behind"),
     };
     let mut peers: Vec<StorageNodeId> = state
@@ -5357,7 +5379,7 @@ async fn run_index_query(
                 last_error = ApiError {
                     status: StatusCode::CONFLICT,
                     message: format!(
-                        "Node {peer} applied cursor {:?} lags activation frontier {:?}",
+                        "Node {peer} applied cursor {:?} lags committed frontier {:?}",
                         response.applied_cursor, response.target_cursor
                     ),
                     code: Some("index_behind"),
@@ -16302,6 +16324,224 @@ mod tests {
                 "local shadow frontier matches the activated cursor"
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn index_query_freshness_tracks_the_live_committed_frontier() {
+        // Commit-boundary apply advances the shadow past the catalog's
+        // frozen activation cursor, so freshness must measure the live
+        // committed frontier: a post-activation commit reports `behind`
+        // and names its cursor as the target until an apply lands it.
+        let directory = TempDir::new().unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let nodes: Vec<crate::active_range::StorageNodeId> =
+            ["storage-1", "storage-2", "storage-3"]
+                .into_iter()
+                .map(|name| crate::active_range::StorageNodeId::try_new(name).unwrap())
+                .collect();
+        let node = nodes[0].clone();
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                directory.path().join("catalog.json"),
+                store.clone(),
+                nodes,
+            )
+            .unwrap(),
+        );
+        control
+            .execute("CREATE SPACE orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        control
+            .execute_commands(vec![Command::DefineIndex {
+                name: "orders.events.by.key".to_owned(),
+                feed: "orders.events".to_owned(),
+                fields: vec![crate::control::IndexFieldSpec::Key],
+                unique: false,
+                collation: crate::control::IndexCollation::Binary,
+                consistency: crate::control::IndexConsistency::Eventual,
+            }])
+            .await
+            .unwrap();
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        let range = control.active_range_assignment(feed.feed_id).await.unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id: feed.feed_id,
+            range_id: range.range_id,
+            generation: range.generation,
+            ownership_epoch: range.ownership_epoch,
+        };
+        crate::active_range::store::seed_committed_history_shaped(
+            &directory.path().join("ranges-0"),
+            &descriptor,
+            4,
+            &|sequence| format!("user-{sequence}").into_bytes(),
+            &|sequence| sequence as i64,
+            8,
+        );
+
+        let index_store: Arc<dyn crate::index::IndexStore> = Arc::new(
+            crate::index::FjallIndexStore::open(directory.path().join("index-0")).unwrap(),
+        );
+        let journal = Arc::new(
+            crate::state_store::FjallStateStoreMutationJournal::open(
+                directory.path().join("journal-0"),
+            )
+            .unwrap(),
+        );
+        let membership = Arc::new(MembershipService::new(
+            MemberAnnouncement {
+                node_id: "test-node-0".to_owned(),
+                api_url: "http://test-node:7070".to_owned(),
+                capacity: 100,
+                capabilities: crate::node::NodeCapabilities::all(),
+                resources: crate::node::NodeCapacity::default(),
+            },
+            vec![],
+            Duration::from_secs(1),
+            Duration::from_secs(5),
+        ));
+        let state = AppState {
+            store: store.clone(),
+            membership,
+            demand: DemandMetrics::default(),
+            autoscaler: Arc::new(Mutex::new(AutoscaleController::default())),
+            reader_pacing: crate::reader::ReaderPacingTable::default(),
+            control: control.clone(),
+            control_plane: None,
+            progress_authority: control.clone(),
+            replica_append: Some(Arc::new(ReplicaAppendService::new(
+                directory.path().join("ranges-0"),
+                node.clone(),
+                control.clone(),
+            ))),
+            majority_append: None,
+            subscription_progress: None,
+            effect_journal: None,
+            state_store_journal: Some(Arc::new(
+                crate::state_store::StateStoreMutationService::new(
+                    node.clone(),
+                    control.clone(),
+                    journal,
+                    Arc::new(crate::state_store::IndexStoreStateApply::new(
+                        index_store.clone(),
+                    )),
+                ),
+            )),
+            subscription_mtls_enabled: false,
+            storage_node_id: Some(node.clone()),
+            control_endpoints: Arc::new(
+                BTreeMap::from([(node.clone(), "http://unused".to_owned())]).into(),
+            ),
+            internal_key: Some("this-is-a-long-control-plane-key".to_owned()),
+            internal_http: reqwest::Client::new(),
+            internal_mtls: None,
+            subscription_recovery_gates: Default::default(),
+            admin_auth: AdminAuthenticator::new(Some(
+                "this-is-a-long-development-api-key".to_owned(),
+            ))
+            .unwrap(),
+        };
+
+        // Build + activate generation 1 over the seeded history; a build
+        // pass materializes the shadow and the next activates it.
+        control
+            .execute("REBUILD INDEX orders.events.by.key;")
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            drive_local_index_builds(&state, 64).await;
+            if let Some(definition) = control.declared_index_by_name("orders.events.by.key").await {
+                if matches!(
+                    definition.stage,
+                    crate::control::IndexBuildStage::Active { .. }
+                ) {
+                    break;
+                }
+            }
+        }
+        let definition = control
+            .declared_index_by_name("orders.events.by.key")
+            .await
+            .unwrap();
+        assert!(matches!(
+            definition.stage,
+            crate::control::IndexBuildStage::Active { .. }
+        ));
+
+        // A post-activation commit: the catalog's applied_cursor stays at
+        // the activation watermark while committed history moves on.
+        let service = state.replica_append.as_ref().unwrap();
+        let record = StoredRecord {
+            message_id: Uuid::from_u128(999),
+            producer_id: Uuid::from_u128(3),
+            producer_sequence: 5,
+            event_time_ns: 5,
+            ingest_time_ns: 5,
+            key: b"user-5".to_vec(),
+            payload: vec![0xAB; 8],
+            metadata: BTreeMap::new(),
+        };
+        let frame = crate::codec::encode_record(&record).unwrap();
+        let accepted = service
+            .append(ReplicaAppendRequest {
+                feed_id: feed.feed_id,
+                range_id: range.range_id,
+                generation: range.generation,
+                ownership_epoch: range.ownership_epoch,
+                append_owner: node.clone(),
+                expected_position: crate::active_range::RangePosition::new(5),
+                identity: AppendIdentity {
+                    writer_session_id: Uuid::from_u128(3),
+                    writer_epoch: 1,
+                    sequence: 5,
+                },
+                cursor: "cursor-5".to_owned(),
+                frame_base64: STANDARD.encode(&frame),
+                pending_effect: None,
+            })
+            .await
+            .unwrap();
+        service
+            .commit(ReplicaCommitRequest {
+                feed_id: feed.feed_id,
+                range_id: range.range_id,
+                generation: range.generation,
+                ownership_epoch: range.ownership_epoch,
+                append_owner: node.clone(),
+                commit_position: crate::active_range::CommitPosition::new(5),
+                frame_digest: accepted.frame_digest,
+            })
+            .await
+            .unwrap();
+
+        // Non-strict honesty: applied at cursor-4, chasing cursor-5.
+        let query = crate::control::IndexQueryPredicate::Exact {
+            values: vec![crate::index::IndexValue::Bytes(b"user-5".to_vec())],
+        };
+        let response = index_query_local(&state, "orders.events.by.key", &query, 8, false, 50)
+            .await
+            .unwrap();
+        assert_eq!(response.applied_cursor.as_deref(), Some("cursor-4"));
+        assert_eq!(response.target_cursor.as_deref(), Some("cursor-5"));
+        assert!(response.behind, "{response:?}");
+
+        // The commit-boundary apply lands the record; freshness clears and
+        // the new key serves.
+        let driver = index_build_driver(&state).unwrap();
+        let outcomes = driver.apply_committed(feed.feed_id, 64).await;
+        assert!(
+            outcomes.iter().all(|(_, result)| result.is_ok()),
+            "{outcomes:?}"
+        );
+        let response = index_query_local(&state, "orders.events.by.key", &query, 8, true, 50)
+            .await
+            .unwrap();
+        assert_eq!(response.applied_cursor.as_deref(), Some("cursor-5"));
+        assert_eq!(response.target_cursor.as_deref(), Some("cursor-5"));
+        assert!(!response.behind, "{response:?}");
+        assert_eq!(response.rows.len(), 1, "user-5 materialized");
     }
 
     #[tokio::test]

@@ -138,16 +138,26 @@ impl IndexBuildDriver {
             match definition.stage {
                 IndexBuildStage::Building { .. } => {}
                 IndexBuildStage::Active { generation } => {
-                    // Skip Nodes whose local shadow already covers the
-                    // activated frontier.
+                    // Skip Nodes whose serving shadow has already reached
+                    // the live committed frontier. The catalog's
+                    // activation watermark is a floor, not the target:
+                    // commit-boundary apply keeps pushing past it, and a
+                    // restart can drop an in-flight apply kick, so the
+                    // periodic pass probes for one committed record beyond
+                    // the applied frontier instead of trusting the frozen
+                    // cursor.
                     let shadow = shadow_index_id(definition.index_id, generation);
-                    match self.index.last_applied(shadow) {
-                        Ok(applied)
-                            if applied.as_deref() == definition.applied_cursor.as_deref() =>
-                        {
-                            continue
-                        }
-                        _ => {}
+                    let applied = self.index.last_applied(shadow).unwrap_or_default();
+                    let pending = match self
+                        .source
+                        .read_committed_records(definition.feed_id, applied.as_deref(), 1)
+                        .await
+                    {
+                        Ok(records) => !records.is_empty(),
+                        Err(_) => true,
+                    };
+                    if !pending {
+                        continue;
                     }
                 }
                 IndexBuildStage::Declared => continue,

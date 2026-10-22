@@ -466,11 +466,19 @@ impl ReplicaAppendService {
         assignment: &ActiveRangeAssignment,
         position: CommitPosition,
     ) -> Result<(), ReplicaAppendError> {
-        self.store_for(assignment)
+        let committed = self
+            .store_for(assignment)
             .await?
             .commit(assignment.generation, assignment.ownership_epoch, position)
             .await
-            .map_err(map_store_error)
+            .map_err(map_store_error);
+        if committed.is_ok() {
+            // Staged commits advance committed history without the append
+            // path's commit RPC — the deterministic Index apply still rides
+            // this boundary so children cover their inherited prefix.
+            self.kick_index_apply(assignment.feed_id);
+        }
+        committed
     }
 
     pub async fn truncate_uncommitted_for_assignment(
