@@ -8612,6 +8612,26 @@ async fn unfreeze_split_nodes(
 /// the `plan_id` fence keeps a stale rollback from deleting a newer plan.
 /// Best-effort: if the Control Plane is mid-election the row stays for the
 /// next attempt to observe, so the failure is logged for diagnosis.
+/// After an unconfirmed fenced abandon command, wait briefly for the staged
+/// plan row to disappear from the applied catalog. An ambiguous commit may
+/// have applied even though its response was lost, and the remedy's goal
+/// state is simply "the staged row is gone" — disappearance proves it
+/// regardless of which request carried the removal. `fetch` returns true
+/// when the row is absent.
+async fn staged_plan_absent<F, Fut>(mut fetch: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    for _ in 0..50 {
+        if fetch().await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    fetch().await
+}
+
 async fn abandon_split_plan(state: &AppState, plan: &RangeSplitPlan) -> bool {
     let Some(control_plane) = state.control_plane.as_ref() else {
         return false;
@@ -9658,7 +9678,12 @@ async fn admin_abandon_range_operation(
         // The remedy reports honestly: a plan still staged after the fenced
         // abandon attempt means the Control Plane could not commit — retry
         // the remedy rather than believing the Feed is clear.
-        if !cleared || state.control.range_split_plan(feed.feed_id).await.is_some() {
+        if !cleared
+            && !staged_plan_absent(|| async {
+                state.control.range_split_plan(feed.feed_id).await.is_none()
+            })
+            .await
+        {
             return Err(ApiError::unavailable(format!(
                 "staged split plan {} could not be abandoned yet; retry the remedy",
                 plan.plan_id
@@ -9689,7 +9714,12 @@ async fn admin_abandon_range_operation(
             }
             _ => abandon_merge_plan(&state, &plan).await,
         };
-        if !cleared || state.control.range_merge_plan(feed.feed_id).await.is_some() {
+        if !cleared
+            && !staged_plan_absent(|| async {
+                state.control.range_merge_plan(feed.feed_id).await.is_none()
+            })
+            .await
+        {
             return Err(ApiError::unavailable(format!(
                 "staged merge plan {} could not be abandoned yet; retry the remedy",
                 plan.plan_id
@@ -9721,11 +9751,14 @@ async fn admin_abandon_range_operation(
         }
         let cleared = abandon_follower_move_plan(&state, &plan).await;
         if !cleared
-            || state
-                .control
-                .feed_follower_move_plan(feed.feed_id)
-                .await
-                .is_some()
+            && !staged_plan_absent(|| async {
+                state
+                    .control
+                    .feed_follower_move_plan(feed.feed_id)
+                    .await
+                    .is_none()
+            })
+            .await
         {
             return Err(ApiError::unavailable(format!(
                 "staged follower move plan {} could not be abandoned yet; retry the remedy",
@@ -9760,11 +9793,14 @@ async fn admin_abandon_range_operation(
         }
         let cleared = abandon_owner_move_plan(&state, &plan).await;
         if !cleared
-            || state
-                .control
-                .feed_owner_move_plan(feed.feed_id)
-                .await
-                .is_some()
+            && !staged_plan_absent(|| async {
+                state
+                    .control
+                    .feed_owner_move_plan(feed.feed_id)
+                    .await
+                    .is_none()
+            })
+            .await
         {
             return Err(ApiError::unavailable(format!(
                 "staged owner move plan {} could not be abandoned yet; retry the remedy",
@@ -23801,6 +23837,84 @@ mod tests {
         assert_eq!(uncommitted.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(uncommitted.message.contains("could not be abandoned"));
         assert!(control.feed_owner_move_plan(feed.feed_id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn admin_abandon_reports_an_ambiguously_committed_owner_move_removal() {
+        // When the fenced abandon command commits but its response is lost,
+        // a retried remedy must report the achieved removal — the goal state
+        // is "the staged row is gone", not "this request observed the
+        // commit". Simulate the ambiguity by removing the plan row through
+        // the local catalog while the endpoint's unreachable-raft abandon
+        // attempt is still in flight; without the disappearance check the
+        // remedy reports a phantom `could not be abandoned` failure and the
+        // client's retry then sees a confusing "no staged operation".
+        let directory = TempDir::new().unwrap();
+        let (state, _plane, control, _replica) = internal_replica_test_state(&directory).await;
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        let inspected = control
+            .execute_commands(vec![Command::InspectPlacement {
+                feed: "orders.events".to_owned(),
+            }])
+            .await
+            .unwrap();
+        let assignments = inspected.results[0].data["range_assignments"].clone();
+        let owner = assignments[0]["owner"].as_str().unwrap().to_owned();
+        let range_id: RangeId = serde_json::from_value(assignments[0]["range_id"].clone()).unwrap();
+        let new_owner = assignments[0]["replicas"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|replica| replica.as_str().unwrap().to_owned())
+            .find(|replica| replica != &owner)
+            .unwrap();
+        let prepared = control
+            .execute_commands(vec![Command::PrepareOwnerMove {
+                feed: "orders.events".to_owned(),
+                range_id,
+                new_owner: crate::active_range::StorageNodeId::try_new(new_owner).unwrap(),
+            }])
+            .await
+            .unwrap();
+        let plan: RangeOwnerMovePlan =
+            serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+
+        let remover = {
+            let control = control.clone();
+            let feed_id = feed.feed_id;
+            let plan_id = plan.plan_id;
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                control
+                    .execute_commands(vec![Command::AbandonOwnerMove { feed_id, plan_id }])
+                    .await
+                    .unwrap();
+            })
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            "Bearer this-is-a-long-development-api-key".parse().unwrap(),
+        );
+        let result = admin_abandon_range_operation(
+            State(state.clone()),
+            headers,
+            Json(AdminAbandonRangeRequest {
+                request_id: Uuid::from_u128(7103),
+                feed: "orders.events".to_owned(),
+                plan_id: plan.plan_id,
+            }),
+        )
+        .await
+        .unwrap();
+        remover.await.unwrap();
+        assert_eq!(result["status"], json!("abandoned"));
+        assert_eq!(
+            result["operations"][0]["plan_id"],
+            json!(plan.plan_id.to_string())
+        );
+        assert!(control.feed_owner_move_plan(feed.feed_id).await.is_none());
     }
 
     #[tokio::test]
