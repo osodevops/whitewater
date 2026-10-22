@@ -1789,6 +1789,100 @@ async fn resequenced_retry_dedup_pushes_the_stored_frame_to_replicas() {
 }
 
 #[tokio::test]
+async fn committed_append_kicks_the_index_apply_boundary() {
+    // Every replica that advances its committed watermark must trigger the
+    // deterministic Index apply for that Feed: the committed log carries
+    // the intents, and each replica materializes them at the same boundary.
+    let fixture = Fixture::new().await;
+    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    struct CountingSource {
+        feed_id: Uuid,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    #[async_trait::async_trait]
+    impl whitewater::state_store::FeedReplaySource for CountingSource {
+        async fn source_exists(&self, feed_id: Uuid) -> bool {
+            feed_id == self.feed_id
+        }
+        async fn read_committed_records(
+            &self,
+            feed_id: Uuid,
+            _after: Option<&str>,
+            _limit: usize,
+        ) -> Result<
+            Vec<whitewater::state_store::ReplaySourceRecord>,
+            whitewater::state_store::StateStoreReplayError,
+        > {
+            assert_eq!(feed_id, self.feed_id);
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![])
+        }
+    }
+    // An Active generation on this Feed is what the commit path serves.
+    let index_id = {
+        fixture
+            .control
+            .execute_commands(vec![
+                Command::DefineIndex {
+                    name: "orders.events.by.key".to_owned(),
+                    feed: "orders.events".to_owned(),
+                    fields: vec![whitewater::control::IndexFieldSpec::Key],
+                    unique: false,
+                    collation: whitewater::control::IndexCollation::Binary,
+                    consistency: whitewater::control::IndexConsistency::Eventual,
+                },
+                Command::RebuildIndex {
+                    name: "orders.events.by.key".to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+        let declared = fixture
+            .control
+            .declared_index_by_name("orders.events.by.key")
+            .await
+            .unwrap();
+        fixture
+            .control
+            .execute_commands(vec![Command::CompleteIndexBuild {
+                index_id: declared.index_id,
+                generation: 1,
+                applied_cursor: "genesis".to_owned(),
+            }])
+            .await
+            .unwrap();
+        declared.index_id
+    };
+    let _ = index_id;
+    let index_dir = tempfile::TempDir::new().unwrap();
+    let index = Arc::new(whitewater::index::FjallIndexStore::open(index_dir.path()).unwrap());
+    let driver = Arc::new(whitewater::index_build::IndexBuildDriver::new(
+        fixture.control.clone(),
+        Arc::new(CountingSource {
+            feed_id: fixture.request.feed_id,
+            reads: reads.clone(),
+        }),
+        index,
+    ));
+    let gate = Arc::new(whitewater::index_build::IndexCommitApply::new(driver));
+    for service in fixture.services.values() {
+        service.set_index_apply(gate.clone());
+    }
+    let coordinator = fixture.coordinator(&[], &[], None);
+    let accepted = coordinator.append(fixture.request.clone()).await.unwrap();
+    assert_eq!(accepted.position.value(), 1);
+    // The owner committed plus at least one follower commit each kick the
+    // gate; the apply pass itself is async, so poll for the side effect.
+    for _ in 0..200 {
+        if reads.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("commit never triggered the deterministic Index apply boundary");
+}
+
+#[tokio::test]
 async fn owner_minted_sequences_stay_contiguous_and_retries_deduplicate() {
     let fixture = Fixture::new().await;
     let coordinator = fixture.coordinator(&[], &[], None);

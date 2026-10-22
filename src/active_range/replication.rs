@@ -247,6 +247,7 @@ pub struct ReplicaAppendService {
     // Serialized per range: appends and generation freezes for one range
     // must not interleave, but unrelated ranges pipeline on this Node.
     append_gates: Arc<Mutex<std::collections::BTreeMap<RangeId, Arc<Mutex<()>>>>>,
+    index_apply: Arc<std::sync::RwLock<Option<Arc<crate::index_build::IndexCommitApply>>>>,
 }
 
 impl ReplicaAppendService {
@@ -264,6 +265,27 @@ impl ReplicaAppendService {
             frozen_generations: Arc::new(RwLock::new(HashSet::new())),
             quorum_blocked_ranges: Arc::new(RwLock::new(HashSet::new())),
             append_gates: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            index_apply: Arc::new(std::sync::RwLock::new(None)),
+        }
+    }
+
+    /// Installs the commit-boundary Index apply trigger. Optional: Nodes
+    /// without an Index store simply skip the hook, and the periodic
+    /// build driver remains the materialization backstop either way.
+    pub fn set_index_apply(&self, apply: Arc<crate::index_build::IndexCommitApply>) {
+        if let Ok(mut slot) = self.index_apply.write() {
+            *slot = Some(apply);
+        }
+    }
+
+    fn kick_index_apply(&self, feed_id: Uuid) {
+        let apply = self
+            .index_apply
+            .read()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(Arc::clone));
+        if let Some(apply) = apply {
+            apply.kick(feed_id);
         }
     }
 
@@ -1198,6 +1220,11 @@ impl ReplicaAppendService {
             Err(ActiveRangeStoreError::CommitMovedBackwards { .. }) => {}
             Err(error) => return Err(map_store_error(error)),
         }
+        // The committed frames are the replicated Index mutation intents:
+        // every replica reaching this point applies the same deterministic
+        // postings at the same committed boundary. The kick is coalesced
+        // and async so the commit RPC never waits on Index latency.
+        self.kick_index_apply(request.feed_id);
         Ok(ReplicaCommitAccepted {
             commit_position: request.commit_position,
             durable: true,

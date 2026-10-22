@@ -6622,7 +6622,7 @@ impl crate::state_store::FeedReplaySource for CommittedFeedReplaySource {
     }
 }
 
-fn index_build_driver(state: &AppState) -> Option<crate::index_build::IndexBuildDriver> {
+pub fn index_build_driver(state: &AppState) -> Option<crate::index_build::IndexBuildDriver> {
     let index = state.state_store_journal.as_ref()?.index_store()?;
     Some(crate::index_build::IndexBuildDriver::new(
         state.control.clone(),

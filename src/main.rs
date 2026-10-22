@@ -734,6 +734,18 @@ async fn main() -> Result<()> {
         admin_auth,
         subscription_recovery_gates: Default::default(),
     };
+    // Commit-boundary Index apply: each replica materializes the same
+    // deterministic postings when its committed watermark advances — the
+    // committed log is the replicated intent carrier. The periodic build
+    // driver remains the catch-up backstop.
+    if let (Some(service), Some(driver)) = (
+        app_state.replica_append.as_ref(),
+        whitewater::api::index_build_driver(&app_state),
+    ) {
+        service.set_index_apply(Arc::new(whitewater::index_build::IndexCommitApply::new(
+            Arc::new(driver),
+        )));
+    }
     let tls_router = config
         .subscription_mtls
         .as_ref()

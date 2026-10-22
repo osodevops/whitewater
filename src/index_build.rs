@@ -105,6 +105,9 @@ pub struct IndexBuildDriver {
     control: Arc<ControlController>,
     source: Arc<dyn FeedReplaySource>,
     index: Arc<dyn IndexStore>,
+    /// Serializes passes so the periodic driver and the commit-boundary
+    /// trigger never interleave two applies of the same generation.
+    pass_lock: tokio::sync::Mutex<()>,
 }
 
 impl IndexBuildDriver {
@@ -117,6 +120,7 @@ impl IndexBuildDriver {
             control,
             source,
             index,
+            pass_lock: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -154,6 +158,37 @@ impl IndexBuildDriver {
         outcomes
     }
 
+    /// Commit-boundary apply for one Feed: every `Active` generation
+    /// targeting `feed_id` takes one bounded pass toward the committed
+    /// frontier. The mutations derive deterministically from the committed
+    /// frames themselves, so every replica running this at its own commit
+    /// boundary converges on identical postings — the committed log is the
+    /// replicated intent carrier, and `last_applied` keeps retries
+    /// idempotent. Lag or refusal reports per definition; nothing here may
+    /// roll back a commit that already landed.
+    pub async fn apply_committed(
+        &self,
+        feed_id: Uuid,
+        limit: usize,
+    ) -> Vec<(Uuid, Result<IndexBuildPass, IndexBuildError>)> {
+        let mut outcomes = Vec::new();
+        for definition in self.control.index_definitions().await {
+            // Unlike the periodic driver's activation-frontier skip, the
+            // commit path must carry a serving generation past its
+            // activation watermark: the index tracks the live committed
+            // frontier, not just the history it was built over.
+            if definition.feed_id != feed_id {
+                continue;
+            }
+            if !matches!(definition.stage, IndexBuildStage::Active { .. }) {
+                continue;
+            }
+            let result = self.build_pass(&definition, limit).await;
+            outcomes.push((definition.index_id, result));
+        }
+        outcomes
+    }
+
     /// Apply up to `limit` committed records to `definition`'s current
     /// generation (building or activated). A `Building` pass that consumed
     /// the committed frontier attempts atomic activation; an `Active` pass
@@ -163,6 +198,7 @@ impl IndexBuildDriver {
         definition: &StoredIndexDefinition,
         limit: usize,
     ) -> Result<IndexBuildPass, IndexBuildError> {
+        let _pass = self.pass_lock.lock().await;
         let (generation, building) = match definition.stage {
             IndexBuildStage::Building { generation } => (generation, true),
             IndexBuildStage::Active { generation } => (generation, false),
@@ -352,6 +388,64 @@ fn json_projection(field: &str, payload: &[u8]) -> Result<IndexValue, IndexBuild
     })
 }
 
+/// Coalesces commit-boundary apply triggers per Feed: at most one apply
+/// task runs per Feed at a time, and a commit observed mid-flight marks
+/// the pass to run again so the latest committed record is not stranded
+/// waiting for the periodic driver.
+pub struct IndexCommitApply {
+    driver: Arc<IndexBuildDriver>,
+    state: std::sync::Mutex<std::collections::HashMap<Uuid, bool>>,
+}
+
+impl IndexCommitApply {
+    pub fn new(driver: Arc<IndexBuildDriver>) -> Self {
+        Self {
+            driver,
+            state: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Kick one bounded apply for `feed_id`. Cheap on every commit: if an
+    /// apply is already running it is marked to re-run once rather than
+    /// queueing a task per commit.
+    pub fn kick(self: &Arc<Self>, feed_id: Uuid) {
+        {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return,
+            };
+            match state.get_mut(&feed_id) {
+                Some(again) => {
+                    *again = true;
+                    return;
+                }
+                None => {
+                    state.insert(feed_id, false);
+                }
+            }
+        }
+        let this = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                this.driver.apply_committed(feed_id, 512).await;
+                let mut state = match this.state.lock() {
+                    Ok(state) => state,
+                    Err(_) => return,
+                };
+                match state.get(&feed_id) {
+                    Some(true) => {
+                        state.insert(feed_id, false);
+                    }
+                    _ => {
+                        state.remove(&feed_id);
+                        return;
+                    }
+                }
+            }
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +456,7 @@ mod tests {
     use crate::index::{FjallIndexStore, IndexId};
     use crate::state_store::ReplaySourceRecord;
     use crate::storage::FileLogStore;
+    use std::time::Duration;
 
     struct StubSource {
         feed_id: Uuid,
@@ -652,6 +747,109 @@ mod tests {
         let pass = driver.build_pass(&definition, 64).await.unwrap();
         assert_eq!(pass.applied, 1);
         assert!(pass.activated);
+    }
+
+    #[tokio::test]
+    async fn apply_committed_materializes_active_generations_at_the_commit_boundary() {
+        // The deterministic replay of committed frames onto Active
+        // generations is what every replica runs when its committed
+        // watermark advances: same committed stream in, same postings out.
+        let fixture = fixture(vec![IndexFieldSpec::Key]).await;
+        let source = Arc::new(StubSource {
+            feed_id: fixture.feed_id,
+            exists: true,
+            retained: std::sync::Mutex::new(vec![record(1, "a"), record(2, "b")]),
+        });
+        let definition = fixture.rebuild().await;
+        let driver = fixture.driver(source.clone());
+        // Activate the shadow so the generation is Active for the commit
+        // path; this also proves apply_committed ignores Building work.
+        driver.build_pass(&definition, 64).await.unwrap();
+        let updated = fixture
+            .control
+            .declared_index_by_name("orders.events.by.customer")
+            .await
+            .unwrap();
+        assert!(matches!(updated.stage, IndexBuildStage::Active { .. }));
+
+        // New records commit after activation; the periodic driver has not
+        // run. The commit-boundary apply picks them up.
+        source
+            .retained
+            .lock()
+            .unwrap()
+            .extend([record(3, "c"), record(4, "d")]);
+        let outcomes = driver.apply_committed(fixture.feed_id, 64).await;
+        assert_eq!(outcomes.len(), 1);
+        let (_, pass) = outcomes.into_iter().next().unwrap();
+        let pass = pass.unwrap();
+        assert_eq!(pass.applied, 2);
+        let shadow = shadow_index_id(updated.index_id, 1);
+        assert_eq!(
+            fixture.index.last_applied(shadow).unwrap().as_deref(),
+            Some("cursor-0004")
+        );
+        assert_eq!(
+            fixture
+                .lookup(shadow, &[IndexValue::Bytes(b"d".to_vec())])
+                .len(),
+            1
+        );
+
+        // Idempotent at the frontier: a second commit boundary for the
+        // same watermark applies nothing.
+        let outcomes = driver.apply_committed(fixture.feed_id, 64).await;
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].1.as_ref().unwrap().applied, 0);
+    }
+
+    #[tokio::test]
+    async fn apply_committed_ignores_other_feeds_and_non_active_stages() {
+        let fixture = fixture(vec![IndexFieldSpec::Key]).await;
+        let source = Arc::new(StubSource {
+            feed_id: fixture.feed_id,
+            exists: true,
+            retained: std::sync::Mutex::new(vec![record(1, "a")]),
+        });
+        let driver = fixture.driver(source);
+        // Declared (never rebuilt) definitions take no commit-boundary work.
+        let outcomes = driver.apply_committed(fixture.feed_id, 64).await;
+        assert!(outcomes.is_empty());
+        // A foreign feed id touches nothing either.
+        let outcomes = driver.apply_committed(Uuid::new_v4(), 64).await;
+        assert!(outcomes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_apply_kick_materializes_and_coalesces() {
+        let fixture = fixture(vec![IndexFieldSpec::Key]).await;
+        let source = Arc::new(StubSource {
+            feed_id: fixture.feed_id,
+            exists: true,
+            retained: std::sync::Mutex::new(vec![record(1, "a"), record(2, "b")]),
+        });
+        let definition = fixture.rebuild().await;
+        let driver = Arc::new(fixture.driver(source.clone()));
+        driver.build_pass(&definition, 64).await.unwrap();
+        let gate = Arc::new(IndexCommitApply::new(driver));
+        source.retained.lock().unwrap().push(record(3, "c"));
+        // Repeated kicks coalesce into one running pass plus one re-run.
+        for _ in 0..5 {
+            gate.kick(fixture.feed_id);
+        }
+        let updated = fixture
+            .control
+            .declared_index_by_name("orders.events.by.customer")
+            .await
+            .unwrap();
+        let shadow = shadow_index_id(updated.index_id, 1);
+        for _ in 0..200 {
+            if fixture.index.last_applied(shadow).unwrap().as_deref() == Some("cursor-0003") {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("commit-boundary apply did not materialize the record");
     }
 
     #[tokio::test]
