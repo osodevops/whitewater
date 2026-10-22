@@ -1,6 +1,7 @@
 import base64
 import http.client
 import json
+import os
 import subprocess
 import time
 import urllib.error
@@ -166,25 +167,54 @@ def drive_probe(node, pipe_id, subscription_id, storage_node, epoch):
     )
 
 
-def find_progress_owner(pipe_id, subscription_id, sweeps=60):
-    """Probe each storage Node with owner=receiver=<that Node>. Only the
-    current progress owner accepts the drive; a stale epoch or wrong owner
-    is fenced, so a 200 is an authoritative answer. The last statuses each
-    Node returned ride the AssertionError: 409s mean placement never moved,
-    5xx mean the owner answered but the drive stayed degraded, and 0s mean
-    the Node was unreachable — three different root causes."""
+def admin_progress(node, subscription):
+    query = urllib.parse.urlencode({"subscription": subscription})
+    request = urllib.request.Request(
+        f"{node}/v1/admin/subscriptions/progress?{query}",
+        headers={"authorization": f"Bearer {KEY}"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.load(response)["assignment"]
+
+
+def find_progress_owner(pipe_id, subscription, subscription_id, sweeps=60):
+    """Read the authoritative progress placement through the admin
+    endpoint — it reports owner+epoch directly, so the probe follows
+    placement moves instead of blind-scanning an epoch range a ratcheting
+    recovery could outrun — then prove the reported owner accepts the
+    drive. The last status each Node returned rides the AssertionError:
+    409s mean the drive fenced a stale hint, 5xx mean the owner answered
+    but stayed degraded, and 0s mean the Node was unreachable."""
     seen = {}
     for _ in range(sweeps):
         for index, node in enumerate(NODES):
-            statuses = seen.setdefault(SERVICES[index], [])
-            for epoch in range(1, 21):
-                status, body = drive_probe(
-                    node, pipe_id, subscription_id, SERVICES[index], epoch
+            try:
+                assignment = admin_progress(node, subscription)
+                owner = assignment["owner"]
+                epoch = int(assignment["ownership_epoch"])
+            except Exception as error:
+                statuses = seen.setdefault("__placement_read__", [])
+                statuses.append(f"{SERVICES[index]}: {error!r}"[:120])
+                del statuses[:-4]
+                continue
+            if owner not in SERVICES:
+                continue
+            try:
+                status, _ = drive_probe(
+                    NODES[SERVICES.index(owner)],
+                    pipe_id,
+                    subscription_id,
+                    owner,
+                    epoch,
                 )
-                statuses.append((epoch, status))
-                del statuses[:-8]
-                if status == 200:
-                    return SERVICES[index], epoch
+            except (ConnectionError, urllib.error.URLError, TimeoutError):
+                status = 0
+            statuses = seen.setdefault(owner, [])
+            statuses.append((epoch, status))
+            del statuses[:-8]
+            if status == 200:
+                return owner, epoch
+            break
         time.sleep(1)
     raise AssertionError({"no Node accepted the Pipe drive": seen})
 
@@ -245,14 +275,14 @@ def main():
         # recovers ownership onto a surviving replica at a higher epoch.
         # Driving follows the placement automatically - the old owner is
         # fenced by the epoch, the new owner's supervisor picks the Pipe up.
-        owner, epoch = find_progress_owner(pipe_id, subscription_id)
+        owner, epoch = find_progress_owner(pipe_id, subscription, subscription_id)
         wcl(NODES[0], f"DRAIN STORAGE NODE {owner};")
         new_owner, new_epoch = None, None
         deadline = time.time() + 120
         last_probe = None
         while time.time() < deadline:
             try:
-                found = find_progress_owner(pipe_id, subscription_id, sweeps=10)
+                found = find_progress_owner(pipe_id, subscription, subscription_id, sweeps=10)
             except AssertionError as error:
                 last_probe = error
             else:
@@ -268,7 +298,7 @@ def main():
         # Feed range moves during the drain can briefly freeze appends;
         # retry inside the same deterministic request identities.
         append_batch(NODES[0], writer, writer_epoch, range(6, 9), retries=45)
-        wait_forwarded(output, 8)
+        wait_forwarded(output, 8, deadline=180)
 
         wcl(NODES[0], f"UNDRAIN STORAGE NODE {owner};")
 
@@ -337,6 +367,25 @@ def main():
                 indent=2,
             )
         )
+    except BaseException:
+        # Container logs before teardown: the suite's own diagnostics
+        # collection runs only after this script's `down`, so the CI
+        # artifact captures the failing cluster only if it is saved here.
+        try:
+            os.makedirs("acceptance-logs", exist_ok=True)
+            logs = subprocess.run(
+                [*COMPOSE, "logs", "--no-color", "--tail", "500"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            with open(
+                "acceptance-logs/test-pipe-forward.py-containers.log", "w"
+            ) as handle:
+                handle.write(logs.stdout + logs.stderr)
+        except Exception as inner:
+            print(f"container log capture failed: {inner!r}")
+        raise
     finally:
         subprocess.run([*COMPOSE, "down", "-v"], check=True)
 

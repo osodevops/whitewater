@@ -2519,6 +2519,185 @@ fn subscription_placement_diverged(
     }
 }
 
+/// A Pipe compute lease is the drive authority for the Pipe's background
+/// pump: only the lease owner runs `drive_local_pipes` ticks, and nothing
+/// re-drives while it is down. Unlike Subscription progress — which member
+/// requests recover opportunistically — no request path recovers a dead
+/// compute owner, so a lease can sit on a stopped Node and silently stall
+/// every driveable Pipe it owns (forwards idle, window panes never expire).
+/// This leader-driven backstop probes each lease owner through the public
+/// /health endpoint and CASes dead ones onto a surviving storage Node —
+/// a threshold of consecutive failures means a slow Node that still
+/// answers is never moved unnecessarily.
+pub struct PipeComputeLeaseRecoverySupervisor {
+    threshold: u32,
+    client: reqwest::Client,
+    /// mTLS-capable probe client, built once from the shared material:
+    /// under `subscription_mtls` the configured endpoints terminate the
+    /// internal TLS listener, so a plain client would read every owner as
+    /// dead and churn leases.
+    mtls_client: std::sync::OnceLock<Option<reqwest::Client>>,
+    failures: std::sync::Mutex<BTreeMap<Uuid, (crate::active_range::StorageNodeId, u32)>>,
+}
+
+impl PipeComputeLeaseRecoverySupervisor {
+    pub fn new(threshold: u32) -> Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(1))
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            threshold: threshold.max(1),
+            client,
+            mtls_client: std::sync::OnceLock::new(),
+            failures: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn probe_client(&self, state: &AppState) -> reqwest::Client {
+        match &state.internal_mtls {
+            Some(material) => self
+                .mtls_client
+                .get_or_init(|| material.client(std::time::Duration::from_secs(3)).ok())
+                .clone()
+                .unwrap_or_else(|| self.client.clone()),
+            None => self.client.clone(),
+        }
+    }
+
+    /// Liveness is "the Node answered over HTTP" — any status, including
+    /// an auth refusal or a route miss on the internal listener, proves
+    /// the process is serving. Only transport failure counts as dead.
+    async fn node_alive(
+        &self,
+        state: &AppState,
+        node: &crate::active_range::StorageNodeId,
+    ) -> bool {
+        let Some(endpoint) = state.control_endpoints.as_ref().resolve(node).await else {
+            return false;
+        };
+        self.probe_client(state)
+            .get(format!("{endpoint}/health"))
+            .send()
+            .await
+            .is_ok()
+    }
+
+    pub async fn tick(&self, state: &AppState) {
+        let Some(plane) = &state.control_plane else {
+            return;
+        };
+        if plane.status().await.state != "leader" {
+            return;
+        }
+        for lease in state.control.pipe_compute_leases().await {
+            // Retired/deleted Pipes can leave a stale explicit entry; the
+            // effective lease is authority — skip entries it suppresses.
+            if state
+                .control
+                .pipe_compute_lease(lease.pipe_id)
+                .await
+                .is_none()
+            {
+                self.failures
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .remove(&lease.pipe_id);
+                continue;
+            }
+            let alive = self.node_alive(state, &lease.owner).await;
+            let should_recover = {
+                let mut failures = self
+                    .failures
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if alive {
+                    failures.remove(&lease.pipe_id);
+                    false
+                } else {
+                    let entry = failures
+                        .entry(lease.pipe_id)
+                        .or_insert_with(|| (lease.owner.clone(), 0));
+                    if entry.0 != lease.owner {
+                        *entry = (lease.owner.clone(), 0);
+                    }
+                    entry.1 = entry.1.saturating_add(1);
+                    entry.1 >= self.threshold
+                }
+            };
+            if !should_recover {
+                continue;
+            }
+            match self.recover(state, &lease).await {
+                Ok(new_owner) => {
+                    self.failures
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&lease.pipe_id);
+                    tracing::info!(
+                        pipe_id = %lease.pipe_id,
+                        owner = %new_owner,
+                        "Pipe compute lease owner recovered"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        pipe_id = %lease.pipe_id,
+                        owner = %lease.owner,
+                        compute_epoch = lease.compute_epoch,
+                        "background Pipe compute lease recovery attempt failed"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Hand the lease to the first registered storage Node answering
+    /// /health: the lease carries no data, so any eligible survivor can
+    /// resume the pump, and the CAS's expected epoch fails closed when a
+    /// racing mover already won rather than ratcheting compute epochs.
+    async fn recover(
+        &self,
+        state: &AppState,
+        lease: &crate::control::PipeComputeLease,
+    ) -> Result<crate::active_range::StorageNodeId, crate::reader::SubscriptionProgressError> {
+        let Some(pipe) = state.control.active_pipe_by_id(lease.pipe_id).await else {
+            return Err(crate::reader::SubscriptionProgressError::Unavailable);
+        };
+        // Re-read the live lease: a racing mover's CAS already advanced the
+        // epoch, so CASing the stale expectation fails closed — but when
+        // the owner already moved the work is done.
+        let current = state
+            .control
+            .pipe_compute_lease(lease.pipe_id)
+            .await
+            .unwrap_or_else(|| lease.clone());
+        if current.owner != lease.owner {
+            return Ok(current.owner);
+        }
+        for candidate in state.control.storage_pool_nodes().await {
+            if candidate == current.owner {
+                continue;
+            }
+            if !self.node_alive(state, &candidate).await {
+                continue;
+            }
+            state
+                .progress_authority
+                .execute_placement_commands(vec![crate::control::Command::MovePipeComputeLease {
+                    pipe: pipe.name.clone(),
+                    new_owner: candidate.clone(),
+                    expected_compute_epoch: Some(current.compute_epoch),
+                }])
+                .await?;
+            return Ok(candidate);
+        }
+        Err(crate::reader::SubscriptionProgressError::Unavailable)
+    }
+}
+
 /// Whether the live placement's owner already answers evidence probes: a
 /// committed CAS — this window's or a racing recovery's — makes another
 /// ownership move pure churn. When the owner answers but at least one
@@ -4141,14 +4320,18 @@ async fn pipe_drive_local(
         .await
         .ok_or_else(|| ApiError::unavailable("Subscription progress placement is unavailable"))?;
     if assignment.owner != request.receiver || assignment.owner != request.owner {
-        return Err(ApiError::conflict(
-            "Pipe drive must run on the current progress owner",
-        ));
+        return Err(ApiError::conflict(format!(
+            "Pipe drive must run on the current progress owner (owner={} ownership_epoch={})",
+            assignment.owner.as_str(),
+            assignment.ownership_epoch
+        )));
     }
     if assignment.ownership_epoch != request.ownership_epoch {
-        return Err(ApiError::conflict(
-            "Pipe drive epoch does not match the current progress placement",
-        ));
+        return Err(ApiError::conflict(format!(
+            "Pipe drive epoch does not match the current progress placement (owner={} ownership_epoch={})",
+            assignment.owner.as_str(),
+            assignment.ownership_epoch
+        )));
     }
     if state.storage_node_id.as_ref() != Some(&request.receiver) {
         return Err(ApiError::conflict(format!(
@@ -19787,16 +19970,24 @@ mod tests {
         );
         let mut wrong_epoch = drive.clone();
         wrong_epoch.ownership_epoch = assignment.ownership_epoch + 9;
-        assert_eq!(
-            app.clone()
-                .oneshot(request(
-                    json!(wrong_epoch),
-                    Some("this-is-a-long-control-plane-key")
-                ))
-                .await
-                .unwrap()
-                .status(),
-            StatusCode::CONFLICT
+        let response = app
+            .clone()
+            .oneshot(request(
+                json!(wrong_epoch),
+                Some("this-is-a-long-control-plane-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        // The conflict names the live placement so drive probes re-hint
+        // themselves instead of blind-scanning epochs across moves.
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains(&format!("ownership_epoch={}", assignment.ownership_epoch)),
+            "{text}"
         );
         // On the progress owner the drive reaches the coordinators: with no
         // established frontier and unreachable peers it degrades to a
@@ -24465,6 +24656,43 @@ mod tests {
             .unwrap();
         assert_eq!(after.owner, before.owner);
         assert_eq!(after.ownership_epoch, before.ownership_epoch);
+    }
+
+    #[tokio::test]
+    async fn pipe_compute_lease_supervisor_stays_idle_until_this_node_leads() {
+        // Same leader gate as Subscription progress and StateStore
+        // recovery: only the Control Plane leader may CAS compute
+        // placement, so a partitioned follower never moves a lease whose
+        // owner it merely cannot reach.
+        let directory = TempDir::new().unwrap();
+        let (state, _plane, control, _replica) = internal_replica_test_state(&directory).await;
+        control
+            .execute("CREATE FEED orders.enriched; CREATE PIPE orders.forward FROM SUBSCRIPTION orders.billing TO FEED orders.enriched;")
+            .await
+            .unwrap();
+        // An explicit lease entry is the recoverable case: Pipes riding
+        // the synthesized progress-owner lease move with Subscription
+        // progress recovery instead.
+        let pipe = control.active_pipe_by_name("orders.forward").await.unwrap();
+        let seeded = control.pipe_compute_lease(pipe.pipe_id).await.unwrap();
+        let target = ["control-1", "control-2", "control-3"]
+            .into_iter()
+            .map(|node| crate::active_range::StorageNodeId::try_new(node).unwrap())
+            .find(|node| *node != seeded.owner)
+            .unwrap();
+        control
+            .execute(&format!(
+                "MOVE PIPE COMPUTE orders.forward TO NODE {target};"
+            ))
+            .await
+            .unwrap();
+        let before = control.pipe_compute_lease(pipe.pipe_id).await.unwrap();
+        assert_eq!(before.owner, target);
+        let supervisor = PipeComputeLeaseRecoverySupervisor::new(2);
+        supervisor.tick(&state).await;
+        let after = control.pipe_compute_lease(pipe.pipe_id).await.unwrap();
+        assert_eq!(after.owner, before.owner);
+        assert_eq!(after.compute_epoch, before.compute_epoch);
     }
 
     /// In-memory CutoverPrefix over a contiguous committed prefix so the

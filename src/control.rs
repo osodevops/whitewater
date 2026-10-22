@@ -1901,6 +1901,17 @@ impl ControlController {
         self.state.lock().await.draining_storage_nodes.clone()
     }
 
+    /// Every currently storage-eligible Node (configured voters plus
+    /// registered storage Nodes, minus retired/draining/capacity-excluded)
+    /// under the wall clock — advisory placement pools like Pipe compute
+    /// lease recovery candidates use this; committed apply still
+    /// re-validates eligibility against `issued_at_ns`.
+    pub async fn storage_pool_nodes(&self) -> BTreeSet<StorageNodeId> {
+        let now_ns = unix_ns();
+        let state = self.state.lock().await;
+        self.storage_pool(&state, now_ns)
+    }
+
     /// Endpoints of every independently registered storage Node.
     pub async fn registered_storage_node_endpoints(&self) -> BTreeMap<StorageNodeId, String> {
         self.state
@@ -2638,6 +2649,19 @@ impl ControlController {
     pub async fn pipe_compute_lease(&self, pipe_id: Uuid) -> Option<PipeComputeLease> {
         let state = self.state.lock().await;
         effective_pipe_compute_lease(&state, pipe_id)
+    }
+
+    /// Every explicit Pipe compute lease in placement order; Pipes riding
+    /// the synthesized progress-owner lease are excluded — their authority
+    /// moves with Subscription progress recovery instead.
+    pub async fn pipe_compute_leases(&self) -> Vec<PipeComputeLease> {
+        self.state
+            .lock()
+            .await
+            .pipe_compute_leases
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub async fn active_pipes(&self) -> Vec<PipeDefinition> {

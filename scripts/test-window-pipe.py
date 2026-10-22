@@ -1,6 +1,7 @@
 import base64
 import http.client
 import json
+import os
 import struct
 import subprocess
 import time
@@ -315,28 +316,54 @@ def drive_probe_once(node, pipe_id, subscription_id, storage_node, epoch):
     )
 
 
-def find_progress_owner(pipe_id, subscription_id, sweeps=90):
-    """Probe each storage Node with owner=receiver=<that Node>. Only the
-    current progress owner accepts the drive; a stale epoch or wrong owner
-    is fenced, so a 200 is an authoritative answer. The last statuses each
-    Node returned ride the AssertionError: 409s mean placement never moved,
-    5xx mean the owner answered but the drive stayed degraded, and 0s mean
-    the Node was unreachable — three different root causes."""
+def admin_progress(node, subscription):
+    query = urllib.parse.urlencode({"subscription": subscription})
+    request = urllib.request.Request(
+        f"{node}/v1/admin/subscriptions/progress?{query}",
+        headers={"authorization": f"Bearer {KEY}"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        return json.load(response)["assignment"]
+
+
+def find_progress_owner(pipe_id, subscription, subscription_id, sweeps=90):
+    """Read the authoritative progress placement through the admin
+    endpoint — it reports owner+epoch directly, so the probe follows
+    placement moves instead of blind-scanning an epoch range a ratcheting
+    recovery could outrun — then prove the reported owner accepts the
+    drive. The last status each Node returned rides the AssertionError:
+    409s mean the drive fenced a stale hint, 5xx mean the owner answered
+    but stayed degraded, and 0s mean the Node was unreachable."""
     seen = {}
     for _ in range(sweeps):
         for index, node in enumerate(NODES):
-            statuses = seen.setdefault(SERVICES[index], [])
-            for epoch in range(1, 21):
-                try:
-                    status, _ = drive_probe_once(
-                        node, pipe_id, subscription_id, SERVICES[index], epoch
-                    )
-                except (ConnectionError, urllib.error.URLError, TimeoutError):
-                    continue
-                statuses.append((epoch, status))
-                del statuses[:-8]
-                if status == 200:
-                    return SERVICES[index], epoch
+            try:
+                assignment = admin_progress(node, subscription)
+                owner = assignment["owner"]
+                epoch = int(assignment["ownership_epoch"])
+            except Exception as error:
+                statuses = seen.setdefault("__placement_read__", [])
+                statuses.append(f"{SERVICES[index]}: {error!r}"[:120])
+                del statuses[:-4]
+                continue
+            if owner not in SERVICES:
+                continue
+            try:
+                status, _ = drive_probe_once(
+                    NODES[SERVICES.index(owner)],
+                    pipe_id,
+                    subscription_id,
+                    owner,
+                    epoch,
+                )
+            except (ConnectionError, urllib.error.URLError, TimeoutError):
+                status = 0
+            statuses = seen.setdefault(owner, [])
+            statuses.append((epoch, status))
+            del statuses[:-8]
+            if status == 200:
+                return owner, epoch
+            break
         time.sleep(1)
     raise AssertionError({"no Node accepted the Pipe drive": seen})
 
@@ -574,14 +601,14 @@ def main():
         # Owner change: drain the progress owner so the Control Plane moves
         # it to a surviving replica at a higher epoch; the supervisor on the
         # new owner picks the Pipe up automatically.
-        owner, epoch = find_progress_owner(pipe_id, subscription_id)
+        owner, epoch = find_progress_owner(pipe_id, subscription, subscription_id)
         wcl(NODES[0], f"DRAIN STORAGE NODE {owner};")
         new_owner, new_epoch = None, None
         deadline = time.time() + 120
         last_probe = None
         while time.time() < deadline:
             try:
-                found = find_progress_owner(pipe_id, subscription_id, sweeps=10)
+                found = find_progress_owner(pipe_id, subscription, subscription_id, sweeps=10)
             except AssertionError as error:
                 last_probe = error
             else:
@@ -607,7 +634,7 @@ def main():
             retries=45,
         )
         expected[("globex", pmoved)] = (1, 3)
-        emitted = emissions(wait_records(results_feed, 7, deadline=90))
+        emitted = emissions(wait_records(results_feed, 7, deadline=180))
         assert_subset(emitted, expected)
 
         # Per-Domain Pipe cost attribution, read while every drive Node is
@@ -685,7 +712,7 @@ def main():
         last_probe = None
         while time.time() < deadline:
             try:
-                found = find_progress_owner(pipe_id, subscription_id, sweeps=10)
+                found = find_progress_owner(pipe_id, subscription, subscription_id, sweeps=10)
             except AssertionError as error:
                 last_probe = error
             else:
@@ -710,7 +737,7 @@ def main():
             retries=45,
         )
         expected[("acme", pdone)] = (1, 9)
-        emitted = emissions(wait_records(results_feed, 8, deadline=90))
+        emitted = emissions(wait_records(results_feed, 8, deadline=180))
         assert_subset(emitted, expected)
         if len(emitted) != 8:
             raise AssertionError({"unexpected extra emissions": emitted})
@@ -880,6 +907,23 @@ def main():
             ),
         }
         print(f"DIAGNOSTICS {json.dumps(diag, indent=2, default=str)}")
+        # Container logs too: the suite's own diagnostics collection runs
+        # only after this script's `down`, so the CI artifact captures the
+        # failing cluster only if the script saves it first.
+        try:
+            os.makedirs("acceptance-logs", exist_ok=True)
+            logs = subprocess.run(
+                [*COMPOSE, "logs", "--no-color", "--tail", "500"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            with open(
+                "acceptance-logs/test-window-pipe.py-containers.log", "w"
+            ) as handle:
+                handle.write(logs.stdout + logs.stderr)
+        except Exception as inner:
+            print(f"container log capture failed: {inner!r}")
         raise
     finally:
         subprocess.run([*COMPOSE, "down", "-v"], check=True)

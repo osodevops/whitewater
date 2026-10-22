@@ -912,6 +912,30 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // Pipe compute leases are drive authority for each Pipe's background
+    // pump: the owner's `drive_local_pipes` tick is the only mover, and no
+    // request path recovers a dead owner — so a lease can sit on a stopped
+    // Node and silently stall forwards and window expiry until an
+    // operator drains it. This leader-driven backstop probes lease owners
+    // through /health and CASes dead ones onto a surviving storage Node.
+    let pipe_lease_recovery_task = if app_state.control_plane.is_some() {
+        let state = app_state.clone();
+        let supervisor = whitewater::api::PipeComputeLeaseRecoverySupervisor::new(3);
+        let mut shutdown = shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => supervisor.tick(&state).await,
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
     let app = router(app_state).layer(TraceLayer::new_for_http());
     let listener = TcpListener::bind(config.bind_addr).await?;
     let tls_task = match (subscription_tls, tls_router, &config.subscription_mtls) {
@@ -970,6 +994,9 @@ async fn main() -> Result<()> {
         let _ = task.await;
     }
     if let Some(task) = state_store_recovery_task {
+        let _ = task.await;
+    }
+    if let Some(task) = pipe_lease_recovery_task {
         let _ = task.await;
     }
     if let Some(task) = state_store_replay_task {
