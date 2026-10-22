@@ -6,7 +6,7 @@ use thiserror::Error;
 use crate::{codec::decode_record, control::RangeMergePlan};
 
 use super::{
-    ActiveRangeAssignment, CommitPosition, RangePosition, ReplicaAppendService,
+    split::StagedBatch, ActiveRangeAssignment, CommitPosition, RangePosition, ReplicaAppendService,
     StagedWriterSequence, StorageNodeId,
 };
 
@@ -227,29 +227,18 @@ async fn stage_merged_range_inner(
     let mut checksum = blake3::Hasher::new();
     let mut writer_sequences = BTreeMap::<(uuid::Uuid, u64), u64>::new();
     let mut transferred_bytes = 0_u64;
+    let mut staged: BTreeMap<&StorageNodeId, StagedBatch> = BTreeMap::new();
     for (index, frame) in frames.iter().enumerate() {
         let position = RangePosition::new(index as u64 + 1);
         let digest = *blake3::hash(&frame.frame).as_bytes();
         for node in replica_nodes.iter() {
-            let target = targets
-                .get(node)
-                .ok_or_else(|| MergeStagingError::MissingTarget(node.clone()))?;
-            let accepted = target
-                .stage_split_frame(
-                    &plan.merged_assignment,
-                    position,
-                    frame.identity.clone(),
-                    frame.cursor.clone(),
-                    frame.frame.clone(),
-                )
-                .await
-                .map_err(|error| MergeStagingError::Target {
-                    node: node.clone(),
-                    message: error.to_string(),
-                })?;
-            if accepted.position != position || accepted.frame_digest != digest {
-                return Err(MergeStagingError::VerificationConflict);
-            }
+            staged.entry(node).or_default().push(
+                position,
+                frame.identity.clone(),
+                frame.cursor.clone(),
+                frame.frame.clone(),
+                digest,
+            );
         }
         writer_sequences
             .entry((
@@ -260,6 +249,23 @@ async fn stage_merged_range_inner(
             .or_insert(frame.identity.sequence);
         checksum.update(&digest);
         transferred_bytes = transferred_bytes.saturating_add(frame.frame.len() as u64);
+    }
+    for (node, batch) in staged {
+        let target = targets
+            .get(node)
+            .ok_or_else(|| MergeStagingError::MissingTarget(node.clone()))?;
+        let accepted = target
+            .stage_split_frames(&plan.merged_assignment, batch.frames)
+            .await
+            .map_err(|error| MergeStagingError::Target {
+                node: node.clone(),
+                message: error.to_string(),
+            })?;
+        for (result, (position, digest)) in accepted.iter().zip(batch.expected.iter()) {
+            if result.position != *position || result.frame_digest != *digest {
+                return Err(MergeStagingError::VerificationConflict);
+            }
+        }
     }
     let merged_commit = CommitPosition::new(frames.len() as u64);
     if !frames.is_empty() {

@@ -439,6 +439,18 @@ pub enum ReaderStart {
     Timestamp(i64),
 }
 
+/// Replay bookkeeping for the single-record delivery path: the Cursor the
+/// page started from plus the bound it was read under let a duplicate
+/// `request_id` re-derive and prove the identical page from immutable
+/// history — the non-frontier counterpart of `ReaderFrontier::previous`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReaderDeliveryReplay {
+    pub request_id: Uuid,
+    pub previous_cursor: Option<String>,
+    pub limit: usize,
+    pub retry_after_ms: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReaderDefinition {
     pub reader_id: Uuid,
@@ -448,6 +460,10 @@ pub struct ReaderDefinition {
     pub acknowledged_cursor: Option<String>,
     #[serde(default)]
     pub delivered_cursor: Option<String>,
+    /// The last committed delivery's replay bracket; set only on the
+    /// non-frontier (single-record Cursor) path.
+    #[serde(default)]
+    pub last_delivery: Option<ReaderDeliveryReplay>,
     #[serde(default)]
     pub session_epoch: u64,
     #[serde(default)]
@@ -1227,6 +1243,16 @@ pub enum Command {
         reader: String,
         session_epoch: u64,
         cursor: String,
+        #[serde(default)]
+        fetch_request_id: Option<Uuid>,
+        /// The record bound the fetch used — persisted on the Reader so a
+        /// duplicate request can replay provably identical records.
+        #[serde(default)]
+        fetch_limit: Option<usize>,
+        /// The retry backoff the page was paced under — persisted so a
+        /// replay reports the identical advice on any ingress Node.
+        #[serde(default)]
+        fetch_retry_after_ms: Option<u64>,
     },
     RecordReaderFrontier {
         reader: String,
@@ -3580,6 +3606,7 @@ impl ControlController {
                     start,
                     acknowledged_cursor: acknowledged_cursor.clone(),
                     delivered_cursor: acknowledged_cursor,
+                    last_delivery: None,
                     session_epoch: 0,
                     session_capacity: 0,
                     session_active: false,
@@ -3749,6 +3776,7 @@ impl ControlController {
                 definition.session_capacity = capacity;
                 definition.session_active = true;
                 definition.delivered_cursor = definition.acknowledged_cursor.clone();
+                definition.last_delivery = None;
                 let updated = definition.clone();
                 if let Some(frontier) = state.reader_frontiers.get_mut(&updated.reader_id) {
                     frontier.delivered = frontier.acknowledged.clone();
@@ -3760,6 +3788,9 @@ impl ControlController {
                 reader,
                 session_epoch,
                 cursor,
+                fetch_request_id,
+                fetch_limit,
+                fetch_retry_after_ms,
             } => {
                 let reader_id = {
                     let definition = active_reader_mut(state, &reader)?;
@@ -3773,6 +3804,23 @@ impl ControlController {
                     ));
                 }
                 let definition = active_reader_mut(state, &reader)?;
+                if fetch_request_id.is_some()
+                    && definition
+                        .last_delivery
+                        .as_ref()
+                        .map(|replay| replay.request_id)
+                        == fetch_request_id
+                {
+                    return Err(ControlError::InvalidOperation("Reader fetch request ID was already delivered; reopen the session to redeliver from acknowledged progress".to_owned()));
+                }
+                definition.last_delivery = fetch_request_id.map(|request_id| {
+                    ReaderDeliveryReplay {
+                        request_id,
+                        previous_cursor: definition.delivered_cursor.clone(),
+                        limit: fetch_limit.unwrap_or(0),
+                        retry_after_ms: fetch_retry_after_ms.unwrap_or(0),
+                    }
+                });
                 definition.delivered_cursor = Some(cursor);
                 Ok((
                     format!("recorded Reader delivery {reader}"),
@@ -8673,6 +8721,9 @@ mod tests {
                 reader: "audit".to_owned(),
                 session_epoch: 1,
                 cursor: "cursor-2".to_owned(),
+                fetch_request_id: None,
+                fetch_limit: None,
+                fetch_retry_after_ms: None,
             }])
             .await
             .unwrap();
@@ -8708,7 +8759,10 @@ mod tests {
             .execute_commands(vec![Command::RecordReaderDelivery {
                 reader: "audit".to_owned(),
                 session_epoch: 1,
-                cursor: "cursor-3".to_owned()
+                cursor: "cursor-3".to_owned(),
+                fetch_request_id: None,
+                fetch_limit: None,
+                fetch_retry_after_ms: None,
             }])
             .await
             .is_err());
@@ -8900,6 +8954,89 @@ mod tests {
         assert_eq!(frontier.previous[&range_id], "event-1");
         assert_eq!(frontier.last_fetch_limit, 32);
         assert_eq!(frontier.last_fetch_retry_after_ms, 50);
+    }
+
+    #[tokio::test]
+    async fn single_record_delivery_persists_replay_bracket_and_fences_duplicates() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller.execute("CREATE SPACE orders; CREATE FEED orders.events; CREATE READER audit FROM orders.events START AT BEGINNING;").await.unwrap();
+        let audit = controller.active_reader_by_name("audit").await.unwrap();
+        controller
+            .execute_commands(vec![Command::OpenReaderSession {
+                reader: "audit".to_owned(),
+                capacity: 64,
+            }])
+            .await
+            .unwrap();
+        let deliver = |cursor: &str, fetch_id: u128| Command::RecordReaderDelivery {
+            reader: "audit".to_owned(),
+            session_epoch: 1,
+            cursor: cursor.to_owned(),
+            fetch_request_id: Some(Uuid::from_u128(fetch_id)),
+            fetch_limit: Some(32),
+            fetch_retry_after_ms: Some(50),
+        };
+        controller
+            .execute_commands(vec![deliver("cursor-32", 7)])
+            .await
+            .unwrap();
+        // The committed delivery carries its replay bracket: the Cursor the
+        // page started from and the bound it was read under.
+        let replay = controller
+            .active_reader_by_name("audit")
+            .await
+            .unwrap()
+            .last_delivery
+            .unwrap();
+        assert_eq!(replay.request_id, Uuid::from_u128(7));
+        assert_eq!(replay.previous_cursor, None);
+        assert_eq!(replay.limit, 32);
+        assert_eq!(replay.retry_after_ms, 50);
+        // A duplicate request ID is fenced at apply instead of advancing
+        // delivered past a page the client may never have seen.
+        assert!(controller
+            .execute_commands(vec![deliver("cursor-64", 7)])
+            .await
+            .is_err());
+        // A fresh fetch under a new request ID advances and re-brackets.
+        controller
+            .execute_commands(vec![deliver("cursor-64", 8)])
+            .await
+            .unwrap();
+        let replay = controller
+            .active_reader_by_name("audit")
+            .await
+            .unwrap()
+            .last_delivery
+            .unwrap();
+        assert_eq!(replay.previous_cursor.as_deref(), Some("cursor-32"));
+
+        drop(controller);
+        let reopened = new_controller(&directory);
+        let replay = reopened
+            .active_reader_by_name("audit")
+            .await
+            .unwrap()
+            .last_delivery
+            .unwrap();
+        assert_eq!(replay.request_id, Uuid::from_u128(8));
+        assert_eq!(replay.previous_cursor.as_deref(), Some("cursor-32"));
+
+        reopened
+            .execute_commands(vec![Command::OpenReaderSession {
+                reader: "audit".to_owned(),
+                capacity: 8,
+            }])
+            .await
+            .unwrap();
+        assert!(reopened
+            .active_reader_by_name("audit")
+            .await
+            .unwrap()
+            .last_delivery
+            .is_none());
+        let _ = audit;
     }
 
     #[tokio::test]

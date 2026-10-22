@@ -16,7 +16,7 @@ use whitewater::{
         ReplicaCommitRequest, ReplicaDiscardPendingRequest, ReplicaDiscardPendingResponse,
         ReplicaTransport, ReplicaTransportError, StorageNodeId,
     },
-    codec::encode_record,
+    codec::{decode_record, encode_record},
     control::{Command, ControlController, RangeOwnerMovePlan},
     domain::StoredRecord,
     storage::{FileLogStore, LogStore},
@@ -1739,4 +1739,51 @@ async fn validated_owner_frame_truncates_the_superseded_uncommitted_tail() {
         .unwrap();
     assert_eq!(status.appended.value(), 2);
     assert_eq!(status.committed.value(), 1);
+}
+
+#[tokio::test]
+async fn resequenced_retry_dedup_pushes_the_stored_frame_to_replicas() {
+    // A retried request shares its request-derived Cursor with the original
+    // append but can carry a freshly allocated or healed sequence — the
+    // exact shape the API hands the owner after a stale-sequence refusal.
+    // The owner dedups it to the stored position; the coordinator must then
+    // push the canonical stored frame, because offering the request's
+    // divergent identity at that position makes every replica refuse a
+    // committed occupant and wedges the range.
+    let fixture = Fixture::new().await;
+    let coordinator = fixture.coordinator(&[], &[], None);
+    let mut records = vec![fixture.request.clone()];
+    for sequence in 2..=3_u64 {
+        let mut request = fixture.request.clone();
+        request.cursor = format!("cursor-{sequence}");
+        request.identity.sequence = sequence;
+        let mut record =
+            decode_record(&STANDARD.decode(&fixture.request.frame_base64).unwrap()).unwrap();
+        record.message_id = Uuid::from_u128(700 + sequence as u128);
+        record.producer_sequence = sequence;
+        request.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+        records.push(request);
+    }
+    for request in &records {
+        coordinator.append(request.clone()).await.unwrap();
+    }
+
+    let mut retry = records[0].clone();
+    retry.identity.sequence = 9;
+    let mut record = decode_record(&STANDARD.decode(&retry.frame_base64).unwrap()).unwrap();
+    record.producer_sequence = 9;
+    retry.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+    let result = coordinator.append(retry).await.unwrap();
+    assert!(result.deduplicated);
+    assert_eq!(result.position.value(), 1);
+    assert_eq!(result.durable_replicas.len(), 3);
+
+    for service in fixture.services.values() {
+        let status = service
+            .recovery_status(fixture.request.feed_id)
+            .await
+            .unwrap();
+        assert_eq!(status.appended.value(), 3);
+        assert_eq!(status.committed.value(), 3);
+    }
 }

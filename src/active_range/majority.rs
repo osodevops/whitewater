@@ -280,13 +280,17 @@ impl MajorityAppendCoordinator {
             })?;
         if assignment.owner != *self.local.local_node() || request.append_owner != assignment.owner
         {
+            // An ownership cutover leaves ingress Nodes and callers holding
+            // the previous placement for a few catalog applies; the refusal
+            // is transient, so classify it retryable — each retry re-resolves
+            // the assignment and lands on the converged owner.
             return Err(self.error(
                 MajorityAppendErrorCode::NotCurrentOwner,
                 format!(
                     "Node {} is not the current Append Owner",
                     self.local.local_node()
                 ),
-                false,
+                true,
                 vec![],
                 vec![],
             ));
@@ -307,6 +311,46 @@ impl MajorityAppendCoordinator {
         // retried request deduplicates to an earlier position than the
         // pre-allocation tip, and replicas must be offered that position.
         request.expected_position = local.position;
+        if local.deduplicated {
+            // A Cursor-dedup hit can land the request on a stored frame
+            // whose identity differs from the request's: a re-sequenced
+            // retry shares the request-derived Cursor but carries a freshly
+            // allocated or healed sequence. Pushing the request's bytes at
+            // that position makes every replica refuse a different committed
+            // occupant; offer the canonical stored frame so replicas dedup
+            // or append it on its own identity.
+            let request_digest = STANDARD
+                .decode(&request.frame_base64)
+                .map(|frame| *blake3::hash(&frame).as_bytes())
+                .unwrap_or_default();
+            if request_digest != local.frame_digest {
+                let after = local
+                    .position
+                    .value()
+                    .checked_sub(1)
+                    .map(RangePosition::new);
+                let frames = self
+                    .local
+                    .read_assignment_uncommitted(&assignment, after, 1)
+                    .await
+                    .map_err(|error| {
+                        self.error(
+                            MajorityAppendErrorCode::LocalStorageFailure,
+                            format!("owner could not reload the deduplicated frame: {error}"),
+                            true,
+                            vec![],
+                            vec![],
+                        )
+                    })?;
+                if let Some(frame) = frames.into_iter().next() {
+                    if frame.position == local.position {
+                        request.frame_base64 = STANDARD.encode(&frame.frame);
+                        request.identity = frame.identity;
+                        request.cursor = frame.cursor;
+                    }
+                }
+            }
+        }
         let mut durable = vec![self.local.local_node().clone()];
         let followers = assignment
             .replicas

@@ -149,8 +149,9 @@ async fn a_resequenced_retry_with_the_same_cursor_returns_the_original_position(
     assert_eq!(deduplicated.position, committed.position);
     assert_eq!(deduplicated.message_id, first_record.message_id);
 
-    // The consumed sequence is recorded against the landed position: replaying
-    // the allocated sequence with a different payload still fails closed.
+    // A forged reuse of the stored Cursor with different record bytes fails
+    // closed at the Cursor layer — the request-identity check runs before
+    // sequence bookkeeping so a known request can never alias new bytes.
     let mut forged = append(6, b"different payload");
     let mut forged_record = decode_record(&forged.frame).unwrap();
     forged_record.message_id = first_record.message_id;
@@ -159,7 +160,7 @@ async fn a_resequenced_retry_with_the_same_cursor_returns_the_original_position(
     forged.cursor = first.cursor.clone();
     assert!(matches!(
         store.append(forged).await,
-        Err(ActiveRangeStoreError::WriterSequenceConflict { .. })
+        Err(ActiveRangeStoreError::InvalidState(_))
     ));
 
     // A forged reuse of the same Cursor at the next stream position fails
@@ -555,9 +556,20 @@ async fn writer_sequence_conflicts_gaps_and_stale_retries_are_rejected() {
     let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
     store.append(append(4, b"accepted")).await.unwrap();
 
+    // A different request (fresh Cursor) reusing an allocated sequence with
+    // different bytes still trips the sequence fence; the same stored Cursor
+    // with different bytes is a Cursor-identity conflict instead.
+    let mut conflict = append(4, b"different");
+    conflict.cursor = "cursor-conflict".to_owned();
     assert!(matches!(
-        store.append(append(4, b"different")).await,
+        store.append(conflict).await,
         Err(ActiveRangeStoreError::WriterSequenceConflict { .. })
+    ));
+    let mut reused = append(4, b"different");
+    reused.cursor = "cursor-4".to_owned();
+    assert!(matches!(
+        store.append(reused).await,
+        Err(ActiveRangeStoreError::InvalidState(_))
     ));
     assert!(matches!(
         store.append(append(6, b"gap")).await,
@@ -796,10 +808,13 @@ async fn imported_merge_branches_deduplicate_colliding_sequences_by_frame_digest
     let replay = store.append(live_retry_left).await.unwrap();
     assert!(replay.deduplicated);
     assert_eq!(replay.position, RangePosition::new(1));
-    // Distinct payloads reusing a committed sequence still fail closed, and
-    // the refusal carries the stream's latest sequence so the session append
-    // path can re-land the record at the boundary.
-    match store.append(append(3, b"different")).await {
+    // Distinct payloads reusing a committed sequence under a fresh request
+    // Cursor still fail closed, and the refusal carries the stream's latest
+    // sequence so the session append path can re-land the record at the
+    // boundary.
+    let mut conflict = append(3, b"different");
+    conflict.cursor = "cursor-merge-conflict".to_owned();
+    match store.append(conflict).await {
         Err(ActiveRangeStoreError::WriterSequenceConflict { latest }) => {
             assert_eq!(latest, 3);
         }
@@ -816,8 +831,10 @@ async fn imported_merge_branches_deduplicate_colliding_sequences_by_frame_digest
     let replay = reopened.append(retry).await.unwrap();
     assert!(replay.deduplicated);
     assert_eq!(replay.cursor, "right-2");
+    let mut another = append(3, b"another");
+    another.cursor = "cursor-merge-another".to_owned();
     assert!(matches!(
-        reopened.append(append(3, b"another")).await,
+        reopened.append(another).await,
         Err(ActiveRangeStoreError::WriterSequenceConflict { .. })
     ));
 }
@@ -1143,4 +1160,96 @@ async fn discard_pending_effect_fences_a_stale_ownership_epoch() {
         .await;
     assert!(error.is_err());
     assert!(store.pending_effect().await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn cursor_dedup_returns_the_original_position_for_resequenced_retries() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    store.append(append(1, b"first")).await.unwrap();
+    store.append(append(2, b"second")).await.unwrap();
+    store.append(append(3, b"third")).await.unwrap();
+
+    // A committed retry of the first record arrives carrying its original
+    // sequence while the session's high-water mark sits at 3. The known
+    // Cursor proves this request already landed, so the stale sequence
+    // must not fence it.
+    let mut retry = append(1, b"first");
+    retry.cursor = "cursor-1".to_owned();
+    let landed = store.append(retry).await.unwrap();
+    assert!(landed.deduplicated);
+    assert_eq!(landed.position, RangePosition::new(1));
+
+    // A retry the API re-allocated a fresh sequence to carries the same
+    // request-derived Cursor and record fields but a new producer
+    // sequence; it must dedup to the original position, consuming the
+    // allocated sequence so later appends stay contiguous.
+    let mut resequenced = append(9, b"first");
+    let mut record = decode_record(&resequenced.frame).unwrap();
+    record.message_id = Uuid::from_u128(101);
+    record.event_time_ns = 1;
+    resequenced.frame = encode_record(&record).unwrap();
+    resequenced.cursor = "cursor-1".to_owned();
+    let landed = store.append(resequenced).await.unwrap();
+    assert!(landed.deduplicated);
+    assert_eq!(landed.position, RangePosition::new(1));
+
+    // The consumed sequence ratcheted the dedup high-water mark: the next
+    // genuinely new record lands at sequence 10 without a gap refusal.
+    let landed = store.append(append(10, b"fourth")).await.unwrap();
+    assert_eq!(landed.position, RangePosition::new(4));
+}
+
+#[tokio::test]
+async fn import_split_batch_flushes_once_and_resumes_through_dedup() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let staged = |position: u64| {
+        let mut request = append(position, format!("staged-{position}").as_bytes());
+        request.expected_position = Some(RangePosition::new(position));
+        request
+    };
+
+    // A staged batch lands contiguously and reports each frame's position.
+    let first: Vec<_> = (1..=4).map(staged).collect();
+    let results = store.import_split_batch(first).await.unwrap();
+    assert_eq!(results.len(), 4);
+    for (index, result) in results.iter().enumerate() {
+        assert!(!result.deduplicated);
+        assert_eq!(result.position, RangePosition::new(index as u64 + 1));
+    }
+    assert_eq!(
+        store.snapshot().await.unwrap().progress.appended(),
+        RangePosition::new(4)
+    );
+
+    // Re-importing the same staged batch dedups every frame in place, so a
+    // retried stage call resumes instead of rewriting the prefix.
+    let retry: Vec<_> = (1..=6).map(staged).collect();
+    let results = store.import_split_batch(retry).await.unwrap();
+    assert_eq!(results.len(), 6);
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(result.position, RangePosition::new(index as u64 + 1));
+        assert_eq!(result.deduplicated, index < 4);
+    }
+
+    // A gap in the staged sequence refuses and leaves the durable prefix
+    // intact for the resume.
+    let gapped = vec![staged(9)];
+    assert!(store.import_split_batch(gapped).await.is_err());
+    drop(store);
+
+    let reopened = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    assert_eq!(
+        reopened.snapshot().await.unwrap().progress.appended(),
+        RangePosition::new(6)
+    );
+    let frames = reopened.read_committed(None, 10).await.unwrap();
+    assert_eq!(frames.len(), 0, "staged frames stay uncommitted");
+    let frames = reopened.read_uncommitted(None, 10).await.unwrap();
+    assert_eq!(frames.len(), 6);
+    for (index, frame) in frames.iter().enumerate() {
+        let record = decode_record(&frame.frame).unwrap();
+        assert_eq!(record.payload, format!("staged-{}", index + 1).as_bytes());
+    }
 }

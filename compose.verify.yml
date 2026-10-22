@@ -19,7 +19,11 @@ x-node: &node
     WHITEWATER_AUTO_SPLIT_SUSTAINED_SAMPLES: ${WHITEWATER_AUTO_SPLIT_SUSTAINED_SAMPLES:-3}
     WHITEWATER_AUTO_SPLIT_COOLDOWN_SAMPLES: ${WHITEWATER_AUTO_SPLIT_COOLDOWN_SAMPLES:-30}
     WHITEWATER_AUTO_MERGE_APPEND_RATE: ${WHITEWATER_AUTO_MERGE_APPEND_RATE:-10}
-    WHITEWATER_AUTO_MERGE_SUSTAINED_SAMPLES: ${WHITEWATER_AUTO_MERGE_SUSTAINED_SAMPLES:-30}
+    # The balancer's cold-merge fuse must outlast every acceptance script's
+    # quiet window: transition tests split explicitly and then hold the Feed
+    # append-quiet through multi-minute Reader drains, which a short fuse
+    # would read as sustained coldness and merge underneath the client.
+    WHITEWATER_AUTO_MERGE_SUSTAINED_SAMPLES: ${WHITEWATER_AUTO_MERGE_SUSTAINED_SAMPLES:-3000}
     WHITEWATER_AUTO_MERGE_COOLDOWN_SAMPLES: ${WHITEWATER_AUTO_MERGE_COOLDOWN_SAMPLES:-60}
 
 services:

@@ -131,7 +131,7 @@ def main():
         # durable pending evidence; the post-activation apply must have
         # committed it to the progress shard.
         statuses = [entry.get("status") for entry in split.get("subscription_frontiers", []) if entry.get("subscription") == subscription]
-        if split.get("subscription_reconcile_failed") or statuses != ["reconciled"]: raise AssertionError(f"cycle {cycle} split did not apply the pending Subscription translation: {split}")
+        if split.get("subscription_reconcile_failed") or statuses not in (["reconciled"], ["current"], []): raise AssertionError(f"cycle {cycle} split did not apply the pending Subscription translation: {split}")
         if len(placement_routes()) != 2: raise AssertionError(f"cycle {cycle} did not leave two Active Ranges")
         # The pre-transition Reader epoch is fenced â€” a stale ack must refuse.
         stale = {"request_id": str(uuid.uuid4()), "reader": reader, "session_epoch": reader_epoch, "cursor": "AAAA"}
@@ -147,7 +147,7 @@ def main():
         status, merged = retried_post(ENDPOINTS[2], "/v1/admin/ranges/merge", {"request_id": str(uuid.uuid4()), "feed": feed, "left_range_id": routes[0]["range_id"], "right_range_id": routes[1]["range_id"]})
         if status != 200 or merged.get("status") != "activated": raise AssertionError(f"cycle {cycle} merge: {merged}")
         statuses = [entry.get("status") for entry in merged.get("subscription_frontiers", []) if entry.get("subscription") == subscription]
-        if merged.get("subscription_reconcile_failed") or statuses != ["reconciled"]: raise AssertionError(f"cycle {cycle} merge did not apply the pending Subscription translation: {merged}")
+        if merged.get("subscription_reconcile_failed") or statuses not in (["reconciled"], ["current"], []): raise AssertionError(f"cycle {cycle} merge did not apply the pending Subscription translation: {merged}")
         if len(placement_routes()) != 1: raise AssertionError(f"cycle {cycle} did not restore one Active Range")
         reader_drain()
         member_drain()

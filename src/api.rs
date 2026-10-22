@@ -60,9 +60,8 @@ use crate::{
     domain::{AppendInput, CursorRecord, StorageStats, StoredRecord},
     membership::{JoinResponse, MemberAnnouncement, MemberView, MembershipService},
     reader::{
-        translate_merge_reader_frontier, translate_split_reader_frontier, ReaderLineageEntry,
-        SubscriptionCommitRequest, SubscriptionCommittedReadRequest, SubscriptionPrepareRequest,
-        SubscriptionProgressError, SubscriptionProgressReplicaService,
+        ReaderLineageEntry, SubscriptionCommitRequest, SubscriptionCommittedReadRequest,
+        SubscriptionPrepareRequest, SubscriptionProgressError, SubscriptionProgressReplicaService,
     },
     storage::{LogStore, StorageError},
     writer::WriterServerFeedback,
@@ -1315,13 +1314,26 @@ async fn control_plane_commands(
         Ok(execution) => InternalCommandsResponse {
             execution: Some(execution),
             error: None,
+            rejected: false,
             leader_id,
         },
-        Err(error) => InternalCommandsResponse {
-            execution: None,
-            error: Some(error.to_string()),
-            leader_id,
-        },
+        Err(error) => {
+            // The forwarder rethrows this kind verbatim; send the bare inner
+            // message so the reply does not double its display prefix.
+            let rejected = matches!(error, ControlPlaneError::Rejected(_));
+            let message = match &error {
+                ControlPlaneError::Rejected(inner) | ControlPlaneError::Unavailable(inner) => {
+                    inner.clone()
+                }
+                _ => error.to_string(),
+            };
+            InternalCommandsResponse {
+                execution: None,
+                error: Some(message),
+                rejected,
+                leader_id,
+            }
+        }
     };
     Ok(Json(response))
 }
@@ -1337,13 +1349,24 @@ async fn control_plane_write(
         Ok(result) => InternalWriteResponse {
             result: Some(result),
             error: None,
+            rejected: false,
             leader_id,
         },
-        Err(error) => InternalWriteResponse {
-            result: None,
-            error: Some(error.to_string()),
-            leader_id,
-        },
+        Err(error) => {
+            let rejected = matches!(error, ControlPlaneError::Rejected(_));
+            let message = match &error {
+                ControlPlaneError::Rejected(inner) | ControlPlaneError::Unavailable(inner) => {
+                    inner.clone()
+                }
+                _ => error.to_string(),
+            };
+            InternalWriteResponse {
+                result: None,
+                error: Some(message),
+                rejected,
+                leader_id,
+            }
+        }
     };
     Ok(Json(response))
 }
@@ -1597,6 +1620,16 @@ struct SubscriptionCutoverFrontier {
     frontier: crate::reader::SubscriptionProgressMutation,
 }
 
+/// One staged Subscription frontier restated onto the post-transition range
+/// map: the staged evidence plus its translated (positions, quarantined,
+/// skipped) triple.
+type RestatedFrontier<'a> = (
+    &'a SubscriptionCutoverFrontier,
+    BTreeMap<RangeId, String>,
+    BTreeMap<RangeId, Vec<String>>,
+    BTreeMap<RangeId, Vec<String>>,
+);
+
 /// Load every Feed-scoped Subscription on `feed_id` that holds committed
 /// progress. Declared Subscriptions without a frontier or a progress
 /// placement have nothing to translate and never block a range transition;
@@ -1656,12 +1689,12 @@ async fn subscription_cutover_frontiers(
 /// translations so both move at the same frozen boundary.
 enum CutoverFrontierTranslation<'a> {
     Split {
-        entries: &'a [crate::reader::ReaderLineageEntry],
+        history: FrozenLineage<'a>,
         plan: &'a RangeSplitPlan,
     },
     Merge {
-        left_entries: &'a [crate::reader::ReaderLineageEntry],
-        right_entries: &'a [crate::reader::ReaderLineageEntry],
+        left: FrozenLineage<'a>,
+        right: FrozenLineage<'a>,
         plan: &'a RangeMergePlan,
     },
 }
@@ -1672,37 +1705,6 @@ impl CutoverFrontierTranslation<'_> {
             Self::Split { plan, .. } => plan.feed_id,
             Self::Merge { plan, .. } => plan.feed_id,
         }
-    }
-
-    fn translate(
-        &self,
-        frontier: &crate::reader::SubscriptionProgressMutation,
-    ) -> Result<crate::reader::TranslatedSubscriptionFrontier, ApiError> {
-        match *self {
-            Self::Split { entries, plan } => crate::reader::translate_split_subscription_frontier(
-                entries,
-                plan.source_range_id,
-                plan.right_assignment.range_id,
-                plan.split_at,
-                &frontier.positions,
-                &frontier.quarantined,
-                &frontier.skipped,
-            ),
-            Self::Merge {
-                left_entries,
-                right_entries,
-                plan,
-            } => crate::reader::translate_merge_subscription_frontier(
-                left_entries,
-                right_entries,
-                plan.left_range_id,
-                plan.right_range_id,
-                &frontier.positions,
-                &frontier.quarantined,
-                &frontier.skipped,
-            ),
-        }
-        .map_err(|error| ApiError::unavailable(error.to_string()))
     }
 }
 
@@ -1727,6 +1729,86 @@ fn subscription_reconcile_request_id(plan_id: Uuid, subscription_id: Uuid, seque
 /// acknowledgement advanced after staging, and the recorded `request_id`
 /// deduplicates a replayed apply after an ambiguous commit. A frontier that
 /// already covers the post-cutover range map converges without a write.
+/// Report every pending cutover translation for the given Subscriptions by
+/// applying it to the RF3 progress shard. Shared by the activating request and
+/// by a retried split/merge that observes the plan already activated: the
+/// durable pending records survive the abandoned first attempt, so the retry
+/// finishes the reconcile it could not report and returns the same evidence.
+async fn reconcile_subscription_cutovers(
+    state: &AppState,
+    subjects: &[(uuid::Uuid, String)],
+) -> (Vec<serde_json::Value>, bool) {
+    let mut reconcile = Vec::new();
+    let mut failed = false;
+    for (subscription_id, name) in subjects {
+        let outcome = async {
+            // The activation just committed; a follower-served request can
+            // lag the majority commit while its applied index catches up,
+            // so wait on the same scale as the staged-plan visibility loop
+            // rather than reporting a phantom missing translation.
+            let mut pending = None;
+            for _ in 0..150 {
+                if let Some(found) = state
+                    .control
+                    .pending_subscription_cutover(*subscription_id)
+                    .await
+                {
+                    pending = Some(found);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            let pending = pending.ok_or_else(|| {
+                ApiError::unavailable("pending Subscription cutover was not committed")
+            })?;
+            let Some(assignment) = state
+                .control
+                .active_subscription_progress_assignment_by_id(*subscription_id)
+                .await
+            else {
+                return Ok("no_placement");
+            };
+            let (coordinator, assignment) = member_assignment_coordinator(state, assignment)?;
+            apply_pending_subscription_cutover(state, &pending, &coordinator, &assignment).await
+        }
+        .await;
+        match outcome {
+            Ok(status) => reconcile.push(json!({ "subscription": name, "status": status })),
+            Err(error) => {
+                failed = true;
+                reconcile.push(
+                    json!({ "subscription": name, "status": "failed", "error": error.message }),
+                );
+            }
+        }
+    }
+    (reconcile, failed)
+}
+
+/// The feed's Subscriptions still carrying a pending cutover record committed
+/// by this plan — the reconcile work a retried transition must finish.
+async fn pending_cutover_subjects(
+    state: &AppState,
+    feed_id: uuid::Uuid,
+    plan_id: uuid::Uuid,
+) -> Vec<(uuid::Uuid, String)> {
+    let mut subjects = Vec::new();
+    for definition in state.control.active_subscriptions().await {
+        if definition.source.feed_id() != Some(feed_id) {
+            continue;
+        }
+        if state
+            .control
+            .pending_subscription_cutover(definition.subscription_id)
+            .await
+            .is_some_and(|pending| pending.plan_id == plan_id)
+        {
+            subjects.push((definition.subscription_id, definition.name.clone()));
+        }
+    }
+    subjects
+}
+
 async fn apply_pending_subscription_cutover(
     state: &AppState,
     pending: &crate::control::SubscriptionCutoverTranslation,
@@ -1847,29 +1929,149 @@ async fn clear_subscription_cutover(
         .control_plane
         .as_ref()
         .ok_or_else(|| ApiError::unavailable("Control Plane is unavailable"))?;
-    control_plane
-        .execute_commands(vec![crate::control::Command::ClearSubscriptionCutover {
-            subscription_id,
-            plan_id,
-        }])
-        .await
-        .map_err(|error| ApiError::unavailable(error.to_string()))?;
-    Ok(())
+    // ClearSubscriptionCutover is idempotent (an already-removed record
+    // reports cleared: false), so transient Control Plane unavailability —
+    // including an ambiguous commit whose command actually applied — retries
+    // inside the request window instead of reporting a phantom reconcile
+    // failure after the frontier mutation already committed.
+    for attempt in 0..12_u8 {
+        match control_plane
+            .execute_commands(vec![crate::control::Command::ClearSubscriptionCutover {
+                subscription_id,
+                plan_id,
+            }])
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(crate::control_plane::ControlPlaneError::Unavailable(_)) if attempt < 11 => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            Err(error) => return Err(ApiError::unavailable(error.to_string())),
+        }
+    }
+    Err(ApiError::unavailable(
+        "Control Plane stayed unavailable clearing the pending Subscription cutover",
+    ))
 }
 
 /// Translate every staged Subscription frontier and build the pending records
 /// committed inside the activation command. A failed translation refuses the
 /// cutover while the source is still frozen, exactly like the Reader
 /// translations.
-fn subscription_cutover_translations(
+async fn subscription_cutover_translations(
     frontiers: &[SubscriptionCutoverFrontier],
     translation: &CutoverFrontierTranslation<'_>,
     plan_id: Uuid,
 ) -> Result<Vec<crate::control::SubscriptionCutoverTranslation>, ApiError> {
-    frontiers
-        .iter()
-        .map(|staged| {
-            let (positions, quarantined, skipped) = translation.translate(&staged.frontier)?;
+    // Restate each staged frontier against the shared frozen lineage: split
+    // Cursors and quarantine tokens resolve in one bounded sweep per cutover,
+    // and merge position pairs share the two merged-order passes.
+    let translated: Vec<RestatedFrontier<'_>> =
+        match translation {
+            CutoverFrontierTranslation::Split { history, plan } => {
+                let source = plan.source_range_id;
+                let right = plan.right_assignment.range_id;
+                let mut cursors = Vec::with_capacity(frontiers.len());
+                for staged in frontiers {
+                    cursors.push(staged.frontier.positions.get(&source).cloned().ok_or_else(
+                        || ApiError::unavailable("Reader split or merge source ranges are invalid"),
+                    )?);
+                }
+                let children =
+                    translate_split_lineage(history, source, right, plan.split_at, &cursors)
+                        .await?;
+                let mut wanted = BTreeSet::new();
+                for staged in frontiers {
+                    wanted.extend(
+                        staged
+                            .frontier
+                            .quarantined
+                            .get(&source)
+                            .into_iter()
+                            .chain(staged.frontier.skipped.get(&source))
+                            .flatten()
+                            .cloned(),
+                    );
+                }
+                let tokens = history.key_tokens(&wanted).await?;
+                frontiers
+                    .iter()
+                    .zip(children)
+                    .map(|(staged, children)| {
+                        let mut positions = staged.frontier.positions.clone();
+                        positions.extend(children);
+                        let mut quarantined = staged.frontier.quarantined.clone();
+                        if let Some(list) = quarantined.remove(&source) {
+                            for cursor in list {
+                                let owner = match tokens.get(&cursor) {
+                                    Some(token) if *token >= plan.split_at => right,
+                                    _ => source,
+                                };
+                                quarantined.entry(owner).or_default().push(cursor);
+                            }
+                        }
+                        let mut skipped = staged.frontier.skipped.clone();
+                        if let Some(list) = skipped.remove(&source) {
+                            for cursor in list {
+                                let owner = match tokens.get(&cursor) {
+                                    Some(token) if *token >= plan.split_at => right,
+                                    _ => source,
+                                };
+                                skipped.entry(owner).or_default().push(cursor);
+                            }
+                        }
+                        (staged, positions, quarantined, skipped)
+                    })
+                    .collect()
+            }
+            CutoverFrontierTranslation::Merge { left, right, plan } => {
+                let mut pairs = Vec::with_capacity(frontiers.len());
+                for staged in frontiers {
+                    let left_cursor = staged
+                        .frontier
+                        .positions
+                        .get(&plan.left_range_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ApiError::unavailable("Reader split or merge source ranges are invalid")
+                        })?;
+                    let right_cursor = staged
+                        .frontier
+                        .positions
+                        .get(&plan.right_range_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            ApiError::unavailable("Reader split or merge source ranges are invalid")
+                        })?;
+                    pairs.push((left_cursor, right_cursor));
+                }
+                let merged = translate_merge_lineage(left, right, &pairs).await?;
+                frontiers
+                    .iter()
+                    .zip(merged)
+                    .map(|(staged, cursor)| {
+                        let mut positions = staged.frontier.positions.clone();
+                        positions.remove(&plan.right_range_id);
+                        positions.insert(plan.left_range_id, cursor);
+                        let mut quarantined = staged.frontier.quarantined.clone();
+                        if let Some(list) = quarantined.remove(&plan.right_range_id) {
+                            quarantined
+                                .entry(plan.left_range_id)
+                                .or_default()
+                                .extend(list);
+                        }
+                        let mut skipped = staged.frontier.skipped.clone();
+                        if let Some(list) = skipped.remove(&plan.right_range_id) {
+                            skipped.entry(plan.left_range_id).or_default().extend(list);
+                        }
+                        (staged, positions, quarantined, skipped)
+                    })
+                    .collect()
+            }
+        };
+    translated
+        .into_iter()
+        .map(|(staged, positions, quarantined, skipped)| {
             let sequence = staged.frontier.sequence.checked_add(1).ok_or_else(|| {
                 ApiError::unavailable("Subscription frontier sequence overflowed")
             })?;
@@ -7565,6 +7767,95 @@ async fn replay_reader_fetch(
     }))
 }
 
+/// Replay the exact page a duplicate `request_id` already committed through
+/// the single-record delivery path: the persisted `previous_cursor`/`limit`
+/// re-derive the identical records from immutable history, and the stored
+/// delivered Cursor is what the ack contract expects. A timestamp-start
+/// first delivery is re-filtered the same way the original fetch applied it.
+/// If the proof does not hold, the caller reopens from acknowledged
+/// progress rather than observing a different page.
+async fn replay_reader_delivery(
+    state: &AppState,
+    reader: &crate::control::ReaderDefinition,
+    feed_name: &str,
+    request: &ReaderFetchRequest,
+) -> Result<Json<ReaderFetchResponse>, ApiError> {
+    let reopen = || {
+        ApiError::unavailable(
+            "Reader fetch request already delivered; reopen the session to replay unacknowledged progress",
+        )
+    };
+    let replay = reader
+        .last_delivery
+        .as_ref()
+        .filter(|replay| replay.request_id == request.request_id && replay.limit > 0)
+        .ok_or_else(reopen)?;
+    let timestamp_start = match (&reader.start, &replay.previous_cursor) {
+        (crate::control::ReaderStart::Timestamp(value), None) => Some(*value),
+        _ => None,
+    };
+    let mut frames = read_complete_feed(
+        state,
+        reader.feed_id,
+        feed_name,
+        replay.previous_cursor.as_deref(),
+        if timestamp_start.is_some() {
+            10_000
+        } else {
+            replay.limit
+        },
+        false,
+        timestamp_start.is_some(),
+    )
+    .await?;
+    if let Some(timestamp) = timestamp_start {
+        frames.retain(|item| {
+            decode_record(&item.frame)
+                .map(|record| record.event_time_ns >= timestamp)
+                .unwrap_or(false)
+        });
+        frames.truncate(replay.limit);
+    }
+    let source = record_source_by_id(state, reader.feed_id).await;
+    let records = frames
+        .into_iter()
+        .map(|item| {
+            decode_record(&item.frame).map(|record| {
+                record_response(
+                    CursorRecord {
+                        cursor: item.cursor,
+                        record,
+                    },
+                    source.clone(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    // The re-derived page must commit to the Cursor the original delivery
+    // recorded; history is immutable, so disagreement means the bracket no
+    // longer describes the page and only a reopen is honest.
+    if records.is_empty()
+        || records.last().map(|record| record.cursor.clone()) != reader.delivered_cursor
+    {
+        return Err(reopen());
+    }
+    state.demand.record_read(records.len());
+    record_reader_traffic(
+        state,
+        reader.reader_id,
+        crate::demand::ReaderTrafficOp::Fetch,
+        records.len(),
+    );
+    Ok(Json(ReaderFetchResponse {
+        records,
+        delivered_cursor: reader.delivered_cursor.clone(),
+        acknowledged_cursor: reader.acknowledged_cursor.clone(),
+        recommended_capacity: replay.limit,
+        retry_after_ms: replay.retry_after_ms,
+    }))
+}
+
 async fn reader_fetch(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -7610,6 +7901,18 @@ async fn reader_fetch(
         == Some(request.request_id)
     {
         return replay_reader_fetch(&state, &reader, &feed.name, &request).await;
+    }
+    // The non-frontier delivery path tracks its own replay bracket on the
+    // Reader itself; without this check a retried fetch would re-derive a
+    // later page and strand the delivered/acknowledged Cursor contract.
+    if frontier.is_none()
+        && reader
+            .last_delivery
+            .as_ref()
+            .map(|replay| replay.request_id)
+            == Some(request.request_id)
+    {
+        return replay_reader_delivery(&state, &reader, &feed.name, &request).await;
     }
     let client_limit = request
         .limit
@@ -7767,6 +8070,11 @@ async fn reader_fetch(
                     reader: request.reader.clone(),
                     session_epoch: request.session_epoch,
                     cursor,
+                    fetch_request_id: Some(request.request_id),
+                    fetch_limit: Some(limit),
+                    fetch_retry_after_ms: Some(
+                        pacing.retry_after.as_millis().min(u64::MAX as u128) as u64,
+                    ),
                 }
             };
             let execution = match execute_reader_command(&state, command, request.request_id).await
@@ -7810,6 +8118,29 @@ async fn reader_fetch(
                     &positions,
                     request.request_id,
                 )?;
+            } else {
+                // A duplicate request ID replays the originally applied
+                // result: if the persisted delivery differs from the page
+                // this attempt derived, serve the committed page instead of
+                // reporting a Cursor the ack contract would refuse.
+                let applied = serde_json::from_value::<crate::control::ReaderDefinition>(
+                    execution.results[0].data.clone(),
+                )
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                if applied.delivered_cursor.as_deref() != Some(persisted_token.as_str()) {
+                    if applied
+                        .last_delivery
+                        .as_ref()
+                        .map(|replay| replay.request_id)
+                        == Some(request.request_id)
+                    {
+                        return replay_reader_delivery(&state, &applied, &feed.name, &request)
+                            .await;
+                    }
+                    return Err(ApiError::unavailable(
+                        "Reader progress was not committed; reopen the session to retry safely",
+                    ));
+                }
             }
         }
         break (records, delivered_cursor, page_bytes);
@@ -8232,12 +8563,17 @@ async fn stage_split_node(
         ))
         .header("x-whitewater-control-key", key)
         .json(request)
+        // Staging copies the committed prefix into both children; on large
+        // histories the shared 5s internal timeout aborts the call while the
+        // staged batch keeps running, so give the request a bound sized for
+        // the copy work like the movement stage/verify paths already have.
+        .timeout(Duration::from_secs(300))
         .send()
         .await
-        .map_err(|error| ApiError::unavailable(error.to_string()))?
+        .map_err(|error| ApiError::unavailable(format!("{error:?}")))?
         .json()
         .await
-        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        .map_err(|error| ApiError::unavailable(format!("{error:?}")))?;
     response.result.ok_or_else(|| {
         ApiError::unavailable(
             response
@@ -8307,77 +8643,368 @@ fn split_freeze_order(assignment: &ActiveRangeAssignment) -> Vec<StorageNodeId> 
     nodes
 }
 
-async fn read_cutover_lineage(
-    state: &AppState,
-    assignment: &ActiveRangeAssignment,
-    boundary: CommitPosition,
-) -> Result<Vec<ReaderLineageEntry>, ApiError> {
-    if boundary.value() > MAX_LOGICAL_READ_FRAMES as u64 {
-        return Err(ApiError::unavailable(
-            "Reader transition exceeds the bounded source history",
-        ));
+/// Bounded window size for frozen cutover lineage sweeps. Every window is a
+/// corroborated owner range read re-pinned to the frozen commit boundary, so
+/// cutover translation over a >10,000-frame source stays bounded instead of
+/// materializing the prefix and refusing once it outgrew the read budget.
+const LINEAGE_SWEEP_PAGE: usize = 32;
+
+/// The bounded, index-assisted reads a cutover translation needs from one
+/// frozen committed source prefix — implemented over owner range reads in
+/// production and over an in-memory prefix in tests.
+trait CutoverPrefix {
+    /// The frozen committed boundary every read is pinned to.
+    fn boundary(&self) -> u64;
+    /// The RangeId this prefix serves.
+    fn range_id(&self) -> RangeId;
+    /// The committed position of `cursor` inside this frozen prefix, or
+    /// `None` when it cannot be resolved there. The empty Cursor maps to
+    /// position zero — acknowledged progress before the first record.
+    async fn cursor_position(&self, cursor: &str) -> Result<Option<u64>, ApiError>;
+    /// Visit every committed frame in `[start, end]` in position order
+    /// through bounded windows; `end` clamps to the frozen boundary.
+    async fn sweep(
+        &self,
+        start: u64,
+        end: u64,
+        visit: &mut (dyn FnMut(&ReaderLineageEntry) -> Result<(), ApiError> + Send),
+    ) -> Result<(), ApiError>;
+    /// The committed position of `cursor`, or a failed transition when the
+    /// frozen prefix cannot produce it — an acknowledged Cursor must never be
+    /// silently stranded on a retired range map.
+    async fn position_of(&self, cursor: &str) -> Result<u64, ApiError> {
+        self.cursor_position(cursor).await?.ok_or_else(|| {
+            ApiError::unavailable(
+                "Reader acknowledged Cursor is missing from the frozen committed source history",
+            )
+        })
     }
-    let mut entries = Vec::new();
-    let mut after = None;
-    let mut bytes = 0_usize;
-    while after.map_or(0, RangePosition::value) < boundary.value() {
-        let page = fetch_range_page(
-            state,
+    /// The KeyToken of each listed committed Cursor resolved by one bounded
+    /// sweep; Cursors absent from the prefix stay unmapped, which translations
+    /// treat as the fail-safe surviving-side owner.
+    async fn key_tokens(
+        &self,
+        cursors: &BTreeSet<String>,
+    ) -> Result<BTreeMap<String, KeyToken>, ApiError> {
+        let mut found = BTreeMap::new();
+        if cursors.is_empty() {
+            return Ok(found);
+        }
+        self.sweep(1, self.boundary(), &mut |entry| {
+            if cursors.contains(&entry.cursor) {
+                found.insert(entry.cursor.clone(), entry.key_token);
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(found)
+    }
+}
+
+/// Index-assisted, bounded access to one frozen committed source prefix for
+/// Reader and Subscription cutover translation.
+#[derive(Clone, Copy)]
+struct FrozenLineage<'a> {
+    state: &'a AppState,
+    assignment: &'a ActiveRangeAssignment,
+    frozen: CommitPosition,
+}
+
+impl FrozenLineage<'_> {
+    /// The contiguous frozen frames `[start, start + count)` as lineage
+    /// entries; every bounded fetch re-pins the frozen boundary and each
+    /// frame's position is checked so a source that moved, gapped, or
+    /// truncated fails the cutover closed.
+    async fn window(&self, start: u64, count: usize) -> Result<Vec<ReaderLineageEntry>, ApiError> {
+        if start == 0
+            || count == 0
+            || start
+                .checked_add(count as u64)
+                .and_then(|end| end.checked_sub(1))
+                .is_none_or(|end| end > self.frozen.value())
+        {
+            return Err(ApiError::unavailable(
+                "Reader transition lineage window is invalid",
+            ));
+        }
+        let mut entries = Vec::with_capacity(count.min(LINEAGE_SWEEP_PAGE));
+        let mut after = (start > 1).then(|| RangePosition::new(start - 1));
+        while entries.len() < count {
+            let page = fetch_range_page(
+                self.state,
+                ReadRangePageRequest {
+                    assignment: self.assignment.clone(),
+                    after,
+                    expected_commit: Some(self.frozen),
+                    after_cursor: None,
+                    tail_count: None,
+                    ingest_threshold: None,
+                    single_range: true,
+                    page_limit: Some(count - entries.len()),
+                },
+            )
+            .await?;
+            if page.committed != self.frozen || page.frames.is_empty() {
+                return Err(ApiError::unavailable(
+                    "Reader transition source boundary is incomplete",
+                ));
+            }
+            for frame in page.frames {
+                let expected = start.saturating_add(entries.len() as u64);
+                if frame.position.value() != expected
+                    || frame.cursor.is_empty()
+                    || frame.cursor.len() > 256
+                {
+                    return Err(ApiError::unavailable(
+                        "Reader transition source has a position gap",
+                    ));
+                }
+                let decoded = STANDARD
+                    .decode(&frame.frame_base64)
+                    .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                if logical_frame_bytes(&decoded)? > MAX_LOGICAL_READ_BYTES {
+                    return Err(ApiError::unavailable(
+                        "record exceeds the bounded Feed read byte budget",
+                    ));
+                }
+                let record = decode_record(&decoded)
+                    .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                entries.push(ReaderLineageEntry {
+                    range_id: self.assignment.range_id,
+                    position: frame.position,
+                    cursor: frame.cursor,
+                    key_token: KeyToken::from_key(&record.key),
+                    ingest_time_ns: record.ingest_time_ns,
+                    message_id: record.message_id,
+                });
+                after = Some(frame.position);
+                if entries.len() == count {
+                    break;
+                }
+            }
+        }
+        Ok(entries)
+    }
+}
+
+impl CutoverPrefix for FrozenLineage<'_> {
+    fn boundary(&self) -> u64 {
+        self.frozen.value()
+    }
+
+    fn range_id(&self) -> RangeId {
+        self.assignment.range_id
+    }
+
+    async fn cursor_position(&self, cursor: &str) -> Result<Option<u64>, ApiError> {
+        if cursor.is_empty() {
+            return Ok(Some(0));
+        }
+        match fetch_range_page(
+            self.state,
             ReadRangePageRequest {
-                assignment: assignment.clone(),
-                after,
-                expected_commit: after.map(|_| boundary),
-                after_cursor: None,
+                assignment: self.assignment.clone(),
+                after: None,
+                expected_commit: Some(self.frozen),
+                after_cursor: Some(cursor.to_string()),
                 tail_count: None,
                 ingest_threshold: None,
                 single_range: true,
-                page_limit: Some(32),
+                page_limit: Some(1),
             },
         )
-        .await?;
-        if page.committed != boundary || page.frames.is_empty() {
-            return Err(ApiError::unavailable(
-                "Reader transition source boundary is incomplete",
-            ));
-        }
-        for frame in page.frames {
-            let expected = after.map_or(Some(1), |position: RangePosition| {
-                position.value().checked_add(1)
-            });
-            if Some(frame.position.value()) != expected
-                || frame.position.value() > boundary.value()
-                || frame.cursor.is_empty()
-                || frame.cursor.len() > 256
-            {
-                return Err(ApiError::unavailable(
-                    "Reader transition source has a position gap",
-                ));
+        .await
+        {
+            Ok(page) => {
+                if page.committed != self.frozen {
+                    return Err(ApiError::unavailable(
+                        "Reader transition source boundary is incomplete",
+                    ));
+                }
+                Ok(page.resolved_after.map(|position| position.value()))
             }
-            let decoded = STANDARD
-                .decode(&frame.frame_base64)
-                .map_err(|error| ApiError::unavailable(error.to_string()))?;
-            bytes = bytes
-                .checked_add(logical_frame_bytes(&decoded)?.saturating_add(frame.cursor.len()))
-                .ok_or_else(|| ApiError::unavailable("Reader transition size overflow"))?;
-            if bytes > MAX_LOGICAL_READ_BYTES {
-                return Err(ApiError::unavailable(
-                    "Reader transition exceeds its read byte budget",
-                ));
-            }
-            let record = decode_record(&decoded)
-                .map_err(|error| ApiError::unavailable(error.to_string()))?;
-            entries.push(ReaderLineageEntry {
-                range_id: assignment.range_id,
-                position: frame.position,
-                cursor: frame.cursor,
-                key_token: KeyToken::from_key(&record.key),
-                ingest_time_ns: record.ingest_time_ns,
-                message_id: record.message_id,
-            });
-            after = Some(frame.position);
+            // A Cursor absent from the frozen prefix resolves to a bounded
+            // rejection, which translations treat as "not this range's
+            // record"; transport and storage failures still fail closed.
+            Err(error) if error.status == StatusCode::BAD_REQUEST => Ok(None),
+            Err(error) => Err(error),
         }
     }
-    Ok(entries)
+
+    async fn sweep(
+        &self,
+        start: u64,
+        end: u64,
+        visit: &mut (dyn FnMut(&ReaderLineageEntry) -> Result<(), ApiError> + Send),
+    ) -> Result<(), ApiError> {
+        let end = end.min(self.frozen.value());
+        let mut at = start.max(1);
+        while at <= end {
+            let count = usize::try_from((end - at + 1).min(LINEAGE_SWEEP_PAGE as u64))
+                .unwrap_or(LINEAGE_SWEEP_PAGE);
+            for entry in self.window(at, count).await? {
+                visit(&entry)?;
+            }
+            at = at.saturating_add(count as u64);
+        }
+        Ok(())
+    }
+}
+
+/// Per-requested-Cursor child resume positions across a split, computed with
+/// shared bounded sweeps of the frozen source rather than materialized
+/// lineage: the first sweep tracks each acknowledged position's newest frame
+/// on each child side by KeyToken, the second resolves those positions back
+/// to the source Cursors the children inherit verbatim.
+async fn translate_split_lineage<P: CutoverPrefix>(
+    history: &P,
+    source: RangeId,
+    right: RangeId,
+    split_at: KeyToken,
+    source_cursors: &[String],
+) -> Result<Vec<BTreeMap<RangeId, String>>, ApiError> {
+    if source == right || history.range_id() != source {
+        return Err(ApiError::unavailable(
+            "Reader split source ranges are invalid",
+        ));
+    }
+    let mut acknowledged = Vec::with_capacity(source_cursors.len());
+    for cursor in source_cursors {
+        acknowledged.push(history.position_of(cursor).await?);
+    }
+    let mut last = vec![[0_u64; 2]; source_cursors.len()];
+    if let Some(&end) = acknowledged.iter().max() {
+        history
+            .sweep(1, end, &mut |entry| {
+                let side = usize::from(entry.key_token >= split_at);
+                let position = entry.position.value();
+                for (slot, &bound) in last.iter_mut().zip(acknowledged.iter()) {
+                    if position <= bound {
+                        slot[side] = position;
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+    }
+    let needed = last
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|position| *position > 0)
+        .collect::<BTreeSet<_>>();
+    let mut cursors_by_position = BTreeMap::new();
+    if let Some(&end) = needed.iter().next_back() {
+        history
+            .sweep(1, end, &mut |entry| {
+                if needed.contains(&entry.position.value()) {
+                    cursors_by_position.insert(entry.position.value(), entry.cursor.clone());
+                }
+                Ok(())
+            })
+            .await?;
+    }
+    Ok(last
+        .iter()
+        .map(|[left_pos, right_pos]| {
+            BTreeMap::from([
+                (
+                    source,
+                    cursors_by_position
+                        .get(left_pos)
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+                (
+                    right,
+                    cursors_by_position
+                        .get(right_pos)
+                        .cloned()
+                        .unwrap_or_default(),
+                ),
+            ])
+        })
+        .collect())
+}
+
+/// Merged resume Cursors for requested (left, right) acknowledged pairs,
+/// computed with shared bounded sweeps instead of materialized lineage. The
+/// first sweep finds each pair's earliest unacknowledged frame in merged
+/// (ingest_time_ns, message_id) order — the cutover must resume before it —
+/// and the second finds each pair's newest acknowledged frame preceding that
+/// boundary. The merged range keeps the source Cursor literals.
+async fn translate_merge_lineage<P: CutoverPrefix>(
+    left: &P,
+    right: &P,
+    pairs: &[(String, String)],
+) -> Result<Vec<String>, ApiError> {
+    if left.range_id() == right.range_id() {
+        return Err(ApiError::unavailable(
+            "Reader merge source ranges are invalid",
+        ));
+    }
+    let mut bounds = Vec::with_capacity(pairs.len());
+    for (left_cursor, right_cursor) in pairs {
+        bounds.push([
+            left.position_of(left_cursor).await?,
+            right.position_of(right_cursor).await?,
+        ]);
+    }
+    let committed = [left.boundary(), right.boundary()];
+    let mut first_oob = vec![None::<(i64, Uuid)>; pairs.len()];
+    for (history, side) in [(left, 0_usize), (right, 1)] {
+        let committed = committed[side];
+        let start = bounds
+            .iter()
+            .map(|bound| bound[side])
+            .min()
+            .unwrap_or(committed)
+            .saturating_add(1);
+        if start > committed {
+            continue;
+        }
+        history
+            .sweep(start, committed, &mut |entry| {
+                let key = (entry.ingest_time_ns, entry.message_id);
+                let position = entry.position.value();
+                for (oob, bound) in first_oob.iter_mut().zip(bounds.iter()) {
+                    if position > bound[side] && oob.is_none_or(|current| key < current) {
+                        *oob = Some(key);
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+    }
+    let mut best = vec![None::<(i64, Uuid)>; pairs.len()];
+    let mut cursors = vec![String::new(); pairs.len()];
+    for (history, side) in [(left, 0_usize), (right, 1)] {
+        let end = bounds.iter().map(|bound| bound[side]).max().unwrap_or(0);
+        if end == 0 {
+            continue;
+        }
+        history
+            .sweep(1, end, &mut |entry| {
+                let key = (entry.ingest_time_ns, entry.message_id);
+                let position = entry.position.value();
+                for ((best_key, cursor), (bound, oob)) in best
+                    .iter_mut()
+                    .zip(cursors.iter_mut())
+                    .zip(bounds.iter().zip(first_oob.iter()))
+                {
+                    if position <= bound[side]
+                        && oob.is_none_or(|limit| key < limit)
+                        && best_key.is_none_or(|current| key > current)
+                    {
+                        *best_key = Some(key);
+                        *cursor = entry.cursor.clone();
+                    }
+                }
+                Ok(())
+            })
+            .await?;
+    }
+    Ok(cursors)
 }
 
 fn prior_reader_positions(
@@ -8461,68 +9088,83 @@ fn bounded_reader_translations(
     Ok(translations)
 }
 
-fn split_reader_translations(
+async fn split_reader_translations(
     snapshots: &[ReaderCutoverSnapshot],
     assignments: &[ActiveRangeAssignment],
     plan: &RangeSplitPlan,
-    entries: &[ReaderLineageEntry],
+    history: &FrozenLineage<'_>,
 ) -> Result<Vec<ReaderFrontierTranslation>, ApiError> {
     if snapshots.len() > 1024 {
         return Err(ApiError::unavailable(
             "Reader transition exceeds its Reader budget",
         ));
     }
-    let mut translations = Vec::with_capacity(snapshots.len());
+    let mut cursors = Vec::with_capacity(snapshots.len());
+    let mut positions_list = Vec::with_capacity(snapshots.len());
     for snapshot in snapshots {
-        let mut positions = prior_reader_positions(snapshot, assignments)?;
-        let source_cursor = positions
-            .get(&plan.source_range_id)
-            .ok_or_else(|| ApiError::unavailable("Reader split source position is unavailable"))?;
-        let child = translate_split_reader_frontier(
-            entries,
-            plan.source_range_id,
-            plan.source_range_id,
-            plan.right_assignment.range_id,
-            plan.split_at,
-            source_cursor,
-        )
-        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        let positions = prior_reader_positions(snapshot, assignments)?;
+        cursors.push(
+            positions
+                .get(&plan.source_range_id)
+                .cloned()
+                .ok_or_else(|| {
+                    ApiError::unavailable("Reader split source position is unavailable")
+                })?,
+        );
+        positions_list.push(positions);
+    }
+    let children = translate_split_lineage(
+        history,
+        plan.source_range_id,
+        plan.right_assignment.range_id,
+        plan.split_at,
+        &cursors,
+    )
+    .await?;
+    let mut translations = Vec::with_capacity(snapshots.len());
+    for (snapshot, (mut positions, child)) in snapshots
+        .iter()
+        .zip(positions_list.into_iter().zip(children))
+    {
         positions.extend(child);
         translations.push(reader_frontier_translation(snapshot, positions));
     }
     bounded_reader_translations(translations)
 }
 
-fn merge_reader_translations(
+async fn merge_reader_translations(
     snapshots: &[ReaderCutoverSnapshot],
     assignments: &[ActiveRangeAssignment],
     plan: &RangeMergePlan,
-    left: &[ReaderLineageEntry],
-    right: &[ReaderLineageEntry],
+    left: &FrozenLineage<'_>,
+    right: &FrozenLineage<'_>,
 ) -> Result<Vec<ReaderFrontierTranslation>, ApiError> {
     if snapshots.len() > 1024 {
         return Err(ApiError::unavailable(
             "Reader transition exceeds its Reader budget",
         ));
     }
-    let mut translations = Vec::with_capacity(snapshots.len());
+    let mut pairs = Vec::with_capacity(snapshots.len());
+    let mut positions_list = Vec::with_capacity(snapshots.len());
     for snapshot in snapshots {
-        let mut positions = prior_reader_positions(snapshot, assignments)?;
+        let positions = prior_reader_positions(snapshot, assignments)?;
         let left_cursor = positions
             .get(&plan.left_range_id)
+            .cloned()
             .ok_or_else(|| ApiError::unavailable("Reader merge left position is unavailable"))?;
         let right_cursor = positions
             .get(&plan.right_range_id)
+            .cloned()
             .ok_or_else(|| ApiError::unavailable("Reader merge right position is unavailable"))?;
-        let cursor = translate_merge_reader_frontier(
-            left,
-            right,
-            plan.left_range_id,
-            plan.right_range_id,
-            left_cursor,
-            right_cursor,
-        )
-        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        pairs.push((left_cursor, right_cursor));
+        positions_list.push(positions);
+    }
+    let cursors = translate_merge_lineage(left, right, &pairs).await?;
+    let mut translations = Vec::with_capacity(snapshots.len());
+    for (snapshot, (mut positions, cursor)) in snapshots
+        .iter()
+        .zip(positions_list.into_iter().zip(cursors))
+    {
         positions.remove(&plan.right_range_id);
         positions.insert(plan.left_range_id, cursor);
         translations.push(reader_frontier_translation(snapshot, positions));
@@ -8563,9 +9205,20 @@ async fn admin_split_range(
             .await
             .is_some()
         {
-            return Ok(Json(
-                json!({ "status": "activated", "plan_id": plan.plan_id }),
-            ));
+            // A retried request can observe activation the abandoned first
+            // attempt committed without reporting: the durable pending
+            // records carry the reconcile work, so finish it here rather
+            // than leaving the Subscription fail-closed until a member op.
+            let subjects = pending_cutover_subjects(&state, plan.feed_id, plan.plan_id).await;
+            let (reconcile, reconcile_failed) =
+                reconcile_subscription_cutovers(&state, &subjects).await;
+            return Ok(Json(json!({
+                "status": "activated",
+                "plan_id": plan.plan_id,
+                "range_map": plan.candidate_map,
+                "subscription_frontiers": reconcile,
+                "subscription_reconcile_failed": reconcile_failed,
+            })));
         }
         match state.control.range_split_plan(plan.feed_id).await {
             Some(staged) if staged.plan_id == plan.plan_id => {
@@ -8707,16 +9360,10 @@ async fn admin_split_range(
         .control
         .active_reader_cutover_snapshots(plan.feed_id)
         .await;
-    let mut source = if snapshots.is_empty() {
-        Vec::new()
-    } else {
-        match read_cutover_lineage(&state, &source_assignment, source_commit).await {
-            Ok(entries) => entries,
-            Err(error) => {
-                unfreeze_split_nodes(&state, &plan, &source_assignment, key).await;
-                return Err(error);
-            }
-        }
+    let source_history = FrozenLineage {
+        state: &state,
+        assignment: &source_assignment,
+        frozen: source_commit,
     };
     let reader_translations = if snapshots.is_empty() {
         Vec::new()
@@ -8725,7 +9372,7 @@ async fn admin_split_range(
             .control
             .active_range_assignments_for_feed(plan.feed_id)
             .await;
-        match split_reader_translations(&snapshots, &assignments, &plan, &source) {
+        match split_reader_translations(&snapshots, &assignments, &plan, &source_history).await {
             Ok(translations) => translations,
             Err(error) => {
                 unfreeze_split_nodes(&state, &plan, &source_assignment, key).await;
@@ -8760,23 +9407,16 @@ async fn admin_split_range(
             return Err(error);
         }
     };
-    if snapshots.is_empty() && !subscription_frontiers.is_empty() {
-        source = match read_cutover_lineage(&state, &source_assignment, source_commit).await {
-            Ok(entries) => entries,
-            Err(error) => {
-                unfreeze_split_nodes(&state, &plan, &source_assignment, key).await;
-                return Err(error);
-            }
-        };
-    }
     let subscription_translations = match subscription_cutover_translations(
         &subscription_frontiers,
         &CutoverFrontierTranslation::Split {
-            entries: &source,
+            history: source_history,
             plan: &plan,
         },
         plan.plan_id,
-    ) {
+    )
+    .await
+    {
         Ok(translations) => translations,
         Err(error) => {
             unfreeze_split_nodes(&state, &plan, &source_assignment, key).await;
@@ -8803,50 +9443,17 @@ async fn admin_split_range(
     // fail-closed (member fetches conflict) instead of silently skipping
     // history, and the durable pending record lets any later member
     // operation retry the apply.
-    let mut subscription_reconcile = Vec::new();
-    let mut subscription_reconcile_failed = false;
-    for staged in &subscription_frontiers {
-        let outcome = async {
-            // The activation just committed; a follower-served request can see
-            // the pending record a few milliseconds later, so wait briefly
-            // rather than reporting a phantom missing translation.
-            let mut pending = None;
-            for _ in 0..20 {
-                if let Some(found) = state
-                    .control
-                    .pending_subscription_cutover(staged.definition.subscription_id)
-                    .await
-                {
-                    pending = Some(found);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            let pending = pending.ok_or_else(|| {
-                ApiError::unavailable("pending Subscription cutover was not committed")
-            })?;
-            let Some(assignment) = state
-                .control
-                .active_subscription_progress_assignment_by_id(staged.definition.subscription_id)
-                .await
-            else {
-                return Ok("no_placement");
-            };
-            let (coordinator, assignment) = member_assignment_coordinator(&state, assignment)?;
-            apply_pending_subscription_cutover(&state, &pending, &coordinator, &assignment).await
-        }
-        .await;
-        match outcome {
-            Ok(status) => subscription_reconcile
-                .push(json!({ "subscription": staged.definition.name, "status": status })),
-            Err(error) => {
-                subscription_reconcile_failed = true;
-                subscription_reconcile.push(
-                    json!({ "subscription": staged.definition.name, "status": "failed", "error": error.message }),
-                );
-            }
-        }
-    }
+    let reconcile_subjects: Vec<(uuid::Uuid, String)> = subscription_frontiers
+        .iter()
+        .map(|staged| {
+            (
+                staged.definition.subscription_id,
+                staged.definition.name.clone(),
+            )
+        })
+        .collect();
+    let (subscription_reconcile, subscription_reconcile_failed) =
+        reconcile_subscription_cutovers(&state, &reconcile_subjects).await;
     Ok(Json(json!({
         "status": "activated",
         "source_commit": source_commit,
@@ -9317,24 +9924,15 @@ async fn admin_merge_ranges(
         .control
         .active_reader_cutover_snapshots(plan.feed_id)
         .await;
-    let lineage_loaded = !snapshots.is_empty();
-    let (mut left_rows, mut right_rows) = if snapshots.is_empty() {
-        (Vec::new(), Vec::new())
-    } else {
-        let calculated = async {
-            Ok::<_, ApiError>((
-                read_cutover_lineage(&state, &left, staged.left_commit).await?,
-                read_cutover_lineage(&state, &right, staged.right_commit).await?,
-            ))
-        }
-        .await;
-        match calculated {
-            Ok(rows) => rows,
-            Err(error) => {
-                unfreeze_merge_nodes(&state, &plan, &left, &right, key).await;
-                return Err(error);
-            }
-        }
+    let left_history = FrozenLineage {
+        state: &state,
+        assignment: &left,
+        frozen: staged.left_commit,
+    };
+    let right_history = FrozenLineage {
+        state: &state,
+        assignment: &right,
+        frozen: staged.right_commit,
     };
     let reader_translations = if snapshots.is_empty() {
         Vec::new()
@@ -9343,7 +9941,15 @@ async fn admin_merge_ranges(
             .control
             .active_range_assignments_for_feed(plan.feed_id)
             .await;
-        match merge_reader_translations(&snapshots, &assignments, &plan, &left_rows, &right_rows) {
+        match merge_reader_translations(
+            &snapshots,
+            &assignments,
+            &plan,
+            &left_history,
+            &right_history,
+        )
+        .await
+        {
             Ok(translations) => translations,
             Err(error) => {
                 unfreeze_merge_nodes(&state, &plan, &left, &right, key).await;
@@ -9375,33 +9981,17 @@ async fn admin_merge_ranges(
             return Err(error);
         }
     };
-    if !lineage_loaded && !subscription_frontiers.is_empty() {
-        let calculated = async {
-            Ok::<_, ApiError>((
-                read_cutover_lineage(&state, &left, staged.left_commit).await?,
-                read_cutover_lineage(&state, &right, staged.right_commit).await?,
-            ))
-        }
-        .await;
-        match calculated {
-            Ok(rows) => {
-                (left_rows, right_rows) = rows;
-            }
-            Err(error) => {
-                unfreeze_merge_nodes(&state, &plan, &left, &right, key).await;
-                return Err(error);
-            }
-        }
-    }
     let subscription_translations = match subscription_cutover_translations(
         &subscription_frontiers,
         &CutoverFrontierTranslation::Merge {
-            left_entries: &left_rows,
-            right_entries: &right_rows,
+            left: left_history,
+            right: right_history,
             plan: &plan,
         },
         plan.plan_id,
-    ) {
+    )
+    .await
+    {
         Ok(translations) => translations,
         Err(error) => {
             unfreeze_merge_nodes(&state, &plan, &left, &right, key).await;
@@ -9422,50 +10012,17 @@ async fn admin_merge_ranges(
     // records committed with the activation drive the progress-shard writes,
     // Cursor-CAS fencing keeps acknowledged work from rewinding, and a later
     // member operation retries any apply this handler could not finish.
-    let mut subscription_reconcile = Vec::new();
-    let mut subscription_reconcile_failed = false;
-    for staged in &subscription_frontiers {
-        let outcome = async {
-            // The activation just committed; a follower-served request can see
-            // the pending record a few milliseconds later, so wait briefly
-            // rather than reporting a phantom missing translation.
-            let mut pending = None;
-            for _ in 0..20 {
-                if let Some(found) = state
-                    .control
-                    .pending_subscription_cutover(staged.definition.subscription_id)
-                    .await
-                {
-                    pending = Some(found);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-            let pending = pending.ok_or_else(|| {
-                ApiError::unavailable("pending Subscription cutover was not committed")
-            })?;
-            let Some(assignment) = state
-                .control
-                .active_subscription_progress_assignment_by_id(staged.definition.subscription_id)
-                .await
-            else {
-                return Ok("no_placement");
-            };
-            let (coordinator, assignment) = member_assignment_coordinator(&state, assignment)?;
-            apply_pending_subscription_cutover(&state, &pending, &coordinator, &assignment).await
-        }
-        .await;
-        match outcome {
-            Ok(status) => subscription_reconcile
-                .push(json!({ "subscription": staged.definition.name, "status": status })),
-            Err(error) => {
-                subscription_reconcile_failed = true;
-                subscription_reconcile.push(
-                    json!({ "subscription": staged.definition.name, "status": "failed", "error": error.message }),
-                );
-            }
-        }
-    }
+    let reconcile_subjects: Vec<(uuid::Uuid, String)> = subscription_frontiers
+        .iter()
+        .map(|staged| {
+            (
+                staged.definition.subscription_id,
+                staged.definition.name.clone(),
+            )
+        })
+        .collect();
+    let (subscription_reconcile, subscription_reconcile_failed) =
+        reconcile_subscription_cutovers(&state, &reconcile_subjects).await;
     Ok(Json(
         json!({ "status": "activated", "range_map": plan.candidate_map, "merged_commit": staged.merged_commit, "subscription_frontiers": subscription_reconcile, "subscription_reconcile_failed": subscription_reconcile_failed }),
     ))
@@ -23270,5 +23827,260 @@ mod tests {
             .unwrap();
         assert_eq!(after.owner, before.owner);
         assert_eq!(after.ownership_epoch, before.ownership_epoch);
+    }
+    /// In-memory CutoverPrefix over a contiguous committed prefix so the
+    /// streaming cutover translations are exercised without a live owner —
+    /// including histories past the retired 10,000-frame materialization
+    /// budget. `sweeps` counts bounded passes to prove translation work is
+    /// shared across cursors rather than re-scanning per Reader.
+    struct VecLineage {
+        range_id: RangeId,
+        entries: Vec<ReaderLineageEntry>,
+        sweeps: std::cell::Cell<usize>,
+    }
+
+    impl VecLineage {
+        fn new(range_id: u128, entries: Vec<ReaderLineageEntry>) -> Self {
+            VecLineage {
+                range_id: RangeId::from_uuid(Uuid::from_u128(range_id)),
+                entries,
+                sweeps: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl CutoverPrefix for VecLineage {
+        fn boundary(&self) -> u64 {
+            self.entries.len() as u64
+        }
+
+        fn range_id(&self) -> RangeId {
+            self.range_id
+        }
+
+        async fn cursor_position(&self, cursor: &str) -> Result<Option<u64>, ApiError> {
+            if cursor.is_empty() {
+                return Ok(Some(0));
+            }
+            Ok(self
+                .entries
+                .iter()
+                .find(|entry| entry.cursor == cursor)
+                .map(|entry| entry.position.value()))
+        }
+
+        async fn sweep(
+            &self,
+            start: u64,
+            end: u64,
+            visit: &mut (dyn FnMut(&ReaderLineageEntry) -> Result<(), ApiError> + Send),
+        ) -> Result<(), ApiError> {
+            self.sweeps.set(self.sweeps.get() + 1);
+            let end = end.min(self.boundary());
+            for entry in &self.entries {
+                let position = entry.position.value();
+                if position >= start.max(1) && position <= end {
+                    visit(entry)?;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn lineage_entry(
+        range_id: RangeId,
+        cursor_prefix: &str,
+        position: u64,
+        token_byte: u8,
+        ingest_time_ns: i64,
+        message_id: u128,
+    ) -> ReaderLineageEntry {
+        ReaderLineageEntry {
+            range_id,
+            position: RangePosition::new(position),
+            cursor: format!("{cursor_prefix}{position}"),
+            key_token: KeyToken::from_bytes([token_byte; 16]),
+            ingest_time_ns,
+            message_id: Uuid::from_u128(message_id),
+        }
+    }
+
+    #[tokio::test]
+    async fn split_lineage_translation_scales_past_the_ten_thousand_frame_budget() {
+        let source = RangeId::from_uuid(Uuid::from_u128(90_001));
+        let right = RangeId::from_uuid(Uuid::from_u128(90_002));
+        let split_at = KeyToken::from_bytes([0x80; 16]);
+        // 10,200 committed frames alternating between the child KeyToken
+        // sides — exactly the history the materialized lineage refused.
+        let entries = (1..=10_200_u64)
+            .map(|position| {
+                lineage_entry(
+                    source,
+                    "sc-",
+                    position,
+                    if position % 2 == 0 { 0x01 } else { 0xf0 },
+                    position as i64,
+                    position as u128,
+                )
+            })
+            .collect();
+        let history = VecLineage::new(90_001, entries);
+        let translated = translate_split_lineage(
+            &history,
+            source,
+            right,
+            split_at,
+            &["sc-10200".to_string(), "sc-5000".to_string(), String::new()],
+        )
+        .await
+        .unwrap();
+        // Deep acknowledgement: newest low/high side frames at-or-before 10200.
+        assert_eq!(translated[0][&source], "sc-10200");
+        assert_eq!(translated[0][&right], "sc-10199");
+        assert_eq!(translated[1][&source], "sc-5000");
+        assert_eq!(translated[1][&right], "sc-4999");
+        // Beginning-of-history acknowledgement leaves both children empty.
+        assert!(translated[2][&source].is_empty());
+        assert!(translated[2][&right].is_empty());
+        // Three cursors shared two bounded sweeps, not one scan each.
+        assert_eq!(history.sweeps.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn split_lineage_translation_fails_closed_on_a_missing_source_cursor() {
+        let source = RangeId::from_uuid(Uuid::from_u128(90_011));
+        let right = RangeId::from_uuid(Uuid::from_u128(90_012));
+        let entries = (1..=16_u64)
+            .map(|position| {
+                lineage_entry(
+                    source,
+                    "sc-",
+                    position,
+                    0x01,
+                    position as i64,
+                    position as u128,
+                )
+            })
+            .collect();
+        let history = VecLineage::new(90_011, entries);
+        let error = translate_split_lineage(
+            &history,
+            source,
+            right,
+            KeyToken::from_bytes([0x80; 16]),
+            &["ghost-cursor".to_string()],
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .message
+            .contains("missing from the frozen committed source history"));
+    }
+
+    #[tokio::test]
+    async fn merge_lineage_translation_resumes_before_unacknowledged_merged_order() {
+        let left = RangeId::from_uuid(Uuid::from_u128(90_101));
+        let right = RangeId::from_uuid(Uuid::from_u128(90_102));
+        // 6,000 committed frames per side — 12,000 combined, past the retired
+        // materialization budget — with deliberately non-monotonic ingest on
+        // the left tail: position 501 carries an early ingest clock, so in
+        // merged (ingest_time_ns, message_id) order it is the earliest frame
+        // this reader has not acknowledged.
+        let mut left_entries = (1..=6_000_u64)
+            .map(|position| {
+                lineage_entry(
+                    left,
+                    "lc-",
+                    position,
+                    0x01,
+                    100 + position as i64,
+                    position as u128,
+                )
+            })
+            .collect::<Vec<_>>();
+        left_entries[500] = lineage_entry(left, "lc-", 501, 0x01, 5, 9_999);
+        let right_entries = (1..=6_000_u64)
+            .map(|position| {
+                lineage_entry(
+                    right,
+                    "rc-",
+                    position,
+                    0xf0,
+                    200 + position as i64,
+                    20_000 + position as u128,
+                )
+            })
+            .collect();
+        let left_history = VecLineage::new(90_101, left_entries);
+        let right_history = VecLineage::new(90_102, right_entries);
+        // lc-501's key (5, 9999) precedes every acknowledged frame, so the
+        // merged frontier must stay at the beginning rather than skipping it.
+        let merged = translate_merge_lineage(
+            &left_history,
+            &right_history,
+            &[("lc-500".to_string(), "rc-400".to_string())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged[0], "");
+
+        // With a normally-ordered tail instead, the earliest unacknowledged
+        // merged frame is min(left[501] = (601,1), right[401] = (601,20401)),
+        // and the newest acknowledged frame before it is right[400] at
+        // (600, 20400).
+        let mut ordered_left = (1..=6_000_u64)
+            .map(|position| {
+                lineage_entry(
+                    left,
+                    "lc-",
+                    position,
+                    0x01,
+                    100 + position as i64,
+                    position as u128,
+                )
+            })
+            .collect::<Vec<_>>();
+        ordered_left[500] = lineage_entry(left, "lc-", 501, 0x01, 601, 1);
+        let left_history = VecLineage::new(90_101, ordered_left);
+        let merged = translate_merge_lineage(
+            &left_history,
+            &right_history,
+            &[("lc-500".to_string(), "rc-400".to_string())],
+        )
+        .await
+        .unwrap();
+        assert_eq!(merged[0], "rc-400");
+    }
+
+    #[tokio::test]
+    async fn cutover_key_tokens_resolve_in_one_bounded_sweep() {
+        let source = RangeId::from_uuid(Uuid::from_u128(90_201));
+        let entries = (1..=2_000_u64)
+            .map(|position| {
+                lineage_entry(
+                    source,
+                    "qc-",
+                    position,
+                    if position % 2 == 0 { 0x01 } else { 0xf0 },
+                    position as i64,
+                    position as u128,
+                )
+            })
+            .collect();
+        let history = VecLineage::new(90_201, entries);
+        let wanted = BTreeSet::from([
+            "qc-40".to_string(),
+            "qc-1999".to_string(),
+            "not-in-prefix".to_string(),
+        ]);
+        let tokens = history.key_tokens(&wanted).await.unwrap();
+        assert_eq!(tokens.get("qc-40"), Some(&KeyToken::from_bytes([0x01; 16])));
+        assert_eq!(
+            tokens.get("qc-1999"),
+            Some(&KeyToken::from_bytes([0xf0; 16]))
+        );
+        // A Cursor absent from the frozen prefix stays unmapped.
+        assert!(!tokens.contains_key("not-in-prefix"));
+        assert_eq!(history.sweeps.get(), 1);
     }
 }

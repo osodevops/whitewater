@@ -11,9 +11,33 @@ use crate::{
 };
 
 use super::{
-    ActiveRangeAssignment, CommitPosition, RangePosition, RangeRoute, ReplicaAppendService,
-    StorageNodeId,
+    ActiveRangeAssignment, AppendIdentity, CommitPosition, RangePosition, RangeRoute,
+    ReplicaAppendService, StorageNodeId,
 };
+
+/// Frames queued for one staged replica plus the position/digest evidence
+/// each staged result must match before the cutover evidence counts it.
+/// Batching one call per export chunk keeps large-history staging from
+/// paying a durability round-trip per frame.
+#[derive(Default)]
+pub(crate) struct StagedBatch {
+    pub(crate) frames: Vec<(RangePosition, AppendIdentity, String, Vec<u8>)>,
+    pub(crate) expected: Vec<(RangePosition, [u8; 32])>,
+}
+
+impl StagedBatch {
+    pub(crate) fn push(
+        &mut self,
+        position: RangePosition,
+        identity: AppendIdentity,
+        cursor: String,
+        frame: Vec<u8>,
+        digest: [u8; 32],
+    ) {
+        self.frames.push((position, identity, cursor, frame));
+        self.expected.push((position, digest));
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct StagedWriterSequence {
@@ -428,6 +452,7 @@ async fn stage_route(
                 "source ended before the captured CommitPosition".to_owned(),
             ));
         }
+        let mut staged: BTreeMap<&StorageNodeId, StagedBatch> = BTreeMap::new();
         for frame in frames
             .into_iter()
             .take_while(|frame| frame.position.value() <= source_commit.value())
@@ -445,25 +470,13 @@ async fn stage_route(
             let position = RangePosition::new(target_position);
             let expected_digest = *blake3::hash(&frame.frame).as_bytes();
             for node in replica_nodes.iter() {
-                let target = targets
-                    .get(node)
-                    .ok_or_else(|| SplitStagingError::MissingTarget(node.clone()))?;
-                let accepted = target
-                    .stage_split_frame(
-                        assignment,
-                        position,
-                        frame.identity.clone(),
-                        frame.cursor.clone(),
-                        frame.frame.clone(),
-                    )
-                    .await
-                    .map_err(|error| SplitStagingError::Target {
-                        node: node.clone(),
-                        message: error.to_string(),
-                    })?;
-                if accepted.position != position || accepted.frame_digest != expected_digest {
-                    return Err(SplitStagingError::VerificationConflict);
-                }
+                staged.entry(node).or_default().push(
+                    position,
+                    frame.identity.clone(),
+                    frame.cursor.clone(),
+                    frame.frame.clone(),
+                    expected_digest,
+                );
             }
             writer_sequences
                 .entry((
@@ -475,6 +488,23 @@ async fn stage_route(
             checksum.update(&frame.position.value().to_be_bytes());
             checksum.update(&expected_digest);
             transferred_bytes = transferred_bytes.saturating_add(frame.frame.len() as u64);
+        }
+        for (node, batch) in staged {
+            let target = targets
+                .get(node)
+                .ok_or_else(|| SplitStagingError::MissingTarget(node.clone()))?;
+            let accepted = target
+                .stage_split_frames(assignment, batch.frames)
+                .await
+                .map_err(|error| SplitStagingError::Target {
+                    node: node.clone(),
+                    message: error.to_string(),
+                })?;
+            for (result, (position, digest)) in accepted.iter().zip(batch.expected.iter()) {
+                if result.position != *position || result.frame_digest != *digest {
+                    return Err(SplitStagingError::VerificationConflict);
+                }
+            }
         }
     }
     let target_commit = CommitPosition::new(target_position);

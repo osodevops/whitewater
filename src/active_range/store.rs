@@ -224,6 +224,18 @@ pub trait ActiveRangeStore: Send + Sync {
         &self,
         request: ActiveRangeAppend,
     ) -> Result<ActiveRangeAppendResult, ActiveRangeStoreError>;
+    /// Staged-import one ordered batch of frames under a single range lock,
+    /// flushing file data and the persisted snapshot once at the end.
+    /// Staged candidates are re-derivable from the split/merge source and
+    /// verified across RF3 replicas before cutover, so per-frame fsync buys
+    /// nothing over batch durability; a partially staged batch stays
+    /// resumable because each frame dedups on position/identity/digest on
+    /// the next attempt. The first failing frame aborts the batch after its
+    /// already-written prefix is flushed.
+    async fn import_split_batch(
+        &self,
+        requests: Vec<ActiveRangeAppend>,
+    ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError>;
     async fn commit(
         &self,
         generation: RangeGeneration,
@@ -583,6 +595,45 @@ impl ActiveRangeStore for FileActiveRangeStore {
             .await
     }
 
+    async fn import_split_batch(
+        &self,
+        requests: Vec<ActiveRangeAppend>,
+    ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError> {
+        self.blocking_mutation(move |inner| {
+            let mut loaded = inner
+                .loaded
+                .lock()
+                .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+            let mut results = Vec::with_capacity(requests.len());
+            for request in requests {
+                if request.cursor.len() > MAX_CURSOR_BYTES {
+                    return Err(ActiveRangeStoreError::CursorTooLarge);
+                }
+                let record = decode_record(&request.frame)?;
+                if record.producer_id != request.identity.writer_session_id
+                    || record.producer_sequence != request.identity.sequence
+                {
+                    return Err(ActiveRangeStoreError::WriterIdentityMismatch);
+                }
+                match append_locked(inner, &mut loaded, request, true, false, &record) {
+                    Ok(result) => results.push(result),
+                    Err(error) => {
+                        // Flush whatever the batch staged before reporting the
+                        // failure so a retry resumes from deduped positions
+                        // instead of restaging the prefix.
+                        loaded.active_file.sync_data()?;
+                        persist_state(&inner.directory, &loaded.persisted)?;
+                        return Err(error);
+                    }
+                }
+            }
+            loaded.active_file.sync_data()?;
+            persist_state(&inner.directory, &loaded.persisted)?;
+            Ok(results)
+        })
+        .await
+    }
+
     async fn commit(
         &self,
         generation: RangeGeneration,
@@ -935,15 +986,33 @@ fn append(
     {
         return Err(ActiveRangeStoreError::WriterIdentityMismatch);
     }
+    let mut loaded = inner
+        .loaded
+        .lock()
+        .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+    append_locked(inner, &mut loaded, request, import, true, &record)
+}
+
+/// The dedup, validation, write, and index body of `append` with the caller
+/// already holding the range lock. `flush` controls durability: `true` runs
+/// the single-frame contract (file sync + persisted-state flush before the
+/// call returns); `false` is for batched staged imports, which defer the
+/// sync/state flush to the batch end because staged candidate frames are
+/// re-derivable from the source and a partial batch stays resumable through
+/// the same dedup checks.
+fn append_locked(
+    inner: &FileActiveRangeStoreInner,
+    loaded: &mut LoadedRange,
+    request: ActiveRangeAppend,
+    import: bool,
+    flush: bool,
+    record: &StoredRecord,
+) -> Result<ActiveRangeAppendResult, ActiveRangeStoreError> {
     let frame_digest = *blake3::hash(&request.frame).as_bytes();
     let writer_key = WriterKey {
         writer_session_id: request.identity.writer_session_id,
         writer_epoch: request.identity.writer_epoch,
     };
-    let mut loaded = inner
-        .loaded
-        .lock()
-        .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
     validate_generation_and_epoch(
         &loaded.persisted,
         request.generation,
@@ -965,7 +1034,7 @@ fn append(
         {
             truncate_uncommitted_locked(
                 inner,
-                &mut loaded,
+                loaded,
                 request.generation,
                 request.ownership_epoch,
             )?;
@@ -1033,6 +1102,68 @@ fn append(
             committed: existing.position.value() <= loaded.persisted.committed,
         });
     }
+    if let Some(existing_position) = loaded.cursor_positions.get(&request.cursor).copied() {
+        // The Cursor derives from (FeedId, request_id), so a hit means this
+        // request already landed. Resequence after a split or merge can hand
+        // the retry a fresh sequence — digest and writer dedup miss it — but
+        // the request-derived fields stay identical; return the original
+        // position instead of appending a duplicate. This check runs before
+        // the writer-sequence fence: a known Cursor is proof of the request's
+        // own earlier append, while a re-sequenced retry carries a stale or
+        // future sequence that would otherwise wedge the retry as a
+        // StaleWriterSequence against the stream's high-water mark.
+        let existing = loaded
+            .entries
+            .iter()
+            .find(|entry| entry.position == existing_position)
+            .ok_or(ActiveRangeStoreError::PositionConflict(existing_position))?;
+        let existing_frame = read_indexed_frame(&inner.directory, existing)?;
+        let existing_record = decode_record(&existing_frame.frame)?;
+        if same_request_record(&existing_record, record) {
+            // The API layer allocated this retry a fresh sequence before the
+            // Cursor dedup caught it; that number is consumed even though no
+            // record lands. Record it against the original position so the
+            // stream's high-water mark stays contiguous across retries and
+            // restarts, and a replay of the same allocated sequence dedupes
+            // on its request-derived fields above.
+            let landed_position = existing.position;
+            let landed_message_id = existing.message_id;
+            let landed_cursor = existing.cursor.clone();
+            let landed_digest = existing.frame_digest;
+            let landed_committed = landed_position.value() <= loaded.persisted.committed;
+            let consumed = DeduplicationState {
+                sequence: request.identity.sequence,
+                position: landed_position,
+                message_id: landed_message_id,
+                cursor: landed_cursor.clone(),
+                frame_digest,
+            };
+            let advanced = loaded
+                .deduplication
+                .get(&writer_key)
+                .is_none_or(|previous| previous.sequence < consumed.sequence);
+            if advanced {
+                loaded.deduplication.insert(writer_key, consumed);
+                let mut next = loaded.persisted.clone();
+                next.deduplication = persisted_deduplication(&loaded.deduplication);
+                if flush {
+                    persist_state(&inner.directory, &next)?;
+                }
+                loaded.persisted = next;
+            }
+            return Ok(ActiveRangeAppendResult {
+                position: landed_position,
+                message_id: landed_message_id,
+                cursor: landed_cursor,
+                frame_digest: landed_digest,
+                deduplicated: true,
+                committed: landed_committed,
+            });
+        }
+        return Err(ActiveRangeStoreError::InvalidState(
+            "Cursor already belongs to another position".to_owned(),
+        ));
+    }
     if !import {
         if let Some(previous) = loaded.deduplication.get(&writer_key) {
             if request.identity.sequence == previous.sequence {
@@ -1046,7 +1177,7 @@ fn append(
                         })?;
                     let existing_frame = read_indexed_frame(&inner.directory, existing)?;
                     let existing_record = decode_record(&existing_frame.frame)?;
-                    if !same_request_record(&existing_record, &record) {
+                    if !same_request_record(&existing_record, record) {
                         return Err(ActiveRangeStoreError::WriterSequenceConflict {
                             latest: previous.sequence,
                         });
@@ -1079,62 +1210,6 @@ fn append(
             }
         }
     }
-    if let Some(existing_position) = loaded.cursor_positions.get(&request.cursor).copied() {
-        // The Cursor derives from (FeedId, request_id), so a hit means this
-        // request already landed. Resequence after a split or merge can hand
-        // the retry a fresh sequence — digest and writer dedup miss it — but
-        // the request-derived fields stay identical; return the original
-        // position instead of appending a duplicate.
-        let existing = loaded
-            .entries
-            .iter()
-            .find(|entry| entry.position == existing_position)
-            .ok_or(ActiveRangeStoreError::PositionConflict(existing_position))?;
-        let existing_frame = read_indexed_frame(&inner.directory, existing)?;
-        let existing_record = decode_record(&existing_frame.frame)?;
-        if same_request_record(&existing_record, &record) {
-            // The API layer allocated this retry a fresh sequence before the
-            // Cursor dedup caught it; that number is consumed even though no
-            // record lands. Record it against the original position so the
-            // stream's high-water mark stays contiguous across retries and
-            // restarts, and a replay of the same allocated sequence dedupes
-            // on its request-derived fields above.
-            let landed_position = existing.position;
-            let landed_message_id = existing.message_id;
-            let landed_cursor = existing.cursor.clone();
-            let landed_digest = existing.frame_digest;
-            let landed_committed = landed_position.value() <= loaded.persisted.committed;
-            let consumed = DeduplicationState {
-                sequence: request.identity.sequence,
-                position: landed_position,
-                message_id: landed_message_id,
-                cursor: landed_cursor.clone(),
-                frame_digest,
-            };
-            let advanced = loaded
-                .deduplication
-                .get(&writer_key)
-                .is_none_or(|previous| previous.sequence < consumed.sequence);
-            if advanced {
-                loaded.deduplication.insert(writer_key, consumed);
-                let mut next = loaded.persisted.clone();
-                next.deduplication = persisted_deduplication(&loaded.deduplication);
-                persist_state(&inner.directory, &next)?;
-                loaded.persisted = next;
-            }
-            return Ok(ActiveRangeAppendResult {
-                position: landed_position,
-                message_id: landed_message_id,
-                cursor: landed_cursor,
-                frame_digest: landed_digest,
-                deduplicated: true,
-                committed: landed_committed,
-            });
-        }
-        return Err(ActiveRangeStoreError::InvalidState(
-            "Cursor already belongs to another position".to_owned(),
-        ));
-    }
     match (&loaded.persisted.pending_effect, request.pending_effect) {
         (Some(pending), Some(requested)) if pending.covers(requested) => {}
         (Some(pending), _) => {
@@ -1162,10 +1237,12 @@ fn append(
             return Err(ActiveRangeStoreError::DiskCapacityExceeded { required, limit });
         }
     }
-    rotate_if_needed(inner, &mut loaded, encoded.len() as u64)?;
+    rotate_if_needed(inner, loaded, encoded.len() as u64)?;
     let entry_start = loaded.active_file.seek(SeekFrom::End(0))?;
     loaded.active_file.write_all(&encoded)?;
-    loaded.active_file.sync_data()?;
+    if flush {
+        loaded.active_file.sync_data()?;
+    }
     let entry_end = entry_start
         .checked_add(encoded.len() as u64)
         .ok_or(ActiveRangeStoreError::PositionOverflow)?;
@@ -1219,9 +1296,13 @@ fn append(
             last_frame_digest: frame_digest,
         });
     }
-    let persistence = persist_state(&inner.directory, &next);
-    loaded.persisted = next;
-    persistence?;
+    if flush {
+        let persistence = persist_state(&inner.directory, &next);
+        loaded.persisted = next;
+        persistence?;
+    } else {
+        loaded.persisted = next;
+    }
     Ok(ActiveRangeAppendResult {
         position,
         message_id: decoded.message_id,

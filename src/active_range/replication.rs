@@ -362,6 +362,43 @@ impl ReplicaAppendService {
             .map_err(map_store_error)
     }
 
+    /// Staged-import an ordered batch of frames in one call. Split/merge
+    /// staging copies the full committed prefix per replica, so per-frame
+    /// durability round-trips turn large histories into an unbounded
+    /// single-request stall: batching pays one flush per call and each frame
+    /// still dedups on position/identity/digest, so a retried call resumes
+    /// instead of restaging.
+    pub async fn stage_split_frames(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        frames: Vec<(RangePosition, AppendIdentity, String, Vec<u8>)>,
+    ) -> Result<Vec<super::ActiveRangeAppendResult>, ReplicaAppendError> {
+        if !assignment.replicas.contains(&self.local_node) {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::ReceiverNotReplica,
+                format!("Node {} is not a staged replica", self.local_node),
+            ));
+        }
+        self.store_for(assignment)
+            .await?
+            .import_split_batch(
+                frames
+                    .into_iter()
+                    .map(|(position, identity, cursor, frame)| ActiveRangeAppend {
+                        generation: assignment.generation,
+                        ownership_epoch: assignment.ownership_epoch,
+                        expected_position: Some(position),
+                        identity,
+                        cursor,
+                        frame,
+                        pending_effect: None,
+                    })
+                    .collect(),
+            )
+            .await
+            .map_err(map_store_error)
+    }
+
     pub async fn read_staged_committed(
         &self,
         assignment: &ActiveRangeAssignment,

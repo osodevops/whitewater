@@ -528,6 +528,11 @@ pub struct InternalCommandsRequest {
 pub struct InternalCommandsResponse {
     pub execution: Option<ControlExecution>,
     pub error: Option<String>,
+    /// Set when `error` is a semantic command rejection rather than a
+    /// transient availability failure, so the forwarding Node rethrows the
+    /// same kind instead of misreporting a committed verdict as a 503.
+    #[serde(default)]
+    pub rejected: bool,
     pub leader_id: Option<ControlNodeId>,
 }
 
@@ -535,6 +540,11 @@ pub struct InternalCommandsResponse {
 pub struct InternalWriteResponse {
     pub result: Option<ReplicatedCommandResult>,
     pub error: Option<String>,
+    /// Set when `error` is a semantic command rejection rather than a
+    /// transient availability failure, so the forwarding Node rethrows the
+    /// same kind instead of misreporting a committed verdict as a 503.
+    #[serde(default)]
+    pub rejected: bool,
     pub leader_id: Option<ControlNodeId>,
 }
 
@@ -781,11 +791,14 @@ impl ControlPlane {
             .await
             .map_err(|error| ControlPlaneError::Unavailable(error.to_string()))?;
         response.execution.ok_or_else(|| {
-            ControlPlaneError::Unavailable(
-                response
-                    .error
-                    .unwrap_or_else(|| "leader returned no execution".to_owned()),
-            )
+            let message = response
+                .error
+                .unwrap_or_else(|| "leader returned no execution".to_owned());
+            if response.rejected {
+                ControlPlaneError::Rejected(message)
+            } else {
+                ControlPlaneError::Unavailable(message)
+            }
         })
     }
 
@@ -824,11 +837,14 @@ impl ControlPlane {
             .await
             .map_err(|error| ControlPlaneError::Unavailable(error.to_string()))?;
         response.result.ok_or_else(|| {
-            ControlPlaneError::Unavailable(
-                response
-                    .error
-                    .unwrap_or_else(|| "leader returned no result".to_owned()),
-            )
+            let message = response
+                .error
+                .unwrap_or_else(|| "leader returned no result".to_owned());
+            if response.rejected {
+                ControlPlaneError::Rejected(message)
+            } else {
+                ControlPlaneError::Unavailable(message)
+            }
         })
     }
 
