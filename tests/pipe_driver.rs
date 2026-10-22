@@ -23,9 +23,9 @@ use whitewater::effect::{
 };
 use whitewater::index::IndexValue;
 use whitewater::pipe::{
-    pipe_declare_request_id, pipe_effect_id, pipe_emission_writer_session,
-    pipe_output_writer_session, window_group_key_bytes, window_pane_row_key, window_refused_groups,
-    EnrichResolution, FetchedPage, FetchedRecord, PipeDriver, WindowEmission,
+    pipe_declare_request_id, pipe_emission_writer_session, pipe_output_writer_session,
+    window_group_key_bytes, window_pane_row_key, window_refused_groups, EnrichResolution,
+    FetchedPage, FetchedRecord, PipeDriver, WindowEmission,
 };
 use whitewater::reader::{
     FjallSubscriptionProgressReplica, SubscriptionCommitEvidence, SubscriptionMemberState,
@@ -665,7 +665,14 @@ async fn pipe_driver_declares_applies_outputs_and_moves_the_frontier() {
     ));
     assert_eq!(
         applied.effect_id,
-        pipe_effect_id(pipe().pipe_id, Uuid::from_u128(SUBSCRIPTION), "p0")
+        harness
+            .driver
+            .planned_effect_id(
+                Uuid::from_u128(SUBSCRIPTION),
+                "p0",
+                &page(vec![record(1), record(2), record(3)], "p1"),
+            )
+            .unwrap()
     );
 
     // Every output got the deterministic per-record writer identity.
@@ -732,7 +739,14 @@ async fn pipe_driver_returns_none_when_the_source_is_caught_up() {
 async fn pipe_driver_replays_safely_after_an_ambiguous_declare_commit() {
     let harness = harness();
     seed_frontier(&harness.progress, "p0").await;
-    let effect_id = pipe_effect_id(pipe().pipe_id, Uuid::from_u128(SUBSCRIPTION), "p0");
+    let effect_id = harness
+        .driver
+        .planned_effect_id(
+            Uuid::from_u128(SUBSCRIPTION),
+            "p0",
+            &page(vec![record(1)], "p1"),
+        )
+        .unwrap();
     let declare_request = pipe_declare_request_id(effect_id);
     harness
         .effect_transport
@@ -780,10 +794,103 @@ async fn pipe_driver_replays_safely_after_an_ambiguous_declare_commit() {
 }
 
 #[tokio::test]
+async fn window_pipe_escapes_prepared_residue_when_the_replan_shifts() {
+    let harness = harness_for(window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+
+    let record = json_record(1, b"key-a", 0, 5);
+    let drifting = |expired: Vec<Vec<u8>>| FetchedPage {
+        records: vec![record.clone()],
+        cursor: "p1".to_owned(),
+        positions: BTreeMap::from([(range(), "p1".to_owned())]),
+        emissions: Vec::new(),
+        expired,
+        refused: Vec::new(),
+        pane_rows: Default::default(),
+        pane_rows_saturated: false,
+    };
+
+    // Drive one's commit dies in flight: the replicas hold a prepared
+    // Declare for one expired row — the residue that used to wedge every
+    // later drive on a same-request conflict.
+    let first_id = harness
+        .driver
+        .planned_effect_id(
+            Uuid::from_u128(SUBSCRIPTION),
+            "p0",
+            &drifting(vec![b"row-a".to_vec()]),
+        )
+        .unwrap();
+    harness
+        .effect_transport
+        .commit_down
+        .lock()
+        .unwrap()
+        .insert(pipe_declare_request_id(first_id));
+    let error = harness
+        .driver
+        .drive_once(
+            64,
+            |_f, _l| async { Ok(drifting(vec![b"row-a".to_vec()])) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        EffectJournalError::AmbiguousCommit
+            | EffectJournalError::NoQuorum
+            | EffectJournalError::Unavailable
+    ));
+    harness.effect_transport.commit_down.lock().unwrap().clear();
+
+    // Wall clock moved: the same frontier now scans a second expired row,
+    // so the plan legitimately diverges. A cursor-only identity would have
+    // re-declared different content under the residue's request id and
+    // Conflicted forever; the plan-covered identity lands on a fresh
+    // effect and commits.
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            move |_f, _l| async move { Ok(drifting(vec![b"row-a".to_vec(), b"row-b".to_vec()])) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    assert_ne!(applied.effect_id, first_id);
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    // One accumulate for the folded record plus both expired-row deletes.
+    assert_eq!(state_mutations.len(), 3);
+    let frontier = harness
+        .progress
+        .read_committed()
+        .await
+        .unwrap()
+        .expect("frontier");
+    assert_eq!(frontier.cursor, "p1");
+}
+
+#[tokio::test]
 async fn pipe_driver_replays_outputs_identically_when_applied_commit_is_ambiguous() {
     let harness = harness();
     seed_frontier(&harness.progress, "p0").await;
-    let effect_id = pipe_effect_id(pipe().pipe_id, Uuid::from_u128(SUBSCRIPTION), "p0");
+    let effect_id = harness
+        .driver
+        .planned_effect_id(
+            Uuid::from_u128(SUBSCRIPTION),
+            "p0",
+            &page(vec![record(1), record(2)], "p1"),
+        )
+        .unwrap();
     let applied_request = effect_apply_request_id(pipe_declare_request_id(effect_id), b"applied");
     harness
         .effect_transport
@@ -912,7 +1019,14 @@ async fn pipe_driver_aborts_a_declare_whose_frontier_moved_mid_apply() {
     // rather than leaving the output tail fenced forever: the row names
     // the committed Declare, the discard freed the Range, and the
     // competing consumer's "pX" frontier is untouched.
-    let effect_id = pipe_effect_id(pipe().pipe_id, Uuid::from_u128(SUBSCRIPTION), "p0");
+    let effect_id = harness
+        .driver
+        .planned_effect_id(
+            Uuid::from_u128(SUBSCRIPTION),
+            "p0",
+            &page(vec![record(1)], "p1"),
+        )
+        .unwrap();
     let row = harness
         .journal
         .read_committed(effect_id)
@@ -1253,7 +1367,21 @@ async fn window_pipe_folds_a_page_into_one_accumulate_mutation() {
 
     assert_eq!(
         applied.effect_id,
-        pipe_effect_id(window_pipe().pipe_id, Uuid::from_u128(SUBSCRIPTION), "p0")
+        harness
+            .driver
+            .planned_effect_id(
+                Uuid::from_u128(SUBSCRIPTION),
+                "p0",
+                &page(
+                    vec![
+                        json_record(1, b"key-a", 0, 5),
+                        json_record(2, b"key-a", 9, 7),
+                        json_record(3, b"key-b", 12, -3),
+                    ],
+                    "p1",
+                ),
+            )
+            .unwrap()
     );
     // The terminal row restates the mutation so post-marker crashes replay it.
     let EffectTransition::Applied {
@@ -1527,7 +1655,22 @@ async fn enrich_pipe_quarantines_misses_to_the_declared_feed() {
 async fn enrich_pipe_adopts_a_committed_divergent_declare() {
     let harness = harness_for(enrich_pipe());
     seed_frontier(&harness.progress, "p0").await;
-    let effect_id = pipe_effect_id(enrich_pipe().pipe_id, Uuid::from_u128(SUBSCRIPTION), "p0");
+    // Our drive plans this resolution; the committed row below diverges
+    // under the same identity and must win.
+    let mut ours = record(1);
+    ours.resolution = Some(EnrichResolution {
+        matched: true,
+        payload: b"fresher-but-lost".to_vec(),
+        applied_seq: 42,
+    });
+    let effect_id = harness
+        .driver
+        .planned_effect_id(
+            Uuid::from_u128(SUBSCRIPTION),
+            "p0",
+            &page(vec![ours.clone()], "p1"),
+        )
+        .unwrap();
 
     // A raced drive resolved the lookup differently and committed its
     // Declare first: the committed row is the single source of truth.
@@ -1565,12 +1708,6 @@ async fn enrich_pipe_adopts_a_committed_divergent_declare() {
 
     // Our drive plans a divergent resolution — it must adopt the committed
     // Declare rather than conflict or double-decide.
-    let mut ours = record(1);
-    ours.resolution = Some(EnrichResolution {
-        matched: true,
-        payload: b"fresher-but-lost".to_vec(),
-        applied_seq: 42,
-    });
     let applied = harness
         .driver
         .drive_once(

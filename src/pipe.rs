@@ -5,10 +5,15 @@
 //! drives that declaration to `Applied`.
 //!
 //! Deterministic identities make a crashed or restarted driver safe: the
-//! same frontier yields the same `effect_id`, `request_id`, and per-record
-//! writer identities, so journal replays and Feed append dedupe collapse
-//! repeats instead of duplicating work. The driver never claims atomicity
-//! beyond what the journal's apply step provides.
+//! same frontier and resolved plan yield the same `effect_id`,
+//! `request_id`, and per-record writer identities, so journal replays and
+//! Feed append dedupe collapse repeats instead of duplicating work. A
+//! replan that legitimately diverges — pane closes, expirations, and
+//! enrich resolutions are sampled at fetch time — yields a different
+//! `effect_id`, so raced Declares arbitrate through the committed row and
+//! the frontier CAS rather than wedging a replica on a same-request
+//! prepared residue. The driver never claims atomicity beyond what the
+//! journal's apply step provides.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -30,6 +35,10 @@ use crate::reader::{SubscriptionProgressCoordinator, SubscriptionProgressMutatio
 use crate::state_store::{
     AccumulateRowEntry, NamedKeyValue, ReplaySourceRecord, StateStoreMutationOp,
 };
+
+/// A StateStore op planned for an effect, before the caller stamps its
+/// plan-derived dedupe identity onto an `EffectStateMutation`.
+type PlannedStateMutation = (Uuid, StateStoreMutationOp);
 
 /// One input record fetched after the Subscription frontier.
 #[derive(Clone, Debug)]
@@ -118,15 +127,27 @@ pub struct WindowEmission {
 }
 
 /// Deterministic identity for the effect one Pipe cycle declares over a
-/// given frontier: the same frontier re-driven after a crash produces the
-/// same identity, and the journal replays it idempotently.
-pub fn pipe_effect_id(pipe_id: Uuid, subscription_id: Uuid, expected_cursor: &str) -> Uuid {
+/// given frontier and plan. `plan` is the serialized volatile surface —
+/// every resolved output and StateStore op — because pane closes, row
+/// expirations, and enrich resolutions are sampled at fetch time: a
+/// replan that legitimately diverges must land on a different identity
+/// so raced Declares arbitrate through the committed row and the
+/// frontier CAS rather than wedging a replica on a same-request prepared
+/// residue. An identical replan yields the identical identity and the
+/// journal replays it idempotently.
+pub fn pipe_effect_id(
+    pipe_id: Uuid,
+    subscription_id: Uuid,
+    expected_cursor: &str,
+    plan: &[u8],
+) -> Uuid {
     derived_uuid(
         b"pipe-effect",
         &[
             pipe_id.as_bytes().as_slice(),
             subscription_id.as_bytes().as_slice(),
             expected_cursor.as_bytes(),
+            plan,
         ],
     )
 }
@@ -339,23 +360,28 @@ impl PipeDriver {
         // An emission-only cycle consumes nothing: the frontier CAS is a
         // no-op move onto its own cursor, and the effect keys on the
         // closed-pane set rather than the shared frontier so a later
-        // drain can never be confused with this one.
-        let effect_id = if page.records.is_empty() {
-            pipe_emission_effect_id(
-                self.pipe.pipe_id,
-                frontier.subscription_id,
-                &frontier.cursor,
-                &page.emissions,
-                &page.expired,
-            )
-        } else {
-            pipe_effect_id(
-                self.pipe.pipe_id,
-                frontier.subscription_id,
-                &frontier.cursor,
-            )
-        };
-        let (outputs, state_mutations) = self.effect_plan(effect_id, &page)?;
+        // drain can never be confused with this one. For a consumed page
+        // the whole resolved plan rides inside the effect identity, so a
+        // replan that sampled different pane closes, expirations, or
+        // enrich resolutions lands on a different identity instead of
+        // conflicting against its own same-request prepared residue.
+        let (outputs, mutation_ops) = self.effect_plan(&page)?;
+        let effect_id = self.effect_identity(
+            frontier.subscription_id,
+            &frontier.cursor,
+            &page,
+            &outputs,
+            &mutation_ops,
+        )?;
+        let state_mutations = mutation_ops
+            .into_iter()
+            .enumerate()
+            .map(|(index, (store_id, op))| EffectStateMutation {
+                store_id,
+                mutation_id: effect_state_mutation_id(effect_id, index),
+                op,
+            })
+            .collect();
         let declare = EffectMutation {
             effect_id,
             subscription_id: frontier.subscription_id,
@@ -414,11 +440,12 @@ impl PipeDriver {
     /// deterministic output append; `Window` folds the page into a single
     /// `AccumulateRows` mutation so every touched pane advances exactly
     /// once inside the same atomic boundary as the consumed frontier.
+    /// Mutations return as ordered (store, op) pairs — the caller stamps
+    /// `mutation_id`s only after deriving the plan-covered effect identity.
     fn effect_plan(
         &self,
-        effect_id: Uuid,
         page: &FetchedPage,
-    ) -> Result<(Vec<EffectOutput>, Vec<EffectStateMutation>), EffectJournalError> {
+    ) -> Result<(Vec<EffectOutput>, Vec<PlannedStateMutation>), EffectJournalError> {
         match &self.pipe.operation {
             PipeOperation::Forward => {
                 let feed_id = self
@@ -679,11 +706,7 @@ impl PipeDriver {
                 let mut outputs = Vec::new();
                 let mut mutations = Vec::new();
                 if !entries.is_empty() {
-                    mutations.push(EffectStateMutation {
-                        store_id,
-                        mutation_id: effect_state_mutation_id(effect_id, 0),
-                        op: StateStoreMutationOp::AccumulateRows { entries },
-                    });
+                    mutations.push((store_id, StateStoreMutationOp::AccumulateRows { entries }));
                 }
                 // Emissions without a declared emit Feed fail closed —
                 // silently dropping closed panes would wedge the store.
@@ -724,13 +747,12 @@ impl PipeDriver {
                             writer_epoch: 1,
                             sequence: 1,
                         });
-                        mutations.push(EffectStateMutation {
+                        mutations.push((
                             store_id,
-                            mutation_id: effect_state_mutation_id(effect_id, mutations.len()),
-                            op: StateStoreMutationOp::DeleteRow {
+                            StateStoreMutationOp::DeleteRow {
                                 key: emission.row_key.clone(),
                             },
-                        });
+                        ));
                         emission_deletes += 1;
                     }
                 }
@@ -744,13 +766,12 @@ impl PipeDriver {
                     .iter()
                     .take(WINDOW_MAX_EMISSIONS_PER_DRIVE.saturating_sub(emission_deletes))
                 {
-                    mutations.push(EffectStateMutation {
+                    mutations.push((
                         store_id,
-                        mutation_id: effect_state_mutation_id(effect_id, mutations.len()),
-                        op: StateStoreMutationOp::DeleteRow {
+                        StateStoreMutationOp::DeleteRow {
                             key: row_key.clone(),
                         },
-                    });
+                    ));
                 }
                 Ok((outputs, mutations))
             }
@@ -850,6 +871,56 @@ impl PipeDriver {
                 ))
             }
         }
+    }
+
+    /// The Declare identity one cycle chooses for a fetched page. An
+    /// emission-only cycle keys on the closed-pane set; a consumed page
+    /// folds the serialized plan — every output and store op — into the
+    /// identity so a legitimately diverged replan becomes a new effect
+    /// rather than a same-request conflict against abandoned residue.
+    fn effect_identity(
+        &self,
+        subscription_id: Uuid,
+        expected_cursor: &str,
+        page: &FetchedPage,
+        outputs: &[EffectOutput],
+        mutation_ops: &[PlannedStateMutation],
+    ) -> Result<Uuid, EffectJournalError> {
+        if page.records.is_empty() {
+            Ok(pipe_emission_effect_id(
+                self.pipe.pipe_id,
+                subscription_id,
+                expected_cursor,
+                &page.emissions,
+                &page.expired,
+            ))
+        } else {
+            let plan = serde_json::to_vec(&(outputs, mutation_ops))?;
+            Ok(pipe_effect_id(
+                self.pipe.pipe_id,
+                subscription_id,
+                expected_cursor,
+                &plan,
+            ))
+        }
+    }
+
+    /// The Declare identity this driver would choose for a fetched page —
+    /// shared by tests and diagnostics correlating drives to journal rows.
+    pub fn planned_effect_id(
+        &self,
+        subscription_id: Uuid,
+        expected_cursor: &str,
+        page: &FetchedPage,
+    ) -> Result<Uuid, EffectJournalError> {
+        let (outputs, mutation_ops) = self.effect_plan(page)?;
+        self.effect_identity(
+            subscription_id,
+            expected_cursor,
+            page,
+            &outputs,
+            &mutation_ops,
+        )
     }
 }
 
@@ -1213,12 +1284,24 @@ mod tests {
     fn derived_identities_are_stable_and_scoped() {
         let pipe = Uuid::from_u128(1);
         let subscription = Uuid::from_u128(2);
-        let first = pipe_effect_id(pipe, subscription, "cursor-a");
-        assert_eq!(first, pipe_effect_id(pipe, subscription, "cursor-a"));
-        assert_ne!(first, pipe_effect_id(pipe, subscription, "cursor-b"));
+        let first = pipe_effect_id(pipe, subscription, "cursor-a", b"plan-a");
+        assert_eq!(
+            first,
+            pipe_effect_id(pipe, subscription, "cursor-a", b"plan-a")
+        );
         assert_ne!(
             first,
-            pipe_effect_id(Uuid::from_u128(9), subscription, "cursor-a")
+            pipe_effect_id(pipe, subscription, "cursor-b", b"plan-a")
+        );
+        assert_ne!(
+            first,
+            pipe_effect_id(Uuid::from_u128(9), subscription, "cursor-a", b"plan-a")
+        );
+        // The plan digest is part of the identity: a wall-clock-shifted
+        // replan over the same frontier is a different effect entirely.
+        assert_ne!(
+            first,
+            pipe_effect_id(pipe, subscription, "cursor-a", b"plan-b")
         );
         let session = pipe_output_writer_session(pipe, Uuid::from_u128(50));
         assert_eq!(
