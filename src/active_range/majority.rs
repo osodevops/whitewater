@@ -128,7 +128,11 @@ pub struct MajorityAppendCoordinator {
     local: Arc<ReplicaAppendService>,
     control: Arc<ControlController>,
     transport: Arc<dyn ReplicaTransport>,
-    append_lock: Arc<Mutex<()>>,
+    // Serialized per range: position allocation, local append, and follower
+    // fan-out for one range must not interleave, while unrelated ranges on
+    // this Node pipeline independently.
+    append_locks: Arc<Mutex<std::collections::BTreeMap<super::RangeId, Arc<Mutex<()>>>>>,
+
     proofs: Option<Arc<CommitProofReporter>>,
 }
 
@@ -142,7 +146,7 @@ impl MajorityAppendCoordinator {
             local,
             control,
             transport,
-            append_lock: Arc::new(Mutex::new(())),
+            append_locks: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             proofs: None,
         }
     }
@@ -211,11 +215,20 @@ impl MajorityAppendCoordinator {
         self.freeze_for_cutover(source).await
     }
 
+    async fn append_lock(&self, range_id: super::RangeId) -> Arc<Mutex<()>> {
+        self.append_locks
+            .lock()
+            .await
+            .entry(range_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     async fn freeze_for_cutover(
         &self,
         source: &super::ActiveRangeAssignment,
     ) -> Result<CommitPosition, MajorityAppendError> {
-        let _append_guard = self.append_lock.lock().await;
+        let _append_guard = self.append_lock(source.range_id).await.lock_owned().await;
         let current = self
             .control
             .active_range_assignment_by_id(source.range_id)
@@ -259,9 +272,41 @@ impl MajorityAppendCoordinator {
 
     pub async fn append(
         &self,
-        mut request: ReplicaAppendRequest,
+        request: ReplicaAppendRequest,
     ) -> Result<MajorityAppendResult, MajorityAppendError> {
-        let _append_guard = self.append_lock.lock().await;
+        self.append_inner(
+            request,
+            None::<fn(u64) -> Result<String, crate::codec::CodecError>>,
+        )
+        .await
+    }
+
+    /// Owner-minted session append: under the range's append lock the owner
+    /// derives the next contiguous Writer sequence from the replica's landed
+    /// dedup stream, then `encode_with_sequence` builds the frame so the
+    /// record's `producer_sequence` and the replicated identity agree before
+    /// any replica sees bytes. Retries deduplicate on the request-derived
+    /// Cursor, and cutovers inherit the minted stream from staged frames.
+    pub async fn append_minted<F>(
+        &self,
+        request: ReplicaAppendRequest,
+        encode_with_sequence: F,
+    ) -> Result<MajorityAppendResult, MajorityAppendError>
+    where
+        F: FnOnce(u64) -> Result<String, crate::codec::CodecError> + Send,
+    {
+        self.append_inner(request, Some(encode_with_sequence)).await
+    }
+
+    async fn append_inner<F>(
+        &self,
+        mut request: ReplicaAppendRequest,
+        mint: Option<F>,
+    ) -> Result<MajorityAppendResult, MajorityAppendError>
+    where
+        F: FnOnce(u64) -> Result<String, crate::codec::CodecError> + Send,
+    {
+        let _append_guard = self.append_lock(request.range_id).await.lock_owned().await;
         request.expected_position = self
             .next_position(request.feed_id, request.range_id)
             .await?;
@@ -294,6 +339,42 @@ impl MajorityAppendCoordinator {
                 vec![],
                 vec![],
             ));
+        }
+        if let Some(encode_with_sequence) = mint {
+            // Owner-minted Writer sequences: the session append path sends no
+            // pre-allocated number; the owner derives it from this replica's
+            // landed dedup stream under the per-range append lock, so a mint
+            // is contiguous with what actually committed and survives
+            // restarts and owner cutovers. A failed append consumes nothing —
+            // the next mint re-derives the same number — and a retried
+            // request deduplicates by its request-derived Cursor.
+            request.identity.sequence = self
+                .local
+                .next_writer_sequence(
+                    &assignment,
+                    request.identity.writer_session_id,
+                    request.identity.writer_epoch,
+                )
+                .await
+                .map_err(|error| {
+                    self.error(
+                        MajorityAppendErrorCode::LocalStorageFailure,
+                        format!("owner could not mint the Writer sequence: {error}"),
+                        true,
+                        vec![],
+                        vec![],
+                    )
+                })?;
+            request.frame_base64 =
+                encode_with_sequence(request.identity.sequence).map_err(|error| {
+                    self.error(
+                        MajorityAppendErrorCode::LocalStorageFailure,
+                        format!("owner could not encode the minted record: {error}"),
+                        false,
+                        vec![],
+                        vec![],
+                    )
+                })?;
         }
         let local = self.local.append(request.clone()).await.map_err(|error| {
             if error.code == ReplicaAppendErrorCode::PendingEffectOccupied {
@@ -624,7 +705,7 @@ impl MajorityAppendCoordinator {
         &self,
         request: PendingReleaseRequest,
     ) -> Result<PendingReleaseOutcome, MajorityAppendError> {
-        let _append_guard = self.append_lock.lock().await;
+        let _append_guard = self.append_lock(request.range_id).await.lock_owned().await;
         let assignment = self
             .control
             .active_range_assignment_by_id(request.range_id)
@@ -757,7 +838,7 @@ impl MajorityAppendCoordinator {
         &self,
         request: PendingReleaseRequest,
     ) -> Result<super::store::PendingDiscardOutcome, MajorityAppendError> {
-        let _append_guard = self.append_lock.lock().await;
+        let _append_guard = self.append_lock(request.range_id).await.lock_owned().await;
         let assignment = self
             .control
             .active_range_assignment_by_id(request.range_id)

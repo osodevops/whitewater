@@ -1787,3 +1787,161 @@ async fn resequenced_retry_dedup_pushes_the_stored_frame_to_replicas() {
         assert_eq!(status.committed.value(), 3);
     }
 }
+
+#[tokio::test]
+async fn owner_minted_sequences_stay_contiguous_and_retries_deduplicate() {
+    let fixture = Fixture::new().await;
+    let coordinator = fixture.coordinator(&[], &[], None);
+    let writer = Uuid::from_u128(700);
+    let encode = |sequence: u64, marker: u128, payload: &'static [u8]| {
+        Ok(STANDARD.encode(
+            encode_record(&StoredRecord {
+                message_id: Uuid::from_u128(marker),
+                producer_id: writer,
+                producer_sequence: sequence,
+                event_time_ns: 1,
+                ingest_time_ns: 2,
+                key: b"customer-1".to_vec(),
+                payload: payload.to_vec(),
+                metadata: BTreeMap::new(),
+            })
+            .unwrap(),
+        ))
+    };
+    // The request's sequence and frame are placeholders — the owner mints
+    // the contiguous number under the range's append lock before encoding.
+    let mut first = fixture.request.clone();
+    first.cursor = "mint-1".to_owned();
+    first.identity.sequence = 0;
+    first.frame_base64 = String::new();
+    let first = coordinator
+        .append_minted(first, |sequence| encode(sequence, 701, b"one"))
+        .await
+        .unwrap();
+    assert_eq!(first.position.value(), 1);
+
+    let mut second = fixture.request.clone();
+    second.cursor = "mint-2".to_owned();
+    second.identity.sequence = 0;
+    second.frame_base64 = String::new();
+    let second = coordinator
+        .append_minted(second, |sequence| encode(sequence, 702, b"two"))
+        .await
+        .unwrap();
+    assert_eq!(second.position.value(), 2);
+
+    let frames = fixture.services[&fixture.owner]
+        .export_committed(fixture.request.feed_id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(frames[0].identity.sequence, 1);
+    assert_eq!(frames[1].identity.sequence, 2);
+    // The stored frame's producer_sequence is the minted number — the
+    // identity and record never disagree.
+    assert_eq!(
+        decode_record(&frames[0].frame).unwrap().producer_sequence,
+        1
+    );
+    assert_eq!(
+        decode_record(&frames[1].frame).unwrap().producer_sequence,
+        2
+    );
+
+    // A retry of the first request deduplicates on its request-derived
+    // Cursor: the minted sequence is consumed against the original position
+    // rather than appending a duplicate.
+    let mut retry = fixture.request.clone();
+    retry.cursor = "mint-1".to_owned();
+    retry.identity.sequence = 0;
+    retry.frame_base64 = String::new();
+    let retried = coordinator
+        .append_minted(retry, |sequence| encode(sequence, 701, b"one"))
+        .await
+        .unwrap();
+    assert!(retried.deduplicated);
+    assert_eq!(retried.position, first.position);
+    let frames = fixture.services[&fixture.owner]
+        .export_committed(fixture.request.feed_id, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        frames.len(),
+        2,
+        "a retried minted append must not duplicate"
+    );
+}
+
+#[tokio::test]
+async fn minted_sequences_parallelize_across_ranges_on_one_node() {
+    // Two Feeds' ranges share this owner Node; minted appends to each run
+    // under independent range locks so neither waits on the other's quorum
+    // round trip. Concurrency proves the locks are per-range; the committed
+    // streams prove each mint stayed contiguous within its own range.
+    let fixture = Fixture::new().await;
+    let created = fixture
+        .control
+        .execute_commands_with_request_id(
+            vec![Command::CreateFeed {
+                name: "orders.second".to_owned(),
+            }],
+            Uuid::from_u128(601),
+        )
+        .await
+        .unwrap();
+    let second_feed_id =
+        serde_json::from_value(created.results[0].data["feed_id"].clone()).unwrap();
+    let second_assignment = fixture
+        .control
+        .active_range_assignment(second_feed_id)
+        .await
+        .unwrap();
+    let coordinator = fixture.coordinator(&[], &[], None);
+
+    let encode_for = |writer: Uuid, marker: u128, payload: &'static [u8]| {
+        move |sequence: u64| {
+            Ok(STANDARD.encode(
+                encode_record(&StoredRecord {
+                    message_id: Uuid::from_u128(marker),
+                    producer_id: writer,
+                    producer_sequence: sequence,
+                    event_time_ns: 1,
+                    ingest_time_ns: 2,
+                    key: b"customer-1".to_vec(),
+                    payload: payload.to_vec(),
+                    metadata: BTreeMap::new(),
+                })
+                .unwrap(),
+            ))
+        }
+    };
+    // A mint goes through the range's current owner; placement may put the
+    // second Feed on a different Node, which is itself the point.
+    let second_coordinator = MajorityAppendCoordinator::new(
+        fixture.services[&second_assignment.owner].clone(),
+        fixture.control.clone(),
+        Arc::new(DirectTransport {
+            services: Arc::new(fixture.services.clone()),
+            append_down: Arc::new(BTreeSet::new()),
+            commit_down: Arc::new(BTreeSet::new()),
+            corrupt_digest: None,
+            commit_pause: None,
+        }),
+    );
+    let mut a = fixture.request.clone();
+    a.cursor = "mint-a".to_owned();
+    a.identity.sequence = 0;
+    a.frame_base64 = String::new();
+    let mut b = a.clone();
+    b.feed_id = second_feed_id;
+    b.range_id = second_assignment.range_id;
+    b.generation = second_assignment.generation;
+    b.append_owner = second_assignment.owner.clone();
+    b.cursor = "mint-b".to_owned();
+    let writer = fixture.request.identity.writer_session_id;
+    let (ra, rb) = tokio::join!(
+        coordinator.append_minted(a, encode_for(writer, 801, b"a")),
+        second_coordinator.append_minted(b, encode_for(writer, 802, b"b")),
+    );
+    assert_eq!(ra.unwrap().position.value(), 1);
+    assert_eq!(rb.unwrap().position.value(), 1);
+}

@@ -7134,6 +7134,7 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
             .await
             .ok_or(crate::effect::EffectJournalError::Conflict)?;
         let request = ClientAppendRequest {
+            mint_sequence: false,
             request_id: crate::effect::effect_apply_request_id(output.writer_session_id, b"append"),
             feed: feed.name,
             writer_session_id: output.writer_session_id,
@@ -11673,7 +11674,13 @@ struct ClientAppendRequest {
     /// tail (durable on the output quorum but invisible until the effect's
     /// terminal marker releases it). Public append paths refuse it.
     #[serde(default)]
-    pending_effect: Option<crate::active_range::PendingEffectRef>,
+    pub pending_effect: Option<crate::active_range::PendingEffectRef>,
+    /// Session-append only: the Append Owner mints the Writer sequence from
+    /// its landed dedup stream instead of a catalog-allocated number — one
+    /// quorum per record, and Writer streams parallelize across ranges.
+    /// Explicit-sequence callers (raw appends, effect sinks) leave it unset.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    mint_sequence: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -12369,14 +12376,13 @@ async fn writer_session_append(
         .active_range_for_key(feed.feed_id, &routing_key)
         .await
         .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
-    let result = session_append_with_sequence(
+    let result = session_append_owner_minted(
         &state,
         &headers,
         &request,
         &feed.name,
-        writer.writer_id,
+        &writer,
         route.range_id,
-        "writer-range",
     )
     .await;
     // A refused append leaves its catalog-allocated Writer sequence
@@ -12400,6 +12406,7 @@ async fn writer_session_append(
             State(state.clone()),
             headers.clone(),
             Json(ClientAppendRequest {
+                mint_sequence: false,
                 request_id: request.request_id,
                 feed: feed.name.clone(),
                 writer_session_id: writer.writer_id,
@@ -12438,57 +12445,61 @@ async fn writer_session_append(
     healed.map(Json)
 }
 
-/// Allocate the Writer's next per-range sequence under `allocation_scope`
-/// and append the record through the routed owner path.
-#[allow(clippy::too_many_arguments)]
-async fn session_append_with_sequence(
+/// Append one session record: the Append Owner mints the per-range Writer
+/// sequence from its replicated dedup stream, so the hot path pays one
+/// quorum commit — not a shared Control Plane write plus a range quorum.
+/// The session-epoch fence that the catalog mint carried moves to the
+/// applied view: a just-opened session gets the same bounded propagation
+/// wait Readers get, a revoked or superseded epoch is refused.
+async fn session_append_owner_minted(
     state: &AppState,
     headers: &HeaderMap,
     request: &WriterSessionAppendRequest,
     feed_name: &str,
-    writer_id: Uuid,
-    range_id: crate::active_range::RangeId,
-    allocation_scope: &str,
+    writer: &crate::control::WriterDefinition,
+    _range_id: crate::active_range::RangeId,
 ) -> Result<WriterAppendResponse, ApiError> {
-    let commands = vec![crate::control::Command::AllocateWriterRangeSequence {
-        writer: request.writer.clone(),
-        session_epoch: request.session_epoch,
-        range_id,
-    }];
-    let allocation_request_id = deterministic_uuid(
-        request.request_id,
-        &format!("{allocation_scope}:{range_id}"),
-    );
-    let execution = match &state.control_plane {
-        Some(control_plane) => control_plane
-            .execute_commands_with_request_id(commands, allocation_request_id)
-            .await
-            .map_err(ApiError::from)?,
-        None => {
-            state
-                .control
-                .execute_commands_with_request_id(commands, allocation_request_id)
-                .await?
+    let mut definition = writer.clone();
+    for _ in 0..20 {
+        if definition.session_epoch >= request.session_epoch {
+            break;
         }
-    };
-    let sequence = execution.results[0].data["sequence"]
-        .as_u64()
-        .ok_or_else(|| ApiError::unavailable("Writer sequence allocation returned no sequence"))?;
+        // The client's session may have opened on another ingress and not
+        // applied here yet — wait briefly rather than fencing it stale.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        match state.control.active_writer_by_name(&request.writer).await {
+            Some(fresh) => definition = fresh,
+            None => break,
+        }
+    }
+    if !definition.session_active {
+        return Err(ApiError::bad_request(format!(
+            "Writer {} has no active session",
+            request.writer
+        )));
+    }
+    if definition.session_epoch != request.session_epoch {
+        return Err(ApiError::bad_request(format!(
+            "stale Writer session epoch: current={}, supplied={}",
+            definition.session_epoch, request.session_epoch
+        )));
+    }
     client_append(
         State(state.clone()),
         headers.clone(),
         Json(ClientAppendRequest {
             request_id: request.request_id,
             feed: feed_name.to_owned(),
-            writer_session_id: writer_id,
+            writer_session_id: writer.writer_id,
             writer_epoch: request.session_epoch,
-            sequence,
+            sequence: 0,
             event_time_ns: request.event_time_ns.clone(),
             key_base64: request.key_base64.clone(),
             payload_base64: request.payload_base64.clone(),
             metadata_base64: request.metadata_base64.clone(),
             use_compression: request.use_compression,
             pending_effect: None,
+            mint_sequence: true,
         }),
     )
     .await
@@ -13050,96 +13061,106 @@ async fn owner_append_local(
         .unwrap_or(ingest_time_ns);
     let message_id = deterministic_uuid(request.request_id, "message");
     let cursor = feed_cursor(feed.feed_id, request.request_id);
-    let frame = crate::codec::encode_record_with_compression(
-        &StoredRecord {
-            message_id,
-            producer_id: request.writer_session_id,
-            producer_sequence: request.sequence,
-            event_time_ns,
-            ingest_time_ns,
-            key,
-            payload,
-            metadata,
-        },
-        request.use_compression,
-    )
-    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let record = StoredRecord {
+        message_id,
+        producer_id: request.writer_session_id,
+        producer_sequence: request.sequence,
+        event_time_ns,
+        ingest_time_ns,
+        key,
+        payload,
+        metadata,
+    };
+    let use_compression = request.use_compression;
+    let encode_with_sequence = move |sequence: u64| {
+        let mut record = record.clone();
+        record.producer_sequence = sequence;
+        crate::codec::encode_record_with_compression(&record, use_compression)
+            .map(|frame| STANDARD.encode(frame))
+    };
     let coordinator = state
         .majority_append
         .as_ref()
         .ok_or_else(|| ApiError::unavailable("majority append coordinator is unavailable"))?;
-    let result = coordinator
-        .append(ReplicaAppendRequest {
-            feed_id: feed.feed_id,
-            range_id: assignment.range_id,
-            generation: assignment.generation,
-            ownership_epoch: assignment.ownership_epoch,
-            append_owner: assignment.owner,
-            expected_position: crate::active_range::RangePosition::new(0),
-            identity: AppendIdentity {
-                writer_session_id: request.writer_session_id,
-                writer_epoch: request.writer_epoch,
-                sequence: request.sequence,
-            },
-            cursor,
-            frame_base64: STANDARD.encode(frame),
-            pending_effect: request.pending_effect,
-        })
-        .await
-        .map_err(|error| {
-            let occupant = error.pending_effect.clone();
-            // A refused append leaves its allocated Writer sequence
-            // unconsumed; once later appends advance the stream, the
-            // deduped allocation can never fill the hole. Tag it so the
-            // session append path can re-allocate and heal the retry.
-            let api = if error.code
-                == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
-                && error.message.contains("is stale; latest accepted sequence")
-            {
-                ApiError {
-                    status: StatusCode::CONFLICT,
-                    message: error.message,
-                    code: Some("writer.stale_sequence"),
-                }
-            } else if error.code
-                == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
-                && error.message.contains("has a gap; expected")
-            {
-                ApiError {
-                    status: StatusCode::CONFLICT,
-                    message: error.message,
-                    code: Some("writer.sequence_gap"),
-                }
-            } else if error.code
-                == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
-                && error.message.contains("different record bytes")
-            {
-                ApiError {
-                    status: StatusCode::CONFLICT,
-                    message: error.message,
-                    code: Some("writer.sequence_conflict"),
-                }
-            } else if error.code
-                == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
-                && error
-                    .message
-                    .contains("Cursor already belongs to another position")
-            {
-                // A request_id reuse whose bytes differ from the committed
-                // record is request poison, not persistence sickness: the
-                // Cursor binds the original request identity, so refuse the
-                // mismatched retry as a client conflict rather than a
-                // retryable storage failure.
-                ApiError {
-                    status: StatusCode::CONFLICT,
-                    message: error.message,
-                    code: None,
-                }
-            } else {
-                majority_api_error(error)
-            };
-            OwnerAppendError { api, occupant }
-        })?;
+    let replica_request = ReplicaAppendRequest {
+        feed_id: feed.feed_id,
+        range_id: assignment.range_id,
+        generation: assignment.generation,
+        ownership_epoch: assignment.ownership_epoch,
+        append_owner: assignment.owner,
+        expected_position: crate::active_range::RangePosition::new(0),
+        identity: AppendIdentity {
+            writer_session_id: request.writer_session_id,
+            writer_epoch: request.writer_epoch,
+            sequence: request.sequence,
+        },
+        cursor,
+        frame_base64: String::new(),
+        pending_effect: request.pending_effect,
+    };
+    // Session appends mint the Writer sequence on the owner inside the
+    // range's append lock so the stored frame's producer_sequence and the
+    // dedup stream agree; explicit-sequence callers encode up front.
+    let result = if request.mint_sequence {
+        coordinator
+            .append_minted(replica_request, encode_with_sequence)
+            .await
+    } else {
+        let mut replica_request = replica_request;
+        replica_request.frame_base64 = encode_with_sequence(request.sequence)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        coordinator.append(replica_request).await
+    }
+    .map_err(|error| {
+        let occupant = error.pending_effect.clone();
+        // A refused append leaves its allocated Writer sequence
+        // unconsumed; once later appends advance the stream, the
+        // deduped allocation can never fill the hole. Tag it so the
+        // session append path can re-allocate and heal the retry.
+        let api = if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
+            && error.message.contains("is stale; latest accepted sequence")
+        {
+            ApiError {
+                status: StatusCode::CONFLICT,
+                message: error.message,
+                code: Some("writer.stale_sequence"),
+            }
+        } else if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
+            && error.message.contains("has a gap; expected")
+        {
+            ApiError {
+                status: StatusCode::CONFLICT,
+                message: error.message,
+                code: Some("writer.sequence_gap"),
+            }
+        } else if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
+            && error.message.contains("different record bytes")
+        {
+            ApiError {
+                status: StatusCode::CONFLICT,
+                message: error.message,
+                code: Some("writer.sequence_conflict"),
+            }
+        } else if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
+            && error
+                .message
+                .contains("Cursor already belongs to another position")
+        {
+            // A request_id reuse whose bytes differ from the committed
+            // record is request poison, not persistence sickness: the
+            // Cursor binds the original request identity, so refuse the
+            // mismatched retry as a client conflict rather than a
+            // retryable storage failure.
+            ApiError {
+                status: StatusCode::CONFLICT,
+                message: error.message,
+                code: None,
+            }
+        } else {
+            majority_api_error(error)
+        };
+        OwnerAppendError { api, occupant }
+    })?;
     state
         .demand
         .record_range_append(assignment.range_id, &pressure_key, pressure_bytes);
@@ -23596,6 +23617,53 @@ mod tests {
         assert!(reply.result.is_some());
         assert_eq!(reply.position, Some(1));
         plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_writer_session_epoch_is_fenced_before_the_owner_mints() {
+        let directory = TempDir::new().unwrap();
+        let (app, _plane, control, _replica) = internal_replica_test_router(&directory).await;
+        let bootstrap = Some("this-is-a-long-development-api-key");
+        // Catalog-direct commands stand in for the applied Control Plane
+        // view (the fixture raft has no quorum). The second open rotates
+        // the session epoch: epoch 1 is fenced even though the client
+        // still holds it.
+        control
+            .execute(
+                "CREATE WRITER orders.writer TO orders.events;                  OPEN WRITER SESSION orders.writer;                  OPEN WRITER SESSION orders.writer;",
+            )
+            .await
+            .unwrap();
+
+        let append = |epoch: u64| {
+            admin_request(
+                "/v1/writers/append",
+                json!({
+                    "request_id": Uuid::new_v4(),
+                    "writer": "orders.writer",
+                    "session_epoch": epoch,
+                    "key_base64": "a2V5LTE=",
+                    "payload_base64": "cGF5bG9hZA==",
+                }),
+                bootstrap,
+            )
+        };
+        let stale = app.clone().oneshot(append(1)).await.unwrap();
+        let status = stale.status();
+        let body = axum::body::to_bytes(stale.into_body(), 4096).await.unwrap();
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{message}");
+        assert!(message.contains("stale Writer session epoch"), "{message}");
+
+        // The current epoch clears the session fence; this fixture has no
+        // append coordinator, so the failure surfaces later at the owner
+        // path - never as a session-epoch refusal.
+        let current = app.clone().oneshot(append(2)).await.unwrap();
+        let body = axum::body::to_bytes(current.into_body(), 4096)
+            .await
+            .unwrap();
+        let message = String::from_utf8_lossy(&body);
+        assert!(!message.contains("stale Writer session epoch"), "{message}");
     }
 
     #[test]

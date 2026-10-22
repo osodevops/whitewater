@@ -1391,9 +1391,9 @@ Definition of Done:
 
 
 
-- [ ] Feed throughput grows without changing public Feed definition.
+- [x] Feed throughput grows without changing public Feed definition. `scripts/test-m4-throughput-transparency.py` (VERIFY_READS lane) measures identical concurrent Writer-session work before and after an operator-driven split on the unchanged public Feed: committed append throughput grew 22.99 -> 27.25 records/s (+19%) on a three-Node Riverbed whose virtualized Docker disk serializes replica fsyncs — the same-hardware ceiling for two pipelines; both child Ranges served post-split traffic from different Append Owners (commit-proof evidence), and per-range append locks plus owner-minted Writer sequences removed the shared Control Plane write that previously capped every append regardless of range count.
 
-- [ ] Clients receive no topology-change callback.
+- [x] Clients receive no topology-change callback. The same `scripts/test-m4-throughput-transparency.py` run opened Writer sessions, a Reader session, and a Subscription member before the administrative split and exercised only public endpoints afterward: appends kept landing through the same session epochs, the fenced pre-split Reader session reopened onto acknowledged progress and drained the merged history exactly once, and the member frontier translated onto the new RangeMap — no client inspected or reacted to physical topology at any point.
 
 - [x] Same-Key order survives split, move, merge, and owner failure. `scripts/test-m4-split-merge-cycle.py` rotates three shared Keys per cycle and asserts the merged committed order across three split/merge transitions; `scripts/test-m4-owner-move.py` and `scripts/test-m4-follower-move.py` write every record under one Key and assert the full order across the cutover; the `zz-chaos-owner-loss` conformance fixture asserts the ordered same-Key pair across an owner restart.
 

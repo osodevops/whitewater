@@ -244,7 +244,9 @@ pub struct ReplicaAppendService {
     /// `frozen_generations`; `recovery_status` reports such an owner as
     /// unhealthy so ownership moves instead of writes stalling forever.
     quorum_blocked_ranges: Arc<RwLock<HashSet<RangeId>>>,
-    append_gate: Arc<Mutex<()>>,
+    // Serialized per range: appends and generation freezes for one range
+    // must not interleave, but unrelated ranges pipeline on this Node.
+    append_gates: Arc<Mutex<std::collections::BTreeMap<RangeId, Arc<Mutex<()>>>>>,
 }
 
 impl ReplicaAppendService {
@@ -261,7 +263,7 @@ impl ReplicaAppendService {
             store_open_gate: Arc::new(Mutex::new(())),
             frozen_generations: Arc::new(RwLock::new(HashSet::new())),
             quorum_blocked_ranges: Arc::new(RwLock::new(HashSet::new())),
-            append_gate: Arc::new(Mutex::new(())),
+            append_gates: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
         }
     }
 
@@ -269,8 +271,17 @@ impl ReplicaAppendService {
         &self.local_node
     }
 
+    async fn append_gate(&self, range_id: RangeId) -> Arc<Mutex<()>> {
+        self.append_gates
+            .lock()
+            .await
+            .entry(range_id)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     pub async fn freeze_generation(&self, range_id: RangeId, generation: RangeGeneration) {
-        let _gate = self.append_gate.lock().await;
+        let _gate = self.append_gate(range_id).await.lock_owned().await;
         self.frozen_generations
             .write()
             .await
@@ -303,6 +314,22 @@ impl ReplicaAppendService {
     /// Clears the quorum-blocked mark after a successful quorum append.
     pub async fn note_owner_quorum_restored(&self, range_id: RangeId) {
         self.quorum_blocked_ranges.write().await.remove(&range_id);
+    }
+
+    /// The next contiguous Writer sequence on this replica's landed dedup
+    /// stream. Owner-only use: the coordinator reads it under the range's
+    /// append serialization so the mint cannot interleave with a landing.
+    pub async fn next_writer_sequence(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        writer_session_id: Uuid,
+        writer_epoch: u64,
+    ) -> Result<u64, ReplicaAppendError> {
+        let store = self.store_for(assignment).await?;
+        store
+            .next_writer_sequence(writer_session_id, writer_epoch)
+            .await
+            .map_err(|error| ReplicaAppendError::storage(error.to_string()))
     }
 
     pub async fn next_position(
@@ -991,7 +1018,7 @@ impl ReplicaAppendService {
         &self,
         request: ReplicaAppendRequest,
     ) -> Result<ReplicaAppendAccepted, ReplicaAppendError> {
-        let _gate = self.append_gate.lock().await;
+        let _gate = self.append_gate(request.range_id).await.lock_owned().await;
         if self
             .generation_is_frozen(request.range_id, request.generation)
             .await

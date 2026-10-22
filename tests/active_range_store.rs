@@ -1440,3 +1440,29 @@ async fn a_stale_index_checkpoint_never_hides_sealed_segment_corruption() {
         "sealed corruption must fail open even though a checkpoint exists"
     );
 }
+
+#[tokio::test]
+async fn next_writer_sequence_tracks_the_landed_stream_across_reopen() {
+    let directory = TempDir::new().unwrap();
+    let writer = Uuid::from_u128(3);
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    // A writer that never landed on this range mints sequence 1.
+    assert_eq!(store.next_writer_sequence(writer, 1).await.unwrap(), 1);
+    // An untouched writer identity starts at 1 independently.
+    assert_eq!(
+        store
+            .next_writer_sequence(Uuid::from_u128(99), 1)
+            .await
+            .unwrap(),
+        1
+    );
+    store.append(append(1, b"one")).await.unwrap();
+    store.append(append(2, b"two")).await.unwrap();
+    assert_eq!(store.next_writer_sequence(writer, 1).await.unwrap(), 3);
+    // The mint derives from landed dedup state, so it survives restart.
+    drop(store);
+    let reopened = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    assert_eq!(reopened.next_writer_sequence(writer, 1).await.unwrap(), 3);
+    // A different epoch mints its own stream from scratch.
+    assert_eq!(reopened.next_writer_sequence(writer, 7).await.unwrap(), 1);
+}

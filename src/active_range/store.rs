@@ -265,6 +265,17 @@ pub trait ActiveRangeStore: Send + Sync {
         &self,
         cursor: &str,
     ) -> Result<Option<RangePosition>, ActiveRangeStoreError>;
+    /// The next contiguous Writer sequence this Range accepts for the
+    /// stream, derived from landed dedup state. The caller must serialize
+    /// mints for this Range (the coordinator's per-range append lock) so a
+    /// minted number cannot be offered twice; a minted sequence is only
+    /// consumed when the append lands, so a failed mint never gaps the
+    /// stream and every retry re-derives the same number or deduplicates.
+    async fn next_writer_sequence(
+        &self,
+        writer_session_id: Uuid,
+        writer_epoch: u64,
+    ) -> Result<u64, ActiveRangeStoreError>;
     /// Resolve the ingest-time boundary inside the committed prefix: the
     /// last committed frame ingested before `threshold` (its position and
     /// Cursor), or the range-start marker when the committed head already
@@ -704,6 +715,31 @@ impl ActiveRangeStore for FileActiveRangeStore {
                 .get(&cursor)
                 .copied()
                 .filter(|position| position.value() <= loaded.persisted.committed))
+        })
+        .await
+    }
+
+    async fn next_writer_sequence(
+        &self,
+        writer_session_id: Uuid,
+        writer_epoch: u64,
+    ) -> Result<u64, ActiveRangeStoreError> {
+        self.blocking(move |inner| {
+            let loaded = inner
+                .loaded
+                .lock()
+                .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+            let key = WriterKey {
+                writer_session_id,
+                writer_epoch,
+            };
+            match loaded.deduplication.get(&key) {
+                Some(state) => state
+                    .sequence
+                    .checked_add(1)
+                    .ok_or(ActiveRangeStoreError::PositionOverflow),
+                None => Ok(1),
+            }
         })
         .await
     }
@@ -1297,7 +1333,14 @@ fn append_locked(
         });
     }
     if flush {
-        let persistence = persist_state(&inner.directory, &next);
+        // A pending-effect marker must be crash-durable with its frames; a
+        // plain append's dedup/appended/flushed bookkeeping is recomputed
+        // by recovery rescan, so it takes the checkpoint-only write.
+        let persistence = if next.pending_effect.is_some() {
+            persist_state(&inner.directory, &next)
+        } else {
+            persist_state_lazy(&inner.directory, &next)
+        };
         loaded.persisted = next;
         persistence?;
     } else {
@@ -2150,6 +2193,30 @@ fn persist_state(
     file.sync_all()?;
     fs::rename(&temporary, &target)?;
     sync_directory(directory)?;
+    Ok(())
+}
+
+/// Checkpoint-only write for state whose durable record is the frame log
+/// itself: appended/flushed watermarks and Writer dedup streams are
+/// recomputed by recovery rescan, so the per-append path writes the
+/// snapshot atomically (temporary file + rename) but skips the fsync
+/// ceremony — a crash replays the tail and rebuilds the checkpoint.
+/// Committed positions, topology epochs, and pending-effect markers take
+/// `persist_state` instead: losing them would change observed semantics.
+fn persist_state_lazy(
+    directory: &Path,
+    state: &PersistedRangeState,
+) -> Result<(), ActiveRangeStoreError> {
+    let target = directory.join("range-state.json");
+    let temporary = directory.join("range-state.json.tmp");
+    let encoded = serde_json::to_vec(state)?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&temporary)?;
+    file.write_all(&encoded)?;
+    fs::rename(&temporary, &target)?;
     Ok(())
 }
 

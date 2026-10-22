@@ -80,6 +80,7 @@ VERIFY_READS = (
     "test-m4-live-split.py",
     "test-m4-split-merge-cycle.py",
     "test-m4-large-history.py",
+    "test-m4-throughput-transparency.py",
     "test-sdk-rust.py",
     "test-wcl-cli-write.py",
 )
