@@ -166,20 +166,27 @@ def drive_probe(node, pipe_id, subscription_id, storage_node, epoch):
     )
 
 
-def find_progress_owner(pipe_id, subscription_id):
+def find_progress_owner(pipe_id, subscription_id, sweeps=60):
     """Probe each storage Node with owner=receiver=<that Node>. Only the
     current progress owner accepts the drive; a stale epoch or wrong owner
-    is fenced, so a 200 is an authoritative answer."""
-    for _ in range(60):
+    is fenced, so a 200 is an authoritative answer. The last statuses each
+    Node returned ride the AssertionError: 409s mean placement never moved,
+    5xx mean the owner answered but the drive stayed degraded, and 0s mean
+    the Node was unreachable — three different root causes."""
+    seen = {}
+    for _ in range(sweeps):
         for index, node in enumerate(NODES):
-            for epoch in range(1, 8):
+            statuses = seen.setdefault(SERVICES[index], [])
+            for epoch in range(1, 21):
                 status, body = drive_probe(
                     node, pipe_id, subscription_id, SERVICES[index], epoch
                 )
+                statuses.append((epoch, status))
+                del statuses[:-8]
                 if status == 200:
                     return SERVICES[index], epoch
         time.sleep(1)
-    raise AssertionError("no Node accepted the Pipe drive")
+    raise AssertionError({"no Node accepted the Pipe drive": seen})
 
 
 def main():
@@ -242,15 +249,20 @@ def main():
         wcl(NODES[0], f"DRAIN STORAGE NODE {owner};")
         new_owner, new_epoch = None, None
         deadline = time.time() + 120
+        last_probe = None
         while time.time() < deadline:
-            found = find_progress_owner(pipe_id, subscription_id)
-            if found[0] != owner and found[1] > epoch:
-                new_owner, new_epoch = found
-                break
+            try:
+                found = find_progress_owner(pipe_id, subscription_id, sweeps=10)
+            except AssertionError as error:
+                last_probe = error
+            else:
+                if found[0] != owner and found[1] > epoch:
+                    new_owner, new_epoch = found
+                    break
             time.sleep(2)
         if new_owner is None:
             raise AssertionError(
-                f"drain did not move the Subscription progress owner off {owner}"
+                {"drain did not move the Subscription progress owner off " + owner: last_probe}
             )
 
         # Feed range moves during the drain can briefly freeze appends;

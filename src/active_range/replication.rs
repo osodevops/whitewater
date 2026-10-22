@@ -1048,6 +1048,29 @@ impl ReplicaAppendService {
         &self,
         request: ReplicaAppendRequest,
     ) -> Result<ReplicaAppendAccepted, ReplicaAppendError> {
+        self.append_inner(request, false).await
+    }
+
+    /// Replay one owner-authoritative frame under the same replica fencing
+    /// as `append`, but without live-Writer sequence ordering: replica
+    /// fan-out, gap re-drives, and repair/catch-up all install positions from
+    /// the owner's log, whose Writer sequences can sit below the local dedup
+    /// high-water when dedup-consumed retries advanced the stream watermark
+    /// without landing frames. Position, digest, Cursor, and pending-effect
+    /// integrity checks still apply; a conflicting occupant still fails
+    /// closed.
+    pub async fn import_committed(
+        &self,
+        request: ReplicaAppendRequest,
+    ) -> Result<ReplicaAppendAccepted, ReplicaAppendError> {
+        self.append_inner(request, true).await
+    }
+
+    async fn append_inner(
+        &self,
+        request: ReplicaAppendRequest,
+        import: bool,
+    ) -> Result<ReplicaAppendAccepted, ReplicaAppendError> {
         let _gate = self.append_gate(request.range_id).await.lock_owned().await;
         if self
             .generation_is_frozen(request.range_id, request.generation)
@@ -1110,18 +1133,21 @@ impl ReplicaAppendService {
         };
         self.validate_assignment(&assignment, &request)?;
         let store = self.store_for(&assignment).await?;
-        let result = store
-            .append(ActiveRangeAppend {
-                generation: request.generation,
-                ownership_epoch: request.ownership_epoch,
-                expected_position: Some(request.expected_position),
-                identity: request.identity,
-                cursor: request.cursor,
-                frame,
-                pending_effect: request.pending_effect,
-            })
-            .await
-            .map_err(map_store_error)?;
+        let append = ActiveRangeAppend {
+            generation: request.generation,
+            ownership_epoch: request.ownership_epoch,
+            expected_position: Some(request.expected_position),
+            identity: request.identity,
+            cursor: request.cursor,
+            frame,
+            pending_effect: request.pending_effect,
+        };
+        let result = if import {
+            store.import_split(append).await
+        } else {
+            store.append(append).await
+        }
+        .map_err(map_store_error)?;
         Ok(ReplicaAppendAccepted {
             position: result.position,
             message_id: result.message_id,
@@ -1526,5 +1552,200 @@ mod tests {
         assert!(missing_right.retryable);
         assert!(missing_right.message.contains(&right.range_id.to_string()));
         assert!(require_all_assignments_locally(&[left, right], &fourth).is_err());
+    }
+
+    #[tokio::test]
+    async fn import_committed_replays_history_below_the_writer_high_water() {
+        let root = tempfile::TempDir::new().unwrap();
+        let nodes = ["storage-1", "storage-2", "storage-3"]
+            .map(|node| StorageNodeId::try_new(node).unwrap());
+        let legacy: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(root.path().join("legacy")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                root.path().join("catalog.json"),
+                legacy,
+                nodes.to_vec(),
+            )
+            .unwrap(),
+        );
+        let created = control
+            .execute_commands(vec![
+                Command::CreateSpace {
+                    name: "orders".to_owned(),
+                },
+                Command::CreateFeed {
+                    name: "orders.events".to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+        let feed_id: Uuid =
+            serde_json::from_value(created.results[1].data["feed_id"].clone()).unwrap();
+        let assignment = control.active_range_assignment(feed_id).await.unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        let replica_root = root.path().join("replica");
+        crate::active_range::store::seed_committed_history(&replica_root, &descriptor, 4);
+        let replica_id = assignment
+            .replicas
+            .iter()
+            .find(|node| **node != assignment.owner)
+            .unwrap()
+            .clone();
+        use crate::domain::StoredRecord;
+        let replica = ReplicaAppendService::new(&replica_root, replica_id, control.clone());
+
+        // Dedup-consumed retries advance the Writer stream watermark to 8
+        // without landing frames: every retry re-requests its already-landed
+        // Cursor, so position 4 stays the last frame while sequence 8 is on
+        // record. The seeded history uses writer_session_id 3 with sequences
+        // 1-4 at positions 1-4.
+        let writer_session_id = Uuid::from_u128(3);
+        for sequence in 5..=8 {
+            let record = StoredRecord {
+                message_id: Uuid::from_u128(104),
+                producer_id: writer_session_id,
+                producer_sequence: sequence,
+                event_time_ns: 4,
+                ingest_time_ns: 4,
+                key: b"key".to_vec(),
+                payload: Vec::new(),
+                metadata: Default::default(),
+            };
+            let accepted = replica
+                .append(ReplicaAppendRequest {
+                    feed_id,
+                    range_id: assignment.range_id,
+                    generation: assignment.generation,
+                    ownership_epoch: assignment.ownership_epoch,
+                    append_owner: assignment.owner.clone(),
+                    expected_position: RangePosition::new(5),
+                    identity: AppendIdentity {
+                        writer_session_id,
+                        writer_epoch: 1,
+                        sequence,
+                    },
+                    cursor: "cursor-4".to_owned(),
+                    frame_base64: STANDARD.encode(crate::codec::encode_record(&record).unwrap()),
+                    pending_effect: None,
+                })
+                .await
+                .unwrap();
+            assert!(accepted.deduplicated);
+            assert_eq!(accepted.position, RangePosition::new(4));
+        }
+
+        // The repair frame is committed history from the quorum: position 5,
+        // Writer sequence 5. The live-Writer append path must still refuse
+        // it as stale against the stream watermark.
+        let repair_record = StoredRecord {
+            message_id: Uuid::from_u128(105),
+            producer_id: writer_session_id,
+            producer_sequence: 5,
+            event_time_ns: 5,
+            ingest_time_ns: 5,
+            key: b"key".to_vec(),
+            payload: Vec::new(),
+            metadata: Default::default(),
+        };
+        let repair_request = ReplicaAppendRequest {
+            feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+            append_owner: assignment.owner.clone(),
+            expected_position: RangePosition::new(5),
+            identity: AppendIdentity {
+                writer_session_id,
+                writer_epoch: 1,
+                sequence: 5,
+            },
+            cursor: "cursor-5".to_owned(),
+            frame_base64: STANDARD.encode(crate::codec::encode_record(&repair_record).unwrap()),
+            pending_effect: None,
+        };
+        let live_error = replica
+            .append(repair_request.clone())
+            .await
+            .expect_err("live appends below the stream watermark stay fenced");
+        assert_eq!(
+            live_error.code,
+            ReplicaAppendErrorCode::WriterSequenceConflict
+        );
+        assert!(live_error.message.contains("is stale"));
+
+        let accepted = replica
+            .import_committed(repair_request)
+            .await
+            .expect("committed-history replay must bypass the stream ordering fence");
+        assert_eq!(accepted.position, RangePosition::new(5));
+        assert!(!accepted.deduplicated);
+
+        replica
+            .commit(ReplicaCommitRequest {
+                feed_id,
+                range_id: assignment.range_id,
+                generation: assignment.generation,
+                ownership_epoch: assignment.ownership_epoch,
+                append_owner: assignment.owner.clone(),
+                commit_position: CommitPosition::new(5),
+                frame_digest: accepted.frame_digest,
+            })
+            .await
+            .unwrap();
+
+        // Position and digest remain the fork guards under import: replaying
+        // the same committed frame deduplicates, while different bytes at an
+        // already-committed position conflict rather than fork the log.
+        let mut replay = repair_request_for(&assignment, 5);
+        replay.identity.sequence = 5;
+        replay.cursor = "cursor-5".to_owned();
+        replay.frame_base64 = STANDARD.encode(crate::codec::encode_record(&repair_record).unwrap());
+        let replayed = replica.import_committed(replay).await.unwrap();
+        assert!(replayed.deduplicated);
+        assert_eq!(replayed.position, RangePosition::new(5));
+
+        let mut tampered = repair_record.clone();
+        tampered.payload = b"tampered".to_vec();
+        let mut tampered_request = repair_request_for(&assignment, 5);
+        tampered_request.identity.sequence = 5;
+        tampered_request.cursor = "cursor-5b".to_owned();
+        tampered_request.frame_base64 =
+            STANDARD.encode(crate::codec::encode_record(&tampered).unwrap());
+        let tampered_error = replica
+            .import_committed(tampered_request)
+            .await
+            .expect_err("different bytes at a committed position must conflict");
+        assert_eq!(
+            tampered_error.code,
+            ReplicaAppendErrorCode::PositionConflict
+        );
+    }
+
+    fn repair_request_for(
+        assignment: &ActiveRangeAssignment,
+        position: u64,
+    ) -> ReplicaAppendRequest {
+        ReplicaAppendRequest {
+            feed_id: assignment.feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+            append_owner: assignment.owner.clone(),
+            expected_position: RangePosition::new(position),
+            identity: AppendIdentity {
+                writer_session_id: Uuid::from_u128(3),
+                writer_epoch: 1,
+                sequence: position,
+            },
+            cursor: String::new(),
+            frame_base64: String::new(),
+            pending_effect: None,
+        }
     }
 }

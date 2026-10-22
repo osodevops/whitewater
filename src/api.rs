@@ -1383,7 +1383,12 @@ async fn replica_append(
     })?;
     let range_id = request.range_id;
     let wire_bytes = request.frame_base64.len();
-    Ok(Json(match service.append(request).await {
+    // Replica fan-out replays the owner's authoritative log, not live Writer
+    // traffic: dedup-consumed retries can carry a replica's Writer watermark
+    // ahead of its landed positions, so applying live-ordering fences here
+    // wedges replication. Placement, epoch, position, digest, and pending-
+    // effect checks still fence the import.
+    Ok(Json(match service.import_committed(request).await {
         Ok(result) => {
             state.demand.record_range_replication(range_id, wire_bytes);
             ReplicaAppendResponse {
@@ -2328,6 +2333,171 @@ impl SubscriptionProgressRecoverySupervisor {
                 }
             }
         }
+    }
+}
+
+/// Leader-driven recovery for dead StateStore journal owners. Mutations
+/// allocate their sequence on the journal owner, so a dead owner wedges
+/// every writer — Pipe drives, enrichment mutations — until placement
+/// moves. The CAS only moves ownership: a survivor holding the freshest
+/// committed head is chosen so the new owner cannot allocate a sequence the
+/// quorum already committed, and the periodic replica catch-up converges
+/// the rest of the set afterward. A dead owner must persist across
+/// consecutive probes before the supervisor moves it, so a slow replica
+/// that still answers fences itself without an unnecessary move.
+pub struct StateStoreOwnerRecoverySupervisor {
+    threshold: u32,
+    failures: std::sync::Mutex<BTreeMap<Uuid, (crate::active_range::StorageNodeId, u32)>>,
+}
+
+impl StateStoreOwnerRecoverySupervisor {
+    pub fn new(threshold: u32) -> Self {
+        Self {
+            threshold: threshold.max(1),
+            failures: std::sync::Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub async fn tick(&self, state: &AppState) {
+        let Some(plane) = &state.control_plane else {
+            return;
+        };
+        if plane.status().await.state != "leader" {
+            return;
+        }
+        for assignment in state.control.active_state_store_assignments().await {
+            let Ok(transport) = state_store_transport_for(state, &assignment) else {
+                continue;
+            };
+            let alive = transport
+                .inspect(
+                    &assignment.owner,
+                    crate::state_store::StateStoreInspectRequest {
+                        owner: assignment.owner.clone(),
+                        receiver: assignment.owner.clone(),
+                        store_id: assignment.store_id,
+                        ownership_epoch: assignment.ownership_epoch,
+                    },
+                )
+                .await
+                .is_ok();
+            let should_recover = {
+                let mut failures = self
+                    .failures
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if alive {
+                    failures.remove(&assignment.store_id);
+                    false
+                } else {
+                    let entry = failures
+                        .entry(assignment.store_id)
+                        .or_insert_with(|| (assignment.owner.clone(), 0));
+                    if entry.0 != assignment.owner {
+                        *entry = (assignment.owner.clone(), 0);
+                    }
+                    entry.1 = entry.1.saturating_add(1);
+                    entry.1 >= self.threshold
+                }
+            };
+            if !should_recover {
+                continue;
+            }
+            match self.recover(state, &assignment, transport.as_ref()).await {
+                Ok(new_owner) => {
+                    self.failures
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&assignment.store_id);
+                    tracing::info!(
+                        store_id = %assignment.store_id,
+                        owner = %new_owner,
+                        "StateStore journal owner recovered"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        store_id = %assignment.store_id,
+                        owner = %assignment.owner,
+                        ownership_epoch = assignment.ownership_epoch,
+                        "background StateStore owner recovery attempt failed"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Inspect every replica and hand ownership to the freshest reachable
+    /// one: the survivor holding the highest committed head can never
+    /// allocate a sequence the quorum already committed, so a lagging
+    /// replica is never promoted ahead of its own catch-up.
+    async fn recover(
+        &self,
+        state: &AppState,
+        assignment: &crate::state_store::StateStoreAssignment,
+        transport: &dyn crate::state_store::StateStoreMutationTransport,
+    ) -> Result<crate::active_range::StorageNodeId, crate::state_store::StateStoreMutationError>
+    {
+        let replies = futures_util::future::join_all(assignment.replicas.iter().map(|node| {
+            transport.inspect(
+                node,
+                crate::state_store::StateStoreInspectRequest {
+                    owner: assignment.owner.clone(),
+                    receiver: node.clone(),
+                    store_id: assignment.store_id,
+                    ownership_epoch: assignment.ownership_epoch,
+                },
+            )
+        }))
+        .await;
+        let mut best: Option<(crate::active_range::StorageNodeId, u64)> = None;
+        for (node, reply) in assignment.replicas.iter().zip(replies) {
+            let Ok(reply) = reply else { continue };
+            if reply.replica != *node
+                || reply.store_id != assignment.store_id
+                || reply.ownership_epoch != assignment.ownership_epoch
+            {
+                continue;
+            }
+            let freshness = reply
+                .result
+                .committed
+                .as_ref()
+                .map(|mutation| mutation.sequence)
+                .unwrap_or(0)
+                .max(reply.result.applied_seq);
+            if best
+                .as_ref()
+                .map(|(_, seen)| freshness > *seen)
+                .unwrap_or(true)
+            {
+                best = Some((node.clone(), freshness));
+            }
+        }
+        let (new_owner, _) = best.ok_or(crate::state_store::StateStoreMutationError::NoQuorum)?;
+        // Re-read the live placement before CASing: a racing recovery may
+        // already have moved ownership while evidence was being collected,
+        // and CASing a stale expected epoch fails closed rather than
+        // ratcheting ownership twice.
+        let current = state
+            .control
+            .active_state_store_assignment_by_id(assignment.store_id)
+            .await
+            .unwrap_or_else(|| assignment.clone());
+        if current.owner != assignment.owner {
+            return Ok(current.owner);
+        }
+        state
+            .progress_authority
+            .execute_placement_commands(vec![crate::control::Command::RecoverStateStoreOwner {
+                store_id: assignment.store_id,
+                expected_ownership_epoch: current.ownership_epoch,
+                new_owner: new_owner.clone(),
+            }])
+            .await
+            .map_err(|_| crate::state_store::StateStoreMutationError::Unavailable)?;
+        Ok(new_owner)
     }
 }
 
@@ -24261,6 +24431,42 @@ mod tests {
         assert_eq!(after.owner, before.owner);
         assert_eq!(after.ownership_epoch, before.ownership_epoch);
     }
+
+    #[tokio::test]
+    async fn state_store_supervisor_stays_idle_until_this_node_leads() {
+        // Same leader gate as Subscription progress recovery: only the
+        // Control Plane leader may CAS journal ownership, so a partitioned
+        // follower never moves a store owner it cannot corroborate.
+        let directory = TempDir::new().unwrap();
+        let (state, _plane, control, _replica) = internal_replica_test_state(&directory).await;
+        control
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "orders.profiles".to_owned(),
+                source: crate::control::StateStoreSourceRequest::Manual,
+                named_keys: vec![],
+            }])
+            .await
+            .unwrap();
+        let store = control
+            .state_store_definitions()
+            .await
+            .into_iter()
+            .next()
+            .unwrap();
+        let before = control
+            .active_state_store_assignment_by_id(store.store_id)
+            .await
+            .unwrap();
+        let supervisor = StateStoreOwnerRecoverySupervisor::new(2);
+        supervisor.tick(&state).await;
+        let after = control
+            .active_state_store_assignment_by_id(store.store_id)
+            .await
+            .unwrap();
+        assert_eq!(after.owner, before.owner);
+        assert_eq!(after.ownership_epoch, before.ownership_epoch);
+    }
+
     /// In-memory CutoverPrefix over a contiguous committed prefix so the
     /// streaming cutover translations are exercised without a live owner —
     /// including histories past the retired 10,000-frame materialization

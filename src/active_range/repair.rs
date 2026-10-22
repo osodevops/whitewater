@@ -658,7 +658,7 @@ pub async fn repair_replica(
         for item in frames {
             let digest = *blake3::hash(&item.frame).as_bytes();
             let accepted = target
-                .append(ReplicaAppendRequest {
+                .import_committed(ReplicaAppendRequest {
                     feed_id: assignment.feed_id,
                     range_id: assignment.range_id,
                     generation: assignment.generation,
@@ -863,7 +863,7 @@ impl LocalRepairSupervisor {
                 let digest = *blake3::hash(&frame).as_bytes();
                 let accepted = self
                     .local
-                    .append(ReplicaAppendRequest {
+                    .import_committed(ReplicaAppendRequest {
                         feed_id: assignment.feed_id,
                         range_id: assignment.range_id,
                         generation: assignment.generation,

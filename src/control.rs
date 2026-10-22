@@ -1520,6 +1520,17 @@ pub enum Command {
         replaced: StorageNodeId,
         replacement: StorageNodeId,
     },
+    /// Recover a dead StateStore journal owner onto a surviving replica:
+    /// the committed mutation prefix already lives on the replica quorum
+    /// and the new owner catches up through the periodic replica catch-up
+    /// pass, so the CAS carries placement fencing only. Mutations allocate
+    /// their sequence on the owner, which makes owner liveness a
+    /// write-availability precondition.
+    RecoverStateStoreOwner {
+        store_id: Uuid,
+        expected_ownership_epoch: u64,
+        new_owner: StorageNodeId,
+    },
     /// Move a Pipe's epoch-fenced compute lease to another
     /// storage-eligible Node. `expected_compute_epoch` fences stale
     /// drain plans; operator moves through `MOVE PIPE COMPUTE` leave it
@@ -1608,6 +1619,7 @@ impl Command {
                 | Self::AbortOwnerMove { .. }
                 | Self::RecoverSubscriptionProgressOwner { .. }
                 | Self::MoveSubscriptionProgressReplica { .. }
+                | Self::RecoverStateStoreOwner { .. }
         )
     }
 }
@@ -2402,6 +2414,22 @@ impl ControlController {
         // a present definition with an assignment is active.
         state.state_stores.get(&store_id)?;
         state.state_store_assignments.get(&store_id).cloned()
+    }
+
+    /// Every StateStore with a live journal placement — the recovery
+    /// supervisor's scan input. A present definition with an assignment is
+    /// active; declared stores awaiting a placement have nothing to
+    /// recover and are absent.
+    pub async fn active_state_store_assignments(
+        &self,
+    ) -> Vec<crate::state_store::StateStoreAssignment> {
+        let state = self.state.lock().await;
+        state
+            .state_store_assignments
+            .iter()
+            .filter(|(store_id, _)| state.state_stores.contains_key(*store_id))
+            .map(|(_, assignment)| assignment.clone())
+            .collect()
     }
 
     /// Every persisted StateStore definition; placements resolve separately.
@@ -4381,6 +4409,56 @@ impl ControlController {
                 Ok((
                     format!(
                         "moved Subscription progress replica {replaced} to {replacement} at epoch {next_epoch}"
+                    ),
+                    json!(next),
+                ))
+            }
+            Command::RecoverStateStoreOwner {
+                store_id,
+                expected_ownership_epoch,
+                new_owner,
+            } => {
+                let current = state
+                    .state_store_assignments
+                    .get(&store_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "StateStore journal placement for {store_id}"
+                        ))
+                    })?;
+                if current.ownership_epoch != expected_ownership_epoch {
+                    return Err(ControlError::InvalidOperation(
+                        "StateStore ownership changed while recovery was being planned"
+                            .to_owned(),
+                    ));
+                }
+                if !current.replicas.contains(&new_owner) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "replacement owner {new_owner} is not a member of the StateStore journal replica set"
+                    )));
+                }
+                if !self.storage_eligible(state, &new_owner, issued_at_ns) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "replacement owner {new_owner} is not eligible for storage"
+                    )));
+                }
+                let next_epoch = expected_ownership_epoch.checked_add(1).ok_or_else(|| {
+                    ControlError::InvalidOperation(
+                        "StateStore ownership epoch overflowed".to_owned(),
+                    )
+                })?;
+                let next = crate::state_store::StateStoreAssignment::try_new(
+                    store_id,
+                    new_owner,
+                    current.replicas.clone(),
+                    next_epoch,
+                )
+                .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                state.state_store_assignments.insert(store_id, next.clone());
+                Ok((
+                    format!(
+                        "recovered StateStore journal ownership for {store_id} at epoch {next_epoch}"
                     ),
                     json!(next),
                 ))
@@ -8467,6 +8545,7 @@ fn command_label(command: &Command) -> String {
         Command::AbortOwnerMove { .. } => "ABORT OWNER MOVE",
         Command::RecoverSubscriptionProgressOwner { .. } => "RECOVER SUBSCRIPTION PROGRESS OWNER",
         Command::MoveSubscriptionProgressReplica { .. } => "MOVE SUBSCRIPTION PROGRESS REPLICA",
+        Command::RecoverStateStoreOwner { .. } => "RECOVER STATE STORE OWNER",
         Command::MovePipeComputeLease { .. } => "MOVE PIPE COMPUTE LEASE",
         Command::RegisterStorageNode { .. } => "REGISTER STORAGE NODE",
         Command::RetireStorageNode { .. } => "RETIRE STORAGE NODE",
@@ -10801,6 +10880,102 @@ mod tests {
             .unwrap();
         assert_eq!(persisted.owner, moved.owner);
         assert_eq!(persisted.ownership_epoch, 2);
+    }
+
+    #[tokio::test]
+    async fn state_store_owner_recovery_requires_current_epoch_and_replica_member() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute("CREATE SPACE orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        controller
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "orders.profiles".to_owned(),
+                source: StateStoreSourceRequest::Manual,
+                named_keys: vec![],
+            }])
+            .await
+            .unwrap();
+        let store = controller
+            .state_store_definitions()
+            .await
+            .into_iter()
+            .next()
+            .unwrap();
+        let assignment = controller
+            .active_state_store_assignment_by_id(store.store_id)
+            .await
+            .unwrap();
+        let survivor = assignment
+            .replicas
+            .iter()
+            .find(|node| *node != &assignment.owner)
+            .cloned()
+            .unwrap();
+        let outsider = StorageNodeId::try_new("storage-x").unwrap();
+
+        assert!(controller
+            .execute_commands(vec![Command::RecoverStateStoreOwner {
+                store_id: store.store_id,
+                expected_ownership_epoch: 1,
+                new_owner: outsider,
+            }])
+            .await
+            .is_err());
+        assert!(controller
+            .execute_commands(vec![Command::RecoverStateStoreOwner {
+                store_id: store.store_id,
+                expected_ownership_epoch: 9,
+                new_owner: survivor.clone(),
+            }])
+            .await
+            .is_err());
+        assert!(controller
+            .execute_commands(vec![Command::RecoverStateStoreOwner {
+                store_id: Uuid::from_u128(9_999),
+                expected_ownership_epoch: 1,
+                new_owner: survivor.clone(),
+            }])
+            .await
+            .is_err());
+
+        controller
+            .execute_commands(vec![Command::RecoverStateStoreOwner {
+                store_id: store.store_id,
+                expected_ownership_epoch: 1,
+                new_owner: survivor.clone(),
+            }])
+            .await
+            .unwrap();
+        let moved = controller
+            .active_state_store_assignment_by_id(store.store_id)
+            .await
+            .unwrap();
+        assert_eq!(moved.owner, survivor);
+        assert_eq!(moved.ownership_epoch, 2);
+        assert_eq!(moved.replicas, assignment.replicas);
+        // A stale expected epoch is fenced: the CAS cannot ratchet
+        // ownership twice off one observation.
+        assert!(controller
+            .execute_commands(vec![Command::RecoverStateStoreOwner {
+                store_id: store.store_id,
+                expected_ownership_epoch: 1,
+                new_owner: survivor,
+            }])
+            .await
+            .is_err());
+
+        drop(controller);
+        let reopened = new_controller(&directory);
+        let persisted = reopened
+            .active_state_store_assignment_by_id(store.store_id)
+            .await
+            .unwrap();
+        assert_eq!(persisted.owner, moved.owner);
+        assert_eq!(persisted.ownership_epoch, 2);
+        assert_eq!(reopened.active_state_store_assignments().await.len(), 1);
     }
 
     #[tokio::test]

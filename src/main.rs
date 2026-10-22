@@ -888,6 +888,30 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // StateStore journal mutations allocate their sequence on the journal
+    // owner, so a dead owner wedges every writer until placement moves.
+    // Pipe drives retry inside their own cycles, but no request path
+    // triggers owner recovery for stores — this leader-driven backstop
+    // probes owners and CASes dead ones onto the freshest surviving
+    // replica; periodic catch-up converges the rest.
+    let state_store_recovery_task = if app_state.control_plane.is_some() {
+        let state = app_state.clone();
+        let supervisor = whitewater::api::StateStoreOwnerRecoverySupervisor::new(3);
+        let mut shutdown = shutdown_tx.subscribe();
+        Some(tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(2));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => supervisor.tick(&state).await,
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
     let app = router(app_state).layer(TraceLayer::new_for_http());
     let listener = TcpListener::bind(config.bind_addr).await?;
     let tls_task = match (subscription_tls, tls_router, &config.subscription_mtls) {
@@ -943,6 +967,9 @@ async fn main() -> Result<()> {
         let _ = pipe_task.await;
     }
     if let Some(task) = subscription_recovery_task {
+        let _ = task.await;
+    }
+    if let Some(task) = state_store_recovery_task {
         let _ = task.await;
     }
     if let Some(task) = state_store_replay_task {

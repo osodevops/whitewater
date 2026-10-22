@@ -315,23 +315,30 @@ def drive_probe_once(node, pipe_id, subscription_id, storage_node, epoch):
     )
 
 
-def find_progress_owner(pipe_id, subscription_id):
+def find_progress_owner(pipe_id, subscription_id, sweeps=90):
     """Probe each storage Node with owner=receiver=<that Node>. Only the
     current progress owner accepts the drive; a stale epoch or wrong owner
-    is fenced, so a 200 is an authoritative answer."""
-    for _ in range(90):
+    is fenced, so a 200 is an authoritative answer. The last statuses each
+    Node returned ride the AssertionError: 409s mean placement never moved,
+    5xx mean the owner answered but the drive stayed degraded, and 0s mean
+    the Node was unreachable — three different root causes."""
+    seen = {}
+    for _ in range(sweeps):
         for index, node in enumerate(NODES):
-            for epoch in range(1, 12):
+            statuses = seen.setdefault(SERVICES[index], [])
+            for epoch in range(1, 21):
                 try:
                     status, _ = drive_probe_once(
                         node, pipe_id, subscription_id, SERVICES[index], epoch
                     )
                 except (ConnectionError, urllib.error.URLError, TimeoutError):
                     continue
+                statuses.append((epoch, status))
+                del statuses[:-8]
                 if status == 200:
                     return SERVICES[index], epoch
         time.sleep(1)
-    raise AssertionError("no Node accepted the Pipe drive")
+    raise AssertionError({"no Node accepted the Pipe drive": seen})
 
 
 def emissions(records):
@@ -571,15 +578,20 @@ def main():
         wcl(NODES[0], f"DRAIN STORAGE NODE {owner};")
         new_owner, new_epoch = None, None
         deadline = time.time() + 120
+        last_probe = None
         while time.time() < deadline:
-            found = find_progress_owner(pipe_id, subscription_id)
-            if found[0] != owner and found[1] > epoch:
-                new_owner, new_epoch = found
-                break
+            try:
+                found = find_progress_owner(pipe_id, subscription_id, sweeps=10)
+            except AssertionError as error:
+                last_probe = error
+            else:
+                if found[0] != owner and found[1] > epoch:
+                    new_owner, new_epoch = found
+                    break
             time.sleep(2)
         if new_owner is None:
             raise AssertionError(
-                f"drain did not move the Subscription progress owner off {owner}"
+                {"drain did not move the Subscription progress owner off " + owner: last_probe}
             )
         wcl(NODES[0], f"UNDRAIN STORAGE NODE {owner};")
 
@@ -665,16 +677,25 @@ def main():
         else:
             raise AssertionError({"member_join_for_recovery": joined})
         recovered_owner, recovered_epoch = None, None
-        deadline = time.time() + 120
+        # Hard-stop recovery waits on more than the progress CAS: the stopped
+        # voter may hold the Control Plane leadership or range ownership, so
+        # the surviving owner's drive can answer retryable errors while the
+        # rest of the cluster re-elects and re-balances.
+        deadline = time.time() + 240
+        last_probe = None
         while time.time() < deadline:
-            found = find_progress_owner(pipe_id, subscription_id)
-            if found[0] != new_owner and found[1] > new_epoch:
-                recovered_owner, recovered_epoch = found
-                break
+            try:
+                found = find_progress_owner(pipe_id, subscription_id, sweeps=10)
+            except AssertionError as error:
+                last_probe = error
+            else:
+                if found[0] != new_owner and found[1] > new_epoch:
+                    recovered_owner, recovered_epoch = found
+                    break
             time.sleep(2)
         if recovered_owner is None:
             raise AssertionError(
-                f"progress owner was not recovered off stopped Node {new_owner}"
+                {"progress owner was not recovered off stopped Node " + new_owner: last_probe}
             )
         subprocess.run([*COMPOSE, "start", new_owner], check=True)
         wait_for_fabric()
