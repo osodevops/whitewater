@@ -1253,3 +1253,190 @@ async fn import_split_batch_flushes_once_and_resumes_through_dedup() {
         assert_eq!(record.payload, format!("staged-{}", index + 1).as_bytes());
     }
 }
+
+use std::io::{Read as _, Seek as _, SeekFrom};
+
+fn checkpoint_file(root: &Path, segment: u64) -> PathBuf {
+    range_directory(root).join(format!("index-checkpoint-{segment:06}.bin"))
+}
+
+#[tokio::test]
+async fn sealed_segments_persist_index_checkpoints_that_reopen_uses() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open_with_options(
+        directory.path(),
+        descriptor(),
+        FileActiveRangeStoreOptions {
+            max_segment_bytes: 1,
+            max_range_bytes: None,
+        },
+    )
+    .unwrap();
+    // max_segment_bytes: 1 seals every committed segment: three committed
+    // records leave two sealed segments plus the active one.
+    for sequence in 1..=3_u64 {
+        store.append(append(sequence, b"payload")).await.unwrap();
+        store
+            .commit(
+                RangeGeneration::new(1),
+                OwnershipEpoch::new(1),
+                CommitPosition::new(sequence),
+            )
+            .await
+            .unwrap();
+    }
+    drop(store);
+
+    assert!(checkpoint_file(directory.path(), 0).exists());
+    assert!(checkpoint_file(directory.path(), 1).exists());
+    assert!(
+        !checkpoint_file(directory.path(), 2).exists(),
+        "the active segment is always rescanned, never checkpointed"
+    );
+
+    let reopened = FileActiveRangeStore::open_with_options(
+        directory.path(),
+        descriptor(),
+        FileActiveRangeStoreOptions {
+            max_segment_bytes: 1,
+            max_range_bytes: None,
+        },
+    )
+    .unwrap();
+    // Checkpoint-loaded entries must rebuild every lookup surface exactly
+    // like a rescan: Cursor positions, committed reads, and dedup.
+    for sequence in 1..=3_u64 {
+        assert_eq!(
+            reopened
+                .committed_position_for_cursor(&format!("cursor-{sequence}"))
+                .await
+                .unwrap(),
+            Some(RangePosition::new(sequence))
+        );
+    }
+    let frames = reopened.read_committed(None, 10).await.unwrap();
+    assert_eq!(frames.len(), 3);
+    // A deduplicated retry against checkpoint-loaded entries returns the
+    // original position instead of appending a duplicate.
+    let retry = store_retry_result(&reopened, append(2, b"payload")).await;
+    assert_eq!(retry, RangePosition::new(2));
+}
+
+async fn store_retry_result(
+    store: &FileActiveRangeStore,
+    request: ActiveRangeAppend,
+) -> RangePosition {
+    let result = store.append(request).await.unwrap();
+    assert!(result.deduplicated, "retry must hit dedup: {result:?}");
+    result.position
+}
+
+#[tokio::test]
+async fn an_invalid_index_checkpoint_falls_back_to_the_segment_rescan() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open_with_options(
+        directory.path(),
+        descriptor(),
+        FileActiveRangeStoreOptions {
+            max_segment_bytes: 1,
+            max_range_bytes: None,
+        },
+    )
+    .unwrap();
+    for sequence in 1..=2_u64 {
+        store.append(append(sequence, b"payload")).await.unwrap();
+        store
+            .commit(
+                RangeGeneration::new(1),
+                OwnershipEpoch::new(1),
+                CommitPosition::new(sequence),
+            )
+            .await
+            .unwrap();
+    }
+    drop(store);
+    assert!(checkpoint_file(directory.path(), 0).exists());
+
+    // A torn or corrupt checkpoint body fails its CRC and the rescan takes
+    // over — the checkpoint is an optimization, never the only copy.
+    let checkpoint = checkpoint_file(directory.path(), 0);
+    let mut bytes = fs::read(&checkpoint).unwrap();
+    bytes[20] ^= 0xFF;
+    fs::write(&checkpoint, bytes).unwrap();
+    let reopened = FileActiveRangeStore::open_with_options(
+        directory.path(),
+        descriptor(),
+        FileActiveRangeStoreOptions {
+            max_segment_bytes: 1,
+            max_range_bytes: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        reopened
+            .committed_position_for_cursor("cursor-1")
+            .await
+            .unwrap(),
+        Some(RangePosition::new(1))
+    );
+    drop(reopened);
+
+    // A missing checkpoint costs a rescan, not an error.
+    fs::remove_file(checkpoint_file(directory.path(), 0)).unwrap();
+    let reopened = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    assert_eq!(
+        reopened
+            .committed_position_for_cursor("cursor-2")
+            .await
+            .unwrap(),
+        Some(RangePosition::new(2))
+    );
+}
+
+#[tokio::test]
+async fn a_stale_index_checkpoint_never_hides_sealed_segment_corruption() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open_with_options(
+        directory.path(),
+        descriptor(),
+        FileActiveRangeStoreOptions {
+            max_segment_bytes: 1,
+            max_range_bytes: None,
+        },
+    )
+    .unwrap();
+    for sequence in 1..=2_u64 {
+        store.append(append(sequence, b"payload")).await.unwrap();
+        store
+            .commit(
+                RangeGeneration::new(1),
+                OwnershipEpoch::new(1),
+                CommitPosition::new(sequence),
+            )
+            .await
+            .unwrap();
+    }
+    drop(store);
+
+    // Corrupt the last byte of the sealed segment: the checkpoint's tail
+    // spot check refuses it, and the fallback rescan refuses the bytes —
+    // sealed corruption can never be laundered through a stale checkpoint.
+    let segment = range_directory(directory.path()).join("segment-000000.log");
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&segment)
+        .unwrap();
+    file.seek(SeekFrom::End(-1)).unwrap();
+    let mut last = [0_u8; 1];
+    file.read_exact(&mut last).unwrap();
+    file.seek(SeekFrom::End(-1)).unwrap();
+    file.write_all(&[last[0] ^ 0xFF]).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    assert!(
+        FileActiveRangeStore::open(directory.path(), descriptor()).is_err(),
+        "sealed corruption must fail open even though a checkpoint exists"
+    );
+}

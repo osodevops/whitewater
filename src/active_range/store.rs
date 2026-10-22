@@ -1512,8 +1512,243 @@ fn rotate_if_needed(
     let mut next = loaded.persisted.clone();
     next.active_segment = next_segment;
     persist_state(&inner.directory, &next)?;
+    // The sealed segment's committed index is now immutable; persist it as
+    // a checkpoint so reopen recovers it without rescanning frame bodies.
+    let sealed_entries: Vec<EntryIndex> = loaded
+        .entries
+        .iter()
+        .filter(|entry| entry.segment == loaded.persisted.active_segment)
+        .cloned()
+        .collect();
+    write_segment_checkpoint(
+        &inner.directory,
+        loaded.persisted.active_segment,
+        &next,
+        &sealed_entries,
+    )?;
     loaded.persisted = next;
     loaded.active_file = next_file;
+    Ok(())
+}
+
+/// A sealed segment is immutable, so its committed index rows persist once
+/// into `index-checkpoint-{segment}.bin` at rotation time. Reopen loads a
+/// sealed segment's `EntryIndex` rows from the checkpoint instead of
+/// rescanning every frame body, bounding restart recovery to the single
+/// active segment's tail rescan. The checkpoint is an optimization layer:
+/// identity, contiguity, coverage, and a tail-frame BLAKE3 spot check are
+/// re-verified against the segment on every load, and any invalid or
+/// missing checkpoint falls back to the full segment rescan.
+const INDEX_CHECKPOINT_MAGIC: &[u8; 4] = b"WWIC";
+const INDEX_CHECKPOINT_VERSION: u32 = 1;
+/// A paranoid bound on checkpointed rows: one full segment can never hold
+/// more committed entries than `max_segment_bytes` smallest-possible frames.
+const MAX_ENTRY_COUNT_HINT: u64 = 1 << 24;
+
+fn checkpoint_path(directory: &Path, segment: u64) -> PathBuf {
+    directory.join(format!("index-checkpoint-{segment:06}.bin"))
+}
+
+fn write_segment_checkpoint(
+    directory: &Path,
+    segment: u64,
+    persisted: &PersistedRangeState,
+    entries: &[EntryIndex],
+) -> Result<(), ActiveRangeStoreError> {
+    let mut body = Vec::new();
+    body.extend_from_slice(INDEX_CHECKPOINT_MAGIC);
+    body.extend_from_slice(&INDEX_CHECKPOINT_VERSION.to_be_bytes());
+    body.extend_from_slice(persisted.feed_id.as_bytes());
+    body.extend_from_slice(persisted.range_id.as_uuid().as_bytes());
+    body.extend_from_slice(&persisted.generation.value().to_be_bytes());
+    let count: u64 = entries
+        .len()
+        .try_into()
+        .map_err(|_| ActiveRangeStoreError::PositionOverflow)?;
+    body.extend_from_slice(&count.to_be_bytes());
+    for entry in entries {
+        body.extend_from_slice(&entry.position.value().to_be_bytes());
+        body.extend_from_slice(&entry.segment.to_be_bytes());
+        body.extend_from_slice(entry.identity.writer_session_id.as_bytes());
+        body.extend_from_slice(&entry.identity.writer_epoch.to_be_bytes());
+        body.extend_from_slice(&entry.identity.sequence.to_be_bytes());
+        let cursor = entry.cursor.as_bytes();
+        let cursor_length: u32 = cursor
+            .len()
+            .try_into()
+            .map_err(|_| ActiveRangeStoreError::CursorTooLarge)?;
+        body.extend_from_slice(&cursor_length.to_be_bytes());
+        body.extend_from_slice(cursor);
+        body.extend_from_slice(&entry.frame_digest);
+        body.extend_from_slice(entry.message_id.as_bytes());
+        body.extend_from_slice(&entry.entry_end.to_be_bytes());
+        body.extend_from_slice(&entry.frame_offset.to_be_bytes());
+        body.extend_from_slice(&entry.frame_length.to_be_bytes());
+        body.extend_from_slice(&entry.ingest_time_ns.to_be_bytes());
+    }
+    body.extend_from_slice(&crc32fast::hash(&body).to_be_bytes());
+    let path = checkpoint_path(directory, segment);
+    let temporary = path.with_extension("tmp");
+    {
+        let mut file = File::create(&temporary)?;
+        file.write_all(&body)?;
+        file.sync_all()?;
+    }
+    fs::rename(&temporary, &path)?;
+    sync_directory(directory)?;
+    Ok(())
+}
+
+/// Loads a sealed segment's checkpoint when it is present and valid.
+/// `expected_start` is the first RangePosition the segment must cover:
+/// positions are dense across segments, so a checkpoint whose coverage does
+/// not begin exactly there cannot pair with this log. Validation checks the
+/// persisted Feed/Range/generation identity, contiguous positions, full
+/// coverage of the segment bytes, and a BLAKE3 spot check of the last
+/// recorded frame — anything else fails closed to a normal rescan.
+fn load_segment_checkpoint(
+    directory: &Path,
+    segment: u64,
+    persisted: &PersistedRangeState,
+    expected_start: u64,
+) -> Option<Vec<EntryIndex>> {
+    let bytes = fs::read(checkpoint_path(directory, segment)).ok()?;
+    let entries = parse_segment_checkpoint(&bytes, segment, persisted, expected_start).ok()?;
+    corroborate_segment_checkpoint(directory, segment, &entries).ok()?;
+    Some(entries)
+}
+
+fn parse_segment_checkpoint(
+    bytes: &[u8],
+    segment: u64,
+    persisted: &PersistedRangeState,
+    expected_start: u64,
+) -> Result<Vec<EntryIndex>, ActiveRangeStoreError> {
+    let invalid =
+        || ActiveRangeStoreError::InvalidState("index checkpoint content is invalid".to_owned());
+    if bytes.len() < 52 {
+        return Err(invalid());
+    }
+    let (body, trailer) = bytes.split_at(bytes.len() - 4);
+    if crc32fast::hash(body) != u32::from_be_bytes(trailer.try_into().map_err(|_| invalid())?) {
+        return Err(invalid());
+    }
+    let mut reader = ByteReader::new(body);
+    if reader.take(4)? != INDEX_CHECKPOINT_MAGIC || reader.u32()? != INDEX_CHECKPOINT_VERSION {
+        return Err(invalid());
+    }
+    if Uuid::from_slice(reader.take(16)?).map_err(|_| invalid())? != persisted.feed_id
+        || RangeId::from_uuid(Uuid::from_slice(reader.take(16)?).map_err(|_| invalid())?)
+            != persisted.range_id
+        || RangeGeneration::new(reader.u64()?) != persisted.generation
+    {
+        return Err(invalid());
+    }
+    let count = reader.u64()?;
+    if count == 0 || count > MAX_ENTRY_COUNT_HINT {
+        return Err(invalid());
+    }
+    let mut entries = Vec::with_capacity(count as usize);
+    let mut expected = expected_start;
+    for _ in 0..count {
+        let position = RangePosition::new(reader.u64()?);
+        if position.value() != expected || reader.u64()? != segment {
+            return Err(invalid());
+        }
+        expected = expected.checked_add(1).ok_or(invalid())?;
+        let writer_session_id = Uuid::from_slice(reader.take(16)?).map_err(|_| invalid())?;
+        let writer_epoch = reader.u64()?;
+        let sequence = reader.u64()?;
+        let cursor_length = reader.u32()? as usize;
+        let cursor =
+            String::from_utf8(reader.take(cursor_length)?.to_vec()).map_err(|_| invalid())?;
+        let frame_digest: [u8; 32] = reader.take(32)?.try_into().map_err(|_| invalid())?;
+        let message_id = Uuid::from_slice(reader.take(16)?).map_err(|_| invalid())?;
+        let entry_end = reader.u64()?;
+        let frame_offset = reader.u64()?;
+        let frame_length = reader.u64()?;
+        let ingest_time_ns = i64::from_be_bytes(reader.take(8)?.try_into().map_err(|_| invalid())?);
+        if frame_length == 0 || frame_length > MAX_FRAME_BYTES as u64 {
+            return Err(invalid());
+        }
+        entries.push(EntryIndex {
+            position,
+            identity: AppendIdentity {
+                writer_session_id,
+                writer_epoch,
+                sequence,
+            },
+            cursor,
+            frame_digest,
+            message_id,
+            segment,
+            entry_end,
+            frame_offset,
+            frame_length,
+            ingest_time_ns,
+        });
+    }
+    if !reader.is_empty() {
+        return Err(invalid());
+    }
+    Ok(entries)
+}
+
+/// Re-verifies a parsed checkpoint against the segment bytes it claims to
+/// index: the checkpoint must cover the segment exactly (its last entry_end
+/// is the file length) and the last entry is re-read in full — its CRC
+/// proves the on-disk bytes are intact while its frame BLAKE3 proves the
+/// checkpoint pairs with these bytes rather than a rewritten segment.
+/// Interior frames stay trusted: sealing made the bytes immutable and the
+/// CRC over the checkpoint pins the pairing.
+fn corroborate_segment_checkpoint(
+    directory: &Path,
+    segment: u64,
+    entries: &[EntryIndex],
+) -> Result<(), ActiveRangeStoreError> {
+    let invalid = || {
+        ActiveRangeStoreError::InvalidState(
+            "index checkpoint does not corroborate the sealed segment".to_owned(),
+        )
+    };
+    let path = segment_path(directory, segment);
+    let mut file = File::open(&path)?;
+    let last = entries.last().ok_or_else(invalid)?;
+    if last.entry_end != file.metadata()?.len() {
+        return Err(invalid());
+    }
+    let frame_in_body = ENTRY_FIXED_BODY_BYTES
+        .checked_add(last.cursor.len())
+        .ok_or_else(invalid)?;
+    let entry_start = last
+        .frame_offset
+        .checked_sub(4 + frame_in_body as u64)
+        .ok_or_else(invalid)?;
+    let entry_length = last
+        .entry_end
+        .checked_sub(entry_start)
+        .ok_or_else(invalid)?;
+    if entry_length < 8 || entry_length > (MAX_ENTRY_BODY_BYTES + 8) as u64 {
+        return Err(invalid());
+    }
+    let mut bytes = vec![0_u8; entry_length as usize];
+    file.seek(SeekFrom::Start(entry_start))?;
+    file.read_exact(&mut bytes)?;
+    let declared = u32::from_be_bytes(bytes[..4].try_into().map_err(|_| invalid())?) as usize;
+    if declared.checked_add(8) != Some(bytes.len()) {
+        return Err(invalid());
+    }
+    let body = &bytes[4..4 + declared];
+    let trailer = &bytes[4 + declared..];
+    if crc32fast::hash(body) != u32::from_be_bytes(trailer.try_into().map_err(|_| invalid())?) {
+        return Err(invalid());
+    }
+    let frame = body
+        .get(frame_in_body..frame_in_body + last.frame_length as usize)
+        .ok_or_else(invalid)?;
+    if blake3::hash(frame).as_bytes() != &last.frame_digest {
+        return Err(invalid());
+    }
     Ok(())
 }
 
@@ -1524,6 +1759,17 @@ fn recover_segments(
     let mut entries = Vec::new();
     let mut expected_position = 1_u64;
     for segment in 0..=persisted.active_segment {
+        if segment < persisted.active_segment {
+            if let Some(checkpointed) =
+                load_segment_checkpoint(directory, segment, persisted, expected_position)
+            {
+                expected_position = expected_position
+                    .checked_add(checkpointed.len() as u64)
+                    .ok_or(ActiveRangeStoreError::PositionOverflow)?;
+                entries.extend(checkpointed);
+                continue;
+            }
+        }
         let path = segment_path(directory, segment);
         if !path.exists() {
             if segment == persisted.active_segment {
