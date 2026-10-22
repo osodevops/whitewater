@@ -286,13 +286,41 @@ impl IndexBuildDriver {
             .map(|row| row.entries.clone())
             .unwrap_or_default();
         entries.retain(|entry| entry.id != shadow);
-        entries.push(IndexEntry {
-            id: shadow,
-            values,
-            unique: false,
-        });
-        self.index
-            .upsert(&reference, &record.payload, &entries, &record.cursor)?;
+        // Unique claims arbitrate by committed order: the earliest record
+        // to claim a value wins identically on every replica because all
+        // replicas replay the same merged committed history. A later
+        // record keeps its row and other postings but never resolves
+        // through this Index — `conflicted` records the loss honestly.
+        let mut conflicted = Vec::new();
+        if definition.unique && !values.contains(&IndexValue::Null) {
+            match self.index.claim_owner(shadow, &values)? {
+                Some(owner)
+                    if owner
+                        != crate::index::primary_key(&reference)
+                            .map_err(IndexStoreError::from)? =>
+                {
+                    conflicted.push(shadow);
+                }
+                _ => entries.push(IndexEntry {
+                    id: shadow,
+                    values,
+                    unique: true,
+                }),
+            }
+        } else {
+            entries.push(IndexEntry {
+                id: shadow,
+                values,
+                unique: definition.unique,
+            });
+        }
+        self.index.upsert(
+            &reference,
+            &record.payload,
+            &entries,
+            &conflicted,
+            &record.cursor,
+        )?;
         Ok(())
     }
 
@@ -811,6 +839,95 @@ mod tests {
         let outcomes = driver.apply_committed(fixture.feed_id, 64).await;
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].1.as_ref().unwrap().applied, 0);
+    }
+
+    #[tokio::test]
+    async fn unique_index_arbitrates_claims_by_committed_order() {
+        // The replicated conditional claim: every replica replays the same
+        // merged committed history, so the earliest committed record to
+        // claim a value wins identically everywhere. The loser keeps its
+        // row but is suppressed from the Index and marked conflicted.
+        let fixture = fixture(vec![IndexFieldSpec::Key]).await;
+        fixture
+            .control
+            .execute_commands(vec![Command::DefineIndex {
+                name: "orders.events.unique.customer".to_owned(),
+                feed: "orders.events".to_owned(),
+                fields: vec![IndexFieldSpec::Projection {
+                    extractor: "json".to_owned(),
+                    version: 1,
+                    field: "customer".to_owned(),
+                }],
+                unique: true,
+                collation: crate::control::IndexCollation::Binary,
+                consistency: crate::control::IndexConsistency::Eventual,
+            }])
+            .await
+            .unwrap();
+        // Two distinct application keys project the same unique value;
+        // a third claims a different value.
+        let mut first = record(1, "k-a");
+        first.payload = br#"{"customer":"dup","total":1}"#.to_vec();
+        let mut second = record(2, "k-b");
+        second.payload = br#"{"customer":"dup","total":2}"#.to_vec();
+        let third = record(3, "k-c");
+        let source = Arc::new(StubSource {
+            feed_id: fixture.feed_id,
+            exists: true,
+            retained: std::sync::Mutex::new(vec![first, second, third]),
+        });
+        fixture
+            .control
+            .execute_commands(vec![Command::RebuildIndex {
+                name: "orders.events.unique.customer".to_owned(),
+            }])
+            .await
+            .unwrap();
+        let definition = fixture
+            .control
+            .declared_index_by_name("orders.events.unique.customer")
+            .await
+            .unwrap();
+        let driver = fixture.driver(source.clone());
+        driver.build_pass(&definition, 64).await.unwrap();
+        let shadow = shadow_index_id(definition.index_id, 1);
+
+        // Winner resolves; loser is suppressed with conflict evidence.
+        let rows = fixture.lookup(shadow, &[IndexValue::Text("dup".to_owned())]);
+        assert_eq!(rows.len(), 1, "only the winner's posting resolves");
+        assert_eq!(rows[0].reference.application_key, b"k-a");
+        let loser = fixture
+            .index
+            .get(&crate::index::PrimaryRef {
+                feed_id: fixture.feed_id,
+                application_key: b"k-b".to_vec(),
+            })
+            .unwrap()
+            .expect("loser keeps its row");
+        assert_eq!(loser.conflicted, vec![shadow]);
+        // The apply pass itself stayed healthy: all three records consumed.
+        assert_eq!(
+            fixture.index.last_applied(shadow).unwrap().as_deref(),
+            Some("cursor-0003")
+        );
+
+        // A re-apply of the same prefix is idempotent and keeps the mark.
+        driver.apply_committed(fixture.feed_id, 64).await;
+        let loser = fixture
+            .index
+            .get(&crate::index::PrimaryRef {
+                feed_id: fixture.feed_id,
+                application_key: b"k-b".to_vec(),
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(loser.conflicted, vec![shadow]);
+        assert_eq!(
+            fixture
+                .lookup(shadow, &[IndexValue::Text("dup".to_owned())])
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

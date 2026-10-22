@@ -1280,6 +1280,7 @@ impl StateStoreApply for IndexStoreStateApply {
                     &reference,
                     payload,
                     &entries,
+                    &[],
                     &Self::cursor(mutation.sequence),
                 ) {
                     Ok(()) => {}
@@ -1384,6 +1385,7 @@ impl StateStoreApply for IndexStoreStateApply {
                     application_key: row.key.clone(),
                 },
                 &row.payload,
+                &[],
                 &[],
                 &Self::cursor(row.applied_seq),
             )

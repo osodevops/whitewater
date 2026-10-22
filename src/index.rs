@@ -368,6 +368,12 @@ pub struct IndexRow {
     pub reference: PrimaryRef,
     pub payload: Vec<u8>,
     pub entries: Vec<IndexEntry>,
+    /// Index generations whose unique claim this row lost to an earlier
+    /// committed primary: the row keeps its payload and other postings,
+    /// but the suppressed Index never resolves it. Populated by committed
+    /// order so every replica derives the identical set.
+    #[serde(default)]
+    pub conflicted: Vec<IndexId>,
     pub applied_cursor: String,
 }
 
@@ -441,14 +447,27 @@ pub struct AccumulateRowWrite {
 pub trait IndexStore: Send + Sync {
     /// Apply one projected row mutation under `cursor`. Refuses a reused
     /// `cursor` that would change an existing row, unowned unique claims,
-    /// oversized rows, and invalid cursors.
+    /// oversized rows, and invalid cursors. `conflicted` names the Index
+    /// generations whose claims the caller already arbitrated (suppressed
+    /// entries); it is merged onto the row so queries can report the loss
+    /// honestly, and ids present in `entries` clear their prior mark.
     fn upsert(
         &self,
         reference: &PrimaryRef,
         payload: &[u8],
         entries: &[IndexEntry],
+        conflicted: &[IndexId],
         cursor: &str,
     ) -> Result<(), IndexStoreError>;
+
+    /// The primary Key holding `id`'s unique claim on `values`, if any.
+    /// Unique arbitration reads this before planning a claim so committed
+    /// order decides ownership deterministically on every replica.
+    fn claim_owner(
+        &self,
+        id: IndexId,
+        values: &[IndexValue],
+    ) -> Result<Option<Vec<u8>>, IndexStoreError>;
 
     /// Atomically merge a batch of additive accumulator rows under `cursor`:
     /// each item reads its current row, adds its deltas to the 24-byte
@@ -582,6 +601,7 @@ impl IndexStore for FjallIndexStore {
         reference: &PrimaryRef,
         payload: &[u8],
         entries: &[IndexEntry],
+        conflicted: &[IndexId],
         cursor: &str,
     ) -> Result<(), IndexStoreError> {
         if cursor.is_empty() || cursor.len() > 512 {
@@ -596,12 +616,9 @@ impl IndexStore for FjallIndexStore {
             reference: reference.clone(),
             payload: payload.to_vec(),
             entries: entries.to_vec(),
+            conflicted: conflicted.to_vec(),
             applied_cursor: cursor.to_owned(),
         };
-        let encoded = serde_json::to_vec(&row)?;
-        if encoded.len() > 4 * 1024 * 1024 {
-            return Err(IndexStoreError::RowTooLarge);
-        }
         let mut tx = self
             .db
             .write_tx()
@@ -610,6 +627,28 @@ impl IndexStore for FjallIndexStore {
             .get(&self.primary, &key)?
             .map(|bytes| serde_json::from_slice::<IndexRow>(&bytes))
             .transpose()?;
+        // Conflict evidence merges across applies: ids re-projected by this
+        // write clear their mark, ids the caller arbitrated are added, and
+        // marks for untouched generations persist.
+        let mut merged_conflicted = previous
+            .as_ref()
+            .map(|row| row.conflicted.clone())
+            .unwrap_or_default();
+        merged_conflicted
+            .retain(|id| !entries.iter().any(|entry| entry.id == *id) || conflicted.contains(id));
+        for id in conflicted {
+            if !merged_conflicted.contains(id) {
+                merged_conflicted.push(*id);
+            }
+        }
+        let row = IndexRow {
+            conflicted: merged_conflicted,
+            ..row
+        };
+        let encoded = serde_json::to_vec(&row)?;
+        if encoded.len() > 4 * 1024 * 1024 {
+            return Err(IndexStoreError::RowTooLarge);
+        }
         if let Some(previous) = &previous {
             if previous.reference != *reference {
                 return Err(IndexStoreError::CorruptPrimary);
@@ -730,6 +769,10 @@ impl IndexStore for FjallIndexStore {
                 reference: row.reference.clone(),
                 payload,
                 entries: target_entries.to_vec(),
+                conflicted: previous
+                    .as_ref()
+                    .map(|row| row.conflicted.clone())
+                    .unwrap_or_default(),
                 applied_cursor: cursor.to_owned(),
             };
             let encoded = serde_json::to_vec(&index_row)?;
@@ -806,6 +849,23 @@ impl IndexStore for FjallIndexStore {
             return Err(IndexStoreError::CorruptPrimary);
         }
         Ok(Some(row))
+    }
+
+    fn claim_owner(
+        &self,
+        id: IndexId,
+        values: &[IndexValue],
+    ) -> Result<Option<Vec<u8>>, IndexStoreError> {
+        let key = unique_claim_key(&IndexEntry {
+            id,
+            values: values.to_vec(),
+            unique: true,
+        })?;
+        self.db
+            .read_tx()
+            .get(&self.entries, key)
+            .map(|value| value.map(|slice| slice.to_vec()))
+            .map_err(IndexStoreError::from)
     }
 
     fn lookup_exact(
@@ -1280,6 +1340,83 @@ mod tests {
     }
 
     #[test]
+    fn claim_owner_and_conflicted_marks_survive_upsert_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let id = IndexId(Uuid::from_u128(7));
+        let winner = reference(b"winner");
+        let loser = reference(b"loser");
+        let claim = IndexEntry {
+            id,
+            values: vec![IndexValue::Text("dup".to_owned())],
+            unique: true,
+        };
+        {
+            let store = FjallIndexStore::open(directory.path()).unwrap();
+            store
+                .upsert(
+                    &winner,
+                    b"one",
+                    std::slice::from_ref(&claim),
+                    &[],
+                    "cursor-1",
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .claim_owner(id, &[IndexValue::Text("dup".to_owned())])
+                    .unwrap()
+                    .as_deref(),
+                Some(primary_key(&winner).unwrap().as_slice())
+            );
+            // The loser's caller already arbitrated: entry suppressed,
+            // the conflicted mark lands instead of a claim attempt.
+            store
+                .upsert(&loser, b"two", &[], &[id], "cursor-2")
+                .unwrap();
+            let row = store.get(&loser).unwrap().unwrap();
+            assert_eq!(row.conflicted, vec![id]);
+            // Strictness is intact for callers that skip arbitration.
+            assert!(matches!(
+                store.upsert(
+                    &loser,
+                    b"two",
+                    std::slice::from_ref(&claim),
+                    &[],
+                    "cursor-3"
+                ),
+                Err(IndexStoreError::Key(IndexKeyError::UniqueConflict))
+            ));
+            // A winner re-write re-projects the entry and keeps its claim.
+            store
+                .upsert(
+                    &winner,
+                    b"one-v2",
+                    std::slice::from_ref(&claim),
+                    &[],
+                    "cursor-4",
+                )
+                .unwrap();
+        }
+        // Restart: claim ownership and conflict marks persist.
+        let store = FjallIndexStore::open(directory.path()).unwrap();
+        assert_eq!(
+            store
+                .claim_owner(id, &[IndexValue::Text("dup".to_owned())])
+                .unwrap()
+                .as_deref(),
+            Some(primary_key(&winner).unwrap().as_slice())
+        );
+        assert_eq!(store.get(&loser).unwrap().unwrap().conflicted, vec![id]);
+        // Re-projecting the entry on a later cursor clears the mark.
+        assert!(matches!(
+            store.upsert(&loser, b"two-v2", &[claim], &[id], "cursor-5"),
+            Err(IndexStoreError::Key(IndexKeyError::UniqueConflict))
+        ));
+        // (still conflicting — winner holds it — so suppression remains)
+        assert_eq!(store.get(&loser).unwrap().unwrap().conflicted, vec![id]);
+    }
+
+    #[test]
     fn one_record_cannot_define_duplicate_index_ids() {
         let value = entry(IndexValue::I64(1), false);
         assert_eq!(
@@ -1303,6 +1440,7 @@ mod tests {
                     &reference(key),
                     location.as_bytes(),
                     &[entry(IndexValue::Text(location.to_owned()), false)],
+                    &[],
                     "cursor-1",
                 )
                 .unwrap();
@@ -1317,6 +1455,7 @@ mod tests {
                 &reference(b"alice"),
                 b"London",
                 &[city.clone(), age.clone()],
+                &[],
                 "cursor-2",
             )
             .unwrap();
@@ -1360,6 +1499,7 @@ mod tests {
                     &reference(b"alice"),
                     b"first",
                     std::slice::from_ref(&unique),
+                    &[],
                     "cursor-a",
                 )
             });
@@ -1368,6 +1508,7 @@ mod tests {
                     &reference(b"bob"),
                     b"second",
                     std::slice::from_ref(&unique),
+                    &[],
                     "cursor-b",
                 )
             });
@@ -1394,6 +1535,7 @@ mod tests {
                 &reference(b"alice"),
                 b"original",
                 std::slice::from_ref(&london),
+                &[],
                 "cursor-1",
             )
             .unwrap();
@@ -1402,6 +1544,7 @@ mod tests {
                 &reference(b"alice"),
                 b"changed-without-new-cursor",
                 std::slice::from_ref(&london),
+                &[],
                 "cursor-1",
             ),
             Err(IndexStoreError::CursorConflict)
@@ -1411,6 +1554,7 @@ mod tests {
                 &reference(b"bob"),
                 b"conflict",
                 std::slice::from_ref(&london),
+                &[],
                 "cursor-2"
             )
             .is_err());
@@ -1424,6 +1568,7 @@ mod tests {
                 &reference(b"alice"),
                 b"moved",
                 std::slice::from_ref(&paris),
+                &[],
                 "cursor-3",
             )
             .unwrap();
@@ -1453,6 +1598,7 @@ mod tests {
                 &reference(b"owner"),
                 b"holder",
                 std::slice::from_ref(&claimed),
+                &[],
                 "cursor-1",
             )
             .unwrap();
@@ -1469,6 +1615,7 @@ mod tests {
                 &reference(b"new"),
                 b"data",
                 &[city.clone(), claimed.clone()],
+                &[],
                 "cursor-2"
             ),
             Err(IndexStoreError::Key(IndexKeyError::UniqueConflict))
@@ -1495,17 +1642,30 @@ mod tests {
                 &reference(b"k"),
                 &[0u8; 4 * 1024 * 1024 + 1],
                 std::slice::from_ref(&row),
+                &[],
                 "c1"
             ),
             Err(IndexStoreError::RowTooLarge)
         ));
         assert!(matches!(
-            store.upsert(&reference(b"k"), b"payload", &vec![row.clone(); 65], "c1"),
+            store.upsert(
+                &reference(b"k"),
+                b"payload",
+                &vec![row.clone(); 65],
+                &[],
+                "c1"
+            ),
             Err(IndexStoreError::RowTooLarge)
         ));
         for cursor in ["", &"x".repeat(513)] {
             assert!(matches!(
-                store.upsert(&reference(b"k"), b"p", std::slice::from_ref(&row), cursor),
+                store.upsert(
+                    &reference(b"k"),
+                    b"p",
+                    std::slice::from_ref(&row),
+                    &[],
+                    cursor
+                ),
                 Err(IndexStoreError::InvalidCursor)
             ));
             assert!(matches!(
@@ -1531,6 +1691,7 @@ mod tests {
                 &reference(b"k"),
                 b"payload",
                 std::slice::from_ref(&row),
+                &[],
                 "cursor-9",
             )
             .unwrap();
@@ -1541,11 +1702,12 @@ mod tests {
                 &reference(b"k"),
                 b"payload",
                 std::slice::from_ref(&row),
+                &[],
                 "cursor-9",
             )
             .unwrap();
         assert!(matches!(
-            store.upsert(&reference(b"k"), b"other", &[row], "cursor-9"),
+            store.upsert(&reference(b"k"), b"other", &[row], &[], "cursor-9"),
             Err(IndexStoreError::CursorConflict)
         ));
     }
@@ -1560,6 +1722,7 @@ mod tests {
                 &reference(b"ana"),
                 b"payload",
                 std::slice::from_ref(&row),
+                &[],
                 "cursor-1",
             )
             .unwrap();
@@ -1604,6 +1767,7 @@ mod tests {
                         id,
                         vec![IndexValue::Text(city.to_owned()), IndexValue::I64(age)],
                     )],
+                    &[],
                     "cursor-1",
                 )
                 .unwrap();
@@ -1649,6 +1813,7 @@ mod tests {
                         id,
                         vec![IndexValue::Text(region.to_owned()), IndexValue::I64(score)],
                     )],
+                    &[],
                     "cursor-1",
                 )
                 .unwrap();

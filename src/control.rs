@@ -356,6 +356,12 @@ pub struct StoredIndexDefinition {
     pub fields: Vec<IndexFieldSpec>,
     pub collation: IndexCollation,
     pub consistency: IndexConsistency,
+    /// UNIQUE Indexes arbitrate claims by committed order: the earliest
+    /// committed record to claim a value wins identically on every
+    /// replica, and losing rows carry the Index generation in their
+    /// `conflicted` evidence instead of poisoning the apply pass.
+    #[serde(default)]
+    pub unique: bool,
     pub stage: IndexBuildStage,
     pub applied_cursor: Option<String>,
     pub created_at_ns: i64,
@@ -2999,12 +3005,6 @@ impl ControlController {
                 consistency,
             } => {
                 validate_dotted_name(&name)?;
-                if unique {
-                    return Err(ControlError::InvalidOperation(
-                        "UNIQUE Indexes require the replicated conditional-claim protocol; declare non-unique Indexes until it exists"
-                            .to_owned(),
-                    ));
-                }
                 validate_index_fields(&fields)?;
                 if state.indexes.values().any(|item| item.name == name) {
                     return Err(ControlError::AlreadyExists(name));
@@ -3024,6 +3024,7 @@ impl ControlController {
                     fields,
                     collation,
                     consistency,
+                    unique,
                     stage: IndexBuildStage::Declared,
                     applied_cursor: None,
                     created_at_ns: issued_at_ns,
@@ -6290,11 +6291,17 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                     })
                 }
             }
-            Some("INDEX") => {
+            Some("INDEX") | Some("UNIQUE") => {
                 // CREATE INDEX <name> ON <feed> FIELDS <field>[,<field>]*
-                expect_keyword(&tokens, 3, "ON")?;
-                expect_keyword(&tokens, 5, "FIELDS")?;
-                let mut position = 6;
+                // CREATE UNIQUE INDEX <name> ON <feed> FIELDS <field>[,<field>]*
+                let unique = keyword(1).as_deref() == Some("UNIQUE");
+                if unique {
+                    expect_keyword(&tokens, 2, "INDEX")?;
+                }
+                let offset = if unique { 1 } else { 0 };
+                expect_keyword(&tokens, 3 + offset, "ON")?;
+                expect_keyword(&tokens, 5 + offset, "FIELDS")?;
+                let mut position = 6 + offset;
                 let mut fields = Vec::new();
                 while position < tokens.len() {
                     let (field, next) = parse_index_field_spec(&tokens, position, "CREATE INDEX FIELDS")?;
@@ -6306,10 +6313,10 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                     }
                 }
                 Ok(Command::DefineIndex {
-                    name: token(&tokens, 2)?.to_owned(),
-                    feed: token(&tokens, 4)?.to_owned(),
+                    name: token(&tokens, 2 + offset)?.to_owned(),
+                    feed: token(&tokens, 4 + offset)?.to_owned(),
                     fields,
-                    unique: false,
+                    unique,
                     collation: IndexCollation::Binary,
                     consistency: IndexConsistency::Eventual,
                 })
@@ -9839,9 +9846,10 @@ mod tests {
         assert_eq!(first.results[0].data["feed_id"], feed_id.to_string());
         assert_eq!(first.results[0].data["fields"].as_array().unwrap().len(), 3);
 
-        // UNIQUE stays refused until the replicated conditional-claim
-        // protocol exists.
-        assert!(leader
+        // UNIQUE defines and persists its arbitration contract: claims
+        // resolve by committed order (first-committed-wins) identically on
+        // every replica replaying the same committed history.
+        let unique = leader
             .execute_commands(vec![Command::DefineIndex {
                 name: "accounts.unique.customer".to_owned(),
                 feed: "accounts.orders".to_owned(),
@@ -9851,7 +9859,8 @@ mod tests {
                 consistency: IndexConsistency::Eventual,
             }])
             .await
-            .is_err());
+            .unwrap();
+        assert_eq!(unique.results[0].data["unique"], true);
         // Duplicate name, cross-Domain feed, and unknown feed are refused.
         for (name, feed) in [
             ("accounts.orders.by.customer", "accounts.orders"),
@@ -9898,7 +9907,7 @@ mod tests {
 
         // SHOW INDEXES and DESCRIBE INDEX expose the persisted definition.
         let shown = leader.execute("SHOW INDEXES;").await.unwrap();
-        assert_eq!(shown.results[0].data.as_array().unwrap().len(), 1);
+        assert_eq!(shown.results[0].data.as_array().unwrap().len(), 2);
         let described = leader
             .execute("DESCRIBE INDEX accounts.orders.by.customer;")
             .await
@@ -9930,7 +9939,7 @@ mod tests {
             .install_snapshot_bytes(&leader.snapshot_bytes().await.unwrap())
             .await
             .unwrap();
-        assert_eq!(follower.state.lock().await.indexes.len(), 1);
+        assert_eq!(follower.state.lock().await.indexes.len(), 2);
         assert_eq!(
             follower
                 .declared_index_by_name("accounts.orders.by.customer")
@@ -10969,6 +10978,16 @@ mod tests {
                 if name == "accounts.orders.by.customer"
                     && feed == "accounts.orders"
                     && fields.len() == 3
+        ));
+
+        // CREATE UNIQUE INDEX flips the arbitration contract on.
+        let commands = parse_wcl(
+            "CREATE UNIQUE INDEX accounts.orders.by.customer ON accounts.orders FIELDS KEY;",
+        )
+        .unwrap();
+        assert!(matches!(
+            &commands[0],
+            Command::DefineIndex { unique: true, .. }
         ));
 
         // Exact predicate with mixed typed literals, limit, strict, wait.

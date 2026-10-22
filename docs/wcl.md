@@ -800,8 +800,18 @@ intent:
 
 `fields` take 1–16 entries of `key`, `metadata`, or versioned
 `projection` extractor specs. `collation` defaults to `binary` and
-`consistency` to `eventual`; `strict` is accepted as intent. `unique`
-is rejected until the replicated conditional-claim protocol exists.
+`consistency` to `eventual`; `strict` is accepted as intent.
+
+`CREATE UNIQUE INDEX <name> ON <feed> FIELDS ...` (or `"unique": true`
+on the typed command) claims each projected value for exactly one
+primary Key. Claims arbitrate by committed order — the replicated
+conditional claim is the committed log itself: every replica replays
+the same merged committed history, so the earliest committed record
+wins identically everywhere. A later record keeps its row but never
+resolves through that Index; query rows report `conflicted: true` for
+the losing primary instead of silently hiding it. Releasing a claim
+does not retroactively promote suppressed rows (they promote when the
+row re-applies).
 
 Declared Indexes persist in the replicated catalog and snapshots. The
 stage stays `declared` until a rebuild materializes a generation:

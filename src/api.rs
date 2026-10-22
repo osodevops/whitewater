@@ -4963,6 +4963,10 @@ impl IndexQueryModeWire {
 struct IndexQueryRow {
     key_base64: String,
     payload_base64: String,
+    /// True when this row lost the queried generation's unique claim to an
+    /// earlier committed primary — the row exists in Feed history but is
+    /// honestly reported as not satisfying the uniqueness assertion.
+    conflicted: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -5178,6 +5182,7 @@ async fn index_query_local(
             .map(|row| IndexQueryRow {
                 key_base64: STANDARD.encode(&row.reference.application_key),
                 payload_base64: STANDARD.encode(&row.payload),
+                conflicted: row.conflicted.contains(&shadow),
             })
             .collect(),
         applied_cursor: frontier,
@@ -16335,17 +16340,14 @@ mod tests {
         let directory = TempDir::new().unwrap();
         let store: Arc<dyn LogStore> =
             Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
-        let nodes: Vec<crate::active_range::StorageNodeId> =
-            ["storage-1", "storage-2", "storage-3"]
-                .into_iter()
-                .map(|name| crate::active_range::StorageNodeId::try_new(name).unwrap())
-                .collect();
-        let node = nodes[0].clone();
         let control = Arc::new(
             ControlController::open_with_storage_nodes(
                 directory.path().join("catalog.json"),
                 store.clone(),
-                nodes,
+                ["storage-1", "storage-2", "storage-3"]
+                    .into_iter()
+                    .map(|name| crate::active_range::StorageNodeId::try_new(name).unwrap())
+                    .collect(),
             )
             .unwrap(),
         );
@@ -16366,6 +16368,9 @@ mod tests {
             .unwrap();
         let feed = control.active_feed_by_name("orders.events").await.unwrap();
         let range = control.active_range_assignment(feed.feed_id).await.unwrap();
+        // Rendezvous placement picks the owner by hash; this Node adopts
+        // the owner's identity so committed reads stay local.
+        let node = range.owner.clone();
         let descriptor = ActiveRangeDescriptor {
             feed_id: feed.feed_id,
             range_id: range.range_id,
@@ -16451,7 +16456,13 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..4 {
-            drive_local_index_builds(&state, 64).await;
+            let outcomes = drive_local_index_builds(&state, 64).await;
+            assert!(
+                outcomes
+                    .iter()
+                    .all(|outcome| !matches!(outcome, IndexBuildDriveOutcome::Failed { .. })),
+                "{outcomes:?}"
+            );
             if let Some(definition) = control.declared_index_by_name("orders.events.by.key").await {
                 if matches!(
                     definition.stage,
