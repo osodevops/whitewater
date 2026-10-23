@@ -287,6 +287,80 @@ def main():
     if rollup.get("subscriptions", 0) < 2: raise AssertionError(f"domain rollup {rollup}")
     phase("subscription demand attribution verified")
 
+    # A Domain-source Subscription tracks one durable frontier per member
+    # Feed: join establishes them all, and every member call carries an
+    # explicit `feed` selector resolved to the immutable FeedId.
+    dsub = f"{domain}.cover"
+    status, declared = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE SUBSCRIPTION {dsub} FROM DOMAIN {domain} START AT BEGINNING;"})
+    if status != 200: raise AssertionError(declared)
+    dmember = str(uuid.uuid4())
+    djoin = member_ready(ENDPOINTS[1], f"{members}/join", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember})
+    if djoin["member_epoch"] != 1: raise AssertionError(djoin)
+    dwork = str(uuid.uuid4())
+    dclaim = member_ready(ENDPOINTS[2], f"{members}/claim", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": dwork, "lease_ticks": 60})
+    dlease = dclaim["lease"]["lease_epoch"]
+
+    # The Feed selector is mandatory on a Domain source; an unattached Feed
+    # conflicts rather than guessing a frontier.
+    status, refused = post(ENDPOINTS[0], f"{members}/fetch", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": dwork, "lease_epoch": dlease})
+    if status != 400: raise AssertionError(refused)
+    status, refused = post(ENDPOINTS[0], f"{members}/fetch", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": dwork, "lease_epoch": dlease, "feed": "nosuch.feed"})
+    if status == 200: raise AssertionError(refused)
+
+    # The Domain frontier is independent of the exact-Feed Subscription's
+    # progress on the same history: all six records deliver again here.
+    dpage = member_ready(ENDPOINTS[1], f"{members}/fetch", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": dwork, "lease_epoch": dlease, "feed": feed, "limit": 10})
+    if len(dpage["records"]) != 6: raise AssertionError(dpage)
+    member_ready(ENDPOINTS[2], f"{members}/ack", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": dwork, "lease_epoch": dlease, "feed": feed, "cursor": dpage["cursor"], "positions": dpage["positions"]})
+
+    # The ack completes dwork's lease, so the empty-tail probe claims fresh
+    # work — the member Feed's frontier stays acked under any later claim.
+    dclaim2 = member_ready(ENDPOINTS[0], f"{members}/claim", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": str(uuid.uuid4()), "lease_ticks": 60})
+    dlease2, dwork2 = dclaim2["lease"]["lease_epoch"], dclaim2["lease"]["work_id"]
+    dempty = member_ready(ENDPOINTS[1], f"{members}/fetch", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": dwork2, "lease_epoch": dlease2, "feed": feed})
+    if dempty["records"]: raise AssertionError(dempty)
+
+    # A Feed created after the Subscription attaches at BEGINNING; the
+    # first fetch naming it commits its frontier entry durably.
+    feed2, writer2 = f"{domain}.late", f"writer2{suffix}"
+    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE FEED {feed2}; CREATE WRITER {writer2} TO {feed2}; OPEN WRITER SESSION {writer2};"})
+    if status != 200: raise AssertionError(setup)
+    we2 = setup["results"][2]["data"]["session_epoch"]
+    for index in (7, 8):
+        status, appended = post(ENDPOINTS[1], "/v1/writers/append", {"request_id": str(uuid.uuid4()), "writer": writer2, "session_epoch": we2, "event_time_ns": str(index), "key_base64": "aw==", "payload_base64": "dg==", "metadata_base64": {}})
+        if status != 200: raise AssertionError(appended)
+    dpage2 = member_ready(ENDPOINTS[2], f"{members}/fetch", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": dwork2, "lease_epoch": dlease2, "feed": feed2, "limit": 10})
+    if len(dpage2["records"]) != 2: raise AssertionError(dpage2)
+
+    # Seeks refuse while members hold leases; release first, then a seek on
+    # one member Feed leaves the other's frontier untouched.
+    member_ready(ENDPOINTS[0], f"{members}/release", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": dwork2, "lease_epoch": dlease2})
+    status, seeked = post(ENDPOINTS[0], "/v1/subscriptions/seek", {"subscription": dsub, "request_id": str(uuid.uuid4()), "position": "beginning", "feed": feed2})
+    if status != 200: raise AssertionError(seeked)
+    dclaim3 = member_ready(ENDPOINTS[1], f"{members}/claim", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": str(uuid.uuid4()), "lease_ticks": 60})
+    dlease3, dwork3 = dclaim3["lease"]["lease_epoch"], dclaim3["lease"]["work_id"]
+    dpage3 = member_ready(ENDPOINTS[2], f"{members}/fetch", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": dwork3, "lease_epoch": dlease3, "feed": feed2, "limit": 10})
+    if len(dpage3["records"]) != 2: raise AssertionError(dpage3)
+    dstill = member_ready(ENDPOINTS[0], f"{members}/fetch", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": dwork3, "lease_epoch": dlease3, "feed": feed})
+    if dstill["records"]: raise AssertionError(dstill)
+
+    # A range split on one member Feed stages a durable cutover that the
+    # reconcile applies to that Feed's frontier entry only: the Domain row
+    # keeps serving, the acknowledged history stays acknowledged, and new
+    # appends land on the post-split ranges.
+    status, split = post(ENDPOINTS[1], "/v1/admin/ranges/split", {"request_id": str(uuid.uuid4()), "feed": feed, "split_at": "80000000000000000000000000000000", "batch_size": 4})
+    if status != 200 or split.get("status") != "activated": raise AssertionError({"split": split})
+    if split.get("subscription_reconcile_failed"): raise AssertionError({"split reconcile": split})
+    status, appended = post(ENDPOINTS[1], "/v1/writers/append", {"request_id": str(uuid.uuid4()), "writer": writer, "session_epoch": writer_epoch, "event_time_ns": "9", "key_base64": "eg==", "payload_base64": "eQ==", "metadata_base64": {}})
+    if status != 200: raise AssertionError(appended)
+    dpost = member_ready(ENDPOINTS[2], f"{members}/fetch", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": dwork3, "lease_epoch": dlease3, "feed": feed, "limit": 10})
+    if len(dpost["records"]) != 1: raise AssertionError(dpost)
+    member_ready(ENDPOINTS[0], f"{members}/ack", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": dwork3, "lease_epoch": dlease3, "feed": feed, "cursor": dpost["cursor"], "positions": dpost["positions"]})
+    dclaim4 = member_ready(ENDPOINTS[1], f"{members}/claim", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": str(uuid.uuid4()), "lease_ticks": 60})
+    dsibling = member_ready(ENDPOINTS[2], f"{members}/fetch", {"subscription": dsub, "request_id": str(uuid.uuid4()), "member_id": dmember, "member_epoch": 1, "work_id": dclaim4["lease"]["work_id"], "lease_epoch": dclaim4["lease"]["lease_epoch"], "feed": feed2, "limit": 10})
+    if len(dsibling["records"]) != 2: raise AssertionError(dsibling)
+    phase("domain member frontiers verified")
+
     # Killing Nodes one at a time: a replica loss never fails member calls,
     # and the owner kill is detected by the ownership_epoch bump the
     # endpoint's transparent recovery performs before serving the mutation.

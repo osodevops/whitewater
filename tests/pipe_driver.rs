@@ -84,6 +84,8 @@ fn frontier_mutation(cursor: &str) -> SubscriptionProgressMutation {
         ownership_epoch: 7,
         sequence: 1,
         request_id: Uuid::new_v4(),
+        member_progress: BTreeMap::new(),
+        member_feed: None,
         expected_cursor: None,
         cursor: cursor.to_owned(),
         positions: BTreeMap::from([(range(), "root".to_owned())]),
@@ -490,6 +492,8 @@ impl EffectApply for RecordingApply {
             ownership_epoch: 7,
             sequence: committed.as_ref().map_or(1, |prior| prior.sequence + 1),
             request_id,
+            member_progress: BTreeMap::new(),
+            member_feed: None,
             expected_cursor: consume.expected_cursor.clone(),
             cursor: consume.cursor.clone(),
             positions: consume.positions.clone(),
@@ -627,6 +631,7 @@ fn page_with_emissions(
         records,
         cursor: cursor.to_owned(),
         positions: BTreeMap::from([(range(), cursor.to_owned())]),
+        member_feed: None,
         emissions,
         expired: Vec::new(),
         refused: Vec::new(),
@@ -669,6 +674,7 @@ async fn pipe_driver_declares_applies_outputs_and_moves_the_frontier() {
             .driver
             .planned_effect_id(
                 Uuid::from_u128(SUBSCRIPTION),
+                feed(),
                 "p0",
                 &page(vec![record(1), record(2), record(3)], "p1"),
             )
@@ -743,6 +749,7 @@ async fn pipe_driver_replays_safely_after_an_ambiguous_declare_commit() {
         .driver
         .planned_effect_id(
             Uuid::from_u128(SUBSCRIPTION),
+            feed(),
             "p0",
             &page(vec![record(1)], "p1"),
         )
@@ -803,6 +810,7 @@ async fn window_pipe_escapes_prepared_residue_when_the_replan_shifts() {
         records: vec![record.clone()],
         cursor: "p1".to_owned(),
         positions: BTreeMap::from([(range(), "p1".to_owned())]),
+        member_feed: None,
         emissions: Vec::new(),
         expired,
         refused: Vec::new(),
@@ -817,6 +825,7 @@ async fn window_pipe_escapes_prepared_residue_when_the_replan_shifts() {
         .driver
         .planned_effect_id(
             Uuid::from_u128(SUBSCRIPTION),
+            feed(),
             "p0",
             &drifting(vec![b"row-a".to_vec()]),
         )
@@ -887,6 +896,7 @@ async fn pipe_driver_replays_outputs_identically_when_applied_commit_is_ambiguou
         .driver
         .planned_effect_id(
             Uuid::from_u128(SUBSCRIPTION),
+            feed(),
             "p0",
             &page(vec![record(1), record(2)], "p1"),
         )
@@ -982,6 +992,8 @@ async fn pipe_driver_aborts_a_declare_whose_frontier_moved_mid_apply() {
         ownership_epoch: 7,
         sequence: 2,
         request_id: Uuid::new_v4(),
+        member_progress: BTreeMap::new(),
+        member_feed: None,
         expected_cursor: Some("p0".to_owned()),
         cursor: "pX".to_owned(),
         positions: BTreeMap::from([(range(), "other".to_owned())]),
@@ -1023,6 +1035,7 @@ async fn pipe_driver_aborts_a_declare_whose_frontier_moved_mid_apply() {
         .driver
         .planned_effect_id(
             Uuid::from_u128(SUBSCRIPTION),
+            feed(),
             "p0",
             &page(vec![record(1)], "p1"),
         )
@@ -1371,6 +1384,7 @@ async fn window_pipe_folds_a_page_into_one_accumulate_mutation() {
             .driver
             .planned_effect_id(
                 Uuid::from_u128(SUBSCRIPTION),
+                feed(),
                 "p0",
                 &page(
                     vec![
@@ -1667,6 +1681,7 @@ async fn enrich_pipe_adopts_a_committed_divergent_declare() {
         .driver
         .planned_effect_id(
             Uuid::from_u128(SUBSCRIPTION),
+            feed(),
             "p0",
             &page(vec![ours.clone()], "p1"),
         )
@@ -1908,6 +1923,7 @@ async fn idle_pages_close_panes_with_an_emission_only_effect() {
         whitewater::pipe::pipe_emission_effect_id(
             emit_window_pipe().pipe_id,
             Uuid::from_u128(SUBSCRIPTION),
+            feed(),
             "p0",
             std::slice::from_ref(&emission),
             &[],
@@ -2058,6 +2074,7 @@ async fn expired_panes_delete_on_an_idle_page() {
         whitewater::pipe::pipe_emission_effect_id(
             expire_window_pipe().pipe_id,
             Uuid::from_u128(SUBSCRIPTION),
+            feed(),
             "p0",
             &[],
             std::slice::from_ref(&expired_key),
@@ -2241,6 +2258,7 @@ async fn window_limit_keys_quarantines_refused_groups_into_a_shared_sentinel() {
                     records,
                     cursor: "p1".to_owned(),
                     positions: BTreeMap::from([(range(), "p1".to_owned())]),
+                    member_feed: None,
                     emissions: Vec::new(),
                     expired: Vec::new(),
                     refused,
@@ -2351,6 +2369,7 @@ async fn window_limit_bytes_refuses_new_pane_rows_into_bytecap() {
                     records,
                     cursor: "p1".to_owned(),
                     positions: BTreeMap::from([(range(), "p1".to_owned())]),
+                    member_feed: None,
                     emissions: Vec::new(),
                     expired: Vec::new(),
                     refused: Vec::new(),
@@ -2427,6 +2446,7 @@ async fn window_limit_bytes_saturated_scan_refuses_every_new_row() {
                     records,
                     cursor: "p1".to_owned(),
                     positions: BTreeMap::from([(range(), "p1".to_owned())]),
+                    member_feed: None,
                     emissions: Vec::new(),
                     expired: Vec::new(),
                     refused: Vec::new(),

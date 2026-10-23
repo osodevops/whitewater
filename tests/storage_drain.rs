@@ -677,6 +677,8 @@ async fn drain_executor_vacates_subscription_progress_references() {
             ownership_epoch: progress.ownership_epoch,
             sequence: 1,
             request_id: Uuid::new_v4(),
+            member_progress: BTreeMap::new(),
+            member_feed: None,
             expected_cursor: None,
             cursor: "beginning".to_owned(),
             positions: BTreeMap::from([(

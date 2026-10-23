@@ -1296,17 +1296,54 @@ impl ReaderProgressEngine for FjallReaderProgressStore {
     }
 }
 
+/// One member Feed's independent frontier inside a Domain-source
+/// Subscription's committed progress. No cross-Feed order is promised, so
+/// each Feed keeps its own Cursor, positions, and durable
+/// quarantine/skip evidence; the enclosing mutation's top-level delta
+/// fields describe whichever Feed `member_feed` names.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MemberFeedProgress {
+    pub cursor: String,
+    pub positions: BTreeMap<RangeId, String>,
+    /// Cumulative positions members quarantined on this Feed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub quarantined: BTreeMap<RangeId, Vec<String>>,
+    /// Cumulative positions permanently skipped on this Feed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skipped: BTreeMap<RangeId, Vec<String>>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct SubscriptionProgressMutation {
     pub subscription_id: Uuid,
+    /// The progress scope identity: the source Feed for exact-Feed
+    /// Subscriptions, the bound Domain for Domain-source ones — the row
+    /// key never changes across a Subscription's lifetime.
     pub feed_id: Uuid,
     pub ownership_epoch: u64,
     pub sequence: u64,
     pub request_id: Uuid,
+    /// Compare-and-set guard on the frontier this mutation advances: the
+    /// committed row's `cursor` for exact-Feed rows, the committed
+    /// `member_progress[member_feed].cursor` for a member-Feed delta, and
+    /// `None` when the touched entry is being attached fresh.
     pub expected_cursor: Option<String>,
     pub cursor: String,
     pub positions: BTreeMap<RangeId, String>,
+    /// Domain-source Subscriptions only: the full per-Feed frontier map
+    /// this commit carries forward. Entries the mutation does not name
+    /// must equal the committed row verbatim; new entries attach a
+    /// discovered member Feed, and dropped entries detach one.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub member_progress: BTreeMap<Uuid, MemberFeedProgress>,
+    /// The member Feed whose frontier this mutation advances. Present
+    /// whenever `member_progress` is non-empty and the mutation moves a
+    /// Feed's cursor; `None` marks a pure attach/detach or lease-only
+    /// mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_feed: Option<Uuid>,
     #[serde(default)]
     pub tick: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1332,6 +1369,111 @@ pub struct SubscriptionProgressMutation {
     /// request replays and a changed one conflicts rather than restating.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skip_add: BTreeMap<RangeId, Vec<String>>,
+}
+
+/// The per-Feed frontier entries a Domain-source mutation may carry:
+/// mirrors the catalog's `MAX_SUBSCRIPTION_MEMBER_FEEDS` bound.
+const MEMBER_PROGRESS_MAX_FEEDS: usize = 4096;
+
+/// Per-entry bounds for a member-Feed frontier, mirroring the top-level
+/// frontier bounds so a Domain row cannot smuggle oversized state past
+/// the legacy checks.
+fn member_progress_bounds_ok(entry: &MemberFeedProgress) -> bool {
+    !entry.cursor.is_empty()
+        && entry.cursor.len() <= 256
+        && !entry.positions.is_empty()
+        && entry.positions.len() <= 128
+        && entry.positions.values().all(|value| value.len() <= 256)
+        && entry.quarantined.len() <= 128
+        && entry
+            .quarantined
+            .values()
+            .flatten()
+            .all(|value| !value.is_empty() && value.len() <= 256)
+        && entry.quarantined.values().map(Vec::len).sum::<usize>()
+            <= SUBSCRIPTION_QUARANTINE_MAX_POSITIONS
+        && entry
+            .quarantined
+            .keys()
+            .all(|range| entry.positions.contains_key(range))
+        && entry.skipped.len() <= 128
+        && entry
+            .skipped
+            .values()
+            .flatten()
+            .all(|value| !value.is_empty() && value.len() <= 256)
+        && entry.skipped.values().map(Vec::len).sum::<usize>() <= SUBSCRIPTION_SKIP_MAX_POSITIONS
+        && entry
+            .skipped
+            .keys()
+            .all(|range| entry.positions.contains_key(range))
+}
+
+/// Validate the Domain-source member-Feed rules on a proposed mutation:
+/// every entry stays inside the per-Feed bounds, the named member Feed's
+/// entry restates the top-level delta exactly, entries the mutation does
+/// not name copy the committed row forward verbatim, and a pure
+/// attach/detach mutation (`member_feed` unset) leaves the aggregate
+/// delta fields untouched and carries no per-Feed evidence.
+fn member_progress_valid(
+    mutation: &SubscriptionProgressMutation,
+    committed: Option<&SubscriptionProgressMutation>,
+) -> Result<(), SubscriptionProgressError> {
+    if mutation.member_progress.is_empty() && mutation.member_feed.is_none() {
+        return Ok(());
+    }
+    if mutation.member_progress.is_empty()
+        || mutation.member_progress.len() > MEMBER_PROGRESS_MAX_FEEDS
+        || !mutation
+            .member_progress
+            .values()
+            .all(member_progress_bounds_ok)
+    {
+        return Err(SubscriptionProgressError::TooLarge);
+    }
+    match mutation.member_feed {
+        Some(feed) => {
+            let Some(entry) = mutation.member_progress.get(&feed) else {
+                return Err(SubscriptionProgressError::Conflict);
+            };
+            if entry.cursor != mutation.cursor
+                || entry.positions != mutation.positions
+                || entry.quarantined != mutation.quarantined
+                || entry.skipped != mutation.skipped
+            {
+                return Err(SubscriptionProgressError::Conflict);
+            }
+        }
+        None => {
+            if !mutation.quarantine_add.is_empty()
+                || !mutation.quarantine_remove.is_empty()
+                || !mutation.skip_add.is_empty()
+            {
+                return Err(SubscriptionProgressError::Conflict);
+            }
+            if let Some(committed) = committed {
+                if committed.cursor != mutation.cursor
+                    || committed.positions != mutation.positions
+                    || committed.quarantined != mutation.quarantined
+                    || committed.skipped != mutation.skipped
+                {
+                    return Err(SubscriptionProgressError::Conflict);
+                }
+            }
+        }
+    }
+    if let Some(committed) = committed {
+        for (feed, prior) in &committed.member_progress {
+            if Some(*feed) == mutation.member_feed {
+                continue;
+            }
+            match mutation.member_progress.get(feed) {
+                Some(next) if next == prior => {}
+                _ => return Err(SubscriptionProgressError::Conflict),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// A replica answering with one of these errors is behind the current
@@ -1386,6 +1528,59 @@ fn refusal_error(status: reqwest::StatusCode, body: &[u8]) -> SubscriptionProgre
     }
 }
 
+impl SubscriptionProgressMutation {
+    /// The frontier Cursor a subsequent mutation must CAS on for the
+    /// member Feed it touches: the entry's Cursor for a named member
+    /// Feed (`None` while the entry is unattached), the row's aggregate
+    /// Cursor for exact-Feed and pure bookkeeping mutations.
+    pub fn expected_frontier_cursor(&self, member_feed: Option<Uuid>) -> Option<&str> {
+        match member_feed {
+            Some(feed) => self
+                .member_progress
+                .get(&feed)
+                .map(|entry| entry.cursor.as_str()),
+            None => Some(self.cursor.as_str()),
+        }
+    }
+
+    /// A synthesized per-Feed frontier view of a Domain-scoped row:
+    /// page fetching, evidence, and record-source resolution all key off
+    /// `feed_id`/`cursor`/`positions`, so callers can treat one member
+    /// Feed exactly like an exact-Feed row. The view carries the row's
+    /// per-Feed delta maps only when this row's last mutation named the
+    /// same Feed, so a replayed request never surfaces another Feed's
+    /// evidence.
+    pub fn member_view(&self, feed: Uuid) -> Option<Self> {
+        let entry = self.member_progress.get(&feed)?;
+        let delta_is_mine = self.member_feed == Some(feed);
+        Some(Self {
+            feed_id: feed,
+            cursor: entry.cursor.clone(),
+            positions: entry.positions.clone(),
+            quarantined: entry.quarantined.clone(),
+            skipped: entry.skipped.clone(),
+            quarantine_add: if delta_is_mine {
+                self.quarantine_add.clone()
+            } else {
+                BTreeMap::new()
+            },
+            quarantine_remove: if delta_is_mine {
+                self.quarantine_remove.clone()
+            } else {
+                BTreeMap::new()
+            },
+            skip_add: if delta_is_mine {
+                self.skip_add.clone()
+            } else {
+                BTreeMap::new()
+            },
+            member_progress: BTreeMap::new(),
+            member_feed: None,
+            ..self.clone()
+        })
+    }
+}
+
 fn same_progress_identity(
     left: &SubscriptionProgressMutation,
     right: &SubscriptionProgressMutation,
@@ -1397,6 +1592,8 @@ fn same_progress_identity(
         && left.expected_cursor == right.expected_cursor
         && left.cursor == right.cursor
         && left.positions == right.positions
+        && left.member_progress == right.member_progress
+        && left.member_feed == right.member_feed
         && left.tick == right.tick
         && left.lease_ops == right.lease_ops
         && left.quarantined == right.quarantined
@@ -1651,7 +1848,7 @@ impl FjallSubscriptionProgressReplica {
             if mutation.sequence == 0
                 || mutation.cursor.is_empty()
                 || mutation.cursor.len() > 256
-                || mutation.positions.is_empty()
+                || (mutation.positions.is_empty() && mutation.member_progress.is_empty())
                 || mutation.positions.len() > 128
                 || mutation.positions.values().any(|value| value.len() > 256)
                 || mutation.quarantined.len() > 128
@@ -1681,7 +1878,10 @@ impl FjallSubscriptionProgressReplica {
                 || mutation.expected_cursor.as_ref().is_some_and(|expected| {
                     expected.is_empty()
                         || expected.len() > 256
-                        || (expected == &mutation.cursor && mutation.lease_ops.is_empty())
+                        || (expected == &mutation.cursor
+                            && mutation.lease_ops.is_empty()
+                            && (mutation.member_feed.is_some()
+                                || mutation.member_progress.is_empty()))
                 })
                 || mutation.lease_ops.len() > SUBSCRIPTION_LEASE_MAX_OPS
                 || serde_json::to_vec(mutation)?.len() > 256 * 1024
@@ -1718,6 +1918,9 @@ impl FjallSubscriptionProgressReplica {
                 Err(SubscriptionProgressError::Conflict)
             };
         }
+        if let Some(recovered) = &committed {
+            member_progress_valid(recovered, row.committed.as_ref())?;
+        }
         if let Some(existing) = &row.committed {
             let Some(recovered) = &committed else {
                 return Err(SubscriptionProgressError::Conflict);
@@ -1726,7 +1929,8 @@ impl FjallSubscriptionProgressReplica {
                 || (recovered.sequence == existing.sequence
                     && !same_progress_identity(existing, recovered))
                 || (recovered.sequence == existing.sequence + 1
-                    && recovered.expected_cursor.as_deref() != Some(existing.cursor.as_str()))
+                    && recovered.expected_cursor.as_deref()
+                        != existing.expected_frontier_cursor(recovered.member_feed))
             {
                 return Err(SubscriptionProgressError::Conflict);
             }
@@ -1752,7 +1956,7 @@ impl FjallSubscriptionProgressReplica {
             || mutation.sequence == 0
             || mutation.cursor.is_empty()
             || mutation.cursor.len() > 256
-            || mutation.positions.is_empty()
+            || (mutation.positions.is_empty() && mutation.member_progress.is_empty())
             || mutation.positions.len() > 128
             || mutation.positions.values().any(|value| value.len() > 256)
             || mutation.quarantined.len() > 128
@@ -1783,7 +1987,9 @@ impl FjallSubscriptionProgressReplica {
             || mutation.expected_cursor.as_ref().is_some_and(|expected| {
                 expected.is_empty()
                     || expected.len() > 256
-                    || (expected == &mutation.cursor && mutation.lease_ops.is_empty())
+                    || (expected == &mutation.cursor
+                        && mutation.lease_ops.is_empty()
+                        && (mutation.member_feed.is_some() || mutation.member_progress.is_empty()))
             })
         {
             return Err(SubscriptionProgressError::TooLarge);
@@ -1847,7 +2053,11 @@ impl FjallSubscriptionProgressReplica {
         if prior_sequence.checked_add(1) != Some(mutation.sequence) {
             return Err(SubscriptionProgressError::Sequence);
         }
-        if row.committed.as_ref().map(|prior| prior.cursor.as_str())
+        member_progress_valid(&mutation, row.committed.as_ref())?;
+        if row
+            .committed
+            .as_ref()
+            .and_then(|prior| prior.expected_frontier_cursor(mutation.member_feed))
             != mutation.expected_cursor.as_deref()
         {
             return Err(SubscriptionProgressError::Conflict);
@@ -2050,7 +2260,7 @@ impl SubscriptionProgressReplicaService {
             .await?;
         if self
             .control
-            .active_subscription_feed_by_id(request.mutation.subscription_id)
+            .active_subscription_progress_scope_by_id(request.mutation.subscription_id)
             .await
             != Some(request.mutation.feed_id)
         {
@@ -2125,7 +2335,7 @@ impl SubscriptionProgressReplicaService {
             .await?;
         let feed_id = self
             .control
-            .active_subscription_feed_by_id(request.subscription_id)
+            .active_subscription_progress_scope_by_id(request.subscription_id)
             .await
             .ok_or(SubscriptionProgressError::InvalidAssignment)?;
         let replica = self.replica.clone();
@@ -2193,7 +2403,7 @@ impl SubscriptionProgressReplicaService {
             .await?;
         let feed_id = self
             .control
-            .active_subscription_feed_by_id(request.subscription_id)
+            .active_subscription_progress_scope_by_id(request.subscription_id)
             .await
             .ok_or(SubscriptionProgressError::InvalidAssignment)?;
         let replica = self.replica.clone();
@@ -3409,6 +3619,60 @@ impl SubscriptionProgressCoordinator {
         mutation.expected_cursor = Some(current.cursor.clone());
         mutation.tick = tick;
         mutation.lease_ops = lease_ops;
+        // A lease-only mutation carries no member-Feed delta on Domain
+        // rows: the top-level frontier fields copy forward verbatim and
+        // stale per-Feed evidence must not restate.
+        if !mutation.member_progress.is_empty() {
+            mutation.member_feed = None;
+            mutation.quarantine_add = BTreeMap::new();
+            mutation.quarantine_remove = BTreeMap::new();
+            mutation.skip_add = BTreeMap::new();
+        }
+        self.apply(mutation.clone()).await?;
+        Ok(mutation)
+    }
+
+    /// Attach member-Feed frontier entries to a Domain-scoped row without
+    /// moving any existing frontier: the mutation copies every committed
+    /// field forward and only adds the named entries, so a member Feed
+    /// discovered after the first join gains progress durably without a
+    /// lease op or a frontier CAS on unrelated Feeds.
+    pub async fn attach_member_feeds(
+        &self,
+        request_id: Uuid,
+        tick: u64,
+        additions: BTreeMap<Uuid, MemberFeedProgress>,
+    ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
+        if additions.is_empty() {
+            return Err(SubscriptionProgressError::Conflict);
+        }
+        let current = self
+            .read_committed()
+            .await?
+            .ok_or(SubscriptionProgressError::Conflict)?;
+        // An attach must never overwrite a committed frontier:
+        // reattaching an already-tracked Feed would silently rewind its
+        // acknowledged positions.
+        if additions
+            .keys()
+            .any(|feed| current.member_progress.contains_key(feed))
+        {
+            return Err(SubscriptionProgressError::Conflict);
+        }
+        let mut mutation = current.clone();
+        mutation.sequence = current
+            .sequence
+            .checked_add(1)
+            .ok_or(SubscriptionProgressError::Sequence)?;
+        mutation.request_id = request_id;
+        mutation.expected_cursor = Some(current.cursor.clone());
+        mutation.tick = tick;
+        mutation.member_feed = None;
+        mutation.quarantine_add = BTreeMap::new();
+        mutation.quarantine_remove = BTreeMap::new();
+        mutation.skip_add = BTreeMap::new();
+        mutation.lease_ops = Vec::new();
+        mutation.member_progress.extend(additions);
         self.apply(mutation.clone()).await?;
         Ok(mutation)
     }
@@ -3418,6 +3682,48 @@ impl SubscriptionProgressCoordinator {
         grant: &SubscriptionWorkLease,
         tick: u64,
         request_id: Uuid,
+        cursor: String,
+        positions: BTreeMap<RangeId, String>,
+        quarantine: SubscriptionQuarantineDelta,
+    ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
+        self.acknowledge_inner(grant, tick, request_id, None, cursor, positions, quarantine)
+            .await
+    }
+
+    /// Acknowledge delivered positions on one member Feed of a
+    /// Domain-source Subscription: the frontier CAS rides that Feed's
+    /// committed entry Cursor while every other member-Feed frontier
+    /// copies forward untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acknowledge_member(
+        &self,
+        grant: &SubscriptionWorkLease,
+        tick: u64,
+        request_id: Uuid,
+        member_feed: Uuid,
+        cursor: String,
+        positions: BTreeMap<RangeId, String>,
+        quarantine: SubscriptionQuarantineDelta,
+    ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
+        self.acknowledge_inner(
+            grant,
+            tick,
+            request_id,
+            Some(member_feed),
+            cursor,
+            positions,
+            quarantine,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn acknowledge_inner(
+        &self,
+        grant: &SubscriptionWorkLease,
+        tick: u64,
+        request_id: Uuid,
+        member_feed: Option<Uuid>,
         cursor: String,
         positions: BTreeMap<RangeId, String>,
         quarantine: SubscriptionQuarantineDelta,
@@ -3440,7 +3746,27 @@ impl SubscriptionProgressCoordinator {
         {
             return Err(SubscriptionProgressError::Conflict);
         }
-        let mut quarantined = current.quarantined.clone();
+        // For a member-Feed acknowledgement the cumulative sets and the
+        // CAS live on that Feed's entry; every other entry copies forward.
+        let prior_entry = member_feed.map(|feed| {
+            current
+                .member_progress
+                .get(&feed)
+                .cloned()
+                .ok_or(SubscriptionProgressError::Conflict)
+        });
+        let prior_entry = match prior_entry {
+            Some(entry) => Some(entry?),
+            None => None,
+        };
+        let mut quarantined = prior_entry
+            .as_ref()
+            .map(|entry| entry.quarantined.clone())
+            .unwrap_or_else(|| current.quarantined.clone());
+        let skipped = prior_entry
+            .as_ref()
+            .map(|entry| entry.skipped.clone())
+            .unwrap_or_else(|| current.skipped.clone());
         for (range, cursors) in &quarantine_remove {
             if let Some(held) = quarantined.get_mut(range) {
                 held.retain(|cursor| !cursors.contains(cursor));
@@ -3461,6 +3787,18 @@ impl SubscriptionProgressCoordinator {
         {
             return Err(SubscriptionProgressError::TooLarge);
         }
+        let mut member_progress = current.member_progress.clone();
+        if let Some(feed) = member_feed {
+            member_progress.insert(
+                feed,
+                MemberFeedProgress {
+                    cursor: cursor.clone(),
+                    positions: positions.clone(),
+                    quarantined: quarantined.clone(),
+                    skipped: skipped.clone(),
+                },
+            );
+        }
         let mutation = SubscriptionProgressMutation {
             subscription_id: current.subscription_id,
             feed_id: current.feed_id,
@@ -3470,13 +3808,18 @@ impl SubscriptionProgressCoordinator {
                 .checked_add(1)
                 .ok_or(SubscriptionProgressError::Sequence)?,
             request_id,
-            expected_cursor: Some(current.cursor.clone()),
+            expected_cursor: prior_entry
+                .as_ref()
+                .map(|entry| entry.cursor.clone())
+                .or_else(|| Some(current.cursor.clone())),
             cursor,
             positions,
+            member_progress,
+            member_feed,
             quarantined,
             quarantine_add,
             quarantine_remove,
-            skipped: current.skipped.clone(),
+            skipped,
             skip_add: BTreeMap::new(),
             tick,
             lease_ops: vec![SubscriptionLeaseOp::Release {
@@ -3502,6 +3845,7 @@ impl SubscriptionProgressCoordinator {
         grant: &SubscriptionWorkLease,
         tick: u64,
         request_id: Uuid,
+        member_feed: Option<Uuid>,
         decision: ExhaustedDelivery,
     ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
         let ExhaustedDelivery {
@@ -3517,8 +3861,26 @@ impl SubscriptionProgressCoordinator {
         if !exhausted.keys().all(|range| positions.contains_key(range)) {
             return Err(SubscriptionProgressError::Conflict);
         }
-        let mut skipped = current.skipped.clone();
-        let mut quarantined = current.quarantined.clone();
+        // On a Domain row the disposition merges into the member Feed's
+        // entry and the CAS rides that entry's committed Cursor.
+        let prior_entry = match member_feed {
+            Some(feed) => Some(
+                current
+                    .member_progress
+                    .get(&feed)
+                    .cloned()
+                    .ok_or(SubscriptionProgressError::Conflict)?,
+            ),
+            None => None,
+        };
+        let mut skipped = prior_entry
+            .as_ref()
+            .map(|entry| entry.skipped.clone())
+            .unwrap_or_else(|| current.skipped.clone());
+        let mut quarantined = prior_entry
+            .as_ref()
+            .map(|entry| entry.quarantined.clone())
+            .unwrap_or_else(|| current.quarantined.clone());
         let mut skip_add = BTreeMap::new();
         let mut quarantine_add = BTreeMap::new();
         match disposition {
@@ -3553,6 +3915,18 @@ impl SubscriptionProgressCoordinator {
                 skip_add = exhausted;
             }
         }
+        let mut member_progress = current.member_progress.clone();
+        if let Some(feed) = member_feed {
+            member_progress.insert(
+                feed,
+                MemberFeedProgress {
+                    cursor: cursor.clone(),
+                    positions: positions.clone(),
+                    quarantined: quarantined.clone(),
+                    skipped: skipped.clone(),
+                },
+            );
+        }
         let mutation = SubscriptionProgressMutation {
             subscription_id: current.subscription_id,
             feed_id: current.feed_id,
@@ -3562,9 +3936,14 @@ impl SubscriptionProgressCoordinator {
                 .checked_add(1)
                 .ok_or(SubscriptionProgressError::Sequence)?,
             request_id,
-            expected_cursor: Some(current.cursor.clone()),
+            expected_cursor: prior_entry
+                .as_ref()
+                .map(|entry| entry.cursor.clone())
+                .or_else(|| Some(current.cursor.clone())),
             cursor,
             positions,
+            member_progress,
+            member_feed,
             quarantined,
             quarantine_add,
             quarantine_remove: BTreeMap::new(),
@@ -3687,6 +4066,8 @@ mod tests {
             ownership_epoch: 1,
             sequence: 1,
             request_id: Uuid::from_u128(700),
+            member_progress: BTreeMap::new(),
+            member_feed: None,
             expected_cursor: None,
             cursor: "rf1_event".to_owned(),
             positions: BTreeMap::from([(
@@ -3809,6 +4190,8 @@ mod tests {
             ownership_epoch: 1,
             sequence: 1,
             request_id: Uuid::from_u128(3),
+            member_progress: BTreeMap::new(),
+            member_feed: None,
             expected_cursor: None,
             cursor: "rf1_one".to_owned(),
             positions: BTreeMap::from([(
@@ -4218,6 +4601,8 @@ mod tests {
             ownership_epoch: epoch,
             sequence,
             request_id: Uuid::from_u128(sequence as u128 + 9_000),
+            member_progress: BTreeMap::new(),
+            member_feed: None,
             expected_cursor: (sequence > 1).then(|| format!("rf1_{}", sequence - 1)),
             cursor: format!("rf1_{sequence}"),
             positions: BTreeMap::from([(
@@ -4853,6 +5238,8 @@ mod tests {
             ownership_epoch: 2,
             sequence: 1,
             request_id: Uuid::from_u128(9_999),
+            member_progress: BTreeMap::new(),
+            member_feed: None,
             expected_cursor: None,
             cursor: "rf1_recovered".to_owned(),
             positions: BTreeMap::from([(

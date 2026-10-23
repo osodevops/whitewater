@@ -400,6 +400,27 @@ pub struct PipeDefinition {
     pub created_at_ns: i64,
 }
 
+impl PipeDefinition {
+    /// Feeds this Pipe writes and therefore must never re-consume: the
+    /// declared output (Forward/Enrich output, or a Window `EMIT TO
+    /// FEED`) plus an `Enrich` miss quarantine route. A Domain-sourced
+    /// Subscription covers those Feeds as member Feeds, so a drive that
+    /// read them would loop its own writes back through the frontier as
+    /// new input — the member-Feed extension of the exact-Feed
+    /// `output != input` refusal.
+    pub fn write_feeds(&self) -> std::collections::BTreeSet<Uuid> {
+        let mut feeds = self.output_feed_id.into_iter().collect::<BTreeSet<Uuid>>();
+        if let PipeOperation::Enrich {
+            quarantine_feed_id: Some(feed),
+            ..
+        } = &self.operation
+        {
+            feeds.insert(*feed);
+        }
+        feeds
+    }
+}
+
 /// Which storage-eligible Node may drive a Pipe right now. The lease is
 /// pure catalog metadata — it owns no replica state of its own, so moving
 /// it is a single epoch-bumping compare-and-set rather than a staged
@@ -2415,6 +2436,22 @@ impl ControlController {
             .collect()
     }
 
+    /// The catalog's member-Feed membership set for one Domain-scoped
+    /// Subscription, keyed by immutable FeedId; empty for exact-Feed
+    /// sources or while no Feed has attached.
+    pub async fn subscription_feed_memberships(
+        &self,
+        subscription_id: Uuid,
+    ) -> BTreeMap<Uuid, SubscriptionFeedMembership> {
+        self.state
+            .lock()
+            .await
+            .subscription_feed_memberships
+            .get(&subscription_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// The RF3 mutation-journal placement of a still-active StateStore.
     pub async fn active_state_store_assignment_by_id(
         &self,
@@ -2454,7 +2491,11 @@ impl ControlController {
             .collect()
     }
 
-    pub(crate) async fn active_subscription_feed_by_id(
+    /// The progress row's scope identity: the exact Feed for Feed-sourced
+    /// Subscriptions, the Domain itself for Domain-sourced ones. Replica
+    /// validation compares committed `feed_id` against this identity, so a
+    /// Domain row fences by Domain scope rather than an absent Feed.
+    pub(crate) async fn active_subscription_progress_scope_by_id(
         &self,
         subscription_id: Uuid,
     ) -> Option<Uuid> {
@@ -2464,7 +2505,7 @@ impl ControlController {
             .subscriptions
             .get(&subscription_id)
             .filter(|item| item.status == ResourceStatus::Active)
-            .and_then(|item| item.source.feed_id())
+            .and_then(|item| item.source.feed_id().or_else(|| item.source.domain_id()))
     }
 
     pub(crate) async fn active_reader_frontier(&self, reader_id: Uuid) -> Option<ReaderFrontier> {
@@ -7464,8 +7505,17 @@ fn validate_subscription_translations(
             .values()
             .map(Vec::len)
             .sum::<usize>();
+        // A translation scopes to one Feed: either the Subscription's exact
+        // Feed source or an Active member Feed inside a Domain source — the
+        // pending record then applies against that member Feed's entry.
+        let covers_feed = subscription.source.feed_id() == Some(feed_id)
+            || state
+                .subscription_feed_memberships
+                .get(&translation.subscription_id)
+                .and_then(|members| members.get(&feed_id))
+                .is_some_and(|member| member.state == SubscriptionFeedState::Active);
         if !seen.insert(translation.subscription_id)
-            || subscription.source.feed_id() != Some(feed_id)
+            || !covers_feed
             || translation.feed_id != feed_id
             || translation.plan_id != plan_id
             || translation.expected_cursor.is_empty()
@@ -12134,6 +12184,47 @@ mod tests {
                 "{statement} must fail"
             );
         }
+    }
+
+    /// A Pipe never consumes a Feed it writes: `write_feeds` is the member
+    /// -Feed exclusion set a Domain-sourced drive applies when probing
+    /// entries — output and miss-quarantine routes both stay out of the
+    /// input set so the pipe can never loop its own writes.
+    #[tokio::test]
+    async fn pipe_write_feeds_excludes_output_and_quarantine_routes() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute(
+                "CREATE DOMAIN accounts; CREATE FEED accounts.in;                  CREATE FEED accounts.out; CREATE FEED accounts.misses;                  DEFINE STATESTORE accounts.lookup KEYS dept;                  CREATE SUBSCRIPTION accounts.flow FROM DOMAIN accounts;                  CREATE PIPE accounts.copy FROM SUBSCRIPTION accounts.flow TO FEED accounts.out;                  CREATE PIPE accounts.lookuped FROM SUBSCRIPTION accounts.flow                    TO FEED accounts.out ENRICH STATESTORE accounts.lookup                    BY KEY MISS QUARANTINE accounts.misses;",
+            )
+            .await
+            .unwrap();
+        let (copy, lookuped) = {
+            let subs = controller.active_pipes().await;
+            (
+                subs.iter()
+                    .find(|p| p.name == "accounts.copy")
+                    .unwrap()
+                    .clone(),
+                subs.iter()
+                    .find(|p| p.name == "accounts.lookuped")
+                    .unwrap()
+                    .clone(),
+            )
+        };
+        let out = controller
+            .active_feed_by_name("accounts.out")
+            .await
+            .unwrap()
+            .feed_id;
+        let misses = controller
+            .active_feed_by_name("accounts.misses")
+            .await
+            .unwrap()
+            .feed_id;
+        assert_eq!(copy.write_feeds(), BTreeSet::from([out]));
+        assert_eq!(lookuped.write_feeds(), BTreeSet::from([out, misses]));
     }
 
     #[tokio::test]

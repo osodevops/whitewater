@@ -1523,6 +1523,11 @@ struct SubscriptionMemberAckRequest {
     lease_epoch: u64,
     cursor: Option<String>,
     positions: Option<BTreeMap<RangeId, String>>,
+    /// The member Feed this acknowledgement advances — required on a
+    /// Domain-source Subscription, ignored when it names an exact-Feed
+    /// source's declared Feed.
+    #[serde(default)]
+    feed: Option<String>,
     /// Positions this acknowledgement declares delivered-but-not-processed
     /// (quarantine) or resolved-and-removable (release_quarantine); the
     /// cumulative set is durable poison evidence a later SEEK can revisit.
@@ -1635,19 +1640,36 @@ type RestatedFrontier<'a> = (
     BTreeMap<RangeId, Vec<String>>,
 );
 
-/// Load every Feed-scoped Subscription on `feed_id` that holds committed
-/// progress. Declared Subscriptions without a frontier or a progress
-/// placement have nothing to translate and never block a range transition;
-/// Domain-scoped sources cannot hold per-Feed progress yet.
+/// Load every Subscription holding committed progress on `feed_id` — an
+/// exact-Feed source's own frontier, or one member-Feed entry inside a
+/// Domain row (staged through the same `SubscriptionCutoverFrontier`
+/// shape so the translation pipeline stays Feed-agnostic). Declared
+/// Subscriptions without a frontier or a progress placement have nothing
+/// to translate and never block a range transition; a Domain member Feed
+/// without a committed entry attaches later against the new range map.
 async fn subscription_cutover_frontiers(
     state: &AppState,
     feed_id: Uuid,
 ) -> Result<Vec<SubscriptionCutoverFrontier>, ApiError> {
     let mut frontiers = Vec::new();
     for definition in state.control.active_subscriptions().await {
-        if definition.source.feed_id() != Some(feed_id) {
-            continue;
-        }
+        let member_feed = match &definition.source {
+            crate::control::SubscriptionSource::Feed { feed_id: source } if *source == feed_id => {
+                None
+            }
+            crate::control::SubscriptionSource::Domain { .. } => match state
+                .control
+                .subscription_feed_memberships(definition.subscription_id)
+                .await
+                .get(&feed_id)
+            {
+                Some(member) if member.state == crate::control::SubscriptionFeedState::Active => {
+                    Some(feed_id)
+                }
+                _ => continue,
+            },
+            _ => continue,
+        };
         let Some(assignment) = state
             .control
             .active_subscription_progress_assignment_by_id(definition.subscription_id)
@@ -1680,6 +1702,15 @@ async fn subscription_cutover_frontiers(
             }
         }
         if let Some(frontier) = frontier.flatten() {
+            let frontier = match member_feed {
+                Some(feed) => match frontier.member_view(feed) {
+                    Some(view) => view,
+                    // The member Feed never gained a frontier entry; its
+                    // eventual attach resolves the post-cutover range map.
+                    None => continue,
+                },
+                None => frontier,
+            };
             frontiers.push(SubscriptionCutoverFrontier {
                 definition,
                 frontier,
@@ -1799,7 +1830,18 @@ async fn pending_cutover_subjects(
 ) -> Vec<(uuid::Uuid, String)> {
     let mut subjects = Vec::new();
     for definition in state.control.active_subscriptions().await {
-        if definition.source.feed_id() != Some(feed_id) {
+        let covered = match &definition.source {
+            crate::control::SubscriptionSource::Feed { feed_id: source } => *source == feed_id,
+            crate::control::SubscriptionSource::Domain { .. } => state
+                .control
+                .subscription_feed_memberships(definition.subscription_id)
+                .await
+                .get(&feed_id)
+                .is_some_and(|member| {
+                    member.state == crate::control::SubscriptionFeedState::Active
+                }),
+        };
+        if !covered {
             continue;
         }
         if state
@@ -1850,8 +1892,23 @@ async fn apply_pending_subscription_cutover(
                 "Subscription frontier vanished before its cutover translation applied",
             ));
         };
-        if frontier
-            .positions
+        // On a Domain-scoped row the cutover targets one member Feed's
+        // entry, so both convergence and the CAS ride that entry's view.
+        let member_feed = if frontier.member_progress.is_empty() {
+            None
+        } else if frontier.member_progress.contains_key(&pending.feed_id) {
+            Some(pending.feed_id)
+        } else {
+            // The member Feed never gained a frontier entry: its eventual
+            // attach resolves positions against the current range map, so
+            // this staged translation is already covered.
+            return Ok("current");
+        };
+        let staged_positions = member_feed
+            .and_then(|feed| frontier.member_progress.get(&feed))
+            .map(|entry| &entry.positions)
+            .unwrap_or(&frontier.positions);
+        if staged_positions
             .keys()
             .copied()
             .collect::<BTreeSet<RangeId>>()
@@ -1863,7 +1920,8 @@ async fn apply_pending_subscription_cutover(
         // Only position-moving mutations rotate the frontier Cursor, so a
         // matching Cursor proves the committed positions are still the staged
         // set even when lease-only member ops drifted the sequence meanwhile.
-        if frontier.cursor != pending.expected_cursor {
+        if frontier.expected_frontier_cursor(member_feed) != Some(pending.expected_cursor.as_str())
+        {
             // A member acknowledgement landed between staging and this apply:
             // its committed positions still reference the retired map, so
             // refusing keeps the Subscription fail-closed instead of
@@ -1877,9 +1935,21 @@ async fn apply_pending_subscription_cutover(
             .sequence
             .checked_add(1)
             .ok_or_else(|| ApiError::unavailable("Subscription frontier sequence overflowed"))?;
+        let mut member_progress = frontier.member_progress.clone();
+        if let Some(feed) = member_feed {
+            member_progress.insert(
+                feed,
+                crate::reader::MemberFeedProgress {
+                    cursor: pending.cursor.clone(),
+                    positions: pending.positions.clone(),
+                    quarantined: pending.quarantined.clone(),
+                    skipped: pending.skipped.clone(),
+                },
+            );
+        }
         let mutation = crate::reader::SubscriptionProgressMutation {
             subscription_id: pending.subscription_id,
-            feed_id: pending.feed_id,
+            feed_id: frontier.feed_id,
             ownership_epoch: assignment.ownership_epoch,
             sequence,
             request_id: subscription_reconcile_request_id(
@@ -1890,6 +1960,8 @@ async fn apply_pending_subscription_cutover(
             expected_cursor: Some(pending.expected_cursor.clone()),
             cursor: pending.cursor.clone(),
             positions: pending.positions.clone(),
+            member_progress,
+            member_feed,
             quarantined: pending.quarantined.clone(),
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
@@ -3003,96 +3075,67 @@ async fn subscription_member_join(
         read_member_state(&coordinator).await?
     } else {
         // First member: establish the declared-start frontier and the Join
-        // lease transition in one atomic sequence-1 quorum mutation.
-        let source_feed = definition.source.feed_id().ok_or_else(|| ApiError {
-            status: StatusCode::CONFLICT,
-            message: "Subscription has a Domain source; member sessions arrive with Domain-wide progress tracking".to_owned(),
-            code: None,
-        })?;
-        let range_assignments = state
-            .control
-            .active_range_assignments_for_feed(source_feed)
-            .await;
-        if range_assignments.is_empty() {
-            return Err(ApiError::unavailable(
-                "Subscription source Feed has no Active Range placement",
-            ));
-        }
-        let (start_cursor, positions) = match &definition.start {
-            crate::control::ReaderStart::Beginning => (
-                "beginning".to_owned(),
-                range_assignments
-                    .iter()
-                    .map(|assignment| (assignment.range_id, String::new()))
-                    .collect::<BTreeMap<_, _>>(),
-            ),
-            crate::control::ReaderStart::Now => {
-                // Pin each range's committed tail Cursor so only records
-                // appended after the first join are delivered.
-                let mut positions = BTreeMap::new();
-                let mut tail: Option<((i64, Uuid), String)> = None;
-                for range_assignment in &range_assignments {
-                    let page = fetch_range_page(
-                        &state,
-                        ReadRangePageRequest {
-                            assignment: range_assignment.clone(),
-                            after: None,
-                            expected_commit: None,
-                            after_cursor: None,
-                            tail_count: Some(1),
-                            ingest_threshold: None,
-                            single_range: true,
-                            page_limit: Some(1),
-                        },
-                    )
-                    .await?;
-                    let frame = page.frames.last();
-                    positions.insert(
-                        range_assignment.range_id,
-                        frame.map(|frame| frame.cursor.clone()).unwrap_or_default(),
-                    );
-                    if let Some(frame) = frame {
-                        let decoded =
-                            STANDARD
-                                .decode(frame.frame_base64.as_bytes())
-                                .map_err(|_| {
-                                    ApiError::unavailable(
-                                        "current owner returned an invalid frame encoding",
-                                    )
-                                })?;
-                        let record = decode_record(&decoded)
-                            .map_err(|error| ApiError::unavailable(error.to_string()))?;
-                        let key = (record.ingest_time_ns, record.message_id);
-                        if tail.as_ref().is_none_or(|(current, _)| key > *current) {
-                            tail = Some((key, frame.cursor.clone()));
-                        }
+        // lease transition in one atomic sequence-1 quorum mutation. A
+        // Domain-scoped Subscription instead seeds one frontier entry per
+        // attached member Feed — each honoring its own recorded start
+        // policy — under a bookkeeping aggregate Cursor.
+        let (row_feed, start_cursor, positions, member_progress) = match &definition.source {
+            crate::control::SubscriptionSource::Feed { feed_id } => {
+                let (cursor, positions) =
+                    initial_frontier_positions(&state, *feed_id, &definition.start).await?;
+                (*feed_id, cursor, positions, BTreeMap::new())
+            }
+            crate::control::SubscriptionSource::Domain { domain_id } => {
+                let memberships = state
+                    .control
+                    .subscription_feed_memberships(definition.subscription_id)
+                    .await;
+                let mut member_progress = BTreeMap::new();
+                for member in memberships.values() {
+                    if member.state != crate::control::SubscriptionFeedState::Active {
+                        continue;
                     }
+                    let (cursor, positions) =
+                        initial_frontier_positions(&state, member.feed_id, &member.start).await?;
+                    member_progress.insert(
+                        member.feed_id,
+                        crate::reader::MemberFeedProgress {
+                            cursor,
+                            positions,
+                            quarantined: BTreeMap::new(),
+                            skipped: BTreeMap::new(),
+                        },
+                    );
+                }
+                if member_progress.is_empty() {
+                    // No member Feed has attached yet — there is no
+                    // frontier to serve, so the member retries after a
+                    // Feed joins the Domain rather than committing an
+                    // empty progress row.
+                    return Err(ApiError::unavailable(
+                        "Subscription Domain source has no attached member Feeds yet",
+                    ));
                 }
                 (
-                    tail.map(|(_, cursor)| cursor)
-                        .unwrap_or_else(|| "now".to_owned()),
-                    positions,
+                    *domain_id,
+                    "domain".to_owned(),
+                    BTreeMap::new(),
+                    member_progress,
                 )
             }
-            crate::control::ReaderStart::Timestamp(threshold) => (
-                format!("timestamp:{threshold}"),
-                resolve_timestamp_positions(&state, &range_assignments, *threshold).await?,
-            ),
-            crate::control::ReaderStart::Cursor(cursor) => (
-                cursor.clone(),
-                resolve_cursor_positions(&state, &range_assignments, cursor).await?,
-            ),
         };
         coordinator
             .apply(crate::reader::SubscriptionProgressMutation {
                 subscription_id: assignment.subscription_id,
-                feed_id: definition.source.feed_id().unwrap(),
+                feed_id: row_feed,
                 ownership_epoch: assignment.ownership_epoch,
                 sequence: 1,
                 request_id: request.request_id,
                 expected_cursor: None,
                 cursor: start_cursor,
                 positions,
+                member_progress,
+                member_feed: None,
                 quarantined: BTreeMap::new(),
                 quarantine_add: BTreeMap::new(),
                 quarantine_remove: BTreeMap::new(),
@@ -3356,13 +3399,16 @@ async fn subscription_member_ack(
                     "Subscription acknowledgement requires a non-empty Cursor and progress positions",
                 ));
             }
+            let member_feed =
+                member_feed_selection(&state, &definition, request.feed.as_deref()).await?;
             if let Some(latest) = coordinator
                 .read_committed()
                 .await
                 .map_err(subscription_progress_api_error)?
                 .filter(|latest| latest.request_id == request.request_id)
             {
-                if latest.cursor != cursor
+                if latest.member_feed != member_feed
+                    || latest.cursor != cursor
                     || latest.positions != positions
                     || latest.quarantine_add != request.quarantine.clone().unwrap_or_default()
                     || latest.quarantine_remove
@@ -3404,20 +3450,39 @@ async fn subscription_member_ack(
             let quarantine_remove = request.release_quarantine.as_ref().map_or(0_u64, |delta| {
                 delta.values().map(Vec::len).sum::<usize>() as u64
             });
-            coordinator
-                .acknowledge(
-                    &grant,
-                    tick,
-                    request.request_id,
-                    cursor,
-                    positions,
-                    crate::reader::SubscriptionQuarantineDelta {
-                        add: request.quarantine.unwrap_or_default(),
-                        remove: request.release_quarantine.unwrap_or_default(),
-                    },
-                )
-                .await
-                .map_err(subscription_progress_api_error)?;
+            let quarantine = crate::reader::SubscriptionQuarantineDelta {
+                add: request.quarantine.unwrap_or_default(),
+                remove: request.release_quarantine.unwrap_or_default(),
+            };
+            match member_feed {
+                Some(feed) => {
+                    coordinator
+                        .acknowledge_member(
+                            &grant,
+                            tick,
+                            request.request_id,
+                            feed,
+                            cursor,
+                            positions,
+                            quarantine,
+                        )
+                        .await
+                        .map_err(subscription_progress_api_error)?;
+                }
+                None => {
+                    coordinator
+                        .acknowledge(
+                            &grant,
+                            tick,
+                            request.request_id,
+                            cursor,
+                            positions,
+                            quarantine,
+                        )
+                        .await
+                        .map_err(subscription_progress_api_error)?;
+                }
+            }
             let member_state = read_member_state(&coordinator).await?;
             state.demand.record_subscription_op(
                 definition.subscription_id,
@@ -3487,6 +3552,11 @@ struct SubscriptionMemberFetchRequest {
     member_epoch: u64,
     work_id: Uuid,
     lease_epoch: u64,
+    /// The member Feed this page draws from — required on a
+    /// Domain-source Subscription, ignored when it names an exact-Feed
+    /// source's declared Feed.
+    #[serde(default)]
+    feed: Option<String>,
     limit: Option<usize>,
 }
 
@@ -3583,13 +3653,22 @@ async fn subscription_member_fetch(
             code: Some("lease.stale_lease"),
         });
     }
-    let mut frontier = coordinator
+    let member_feed = member_feed_selection(&state, &definition, request.feed.as_deref()).await?;
+    let committed_frontier = coordinator
         .read_committed()
         .await
         .map_err(subscription_progress_api_error)?
         .ok_or_else(|| {
             ApiError::unavailable("Subscription progress frontier is not established")
         })?;
+    let mut frontier = ensure_member_feed_entry(
+        &state,
+        &coordinator,
+        &definition,
+        member_feed,
+        &committed_frontier,
+    )
+    .await?;
     let eligible_ingest_ns = definition
         .delivery_delay_ns
         .map(|delay| unix_ns().saturating_sub(i64::try_from(delay).unwrap_or(i64::MAX)));
@@ -3604,9 +3683,11 @@ async fn subscription_member_fetch(
                 && lease.lease_epoch == request.lease_epoch
                 && !lease.exhausted_applied
         });
-        if frontier.request_id == request.request_id {
+        if frontier.request_id == request.request_id && frontier.member_feed == member_feed {
             // A replayed fetch must surface the disposition its request
             // committed rather than firing the policy on the next head.
+            // On a Domain row the evidence is per-Feed, so a replay only
+            // matches the row whose last mutation named the same Feed.
             if !frontier.lease_ops.iter().any(|op| {
                 matches!(
                     op,
@@ -3634,8 +3715,18 @@ async fn subscription_member_fetch(
                 },
             });
         } else if claim_unmarked {
+            let claim_view = member_feed
+                .map(|feed| {
+                    frontier.member_view(feed).ok_or_else(|| {
+                        ApiError::unavailable(
+                            "Subscription member Feed frontier is not established",
+                        )
+                    })
+                })
+                .transpose()?
+                .unwrap_or_else(|| frontier.clone());
             let (parked, exhausted_positions_map, _) =
-                fetch_frontier_page(&state, &frontier, limit, eligible_ingest_ns).await?;
+                fetch_frontier_page(&state, &claim_view, limit, eligible_ingest_ns).await?;
             if !parked.is_empty() {
                 let mut exhausted_positions: BTreeMap<RangeId, Vec<String>> = BTreeMap::new();
                 for (range_id, cursor, _) in &parked {
@@ -3647,7 +3738,7 @@ async fn subscription_member_fetch(
                 let exhausted_cursor = parked
                     .last()
                     .map(|(_, cursor, _)| cursor.clone())
-                    .unwrap_or_else(|| frontier.cursor.clone());
+                    .unwrap_or_else(|| claim_view.cursor.clone());
                 // The marker lease op rides the same mutation: one commit
                 // both exhausts the positions and flags the claim, so a
                 // retried fetch cannot drain two pages under one epoch.
@@ -3656,6 +3747,7 @@ async fn subscription_member_fetch(
                         &grant,
                         members.last_tick,
                         request.request_id,
+                        member_feed,
                         crate::reader::ExhaustedDelivery {
                             cursor: exhausted_cursor,
                             positions: exhausted_positions_map,
@@ -3679,8 +3771,16 @@ async fn subscription_member_fetch(
             }
         }
     }
+    let page_view = member_feed
+        .map(|feed| {
+            frontier.member_view(feed).ok_or_else(|| {
+                ApiError::unavailable("Subscription member Feed frontier is not established")
+            })
+        })
+        .transpose()?
+        .unwrap_or_else(|| frontier.clone());
     let (delivered, positions, parked_ingest_ns) =
-        fetch_frontier_page(&state, &frontier, limit, eligible_ingest_ns).await?;
+        fetch_frontier_page(&state, &page_view, limit, eligible_ingest_ns).await?;
     let next_delivery_ns =
         parked_ingest_ns
             .zip(definition.delivery_delay_ns)
@@ -3691,7 +3791,7 @@ async fn subscription_member_fetch(
             });
     let delivered_records = delivered.len() as u64;
     let cursor = delivered.last().map(|(_, cursor, _)| cursor.clone());
-    let source = record_source_by_id(&state, frontier.feed_id).await;
+    let source = record_source_by_id(&state, page_view.feed_id).await;
     let records = delivered
         .into_iter()
         .map(|(_, frame_cursor, record)| {
@@ -3772,6 +3872,192 @@ async fn resolve_tail_positions(
         }
     }
     Ok((tail, positions))
+}
+
+/// Resolve the sequence-1 `(Cursor, positions)` a frontier starts from
+/// under one declared start policy — used identically by exact-Feed
+/// first join, Domain member-Feed attach, and Pipe bootstrap. Beginning
+/// delivers every retained record; Now pins each Range's committed tail
+/// so only later appends deliver; Timestamp and Cursor seek to the
+/// declared boundary.
+async fn initial_frontier_positions(
+    state: &AppState,
+    feed_id: Uuid,
+    start: &crate::control::ReaderStart,
+) -> Result<(String, BTreeMap<RangeId, String>), ApiError> {
+    let range_assignments = state
+        .control
+        .active_range_assignments_for_feed(feed_id)
+        .await;
+    if range_assignments.is_empty() {
+        return Err(ApiError::unavailable(
+            "Subscription source Feed has no Active Range placement",
+        ));
+    }
+    Ok(match start {
+        crate::control::ReaderStart::Beginning => (
+            "beginning".to_owned(),
+            range_assignments
+                .iter()
+                .map(|assignment| (assignment.range_id, String::new()))
+                .collect::<BTreeMap<_, _>>(),
+        ),
+        crate::control::ReaderStart::Now => {
+            let (tail, positions) = resolve_tail_positions(state, &range_assignments).await?;
+            (
+                tail.map(|(_, cursor)| cursor)
+                    .unwrap_or_else(|| "now".to_owned()),
+                positions,
+            )
+        }
+        crate::control::ReaderStart::Timestamp(threshold) => (
+            format!("timestamp:{threshold}"),
+            resolve_timestamp_positions(state, &range_assignments, *threshold).await?,
+        ),
+        crate::control::ReaderStart::Cursor(cursor) => (
+            cursor.clone(),
+            resolve_cursor_positions(state, &range_assignments, cursor).await?,
+        ),
+    })
+}
+
+/// Resolve the member Feed a member request names: a Domain-source
+/// Subscription requires `feed` and fences it to an `Active` catalog
+/// membership, while an exact-Feed source accepts an absent `feed` or one
+/// naming the declared Feed. Mismatches are bad requests, never silent
+/// cross-Feed divergence.
+/// Resolve a member request's `feed` selector to an immutable FeedId:
+/// names resolve as usual, and a FeedId string resolves directly so a
+/// member can address a Feed learned through `member_feeds` discovery.
+async fn member_feed_id(state: &AppState, feed: &str) -> Option<Uuid> {
+    if let Some(feed) = state.control.active_feed_by_name(feed).await {
+        return Some(feed.feed_id);
+    }
+    let Ok(parsed) = Uuid::parse_str(feed) else {
+        return None;
+    };
+    state
+        .control
+        .feed_definition_by_id(parsed)
+        .await
+        .map(|feed| feed.feed_id)
+}
+
+async fn member_feed_selection(
+    state: &AppState,
+    definition: &crate::control::SubscriptionDefinition,
+    feed: Option<&str>,
+) -> Result<Option<Uuid>, ApiError> {
+    match &definition.source {
+        crate::control::SubscriptionSource::Domain { .. } => {
+            let name = feed.ok_or_else(|| {
+                ApiError::bad_request(
+                    "feed names the member Feed a Domain-source member request applies to",
+                )
+            })?;
+            let feed_id = member_feed_id(state, name)
+                .await
+                .ok_or_else(|| ApiError::bad_request("Subscription member Feed does not exist"))?;
+            let memberships = state
+                .control
+                .subscription_feed_memberships(definition.subscription_id)
+                .await;
+            match memberships.get(&feed_id) {
+                Some(member) if member.state == crate::control::SubscriptionFeedState::Active => {
+                    Ok(Some(feed_id))
+                }
+                _ => Err(ApiError {
+                    status: StatusCode::CONFLICT,
+                    message: "Subscription member Feed is not attached to the Domain source"
+                        .to_owned(),
+                    code: Some("conflict"),
+                }),
+            }
+        }
+        crate::control::SubscriptionSource::Feed { feed_id } => match feed {
+            None => Ok(None),
+            Some(name) => {
+                if member_feed_id(state, name).await == Some(*feed_id) {
+                    Ok(None)
+                } else {
+                    Err(ApiError::bad_request(
+                        "feed does not match the Subscription's declared Feed source",
+                    ))
+                }
+            }
+        },
+    }
+}
+
+/// Ensure a Domain row carries a frontier entry for an `Active` member
+/// Feed, committing an attach mutation when the Feed joined the Domain
+/// after the Subscription's frontier was established. The entry honors
+/// the membership's recorded start policy, so a late-discovered Feed
+/// never skips history it promised to deliver.
+async fn ensure_member_feed_entry(
+    state: &AppState,
+    coordinator: &crate::reader::SubscriptionProgressCoordinator,
+    definition: &crate::control::SubscriptionDefinition,
+    member_feed: Option<Uuid>,
+    frontier: &crate::reader::SubscriptionProgressMutation,
+) -> Result<crate::reader::SubscriptionProgressMutation, ApiError> {
+    let Some(feed) = member_feed else {
+        return Ok(frontier.clone());
+    };
+    if frontier.member_progress.contains_key(&feed) {
+        return Ok(frontier.clone());
+    }
+    let memberships = state
+        .control
+        .subscription_feed_memberships(definition.subscription_id)
+        .await;
+    let member = memberships.get(&feed).ok_or_else(|| ApiError {
+        status: StatusCode::CONFLICT,
+        message: "Subscription member Feed is not attached to the Domain source".to_owned(),
+        code: Some("conflict"),
+    })?;
+    let (cursor, positions) = initial_frontier_positions(state, feed, &member.start).await?;
+    let attach = coordinator
+        .attach_member_feeds(
+            subscription_member_attach_request_id(definition.subscription_id, feed),
+            frontier.tick,
+            BTreeMap::from([(
+                feed,
+                crate::reader::MemberFeedProgress {
+                    cursor,
+                    positions,
+                    quarantined: BTreeMap::new(),
+                    skipped: BTreeMap::new(),
+                },
+            )]),
+        )
+        .await;
+    if let Err(error) = &attach {
+        // Two members may race the same attach: the loser reads back the
+        // winner's committed entry rather than surfacing a CAS conflict
+        // for progress that now exists.
+        if !matches!(error, crate::reader::SubscriptionProgressError::Conflict) {
+            attach.map_err(subscription_progress_api_error)?;
+        }
+    }
+    coordinator
+        .read_committed()
+        .await
+        .map_err(subscription_progress_api_error)?
+        .filter(|frontier| frontier.member_progress.contains_key(&feed))
+        .ok_or_else(|| ApiError::unavailable("Subscription progress frontier is not established"))
+}
+
+/// Deterministic request identity for an on-demand member-Feed attach:
+/// the same Feed attaching under the same Subscription replays to one
+/// journal row rather than racing a fresh mutation per caller.
+fn subscription_member_attach_request_id(subscription_id: Uuid, feed_id: Uuid) -> Uuid {
+    let digest = blake3::hash(
+        format!("whitewater-subscription-member-attach:{subscription_id}:{feed_id}").as_bytes(),
+    );
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest.as_bytes()[..16]);
+    Uuid::from_bytes(bytes)
 }
 
 /// Resolve per-Range positions behind one Feed Cursor for a Subscription
@@ -3936,6 +4222,11 @@ struct SubscriptionSeekRequest {
     /// seeks, which resolve only on a single-range source.
     #[serde(default)]
     cursor: Option<String>,
+    /// The member Feed this seek repositions — required on a
+    /// Domain-source Subscription, ignored when it names an exact-Feed
+    /// source's declared Feed.
+    #[serde(default)]
+    feed: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -3967,13 +4258,10 @@ async fn subscription_seek(
     authorize_subscription(&state, &headers, &definition, PermissionAction::Manage).await?;
     let (coordinator, assignment, definition) =
         member_coordinator_inner(&state, &request.subscription).await?;
-    let source_feed = definition.source.feed_id().ok_or_else(|| ApiError {
-        status: StatusCode::CONFLICT,
-        message:
-            "Subscription has a Domain source; per-Feed seeking arrives with Domain member delivery"
-                .to_owned(),
-        code: None,
-    })?;
+    let member_feed = member_feed_selection(&state, &definition, request.feed.as_deref()).await?;
+    let source_feed = member_feed
+        .or_else(|| definition.source.feed_id())
+        .expect("member Feed selection resolves for both source kinds");
     let frontier = coordinator
         .read_committed()
         .await
@@ -3984,6 +4272,20 @@ async fn subscription_seek(
                 .to_owned(),
             code: None,
         })?;
+    // A seek targets one member-Feed entry on a Domain row; the CAS and
+    // the carried-forward evidence scope to that entry.
+    let seek_view = member_feed
+        .map(|feed| {
+            frontier.member_view(feed).ok_or_else(|| ApiError {
+                status: StatusCode::CONFLICT,
+                message:
+                    "Subscription member Feed has no committed frontier; it attaches on first fetch"
+                        .to_owned(),
+                code: None,
+            })
+        })
+        .transpose()?
+        .unwrap_or_else(|| frontier.clone());
     // The committed Cursor marker carries the request identity AND the
     // requested position so a replayed request_id with a different seek
     // conflicts instead of impersonating the earlier one.
@@ -3999,7 +4301,7 @@ async fn subscription_seek(
         }
     );
     if frontier.request_id == request.request_id {
-        if frontier.cursor != seek_cursor {
+        if frontier.member_feed != member_feed || seek_view.cursor != seek_cursor {
             return Err(ApiError {
                 status: StatusCode::CONFLICT,
                 message: "request_id was already used with a different Subscription operation"
@@ -4009,8 +4311,8 @@ async fn subscription_seek(
         }
         return Ok(Json(SubscriptionSeekResponse {
             request_id: request.request_id,
-            cursor: frontier.cursor,
-            positions: frontier.positions,
+            cursor: seek_view.cursor,
+            positions: seek_view.positions,
             ownership_epoch: frontier.ownership_epoch,
         }));
     }
@@ -4084,25 +4386,45 @@ async fn subscription_seek(
             resolve_seek_cursor_positions(&state, &range_assignments, &cursor).await?
         }
     };
+    let mut member_progress = frontier.member_progress.clone();
+    if let Some(feed) = member_feed {
+        member_progress.insert(
+            feed,
+            crate::reader::MemberFeedProgress {
+                cursor: seek_cursor.clone(),
+                positions: positions.clone(),
+                quarantined: seek_view.quarantined.clone(),
+                skipped: seek_view.skipped.clone(),
+            },
+        );
+    }
     let mutation = crate::reader::SubscriptionProgressMutation {
         subscription_id: assignment.subscription_id,
-        feed_id: source_feed,
+        feed_id: frontier.feed_id,
         ownership_epoch: assignment.ownership_epoch,
         sequence: frontier
             .sequence
             .checked_add(1)
             .ok_or_else(|| ApiError::unavailable("Subscription frontier sequence overflowed"))?,
         request_id: request.request_id,
-        expected_cursor: Some(frontier.cursor.clone()),
+        expected_cursor: member_feed
+            .and_then(|_| {
+                frontier
+                    .expected_frontier_cursor(member_feed)
+                    .map(str::to_owned)
+            })
+            .or_else(|| Some(frontier.cursor.clone())),
         cursor: seek_cursor.clone(),
         positions: positions.clone(),
+        member_progress,
+        member_feed,
         // A seek repositions delivery; quarantine evidence belongs to the
         // Subscription's processing history and carries forward so a
         // replay through the same positions can see it again.
-        quarantined: frontier.quarantined.clone(),
+        quarantined: seek_view.quarantined.clone(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
-        skipped: frontier.skipped.clone(),
+        skipped: seek_view.skipped.clone(),
         skip_add: BTreeMap::new(),
         tick: frontier.tick,
         lease_ops: Vec::new(),
@@ -4422,151 +4744,70 @@ async fn drive_pipe(
                 let pipe = pipe.clone();
                 let tally = Arc::clone(&tally_cell);
                 async move {
-                    let eligible_ingest_ns = delivery_delay_ns.map(|delay| {
-                        unix_ns().saturating_sub(i64::try_from(delay).unwrap_or(i64::MAX))
-                    });
-                    let (delivered, positions, _parked) =
-                        fetch_frontier_page(state, &frontier, limit, eligible_ingest_ns)
-                            .await
-                            .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
-                    let cursor = delivered
-                        .last()
-                        .map(|(_, cursor, _)| cursor.clone())
-                        .unwrap_or_else(|| frontier.cursor.clone());
-                    let mut records = Vec::with_capacity(delivered.len());
-                    for (_, _, record) in delivered {
-                        if let Ok(mut tally) = tally.lock() {
-                            tally.fetch_bytes = tally.fetch_bytes.saturating_add(
-                                (record.key.len()
-                                    + record.payload.len()
-                                    + record
-                                        .metadata
-                                        .values()
-                                        .map(|value| value.len())
-                                        .sum::<usize>()) as u64,
-                            );
-                        }
-                        // Enrich lookups resolve at fetch time: the outcome
-                        // rides inside the Declare, so an applied output is
-                        // byte-identical across replays and raced drives
-                        // converge on whichever Declare committed first.
-                        let resolution = if let crate::control::PipeOperation::Enrich {
-                            key,
-                            freshness,
-                            named,
-                            ..
-                        } = &pipe.operation
-                        {
-                            Some(
-                                resolve_enrich(
-                                    state,
-                                    &pipe,
-                                    key,
-                                    *freshness,
-                                    named.as_deref(),
-                                    &record,
-                                )
-                                .await
-                                .map_err(|_| crate::effect::EffectJournalError::Unavailable)?,
-                            )
-                        } else {
-                            None
-                        };
-                        records.push(crate::pipe::FetchedRecord {
-                            message_id: record.message_id,
-                            key_base64: STANDARD.encode(&record.key),
-                            payload_base64: STANDARD.encode(&record.payload),
-                            metadata_base64: record
-                                .metadata
-                                .into_iter()
-                                .map(|(name, value)| (name, STANDARD.encode(value)))
-                                .collect(),
-                            event_time_ns: record.event_time_ns,
-                            ingest_time_ns: record.ingest_time_ns,
-                            resolution,
+                    // A Domain row offers one page per member Feed: probe
+                    // entries in rotation order and drive the first
+                    // non-empty one so a busy Feed can never starve
+                    // quieter members.
+                    if frontier.member_progress.is_empty() {
+                        return pipe_drive_fetch_page(
+                            state,
+                            &pipe,
+                            &frontier,
+                            limit,
+                            delivery_delay_ns,
+                            &tally,
+                        )
+                        .await;
+                    }
+                    // Feeds this Pipe writes stay out of the probe set —
+                    // otherwise an output inside the consumed Domain loops
+                    // its own writes back through the frontier.
+                    let excluded = pipe.write_feeds();
+                    let feeds: Vec<Uuid> = frontier
+                        .member_progress
+                        .keys()
+                        .copied()
+                        .filter(|feed| !excluded.contains(feed))
+                        .collect();
+                    if feeds.is_empty() {
+                        return Ok(crate::pipe::FetchedPage {
+                            member_feed: None,
+                            cursor: frontier.cursor.clone(),
+                            records: Vec::new(),
+                            positions: frontier.positions.clone(),
+                            emissions: Vec::new(),
+                            expired: Vec::new(),
+                            refused: Vec::new(),
+                            pane_rows: Default::default(),
+                            pane_rows_saturated: false,
                         });
                     }
-                    // Window pane-close and expiry resolve at fetch time
-                    // alongside the page; the outcome rides inside the
-                    // Declare so a replayed effect never re-scans.
-                    let (emissions, expired) = match &pipe.operation {
-                        crate::control::PipeOperation::Window {
-                            window_ns,
-                            max_late_ns,
-                            expire_ns,
-                            ..
-                        } if pipe.output_feed_id.is_some() || expire_ns.is_some() => {
-                            resolve_window_emissions(
-                                state,
-                                &pipe,
-                                *window_ns,
-                                *max_late_ns,
-                                *expire_ns,
-                                &records,
-                            )
-                            .await
-                            .map_err(|_| crate::effect::EffectJournalError::Unavailable)?
+                    let start = frontier.sequence as usize % feeds.len();
+                    let mut last_page = None;
+                    for offset in 0..feeds.len() {
+                        let feed = feeds[(start + offset) % feeds.len()];
+                        let view = frontier
+                            .member_view(feed)
+                            .ok_or(crate::effect::EffectJournalError::Unavailable)?;
+                        let mut page = pipe_drive_fetch_page(
+                            state,
+                            &pipe,
+                            &view,
+                            limit,
+                            delivery_delay_ns,
+                            &tally,
+                        )
+                        .await?;
+                        page.member_feed = Some(feed);
+                        if !page.records.is_empty()
+                            || !page.emissions.is_empty()
+                            || !page.expired.is_empty()
+                        {
+                            return Ok(page);
                         }
-                        _ => (Vec::new(), Vec::new()),
-                    };
-                    // `LIMIT KEYS`/`LIMIT BYTES` resolve alongside the
-                    // page on the same serving replica: the admitted and
-                    // refused split journals inside the Declare, so a
-                    // replayed effect never re-scans.
-                    let (refused, pane_rows, pane_rows_saturated) = match &pipe.operation {
-                        crate::control::PipeOperation::Window {
-                            key_limit,
-                            byte_limit,
-                            key,
-                            ..
-                        } if key_limit.is_some() || byte_limit.is_some() => {
-                            let scan_limit =
-                                crate::pipe::window_scan_row_limit(*key_limit, *byte_limit);
-                            let (rows, saturated) =
-                                resolve_window_pane_rows(state, &pipe, scan_limit)
-                                    .await
-                                    .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
-                            let refused = match key_limit {
-                                Some(limit) => {
-                                    let active: std::collections::BTreeSet<Vec<u8>> =
-                                        rows.iter().map(|(group, _)| group.clone()).collect();
-                                    crate::pipe::window_refused_groups(
-                                        &records, key, *limit, &active, saturated,
-                                    )
-                                }
-                                None => Vec::new(),
-                            };
-                            let pane_rows = if byte_limit.is_some() {
-                                rows
-                            } else {
-                                Default::default()
-                            };
-                            (refused, pane_rows, saturated && byte_limit.is_some())
-                        }
-                        _ => (Vec::new(), Default::default(), false),
-                    };
-                    let page = crate::pipe::FetchedPage {
-                        cursor,
-                        records,
-                        positions,
-                        emissions,
-                        expired,
-                        refused,
-                        pane_rows,
-                        pane_rows_saturated,
-                    };
-                    if let Ok(mut tally) = tally.lock() {
-                        tally.records = page.records.len() as u64;
-                        tally.emissions = page.emissions.len() as u64;
-                        tally.pane_rows = page.pane_rows.len() as u64;
-                        tally.pane_bytes = page
-                            .pane_rows
-                            .iter()
-                            .map(|(group, _)| (4 + group.len() + 8 + 24) as u64)
-                            .sum();
-                        tally.page_limit = limit as u64;
+                        last_page = Some(page);
                     }
-                    Ok(page)
+                    last_page.ok_or(crate::effect::EffectJournalError::Unavailable)
                 }
             },
             || async move {
@@ -4674,6 +4915,147 @@ fn record_pipe_drive_telemetry(
     );
 }
 
+/// Resolve one bounded drive page for a single frontier view: the shared
+/// fetch core plus the fetch-time enrich, window emission/expiry, and
+/// limit scans, so the resolved plan rides inside the Declare byte-for
+/// byte on replay. `tally` accumulates Node-local drive measurements.
+async fn pipe_drive_fetch_page(
+    state: &AppState,
+    pipe: &crate::control::PipeDefinition,
+    frontier: &crate::reader::SubscriptionProgressMutation,
+    limit: usize,
+    delivery_delay_ns: Option<u64>,
+    tally: &std::sync::Mutex<PipeFetchTally>,
+) -> Result<crate::pipe::FetchedPage, crate::effect::EffectJournalError> {
+    let eligible_ingest_ns = delivery_delay_ns
+        .map(|delay| unix_ns().saturating_sub(i64::try_from(delay).unwrap_or(i64::MAX)));
+    let (delivered, positions, _parked) =
+        fetch_frontier_page(state, frontier, limit, eligible_ingest_ns)
+            .await
+            .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
+    let cursor = delivered
+        .last()
+        .map(|(_, cursor, _)| cursor.clone())
+        .unwrap_or_else(|| frontier.cursor.clone());
+    let mut records = Vec::with_capacity(delivered.len());
+    for (_, _, record) in delivered {
+        if let Ok(mut tally) = tally.lock() {
+            tally.fetch_bytes = tally.fetch_bytes.saturating_add(
+                (record.key.len()
+                    + record.payload.len()
+                    + record
+                        .metadata
+                        .values()
+                        .map(|value| value.len())
+                        .sum::<usize>()) as u64,
+            );
+        }
+        // Enrich lookups resolve at fetch time: the outcome
+        // rides inside the Declare, so an applied output is
+        // byte-identical across replays and raced drives
+        // converge on whichever Declare committed first.
+        let resolution = if let crate::control::PipeOperation::Enrich {
+            key,
+            freshness,
+            named,
+            ..
+        } = &pipe.operation
+        {
+            Some(
+                resolve_enrich(state, pipe, key, *freshness, named.as_deref(), &record)
+                    .await
+                    .map_err(|_| crate::effect::EffectJournalError::Unavailable)?,
+            )
+        } else {
+            None
+        };
+        records.push(crate::pipe::FetchedRecord {
+            message_id: record.message_id,
+            key_base64: STANDARD.encode(&record.key),
+            payload_base64: STANDARD.encode(&record.payload),
+            metadata_base64: record
+                .metadata
+                .into_iter()
+                .map(|(name, value)| (name, STANDARD.encode(value)))
+                .collect(),
+            event_time_ns: record.event_time_ns,
+            ingest_time_ns: record.ingest_time_ns,
+            resolution,
+        });
+    }
+    // Window pane-close and expiry resolve at fetch time
+    // alongside the page; the outcome rides inside the
+    // Declare so a replayed effect never re-scans.
+    let (emissions, expired) = match &pipe.operation {
+        crate::control::PipeOperation::Window {
+            window_ns,
+            max_late_ns,
+            expire_ns,
+            ..
+        } if pipe.output_feed_id.is_some() || expire_ns.is_some() => {
+            resolve_window_emissions(state, pipe, *window_ns, *max_late_ns, *expire_ns, &records)
+                .await
+                .map_err(|_| crate::effect::EffectJournalError::Unavailable)?
+        }
+        _ => (Vec::new(), Vec::new()),
+    };
+    // `LIMIT KEYS`/`LIMIT BYTES` resolve alongside the
+    // page on the same serving replica: the admitted and
+    // refused split journals inside the Declare, so a
+    // replayed effect never re-scans.
+    let (refused, pane_rows, pane_rows_saturated) = match &pipe.operation {
+        crate::control::PipeOperation::Window {
+            key_limit,
+            byte_limit,
+            key,
+            ..
+        } if key_limit.is_some() || byte_limit.is_some() => {
+            let scan_limit = crate::pipe::window_scan_row_limit(*key_limit, *byte_limit);
+            let (rows, saturated) = resolve_window_pane_rows(state, pipe, scan_limit)
+                .await
+                .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
+            let refused = match key_limit {
+                Some(limit) => {
+                    let active: std::collections::BTreeSet<Vec<u8>> =
+                        rows.iter().map(|(group, _)| group.clone()).collect();
+                    crate::pipe::window_refused_groups(&records, key, *limit, &active, saturated)
+                }
+                None => Vec::new(),
+            };
+            let pane_rows = if byte_limit.is_some() {
+                rows
+            } else {
+                Default::default()
+            };
+            (refused, pane_rows, saturated && byte_limit.is_some())
+        }
+        _ => (Vec::new(), Default::default(), false),
+    };
+    let page = crate::pipe::FetchedPage {
+        member_feed: None,
+        cursor,
+        records,
+        positions,
+        emissions,
+        expired,
+        refused,
+        pane_rows,
+        pane_rows_saturated,
+    };
+    if let Ok(mut tally) = tally.lock() {
+        tally.records = page.records.len() as u64;
+        tally.emissions = page.emissions.len() as u64;
+        tally.pane_rows = page.pane_rows.len() as u64;
+        tally.pane_bytes = page
+            .pane_rows
+            .iter()
+            .map(|(group, _)| (4 + group.len() + 8 + 24) as u64)
+            .sum();
+        tally.page_limit = limit as u64;
+    }
+    Ok(page)
+}
+
 /// Build the sequence-1 frontier mutation a Pipe driver commits when no
 /// member has ever joined the consumed Subscription: the Subscription's
 /// declared start decides `beginning` vs `now` exactly as first-member join
@@ -4684,54 +5066,109 @@ async fn bootstrap_pipe_frontier(
     definition: &crate::control::SubscriptionDefinition,
     assignment: &crate::reader::SubscriptionProgressAssignment,
 ) -> Result<crate::reader::SubscriptionProgressMutation, ApiError> {
-    let source_feed = definition.source.feed_id().ok_or_else(|| ApiError {
-        status: StatusCode::CONFLICT,
-        message: "Subscription has a Domain source; member sessions arrive with Domain-wide progress tracking".to_owned(),
-        code: None,
-    })?;
-    let range_assignments = state
-        .control
-        .active_range_assignments_for_feed(source_feed)
-        .await;
-    if range_assignments.is_empty() {
-        return Err(ApiError::unavailable(
-            "Subscription source Feed has no Active Range placement",
-        ));
-    }
-    let (start_cursor, positions) = match &definition.start {
-        crate::control::ReaderStart::Beginning => (
-            "beginning".to_owned(),
-            range_assignments
-                .iter()
-                .map(|assignment| (assignment.range_id, String::new()))
-                .collect::<BTreeMap<_, _>>(),
-        ),
-        crate::control::ReaderStart::Now => {
-            let (tail, positions) = resolve_tail_positions(state, &range_assignments).await?;
-            (
-                tail.map(|(_, cursor)| cursor)
-                    .unwrap_or_else(|| "now".to_owned()),
-                positions,
-            )
-        }
-        crate::control::ReaderStart::Cursor(_) | crate::control::ReaderStart::Timestamp(_) => {
-            return Err(ApiError {
-                status: StatusCode::CONFLICT,
-                message: "Pipe drives support beginning and now starts; explicit-Cursor and timestamp starts are not driveable yet".to_owned(),
+    // A Domain-scoped Subscription bootstraps one frontier entry per
+    // attached member Feed under the same start rules an exact-Feed row
+    // honors; the aggregate Cursor is bookkeeping only.
+    let (row_feed, start_cursor, positions, member_progress) = match &definition.source {
+        crate::control::SubscriptionSource::Feed { feed_id } => {
+            let range_assignments = state
+                .control
+                .active_range_assignments_for_feed(*feed_id)
+                .await;
+            if range_assignments.is_empty() {
+                return Err(ApiError::unavailable(
+                    "Subscription source Feed has no Active Range placement",
+                ));
+            }
+            let (start_cursor, positions) = match &definition.start {
+                crate::control::ReaderStart::Beginning => (
+                    "beginning".to_owned(),
+                    range_assignments
+                        .iter()
+                        .map(|assignment| (assignment.range_id, String::new()))
+                        .collect::<BTreeMap<_, _>>(),
+                ),
+                crate::control::ReaderStart::Now => {
+                    let (tail, positions) =
+                        resolve_tail_positions(state, &range_assignments).await?;
+                    (
+                        tail.map(|(_, cursor)| cursor)
+                            .unwrap_or_else(|| "now".to_owned()),
+                        positions,
+                    )
+                }
+                crate::control::ReaderStart::Cursor(_)
+                | crate::control::ReaderStart::Timestamp(_) => {
+                    return Err(ApiError {
+                        status: StatusCode::CONFLICT,
+                        message: "Pipe drives support beginning and now starts; explicit-Cursor and timestamp starts are not driveable yet".to_owned(),
 
-                code: None,
-            })
+                        code: None,
+                    })
+                }
+            };
+            (*feed_id, start_cursor, positions, BTreeMap::new())
+        }
+        crate::control::SubscriptionSource::Domain { domain_id } => {
+            let memberships = state
+                .control
+                .subscription_feed_memberships(definition.subscription_id)
+                .await;
+            let mut member_progress = BTreeMap::new();
+            for member in memberships.values() {
+                if member.state != crate::control::SubscriptionFeedState::Active {
+                    continue;
+                }
+                let (cursor, positions) = match &member.start {
+                    crate::control::ReaderStart::Beginning
+                    | crate::control::ReaderStart::Now => {
+                        initial_frontier_positions(state, member.feed_id, &member.start)
+                            .await?
+                    }
+                    crate::control::ReaderStart::Cursor(_)
+                    | crate::control::ReaderStart::Timestamp(_) => {
+                        return Err(ApiError {
+                            status: StatusCode::CONFLICT,
+                            message: "Pipe drives support beginning and now starts; explicit-Cursor and timestamp starts are not driveable yet".to_owned(),
+
+                            code: None,
+                        })
+                    }
+                };
+                member_progress.insert(
+                    member.feed_id,
+                    crate::reader::MemberFeedProgress {
+                        cursor,
+                        positions,
+                        quarantined: BTreeMap::new(),
+                        skipped: BTreeMap::new(),
+                    },
+                );
+            }
+            if member_progress.is_empty() {
+                return Err(ApiError::unavailable(
+                    "Subscription Domain source has no attached member Feeds yet",
+                ));
+            }
+            (
+                *domain_id,
+                "domain".to_owned(),
+                BTreeMap::new(),
+                member_progress,
+            )
         }
     };
     Ok(crate::reader::SubscriptionProgressMutation {
         subscription_id: assignment.subscription_id,
-        feed_id: source_feed,
+        feed_id: row_feed,
         ownership_epoch: assignment.ownership_epoch,
         sequence: 1,
-        request_id: crate::pipe::pipe_frontier_request_id(assignment.subscription_id, source_feed),
+        request_id: crate::pipe::pipe_frontier_request_id(assignment.subscription_id, row_feed),
         expected_cursor: None,
         cursor: start_cursor,
         positions,
+        member_progress,
+        member_feed: None,
         quarantined: BTreeMap::new(),
         quarantine_add: BTreeMap::new(),
         quarantine_remove: BTreeMap::new(),
@@ -7692,28 +8129,67 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
             .read_committed()
             .await
             .map_err(progress_apply_error)?;
+        // A Domain row consumes one member-Feed entry per effect: the
+        // consume names the Feed directly and the frontier CAS rides that
+        // entry's committed Cursor.
+        let member_feed = committed
+            .as_ref()
+            .filter(|row| !row.member_progress.is_empty())
+            .map(|_| consume.feed_id);
         if let Some(current) = &committed {
-            if current.cursor == consume.cursor {
+            if current.expected_frontier_cursor(member_feed) == Some(consume.cursor.as_str()) {
                 return Ok(());
             }
         }
+        let prior_entry = member_feed.and_then(|feed| {
+            committed
+                .as_ref()
+                .and_then(|row| row.member_progress.get(&feed))
+        });
+        let mut member_progress = committed
+            .as_ref()
+            .map_or_else(BTreeMap::new, |row| row.member_progress.clone());
+        if let Some(feed) = member_feed {
+            member_progress.insert(
+                feed,
+                crate::reader::MemberFeedProgress {
+                    cursor: consume.cursor.clone(),
+                    positions: consume.positions.clone(),
+                    quarantined: prior_entry
+                        .map_or_else(BTreeMap::new, |entry| entry.quarantined.clone()),
+                    skipped: prior_entry.map_or_else(BTreeMap::new, |entry| entry.skipped.clone()),
+                },
+            );
+        }
         let mutation = crate::reader::SubscriptionProgressMutation {
             subscription_id: self.subscription_id,
-            feed_id: consume.feed_id,
+            feed_id: committed
+                .as_ref()
+                .map_or(consume.feed_id, |prior| prior.feed_id),
             ownership_epoch: self.ownership_epoch,
             sequence: committed.as_ref().map_or(1, |prior| prior.sequence + 1),
             request_id,
             expected_cursor: consume.expected_cursor.clone(),
             cursor: consume.cursor.clone(),
             positions: consume.positions.clone(),
-            quarantined: committed
-                .as_ref()
-                .map_or_else(BTreeMap::new, |prior| prior.quarantined.clone()),
+            member_progress,
+            member_feed,
+            quarantined: match (member_feed, prior_entry) {
+                (_, Some(entry)) => entry.quarantined.clone(),
+                (Some(_), None) => BTreeMap::new(),
+                (None, None) => committed
+                    .as_ref()
+                    .map_or_else(BTreeMap::new, |prior| prior.quarantined.clone()),
+            },
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
-            skipped: committed
-                .as_ref()
-                .map_or_else(BTreeMap::new, |prior| prior.skipped.clone()),
+            skipped: match (member_feed, prior_entry) {
+                (_, Some(entry)) => entry.skipped.clone(),
+                (Some(_), None) => BTreeMap::new(),
+                (None, None) => committed
+                    .as_ref()
+                    .map_or_else(BTreeMap::new, |prior| prior.skipped.clone()),
+            },
             skip_add: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
@@ -18633,6 +19109,8 @@ mod tests {
             ownership_epoch: assignment.ownership_epoch,
             sequence: 1,
             request_id: Uuid::from_u128(877),
+            member_progress: BTreeMap::new(),
+            member_feed: None,
             expected_cursor: None,
             cursor: "rf1_test".to_owned(),
             positions: BTreeMap::from([(
@@ -18768,6 +19246,8 @@ mod tests {
             ownership_epoch: assignment.ownership_epoch,
             sequence: 1,
             request_id: Uuid::from_u128(900),
+            member_progress: BTreeMap::new(),
+            member_feed: None,
             expected_cursor: None,
             cursor: "rf1_page".to_owned(),
             positions: BTreeMap::from([(
@@ -18984,6 +19464,8 @@ mod tests {
             ownership_epoch: assignment.ownership_epoch,
             sequence: 1,
             request_id: Uuid::from_u128(960),
+            member_progress: BTreeMap::new(),
+            member_feed: None,
             expected_cursor: None,
             cursor: "rf1_page".to_owned(),
             positions: BTreeMap::from([(
@@ -22132,6 +22614,8 @@ mod tests {
                 ownership_epoch: assignment.ownership_epoch,
                 sequence: 1,
                 request_id: Uuid::from_u128(0x9001),
+                member_progress: BTreeMap::new(),
+                member_feed: None,
                 expected_cursor: None,
                 cursor: "cursor-2".to_owned(),
                 positions: BTreeMap::from([(progress_range, "cursor-2".to_owned())]),
@@ -23303,6 +23787,8 @@ mod tests {
                 ownership_epoch,
                 sequence,
                 request_id: Uuid::from_u128(9_102),
+                member_progress: BTreeMap::new(),
+                member_feed: None,
                 expected_cursor: None,
                 cursor: format!("rf1_{sequence}"),
                 positions: BTreeMap::from([(

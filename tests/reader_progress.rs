@@ -748,6 +748,8 @@ async fn subscription_coordinator_uses_private_catalog_placement_and_refuses_leg
         ownership_epoch: 1,
         sequence: 1,
         request_id: Uuid::from_u128(500),
+        member_progress: BTreeMap::new(),
+        member_feed: None,
         expected_cursor: None,
         cursor: "rf1_page".to_owned(),
         positions: BTreeMap::from([(
@@ -827,6 +829,8 @@ async fn quorum_subscription_read_fails_closed_on_loss_disagreement_and_ambiguou
         ownership_epoch: 1,
         sequence: 1,
         request_id: Uuid::from_u128(803),
+        member_progress: BTreeMap::new(),
+        member_feed: None,
         expected_cursor: None,
         cursor: "rf1_a".to_owned(),
         positions: BTreeMap::from([(
@@ -945,6 +949,8 @@ async fn ambiguous_subscription_retry_reconciles_after_restart_without_guessing(
         ownership_epoch: 1,
         sequence: 1,
         request_id: Uuid::from_u128(1203),
+        member_progress: BTreeMap::new(),
+        member_feed: None,
         expected_cursor: None,
         cursor: "cursor-1".to_owned(),
         positions: BTreeMap::from([(
@@ -1050,6 +1056,8 @@ async fn progress_coordinator_refuses_replies_claiming_another_replica() {
         ownership_epoch: 1,
         sequence: 1,
         request_id: Uuid::from_u128(983),
+        member_progress: BTreeMap::new(),
+        member_feed: None,
         expected_cursor: None,
         cursor: "rf1_a".to_owned(),
         positions: BTreeMap::from([(
@@ -1121,6 +1129,8 @@ async fn subscription_progress_coordinator_requires_matching_prepare_and_commit_
         ownership_epoch: 1,
         sequence: 1,
         request_id: Uuid::from_u128(203),
+        member_progress: BTreeMap::new(),
+        member_feed: None,
         expected_cursor: None,
         cursor: "rf1_a".to_owned(),
         positions: BTreeMap::from([(
@@ -1227,6 +1237,8 @@ async fn subscription_progress_coordinator_refuses_contradictory_replica_evidenc
         ownership_epoch: 1,
         sequence: 1,
         request_id: Uuid::from_u128(303),
+        member_progress: BTreeMap::new(),
+        member_feed: None,
         expected_cursor: None,
         cursor: "rf1_a".to_owned(),
         positions: BTreeMap::from([(
@@ -1276,6 +1288,8 @@ fn prepared_subscription_progress_remains_invisible_after_replica_restart() {
         ownership_epoch: 1,
         sequence: 1,
         request_id: Uuid::from_u128(103),
+        member_progress: BTreeMap::new(),
+        member_feed: None,
         expected_cursor: None,
         cursor: "rf1_progress".to_owned(),
         positions: BTreeMap::from([(
@@ -1559,6 +1573,8 @@ fn progress_mutation(
         ownership_epoch: epoch,
         sequence,
         request_id: Uuid::from_u128(5_000 + sequence as u128),
+        member_progress: BTreeMap::new(),
+        member_feed: None,
         expected_cursor: (sequence > 1).then(|| format!("rf1_{}", sequence - 1)),
         cursor: format!("rf1_{sequence}"),
         positions: BTreeMap::from([(
@@ -3414,4 +3430,555 @@ async fn control_lists_every_active_subscription_progress_placement() {
     assert!(assignments
         .iter()
         .all(|assignment| assignment.ownership_epoch == 1));
+}
+
+/// A sequence-1 Domain-source row: one frontier entry per attached member
+/// Feed under the bookkeeping aggregate Cursor, like first-member join
+/// or Pipe bootstrap commits for a Domain-scoped Subscription.
+fn domain_progress_mutation(
+    subscription_id: Uuid,
+    domain_id: Uuid,
+    members: &[(Uuid, &str)],
+) -> SubscriptionProgressMutation {
+    use whitewater::reader::MemberFeedProgress;
+    SubscriptionProgressMutation {
+        subscription_id,
+        feed_id: domain_id,
+        ownership_epoch: 1,
+        sequence: 1,
+        request_id: Uuid::from_u128(71_001),
+        member_progress: members
+            .iter()
+            .enumerate()
+            .map(|(index, (feed, cursor))| {
+                (
+                    *feed,
+                    MemberFeedProgress {
+                        cursor: cursor.to_string(),
+                        positions: BTreeMap::from([(
+                            RangeId::from_uuid(Uuid::from_u128(31_000 + index as u128)),
+                            format!("pos-{cursor}"),
+                        )]),
+                        quarantined: BTreeMap::new(),
+                        skipped: BTreeMap::new(),
+                    },
+                )
+            })
+            .collect(),
+        member_feed: None,
+        expected_cursor: None,
+        cursor: "domain".to_owned(),
+        positions: BTreeMap::new(),
+        quarantined: BTreeMap::new(),
+        quarantine_add: BTreeMap::new(),
+        quarantine_remove: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+        skip_add: BTreeMap::new(),
+        tick: 0,
+        lease_ops: Vec::new(),
+    }
+}
+
+async fn domain_subscription(
+    controller: &ControlController,
+) -> whitewater::control::SubscriptionDefinition {
+    controller
+        .execute(
+            "CREATE DOMAIN orders; CREATE FEED orders.alpha; CREATE FEED orders.beta; \
+             CREATE SUBSCRIPTION orders.all FROM DOMAIN orders;",
+        )
+        .await
+        .unwrap();
+    controller
+        .active_subscription_by_name("orders.all")
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn domain_subscription_member_frontiers_advance_independently() {
+    use whitewater::reader::{
+        MemberFeedProgress, SubscriptionLeaseOp, SubscriptionQuarantineDelta, SubscriptionWorkLease,
+    };
+
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    let subscription = domain_subscription(&controller).await;
+    let domain_id = subscription.source.domain_id().unwrap();
+    let alpha = controller
+        .active_feed_by_name("orders.alpha")
+        .await
+        .unwrap()
+        .feed_id;
+    let beta = controller
+        .active_feed_by_name("orders.beta")
+        .await
+        .unwrap()
+        .feed_id;
+    // The catalog tracked both Feeds as attached members at declaration.
+    let memberships = controller
+        .subscription_feed_memberships(subscription.subscription_id)
+        .await;
+    assert_eq!(
+        memberships
+            .values()
+            .map(|member| member.state)
+            .collect::<Vec<_>>(),
+        vec![
+            whitewater::control::SubscriptionFeedState::Active,
+            whitewater::control::SubscriptionFeedState::Active
+        ]
+    );
+
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+
+    coordinator
+        .apply(domain_progress_mutation(
+            subscription.subscription_id,
+            domain_id,
+            &[(alpha, "alpha_0"), (beta, "beta_0")],
+        ))
+        .await
+        .unwrap();
+
+    let member = Uuid::from_u128(33_001);
+    let work = Uuid::from_u128(33_002);
+    coordinator
+        .apply_member_ops(
+            Uuid::from_u128(33_010),
+            10,
+            vec![SubscriptionLeaseOp::Join {
+                member_id: member,
+                member_epoch: 1,
+            }],
+        )
+        .await
+        .unwrap();
+    coordinator
+        .apply_member_ops(
+            Uuid::from_u128(33_011),
+            10,
+            vec![SubscriptionLeaseOp::Claim {
+                work_id: work,
+                member_id: member,
+                member_epoch: 1,
+                lease_ticks: 30,
+            }],
+        )
+        .await
+        .unwrap();
+    let members = coordinator.member_state().await.unwrap();
+    let grant = SubscriptionWorkLease {
+        work_id: work,
+        member_id: member,
+        member_epoch: 1,
+        lease_epoch: members.leases[&work].lease_epoch,
+        expires_at_tick: members.leases[&work].expires_at_tick,
+        exhausted_applied: false,
+    };
+
+    // Acknowledging alpha moves only its entry; beta's frontier — and the
+    // row's aggregate Cursor — stay exactly as committed. A quarantine
+    // delta lands on alpha's evidence only.
+    let alpha_range = RangeId::from_uuid(Uuid::from_u128(41_001));
+    let acked = coordinator
+        .acknowledge_member(
+            &grant,
+            20,
+            Uuid::from_u128(33_012),
+            alpha,
+            "alpha_1".to_owned(),
+            BTreeMap::from([(alpha_range, "alpha-p1".to_owned())]),
+            SubscriptionQuarantineDelta {
+                add: BTreeMap::from([(alpha_range, vec!["poison-1".to_owned()])]),
+                remove: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(acked.member_feed, Some(alpha));
+    assert_eq!(acked.cursor, "alpha_1");
+    assert_eq!(acked.member_progress[&alpha].cursor, "alpha_1");
+    assert_eq!(acked.member_progress[&beta].cursor, "beta_0");
+    assert_eq!(
+        acked.member_progress[&alpha].quarantined[&alpha_range],
+        vec!["poison-1".to_owned()]
+    );
+    assert!(acked.member_progress[&beta].quarantined.is_empty());
+    for node in &nodes {
+        let committed = transport.stores[node]
+            .local_committed(subscription.subscription_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.member_progress[&beta].cursor, "beta_0");
+    }
+
+    // Re-claim, then acknowledge beta: its CAS rode beta's own committed
+    // entry Cursor, so alpha's movement never rewrote beta's chain.
+    coordinator
+        .apply_member_ops(
+            Uuid::from_u128(33_013),
+            21,
+            vec![SubscriptionLeaseOp::Claim {
+                work_id: work,
+                member_id: member,
+                member_epoch: 1,
+                lease_ticks: 30,
+            }],
+        )
+        .await
+        .unwrap();
+    let members = coordinator.member_state().await.unwrap();
+    let grant = SubscriptionWorkLease {
+        work_id: work,
+        member_id: member,
+        member_epoch: 1,
+        lease_epoch: members.leases[&work].lease_epoch,
+        expires_at_tick: members.leases[&work].expires_at_tick,
+        exhausted_applied: false,
+    };
+    let acked_b = coordinator
+        .acknowledge_member(
+            &grant,
+            40,
+            Uuid::from_u128(33_014),
+            beta,
+            "beta_1".to_owned(),
+            BTreeMap::from([(
+                RangeId::from_uuid(Uuid::from_u128(41_002)),
+                "bp1".to_owned(),
+            )]),
+            SubscriptionQuarantineDelta::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(acked_b.member_progress[&alpha].cursor, "alpha_1");
+    assert_eq!(acked_b.member_progress[&beta].cursor, "beta_1");
+    assert_eq!(
+        acked_b.member_progress[&alpha].quarantined[&alpha_range],
+        vec!["poison-1".to_owned()]
+    );
+
+    // The synthesized member view scopes evidence to the named Feed only:
+    // beta sees no quarantine and none of alpha's delta.
+    let row = coordinator.read_committed().await.unwrap().unwrap();
+    let view = row.member_view(beta).unwrap();
+    assert_eq!(view.feed_id, beta);
+    assert_eq!(view.cursor, "beta_1");
+    assert!(view.quarantined.is_empty());
+    assert!(view.quarantine_add.is_empty());
+    let alpha_view = row.member_view(alpha).unwrap();
+    assert_eq!(
+        alpha_view.quarantined[&alpha_range],
+        vec!["poison-1".to_owned()]
+    );
+    assert!(row.member_view(Uuid::from_u128(999)).is_none());
+
+    // attach_member_feeds adds a discovered Feed without moving anything.
+    let gamma = Uuid::from_u128(42_000);
+    coordinator
+        .attach_member_feeds(
+            Uuid::from_u128(33_015),
+            41,
+            BTreeMap::from([(
+                gamma,
+                MemberFeedProgress {
+                    cursor: "beginning".to_owned(),
+                    positions: BTreeMap::from([(
+                        RangeId::from_uuid(Uuid::from_u128(41_003)),
+                        String::new(),
+                    )]),
+                    quarantined: BTreeMap::new(),
+                    skipped: BTreeMap::new(),
+                },
+            )]),
+        )
+        .await
+        .unwrap();
+    let row = coordinator.read_committed().await.unwrap().unwrap();
+    assert!(row.member_progress.contains_key(&gamma));
+    assert_eq!(row.member_progress[&alpha].cursor, "alpha_1");
+    assert_eq!(row.member_feed, None);
+    // Re-attaching a tracked Feed can never silently rewind it.
+    assert!(matches!(
+        coordinator
+            .attach_member_feeds(
+                Uuid::from_u128(33_016),
+                42,
+                BTreeMap::from([(
+                    gamma,
+                    MemberFeedProgress {
+                        cursor: "beginning".to_owned(),
+                        positions: BTreeMap::new(),
+                        quarantined: BTreeMap::new(),
+                        skipped: BTreeMap::new(),
+                    },
+                )]),
+            )
+            .await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+}
+
+#[tokio::test]
+async fn domain_progress_validation_fences_delta_and_drift_violations() {
+    use whitewater::reader::MemberFeedProgress;
+
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    let subscription = domain_subscription(&controller).await;
+    let domain_id = subscription.source.domain_id().unwrap();
+    let alpha = Uuid::from_u128(51_001);
+    let beta = Uuid::from_u128(51_002);
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    let seed = domain_progress_mutation(
+        subscription.subscription_id,
+        domain_id,
+        &[(alpha, "alpha_0"), (beta, "beta_0")],
+    );
+    coordinator.apply(seed.clone()).await.unwrap();
+
+    let entry = |cursor: &str| MemberFeedProgress {
+        cursor: cursor.to_owned(),
+        positions: BTreeMap::from([(RangeId::from_uuid(Uuid::from_u128(52_000)), "p".to_owned())]),
+        quarantined: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+    };
+    #[allow(clippy::too_many_arguments)]
+    fn base(
+        subscription_id: Uuid,
+        domain_id: Uuid,
+        member_feed: Option<Uuid>,
+        member_progress: BTreeMap<Uuid, MemberFeedProgress>,
+        cursor: &str,
+        expected: &str,
+        request_id: Uuid,
+    ) -> SubscriptionProgressMutation {
+        SubscriptionProgressMutation {
+            subscription_id,
+            feed_id: domain_id,
+            ownership_epoch: 1,
+            sequence: 2,
+            request_id,
+            member_progress,
+            member_feed,
+            expected_cursor: Some(expected.to_owned()),
+            cursor: cursor.to_owned(),
+            positions: BTreeMap::from([(
+                RangeId::from_uuid(Uuid::from_u128(52_000)),
+                "p".to_owned(),
+            )]),
+            quarantined: BTreeMap::new(),
+            quarantine_add: BTreeMap::new(),
+            quarantine_remove: BTreeMap::new(),
+            skipped: BTreeMap::new(),
+            skip_add: BTreeMap::new(),
+            tick: 1,
+            lease_ops: Vec::new(),
+        }
+    }
+    let sid = subscription.subscription_id;
+
+    // (a) named entry whose top-level delta does not restate it exactly.
+    let forged = base(
+        sid,
+        domain_id,
+        Some(alpha),
+        BTreeMap::from([
+            (alpha, entry("alpha_X")),
+            (beta, seed.member_progress[&beta].clone()),
+        ]),
+        "alpha_Y",
+        "alpha_0",
+        Uuid::from_u128(53_001),
+    );
+    assert!(matches!(
+        coordinator.apply(forged).await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+
+    // (b) a drifted non-named entry cannot ride a valid alpha delta.
+    let forged = base(
+        sid,
+        domain_id,
+        Some(alpha),
+        BTreeMap::from([(alpha, entry("alpha_1")), (beta, entry("beta_X"))]),
+        "alpha_1",
+        "alpha_0",
+        Uuid::from_u128(53_002),
+    );
+    assert!(matches!(
+        coordinator.apply(forged).await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+
+    // (c) a pure bookkeeping/attach mutation carries no per-Feed evidence.
+    let mut forged = base(
+        sid,
+        domain_id,
+        None,
+        seed.member_progress.clone(),
+        "domain",
+        "domain",
+        Uuid::from_u128(53_003),
+    );
+    forged.quarantine_add = BTreeMap::from([(
+        RangeId::from_uuid(Uuid::from_u128(52_000)),
+        vec!["x".to_owned()],
+    )]);
+    assert!(matches!(
+        coordinator.apply(forged).await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+
+    // (d) a member Feed outside the committed map cannot acknowledge.
+    let forged = base(
+        sid,
+        domain_id,
+        Some(Uuid::from_u128(51_999)),
+        seed.member_progress.clone(),
+        "ghost",
+        "domain",
+        Uuid::from_u128(53_004),
+    );
+    assert!(matches!(
+        coordinator.apply(forged).await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+
+    // (e) the CAS rides the named entry's Cursor: expecting beta's Cursor
+    // while advancing alpha conflicts.
+    let forged = base(
+        sid,
+        domain_id,
+        Some(alpha),
+        BTreeMap::from([
+            (alpha, entry("alpha_1")),
+            (beta, seed.member_progress[&beta].clone()),
+        ]),
+        "alpha_1",
+        "beta_0",
+        Uuid::from_u128(53_005),
+    );
+    assert!(matches!(
+        coordinator.apply(forged).await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+
+    // And the honest sequence-2 alpha delta commits on every replica.
+    let honest = base(
+        sid,
+        domain_id,
+        Some(alpha),
+        BTreeMap::from([
+            (alpha, entry("alpha_1")),
+            (beta, seed.member_progress[&beta].clone()),
+        ]),
+        "alpha_1",
+        "alpha_0",
+        Uuid::from_u128(53_006),
+    );
+    coordinator.apply(honest.clone()).await.unwrap();
+    // Replaying the identical mutation is an idempotent no-op.
+    coordinator.apply(honest.clone()).await.unwrap();
+    // The same request identity carrying different content conflicts.
+    let mut divergent = honest.clone();
+    divergent.cursor = "alpha_2".to_owned();
+    assert!(matches!(
+        coordinator.apply(divergent).await,
+        Err(SubscriptionProgressError::Conflict)
+    ));
+}
+
+#[test]
+fn member_view_scopes_delta_evidence_to_the_named_feed() {
+    use whitewater::reader::MemberFeedProgress;
+    let alpha = Uuid::from_u128(61_001);
+    let beta = Uuid::from_u128(61_002);
+    let range = RangeId::from_uuid(Uuid::from_u128(61_003));
+    let row = SubscriptionProgressMutation {
+        subscription_id: Uuid::from_u128(61_000),
+        feed_id: Uuid::from_u128(61_004),
+        ownership_epoch: 1,
+        sequence: 2,
+        request_id: Uuid::from_u128(61_005),
+        member_progress: BTreeMap::from([
+            (
+                alpha,
+                MemberFeedProgress {
+                    cursor: "a1".to_owned(),
+                    positions: BTreeMap::from([(range, "ap".to_owned())]),
+                    quarantined: BTreeMap::from([(range, vec!["aq".to_owned()])]),
+                    skipped: BTreeMap::new(),
+                },
+            ),
+            (
+                beta,
+                MemberFeedProgress {
+                    cursor: "b1".to_owned(),
+                    positions: BTreeMap::from([(range, "bp".to_owned())]),
+                    quarantined: BTreeMap::new(),
+                    skipped: BTreeMap::from([(range, vec!["bs".to_owned()])]),
+                },
+            ),
+        ]),
+        member_feed: Some(alpha),
+        expected_cursor: Some("a0".to_owned()),
+        cursor: "a1".to_owned(),
+        positions: BTreeMap::from([(range, "ap".to_owned())]),
+        quarantined: BTreeMap::from([(range, vec!["aq".to_owned()])]),
+        quarantine_add: BTreeMap::from([(range, vec!["aq".to_owned()])]),
+        quarantine_remove: BTreeMap::new(),
+        skipped: BTreeMap::new(),
+        skip_add: BTreeMap::new(),
+        tick: 5,
+        lease_ops: Vec::new(),
+    };
+    // alpha's view carries the row's delta (the last mutation named it);
+    // beta's view carries its own entry and none of alpha's delta.
+    let alpha_view = row.member_view(alpha).unwrap();
+    assert_eq!(alpha_view.feed_id, alpha);
+    assert_eq!(alpha_view.cursor, "a1");
+    assert_eq!(alpha_view.quarantine_add[&range], vec!["aq".to_owned()]);
+    let beta_view = row.member_view(beta).unwrap();
+    assert_eq!(beta_view.cursor, "b1");
+    assert_eq!(beta_view.skipped[&range], vec!["bs".to_owned()]);
+    assert!(beta_view.quarantine_add.is_empty());
+    assert!(beta_view.quarantined.is_empty());
+    assert!(row.member_view(Uuid::from_u128(61_999)).is_none());
+    // expected_frontier_cursor: aggregate for exact/lease mutations,
+    // the entry's Cursor for member-Feed deltas, None when unattached.
+    assert_eq!(row.expected_frontier_cursor(None), Some("a1"));
+    assert_eq!(row.expected_frontier_cursor(Some(alpha)), Some("a1"));
+    assert_eq!(row.expected_frontier_cursor(Some(beta)), Some("b1"));
+    assert_eq!(
+        row.expected_frontier_cursor(Some(Uuid::from_u128(61_999))),
+        None
+    );
 }

@@ -77,6 +77,10 @@ pub struct FetchedPage {
     pub records: Vec<FetchedRecord>,
     pub cursor: String,
     pub positions: BTreeMap<RangeId, String>,
+    /// The Domain member Feed this page was drawn from; `None` when the
+    /// Subscription consumes an exact-Feed row. The driver scopes the
+    /// consumed frontier and the effect identity to it.
+    pub member_feed: Option<Uuid>,
     /// Window Pipes only: closed panes resolved at fetch time. Emission
     /// travels inside the same Declare/Applied boundary as the pane
     /// accumulation, so a replayed effect never re-scans the store.
@@ -138,6 +142,7 @@ pub struct WindowEmission {
 pub fn pipe_effect_id(
     pipe_id: Uuid,
     subscription_id: Uuid,
+    consumed_feed: Uuid,
     expected_cursor: &str,
     plan: &[u8],
 ) -> Uuid {
@@ -146,6 +151,7 @@ pub fn pipe_effect_id(
         &[
             pipe_id.as_bytes().as_slice(),
             subscription_id.as_bytes().as_slice(),
+            consumed_feed.as_bytes().as_slice(),
             expected_cursor.as_bytes(),
             plan,
         ],
@@ -183,6 +189,7 @@ pub fn pipe_emission_writer_session(pipe_id: Uuid, pane_row_key: &[u8]) -> Uuid 
 pub fn pipe_emission_effect_id(
     pipe_id: Uuid,
     subscription_id: Uuid,
+    consumed_feed: Uuid,
     expected_cursor: &str,
     emissions: &[WindowEmission],
     expired: &[Vec<u8>],
@@ -206,6 +213,7 @@ pub fn pipe_emission_effect_id(
         &[
             pipe_id.as_bytes().as_slice(),
             subscription_id.as_bytes().as_slice(),
+            consumed_feed.as_bytes().as_slice(),
             expected_cursor.as_bytes(),
             digest.as_bytes().as_slice(),
         ],
@@ -349,6 +357,16 @@ impl PipeDriver {
         if page.records.is_empty() && page.emissions.is_empty() && page.expired.is_empty() {
             return Ok(None);
         }
+        // A page drawn from a Domain member Feed names it in
+        // `member_feed`: the consumed frontier, the CAS Cursor, and the
+        // effect identity all scope through that Feed's synthesized
+        // member view while every other entry stays untouched.
+        let frontier = match page.member_feed {
+            Some(feed) => frontier
+                .member_view(feed)
+                .ok_or(EffectJournalError::Conflict)?,
+            None => frontier,
+        };
         if page.records.len() > crate::effect::EFFECT_MAX_OUTPUTS
             || page.positions.len() > crate::effect::EFFECT_MAX_POSITIONS
         {
@@ -368,6 +386,7 @@ impl PipeDriver {
         let (outputs, mutation_ops) = self.effect_plan(&page)?;
         let effect_id = self.effect_identity(
             frontier.subscription_id,
+            frontier.feed_id,
             &frontier.cursor,
             &page,
             &outputs,
@@ -881,6 +900,7 @@ impl PipeDriver {
     fn effect_identity(
         &self,
         subscription_id: Uuid,
+        consumed_feed: Uuid,
         expected_cursor: &str,
         page: &FetchedPage,
         outputs: &[EffectOutput],
@@ -890,6 +910,7 @@ impl PipeDriver {
             Ok(pipe_emission_effect_id(
                 self.pipe.pipe_id,
                 subscription_id,
+                consumed_feed,
                 expected_cursor,
                 &page.emissions,
                 &page.expired,
@@ -899,6 +920,7 @@ impl PipeDriver {
             Ok(pipe_effect_id(
                 self.pipe.pipe_id,
                 subscription_id,
+                consumed_feed,
                 expected_cursor,
                 &plan,
             ))
@@ -910,12 +932,14 @@ impl PipeDriver {
     pub fn planned_effect_id(
         &self,
         subscription_id: Uuid,
+        consumed_feed: Uuid,
         expected_cursor: &str,
         page: &FetchedPage,
     ) -> Result<Uuid, EffectJournalError> {
         let (outputs, mutation_ops) = self.effect_plan(page)?;
         self.effect_identity(
             subscription_id,
+            consumed_feed,
             expected_cursor,
             page,
             &outputs,
@@ -1284,24 +1308,41 @@ mod tests {
     fn derived_identities_are_stable_and_scoped() {
         let pipe = Uuid::from_u128(1);
         let subscription = Uuid::from_u128(2);
-        let first = pipe_effect_id(pipe, subscription, "cursor-a", b"plan-a");
+        let feed = Uuid::from_u128(3);
+        let first = pipe_effect_id(pipe, subscription, feed, "cursor-a", b"plan-a");
         assert_eq!(
             first,
-            pipe_effect_id(pipe, subscription, "cursor-a", b"plan-a")
+            pipe_effect_id(pipe, subscription, feed, "cursor-a", b"plan-a")
         );
         assert_ne!(
             first,
-            pipe_effect_id(pipe, subscription, "cursor-b", b"plan-a")
+            pipe_effect_id(pipe, subscription, feed, "cursor-b", b"plan-a")
         );
         assert_ne!(
             first,
-            pipe_effect_id(Uuid::from_u128(9), subscription, "cursor-a", b"plan-a")
+            pipe_effect_id(
+                pipe,
+                subscription,
+                Uuid::from_u128(7),
+                "cursor-a",
+                b"plan-a"
+            )
+        );
+        assert_ne!(
+            first,
+            pipe_effect_id(
+                Uuid::from_u128(9),
+                subscription,
+                feed,
+                "cursor-a",
+                b"plan-a"
+            )
         );
         // The plan digest is part of the identity: a wall-clock-shifted
         // replan over the same frontier is a different effect entirely.
         assert_ne!(
             first,
-            pipe_effect_id(pipe, subscription, "cursor-a", b"plan-b")
+            pipe_effect_id(pipe, subscription, feed, "cursor-a", b"plan-b")
         );
         let session = pipe_output_writer_session(pipe, Uuid::from_u128(50));
         assert_eq!(

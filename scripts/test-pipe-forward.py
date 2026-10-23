@@ -347,11 +347,49 @@ def main():
                 "the Pipe lost or duplicated records across range transitions"
             )
 
+        # A Pipe over a Domain-source Subscription bootstraps one durable
+        # frontier per member Feed and rotates drives across them: records
+        # appended through either Feed land in the single output Feed via
+        # the same effect-journal commit path.
+        ddomain = f"dpipe{suffix}"
+        dsrc_a, dsrc_b, dout = (
+            f"{ddomain}.alpha",
+            f"{ddomain}.beta",
+            f"{ddomain}.out",
+        )
+        dwriter_a, dwriter_b = f"dwa{suffix}", f"dwb{suffix}"
+        dsub, dpipe = f"{ddomain}.all", f"{ddomain}.copy"
+        results = wcl_retry(
+            NODES[0],
+            f"CREATE DOMAIN {ddomain}; "
+            f"CREATE FEED {dsrc_a}; CREATE FEED {dsrc_b}; CREATE FEED {dout}; "
+            f"CREATE WRITER {dwriter_a} TO {dsrc_a}; "
+            f"OPEN WRITER SESSION {dwriter_a}; "
+            f"CREATE WRITER {dwriter_b} TO {dsrc_b}; "
+            f"OPEN WRITER SESSION {dwriter_b}; "
+            f"CREATE SUBSCRIPTION {dsub} FROM DOMAIN {ddomain} START AT BEGINNING; "
+            f"CREATE PIPE {dpipe} FROM SUBSCRIPTION {dsub} TO FEED {dout};",
+        )
+        append_batch(NODES[1], dwriter_a, results[5]["session_epoch"], range(1, 4), retries=15)
+        append_batch(NODES[2], dwriter_b, results[7]["session_epoch"], range(4, 7), retries=15)
+        dforwarded = wait_forwarded(dout, 6, deadline=180)
+        # Exactly the six appended records: the output Feed is itself a
+        # member Feed of the consumed Domain, so a drive that failed to
+        # exclude its own writes would loop them back through the
+        # frontier — the strict count is the regression oracle.
+        if len(dforwarded) != 6 or len(
+            {record["key_base64"] for record in dforwarded}
+        ) != 6:
+            raise AssertionError(
+                "the Domain-source Pipe lost or duplicated records across member Feeds"
+            )
+
         print(
             json.dumps(
                 {
                     "status": "ok",
                     "forwarded": len(forwarded),
+                    "domain_forwarded": len(dforwarded),
                     "owner_before_drain": owner,
                     "owner_after_drain": new_owner,
                     "epoch_after_drain": new_epoch,
