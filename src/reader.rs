@@ -1769,6 +1769,21 @@ fn same_progress_identity(
         && left.deferred_remove == right.deferred_remove
 }
 
+/// `ownership_epoch` stamps which assignment issued a mutation; it fences
+/// writes but is not decision content - `same_progress_identity` already
+/// excludes it, and quorum digests must too or a stored decision and its
+/// epoch-moved replay can never match commit evidence.
+fn progress_decision_digest(
+    mutation: &SubscriptionProgressMutation,
+) -> Result<[u8; 32], SubscriptionProgressError> {
+    let canonical = SubscriptionProgressMutation {
+        ownership_epoch: 0,
+        ..mutation.clone()
+    };
+    let bytes = serde_json::to_vec(&canonical)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SubscriptionProgressReplicaRow {
     subscription_id: Uuid,
@@ -1943,7 +1958,7 @@ impl FjallSubscriptionProgressReplica {
                     || row.committed.as_ref().is_some_and(|committed| {
                         committed.subscription_id != subscription_id
                             || committed.feed_id != row.feed_id
-                            || committed.ownership_epoch != row.ownership_epoch
+                            || committed.ownership_epoch > row.ownership_epoch
                     }) =>
             {
                 Err(SubscriptionProgressError::Conflict)
@@ -1969,12 +1984,12 @@ impl FjallSubscriptionProgressReplica {
                     || row.committed.as_ref().is_some_and(|committed| {
                         committed.subscription_id != subscription_id
                             || committed.feed_id != row.feed_id
-                            || committed.ownership_epoch != row.ownership_epoch
+                            || committed.ownership_epoch > row.ownership_epoch
                     })
                     || row.prepared.as_ref().is_some_and(|prepared| {
                         prepared.subscription_id != subscription_id
                             || prepared.feed_id != row.feed_id
-                            || prepared.ownership_epoch != row.ownership_epoch
+                            || prepared.ownership_epoch > row.ownership_epoch
                     }) =>
             {
                 Err(SubscriptionProgressError::Conflict)
@@ -2007,9 +2022,11 @@ impl FjallSubscriptionProgressReplica {
             return Err(SubscriptionProgressError::Conflict);
         }
         if let Some(mutation) = &committed {
+            // The stamped epoch is the decision's history, not its scope: a
+            // committed row adopted forward keeps the epoch that made it.
             if mutation.subscription_id != subscription_id
                 || mutation.feed_id != feed_id
-                || mutation.ownership_epoch != ownership_epoch
+                || mutation.ownership_epoch > ownership_epoch
             {
                 return Err(SubscriptionProgressError::Conflict);
             }
@@ -2092,7 +2109,12 @@ impl FjallSubscriptionProgressReplica {
             return Err(SubscriptionProgressError::StaleEpoch);
         }
         if row.ownership_epoch == ownership_epoch {
-            return if row.committed == committed && row.members == members {
+            let same_committed = match (&row.committed, &committed) {
+                (None, None) => true,
+                (Some(existing), Some(candidate)) => same_progress_identity(existing, candidate),
+                _ => false,
+            };
+            return if same_committed && row.members == members {
                 Ok(row.committed)
             } else {
                 Err(SubscriptionProgressError::Conflict)
@@ -2193,7 +2215,7 @@ impl FjallSubscriptionProgressReplica {
         let vote = SubscriptionPrepareVote {
             subscription_id: mutation.subscription_id,
             request_id: mutation.request_id,
-            digest: *blake3::hash(&bytes).as_bytes(),
+            digest: progress_decision_digest(&mutation)?,
         };
         let mut tx = self
             .db
@@ -2217,12 +2239,18 @@ impl FjallSubscriptionProgressReplica {
         if row.subscription_id != mutation.subscription_id || row.feed_id != mutation.feed_id {
             return Err(SubscriptionProgressError::Conflict);
         }
-        if row.ownership_epoch != mutation.ownership_epoch {
+        // Fencing is directional: the placement check upstream already
+        // proved the request epoch is the authoritative assignment, so a
+        // row fenced behind it ratchets forward on install below rather
+        // than wedging the mutation chain while adoption catches up. A
+        // mutation stamped under an older epoch than the row dies here as
+        // a stale write.
+        if row.ownership_epoch > mutation.ownership_epoch {
             return Err(SubscriptionProgressError::StaleEpoch);
         }
         if let Some(committed) = &row.committed {
             if committed.request_id == mutation.request_id {
-                return if committed == &mutation {
+                return if same_progress_identity(committed, &mutation) {
                     Ok(vote)
                 } else {
                     Err(SubscriptionProgressError::Conflict)
@@ -2230,7 +2258,7 @@ impl FjallSubscriptionProgressReplica {
             }
         }
         if let Some(prepared) = &row.prepared {
-            if prepared == &mutation {
+            if same_progress_identity(prepared, &mutation) {
                 return Ok(vote);
             }
             if prepared.request_id == mutation.request_id {
@@ -2265,6 +2293,7 @@ impl FjallSubscriptionProgressReplica {
                     .map_err(SubscriptionProgressError::Lease)?;
             }
         }
+        row.ownership_epoch = mutation.ownership_epoch;
         row.prepared = Some(mutation);
         let encoded = serde_json::to_vec(&row)?;
         if encoded.len() > 256 * 1024 {
@@ -2300,7 +2329,7 @@ impl FjallSubscriptionProgressReplica {
                     .filter(|value| value.request_id == evidence.request_id)
             })
             .ok_or(SubscriptionProgressError::Conflict)?;
-        let digest = *blake3::hash(&serde_json::to_vec(candidate)?).as_bytes();
+        let digest = progress_decision_digest(candidate)?;
         if evidence.request_id != candidate.request_id
             || evidence.votes[0].0 == evidence.votes[1].0
             || evidence.votes.iter().any(|(_, value)| *value != digest)
@@ -2312,6 +2341,12 @@ impl FjallSubscriptionProgressReplica {
             .as_ref()
             .is_none_or(|value| value.request_id != evidence.request_id)
         {
+            tracing::warn!(
+                subscription = %evidence.subscription_id,
+                evidence_request = %evidence.request_id,
+                prepared_request = ?row.prepared.as_ref().map(|value| value.request_id),
+                "Subscription progress commit found no matching prepared vote"
+            );
             return row.committed.ok_or(SubscriptionProgressError::Conflict);
         }
         let committed = row
@@ -2540,7 +2575,7 @@ impl SubscriptionProgressReplicaService {
             if progress.subscription_id != subscription_id || progress.feed_id != feed_id {
                 return Err(SubscriptionProgressError::Conflict);
             }
-            if progress.ownership_epoch != request.ownership_epoch {
+            if progress.ownership_epoch > request.ownership_epoch {
                 return Err(SubscriptionProgressError::StaleEpoch);
             }
         }
@@ -3013,6 +3048,7 @@ impl SubscriptionPlacementAuthority for crate::control_plane::ControlPlane {
     }
 }
 
+#[derive(Clone)]
 pub struct SubscriptionProgressCoordinator {
     assignment: SubscriptionProgressAssignment,
     transport: std::sync::Arc<dyn SubscriptionProgressTransport>,
@@ -3089,17 +3125,14 @@ impl SubscriptionProgressCoordinator {
                         if mutation.subscription_id != self.assignment.subscription_id {
                             return Err(SubscriptionProgressError::Conflict);
                         }
-                        if mutation.ownership_epoch != self.assignment.ownership_epoch {
-                            if mutation.ownership_epoch > self.assignment.ownership_epoch {
-                                // The replica knows a newer placement; this
-                                // coordinator's assignment is stale.
-                                return Err(SubscriptionProgressError::StaleEpoch);
-                            }
-                            // The replica still carries the prior epoch's row;
-                            // it is a lagging witness, not a contradiction.
-                            lagged = true;
-                            continue;
+                        if mutation.ownership_epoch > self.assignment.ownership_epoch {
+                            // The replica knows a newer placement; this
+                            // coordinator's assignment is stale.
+                            return Err(SubscriptionProgressError::StaleEpoch);
                         }
+                        // A decision committed under a prior epoch stays
+                        // committed: the stamped epoch is history, and the
+                        // reply envelope's row epoch already fenced the read.
                     }
                     votes += 1;
                     if let Some(candidate) = progress {
@@ -3160,7 +3193,7 @@ impl SubscriptionProgressCoordinator {
                         owner_seen = true;
                     }
                     match reply.result {
-                        Some(current) if current == mutation => {
+                        Some(current) if same_progress_identity(&current, &mutation) => {
                             matching += 1;
                             if node == &self.assignment.owner {
                                 owner_committed = true;
@@ -3183,7 +3216,9 @@ impl SubscriptionProgressCoordinator {
         }
         if owner_committed && matching >= 2 {
             match self.read_committed().await {
-                Ok(Some(committed)) if committed == mutation => return Ok(mutation),
+                Ok(Some(committed)) if same_progress_identity(&committed, &mutation) => {
+                    return Ok(mutation)
+                }
                 Err(SubscriptionProgressError::Conflict) => {}
                 Err(error) => return Err(error),
                 _ => return Err(SubscriptionProgressError::AmbiguousCommit),
@@ -3191,7 +3226,7 @@ impl SubscriptionProgressCoordinator {
         }
         self.apply(mutation.clone()).await?;
         match self.read_committed().await {
-            Ok(Some(committed)) if committed == mutation => Ok(mutation),
+            Ok(Some(committed)) if same_progress_identity(&committed, &mutation) => Ok(mutation),
             Err(SubscriptionProgressError::Conflict) | Ok(_) => {
                 Err(SubscriptionProgressError::AmbiguousCommit)
             }
@@ -3208,7 +3243,7 @@ impl SubscriptionProgressCoordinator {
         {
             return Err(SubscriptionProgressError::InvalidAssignment);
         }
-        let digest = *blake3::hash(&serde_json::to_vec(&mutation)?).as_bytes();
+        let digest = progress_decision_digest(&mutation)?;
         let owner = &self.assignment.owner;
         let owner_reply = match self.transport.prepare(owner, mutation.clone()).await {
             Ok(reply) => reply,
@@ -3234,6 +3269,12 @@ impl SubscriptionProgressCoordinator {
             || owner_reply.result.request_id != mutation.request_id
             || owner_reply.result.digest != digest
         {
+            tracing::warn!(
+                subscription = %mutation.subscription_id,
+                vote_request = %owner_reply.result.request_id,
+                mutation_request = %mutation.request_id,
+                "Subscription progress owner prepare vote mismatched"
+            );
             return Err(SubscriptionProgressError::Conflict);
         }
         let mut prepared = vec![(owner.clone(), digest)];
@@ -3264,6 +3305,13 @@ impl SubscriptionProgressCoordinator {
                         || vote.request_id != mutation.request_id
                         || vote.digest != digest
                     {
+                        tracing::warn!(
+                            %node,
+                            subscription = %mutation.subscription_id,
+                            vote_request = %vote.request_id,
+                            mutation_request = %mutation.request_id,
+                            "Subscription progress follower prepare vote mismatched"
+                        );
                         return Err(SubscriptionProgressError::Conflict);
                     }
                     prepared.push((node.clone(), vote.digest));
@@ -3316,8 +3364,21 @@ impl SubscriptionProgressCoordinator {
                 {
                     return Err(SubscriptionProgressError::InvalidAssignment);
                 }
-                Ok(reply) if reply.result == mutation => committed.push(node.clone()),
-                Ok(_) => return Err(SubscriptionProgressError::Conflict),
+                Ok(reply) if same_progress_identity(&reply.result, &mutation) => {
+                    committed.push(node.clone())
+                }
+                Ok(reply) => {
+                    tracing::warn!(
+                        %node,
+                        subscription = %mutation.subscription_id,
+                        committed_seq = reply.result.sequence,
+                        committed_request = %reply.result.request_id,
+                        mutation_seq = mutation.sequence,
+                        mutation_request = %mutation.request_id,
+                        "Subscription progress commit reply mismatched mutation"
+                    );
+                    return Err(SubscriptionProgressError::Conflict);
+                }
                 Err(error) if lagging_witness(&error) => {}
                 Err(error) => return Err(error),
             }
@@ -3326,6 +3387,93 @@ impl SubscriptionProgressCoordinator {
             return Err(SubscriptionProgressError::AmbiguousCommit);
         }
         Ok(committed)
+    }
+
+    /// Settles a stranded two-phase vote. A coordinator that dies between a
+    /// quorum's prepare votes and its commit leaves an uncommitted residue
+    /// that foreign mutations cannot supersede: replicas answer every later
+    /// mutation as a lagging witness forever. When a quorum of replicas
+    /// holds the identical prepared row extending the committed tip, that
+    /// decision was already chosen — this finishes its commit rather than
+    /// letting the residue wedge the chain until an ownership epoch ratchet
+    /// happens to clear it.
+    ///
+    /// A residue held by a lone replica or split into divergent contents is
+    /// not a chosen decision and is left for adoption-driven recovery.
+    pub async fn settle_stranded_prepare(
+        &self,
+    ) -> Result<Option<SubscriptionProgressMutation>, SubscriptionProgressError> {
+        let evidence = self.inspect_evidence().await?;
+        let mut residue: Option<(
+            SubscriptionProgressMutation,
+            Vec<crate::active_range::StorageNodeId>,
+        )> = None;
+        let mut divergent = false;
+        for (node, inspection) in &evidence {
+            let Some(prepared) = &inspection.prepared else {
+                continue;
+            };
+            match &mut residue {
+                Some((existing, holders)) if same_progress_identity(existing, prepared) => {
+                    holders.push(node.clone());
+                }
+                Some(_) => divergent = true,
+                None => residue = Some((prepared.clone(), vec![node.clone()])),
+            }
+        }
+        let Some((residue, holders)) = residue else {
+            return Ok(None);
+        };
+        if divergent || holders.len() < 2 {
+            return Ok(None);
+        }
+        // A prepared vote only ever extends the committed tip; a residue at
+        // any other sequence contradicts the accept rule and is left for
+        // epoch-fenced recovery rather than committed here.
+        if evidence.iter().any(|(node, inspection)| {
+            holders.contains(node)
+                && inspection
+                    .committed
+                    .as_ref()
+                    .is_some_and(|committed| residue.sequence != committed.sequence + 1)
+        }) {
+            return Ok(None);
+        }
+        let digest = progress_decision_digest(&residue)?;
+        let first = holders
+            .iter()
+            .find(|node| **node == self.assignment.owner)
+            .unwrap_or(&holders[0]);
+        let second = holders
+            .iter()
+            .find(|node| *node != first)
+            .expect("a residue quorum holds at least two distinct replicas");
+        let commit_evidence = SubscriptionCommitEvidence {
+            subscription_id: self.assignment.subscription_id,
+            request_id: residue.request_id,
+            votes: [(first.clone(), digest), (second.clone(), digest)],
+        };
+        let mut committed = 0usize;
+        let replies = futures_util::future::join_all(
+            holders
+                .iter()
+                .map(|node| self.transport.commit(node, commit_evidence.clone())),
+        )
+        .await;
+        for reply in replies {
+            match reply {
+                Ok(reply) if same_progress_identity(&reply.result, &residue) => {
+                    committed += 1;
+                }
+                Ok(_) => return Err(SubscriptionProgressError::Conflict),
+                Err(error) if lagging_witness(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if committed < 2 {
+            return Err(SubscriptionProgressError::AmbiguousCommit);
+        }
+        Ok(Some(residue))
     }
 
     pub fn assignment(&self) -> &SubscriptionProgressAssignment {
@@ -4553,7 +4701,7 @@ mod tests {
         next.request_id = Uuid::from_u128(5);
         next.expected_cursor = Some(mutation.cursor.clone());
         next.cursor = "rf1_two".to_owned();
-        reopened.prepare(next.clone()).unwrap();
+        let next_vote = reopened.prepare(next.clone()).unwrap();
         assert_eq!(reopened.commit_with_quorum(proof()).unwrap(), mutation);
         assert_eq!(
             reopened.local_committed(subscription_id).unwrap(),
@@ -4571,10 +4719,27 @@ mod tests {
             reopened.prepare(conflicting_request),
             Err(SubscriptionProgressError::Conflict)
         ));
-        let mut future_epoch = next;
+        // The fence is directional: the placement check upstream proves the
+        // authoritative epoch, so the identical decision restamped under an
+        // adopted epoch re-votes instead of wedging. Once the row fence
+        // ratchets forward, a mutation stamped behind it still dies.
+        let mut future_epoch = next.clone();
         future_epoch.ownership_epoch = 2;
+        assert_eq!(
+            reopened.prepare(future_epoch).unwrap().digest,
+            next_vote.digest
+        );
+        reopened
+            .adopt_recovered(
+                subscription_id,
+                mutation.feed_id,
+                2,
+                Some(mutation.clone()),
+                SubscriptionMemberState::default(),
+            )
+            .unwrap();
         assert!(matches!(
-            reopened.prepare(future_epoch),
+            reopened.prepare(next),
             Err(SubscriptionProgressError::StaleEpoch)
         ));
     }
@@ -5231,7 +5396,7 @@ mod tests {
         mutation: &SubscriptionProgressMutation,
     ) {
         replica.prepare(mutation.clone()).unwrap();
-        let digest = *blake3::hash(&serde_json::to_vec(mutation).unwrap()).as_bytes();
+        let digest = progress_decision_digest(mutation).unwrap();
         replica
             .commit_with_quorum(
                 SubscriptionCommitEvidence::new(
@@ -5447,6 +5612,40 @@ mod tests {
             reopened.local_committed(subscription_id).unwrap(),
             Some(third)
         );
+    }
+
+    #[test]
+    fn subscription_progress_replays_identical_decisions_across_epoch_moves() {
+        // A decision committed under epoch 1 keeps its stamp through the
+        // epoch-2 adoption; the identical replay under the new epoch answers
+        // the same vote instead of conflicting on the stamp, and commit
+        // evidence still matches the stored candidate.
+        let directory = tempfile::TempDir::new().unwrap();
+        let replica = FjallSubscriptionProgressReplica::open(directory.path()).unwrap();
+        let subscription_id = Uuid::from_u128(720);
+        let feed_id = Uuid::from_u128(721);
+        let committed = subscription_progress_mutation(subscription_id, feed_id, 1, 1);
+        commit_direct(&replica, &committed);
+
+        replica
+            .adopt_recovered(
+                subscription_id,
+                feed_id,
+                2,
+                Some(committed.clone()),
+                SubscriptionMemberState::default(),
+            )
+            .unwrap();
+
+        let mut replayed = committed.clone();
+        replayed.ownership_epoch = 2;
+        let vote = replica.prepare(replayed.clone()).unwrap();
+        assert_eq!(vote.request_id, committed.request_id);
+        assert_eq!(
+            replica.local_committed(subscription_id).unwrap(),
+            Some(committed)
+        );
+        commit_direct(&replica, &replayed);
     }
 
     #[tokio::test]

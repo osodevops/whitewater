@@ -136,6 +136,22 @@ pub enum PipeOperation {
         /// Meaningful only under the event-time clock.
         #[serde(default)]
         max_late_ns: Option<u64>,
+        /// Optional event-time watermark in nanoseconds: the driver tracks
+        /// a durable monotone horizon `max(event_time) - watermark_ns` per
+        /// Pipe and closes a pane once the horizon passes its end — close
+        /// decisions follow event-time disorder rather than ingest-clock
+        /// arrival skew. Mutually exclusive with `max_late_ns` (one
+        /// lateness model per Pipe); refused under the ingest clock.
+        #[serde(default)]
+        watermark_ns: Option<u64>,
+        /// Optional revision bound in nanoseconds, requires `watermark_ns`:
+        /// an event landing on an already-emitted pane while
+        /// `horizon <= pane_end + grace_ns` revises the pane and re-emits
+        /// the result under a bumped `revision`; once the horizon passes
+        /// the grace bound the event counts into the `late` row instead.
+        /// Without `GRACE` every emitted-pane event quarantines.
+        #[serde(default)]
+        grace_ns: Option<u64>,
         /// Optional pane-row retention bound in nanoseconds: a pane row
         /// deletes once `pane_end + expire_ns` is behind the close clock,
         /// emitted or not — the declared bound on how much window state
@@ -1202,11 +1218,11 @@ pub enum Command {
         quarantine_feed: Option<String>,
         /// Closed-pane emission Feed name for `Window` Pipes
         /// (`EMIT TO FEED <feed>`); resolved to `output_feed_id` at
-        /// define time. Requires `MAX_LATE` — a pane only provably
-        /// closes once the ingest clock passes pane_end + bound.
+        /// define time. Requires `MAX_LATE` or `WATERMARK` — a pane
+        /// only provably closes under a declared lateness bound.
         #[serde(default)]
         emit_feed: Option<String>,
-        operation: PipeOperation,
+        operation: Box<PipeOperation>,
     },
     CreateWriter {
         name: String,
@@ -3244,7 +3260,7 @@ impl ControlController {
                     ));
                 }
                 let mut operation = operation;
-                let (output_feed_id, output_store_id) = match &mut operation {
+                let (output_feed_id, output_store_id) = match operation.as_mut() {
                     PipeOperation::Forward => {
                         if emit_feed.is_some() {
                             return Err(ControlError::InvalidOperation(
@@ -3275,6 +3291,8 @@ impl ControlController {
                         aggregation,
                         time,
                         max_late_ns,
+                        watermark_ns,
+                        grace_ns,
                         expire_ns,
                         key_limit,
                         byte_limit,
@@ -3293,6 +3311,42 @@ impl ControlController {
                             if matches!(time, WindowTime::Ingest) {
                                 return Err(ControlError::InvalidOperation(
                                     "MAX_LATE is meaningless under the ingest clock — records can never arrive late to their own ingest time".to_owned(),
+                                ));
+                            }
+                        }
+                        if max_late_ns.is_some() && watermark_ns.is_some() {
+                            return Err(ControlError::InvalidOperation(
+                                "MAX_LATE and WATERMARK are alternative lateness models — declare exactly one".to_owned(),
+                            ));
+                        }
+                        if let Some(bound) = watermark_ns {
+                            if *bound == 0 {
+                                return Err(ControlError::InvalidOperation(
+                                    "WATERMARK requires a non-zero duration".to_owned(),
+                                ));
+                            }
+                            if matches!(time, WindowTime::Ingest) {
+                                return Err(ControlError::InvalidOperation(
+                                    "WATERMARK is meaningless under the ingest clock — the horizon would follow arrival order, not event-time disorder".to_owned(),
+                                ));
+                            }
+                        }
+                        if let Some(bound) = grace_ns {
+                            if *bound == 0 {
+                                return Err(ControlError::InvalidOperation(
+                                    "GRACE requires a non-zero duration".to_owned(),
+                                ));
+                            }
+                            if watermark_ns.is_none() {
+                                return Err(ControlError::InvalidOperation(
+                                    "GRACE requires WATERMARK — revision bounds ride the event-time horizon".to_owned(),
+                                ));
+                            }
+                        }
+                        if let (Some(expire), Some(grace)) = (*expire_ns, *grace_ns) {
+                            if expire <= grace {
+                                return Err(ControlError::InvalidOperation(
+                                    "EXPIRE must exceed GRACE — revision markers must outlive the revision bound they serve".to_owned(),
                                 ));
                             }
                         }
@@ -3378,14 +3432,17 @@ impl ControlController {
                             validate_window_field(value)?;
                         }
                         // `EMIT TO FEED` declares where closed panes
-                        // publish. Without `MAX_LATE` no pane ever
+                        // publish. Without a lateness bound no pane ever
                         // provably closes (a record could always arrive
-                        // legally), so emission requires the bound.
+                        // legally) — either `MAX_LATE`'s ingest bound or
+                        // `WATERMARK`'s committed event-time horizon
+                        // supplies the close proof, and the two are
+                        // mutually exclusive by the check above.
                         let emit_feed_id = match &emit_feed {
                             Some(name) => {
-                                if max_late_ns.is_none() {
+                                if max_late_ns.is_none() && watermark_ns.is_none() {
                                     return Err(ControlError::InvalidOperation(
-                                        "EMIT TO FEED requires MAX_LATE — without a lateness bound no pane ever provably closes".to_owned(),
+                                        "EMIT TO FEED requires MAX_LATE or WATERMARK — without a lateness bound no pane ever provably closes".to_owned(),
                                     ));
                                 }
                                 let feed = active_feed(state, name)?;
@@ -3530,7 +3587,7 @@ impl ControlController {
                     name: name.clone(),
                     space_id,
                     subscription_id: subscription.subscription_id,
-                    operation,
+                    operation: *operation,
                     output_feed_id,
                     output_store_id,
                     stage: PipeStage::Declared,
@@ -6172,13 +6229,13 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                                 output_store: Some(token(&tokens, 11)?.to_owned()),
                                 quarantine_feed,
                                 emit_feed: None,
-                                operation: PipeOperation::Enrich {
+                                operation: Box::new(PipeOperation::Enrich {
                                     key,
                                     freshness,
                                     named,
                                     on_miss,
                                     quarantine_feed_id: None,
-                                },
+                                }),
                             });
                         }
                         Ok(Command::DefinePipe {
@@ -6188,7 +6245,7 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             output_store: None,
                             quarantine_feed: None,
                             emit_feed: None,
-                            operation: PipeOperation::Forward,
+                            operation: Box::new(PipeOperation::Forward),
                         })
                     }
                     "STATESTORE" => {
@@ -6215,6 +6272,29 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             max_late_ns =
                                 Some(parse_duration_ns(token(&tokens, at + 1)?)?);
                             at += 2;
+                        }
+                        // `WATERMARK <dur> [GRACE <dur>]` selects the
+                        // event-time lateness model: panes close once the
+                        // durable horizon `max(event)-watermark` passes
+                        // their end, and `GRACE` bounds how long an
+                        // emitted pane still accepts revising events.
+                        let mut watermark_ns = None;
+                        let mut grace_ns = None;
+                        if token(&tokens, at)
+                            .map(|value| value.eq_ignore_ascii_case("WATERMARK"))
+                            .unwrap_or(false)
+                        {
+                            watermark_ns =
+                                Some(parse_duration_ns(token(&tokens, at + 1)?)?);
+                            at += 2;
+                            if token(&tokens, at)
+                                .map(|value| value.eq_ignore_ascii_case("GRACE"))
+                                .unwrap_or(false)
+                            {
+                                grace_ns =
+                                    Some(parse_duration_ns(token(&tokens, at + 1)?)?);
+                                at += 2;
+                            }
                         }
                         let mut expire_ns = None;
                         if token(&tokens, at)
@@ -6307,16 +6387,18 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                             output_store: Some(token(&tokens, 8)?.to_owned()),
                             quarantine_feed: None,
                             emit_feed,
-                            operation: PipeOperation::Window {
+                            operation: Box::new(PipeOperation::Window {
                                 window_ns,
                                 max_late_ns,
+                                watermark_ns,
+                                grace_ns,
                                 expire_ns,
                                 key_limit,
                                 byte_limit,
                                 key,
                                 aggregation,
                                 time,
-                            },
+                            }),
                         })
                     }
                     other => Err(ControlError::Syntax(format!(
@@ -10281,7 +10363,7 @@ mod tests {
             output_store: None,
             quarantine_feed: None,
             emit_feed: None,
-            operation: PipeOperation::Forward,
+            operation: Box::new(PipeOperation::Forward),
         }];
         let first = leader
             .execute_commands_with_request_id(command.clone(), request_id)
@@ -10319,7 +10401,7 @@ mod tests {
                 output_store: None,
                 quarantine_feed: None,
                 emit_feed: None,
-                operation: PipeOperation::Forward,
+                operation: Box::new(PipeOperation::Forward),
             }])
             .await
             .is_err());
@@ -10341,7 +10423,7 @@ mod tests {
                         output_store: None,
                         quarantine_feed: None,
                         emit_feed: None,
-                        operation: PipeOperation::Forward,
+                        operation: Box::new(PipeOperation::Forward),
                     }])
                     .await
                     .is_err(),
@@ -10423,7 +10505,7 @@ mod tests {
                 output_store: None,
                 quarantine_feed: None,
                 emit_feed: None,
-                operation: PipeOperation::Forward,
+                operation: Box::new(PipeOperation::Forward),
             }])
             .await
             .is_err());
@@ -11671,16 +11753,18 @@ mod tests {
             output_store,
             quarantine_feed: None,
             emit_feed: None,
-            operation: PipeOperation::Window {
+            operation: Box::new(PipeOperation::Window {
                 window_ns,
                 key: IndexFieldSpec::Key,
                 aggregation: WindowAggregation::Count,
                 time: WindowTime::Event,
                 max_late_ns: None,
+                watermark_ns: None,
+                grace_ns: None,
                 expire_ns: None,
                 key_limit: None,
                 byte_limit: None,
-            },
+            }),
         };
         // Missing store, foreign-Domain store, zero window, and a missing
         // output target are all refused.
@@ -11868,6 +11952,52 @@ mod tests {
             );
         }
 
+        // `WATERMARK <dur> [GRACE <dur>]` selects the durable
+        // event-time lateness model — panes close once the committed
+        // horizon `max(event)-watermark` passes their end, and GRACE
+        // bounds how long an emitted pane accepts revising events.
+        leader
+            .execute(
+                "CREATE PIPE accounts.watermarked FROM SUBSCRIPTION accounts.flow                  TO STATESTORE accounts.panes WINDOW 1h EVENT WATERMARK 5m GRACE 30s EXPIRE 2h BY KEY COUNT EMIT TO FEED accounts.results;",
+            )
+            .await
+            .unwrap();
+        let watermarked = leader
+            .active_pipe_by_name("accounts.watermarked")
+            .await
+            .unwrap();
+        assert!(matches!(
+            watermarked.operation,
+            PipeOperation::Window {
+                max_late_ns: None,
+                watermark_ns: Some(300_000_000_000),
+                grace_ns: Some(30_000_000_000),
+                expire_ns: Some(7_200_000_000_000),
+                ..
+            }
+        ));
+        // WATERMARK alone supplies the close proof EMIT TO FEED needs.
+        assert_eq!(watermarked.output_feed_id, Some(results_feed.feed_id));
+
+        for statement in [
+            // MAX_LATE and WATERMARK are alternative lateness models.
+            "CREATE PIPE accounts.wbad1 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h MAX_LATE 5m WATERMARK 5m BY KEY COUNT;",
+            // WATERMARK follows the event clock only.
+            "CREATE PIPE accounts.wbad2 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h INGEST WATERMARK 5m BY KEY COUNT;",
+            // GRACE needs the horizon it bounds, and both need non-zero
+            // durations.
+            "CREATE PIPE accounts.wbad3 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h MAX_LATE 5m GRACE 30s BY KEY COUNT;",
+            "CREATE PIPE accounts.wbad4 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h WATERMARK 0s BY KEY COUNT;",
+            "CREATE PIPE accounts.wbad5 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h WATERMARK 5m GRACE 0s BY KEY COUNT;",
+            // Revision markers must outlive the revision bound.
+            "CREATE PIPE accounts.wbad6 FROM SUBSCRIPTION accounts.flow TO STATESTORE accounts.panes WINDOW 1h WATERMARK 5m GRACE 30s EXPIRE 20s BY KEY COUNT;",
+        ] {
+            assert!(
+                leader.execute(statement).await.is_err(),
+                "{statement} must fail"
+            );
+        }
+
         // EXPIRE declares a pane-row retention bound independent of
         // emission — the store keeps no pane past pane_end + expire.
         leader
@@ -12022,13 +12152,13 @@ mod tests {
             output_store,
             quarantine_feed: None,
             emit_feed: None,
-            operation: PipeOperation::Enrich {
+            operation: Box::new(PipeOperation::Enrich {
                 key: IndexFieldSpec::Key,
                 freshness: EnrichFreshness::Latest,
                 named: None,
                 on_miss: EnrichMiss::Forward,
                 quarantine_feed_id: None,
-            },
+            }),
         };
         leader
             .execute("CREATE FEED accounts.enriched; CREATE FEED accounts.dead;")

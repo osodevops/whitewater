@@ -381,6 +381,7 @@ async fn applied_transition_commits_as_a_second_sequenced_mutation() {
 struct RecordingApply {
     appended: Mutex<Vec<EffectOutput>>,
     frontier_request_log: Mutex<Vec<Uuid>>,
+    frontier_skipped_log: Mutex<Vec<Uuid>>,
     releases: Mutex<Vec<EffectReleaseTarget>>,
     state_mutated: Mutex<Vec<whitewater::effect::EffectStateMutation>>,
     call_log: Mutex<Vec<&'static str>>,
@@ -553,6 +554,15 @@ impl EffectApply for RecordingApply {
         }
         self.frontier_request_log.lock().unwrap().push(request_id);
         Ok(())
+    }
+
+    async fn commit_frontier_skipped(
+        &self,
+        consume: &EffectConsume,
+        request_id: Uuid,
+    ) -> Result<(), EffectJournalError> {
+        self.frontier_skipped_log.lock().unwrap().push(request_id);
+        self.commit_frontier(consume, request_id).await
     }
 
     async fn discard_output(
@@ -879,10 +889,13 @@ async fn apply_committed_converges_when_the_frontier_commit_crashes() {
         applied.transition,
         EffectTransition::Applied { .. }
     ));
-    // Outputs deduped on writer identity: still one logical append.
+    // Outputs deduped on writer identity: still one logical append. The
+    // release phase precedes the frontier commit, so the replayed attempt
+    // releases the Range once more — idempotent bookkeeping, not a second
+    // visibility boundary.
     assert_eq!(sink.appended.lock().unwrap().len(), 1);
     assert_eq!(sink.frontier_request_log.lock().unwrap().len(), 1);
-    assert_eq!(sink.releases.lock().unwrap().len(), 1);
+    assert_eq!(sink.releases.lock().unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -899,8 +912,14 @@ async fn apply_committed_rereleases_a_tail_the_terminal_marker_left_pending() {
     coordinator.apply(mutation.clone()).await.unwrap();
 
     let sink = RecordingApply::default();
-    // The Applied marker commits but the release fails: replay finds the
-    // terminal row, re-runs ensure idempotently, and releases the tail.
+    // The first apply commits Applied with every phase complete. A replayed
+    // drive over the terminal row still re-runs ensure+release idempotently:
+    // a transient release failure defers to retry rather than re-appending
+    // or losing the durable decision.
+    coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
     *sink.fail_releases.lock().unwrap() = 3;
     assert!(matches!(
         coordinator.apply_committed(mutation.effect_id, &sink).await,
@@ -924,12 +943,12 @@ async fn apply_committed_rereleases_a_tail_the_terminal_marker_left_pending() {
         applied.transition,
         EffectTransition::Applied { .. }
     ));
-    // The replay appended nothing new and completed the release; the
-    // frontier committed exactly once across both attempts because the
-    // Applied row no longer carries consume evidence.
+    // The replays appended nothing new and completed the release; the
+    // frontier committed exactly once because the Applied row no longer
+    // carries consume evidence.
     assert_eq!(sink.appended.lock().unwrap().len(), 1);
     assert_eq!(sink.frontier_request_log.lock().unwrap().len(), 1);
-    assert_eq!(sink.releases.lock().unwrap().len(), 4);
+    assert_eq!(sink.releases.lock().unwrap().len(), 5);
 }
 
 fn state_mutation(index: usize) -> whitewater::effect::EffectStateMutation {
@@ -1253,6 +1272,7 @@ async fn apply_committed_aborts_a_permanent_output_failure_and_discards_declared
         declares,
         reason,
         outputs,
+        consume,
     } = &terminal.transition
     else {
         panic!("expected aborted, got {:?}", terminal.transition)
@@ -1260,10 +1280,21 @@ async fn apply_committed_aborts_a_permanent_output_failure_and_discards_declared
     assert_eq!(*declares, mutation.request_id);
     assert!(!reason.is_empty() && reason.len() <= 256);
     // The terminal row restates the declared outputs so replay can
-    // discard any tail the first attempt left pending.
+    // discard any tail the first attempt left pending, and the declared
+    // consume so replay can still pass the abandoned input over the
+    // frontier as skipped.
     assert_eq!(outputs.len(), 2);
+    let EffectTransition::Declare {
+        consume: declared_consume,
+        ..
+    } = &mutation.transition
+    else {
+        panic!("expected declare")
+    };
+    assert_eq!(consume, declared_consume);
     // Both declared outputs' Ranges were told to discard this effect's
-    // tail; the frontier never moved and no state mutation ran.
+    // tail; the abandoned input passed the frontier as skipped and no
+    // state mutation ran.
     let discards = sink.discards.lock().unwrap();
     assert_eq!(discards.len(), 2);
     assert!(discards
@@ -1271,7 +1302,8 @@ async fn apply_committed_aborts_a_permanent_output_failure_and_discards_declared
         .all(|(_, effect, sub)| *effect == mutation.effect_id && *sub == scope()));
     drop(discards);
     assert!(sink.state_mutated.lock().unwrap().is_empty());
-    assert!(sink.frontier_request_log.lock().unwrap().is_empty());
+    assert_eq!(sink.frontier_skipped_log.lock().unwrap().len(), 1);
+    assert_eq!(sink.frontier_request_log.lock().unwrap().len(), 1);
     // The first output did append under the pending marker before the
     // second's permanent refusal.
     assert_eq!(sink.appended.lock().unwrap().len(), 1);
@@ -1330,6 +1362,9 @@ async fn apply_committed_aborts_a_permanent_frontier_failure_after_outputs_appen
 
     let sink = RecordingApply::default();
     *sink.permanent_frontier.lock().unwrap() = true;
+    // The frontier failure aborts the effect; the abandoned consume's skip
+    // CAS then refuses against the moved frontier, which settles as void —
+    // the frontier's new owner, not this dead effect, disposes of the input.
     let terminal = coordinator
         .apply_committed(mutation.effect_id, &sink)
         .await
@@ -1338,9 +1373,23 @@ async fn apply_committed_aborts_a_permanent_frontier_failure_after_outputs_appen
         terminal.transition,
         EffectTransition::Aborted { .. }
     ));
-    // The appended output's tail was discarded and the frontier stayed
-    // uncommitted so the input redelivers to a later effect.
+    // The appended output's tail was discarded; the skip attempted once
+    // and its refusal settled the claim without a frontier commit.
     assert_eq!(sink.discards.lock().unwrap().len(), 1);
+    assert_eq!(sink.frontier_skipped_log.lock().unwrap().len(), 1);
+    assert!(sink.frontier_request_log.lock().unwrap().is_empty());
+
+    // Replays keep the abort settled: the terminal row re-drives discard
+    // and skip idempotently, still without a frontier commit.
+    let replayed = coordinator
+        .apply_committed(mutation.effect_id, &sink)
+        .await
+        .unwrap();
+    assert!(matches!(
+        replayed.transition,
+        EffectTransition::Aborted { .. }
+    ));
+    assert_eq!(sink.frontier_skipped_log.lock().unwrap().len(), 2);
     assert!(sink.frontier_request_log.lock().unwrap().is_empty());
 }
 
@@ -1369,8 +1418,9 @@ async fn apply_committed_aborted_replay_is_idempotent_and_never_reapplies() {
         .unwrap();
     assert_eq!(sink.discards.lock().unwrap().len(), 1);
 
-    // Replaying the terminal row drives the discard again (idempotent
-    // cleanup) but never re-appends outputs or moves the frontier.
+    // Replaying the terminal row drives the discard and the abandoned-
+    // consume skip again (both idempotent cleanup) but never re-appends
+    // outputs.
     sink.permanent_appends.lock().unwrap().clear();
     let replayed = coordinator
         .apply_committed(mutation.effect_id, &sink)
@@ -1381,7 +1431,8 @@ async fn apply_committed_aborted_replay_is_idempotent_and_never_reapplies() {
         EffectTransition::Aborted { .. }
     ));
     assert!(sink.appended.lock().unwrap().is_empty());
-    assert!(sink.frontier_request_log.lock().unwrap().is_empty());
+    assert_eq!(sink.frontier_skipped_log.lock().unwrap().len(), 2);
+    assert_eq!(sink.frontier_request_log.lock().unwrap().len(), 2);
     assert_eq!(sink.discards.lock().unwrap().len(), 2);
 }
 
@@ -1563,6 +1614,7 @@ async fn aborted_rows_obey_the_reason_and_output_bounds() {
             declares: declared.request_id,
             reason,
             outputs: Vec::new(),
+            consume: None,
         },
     };
     for reason in [String::new(), "x".repeat(257)] {

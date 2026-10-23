@@ -1348,6 +1348,101 @@ fn prepared_subscription_progress_remains_invisible_after_replica_restart() {
     assert!(second.local_committed(subscription_id).unwrap().is_none());
 }
 
+#[tokio::test]
+async fn settle_stranded_prepare_commits_a_quorum_chosen_residue() {
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = progress_nodes();
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let subscription_id = Uuid::from_u128(9200);
+    let feed_id = Uuid::from_u128(9201);
+    let assignment = SubscriptionProgressAssignment::try_new(
+        subscription_id,
+        nodes[0].clone(),
+        ReplicaSet::try_new(nodes.clone()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let coordinator = SubscriptionProgressCoordinator::new(assignment, transport.clone());
+    let first = progress_mutation(subscription_id, feed_id, 1, 1);
+    coordinator.apply(first.clone()).await.unwrap();
+    let residue = progress_mutation(subscription_id, feed_id, 1, 2);
+    for node in &nodes {
+        transport.stores[node].prepare(residue.clone()).unwrap();
+    }
+    // The residue is the quorum-chosen decision: a foreign mutation sees the
+    // holders as lagging witnesses and cannot supersede it.
+    let mut foreign = progress_mutation(subscription_id, feed_id, 1, 2);
+    foreign.request_id = Uuid::from_u128(9_299);
+    foreign.cursor = "rf1_foreign".to_owned();
+    assert!(matches!(
+        coordinator.apply(foreign).await,
+        Err(SubscriptionProgressError::Sequence)
+    ));
+    let settled = coordinator.settle_stranded_prepare().await.unwrap();
+    assert_eq!(settled, Some(residue.clone()));
+    for node in &nodes {
+        assert_eq!(
+            transport.stores[node]
+                .local_committed(subscription_id)
+                .unwrap(),
+            Some(residue.clone())
+        );
+    }
+    // The chain tip advanced, so the foreign mutation re-plans at seq 3 and
+    // commits cleanly rather than wedging behind the residue.
+    let next = progress_mutation(subscription_id, feed_id, 1, 3);
+    assert!(coordinator.apply(next.clone()).await.is_ok());
+}
+
+#[tokio::test]
+async fn settle_stranded_prepare_leaves_divergent_residues_for_recovery() {
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let nodes = progress_nodes();
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let subscription_id = Uuid::from_u128(9300);
+    let feed_id = Uuid::from_u128(9301);
+    let assignment = SubscriptionProgressAssignment::try_new(
+        subscription_id,
+        nodes[0].clone(),
+        ReplicaSet::try_new(nodes.clone()).unwrap(),
+        1,
+    )
+    .unwrap();
+    let coordinator = SubscriptionProgressCoordinator::new(assignment, transport.clone());
+    let first = progress_mutation(subscription_id, feed_id, 1, 1);
+    coordinator.apply(first.clone()).await.unwrap();
+    let residue = progress_mutation(subscription_id, feed_id, 1, 2);
+    transport.stores[&nodes[0]]
+        .prepare(residue.clone())
+        .unwrap();
+    transport.stores[&nodes[1]]
+        .prepare(residue.clone())
+        .unwrap();
+    let mut competing = residue.clone();
+    competing.request_id = Uuid::from_u128(9_399);
+    competing.cursor = "rf1_competing".to_owned();
+    transport.stores[&nodes[2]].prepare(competing).unwrap();
+    // A split residue is in-flight contention, not a chosen decision: no
+    // settlement, nothing committed beyond the established tip.
+    assert_eq!(coordinator.settle_stranded_prepare().await.unwrap(), None);
+    for node in &nodes {
+        assert_eq!(
+            transport.stores[node]
+                .local_committed(subscription_id)
+                .unwrap(),
+            Some(first.clone())
+        );
+    }
+}
+
 fn delivery(
     reader_id: Uuid,
     epoch: u64,
@@ -2937,24 +3032,26 @@ async fn epoch_stale_replica_rows_are_lagging_witnesses_for_reads_and_writes() {
     }];
     recovered.reconcile_retry(retry).await.unwrap();
 
-    // The lagging replica was never admitted into the epoch-2 mutations and
-    // remains fenced at epoch 1 until a future adoption heals it.
-    let stale = transport.stores[&lagging]
+    // The lagging replica is not fenced off by its stale row stamp: the
+    // epoch-2 mutation chain ratchets its fence forward on first contact,
+    // so it votes and converges to the quorum's committed decision without
+    // waiting for a separate adoption pass.
+    let healed = transport.stores[&lagging]
         .local_committed(subscription.subscription_id)
         .unwrap()
         .unwrap();
-    assert_eq!(stale.sequence, 2);
-    assert_eq!(stale.ownership_epoch, 1);
+    assert_eq!(healed.sequence, 4);
+    assert_eq!(healed.ownership_epoch, 2);
 }
 
 #[tokio::test]
 async fn synchronize_placement_heals_replicas_stranded_behind_a_committed_move() {
     // Live-fault regression: a placement CAS commits before adoption runs.
     // When adoption misses replicas their rows stay stamped at the prior
-    // epoch and every committed read fences them as stale, so quorum never
-    // forms and member operations wedge permanently. Re-adopting the
-    // recovered frontier at the live epoch must heal without committing
-    // another ownership move.
+    // epoch, so new mutations fence them and the replicas never self-heal.
+    // The already-committed decision remains readable (its stamped epoch is
+    // history, not a contradiction), and re-adopting the recovered frontier
+    // at the live epoch must heal without committing another ownership move.
     let directory = TempDir::new().unwrap();
     let nodes = progress_nodes();
     let controller = progress_controller(&directory, &nodes);
@@ -2997,10 +3094,11 @@ async fn synchronize_placement_heals_replicas_stranded_behind_a_committed_move()
         .unwrap();
     assert_eq!(moved.ownership_epoch, 2);
     let stranded = SubscriptionProgressCoordinator::new(moved.clone(), transport.clone());
-    assert!(matches!(
-        stranded.read_committed().await,
-        Err(SubscriptionProgressError::NoQuorum)
-    ));
+    // The committed decision committed while epoch 1 was authoritative, so
+    // it stays readable under epoch 2; only new writes are fenced.
+    let lagging = stranded.read_committed().await.unwrap().unwrap();
+    assert_eq!(lagging.sequence, 1);
+    assert_eq!(lagging.ownership_epoch, 1);
 
     transport.adopt_down.lock().unwrap().clear();
     let outcome = stranded.synchronize_placement().await.unwrap();

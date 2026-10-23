@@ -208,13 +208,41 @@ def get_by(node, store, named_key, values=None, lower=None):
 
 def pane_rows(node, store):
     """Every real (non-sentinel) pane row: the named `pane` posting of any
-    pane index >= 0."""
-    return get_by(
-        node,
-        store,
-        "pane",
-        lower={"value": {"kind": "i64", "value": 0}, "inclusive": True},
-    )
+    pane index >= 0. Emitted-marker rows post their pane index too but are
+    distinguishable by the impossible 0xFFFFFFFF length prefix."""
+    return [
+        row
+        for row in get_by(
+            node,
+            store,
+            "pane",
+            lower={"value": {"kind": "i64", "value": 0}, "inclusive": True},
+        )
+        if base64.b64decode(row["key_base64"])[:4] != bytes([255, 255, 255, 255])
+    ]
+
+
+def marker_rows(node, store):
+    """Emitted-marker rows only: 0xFFFFFFFF prefix + tagged group + pane."""
+    return [
+        row
+        for row in get_by(
+            node,
+            store,
+            "pane",
+            lower={"value": {"kind": "i64", "value": 0}, "inclusive": True},
+        )
+        if base64.b64decode(row["key_base64"])[:4] == bytes([255, 255, 255, 255])
+    ]
+
+
+def parse_marker_key(key_base64):
+    """Inverse of `window_emitted_marker_key`: (tagged group, u64 pane)."""
+    raw = base64.b64decode(key_base64)
+    if raw[:4] != bytes([255, 255, 255, 255]) or len(raw) < 13:
+        raise AssertionError(f"not an emitted-marker row key: {key_base64}")
+    pane = struct.unpack(">Q", raw[-8:])[0]
+    return raw[4:-8], pane
 
 
 def pipe_demand():
@@ -293,11 +321,19 @@ def decode_group(group_tagged):
 
 def decode_accumulator(payload_base64):
     raw = base64.b64decode(payload_base64)
-    if len(raw) != 24:
-        raise AssertionError(f"accumulator payload is not 24 bytes: {len(raw)}")
-    count = struct.unpack("<Q", raw[:8])[0]
-    sum_value = int.from_bytes(raw[8:], "little", signed=True)
-    return count, sum_value
+    # v2: 0xAC tag + version byte + count + sum (26 bytes); v1 rows
+    # committed before the version bump still decode (24 bytes).
+    if len(raw) == 26:
+        if raw[0] != 0xAC or raw[1] != 2:
+            raise AssertionError(f"bad v2 accumulator tag/version: {raw[:2]!r}")
+        count = struct.unpack("<Q", raw[2:10])[0]
+        sum_value = int.from_bytes(raw[10:], "little", signed=True)
+        return count, sum_value
+    if len(raw) == 24:
+        count = struct.unpack("<Q", raw[:8])[0]
+        sum_value = int.from_bytes(raw[8:], "little", signed=True)
+        return count, sum_value
+    raise AssertionError(f"accumulator payload is not 24/26 bytes: {len(raw)}")
 
 
 def drive_probe_once(node, pipe_id, subscription_id, storage_node, epoch):
@@ -456,14 +492,15 @@ def main():
             f"CREATE PIPE {capped_pipe} FROM SUBSCRIPTION {subscription_c} "
             f"TO STATESTORE {capped_store} WINDOW 8s EVENT MAX_LATE 20s "
             f"LIMIT KEYS 1 BY JSON 'customer' COUNT; "
-            # Byte-capped pipe: LIMIT BYTES 130 admits three pane rows
-            # (41-43 accounted bytes each) then refuses every further new
-            # (group, pane) row into the shared __bytecap__ sentinel.
+            # Byte-capped pipe: LIMIT BYTES 131 admits three pane rows
+            # (43-45 accounted bytes each under the v2 accumulator) then
+            # refuses every further new (group, pane) row into the shared
+            # __bytecap__ sentinel.
             f"DEFINE STATESTORE {byte_store} KEYS key, pane; "
             f"CREATE SUBSCRIPTION {subscription_d} FROM {source} START AT BEGINNING; "
             f"CREATE PIPE {byte_pipe} FROM SUBSCRIPTION {subscription_d} "
             f"TO STATESTORE {byte_store} WINDOW 8s EVENT MAX_LATE 20s "
-            f"LIMIT BYTES 130 BY JSON 'customer' COUNT;",
+            f"LIMIT BYTES 131 BY JSON 'customer' COUNT;",
         )
         writer_epoch = results[6]["session_epoch"]
         described = wcl(NODES[1], f"DESCRIBE PIPE {totals_pipe};")[0]
@@ -753,17 +790,24 @@ def main():
         # same source) delete at pane_end + EXPIRE on idle drives â€” the
         # sentinel and the overflow pane are kept as designed.
         expiry_deadline = (pdone + 1) * PANE_NS + 40_000_000_000 + 30_000_000_000
-        while time.time_ns() < expiry_deadline:
+        # A pane row that materialized late — its record consumed only after
+        # restart convergence — lands already past its expiry boundary and
+        # deletes on the next drive; anchor the tail to the last observed
+        # row change rather than failing mid-settle on a recovered leg.
+        last_sig, last_change = None, time.time_ns()
+        while True:
             rows = pane_rows(NODES[2], retired_store)
             if len(rows) == 1:
                 group_tagged, _ = parse_row_key(rows[0]["key_base64"])
                 if decode_group(group_tagged) == "edge":
                     break
+            sig = sorted(row["key_base64"] for row in rows)
+            if sig != last_sig:
+                last_sig, last_change = sig, time.time_ns()
+            now = time.time_ns()
+            if now > expiry_deadline and now > last_change + 60_000_000_000:
+                raise AssertionError({"expired rows never deleted": rows})
             time.sleep(1)
-        else:
-            raise AssertionError(
-                {"expired rows never deleted": pane_rows(NODES[2], retired_store)}
-            )
         if len(sentinel_rows(NODES[0], retired_store)) != 1:
             raise AssertionError("sentinel row expired or duplicated")
 
@@ -803,13 +847,13 @@ def main():
 
         # LIMIT BYTES: the byte-capped Pipe admits the first three pane
         # rows it encounters â€” (acme,P0), (globex,P0), (acme,P0+1) at
-        # 41+43+41=125 accounted bytes â€” then every later new (group,
+        # 43+45+43=131 accounted bytes â€” then every later new (group,
         # pane) row refuses into the one shared `__bytecap__` sentinel:
         # globex P0+2, acme P0+3, lateco's late row, acme pfresh, edge's
         # overflow pane, and the post-move/restart records â€” 7 refused
         # records total. Merges into admitted rows never grow the budget.
         byte_sentinels, byte_panes = [], None
-        deadline = time.time() + 120
+        deadline = time.time() + 300
         while time.time() < deadline:
             byte_sentinels = sentinel_rows(NODES[0], byte_store)
             byte_panes = pane_rows(NODES[0], byte_store)
@@ -826,6 +870,10 @@ def main():
                 {
                     "byte-capped pane rows": byte_panes,
                     "byte-capped sentinels": byte_sentinels,
+                    "sub_d progress": [
+                        admin_progress(node, subscription_d) for node in NODES
+                    ],
+                    "source tail": read(NODES[2], source)[-3:],
                 }
             )
         byte_groups = sorted(
@@ -839,6 +887,106 @@ def main():
         )
         if bytecap_pane != 2**64 - 1 or decode_group(bytecap_tagged) != "__bytecap__":
             raise AssertionError({"bytecap sentinel": byte_sentinels[0]})
+
+        # WATERMARK/GRACE leg — a separate source Feed so the `edge`
+        # record's i64::MAX event time can never poison the horizon.
+        # Pure event-time scheduling: the durable horizon is
+        # max(event) - 4s and grace is 6s, so pane closes, revisions and
+        # quarantines are all deterministic regardless of wall timing.
+        source_w, wm_results = f"{domain}.wmsource", f"{domain}.wmresults"
+        wm_store, wm_pipe = f"{domain}.wmpanes", f"{domain}.wm"
+        subscription_w = f"{domain}.wmsub"
+        writer_w = f"writerw{suffix}"
+        wm_declare = wcl_retry(
+            NODES[0],
+            f"CREATE FEED {source_w}; "
+            f"CREATE FEED {wm_results}; "
+            f"DEFINE STATESTORE {wm_store} KEYS key, pane; "
+            f"CREATE WRITER {writer_w} TO {source_w}; "
+            f"OPEN WRITER SESSION {writer_w}; "
+            f"CREATE SUBSCRIPTION {subscription_w} FROM {source_w} "
+            f"START AT BEGINNING; "
+            f"CREATE PIPE {wm_pipe} FROM SUBSCRIPTION {subscription_w} "
+            f"TO STATESTORE {wm_store} WINDOW 8s EVENT WATERMARK 4s "
+            f"GRACE 6s BY JSON 'customer' SUM JSON 'amount' "
+            f"EMIT TO FEED {wm_results};",
+        )
+        writer_w_epoch = wm_declare[4]["session_epoch"]
+
+        # Pane QA holds event ev_a; a second event 10s later commits
+        # horizon ev_a + 6s. pane_end(QA) = ev_a + 0.4s closes; its grace
+        # edge ev_a + 6.4s still exceeds the horizon, so a record landing
+        # in QA revises. An event in QA-1 ends at ev_a - 0.1s — its grace
+        # edge ev_a + 5.9s is behind the horizon, so it quarantines.
+        qa = pane_of(time.time_ns() + 40_000_000_000)
+        ev_a = qa * PANE_NS + 100_000_000
+        ev_b = ev_a + 10_000_000_000
+        ev_q = ev_a - 500_000_000
+        append_json(
+            NODES[1],
+            writer_w,
+            writer_w_epoch,
+            [("wacme", 10, ev_a), ("wacme", 20, ev_b)],
+        )
+        first = emissions(wait_records(wm_results, 1, deadline=240))
+        assert_subset(first, {("wacme", qa): (1, 10)})
+
+        append_json(
+            NODES[2],
+            writer_w,
+            writer_w_epoch,
+            [("wacme", 5, ev_a), ("wacme", 7, ev_q)],
+        )
+        revised = wait_records(wm_results, 2, deadline=240)
+        bodies = [
+            json.loads(unb64(record["payload_base64"])) for record in revised
+        ]
+        revisions = {
+            (body["group"], body["pane"], body["revision"]) for body in bodies
+        }
+        if revisions != {("wacme", qa, "1"), ("wacme", qa, "2")}:
+            raise AssertionError({"wm emissions": bodies})
+        rev2 = next(body for body in bodies if body["revision"] == "2")
+        if (rev2["count"], rev2["sum"]) != (1, "5"):
+            raise AssertionError({"revision 2 result": rev2})
+
+        # The durable watermark row commits the horizon inside the same
+        # effect as the pane writes; the emitted marker proves two
+        # publishes on (wacme, QA); the beyond-grace event counts in the
+        # shared sentinel rather than revising.
+        deadline = time.time() + 240
+        wm_row, markers, sentinels = [], [], []
+        while time.time() < deadline:
+            wm_row = get_by(
+                NODES[0], wm_store, "pane",
+                values=[{"kind": "i64", "value": -3}],
+            )
+            markers = marker_rows(NODES[0], wm_store)
+            sentinels = sentinel_rows(NODES[0], wm_store)
+            if len(wm_row) == 1 and len(markers) == 1 and len(sentinels) == 1:
+                break
+            time.sleep(0.5)
+        if len(wm_row) != 1:
+            raise AssertionError({"watermark rows": wm_row})
+        if decode_accumulator(wm_row[0]["payload_base64"]) != (
+            0,
+            ev_b - 4_000_000_000,
+        ):
+            raise AssertionError({"watermark accumulator": wm_row[0]})
+        if len(markers) != 1:
+            raise AssertionError({"emitted markers": markers})
+        marker_group, marker_pane = parse_marker_key(markers[0]["key_base64"])
+        if decode_group(marker_group) != "wacme" or marker_pane != qa:
+            raise AssertionError({"emitted marker": markers[0]})
+        if decode_accumulator(markers[0]["payload_base64"]) != (2, 0):
+            raise AssertionError({"marker accumulator": markers[0]})
+        if len(sentinels) != 1:
+            raise AssertionError({"wm sentinel rows": sentinels})
+        sent_group, sent_pane = parse_row_key(sentinels[0]["key_base64"])
+        if sent_pane != 2**64 - 1 or decode_group(sent_group) != "wacme":
+            raise AssertionError({"wm sentinel": sentinels[0]})
+        if decode_accumulator(sentinels[0]["payload_base64"]) != (1, 0):
+            raise AssertionError({"wm sentinel accumulator": sentinels[0]})
 
         # Post-restart attribution: the recovered compute-lease owner
         # records fresh drives for the same Pipes â€” the restarted Node's

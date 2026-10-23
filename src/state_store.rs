@@ -605,8 +605,22 @@ fn idempotency_key(store_id: Uuid, mutation_id: Uuid) -> [u8; 32] {
     key
 }
 
+/// The committed-significant digest of one mutation: request_id and
+/// issued_at_ns are per-attempt evidence — the same mutation re-prepared
+/// after an ambiguous apply legitimately carries fresh values, and
+/// replicas may durably hold either variant — so neither rides the
+/// digest replicas must agree on. `ownership_epoch` fences the write but
+/// is not the decision: an identical mutation_id+op replayed under a moved
+/// epoch is the same mutation, so the stamp stays out of the digest the
+/// same way the other per-attempt fields do.
 fn mutation_digest(mutation: &StateStoreMutation) -> Result<[u8; 32], StateStoreMutationError> {
-    let bytes = serde_json::to_vec(mutation)?;
+    let bytes = serde_json::to_vec(&(
+        mutation.store_id,
+        mutation.mutation_id,
+        mutation.sequence,
+        &mutation.op,
+        &mutation.source,
+    ))?;
     Ok(*blake3::hash(&bytes).as_bytes())
 }
 
@@ -882,7 +896,7 @@ impl FjallStateStoreMutationJournal {
             )? {
                 Some(existing) => {
                     let existing: StateStoreMutation = serde_json::from_slice(&existing)?;
-                    if existing == *mutation {
+                    if mutation_digest(&existing)? == mutation_digest(mutation)? {
                         tx.commit()?;
                         return Ok(false);
                     }
@@ -982,7 +996,13 @@ impl FjallStateStoreMutationJournal {
         if head.store_id != mutation.store_id {
             return Err(StateStoreMutationError::Conflict);
         }
-        if head.ownership_epoch != mutation.ownership_epoch {
+        // Fencing is directional: the placement check upstream already
+        // proved the request epoch is the authoritative assignment, so a
+        // head fenced behind it ratchets forward on install below rather
+        // than wedging the mutation chain while adoption catches up. A
+        // mutation stamped under an older epoch than the head dies here
+        // as a stale write.
+        if head.ownership_epoch > mutation.ownership_epoch {
             return Err(StateStoreMutationError::StaleEpoch);
         }
 
@@ -1006,7 +1026,6 @@ impl FjallStateStoreMutationJournal {
             // mutation when the committed-significant fields match. Reused
             // identity carrying different content is a true conflict.
             let same = committed.store_id == mutation.store_id
-                && committed.ownership_epoch == mutation.ownership_epoch
                 && committed.op == mutation.op
                 && (mutation.sequence == 0 || mutation.sequence == committed.sequence);
             return if same {
@@ -1044,9 +1063,11 @@ impl FjallStateStoreMutationJournal {
                 // Same client identity retried with a fresh request_id: the
                 // prepared entry re-votes when every committed-significant
                 // field matches, and conflicts when the identity was reused
-                // for different content.
+                // for different content. A retry arriving unallocated
+                // (sequence 0) was normalized to this replica's chain tip
+                // above — the residue's own sequence, since a prepared
+                // entry only ever extends committed_seq by one.
                 let same = prepared.store_id == mutation.store_id
-                    && prepared.ownership_epoch == mutation.ownership_epoch
                     && prepared.sequence == mutation.sequence
                     && prepared.op == mutation.op;
                 return if same {
@@ -1075,6 +1096,7 @@ impl FjallStateStoreMutationJournal {
             digest: mutation_digest(&mutation)?,
             mutation: mutation.clone(),
         };
+        head.ownership_epoch = mutation.ownership_epoch;
         head.prepared = Some(mutation);
         let encoded = serde_json::to_vec(&head)?;
         if encoded.len() > STATE_STORE_MAX_MUTATION_BYTES {
@@ -1104,7 +1126,9 @@ impl FjallStateStoreMutationJournal {
             .map(|bytes| serde_json::from_slice::<StateStoreJournalHead>(&bytes))
             .transpose()?
             .ok_or(StateStoreMutationError::NotFound)?;
-        if head.ownership_epoch != ownership_epoch {
+        // Same directional fence as prepare: a commit arriving under a
+        // newer epoch ratchets the head forward with the flip below.
+        if head.ownership_epoch > ownership_epoch {
             return Err(StateStoreMutationError::StaleEpoch);
         }
         if evidence.store_id != store_id {
@@ -1133,6 +1157,7 @@ impl FjallStateStoreMutationJournal {
                     );
                     head.committed_seq = mutation.sequence;
                     head.committed_mutation_id = Some(mutation.mutation_id);
+                    head.ownership_epoch = ownership_epoch;
                     head.prepared = None;
                     tx.insert(&self.head, store_id.as_bytes(), serde_json::to_vec(&head)?);
                     tx.commit()?;
@@ -1529,7 +1554,9 @@ impl StateStoreMutationCoordinator {
                     votes += 1;
                     if let Some(candidate) = reply.result {
                         match &observed {
-                            Some(current) if *current != candidate => {
+                            Some(current)
+                                if mutation_digest(current)? != mutation_digest(&candidate)? =>
+                            {
                                 match candidate.sequence.cmp(&current.sequence) {
                                     std::cmp::Ordering::Greater => observed = Some(candidate),
                                     std::cmp::Ordering::Equal => {
@@ -1664,7 +1691,7 @@ impl StateStoreMutationCoordinator {
                     if !self.assignment.replicas.contains(&reply.replica)
                         || reply.store_id != mutation.store_id
                         || reply.ownership_epoch != self.assignment.ownership_epoch
-                        || reply.result.mutation != mutation =>
+                        || reply.result.digest != mutation_digest(&mutation)? =>
                 {
                     return Err(StateStoreMutationError::InvalidAssignment)
                 }
@@ -1723,7 +1750,9 @@ impl StateStoreMutationCoordinator {
                 {
                     return Err(StateStoreMutationError::InvalidAssignment)
                 }
-                Ok(reply) if reply.result == mutation => committed.push(reply.replica),
+                Ok(reply) if mutation_digest(&reply.result)? == mutation_digest(&mutation)? => {
+                    committed.push(reply.replica)
+                }
                 Ok(_) => return Err(StateStoreMutationError::Conflict),
                 Err(error) if lagging_witness(&error) => {}
                 Err(StateStoreMutationError::Conflict) => {
@@ -1838,7 +1867,6 @@ impl HttpStateStoreMutationTransport {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.bytes().await.unwrap_or_default();
-            tracing::warn!(node = %node, path, %status, "StateStore journal replica refused");
             let code = body
                 .get(..4096)
                 .and_then(|head| serde_json::from_slice::<serde_json::Value>(head).ok())
@@ -1848,6 +1876,13 @@ impl HttpStateStoreMutationTransport {
                         .and_then(|code| code.as_str())
                         .map(str::to_owned)
                 });
+            tracing::warn!(
+                node = %node,
+                path,
+                %status,
+                code = code.as_deref().unwrap_or(""),
+                "StateStore journal replica refused"
+            );
             if let Some(error) = code.as_deref().and_then(StateStoreMutationError::from_code) {
                 return Err(error);
             }
@@ -2948,6 +2983,32 @@ mod tests {
     }
 
     #[test]
+    fn prepared_residue_re_votes_an_unallocated_retry() {
+        let directory = TempDir::new().unwrap();
+        let journal = FjallStateStoreMutationJournal::open(directory.path()).unwrap();
+        let store_id = Uuid::new_v4();
+        let prepared = mutation(store_id, 0, "row");
+        let vote = journal.prepare(prepared.clone()).unwrap();
+        assert_eq!(vote.mutation.sequence, 1);
+        // The same identity retried before any commit — fresh request_id
+        // and issued_at_ns, still unallocated — re-votes the prepared
+        // residue instead of conflicting: the retry's chain-tip allocation
+        // matches the residue's own sequence.
+        let mut retry = prepared;
+        retry.request_id = Uuid::new_v4();
+        retry.issued_at_ns = 999;
+        let revote = journal.prepare(retry).unwrap();
+        assert_eq!(revote.mutation.sequence, 1);
+        assert_eq!(revote.mutation.request_id, vote.mutation.request_id);
+        // A retry of a different identity while the residue is pending is
+        // a lagging-witness sequence gap, not a conflict.
+        assert!(matches!(
+            journal.prepare(mutation(store_id, 0, "other")),
+            Err(StateStoreMutationError::Sequence)
+        ));
+    }
+
+    #[test]
     fn committed_mutation_dedupes_retry_with_fresh_request_envelope() {
         // A client retry after an ambiguous commit reuses only the
         // mutation_id: the server mints a new request_id and the incoming
@@ -3842,6 +3903,37 @@ mod tests {
                 .sequence,
             1
         );
+    }
+
+    #[test]
+    fn install_committed_accepts_attempt_evidence_variants() {
+        // Two replicas may durably hold the same committed mutation with
+        // different request_id/issued_at_ns — per-attempt evidence is not
+        // committed-significant. A catch-up entry differing only there
+        // dedupes instead of forking the journal.
+        let directory = TempDir::new().unwrap();
+        let journal = FjallStateStoreMutationJournal::open(directory.path()).unwrap();
+        let store_id = Uuid::new_v4();
+        let mut first = mutation(store_id, 1, "a");
+        first.ownership_epoch = 7;
+        assert!(journal.install_committed(&first).unwrap());
+
+        let mut variant = first.clone();
+        variant.request_id = Uuid::new_v4();
+        variant.issued_at_ns += 1;
+        assert_eq!(
+            mutation_digest(&variant).unwrap(),
+            mutation_digest(&first).unwrap()
+        );
+        assert!(!journal.install_committed(&variant).unwrap());
+
+        // A genuinely different op under the same identity still conflicts.
+        let mut conflicting = first.clone();
+        conflicting.op = StateStoreMutationOp::DeleteRow { key: b"a".to_vec() };
+        assert!(matches!(
+            journal.install_committed(&conflicting),
+            Err(StateStoreMutationError::Conflict)
+        ));
     }
 
     #[test]

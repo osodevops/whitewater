@@ -104,6 +104,13 @@ pub struct FetchedPage {
     /// The pane-row scan hit its row bound — the fold refuses every new
     /// (group, pane) row rather than guessing remaining byte capacity.
     pub pane_rows_saturated: bool,
+    /// WATERMARK Pipes only: `(horizon before this drive, horizon after)`
+    /// — the durable event-time watermark the fetch-time scan committed
+    /// to from `max(event_time) - watermark`. The fold carries the delta
+    /// into the `__watermark__` row inside the same effect and closes
+    /// panes the horizon passed, so a replay writes the identical
+    /// horizon and resolves the identical close set.
+    pub watermark: Option<(u64, u64)>,
 }
 
 /// One closed window pane resolved for emission: the StateStore pane row
@@ -128,6 +135,11 @@ pub struct WindowEmission {
     /// the emitted payload so an operator can answer "which store
     /// version produced this window result".
     pub store_seq: u64,
+    /// Which emission this is for `(group, pane)`: 1 for the first
+    /// publish, marker_count+1 when the pane re-emits a late-event
+    /// revision. The scanner stamps it from the `emitted` marker row, so
+    /// a replayed scan reports the identical revision.
+    pub revision: u64,
 }
 
 /// Deterministic identity for the effect one Pipe cycle declares over a
@@ -173,49 +185,13 @@ pub fn pipe_output_writer_session(pipe_id: Uuid, message_id: Uuid) -> Uuid {
 /// The writer identity for one emitted pane: keyed by the pane row so a
 /// retried append dedupes on the emission's own identity rather than
 /// sharing the effect's session.
-pub fn pipe_emission_writer_session(pipe_id: Uuid, pane_row_key: &[u8]) -> Uuid {
+pub fn pipe_emission_writer_session(pipe_id: Uuid, pane_row_key: &[u8], revision: u64) -> Uuid {
     derived_uuid(
         b"pipe-emission",
-        &[pipe_id.as_bytes().as_slice(), pane_row_key],
-    )
-}
-
-/// The Declare effect identity for an emission-only cycle: an idle
-/// input still shares the frontier's cursor, so the closed-pane set
-/// itself distinguishes this effect from any other over the same
-/// frontier. Identical scans replay identically; a partially drained
-/// set produces a different effect and the Aborted/Applied journals
-/// arbitrate races.
-pub fn pipe_emission_effect_id(
-    pipe_id: Uuid,
-    subscription_id: Uuid,
-    consumed_feed: Uuid,
-    expected_cursor: &str,
-    emissions: &[WindowEmission],
-    expired: &[Vec<u8>],
-) -> Uuid {
-    let mut material = Vec::new();
-    let mut keys: Vec<&[u8]> = emissions
-        .iter()
-        .map(|emission| emission.row_key.as_slice())
-        .collect();
-    // The digest covers the whole delete set — emitted and expired rows
-    // alike — so a differently drained cycle can never alias this one.
-    keys.extend(expired.iter().map(|key| key.as_slice()));
-    keys.sort_unstable();
-    for key in keys {
-        material.extend_from_slice(&(key.len() as u64).to_le_bytes());
-        material.extend_from_slice(key);
-    }
-    let digest = blake3::hash(&material);
-    derived_uuid(
-        b"pipe-emission-effect",
         &[
             pipe_id.as_bytes().as_slice(),
-            subscription_id.as_bytes().as_slice(),
-            consumed_feed.as_bytes().as_slice(),
-            expected_cursor.as_bytes(),
-            digest.as_bytes().as_slice(),
+            pane_row_key,
+            &revision.to_be_bytes(),
         ],
     )
 }
@@ -497,6 +473,8 @@ impl PipeDriver {
                 aggregation,
                 time,
                 max_late_ns,
+                watermark_ns,
+                grace_ns,
                 expire_ns: _,
                 key_limit: _,
                 byte_limit,
@@ -573,11 +551,30 @@ impl PipeDriver {
                         keycap = keycap.saturating_add(1);
                         continue;
                     }
+                    let instant = match time {
+                        WindowTime::Event => record.event_time_ns,
+                        WindowTime::Ingest => record.ingest_time_ns,
+                    };
+                    let pane = u64::try_from(instant.max(0)).unwrap_or(0) / pane_ns;
                     let lateness = record.ingest_time_ns.saturating_sub(record.event_time_ns);
-                    if matches!(time, WindowTime::Event)
+                    // WATERMARK mode: the pane is closed once its end
+                    // reaches the durable horizon; an event landing there
+                    // revises while `horizon <= pane_end + grace` and
+                    // quarantines past the bound (grace absent = zero —
+                    // only a horizon exactly at the edge still revises).
+                    let beyond_watermark_grace = watermark_ns
+                        .zip(page.watermark)
+                        .map(|(_, (_, horizon))| {
+                            let pane_end = pane.saturating_add(1).saturating_mul(pane_ns);
+                            pane_end <= horizon
+                                && horizon > pane_end.saturating_add(grace_ns.unwrap_or(0))
+                        })
+                        .unwrap_or(false);
+                    if (matches!(time, WindowTime::Event)
                         && max_late_ns
                             .map(|bound| lateness > bound as i64)
-                            .unwrap_or(false)
+                            .unwrap_or(false))
+                        || beyond_watermark_grace
                     {
                         if !admit_pane(&(group.0.clone(), WINDOW_LATE_PANE)) {
                             bytecap = bytecap.saturating_add(1);
@@ -603,11 +600,6 @@ impl PipeDriver {
                             }
                         }
                     };
-                    let instant = match time {
-                        WindowTime::Event => record.event_time_ns,
-                        WindowTime::Ingest => record.ingest_time_ns,
-                    };
-                    let pane = u64::try_from(instant.max(0)).unwrap_or(0) / pane_ns;
                     if !admit_pane(&(group.0.clone(), pane)) {
                         bytecap = bytecap.saturating_add(1);
                         continue;
@@ -626,6 +618,10 @@ impl PipeDriver {
                     && bytecap == 0
                     && page.emissions.is_empty()
                     && page.expired.is_empty()
+                    && !page
+                        .watermark
+                        .map(|(before, after)| after > before)
+                        .unwrap_or(false)
                 {
                     return Ok((Vec::new(), Vec::new()));
                 }
@@ -724,15 +720,11 @@ impl PipeDriver {
                 }));
                 let mut outputs = Vec::new();
                 let mut mutations = Vec::new();
-                if !entries.is_empty() {
-                    mutations.push((store_id, StateStoreMutationOp::AccumulateRows { entries }));
-                }
                 // Emissions without a declared emit Feed fail closed —
                 // silently dropping closed panes would wedge the store.
                 if !page.emissions.is_empty() && self.pipe.output_feed_id.is_none() {
                     return Err(EffectJournalError::Conflict);
                 }
-                let mut emission_deletes = 0usize;
                 if let Some(feed_id) = self.pipe.output_feed_id {
                     // Row-key order is byte-identical across replays —
                     // mutation and writer identities depend on it.
@@ -762,6 +754,7 @@ impl PipeDriver {
                             writer_session_id: pipe_emission_writer_session(
                                 self.pipe.pipe_id,
                                 &emission.row_key,
+                                emission.revision.max(1),
                             ),
                             writer_epoch: 1,
                             sequence: 1,
@@ -772,13 +765,49 @@ impl PipeDriver {
                                 key: emission.row_key.clone(),
                             },
                         ));
-                        emission_deletes += 1;
+                        // The `emitted` marker survives the accumulator
+                        // delete — it is the durable proof this pane
+                        // published, and the next emission's revision.
+                        entries.push(AccumulateRowEntry {
+                            key: window_emitted_marker_key(&emission.group_tagged, emission.pane),
+                            count_delta: 1,
+                            sum_delta: 0,
+                            named: vec![NamedKeyValue {
+                                name: WINDOW_PANE_NAME.to_owned(),
+                                values: vec![IndexValue::I64(emission.pane as i64)],
+                                unique: false,
+                            }],
+                        });
                     }
+                }
+                // The durable watermark horizon rides inside the same
+                // effect: a replay writes the identical delta rather than
+                // re-deriving it from live input.
+                if let Some((before, after)) = page.watermark {
+                    if after > before {
+                        entries.push(AccumulateRowEntry {
+                            key: window_watermark_row_key(),
+                            count_delta: 0,
+                            sum_delta: after.saturating_sub(before) as i64,
+                            named: vec![NamedKeyValue {
+                                name: WINDOW_PANE_NAME.to_owned(),
+                                values: vec![IndexValue::I64(WINDOW_WATERMARK_PANE_POSTING)],
+                                unique: false,
+                            }],
+                        });
+                    }
+                }
+                if !entries.is_empty() {
+                    mutations.insert(
+                        0,
+                        (store_id, StateStoreMutationOp::AccumulateRows { entries }),
+                    );
                 }
                 // Expired pane rows fill whatever delete budget the
                 // emissions left — row-key order keeps replay identities
                 // deterministic, and rows left over wait for a later
                 // drive rather than escaping the mutation bound.
+                let emission_deletes = page.emissions.len().min(WINDOW_MAX_EMISSIONS_PER_DRIVE);
                 let mut expired = page.expired.clone();
                 expired.sort();
                 for row_key in expired
@@ -892,39 +921,30 @@ impl PipeDriver {
         }
     }
 
-    /// The Declare identity one cycle chooses for a fetched page. An
-    /// emission-only cycle keys on the closed-pane set; a consumed page
-    /// folds the serialized plan — every output and store op — into the
+    /// The Declare identity one cycle chooses for a fetched page. The
+    /// serialized plan — every output and store op — folds into the
     /// identity so a legitimately diverged replan becomes a new effect
     /// rather than a same-request conflict against abandoned residue.
+    /// Emission-only cycles ride the same rule: their outputs carry
+    /// replica-stamped `store_seq` evidence and watermark deltas, so a
+    /// closed-set digest alone would let two divergent replans collide.
     fn effect_identity(
         &self,
         subscription_id: Uuid,
         consumed_feed: Uuid,
         expected_cursor: &str,
-        page: &FetchedPage,
+        _page: &FetchedPage,
         outputs: &[EffectOutput],
         mutation_ops: &[PlannedStateMutation],
     ) -> Result<Uuid, EffectJournalError> {
-        if page.records.is_empty() {
-            Ok(pipe_emission_effect_id(
-                self.pipe.pipe_id,
-                subscription_id,
-                consumed_feed,
-                expected_cursor,
-                &page.emissions,
-                &page.expired,
-            ))
-        } else {
-            let plan = serde_json::to_vec(&(outputs, mutation_ops))?;
-            Ok(pipe_effect_id(
-                self.pipe.pipe_id,
-                subscription_id,
-                consumed_feed,
-                expected_cursor,
-                &plan,
-            ))
-        }
+        let plan = serde_json::to_vec(&(outputs, mutation_ops))?;
+        Ok(pipe_effect_id(
+            self.pipe.pipe_id,
+            subscription_id,
+            consumed_feed,
+            expected_cursor,
+            &plan,
+        ))
     }
 
     /// The Declare identity this driver would choose for a fetched page —
@@ -956,9 +976,60 @@ pub const WINDOW_PANE_COUNT: u64 = 16;
 pub const WINDOW_KEY_NAME: &str = "key";
 pub const WINDOW_PANE_NAME: &str = "pane";
 /// Sentinel pane index for quarantined late events: sorts after every
-/// real pane so row scans find it last, and it can never collide with a
-/// genuine pane (only 16 exist).
+/// real pane — one bounded row per group, never emission-eligible.
 pub const WINDOW_LATE_PANE: u64 = u64::MAX;
+
+/// Row-key length prefix that can never belong to a pane row (real group
+/// lengths are bounded far below `u32::MAX`) marking an `emitted` marker
+/// row. A marker row counts how many times its `(group, pane)` has
+/// published — it survives accumulator deletion so a late event's
+/// re-emit publishes `revision = count + 1` instead of silently deduping
+/// onto the first emission's writer session.
+pub const WINDOW_EMITTED_LEN_PREFIX: u32 = u32::MAX;
+
+/// Row-key length prefix marking the Pipe's durable event-time watermark
+/// row — one row per Pipe store, holding the monotone horizon in its
+/// accumulator sum.
+pub const WINDOW_WATERMARK_LEN_PREFIX: u32 = u32::MAX - 1;
+
+/// The `pane` posting value the watermark row carries for the close
+/// scan — one bounded row, always below any pane bound. Emitted-marker
+/// rows post their own pane index instead: a marker is only ever read
+/// when its pane's row is in close/expiry range, and a constant
+/// below-bound posting would sort ahead of every pane row and starve
+/// the bounded scan once enough panes have published.
+pub const WINDOW_WATERMARK_PANE_POSTING: i64 = -3;
+
+/// The watermark row key: reserved prefix + 0xFF tag + zero pane. The
+/// 0xFF tag can never open a real group (no tag `window_group_key_bytes`
+/// produces), so the row can never alias a pane row.
+pub fn window_watermark_row_key() -> Vec<u8> {
+    let mut key = Vec::with_capacity(13);
+    key.extend_from_slice(&WINDOW_WATERMARK_LEN_PREFIX.to_be_bytes());
+    key.extend_from_slice(&[0xFF]);
+    key.extend_from_slice(&0u64.to_be_bytes());
+    key
+}
+
+/// The marker row key for `(group, pane)` — `u32::MAX | group | pane`.
+pub fn window_emitted_marker_key(group: &[u8], pane: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(4 + group.len() + 8);
+    key.extend_from_slice(&WINDOW_EMITTED_LEN_PREFIX.to_be_bytes());
+    key.extend_from_slice(group);
+    key.extend_from_slice(&pane.to_be_bytes());
+    key
+}
+
+/// Parse an emitted-marker row key back to `(group, pane)`; `None` for
+/// pane rows, the watermark row, or foreign bytes.
+pub fn window_emitted_marker_key_parse(key: &[u8]) -> Option<(Vec<u8>, u64)> {
+    if key.len() < 13 || key[..4] != WINDOW_EMITTED_LEN_PREFIX.to_be_bytes() {
+        return None;
+    }
+    let group = key[4..key.len() - 8].to_vec();
+    let pane = u64::from_be_bytes(key[key.len() - 8..].try_into().ok()?);
+    Some((group, pane))
+}
 
 /// Reserved group value for the shared `LIMIT KEYS` refusal row: every
 /// record refused by the active-Key bound accumulates this one sentinel
@@ -1001,11 +1072,13 @@ pub const WINDOW_MAX_BYTE_LIMIT: u64 = 256 * 1024;
 pub const WINDOW_MIN_ACCOUNTED_ROW_BYTES: u64 = 36;
 
 /// The accounted byte size of one pane row — 4-byte group length prefix,
-/// group bytes, 8-byte big-endian pane, and the 24-byte accumulator.
+/// group bytes, 8-byte big-endian pane, and the versioned accumulator
+/// (26-byte v2; a conservative over-charge on legacy 24-byte v1 rows so
+/// mixed stores stay inside the bound).
 /// Posting overhead is an internal detail; the operator-facing bound
 /// counts enumerable pane-state bytes.
 pub fn window_pane_row_bytes(group: &[u8]) -> u64 {
-    (4 + group.len() + 8 + 24) as u64
+    (4 + group.len() + 8 + crate::index::ACCUMULATOR_ROW_V2_BYTES) as u64
 }
 
 /// Fetch-time `key`-posting scan bound for `LIMIT KEYS`/`LIMIT BYTES`
@@ -1110,6 +1183,8 @@ pub fn window_emission_from_row(
         sum,
         // The scanner stamps the serving replica's applied sequence.
         store_seq: 0,
+        // The scanner stamps the marker-derived revision.
+        revision: 0,
     })
 }
 
@@ -1125,13 +1200,21 @@ pub enum WindowPaneDisposition {
     Expire,
 }
 
+/// Classify one scanned pane row. Two clocks stay distinct on purpose:
+/// `emit_now_ns` is the close clock — the ingest horizon under `MAX_LATE`
+/// or the durable event-time watermark under `WATERMARK` — while
+/// `expire_now_ns` is always the ingest/wall horizon, because row
+/// retention is a storage concern that must still advance while event
+/// input idles. `emit_after_ns` is the offset a pane must pass to close
+/// (`max_late` under ingest mode, 0 under watermark mode).
 pub fn window_row_disposition(
     row_key: &[u8],
     payload: &[u8],
     pane_ns: u64,
-    max_late_ns: Option<u64>,
+    emit_after_ns: Option<u64>,
     expire_ns: Option<u64>,
-    now_ns: u64,
+    emit_now_ns: u64,
+    expire_now_ns: u64,
 ) -> WindowPaneDisposition {
     let Some((_row_group, pane)) = window_pane_row_key_parse(row_key) else {
         return WindowPaneDisposition::Keep;
@@ -1145,12 +1228,14 @@ pub fn window_row_disposition(
         return WindowPaneDisposition::Keep;
     };
     if let Some(bound) = expire_ns.and_then(|expire| pane_end.checked_add(expire)) {
-        if now_ns >= bound {
+        if expire_now_ns >= bound {
             return WindowPaneDisposition::Expire;
         }
     }
-    if let Some(bound) = max_late_ns {
-        if let Some(emission) = window_emission_from_row(row_key, payload, pane_ns, bound, now_ns) {
+    if let Some(after) = emit_after_ns {
+        if let Some(emission) =
+            window_emission_from_row(row_key, payload, pane_ns, after, emit_now_ns)
+        {
             return WindowPaneDisposition::Emit(emission);
         }
     }
@@ -1189,6 +1274,10 @@ fn window_emission_payload(
         // Decimal string: the sequence is version evidence, not a value
         // — keep it opaque to JavaScript-precision loss like the bounds.
         "store_seq": emission.store_seq.to_string(),
+        // Decimal string: which publish this (group, pane) is — a
+        // late-event revision re-emits with a bumped revision so a
+        // downstream consumer can order or dedupe publications.
+        "revision": emission.revision.max(1).to_string(),
     });
     match aggregation {
         WindowAggregation::Count => {}
@@ -1418,6 +1507,33 @@ mod tests {
     }
 
     #[test]
+    fn window_emitted_marker_key_round_trips_and_sorts_after_its_pane_row() {
+        let group = window_group_key_bytes(&IndexValue::Text("acct".to_owned())).unwrap();
+        let marker = window_emitted_marker_key(&group, 42);
+        assert_eq!(
+            window_emitted_marker_key_parse(&marker),
+            Some((group.clone(), 42))
+        );
+        // Pane rows, the watermark row, and foreign bytes never parse as
+        // markers.
+        assert_eq!(
+            window_emitted_marker_key_parse(&window_pane_row_key(&group, 42)),
+            None
+        );
+        assert_eq!(
+            window_emitted_marker_key_parse(&window_watermark_row_key()),
+            None
+        );
+        assert_eq!(window_emitted_marker_key_parse(&marker[..8]), None);
+        assert_eq!(window_emitted_marker_key_parse(&[]), None);
+        // Marker keys post the pane index like pane rows, but the
+        // `u32::MAX` length prefix sorts them strictly after their pane
+        // row inside any named `pane` scan: a scan loop that resolves an
+        // emission's revision inline never sees the marker first.
+        assert!(marker > window_pane_row_key(&group, 42));
+    }
+
+    #[test]
     fn window_emission_from_row_emits_only_closed_real_panes() {
         let group_value = IndexValue::Text("acct".to_owned());
         let group = window_group_key_bytes(&group_value).unwrap();
@@ -1451,45 +1567,82 @@ mod tests {
         let group = window_group_key_bytes(&IndexValue::Text("acct".to_owned())).unwrap();
         let pane_ns = 10u64;
         let payload = crate::index::encode_accumulator(3, 42);
-        // pane 5 closes at (5+1)*10 + 20 = 80; expires at (5+1)*10 + 100 = 160.
+        // pane 5 closes at (5+1)*10 + 20 = 80 on the emit clock and
+        // expires at (5+1)*10 + 100 = 160 on the ingest clock.
         let key = window_pane_row_key(&group, 5);
 
         // Open panes keep — whatever policies are declared.
         assert_eq!(
-            window_row_disposition(&key, &payload, pane_ns, Some(20), Some(100), 79),
+            window_row_disposition(&key, &payload, pane_ns, Some(20), Some(100), 79, 79),
             WindowPaneDisposition::Keep
         );
         // A closed, unexpired pane emits when a bound is declared.
         let WindowPaneDisposition::Emit(emission) =
-            window_row_disposition(&key, &payload, pane_ns, Some(20), Some(100), 80)
+            window_row_disposition(&key, &payload, pane_ns, Some(20), Some(100), 80, 80)
         else {
             panic!("closed pane emits")
         };
         assert_eq!(emission.pane, 5);
         // Without an emit bound the same closed-age pane just keeps.
         assert_eq!(
-            window_row_disposition(&key, &payload, pane_ns, None, Some(100), 80),
+            window_row_disposition(&key, &payload, pane_ns, None, Some(100), 80, 80),
             WindowPaneDisposition::Keep
         );
         // Past expiry the row deletes — emitted or not, and regardless of
         // whether the payload still decodes.
         assert_eq!(
-            window_row_disposition(&key, &payload, pane_ns, Some(20), Some(100), 160),
+            window_row_disposition(&key, &payload, pane_ns, Some(20), Some(100), 160, 160),
             WindowPaneDisposition::Expire
         );
         assert_eq!(
-            window_row_disposition(&key, b"garbage", pane_ns, Some(20), Some(100), 160),
+            window_row_disposition(&key, b"garbage", pane_ns, Some(20), Some(100), 160, 160),
             WindowPaneDisposition::Expire
+        );
+        // The emit and expire clocks differ under WATERMARK: an
+        // event-time horizon that stalls behind the wall clock must not
+        // hold retention open.
+        assert_eq!(
+            window_row_disposition(&key, &payload, pane_ns, Some(0), Some(100), 10, 160),
+            WindowPaneDisposition::Expire
+        );
+        assert_eq!(
+            window_row_disposition(&key, &payload, pane_ns, Some(0), Some(100), 160, 10),
+            WindowPaneDisposition::Emit(WindowEmission {
+                row_key: key.clone(),
+                group: IndexValue::Text("acct".to_owned()),
+                group_tagged: group.clone(),
+                pane: 5,
+                count: 3,
+                sum: 42,
+                store_seq: 0,
+                revision: 0,
+            })
         );
         // The late-sentinel row never expires or emits.
         let late_key = window_pane_row_key(&group, WINDOW_LATE_PANE);
         assert_eq!(
-            window_row_disposition(&late_key, &payload, pane_ns, Some(20), Some(100), u64::MAX),
+            window_row_disposition(
+                &late_key,
+                &payload,
+                pane_ns,
+                Some(20),
+                Some(100),
+                u64::MAX,
+                u64::MAX
+            ),
             WindowPaneDisposition::Keep
         );
         // Malformed keys and overflowed bounds keep rather than guessing.
         assert_eq!(
-            window_row_disposition(b"bad", &payload, pane_ns, Some(20), Some(100), u64::MAX),
+            window_row_disposition(
+                b"bad",
+                &payload,
+                pane_ns,
+                Some(20),
+                Some(100),
+                u64::MAX,
+                u64::MAX
+            ),
             WindowPaneDisposition::Keep
         );
     }
@@ -1523,6 +1676,7 @@ mod tests {
             count: 4,
             sum: 30,
             store_seq: 41,
+            revision: 2,
         };
         let payload = window_emission_payload(
             &emission,
@@ -1540,8 +1694,10 @@ mod tests {
         assert_eq!(body["sum"], "30");
         assert_eq!(body["average"], "7.5");
         // The serving replica's applied journal sequence rides as the
-        // version evidence for this result.
+        // version evidence for this result, and the revision marker
+        // distinguishes a late-event re-publish from the first emission.
         assert_eq!(body["store_seq"], "41");
+        assert_eq!(body["revision"], "2");
         // Count aggregations carry no sum/average fields.
         let payload = window_emission_payload(&emission, 10, &WindowAggregation::Count);
         let body: serde_json::Value = serde_json::from_slice(&payload).unwrap();

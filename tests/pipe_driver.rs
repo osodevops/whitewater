@@ -643,6 +643,7 @@ fn page_with_emissions(
         refused: Vec::new(),
         pane_rows: Default::default(),
         pane_rows_saturated: false,
+        watermark: None,
     }
 }
 
@@ -822,6 +823,7 @@ async fn window_pipe_escapes_prepared_residue_when_the_replan_shifts() {
         refused: Vec::new(),
         pane_rows: Default::default(),
         pane_rows_saturated: false,
+        watermark: None,
     };
 
     // Drive one's commit dies in flight: the replicas hold a prepared
@@ -1213,6 +1215,8 @@ fn window_pipe() -> PipeDefinition {
             key: IndexFieldSpec::Key,
             time: whitewater::control::WindowTime::Event,
             max_late_ns: None,
+            watermark_ns: None,
+            grace_ns: None,
             expire_ns: None,
             key_limit: None,
             byte_limit: None,
@@ -1257,6 +1261,8 @@ async fn window_pipe_quarantines_late_events_into_a_countable_row() {
         aggregation: WindowAggregation::Count,
         time: whitewater::control::WindowTime::Event,
         max_late_ns: Some(500),
+        watermark_ns: None,
+        grace_ns: None,
         expire_ns: None,
         key_limit: None,
         byte_limit: None,
@@ -1310,6 +1316,296 @@ async fn window_pipe_quarantines_late_events_into_a_countable_row() {
     assert_eq!(entries[1].sum_delta, 0);
 }
 
+/// A window Pipe on the durable event-time watermark: `WATERMARK 40ns
+/// GRACE 15ns` — panes close once the committed horizon passes their
+/// end, and late events revise a closed pane until the horizon moves
+/// 15ns past it.
+fn watermark_window_pipe() -> PipeDefinition {
+    let mut pipe = window_pipe();
+    pipe.operation = PipeOperation::Window {
+        window_ns: 160,
+        key: IndexFieldSpec::Key,
+        aggregation: WindowAggregation::Count,
+        time: whitewater::control::WindowTime::Event,
+        max_late_ns: None,
+        watermark_ns: Some(40),
+        grace_ns: Some(15),
+        expire_ns: None,
+        key_limit: None,
+        byte_limit: None,
+    };
+    pipe
+}
+
+#[tokio::test]
+async fn watermark_delta_rides_inside_the_window_effect() {
+    let harness = harness_for(watermark_window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+
+    // The fetch-time resolver committed horizon 200 -> 400 for this
+    // page; the fold carries the delta into the durable watermark row
+    // so a replay restates the identical horizon.
+    let mut fetched = page(vec![json_record(1, b"key-a", 500, 1)], "p1");
+    fetched.watermark = Some((200, 400));
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_f, _l| async { Ok(fetched) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
+        panic!("expected AccumulateRows")
+    };
+    // Pane row for event 500 (pane 50) plus the watermark row — one
+    // AccumulateRows so horizon and panes commit atomically.
+    assert_eq!(entries.len(), 2);
+    let watermark = entries
+        .iter()
+        .find(|entry| entry.key == whitewater::pipe::window_watermark_row_key())
+        .expect("watermark row entry");
+    assert_eq!(watermark.count_delta, 0);
+    assert_eq!(watermark.sum_delta, 200);
+    assert_eq!(
+        watermark.named[0].values,
+        vec![IndexValue::I64(
+            whitewater::pipe::WINDOW_WATERMARK_PANE_POSTING
+        )]
+    );
+
+    // The watermark tuple rides inside the effect plan: an identical
+    // replan yields the identical identity (journal dedupes), while a
+    // different committed horizon — or none — is a different effect
+    // that arbitrates through the frontier CAS rather than colliding.
+    let mut same = page(vec![json_record(1, b"key-a", 500, 1)], "p1");
+    same.watermark = Some((200, 400));
+    assert_eq!(
+        applied.effect_id,
+        harness
+            .driver
+            .planned_effect_id(Uuid::from_u128(SUBSCRIPTION), feed(), "p0", &same)
+            .unwrap()
+    );
+    let mut shallower = same.clone();
+    shallower.watermark = Some((200, 350));
+    assert_ne!(
+        applied.effect_id,
+        harness
+            .driver
+            .planned_effect_id(Uuid::from_u128(SUBSCRIPTION), feed(), "p0", &shallower)
+            .unwrap()
+    );
+    let mut no_watermark = same.clone();
+    no_watermark.watermark = None;
+    assert_ne!(
+        applied.effect_id,
+        harness
+            .driver
+            .planned_effect_id(Uuid::from_u128(SUBSCRIPTION), feed(), "p0", &no_watermark)
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn grace_boundaries_split_late_events_between_revision_and_quarantine() {
+    let harness = harness_for(watermark_window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+
+    // 10ns panes. Event 25 lands in pane 2 (end 30). A committed horizon
+    // of 45 means pane 2 closed and `30 + grace(15) = 45` still revises;
+    // a horizon of 46 quarantines. Event 50 (pane 5, end 60 > 45) is
+    // simply on time.
+    let mut revising = page(
+        vec![
+            json_record(1, b"key-a", 25, 1),
+            json_record(2, b"key-a", 50, 1),
+        ],
+        "p1",
+    );
+    revising.watermark = Some((40, 45));
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_f, _l| async { Ok(revising) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
+        panic!("expected AccumulateRows")
+    };
+    // Real pane rows only — no sentinel: pane 2 revised inside grace,
+    // pane 5 on time, plus the watermark row.
+    let late_rows = entries
+        .iter()
+        .filter(|entry| entry.key[entry.key.len() - 8..] == u64::MAX.to_be_bytes())
+        .count();
+    assert_eq!(late_rows, 0);
+    assert!(entries
+        .iter()
+        .any(|entry| entry.named.get(1).map(|named| named.values.clone())
+            == Some(vec![IndexValue::I64(2)])));
+
+    // One ns later the same event is beyond grace — it accumulates the
+    // countable late sentinel instead of revising pane 2.
+    let mut quarantining = page(vec![json_record(3, b"key-a", 25, 1)], "p2");
+    quarantining.watermark = Some((45, 46));
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_f, _l| async { Ok(quarantining) },
+            || async { Ok(bootstrap_with("p2")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
+        panic!("expected AccumulateRows")
+    };
+    let sentinel = entries
+        .iter()
+        .find(|entry| entry.key[entry.key.len() - 8..] == u64::MAX.to_be_bytes())
+        .expect("late sentinel row");
+    assert_eq!(sentinel.count_delta, 1);
+    assert_eq!(sentinel.named[1].values, vec![IndexValue::I64(-1)]);
+    // No pane-2 row was touched.
+    assert!(!entries
+        .iter()
+        .any(|entry| entry.named.get(1).map(|named| named.values.clone())
+            == Some(vec![IndexValue::I64(2)])));
+}
+
+#[tokio::test]
+async fn revised_emission_scopes_writer_identity_and_marker_posting() {
+    let mut pipe = emit_window_pipe();
+    pipe.operation = PipeOperation::Window {
+        window_ns: 160,
+        key: IndexFieldSpec::Key,
+        aggregation: WindowAggregation::Sum {
+            value: IndexFieldSpec::Projection {
+                extractor: "json".to_owned(),
+                version: 1,
+                field: "v".to_owned(),
+            },
+        },
+        time: whitewater::control::WindowTime::Event,
+        max_late_ns: None,
+        watermark_ns: Some(40),
+        grace_ns: Some(15),
+        expire_ns: None,
+        key_limit: None,
+        byte_limit: None,
+    };
+    let pipe_id = pipe.pipe_id;
+    let harness = harness_for(pipe);
+    seed_frontier(&harness.progress, "p0").await;
+    let mut revision = pane_emission(IndexValue::Bytes(b"key-a".to_vec()), 3, 6, 42);
+    revision.revision = 2;
+
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_f, _l| async { Ok(page_with_emissions(vec![], vec![revision.clone()], "p0")) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    let EffectTransition::Applied {
+        outputs,
+        state_mutations,
+        ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    // The revision-scoped writer session never collides with the first
+    // publish's — a retried revision append dedupes on its own identity.
+    assert_eq!(
+        outputs[0].writer_session_id,
+        pipe_emission_writer_session(pipe_id, &revision.row_key, 2)
+    );
+    assert_ne!(
+        outputs[0].writer_session_id,
+        pipe_emission_writer_session(pipe_id, &revision.row_key, 1)
+    );
+    // The emitted payload carries the revision marker.
+    let payload: serde_json::Value = serde_json::from_slice(
+        &base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            &outputs[0].payload_base64,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["revision"], "2");
+    // The marker accumulate posts the pane's own index so the bounded
+    // close-scan prefilters it alongside its pane row.
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
+        panic!("expected marker AccumulateRows")
+    };
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].key,
+        whitewater::pipe::window_emitted_marker_key(&revision.group_tagged, 3)
+    );
+    assert_eq!(entries[0].named[0].values, vec![IndexValue::I64(3)]);
+    // A revision on the same pane is a distinct effect from the first
+    // publish — raced Declares arbitrate rather than colliding.
+    let mut first = pane_emission(IndexValue::Bytes(b"key-a".to_vec()), 3, 4, 30);
+    first.revision = 1;
+    assert_ne!(
+        harness
+            .driver
+            .planned_effect_id(
+                Uuid::from_u128(SUBSCRIPTION),
+                feed(),
+                "p0",
+                &page_with_emissions(vec![], vec![revision.clone()], "p0"),
+            )
+            .unwrap(),
+        harness
+            .driver
+            .planned_effect_id(
+                Uuid::from_u128(SUBSCRIPTION),
+                feed(),
+                "p0",
+                &page_with_emissions(vec![], vec![first.clone()], "p0"),
+            )
+            .unwrap()
+    );
+}
+
 fn ingest_window_pipe() -> PipeDefinition {
     let mut pipe = window_pipe();
     pipe.operation = PipeOperation::Window {
@@ -1318,6 +1614,8 @@ fn ingest_window_pipe() -> PipeDefinition {
         aggregation: WindowAggregation::Count,
         time: whitewater::control::WindowTime::Ingest,
         max_late_ns: None,
+        watermark_ns: None,
+        grace_ns: None,
         expire_ns: None,
         key_limit: None,
         byte_limit: None,
@@ -1773,6 +2071,8 @@ fn emit_window_pipe() -> PipeDefinition {
         },
         time: whitewater::control::WindowTime::Event,
         max_late_ns: Some(20),
+        watermark_ns: None,
+        grace_ns: None,
         expire_ns: None,
         key_limit: None,
         byte_limit: None,
@@ -1791,6 +2091,8 @@ fn expire_window_pipe() -> PipeDefinition {
         aggregation: WindowAggregation::Count,
         time: whitewater::control::WindowTime::Event,
         max_late_ns: None,
+        watermark_ns: None,
+        grace_ns: None,
         expire_ns: Some(30),
         key_limit: None,
         byte_limit: None,
@@ -1808,6 +2110,7 @@ fn pane_emission(group: IndexValue, pane: u64, count: u64, sum: i128) -> WindowE
         count,
         sum,
         store_seq: 7,
+        revision: 1,
     }
 }
 
@@ -1882,7 +2185,7 @@ async fn window_pipe_emits_a_closed_pane_and_deletes_its_row_atomically() {
     // Emission dedupe identity is the pane row itself.
     assert_eq!(
         output.writer_session_id,
-        pipe_emission_writer_session(emit_window_pipe().pipe_id, &emission.row_key)
+        pipe_emission_writer_session(emit_window_pipe().pipe_id, &emission.row_key, 1)
     );
     assert_eq!(output.sequence, 1);
     // pane_end - 1 is the output's event-time edge.
@@ -1929,14 +2232,15 @@ async fn idle_pages_close_panes_with_an_emission_only_effect() {
         .expect("applied");
     assert_eq!(
         applied.effect_id,
-        whitewater::pipe::pipe_emission_effect_id(
-            emit_window_pipe().pipe_id,
-            Uuid::from_u128(SUBSCRIPTION),
-            feed(),
-            "p0",
-            std::slice::from_ref(&emission),
-            &[],
-        )
+        harness
+            .driver
+            .planned_effect_id(
+                Uuid::from_u128(SUBSCRIPTION),
+                feed(),
+                "p0",
+                &page_with_emissions(vec![], vec![emission.clone()], "p0"),
+            )
+            .unwrap()
     );
     let EffectTransition::Applied {
         outputs,
@@ -1946,11 +2250,13 @@ async fn idle_pages_close_panes_with_an_emission_only_effect() {
     else {
         panic!("expected Applied")
     };
-    // One emitted output + one DeleteRow; no accumulate on an idle page.
+    // One emitted output plus the pane-row delete and the `emitted`
+    // marker accumulate — the marker is the durable proof this pane
+    // published, and the next emission's revision.
     assert_eq!(outputs.len(), 1);
-    assert_eq!(state_mutations.len(), 1);
+    assert_eq!(state_mutations.len(), 2);
     assert_eq!(harness.sink.appends.lock().unwrap().len(), 1);
-    assert_eq!(harness.sink.mutations.lock().unwrap().len(), 1);
+    assert_eq!(harness.sink.mutations.lock().unwrap().len(), 2);
     // The frontier never moved.
     let committed = harness.progress.read_committed().await.unwrap().unwrap();
     assert_eq!(committed.cursor, "p0");
@@ -1976,8 +2282,9 @@ async fn idle_pages_close_panes_with_an_emission_only_effect() {
     // dedupes on mutation_id, so the second call is a no-op there.
     {
         let mutations = harness.sink.mutations.lock().unwrap();
-        assert_eq!(mutations.len(), 2);
-        assert_eq!(mutations[1], mutations[0]);
+        assert_eq!(mutations.len(), 4);
+        assert_eq!(mutations[2], mutations[0]);
+        assert_eq!(mutations[3], mutations[1]);
     }
 
     // A different closed set over the same frontier is a distinct effect.
@@ -2077,17 +2384,14 @@ async fn expired_panes_delete_on_an_idle_page() {
         .await
         .unwrap()
         .expect("applied");
-    // Expiry rides the emission-effect identity keyed on the delete set.
+    // Expiry rides the same plan-covered identity as every other cycle:
+    // the delete set lands in the mutation plan the identity covers.
     assert_eq!(
         applied.effect_id,
-        whitewater::pipe::pipe_emission_effect_id(
-            expire_window_pipe().pipe_id,
-            Uuid::from_u128(SUBSCRIPTION),
-            feed(),
-            "p0",
-            &[],
-            std::slice::from_ref(&expired_key),
-        )
+        harness
+            .driver
+            .planned_effect_id(Uuid::from_u128(SUBSCRIPTION), feed(), "p0", &page,)
+            .unwrap()
     );
     let EffectTransition::Applied {
         outputs,
@@ -2273,6 +2577,7 @@ async fn window_limit_keys_quarantines_refused_groups_into_a_shared_sentinel() {
                     refused,
                     pane_rows: Default::default(),
                     pane_rows_saturated: false,
+                    watermark: None,
                 })
             },
             || async { Ok(bootstrap_with("p0")) },
@@ -2384,6 +2689,7 @@ async fn window_limit_bytes_refuses_new_pane_rows_into_bytecap() {
                     refused: Vec::new(),
                     pane_rows: existing,
                     pane_rows_saturated: false,
+                    watermark: None,
                 })
             },
             || async { Ok(bootstrap_with("p0")) },
@@ -2461,6 +2767,7 @@ async fn window_limit_bytes_saturated_scan_refuses_every_new_row() {
                     refused: Vec::new(),
                     pane_rows: existing,
                     pane_rows_saturated: true,
+                    watermark: None,
                 })
             },
             || async { Ok(bootstrap_with("p0")) },
@@ -2497,7 +2804,9 @@ fn window_scan_row_limit_tracks_the_tighter_declared_bound() {
     use whitewater::pipe::{
         window_pane_row_bytes, window_scan_row_limit, WINDOW_KEY_ROW_FOOTPRINT,
     };
-    assert_eq!(window_pane_row_bytes(b"ab"), 38);
+    // 4-byte prefix + 2 group bytes + 8-byte pane + 26-byte v2
+    // accumulator.
+    assert_eq!(window_pane_row_bytes(b"ab"), 40);
     // Key bound: 7 Keys * 17-row footprint + sentinel/probe headroom.
     assert_eq!(
         window_scan_row_limit(Some(7), None),

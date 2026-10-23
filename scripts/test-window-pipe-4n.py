@@ -206,11 +206,19 @@ def decode_group(group_tagged):
 
 def decode_accumulator(payload_base64):
     raw = base64.b64decode(payload_base64)
-    if len(raw) != 24:
-        raise AssertionError(f"accumulator payload is not 24 bytes: {len(raw)}")
-    count = struct.unpack("<Q", raw[:8])[0]
-    sum_value = int.from_bytes(raw[8:], "little", signed=True)
-    return count, sum_value
+    # v2: 0xAC tag + version byte + count + sum (26 bytes); v1 rows
+    # committed before the version bump still decode (24 bytes).
+    if len(raw) == 26:
+        if raw[0] != 0xAC or raw[1] != 2:
+            raise AssertionError(f"bad v2 accumulator tag/version: {raw[:2]!r}")
+        count = struct.unpack("<Q", raw[2:10])[0]
+        sum_value = int.from_bytes(raw[10:], "little", signed=True)
+        return count, sum_value
+    if len(raw) == 24:
+        count = struct.unpack("<Q", raw[:8])[0]
+        sum_value = int.from_bytes(raw[8:], "little", signed=True)
+        return count, sum_value
+    raise AssertionError(f"accumulator payload is not 24/26 bytes: {len(raw)}")
 
 
 def member_join(node, subscription):
@@ -534,7 +542,7 @@ def main():
         # Three-to-four: start and register the storage Node. Its pin is not
         # in the voters' static peer set â€” only the catalog registration
         # makes it a trusted internal peer.
-        subprocess.run([*COMPOSE, "up", "-d", STORAGE_NODE], check=True)
+        subprocess.run([*COMPOSE, "up", "-d", "--build", STORAGE_NODE], check=True)
         wait_for_nodes(NODES, "four-Node")
         pin = storage_pin()
         wcl_retry(

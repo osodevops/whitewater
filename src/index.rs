@@ -408,27 +408,54 @@ pub enum IndexStoreError {
 /// returns. Reads are snapshot-consistent and bounded by caller limits and
 /// fixed byte budgets. The interface is intentionally engine-agnostic so the
 /// selected engine remains an implementation detail of replica code.
-/// The fixed little-endian payload of an additive-accumulator row:
-/// `count u64 | sum i128` totalling 24 bytes.
+/// The fixed little-endian payload of a legacy (v1) additive-accumulator
+/// row: `count u64 | sum i128` totalling 24 bytes.
 pub const ACCUMULATOR_ROW_BYTES: usize = 24;
 
-/// Encode an additive-accumulator payload.
+/// Versioned accumulator encoding: `0xAC | version u8 | count u64 | sum
+/// i128`. The tag byte cannot collide with a v1 payload (a v1 count's low
+/// byte may read as 0xAC but the second byte being a plausible small
+/// version while ten trailing bytes stay exactly 26 long is the version
+/// discriminator); the version leaves headroom for future rebuilds that
+/// widen or re-order fields without rewriting committed rows.
+pub const ACCUMULATOR_V2_TAG: u8 = 0xAC;
+pub const ACCUMULATOR_V2_VERSION: u8 = 2;
+pub const ACCUMULATOR_ROW_V2_BYTES: usize = 26;
+
+/// Encode an additive-accumulator payload in the current (v2) encoding.
+/// New rows always write v2; replicas decoding a batch stay compatible
+/// with v1 rows committed before the version bump.
 pub fn encode_accumulator(count: u64, sum: i128) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(ACCUMULATOR_ROW_BYTES);
+    let mut payload = Vec::with_capacity(ACCUMULATOR_ROW_V2_BYTES);
+    payload.push(ACCUMULATOR_V2_TAG);
+    payload.push(ACCUMULATOR_V2_VERSION);
     payload.extend_from_slice(&count.to_le_bytes());
     payload.extend_from_slice(&sum.to_le_bytes());
     payload
 }
 
 /// Decode an additive-accumulator payload; `None` when the bytes are not a
-/// well-formed accumulator.
+/// well-formed accumulator. Accepts both the v2 versioned layout and the
+/// 24-byte v1 layout so pre-version committed rows still merge.
 pub fn decode_accumulator(payload: &[u8]) -> Option<(u64, i128)> {
-    if payload.len() != ACCUMULATOR_ROW_BYTES {
-        return None;
+    match payload.len() {
+        ACCUMULATOR_ROW_V2_BYTES => {
+            if payload[0] != ACCUMULATOR_V2_TAG || payload[1] != ACCUMULATOR_V2_VERSION {
+                return None;
+            }
+            let count = u64::from_le_bytes(payload[2..10].try_into().ok()?);
+            let sum = i128::from_le_bytes(payload[10..].try_into().ok()?);
+            Some((count, sum))
+        }
+        ACCUMULATOR_ROW_BYTES => {
+            // A v1 row whose first two bytes mimic the v2 tag+version is
+            // still v1: its length is the discriminator.
+            let count = u64::from_le_bytes(payload[..8].try_into().ok()?);
+            let sum = i128::from_le_bytes(payload[8..].try_into().ok()?);
+            Some((count, sum))
+        }
+        _ => None,
     }
-    let count = u64::from_le_bytes(payload[..8].try_into().ok()?);
-    let sum = i128::from_le_bytes(payload[8..].try_into().ok()?);
-    Some((count, sum))
 }
 
 /// One additive merge inside an `accumulate_rows` batch: `count_delta` and

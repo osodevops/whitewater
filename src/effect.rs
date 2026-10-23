@@ -112,6 +112,11 @@ pub enum EffectTransition {
         /// post-crash replay is self-contained.
         #[serde(default)]
         outputs: Vec<EffectOutput>,
+        /// The abandoned consume, restated so a post-crash replay can still
+        /// pass the declared input over the frontier as skipped rather than
+        /// re-planning the dead effect forever.
+        #[serde(default)]
+        consume: Option<EffectConsume>,
     },
 }
 
@@ -226,6 +231,11 @@ pub struct EffectReplicaReply<T> {
 pub struct EffectJournalInspection {
     pub committed: Option<EffectMutation>,
     pub prepared: Option<EffectMutation>,
+    /// The journal row's current fencing epoch: the assignment epoch the
+    /// replica last adopted, independent of any committed decision's
+    /// historical stamp.
+    #[serde(default)]
+    pub ownership_epoch: u64,
 }
 
 #[derive(Debug, Error)]
@@ -302,6 +312,33 @@ fn lagging_witness(error: &EffectJournalError) -> bool {
     )
 }
 
+/// `ownership_epoch` stamps which assignment issued a mutation; it fences
+/// writes but is not part of the replicated decision. A replayed identical
+/// decision under a moved epoch is the same decision, so equality and
+/// quorum digests compare decision content only.
+fn decisions_equal(left: &EffectMutation, right: &EffectMutation) -> bool {
+    EffectMutation {
+        ownership_epoch: 0,
+        ..left.clone()
+    } == EffectMutation {
+        ownership_epoch: 0,
+        ..right.clone()
+    }
+}
+
+/// Quorum digest over decision content - the epoch stamp excluded for the
+/// same reason `decisions_equal` excludes it: a stored decision and its
+/// epoch-moved replay hash identically so commit evidence always matches
+/// the stored candidate.
+fn decision_digest(mutation: &EffectMutation) -> Result<[u8; 32], EffectJournalError> {
+    let canonical = EffectMutation {
+        ownership_epoch: 0,
+        ..mutation.clone()
+    };
+    let bytes = serde_json::to_vec(&canonical)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct EffectJournalRow {
     effect_id: Uuid,
@@ -371,6 +408,7 @@ impl FjallEffectJournalReplica {
                 Ok(EffectJournalInspection {
                     committed: row.committed,
                     prepared: row.prepared,
+                    ownership_epoch: row.ownership_epoch,
                 })
             }
             None => Ok(EffectJournalInspection::default()),
@@ -418,7 +456,8 @@ impl FjallEffectJournalReplica {
                         return Err(EffectJournalError::Conflict)
                     }
                     Some(candidate)
-                        if existing.sequence == candidate.sequence && existing != candidate =>
+                        if existing.sequence == candidate.sequence
+                            && !decisions_equal(existing, candidate) =>
                     {
                         return Err(EffectJournalError::Conflict)
                     }
@@ -460,11 +499,10 @@ impl FjallEffectJournalReplica {
         mutation: EffectMutation,
     ) -> Result<EffectPrepareVote, EffectJournalError> {
         validate_effect_bounds(&mutation)?;
-        let bytes = serde_json::to_vec(&mutation)?;
         let vote = EffectPrepareVote {
             effect_id: mutation.effect_id,
             request_id: mutation.request_id,
-            digest: *blake3::hash(&bytes).as_bytes(),
+            digest: decision_digest(&mutation)?,
         };
         let mut tx = self
             .db
@@ -486,12 +524,17 @@ impl FjallEffectJournalReplica {
         if row.effect_id != mutation.effect_id {
             return Err(EffectJournalError::Conflict);
         }
-        if row.ownership_epoch != mutation.ownership_epoch {
+        // Fencing is directional: the placement check upstream already
+        // proved the request epoch is the authoritative assignment, so a
+        // row fenced behind it ratchets forward on install below rather
+        // than wedging the mutation chain. A mutation stamped under an
+        // older epoch than the row dies here as a stale write.
+        if row.ownership_epoch > mutation.ownership_epoch {
             return Err(EffectJournalError::StaleEpoch);
         }
         if let Some(committed) = &row.committed {
             if committed.request_id == mutation.request_id {
-                return if committed == &mutation {
+                return if decisions_equal(committed, &mutation) {
                     Ok(vote)
                 } else {
                     Err(EffectJournalError::Conflict)
@@ -499,7 +542,7 @@ impl FjallEffectJournalReplica {
             }
         }
         if let Some(prepared) = &row.prepared {
-            if prepared == &mutation {
+            if decisions_equal(prepared, &mutation) {
                 return Ok(vote);
             }
             if prepared.request_id == mutation.request_id {
@@ -515,6 +558,7 @@ impl FjallEffectJournalReplica {
             return Err(EffectJournalError::Sequence);
         }
         validate_transition(row.committed.as_ref(), &mutation)?;
+        row.ownership_epoch = mutation.ownership_epoch;
         row.prepared = Some(mutation);
         let encoded = serde_json::to_vec(&row)?;
         if encoded.len() > EFFECT_MAX_MUTATION_BYTES {
@@ -550,7 +594,7 @@ impl FjallEffectJournalReplica {
                     .filter(|value| value.request_id == evidence.request_id)
             })
             .ok_or(EffectJournalError::Conflict)?;
-        let digest = *blake3::hash(&serde_json::to_vec(candidate)?).as_bytes();
+        let digest = decision_digest(candidate)?;
         if evidence.request_id != candidate.request_id
             || evidence.votes[0].0 == evidence.votes[1].0
             || evidence.votes.iter().any(|(_, value)| *value != digest)
@@ -796,18 +840,17 @@ impl EffectCoordinator {
                         if candidate.effect_id != effect_id {
                             return Err(EffectJournalError::Conflict);
                         }
-                        if candidate.ownership_epoch != self.assignment.ownership_epoch {
-                            if candidate.ownership_epoch > self.assignment.ownership_epoch {
-                                return Err(EffectJournalError::StaleEpoch);
-                            }
-                            lagged = true;
-                            continue;
+                        // The committed decision's stamped epoch is history,
+                        // not fencing: a decision committed under a prior
+                        // epoch still counts once the row adopted forward.
+                        if candidate.ownership_epoch > self.assignment.ownership_epoch {
+                            return Err(EffectJournalError::StaleEpoch);
                         }
                     }
                     votes += 1;
                     if let Some(candidate) = mutation {
                         match &observed {
-                            Some(current) if *current != candidate => {
+                            Some(current) if !decisions_equal(current, &candidate) => {
                                 match candidate.sequence.cmp(&current.sequence) {
                                     std::cmp::Ordering::Greater => observed = Some(candidate),
                                     std::cmp::Ordering::Equal => {
@@ -907,7 +950,9 @@ impl EffectCoordinator {
                 {
                     return Err(EffectJournalError::InvalidAssignment)
                 }
-                Ok(reply) if reply.result == mutation => committed.push(node.clone()),
+                Ok(reply) if decisions_equal(&reply.result, &mutation) => {
+                    committed.push(node.clone())
+                }
                 Ok(_) => return Err(EffectJournalError::Conflict),
                 Err(error) if lagging_witness(&error) => {}
                 Err(EffectJournalError::Conflict) => {
@@ -957,7 +1002,7 @@ impl EffectCoordinator {
                         owner_seen = true;
                     }
                     match reply.result {
-                        Some(current) if current == mutation => {
+                        Some(current) if decisions_equal(&current, &mutation) => {
                             matching += 1;
                             if node == &self.assignment.owner {
                                 owner_committed = true;
@@ -977,7 +1022,9 @@ impl EffectCoordinator {
         }
         if owner_committed && matching >= 2 {
             match self.read_committed(mutation.effect_id).await {
-                Ok(Some(committed)) if committed == mutation => return Ok(mutation),
+                Ok(Some(committed)) if decisions_equal(&committed, &mutation) => {
+                    return Ok(mutation)
+                }
                 Err(EffectJournalError::Conflict) => {}
                 Err(error) => return Err(error),
                 _ => return Err(EffectJournalError::AmbiguousCommit),
@@ -996,11 +1043,15 @@ impl EffectCoordinator {
     /// 1. **Ensure outputs**: every declared output appends under the pending
     ///    fence - durable on the output Range quorum but fenced behind the
     ///    committed boundary, so no reader can observe it yet.
-    /// 2. **Frontier**: the consumed Subscription frontier commits.
-    /// 3. **`Applied`**: the terminal journal marker commits - the effect's
-    ///    decision is final and replayable from this row alone.
-    /// 4. **Release**: each touched output Range's pending tail commits,
+    /// 2. **Release**: each touched output Range's pending tail commits,
     ///    making every output visible in one step per Range.
+    /// 3. **Mutations**: each declared co-located StateStore mutation commits
+    ///    through its own RF3 journal under the dedupe identity.
+    /// 4. **Frontier**: the consumed Subscription frontier commits last, so an
+    ///    interrupted apply leaves the input unconsumed and the next drive
+    ///    refetches the identical page instead of skipping it.
+    /// 5. **`Applied`**: the terminal journal marker commits - the effect's
+    ///    decision is final and replayable from this row alone.
     ///
     /// An already-`Applied` row still re-runs the ensure and release phases:
     /// replay re-appends outputs idempotently and releases any tail the
@@ -1037,11 +1088,19 @@ impl EffectCoordinator {
                 state_mutations,
                 ..
             } => (None, outputs.as_slice(), state_mutations.as_slice()),
-            EffectTransition::Aborted { outputs, .. } => {
+            EffectTransition::Aborted {
+                declares,
+                outputs,
+                consume,
+                ..
+            } => {
                 // Terminal replay: the abort decision is durable; discard
                 // any pending tail that survived the first pass so the
-                // output Ranges unwedge, then settle.
+                // output Ranges unwedge, then pass the abandoned input over
+                // the frontier as skipped so the dead effect never re-plans.
                 self.discard_declared_outputs(outputs, effect_id, committed.subscription_id, apply)
+                    .await?;
+                self.skip_abandoned_consume(consume.as_ref(), *declares, apply)
                     .await?;
                 return Ok(committed);
             }
@@ -1124,50 +1183,6 @@ impl EffectCoordinator {
                 }
             }
         }
-        if let Some(consume) = consume {
-            let mut attempts = 0;
-            loop {
-                match apply
-                    .commit_frontier(
-                        consume,
-                        effect_apply_request_id(committed.request_id, b"frontier"),
-                    )
-                    .await
-                {
-                    Ok(()) => break,
-                    Err(error) if effect_retryable(&error) => {
-                        attempts += 1;
-                        if attempts >= MAX_APPLY_ATTEMPTS {
-                            return Err(error);
-                        }
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-        }
-        let terminal = if matches!(committed.transition, EffectTransition::Declare { .. }) {
-            let applied = EffectMutation {
-                effect_id,
-                subscription_id: committed.subscription_id,
-                ownership_epoch: committed.ownership_epoch,
-                sequence: committed.sequence + 1,
-                request_id: effect_apply_request_id(committed.request_id, b"applied"),
-                transition: EffectTransition::Applied {
-                    declares: committed.request_id,
-                    outputs: outputs.to_vec(),
-                    state_mutations: state_mutations.to_vec(),
-                },
-            };
-            match self.apply(applied.clone()).await {
-                Ok(committed) => committed,
-                Err(EffectJournalError::AmbiguousCommit | EffectJournalError::NoQuorum) => {
-                    self.reconcile_retry(applied).await?
-                }
-                Err(error) => return Err(error),
-            }
-        } else {
-            committed.clone()
-        };
         let mut ranges: BTreeMap<(Uuid, crate::active_range::RangeId), ()> = BTreeMap::new();
         for receipt in &receipts {
             ranges.insert((receipt.feed_id, receipt.range_id), ());
@@ -1182,7 +1197,7 @@ impl EffectCoordinator {
                         feed_id,
                         range_id,
                         effect_id,
-                        subscription_id: terminal.subscription_id,
+                        subscription_id: committed.subscription_id,
                     })
                     .await
                 {
@@ -1257,14 +1272,67 @@ impl EffectCoordinator {
                 }
             }
         }
+        // The consumed frontier commits only after every declared effect is
+        // durable: outputs appended and released, co-located mutations
+        // committed. An interrupted apply therefore leaves the frontier
+        // unmoved, so the next drive refetches the same records, replans the
+        // identical effect identity, and settles the residue instead of
+        // skipping the input. Replays past this point are no-ops: the CAS
+        // returns early once the frontier already rests at the target.
+        if let Some(consume) = consume {
+            let mut attempts = 0;
+            loop {
+                match apply
+                    .commit_frontier(
+                        consume,
+                        effect_apply_request_id(committed.request_id, b"frontier"),
+                    )
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(error) if effect_retryable(&error) => {
+                        attempts += 1;
+                        if attempts >= MAX_APPLY_ATTEMPTS {
+                            return Err(error);
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        let terminal = if matches!(committed.transition, EffectTransition::Declare { .. }) {
+            let applied = EffectMutation {
+                effect_id,
+                subscription_id: committed.subscription_id,
+                ownership_epoch: self.assignment.ownership_epoch,
+                sequence: committed.sequence + 1,
+                request_id: effect_apply_request_id(committed.request_id, b"applied"),
+                transition: EffectTransition::Applied {
+                    declares: committed.request_id,
+                    outputs: outputs.to_vec(),
+                    state_mutations: state_mutations.to_vec(),
+                },
+            };
+            match self.apply(applied.clone()).await {
+                Ok(committed) => committed,
+                Err(EffectJournalError::AmbiguousCommit | EffectJournalError::NoQuorum) => {
+                    self.reconcile_retry(applied).await?
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            committed.clone()
+        };
         Ok(terminal)
     }
 
     /// Terminalize a committed `Declare` whose apply hit a permanent
     /// failure: journal `Aborted` under a deterministic request identity,
-    /// then discard this effect's pending tails. The terminal row is
-    /// journaled first so a crash before the discard replays it from the
-    /// `Aborted` arm instead of leaving the marker wedged.
+    /// then discard this effect's pending tails and pass the declared
+    /// consume over the frontier as skipped. The terminal row is journaled
+    /// first — restating the consume on it — so a crash before the discard
+    /// or skip replays both from the `Aborted` arm instead of leaving the
+    /// marker wedged or the abandoned input re-planned forever.
     async fn abort_declared<A: EffectApply + ?Sized>(
         &self,
         committed: &EffectMutation,
@@ -1272,16 +1340,21 @@ impl EffectCoordinator {
         cause: EffectJournalError,
         apply: &A,
     ) -> Result<EffectMutation, EffectJournalError> {
+        let consume = match &committed.transition {
+            EffectTransition::Declare { consume, .. } => consume.clone(),
+            _ => None,
+        };
         let aborted = EffectMutation {
             effect_id: committed.effect_id,
             subscription_id: committed.subscription_id,
-            ownership_epoch: committed.ownership_epoch,
+            ownership_epoch: self.assignment.ownership_epoch,
             sequence: committed.sequence + 1,
             request_id: effect_apply_request_id(committed.request_id, b"aborted"),
             transition: EffectTransition::Aborted {
                 declares: committed.request_id,
                 reason: abort_reason(&cause),
                 outputs: outputs.to_vec(),
+                consume: consume.clone(),
             },
         };
         let terminal = match self.apply(aborted.clone()).await {
@@ -1298,7 +1371,55 @@ impl EffectCoordinator {
             apply,
         )
         .await?;
+        self.skip_abandoned_consume(consume.as_ref(), committed.request_id, apply)
+            .await?;
         Ok(terminal)
+    }
+
+    /// Pass an abandoned consume's declared positions over the Subscription
+    /// frontier as `skipped`: the dead effect's input is durably passed
+    /// over — recorded, not re-planned — so a committed `Aborted` row
+    /// settles instead of storming the identical `Declare` forever. A
+    /// frontier no-op consume (emission- or expiry-only effect) moves
+    /// nothing and is skipped outright. Non-retryable failures propagate:
+    /// the `Aborted` row is already durable, so every later replay retries
+    /// the same deterministic skip until it lands or fails closed.
+    async fn skip_abandoned_consume<A: EffectApply + ?Sized>(
+        &self,
+        consume: Option<&EffectConsume>,
+        declare_request_id: Uuid,
+        apply: &A,
+    ) -> Result<(), EffectJournalError> {
+        let Some(consume) = consume else {
+            return Ok(());
+        };
+        if consume.expected_cursor.as_deref() == Some(consume.cursor.as_str()) {
+            return Ok(());
+        }
+        let mut attempts = 0;
+        loop {
+            match apply
+                .commit_frontier_skipped(
+                    consume,
+                    effect_apply_request_id(declare_request_id, b"frontier-skip"),
+                )
+                .await
+            {
+                Ok(()) => return Ok(()),
+                // The CAS refusal means the frontier moved under a different
+                // decision since this consume was declared: the input's
+                // disposition now belongs to that decision, so the dead
+                // effect's claim on it is void rather than an error.
+                Err(EffectJournalError::Conflict) => return Ok(()),
+                Err(error) if effect_retryable(&error) => {
+                    attempts += 1;
+                    if attempts >= MAX_APPLY_ATTEMPTS {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Discard this effect's pending tail on every declared output's
@@ -1440,6 +1561,22 @@ pub trait EffectApply: Send + Sync {
         consume: &EffectConsume,
         request_id: Uuid,
     ) -> Result<(), EffectJournalError>;
+
+    /// Idempotently commit the declared frontier move for an effect whose
+    /// apply was durably abandoned: the consumed positions pass the
+    /// frontier recorded as `skipped` — final-disposition evidence — so the
+    /// dead effect's input never re-plans. Runs after the terminal
+    /// `Aborted` row is durable and again on `Aborted` replay, so a crash
+    /// between marker and frontier still converges. The default falls back
+    /// to a plain frontier commit for sinks without skip evidence; either
+    /// way the abandoned input must not return.
+    async fn commit_frontier_skipped(
+        &self,
+        consume: &EffectConsume,
+        request_id: Uuid,
+    ) -> Result<(), EffectJournalError> {
+        self.commit_frontier(consume, request_id).await
+    }
 
     /// Release the pending tail one of this effect's outputs occupies on the
     /// target Range so the outputs become visible atomically with the
@@ -1615,7 +1752,7 @@ impl EffectJournalService {
         Ok(EffectReplicaReply {
             replica: self.local_node.clone(),
             effect_id: result.effect_id,
-            ownership_epoch: result.ownership_epoch,
+            ownership_epoch: assignment.ownership_epoch,
             result,
         })
     }
@@ -1643,7 +1780,7 @@ impl EffectJournalService {
             {
                 return Err(EffectJournalError::Conflict);
             }
-            if mutation.ownership_epoch != request.ownership_epoch {
+            if mutation.ownership_epoch > request.ownership_epoch {
                 return Err(EffectJournalError::StaleEpoch);
             }
         }
@@ -1810,7 +1947,6 @@ impl HttpEffectJournalTransport {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.bytes().await.unwrap_or_default();
-            tracing::warn!(node = %node, path, %status, "effect journal replica refused");
             let code = body
                 .get(..4096)
                 .and_then(|head| serde_json::from_slice::<serde_json::Value>(head).ok())
@@ -1820,6 +1956,13 @@ impl HttpEffectJournalTransport {
                         .and_then(|code| code.as_str())
                         .map(str::to_owned)
                 });
+            tracing::warn!(
+                node = %node,
+                path,
+                %status,
+                code = code.as_deref().unwrap_or(""),
+                "effect journal replica refused"
+            );
             if let Some(error) = code.as_deref().and_then(EffectJournalError::from_code) {
                 return Err(error);
             }
@@ -2128,12 +2271,15 @@ mod tests {
         let replica = FjallEffectJournalReplica::open(directory.path()).unwrap();
         let mutation = declare(1);
         replica.prepare(mutation.clone()).unwrap();
-        let mut stale = mutation.clone();
-        stale.ownership_epoch = 2;
-        assert!(matches!(
-            replica.prepare(stale),
-            Err(EffectJournalError::StaleEpoch)
-        ));
+        // The fence is directional: the placement check upstream proves the
+        // authoritative epoch, so the identical decision restamped under an
+        // adopted epoch re-votes instead of wedging.
+        let mut forwarded = mutation.clone();
+        forwarded.ownership_epoch = 2;
+        assert_eq!(
+            replica.prepare(forwarded).unwrap().digest,
+            replica.prepare(mutation.clone()).unwrap().digest
+        );
         let vote = replica.prepare(mutation.clone()).unwrap();
         replica
             .commit_with_quorum(evidence(
@@ -2155,6 +2301,20 @@ mod tests {
         assert!(matches!(
             replica.prepare(wrong),
             Err(EffectJournalError::Conflict)
+        ));
+        // Once adoption ratchets the row fence forward, a mutation stamped
+        // behind it is refused as a stale write.
+        replica
+            .adopt_recovered(
+                mutation.effect_id,
+                mutation.subscription_id,
+                3,
+                Some(mutation.clone()),
+            )
+            .unwrap();
+        assert!(matches!(
+            replica.prepare(mutation),
+            Err(EffectJournalError::StaleEpoch)
         ));
     }
 
@@ -2314,7 +2474,7 @@ mod tests {
             Ok(EffectReplicaReply {
                 replica: node.clone(),
                 effect_id: result.effect_id,
-                ownership_epoch: result.ownership_epoch,
+                ownership_epoch: store.local_state(result.effect_id)?.ownership_epoch,
                 result,
             })
         }
@@ -2389,6 +2549,8 @@ mod tests {
         occupied: std::sync::Mutex<Option<EffectOccupant>>,
         resolved: std::sync::Mutex<Vec<EffectOccupant>>,
         not_pending: std::sync::Mutex<Option<u64>>,
+        fail_mutations: std::sync::Mutex<usize>,
+        events: std::sync::Mutex<Vec<&'static str>>,
     }
 
     #[async_trait::async_trait]
@@ -2412,6 +2574,7 @@ mod tests {
                     subscription_id: occupant.subscription_id,
                 });
             }
+            self.events.lock().unwrap().push("append");
             let mut appended = self.appended.lock().unwrap();
             if !appended
                 .iter()
@@ -2431,6 +2594,7 @@ mod tests {
             _consume: &EffectConsume,
             request_id: Uuid,
         ) -> Result<(), EffectJournalError> {
+            self.events.lock().unwrap().push("frontier");
             self.frontier_requests.lock().unwrap().push(request_id);
             Ok(())
         }
@@ -2439,6 +2603,7 @@ mod tests {
             &self,
             target: &EffectReleaseTarget,
         ) -> Result<EffectReleaseOutcome, EffectJournalError> {
+            self.events.lock().unwrap().push("release");
             if let Some(committed) = *self.not_pending.lock().unwrap() {
                 return Ok(EffectReleaseOutcome::NotPending { committed });
             }
@@ -2453,6 +2618,12 @@ mod tests {
             &self,
             _mutation: &EffectStateMutation,
         ) -> Result<(), EffectJournalError> {
+            self.events.lock().unwrap().push("mutate");
+            let mut failures = self.fail_mutations.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(EffectJournalError::Unavailable);
+            }
             Ok(())
         }
 
@@ -2589,6 +2760,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_committed_commits_the_frontier_after_state_mutations() {
+        let (_directories, _nodes, _transport, coordinator) = apply_fixture();
+        let mut mutation = scoped_declare(Uuid::new_v4());
+        let EffectTransition::Declare {
+            state_mutations, ..
+        } = &mut mutation.transition
+        else {
+            panic!("expected declare")
+        };
+        state_mutations.push(EffectStateMutation {
+            store_id: Uuid::from_u128(5),
+            mutation_id: Uuid::from_u128(6),
+            op: crate::state_store::StateStoreMutationOp::DeleteRow { key: b"k".to_vec() },
+        });
+        coordinator.apply(mutation.clone()).await.unwrap();
+        let sink = RecordingApply::default();
+        // Exhaust the bounded in-place retries so the apply fails while the
+        // declared mutation is still unsettled.
+        *sink.fail_mutations.lock().unwrap() = MAX_APPLY_ATTEMPTS;
+        assert!(matches!(
+            coordinator.apply_committed(mutation.effect_id, &sink).await,
+            Err(EffectJournalError::Unavailable)
+        ));
+        // The frontier must not have committed: leaving it unmoved lets the
+        // next drive refetch the same records and replay this exact effect
+        // instead of silently skipping the consumed input.
+        assert!(sink.frontier_requests.lock().unwrap().is_empty());
+        let applied = coordinator
+            .apply_committed(mutation.effect_id, &sink)
+            .await
+            .unwrap();
+        assert!(matches!(
+            applied.transition,
+            EffectTransition::Applied { .. }
+        ));
+        let events = sink.events.lock().unwrap().clone();
+        let last_mutate = events.iter().rposition(|event| *event == "mutate");
+        let first_frontier = events.iter().position(|event| *event == "frontier");
+        assert!(
+            last_mutate.is_some() && first_frontier.is_some() && last_mutate < first_frontier,
+            "every mutation must settle before the frontier commits: {events:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn apply_committed_survives_a_member_replica_loss() {
         let (_directories, nodes, transport, coordinator) = apply_fixture();
         let mutation = scoped_declare(Uuid::new_v4());
@@ -2603,6 +2819,78 @@ mod tests {
             applied.transition,
             EffectTransition::Applied { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn apply_committed_converges_across_an_ownership_epoch_move() {
+        // A Declare committed under epoch 1 keeps its stamp; after the
+        // assignment moves to epoch 2, the recovered coordinator replans the
+        // identical page into the identical effect identity and must drive it
+        // terminal - not wedge on the old epoch stamp.
+        let (_directories, nodes, transport, coordinator) = apply_fixture();
+        let mutation = scoped_declare(Uuid::new_v4());
+        let committed = coordinator.apply(mutation.clone()).await.unwrap();
+        assert!(matches!(
+            committed.transition,
+            EffectTransition::Declare { .. }
+        ));
+
+        for node in &nodes {
+            transport
+                .adopt(node, mutation.effect_id, 2, Some(committed.clone()))
+                .await
+                .unwrap();
+        }
+        let recovered = EffectCoordinator::new(
+            crate::reader::SubscriptionProgressAssignment::try_new(
+                Uuid::from_u128(0),
+                nodes[0].clone(),
+                crate::active_range::ReplicaSet::try_new(nodes.clone()).unwrap(),
+                2,
+            )
+            .unwrap(),
+            transport.clone(),
+        );
+
+        // The identical decision replanned under the new epoch is the same
+        // request: the journal re-verifies the committed row instead of
+        // conflicting on the epoch stamp.
+        let mut replanned = mutation.clone();
+        replanned.ownership_epoch = 2;
+        recovered.apply(replanned).await.unwrap();
+        let observed = recovered
+            .read_committed(mutation.effect_id)
+            .await
+            .unwrap()
+            .expect("committed declare survives the epoch move");
+        assert!(decisions_equal(&observed, &committed));
+
+        let sink = RecordingApply::default();
+        let applied = recovered
+            .apply_committed(mutation.effect_id, &sink)
+            .await
+            .unwrap();
+        assert!(matches!(
+            applied.transition,
+            EffectTransition::Applied { .. }
+        ));
+        assert_eq!(sink.appended.lock().unwrap().len(), 1);
+        assert_eq!(sink.frontier_requests.lock().unwrap().len(), 1);
+        let expected_mutations = match &committed.transition {
+            EffectTransition::Declare {
+                state_mutations, ..
+            } => state_mutations.len(),
+            _ => 0,
+        };
+        assert_eq!(
+            sink.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| **event == "mutate")
+                .count(),
+            expected_mutations
+        );
     }
 
     #[tokio::test]

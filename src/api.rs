@@ -2295,6 +2295,18 @@ async fn member_coordinator_inner(
             }
         }
     }
+    // A quorum holding the identical prepared row has already chosen that
+    // mutation; its residue only means the coordinator died between phases.
+    // Foreign mutations can never supersede it, so settle the chosen
+    // decision here rather than letting the residue wedge the chain behind
+    // lagging-witness refusals until an ownership epoch happens to ratchet.
+    if let Err(error) = coordinator.settle_stranded_prepare().await {
+        tracing::warn!(
+            %error,
+            subscription = %definition.subscription_id,
+            "Subscription progress stranded prepare could not be settled"
+        );
+    }
     Ok((coordinator, assignment, definition))
 }
 
@@ -2388,6 +2400,23 @@ impl SubscriptionProgressRecoverySupervisor {
                 continue;
             };
             let alive = coordinator.owner_available().await;
+            if alive {
+                // A live owner can still host a stale replica set (a Node
+                // that missed commits while it was down answers stale_epoch
+                // forever until adoption catches it up). Drive the placement
+                // convergence here so lagging replicas heal under a healthy
+                // owner instead of waiting for a member request to hit a
+                // dead-owner path.
+                if let Err(error) =
+                    progress_owner_converged(state, coordinator.clone(), assignment.clone()).await
+                {
+                    tracing::warn!(
+                        error = %error.message,
+                        subscription = %assignment.subscription_id,
+                        "Subscription progress replica convergence failed"
+                    );
+                }
+            }
             let should_recover = {
                 let mut failures = self
                     .failures
@@ -3020,6 +3049,11 @@ async fn member_replayed(
 
 /// Applies member ops with request-identity dedup: a retry of a committed
 /// request returns the recorded outcome rather than a second mutation.
+/// The mutation's frontier CAS can legitimately lose to a concurrent Pipe
+/// drive or member commit between the coordinator's read and the
+/// replicas' prepare — a spurious Conflict to the caller — so the same
+/// request identity re-bases on a fresh committed read a bounded number
+/// of times before surfacing a genuine conflict.
 async fn member_apply(
     coordinator: &crate::reader::SubscriptionProgressCoordinator,
     request_id: Uuid,
@@ -3028,14 +3062,26 @@ async fn member_apply(
     if let Some(state) = member_replayed(coordinator, request_id, &lease_ops).await? {
         return Ok(state);
     }
-    let tick = read_member_state(coordinator)
-        .await?
-        .last_tick
-        .saturating_add(1);
-    coordinator
-        .apply_member_ops(request_id, tick, lease_ops)
-        .await
-        .map_err(subscription_progress_api_error)?;
+    let mut attempts = 0u8;
+    loop {
+        let tick = read_member_state(coordinator)
+            .await?
+            .last_tick
+            .saturating_add(1);
+        match coordinator
+            .apply_member_ops(request_id, tick, lease_ops.clone())
+            .await
+        {
+            Err(
+                crate::reader::SubscriptionProgressError::Conflict
+                | crate::reader::SubscriptionProgressError::Sequence,
+            ) if attempts < 8 => attempts += 1,
+            outcome => {
+                outcome.map_err(subscription_progress_api_error)?;
+                break;
+            }
+        }
+    }
     read_member_state(coordinator).await
 }
 
@@ -3086,24 +3132,39 @@ async fn subscription_member_join(
         .is_some()
     {
         // An established frontier already exists: the Join rides the next
-        // sequence under the current cursor boundary.
-        let prior = read_member_state(&coordinator).await?;
-        let member_epoch = prior
-            .member_epochs
-            .get(&request.member_id)
-            .copied()
-            .map_or(1, |epoch| epoch.saturating_add(1));
-        coordinator
-            .apply_member_ops(
-                request.request_id,
-                prior.last_tick.saturating_add(1),
-                vec![crate::reader::SubscriptionLeaseOp::Join {
-                    member_id: request.member_id,
-                    member_epoch,
-                }],
-            )
-            .await
-            .map_err(subscription_progress_api_error)?;
+        // sequence under the current cursor boundary. Its frontier CAS can
+        // lose to a concurrent Pipe drive or member commit — re-base on a
+        // fresh read a bounded number of times under the same request
+        // identity rather than surfacing a spurious conflict.
+        let mut attempts = 0u8;
+        loop {
+            let prior = read_member_state(&coordinator).await?;
+            let member_epoch = prior
+                .member_epochs
+                .get(&request.member_id)
+                .copied()
+                .map_or(1, |epoch| epoch.saturating_add(1));
+            match coordinator
+                .apply_member_ops(
+                    request.request_id,
+                    prior.last_tick.saturating_add(1),
+                    vec![crate::reader::SubscriptionLeaseOp::Join {
+                        member_id: request.member_id,
+                        member_epoch,
+                    }],
+                )
+                .await
+            {
+                Err(
+                    crate::reader::SubscriptionProgressError::Conflict
+                    | crate::reader::SubscriptionProgressError::Sequence,
+                ) if attempts < 8 => attempts += 1,
+                outcome => {
+                    outcome.map_err(subscription_progress_api_error)?;
+                    break;
+                }
+            }
+        }
         read_member_state(&coordinator).await?
     } else {
         // First member: establish the declared-start frontier and the Join
@@ -5166,6 +5227,7 @@ async fn drive_pipe(
                             refused: Vec::new(),
                             pane_rows: Default::default(),
                             pane_rows_saturated: false,
+                            watermark: None,
                         });
                     }
                     let start = frontier.sequence as usize % feeds.len();
@@ -5372,18 +5434,27 @@ async fn pipe_drive_fetch_page(
     // Window pane-close and expiry resolve at fetch time
     // alongside the page; the outcome rides inside the
     // Declare so a replayed effect never re-scans.
-    let (emissions, expired) = match &pipe.operation {
+    let (emissions, expired, watermark) = match &pipe.operation {
         crate::control::PipeOperation::Window {
             window_ns,
             max_late_ns,
+            watermark_ns,
             expire_ns,
             ..
-        } if pipe.output_feed_id.is_some() || expire_ns.is_some() => {
-            resolve_window_emissions(state, pipe, *window_ns, *max_late_ns, *expire_ns, &records)
-                .await
-                .map_err(|_| crate::effect::EffectJournalError::Unavailable)?
+        } if pipe.output_feed_id.is_some() || expire_ns.is_some() || watermark_ns.is_some() => {
+            resolve_window_emissions(
+                state,
+                pipe,
+                *window_ns,
+                *max_late_ns,
+                *watermark_ns,
+                *expire_ns,
+                &records,
+            )
+            .await
+            .map_err(|_| crate::effect::EffectJournalError::Unavailable)?
         }
-        _ => (Vec::new(), Vec::new()),
+        _ => (Vec::new(), Vec::new(), None),
     };
     // `LIMIT KEYS`/`LIMIT BYTES` resolve alongside the
     // page on the same serving replica: the admitted and
@@ -5427,6 +5498,7 @@ async fn pipe_drive_fetch_page(
         refused,
         pane_rows,
         pane_rows_saturated,
+        watermark,
     };
     if let Ok(mut tally) = tally.lock() {
         tally.records = page.records.len() as u64;
@@ -7386,21 +7458,32 @@ async fn resolve_window_emissions(
     pipe: &crate::control::PipeDefinition,
     window_ns: u64,
     max_late_ns: Option<u64>,
+    watermark_ns: Option<u64>,
     expire_ns: Option<u64>,
     records: &[crate::pipe::FetchedRecord],
-) -> Result<(Vec<crate::pipe::WindowEmission>, Vec<Vec<u8>>), ApiError> {
+) -> Result<
+    (
+        Vec<crate::pipe::WindowEmission>,
+        Vec<Vec<u8>>,
+        Option<(u64, u64)>,
+    ),
+    ApiError,
+> {
     let store_id = pipe
         .output_store_id
         .ok_or_else(|| ApiError::conflict("Window Pipe has no output StateStore"))?;
     let pane_ns = crate::pipe::window_pane_ns(window_ns);
-    // Closed panes publish only when the Pipe declared an emission Feed.
-    let emit_enabled = max_late_ns.is_some() && pipe.output_feed_id.is_some();
-    // The deterministic "now" for close decisions: the newest ingest
-    // timestamp this page observed, floored by the driver's own clock so
-    // panes still close while input idles. The resolved set journals
-    // inside the Declare, so a replay never re-resolves.
+    // Closed panes publish only when the Pipe declared an emission Feed
+    // under either lateness model — ingest-clock `MAX_LATE` or the
+    // event-time `WATERMARK` horizon.
+    let emit_enabled =
+        (max_late_ns.is_some() || watermark_ns.is_some()) && pipe.output_feed_id.is_some();
+    // The deterministic ingest "now": the newest ingest timestamp this
+    // page observed, floored by the driver's own clock. It decides only
+    // `EXPIRE` — row retention is a storage contract that must still
+    // advance while event input idles.
     let wall_now = u64::try_from(unix_ns().max(0)).unwrap_or(0);
-    let now_ns = records
+    let expire_now = records
         .iter()
         .map(|record| u64::try_from(record.ingest_time_ns).unwrap_or(0))
         .max()
@@ -7425,35 +7508,68 @@ async fn resolve_window_emissions(
             candidates.push(replica.clone());
         }
     }
-    // Closable panes satisfy (pane + 1) * pane_ns + max_late <= now and
-    // expired panes satisfy pane_end + expire <= now; the range bound
-    // prefilters whichever reaches furthest, and the per-row check
+    // WATERMARK mode: the durable horizon lives in one store row the
+    // pane-posting scan also carries — point-read it first so the close
+    // bound can cover every pane the horizon already passed (a stored
+    // horizon can exceed what this page's events alone would imply).
+    let mut watermark_before = 0u64;
+    if watermark_ns.is_some() {
+        let reply = serve_state_store_read(
+            state,
+            &assignment,
+            store_id,
+            crate::pipe::window_watermark_row_key(),
+            None,
+            false,
+            Some(500),
+        )
+        .await?;
+        if let Some(found) = reply.result.row {
+            watermark_before = crate::index::decode_accumulator(&found.payload)
+                .map(|(_, sum)| u64::try_from(sum).unwrap_or(0))
+                .unwrap_or(0);
+        }
+    }
+    // The new horizon advances monotonically on event-time evidence:
+    // `max(event) - watermark` — ingest order never moves it.
+    let page_max_event = records
+        .iter()
+        .map(|record| u64::try_from(record.event_time_ns).unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    let watermark_after =
+        watermark_ns.map(|bound| watermark_before.max(page_max_event.saturating_sub(bound)));
+    // Under WATERMARK the close clock is the durable horizon; under
+    // MAX_LATE it stays the ingest `now`.
+    let emit_now = watermark_after.unwrap_or(expire_now);
+    let emit_after = if emit_enabled {
+        Some(watermark_ns.map(|_| 0u64).or(max_late_ns).unwrap_or(0))
+    } else {
+        None
+    };
+    // Closable panes satisfy pane_end + emit_after <= emit_now and
+    // expired panes satisfy pane_end + expire <= expire_now; the range
+    // bound prefilters whichever reaches furthest, and the per-row check
     // decides.
-    let bound_max = |bound_ns: u64| {
-        i64::try_from((now_ns.saturating_sub(bound_ns) / pane_ns).saturating_sub(1))
+    let bound_max = |clock: u64, bound_ns: u64| {
+        i64::try_from((clock.saturating_sub(bound_ns) / pane_ns).saturating_sub(1))
             .unwrap_or(i64::MAX)
     };
     let scan_max = [
-        emit_enabled.then(|| bound_max(max_late_ns.unwrap_or(0))),
-        expire_ns.map(bound_max),
+        emit_after.map(|after| bound_max(emit_now, after)),
+        expire_ns.map(|expire| bound_max(expire_now, expire)),
     ]
     .into_iter()
     .flatten()
     .max()
     .unwrap_or(-1);
-    let mut reply = None;
-    let mut last_error: Option<ApiError> = None;
-    for replica in &candidates {
-        let read = crate::state_store::StateStoreReadRequest {
-            owner: assignment.owner.clone(),
-            receiver: replica.clone(),
-            store_id,
-            ownership_epoch: assignment.ownership_epoch,
-            key: Vec::new(),
-            strict: false,
-            wait_ms: 500,
-            by_named: None,
-            by_named_range: Some(crate::state_store::StateStoreNamedRangeRead {
+    let reply = serve_state_store_read(
+        state,
+        &assignment,
+        store_id,
+        Vec::new(),
+        Some(NamedReadSelection::Range(
+            crate::state_store::StateStoreNamedRangeRead {
                 name: crate::pipe::WINDOW_PANE_NAME.to_owned(),
                 lower: None,
                 upper: Some(crate::control::IndexBound {
@@ -7461,58 +7577,60 @@ async fn resolve_window_emissions(
                     inclusive: true,
                 }),
                 limit: 64,
-            }),
-        };
-        let outcome = if Some(replica) == state.storage_node_id.as_ref()
-            && state.state_store_journal.is_some()
-        {
-            state
-                .state_store_journal
-                .as_ref()
-                .unwrap()
-                .read_row(read)
-                .await
-                .map_err(state_store_api_error)
-        } else {
-            match state_store_transport_for(state, &assignment) {
-                Ok(transport) => transport
-                    .read(replica, read)
-                    .await
-                    .map_err(state_store_api_error),
-                Err(error) => Err(error),
-            }
-        };
-        match outcome {
-            Ok(result) => {
-                reply = Some(result);
-                break;
-            }
-            Err(error) => last_error = Some(error),
-        }
-    }
+            },
+        )),
+        false,
+        Some(500),
+    )
+    .await
     // A scan that cannot complete fails the whole resolve — the drive
     // retries rather than emitting a partial close set. Emission
     // deletes are atomic with their outputs, so a retry is idempotent.
-    let Some(reply) = reply else {
-        return Err(last_error.unwrap_or_else(|| {
+    .map_err(|error| {
+        if matches!(
+            error.status,
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::CONFLICT
+        ) {
+            error
+        } else {
             ApiError::unavailable("no StateStore replica could serve the emission scan")
-        }));
-    };
+        }
+    })?;
     let mut emissions = Vec::new();
     let mut expired = Vec::new();
+    let watermark_row_key = crate::pipe::window_watermark_row_key();
+    let scan_seq = reply.result.applied_seq;
     for row in reply.result.named_rows {
+        if row.key == watermark_row_key {
+            continue;
+        }
+        if let Some((_group, pane)) = crate::pipe::window_emitted_marker_key_parse(&row.key) {
+            // Marker rows expire on the ingest clock like pane rows —
+            // revision memory has the same retention bound.
+            if let Some(bound) = expire_ns.and_then(|expire| {
+                pane.checked_add(1)
+                    .and_then(|end| end.checked_mul(pane_ns))
+                    .and_then(|end| end.checked_add(expire))
+            }) {
+                if expire_now >= bound {
+                    expired.push(row.key.clone());
+                }
+            }
+            continue;
+        }
         match crate::pipe::window_row_disposition(
             &row.key,
             &row.payload,
             pane_ns,
-            if emit_enabled { max_late_ns } else { None },
+            emit_after,
             expire_ns,
-            now_ns,
+            emit_now,
+            expire_now,
         ) {
             crate::pipe::WindowPaneDisposition::Emit(mut emission) => {
                 // The serving replica's applied journal sequence is the
                 // version evidence for every result this scan produced.
-                emission.store_seq = reply.result.applied_seq;
+                emission.store_seq = scan_seq;
                 emissions.push(emission)
             }
             crate::pipe::WindowPaneDisposition::Expire => expired.push(row.key.clone()),
@@ -7522,9 +7640,46 @@ async fn resolve_window_emissions(
             break;
         }
     }
+    // Marker row keys carry a `u32::MAX` length prefix, so they always
+    // sort after their pane row in the named scan and the bounded page
+    // can split a pane from its marker entirely. Resolving a revision
+    // inline from scan order would re-publish a revised pane as
+    // `revision 1` on the first emission's writer session, whose
+    // differing payload then conflicts at append. Read each emitted
+    // pane's marker point-exactly and refuse marker evidence older than
+    // the scan's — the marker strictly precedes any pane row needing a
+    // revision, so a replica at or beyond `scan_seq` answers
+    // conclusively.
+    for emission in &mut emissions {
+        let marker = serve_state_store_read(
+            state,
+            &assignment,
+            store_id,
+            crate::pipe::window_emitted_marker_key(&emission.group_tagged, emission.pane),
+            None,
+            false,
+            Some(500),
+        )
+        .await?;
+        if marker.result.applied_seq < scan_seq {
+            return Err(ApiError::unavailable(
+                "emitted-marker read served a store version older than the emission scan",
+            ));
+        }
+        emission.revision = marker
+            .result
+            .row
+            .and_then(|row| crate::index::decode_accumulator(&row.payload))
+            .map(|(count, _): (u64, i128)| count.saturating_add(1))
+            .unwrap_or(1);
+    }
     emissions.sort_by(|a, b| a.row_key.cmp(&b.row_key));
     expired.sort();
-    Ok((emissions, expired))
+    Ok((
+        emissions,
+        expired,
+        watermark_after.map(|after| (watermark_before, after)),
+    ))
 }
 
 /// Fetch-time pane-row resolution for `LIMIT KEYS`/`LIMIT BYTES`: scan
@@ -8312,6 +8467,23 @@ enum EffectAppendOutcome {
     },
 }
 
+/// Fold newly skipped positions into a frontier's cumulative `skipped`
+/// evidence map without duplicating cursors already recorded.
+fn merge_skipped(
+    mut skipped: BTreeMap<RangeId, Vec<String>>,
+    add: &BTreeMap<RangeId, Vec<String>>,
+) -> BTreeMap<RangeId, Vec<String>> {
+    for (range, cursors) in add {
+        let existing = skipped.entry(*range).or_default();
+        for cursor in cursors {
+            if !existing.contains(cursor) {
+                existing.push(cursor.clone());
+            }
+        }
+    }
+    skipped
+}
+
 fn progress_apply_error(
     error: crate::reader::SubscriptionProgressError,
 ) -> crate::effect::EffectJournalError {
@@ -8319,6 +8491,13 @@ fn progress_apply_error(
         crate::reader::SubscriptionProgressError::Unavailable
         | crate::reader::SubscriptionProgressError::AmbiguousCommit
         | crate::reader::SubscriptionProgressError::NoQuorum
+        // Placement moves and sequence transitions mid-commit are transient
+        // by construction: the next apply attempt reads a fresh committed
+        // frontier and retries the identical request identity rather than
+        // aborting the effect.
+        | crate::reader::SubscriptionProgressError::StaleEpoch
+        | crate::reader::SubscriptionProgressError::Sequence
+        | crate::reader::SubscriptionProgressError::InvalidAssignment
         | crate::reader::SubscriptionProgressError::Engine(_)
         | crate::reader::SubscriptionProgressError::Serialization(_) => {
             crate::effect::EffectJournalError::Unavailable
@@ -8466,11 +8645,18 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
             .await
             .map(|_| ())
             .map_err(|error| match error {
+                // Placement and convergence failures are transient by
+                // definition: the apply retries the identical dedupe identity
+                // once the store's quorum settles rather than aborting an
+                // effect whose frontier has not committed yet.
                 crate::state_store::StateStoreMutationError::NoQuorum
                 | crate::state_store::StateStoreMutationError::Unavailable
                 | crate::state_store::StateStoreMutationError::AmbiguousCommit
                 | crate::state_store::StateStoreMutationError::ApplyFailed
-                | crate::state_store::StateStoreMutationError::Diverged => {
+                | crate::state_store::StateStoreMutationError::Diverged
+                | crate::state_store::StateStoreMutationError::StaleEpoch
+                | crate::state_store::StateStoreMutationError::InvalidAssignment
+                | crate::state_store::StateStoreMutationError::Sequence => {
                     crate::effect::EffectJournalError::Unavailable
                 }
                 _ => crate::effect::EffectJournalError::Conflict,
@@ -8514,6 +8700,29 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
         consume: &crate::effect::EffectConsume,
         request_id: Uuid,
     ) -> Result<(), crate::effect::EffectJournalError> {
+        self.commit_frontier_inner(consume, request_id, false).await
+    }
+
+    async fn commit_frontier_skipped(
+        &self,
+        consume: &crate::effect::EffectConsume,
+        request_id: Uuid,
+    ) -> Result<(), crate::effect::EffectJournalError> {
+        self.commit_frontier_inner(consume, request_id, true).await
+    }
+}
+
+impl LiveEffectApply<'_> {
+    /// The shared frontier commit: `mark_skipped` additionally records the
+    /// declared positions in the frontier's `skipped` evidence so an
+    /// abandoned effect's input is durably passed over rather than
+    /// re-planned by every later drive.
+    async fn commit_frontier_inner(
+        &self,
+        consume: &crate::effect::EffectConsume,
+        request_id: Uuid,
+        mark_skipped: bool,
+    ) -> Result<(), crate::effect::EffectJournalError> {
         let committed = self
             .progress
             .read_committed()
@@ -8530,12 +8739,31 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
             if current.expected_frontier_cursor(member_feed) == Some(consume.cursor.as_str()) {
                 return Ok(());
             }
+            if mark_skipped
+                && current.expected_frontier_cursor(member_feed)
+                    != consume.expected_cursor.as_deref()
+            {
+                // The frontier moved under a different decision since this
+                // consume was declared: the input's disposition now belongs
+                // to that decision, so the abandoned-consume skip settles
+                // as a no-op rather than conflicting forever.
+                return Ok(());
+            }
         }
         let prior_entry = member_feed.and_then(|feed| {
             committed
                 .as_ref()
                 .and_then(|row| row.member_progress.get(&feed))
         });
+        let skip_add: BTreeMap<RangeId, Vec<String>> = if mark_skipped {
+            consume
+                .positions
+                .iter()
+                .map(|(range, cursor)| (*range, vec![cursor.clone()]))
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
         let mut member_progress = committed
             .as_ref()
             .map_or_else(BTreeMap::new, |row| row.member_progress.clone());
@@ -8547,7 +8775,10 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
                     positions: consume.positions.clone(),
                     quarantined: prior_entry
                         .map_or_else(BTreeMap::new, |entry| entry.quarantined.clone()),
-                    skipped: prior_entry.map_or_else(BTreeMap::new, |entry| entry.skipped.clone()),
+                    skipped: merge_skipped(
+                        prior_entry.map_or_else(BTreeMap::new, |entry| entry.skipped.clone()),
+                        &skip_add,
+                    ),
                     deferred: prior_entry
                         .map_or_else(BTreeMap::new, |entry| entry.deferred.clone()),
                 },
@@ -8576,13 +8807,17 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
             quarantine_add: BTreeMap::new(),
             quarantine_remove: BTreeMap::new(),
             skipped: match (member_feed, prior_entry) {
-                (_, Some(entry)) => entry.skipped.clone(),
-                (Some(_), None) => BTreeMap::new(),
-                (None, None) => committed
-                    .as_ref()
-                    .map_or_else(BTreeMap::new, |prior| prior.skipped.clone()),
+                (_, Some(entry)) => merge_skipped(entry.skipped.clone(), &skip_add),
+                // A fresh member entry's `skipped` restates this delta.
+                (Some(_), None) => skip_add.clone(),
+                (None, None) => merge_skipped(
+                    committed
+                        .as_ref()
+                        .map_or_else(BTreeMap::new, |prior| prior.skipped.clone()),
+                    &skip_add,
+                ),
             },
-            skip_add: BTreeMap::new(),
+            skip_add,
             deferred: match (member_feed, prior_entry) {
                 (_, Some(entry)) => entry.deferred.clone(),
                 (Some(_), None) => BTreeMap::new(),
@@ -8597,6 +8832,21 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
         };
         match self.progress.apply(mutation.clone()).await {
             Ok(_) => Ok(()),
+            Err(crate::reader::SubscriptionProgressError::Sequence) => {
+                // The frontier CAS lost to a quorum-held stranded prepare:
+                // the residue was already chosen, so commit it now and let
+                // the next drive tick re-plan against the settled tip.
+                if let Err(error) = self.progress.settle_stranded_prepare().await {
+                    tracing::warn!(
+                        %error,
+                        subscription = %self.subscription_id,
+                        "Subscription progress stranded prepare could not be settled"
+                    );
+                }
+                Err(progress_apply_error(
+                    crate::reader::SubscriptionProgressError::Sequence,
+                ))
+            }
             Err(crate::reader::SubscriptionProgressError::AmbiguousCommit)
             | Err(crate::reader::SubscriptionProgressError::NoQuorum) => self
                 .progress
@@ -16468,6 +16718,40 @@ mod tests {
         assert!(hot.recommended_batch_bytes <= 64 * 1024);
     }
 
+    #[test]
+    fn progress_apply_error_classifies_convergence_failures_as_retryable() {
+        use crate::reader::SubscriptionProgressError;
+        // Placement moves, sequence transitions, quorum gaps, and engine
+        // faults mid-commit are transient for the apply: the identical
+        // request identity retries rather than aborting the effect.
+        for error in [
+            SubscriptionProgressError::StaleEpoch,
+            SubscriptionProgressError::Sequence,
+            SubscriptionProgressError::InvalidAssignment,
+            SubscriptionProgressError::Unavailable,
+            SubscriptionProgressError::AmbiguousCommit,
+            SubscriptionProgressError::NoQuorum,
+        ] {
+            let code = error.code();
+            assert!(
+                matches!(
+                    progress_apply_error(error),
+                    crate::effect::EffectJournalError::Unavailable
+                ),
+                "{code} must classify retryable for the effect apply"
+            );
+        }
+        for error in [
+            SubscriptionProgressError::Conflict,
+            SubscriptionProgressError::TooLarge,
+        ] {
+            assert!(matches!(
+                progress_apply_error(error),
+                crate::effect::EffectJournalError::Conflict
+            ));
+        }
+    }
+
     fn delayed_head(position: u64, ingest_time_ns: i64) -> Option<((i64, Uuid), StoredRangeFrame)> {
         Some((
             (ingest_time_ns, Uuid::from_u128(u128::from(position) + 1)),
@@ -20572,6 +20856,8 @@ mod tests {
                 aggregation: crate::control::WindowAggregation::Count,
                 time: crate::control::WindowTime::Event,
                 max_late_ns: Some(1_000),
+                watermark_ns: None,
+                grace_ns: None,
                 expire_ns: None,
                 key_limit: None,
                 byte_limit: None,
@@ -20595,11 +20881,17 @@ mod tests {
         // An empty page resolves "now" on the driver's own clock, so it
         // still scans the store — and fails closed when that store has
         // no reachable placement rather than skipping idle panes.
-        assert!(
-            resolve_window_emissions(&state, &pipe, 60_000_000_000, Some(1_000), None, &[],)
-                .await
-                .is_err()
-        );
+        assert!(resolve_window_emissions(
+            &state,
+            &pipe,
+            60_000_000_000,
+            Some(1_000),
+            None,
+            None,
+            &[],
+        )
+        .await
+        .is_err());
 
         // A real page under a store with no journal placement fails the
         // whole resolve — the drive retries rather than emitting a
@@ -20609,6 +20901,7 @@ mod tests {
             &pipe,
             60_000_000_000,
             Some(1_000),
+            None,
             None,
             &[record("acct", 1_000)],
         )
