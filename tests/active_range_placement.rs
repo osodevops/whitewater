@@ -1632,6 +1632,7 @@ async fn activation_commits_pending_subscription_translations_until_applied() {
         ]),
         quarantined: BTreeMap::from([(right_range, vec!["poison-1".to_owned()])]),
         skipped: BTreeMap::new(),
+        deferred: BTreeMap::new(),
         tick: 11,
     };
 

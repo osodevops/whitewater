@@ -1486,6 +1486,12 @@ struct SubscriptionMemberLeaseRequest {
     work_id: Uuid,
     lease_ticks: Option<u64>,
     lease_epoch: Option<u64>,
+    /// Pins this claim to a Key window: the lease then exclusively serves
+    /// the records whose KeyToken maps into its coverage while unclaimed
+    /// windows deal across the windowed leases. Absent keeps the legacy
+    /// unfiltered delivery contract.
+    #[serde(default)]
+    key_window: Option<u16>,
 }
 
 #[derive(Deserialize)]
@@ -1535,6 +1541,11 @@ struct SubscriptionMemberAckRequest {
     quarantine: Option<BTreeMap<RangeId, Vec<String>>>,
     #[serde(default)]
     release_quarantine: Option<BTreeMap<RangeId, Vec<String>>>,
+    /// The opaque delivery evidence a windowed fetch issued; required on
+    /// acknowledgements under a Key-windowed lease so the frontier can
+    /// defer the positions the filtered page withheld for other windows.
+    #[serde(default)]
+    delivery_evidence: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1636,6 +1647,7 @@ struct SubscriptionCutoverFrontier {
 type RestatedFrontier<'a> = (
     &'a SubscriptionCutoverFrontier,
     BTreeMap<RangeId, String>,
+    BTreeMap<RangeId, Vec<String>>,
     BTreeMap<RangeId, Vec<String>>,
     BTreeMap<RangeId, Vec<String>>,
 );
@@ -1944,6 +1956,7 @@ async fn apply_pending_subscription_cutover(
                     positions: pending.positions.clone(),
                     quarantined: pending.quarantined.clone(),
                     skipped: pending.skipped.clone(),
+                    deferred: pending.deferred.clone(),
                 },
             );
         }
@@ -1967,6 +1980,9 @@ async fn apply_pending_subscription_cutover(
             quarantine_remove: BTreeMap::new(),
             skipped: pending.skipped.clone(),
             skip_add: BTreeMap::new(),
+            deferred_add: BTreeMap::new(),
+            deferred_remove: BTreeMap::new(),
+            deferred: pending.deferred.clone(),
             tick: pending.tick,
             lease_ops: Vec::new(),
         };
@@ -2066,6 +2082,7 @@ async fn subscription_cutover_translations(
                             .get(&source)
                             .into_iter()
                             .chain(staged.frontier.skipped.get(&source))
+                            .chain(staged.frontier.deferred.get(&source))
                             .flatten()
                             .cloned(),
                     );
@@ -2097,7 +2114,17 @@ async fn subscription_cutover_translations(
                                 skipped.entry(owner).or_default().push(cursor);
                             }
                         }
-                        (staged, positions, quarantined, skipped)
+                        let mut deferred = staged.frontier.deferred.clone();
+                        if let Some(list) = deferred.remove(&source) {
+                            for cursor in list {
+                                let owner = match tokens.get(&cursor) {
+                                    Some(token) if *token >= plan.split_at => right,
+                                    _ => source,
+                                };
+                                deferred.entry(owner).or_default().push(cursor);
+                            }
+                        }
+                        (staged, positions, quarantined, skipped, deferred)
                     })
                     .collect()
             }
@@ -2141,14 +2168,18 @@ async fn subscription_cutover_translations(
                         if let Some(list) = skipped.remove(&plan.right_range_id) {
                             skipped.entry(plan.left_range_id).or_default().extend(list);
                         }
-                        (staged, positions, quarantined, skipped)
+                        let mut deferred = staged.frontier.deferred.clone();
+                        if let Some(list) = deferred.remove(&plan.right_range_id) {
+                            deferred.entry(plan.left_range_id).or_default().extend(list);
+                        }
+                        (staged, positions, quarantined, skipped, deferred)
                     })
                     .collect()
             }
         };
     translated
         .into_iter()
-        .map(|(staged, positions, quarantined, skipped)| {
+        .map(|(staged, positions, quarantined, skipped, deferred)| {
             let sequence = staged.frontier.sequence.checked_add(1).ok_or_else(|| {
                 ApiError::unavailable("Subscription frontier sequence overflowed")
             })?;
@@ -2167,6 +2198,7 @@ async fn subscription_cutover_translations(
                 positions,
                 quarantined,
                 skipped,
+                deferred,
                 tick: staged.frontier.tick,
             })
         })
@@ -3104,6 +3136,7 @@ async fn subscription_member_join(
                             positions,
                             quarantined: BTreeMap::new(),
                             skipped: BTreeMap::new(),
+                            deferred: BTreeMap::new(),
                         },
                     );
                 }
@@ -3141,6 +3174,9 @@ async fn subscription_member_join(
                 quarantine_remove: BTreeMap::new(),
                 skipped: BTreeMap::new(),
                 skip_add: BTreeMap::new(),
+                deferred: BTreeMap::new(),
+                deferred_add: BTreeMap::new(),
+                deferred_remove: BTreeMap::new(),
                 tick: 1,
                 lease_ops: vec![crate::reader::SubscriptionLeaseOp::Join {
                     member_id: request.member_id,
@@ -3189,6 +3225,14 @@ async fn subscription_member_claim(
     let (coordinator, assignment, definition) =
         member_coordinator_recovering(&state, &request.subscription).await?;
     let lease_ticks = member_lease_ticks(request.lease_ticks)?;
+    if request
+        .key_window
+        .is_some_and(|window| window >= crate::reader::SUBSCRIPTION_WORK_WINDOWS)
+    {
+        return Err(ApiError::bad_request(
+            "key_window must name one of the Subscription's Key work windows",
+        ));
+    }
     let member_state = member_apply(
         &coordinator,
         request.request_id,
@@ -3197,6 +3241,7 @@ async fn subscription_member_claim(
             member_id: request.member_id,
             member_epoch: request.member_epoch,
             lease_ticks,
+            key_window: request.key_window,
         }],
     )
     .await?;
@@ -3401,18 +3446,56 @@ async fn subscription_member_ack(
             }
             let member_feed =
                 member_feed_selection(&state, &definition, request.feed.as_deref()).await?;
-            if let Some(latest) = coordinator
+            let committed_frontier = coordinator
                 .read_committed()
                 .await
-                .map_err(subscription_progress_api_error)?
+                .map_err(subscription_progress_api_error)?;
+            if let Some(latest) = committed_frontier
+                .as_ref()
                 .filter(|latest| latest.request_id == request.request_id)
             {
+                let replay_deferred = latest.deferred_add.clone();
+                let replay_deferred_remove = latest.deferred_remove.clone();
+                let decoded = decode_delivery_evidence(request.delivery_evidence.as_deref())?;
+                let (replayed_add, replayed_remove) = decoded
+                    .map(|(delivered, withheld)| {
+                        // The pre-ack deferred set is recoverable from the
+                        // committed row: the removed positions were in it,
+                        // and added positions can never intersect the
+                        // delivered set (a page delivers xor withholds).
+                        let entry = member_feed.and_then(|feed| latest.member_progress.get(&feed));
+                        let mut prior = entry
+                            .map(|entry| entry.deferred.clone())
+                            .unwrap_or_else(|| latest.deferred.clone());
+                        let removes = entry
+                            .map(|entry| {
+                                latest
+                                    .deferred_remove
+                                    .iter()
+                                    .filter(|(range, _)| entry.positions.contains_key(*range))
+                                    .map(|(range, cursors)| (*range, cursors.clone()))
+                                    .collect::<BTreeMap<RangeId, Vec<String>>>()
+                            })
+                            .unwrap_or_else(|| latest.deferred_remove.clone());
+                        for (range, cursors) in removes {
+                            let held = prior.entry(range).or_default();
+                            for cursor in cursors {
+                                if !held.contains(&cursor) {
+                                    held.push(cursor);
+                                }
+                            }
+                        }
+                        (withheld, intersect_deferred(&delivered, &prior))
+                    })
+                    .unwrap_or_default();
                 if latest.member_feed != member_feed
                     || latest.cursor != cursor
                     || latest.positions != positions
                     || latest.quarantine_add != request.quarantine.clone().unwrap_or_default()
                     || latest.quarantine_remove
                         != request.release_quarantine.clone().unwrap_or_default()
+                    || replay_deferred != replayed_add
+                    || replay_deferred_remove != replayed_remove
                 {
                     return Err(ApiError {
                         status: StatusCode::CONFLICT,
@@ -3438,11 +3521,10 @@ async fn subscription_member_ack(
                 lease_epoch: request.lease_epoch,
                 expires_at_tick: 0,
                 exhausted_applied: false,
+                key_window: None,
             };
-            let tick = read_member_state(&coordinator)
-                .await?
-                .last_tick
-                .saturating_add(1);
+            let members = read_member_state(&coordinator).await?;
+            let tick = members.last_tick.saturating_add(1);
             let ack_ranges = positions.len() as u64;
             let quarantine_add = request.quarantine.as_ref().map_or(0_u64, |delta| {
                 delta.values().map(Vec::len).sum::<usize>() as u64
@@ -3450,6 +3532,81 @@ async fn subscription_member_ack(
             let quarantine_remove = request.release_quarantine.as_ref().map_or(0_u64, |delta| {
                 delta.values().map(Vec::len).sum::<usize>() as u64
             });
+            // Per-Key work subdivision: a windowed lease must echo the
+            // delivery evidence its filtered fetch issued — the withheld
+            // positions defer to their windows instead of being silently
+            // consumed, and positions the member claims as quarantined
+            // must be positions it was actually delivered.
+            let lease_window = members
+                .leases
+                .get(&request.work_id)
+                .and_then(|lease| lease.key_window);
+            let deferred = match (lease_window, request.delivery_evidence.as_deref()) {
+                (Some(_), None) => {
+                    return Err(ApiError {
+                        status: StatusCode::CONFLICT,
+                        message: "Key-windowed work requires the fetch's delivery_evidence at ack"
+                            .to_owned(),
+
+                        code: Some("conflict"),
+                    });
+                }
+                (None, Some(_)) => {
+                    return Err(ApiError::bad_request(
+                        "delivery_evidence is only valid for Key-windowed work",
+                    ));
+                }
+                (Some(_), Some(evidence)) => {
+                    let (delivered, withheld) = decode_delivery_evidence(Some(evidence))?
+                        .ok_or_else(|| {
+                            ApiError::bad_request("delivery_evidence failed to decode")
+                        })?;
+                    if delivered.iter().any(|(range, cursors)| {
+                        withheld.get(range).is_some_and(|other| {
+                            cursors.iter().any(|cursor| other.contains(cursor))
+                        })
+                    }) {
+                        return Err(ApiError::bad_request(
+                            "delivery_evidence delivered and withheld positions overlap",
+                        ));
+                    }
+                    if let Some(quarantined) = &request.quarantine {
+                        let undelivered = quarantined.iter().any(|(range, cursors)| {
+                            cursors.iter().any(|cursor| {
+                                !delivered
+                                    .get(range)
+                                    .is_some_and(|held| held.contains(cursor))
+                            })
+                        });
+                        if undelivered {
+                            return Err(ApiError {
+                                status: StatusCode::CONFLICT,
+                                message: "quarantined positions must be delivered work".to_owned(),
+
+                                code: Some("conflict"),
+                            });
+                        }
+                    }
+                    let committed_deferred = member_feed
+                        .and_then(|feed| {
+                            committed_frontier
+                                .as_ref()
+                                .and_then(|frontier| frontier.member_progress.get(&feed))
+                        })
+                        .map(|entry| entry.deferred.clone())
+                        .or_else(|| {
+                            committed_frontier
+                                .as_ref()
+                                .map(|frontier| frontier.deferred.clone())
+                        })
+                        .unwrap_or_default();
+                    crate::reader::SubscriptionDeferredDelta {
+                        add: withheld,
+                        remove: intersect_deferred(&delivered, &committed_deferred),
+                    }
+                }
+                (None, None) => crate::reader::SubscriptionDeferredDelta::default(),
+            };
             let quarantine = crate::reader::SubscriptionQuarantineDelta {
                 add: request.quarantine.unwrap_or_default(),
                 remove: request.release_quarantine.unwrap_or_default(),
@@ -3465,6 +3622,7 @@ async fn subscription_member_ack(
                             cursor,
                             positions,
                             quarantine,
+                            deferred,
                         )
                         .await
                         .map_err(subscription_progress_api_error)?;
@@ -3478,6 +3636,7 @@ async fn subscription_member_ack(
                             cursor,
                             positions,
                             quarantine,
+                            deferred,
                         )
                         .await
                         .map_err(subscription_progress_api_error)?;
@@ -3578,6 +3737,13 @@ struct SubscriptionMemberFetchResponse {
     /// redelivering: those positions moved to quarantine or the durable
     /// skipped set, and the returned page is the work after them.
     exhausted: Option<ExhaustedDeliveryEvidence>,
+    /// The Key window the serving lease pinned, when any.
+    key_window: Option<u16>,
+    /// Opaque server-issued evidence of exactly which positions this
+    /// windowed page delivered and which it withheld for other windows;
+    /// the member echoes it verbatim on `ack` so withheld positions are
+    /// deferred rather than silently consumed.
+    delivery_evidence: Option<String>,
 }
 
 /// The positions an over-budget claim passed over under its declared
@@ -3640,6 +3806,7 @@ async fn subscription_member_fetch(
         lease_epoch: request.lease_epoch,
         expires_at_tick: 0,
         exhausted_applied: false,
+        key_window: None,
     };
     let tracker = crate::reader::SubscriptionLeaseTracker::from_state(
         members.clone(),
@@ -3669,6 +3836,19 @@ async fn subscription_member_fetch(
         &committed_frontier,
     )
     .await?;
+    // Per-Key work subdivision: a windowed lease exclusively serves the
+    // records whose KeyToken falls inside its coverage — its pinned
+    // window plus the unclaimed windows dealt to it deterministically.
+    let lease_window = members
+        .leases
+        .get(&request.work_id)
+        .and_then(|lease| lease.key_window);
+    let window_coverage: Option<BTreeSet<u16>> = lease_window.map(|_| {
+        crate::reader::subscription_work_coverage(&members.leases, members.last_tick)
+            .get(&request.work_id)
+            .cloned()
+            .unwrap_or_default()
+    });
     let eligible_ingest_ns = definition
         .delivery_delay_ns
         .map(|delay| unix_ns().saturating_sub(i64::try_from(delay).unwrap_or(i64::MAX)));
@@ -3728,12 +3908,26 @@ async fn subscription_member_fetch(
             let (parked, exhausted_positions_map, _) =
                 fetch_frontier_page(&state, &claim_view, limit, eligible_ingest_ns).await?;
             if !parked.is_empty() {
+                // A windowed lease only exhausts the records its coverage
+                // owns; the rest of the passed span stays owed to the
+                // other windows through the deferred set.
                 let mut exhausted_positions: BTreeMap<RangeId, Vec<String>> = BTreeMap::new();
-                for (range_id, cursor, _) in &parked {
-                    exhausted_positions
-                        .entry(*range_id)
-                        .or_default()
-                        .push(cursor.clone());
+                let mut deferred_positions: BTreeMap<RangeId, Vec<String>> = BTreeMap::new();
+                for (range_id, cursor, record) in &parked {
+                    let covered = window_coverage.as_ref().is_none_or(|mine| {
+                        mine.contains(&crate::reader::subscription_work_window(&record.key))
+                    });
+                    if covered {
+                        exhausted_positions
+                            .entry(*range_id)
+                            .or_default()
+                            .push(cursor.clone());
+                    } else {
+                        deferred_positions
+                            .entry(*range_id)
+                            .or_default()
+                            .push(cursor.clone());
+                    }
                 }
                 let exhausted_cursor = parked
                     .last()
@@ -3753,6 +3947,7 @@ async fn subscription_member_fetch(
                             positions: exhausted_positions_map,
                             exhausted: exhausted_positions.clone(),
                             disposition: policy.disposition,
+                            deferred_add: deferred_positions,
                         },
                     )
                     .await
@@ -3781,6 +3976,104 @@ async fn subscription_member_fetch(
         .unwrap_or_else(|| frontier.clone());
     let (delivered, positions, parked_ingest_ns) =
         fetch_frontier_page(&state, &page_view, limit, eligible_ingest_ns).await?;
+    // The frontier Cursor is the end of the fetched span whether or not
+    // the records at it were withheld — the deferred set owes them, not
+    // the frontier position.
+    let page_end_cursor = delivered.last().map(|(_, cursor, _)| cursor.clone());
+    // The withheld span positions ride server-issued delivery evidence so
+    // the ack defers them to their windows instead of consuming them.
+    let mut delivery_evidence: Option<String> = None;
+    let delivered = if let Some(mine) = window_coverage.clone() {
+        // Positions already deferred to this lease's coverage are the
+        // oldest owed work — they deliver first, preserving per-Key order.
+        let mut picked: Vec<(RangeId, String, StoredRecord)> = Vec::new();
+        if !page_view.deferred.is_empty() {
+            let assignments = state
+                .control
+                .active_range_assignments_for_feed(page_view.feed_id)
+                .await;
+            'outer: for (range_id, cursors) in &page_view.deferred {
+                let Some(assignment) = assignments
+                    .iter()
+                    .find(|assignment| assignment.range_id == *range_id)
+                else {
+                    continue;
+                };
+                for chunk in cursors.chunks(64) {
+                    if picked.len() >= limit {
+                        break 'outer;
+                    }
+                    let page = fetch_range_page(
+                        &state,
+                        ReadRangePageRequest {
+                            assignment: assignment.clone(),
+                            after: None,
+                            expected_commit: None,
+                            after_cursor: None,
+                            tail_count: None,
+                            ingest_threshold: None,
+                            cursors: Some(chunk.to_vec()),
+                            single_range: true,
+                            page_limit: None,
+                        },
+                    )
+                    .await?;
+                    for frame in page.frames {
+                        let bytes =
+                            STANDARD
+                                .decode(frame.frame_base64.as_bytes())
+                                .map_err(|_| {
+                                    ApiError::unavailable(
+                                        "current owner returned an invalid frame encoding",
+                                    )
+                                })?;
+                        let record = decode_record(&bytes)
+                            .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                        if mine.contains(&crate::reader::subscription_work_window(&record.key)) {
+                            picked.push((*range_id, frame.cursor.clone(), record));
+                        }
+                        if picked.len() >= limit {
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        let mut delivered_set: BTreeMap<RangeId, Vec<String>> = BTreeMap::new();
+        let mut withheld_set: BTreeMap<RangeId, Vec<String>> = BTreeMap::new();
+        let mut head: Vec<(RangeId, String, StoredRecord)> = Vec::new();
+        for (range_id, cursor, record) in delivered {
+            if mine.contains(&crate::reader::subscription_work_window(&record.key)) {
+                delivered_set
+                    .entry(range_id)
+                    .or_default()
+                    .push(cursor.clone());
+                head.push((range_id, cursor, record));
+            } else {
+                withheld_set.entry(range_id).or_default().push(cursor);
+            }
+        }
+        for (range_id, cursor, _) in &picked {
+            delivered_set
+                .entry(*range_id)
+                .or_default()
+                .push(cursor.clone());
+        }
+        delivery_evidence = Some(
+            STANDARD.encode(
+                serde_json::to_vec(&serde_json::json!({
+                    "v": 1,
+                    "delivered": delivered_set,
+                    "withheld": withheld_set,
+                }))
+                .map_err(|_| ApiError::unavailable("delivery evidence failed to encode"))?,
+            ),
+        );
+        picked.extend(head);
+        picked
+    } else {
+        delivered
+    };
     let next_delivery_ns =
         parked_ingest_ns
             .zip(definition.delivery_delay_ns)
@@ -3790,7 +4083,13 @@ async fn subscription_member_fetch(
                     .to_string()
             });
     let delivered_records = delivered.len() as u64;
-    let cursor = delivered.last().map(|(_, cursor, _)| cursor.clone());
+    // A windowed page that serves only deferred positions still needs an
+    // ack handle: the frontier does not move, so the Cursor is the
+    // current one — the ack no-ops the CAS while the deferred-removal
+    // delta commits and the lease releases. Unwindowed empty pages keep
+    // the legacy absent Cursor.
+    let cursor =
+        page_end_cursor.or_else(|| window_coverage.is_some().then(|| page_view.cursor.clone()));
     let source = record_source_by_id(&state, page_view.feed_id).await;
     let records = delivered
         .into_iter()
@@ -3825,6 +4124,8 @@ async fn subscription_member_fetch(
         delivery_attempt: request.lease_epoch,
         next_delivery_ns,
         exhausted,
+        key_window: lease_window,
+        delivery_evidence,
     }))
 }
 
@@ -3847,6 +4148,7 @@ async fn resolve_tail_positions(
                 after_cursor: None,
                 tail_count: Some(1),
                 ingest_threshold: None,
+                cursors: None,
                 single_range: true,
                 page_limit: Some(1),
             },
@@ -3943,6 +4245,80 @@ async fn member_feed_id(state: &AppState, feed: &str) -> Option<Uuid> {
         .map(|feed| feed.feed_id)
 }
 
+/// The (delivered, withheld) position sets decoded from delivery
+/// evidence.
+type DeliveryEvidencePositions = (
+    BTreeMap<RangeId, Vec<String>>,
+    BTreeMap<RangeId, Vec<String>>,
+);
+
+/// Decode a member-echoed `delivery_evidence` token into its
+/// (delivered, withheld) position sets. `None` stays `None`; malformed
+/// tokens fail closed — members replay evidence verbatim and any other
+/// content is client-invented positions the server must not honor.
+fn decode_delivery_evidence(
+    evidence: Option<&str>,
+) -> Result<Option<DeliveryEvidencePositions>, ApiError> {
+    let Some(evidence) = evidence else {
+        return Ok(None);
+    };
+    let bytes = STANDARD
+        .decode(evidence.as_bytes())
+        .map_err(|_| ApiError::bad_request("delivery_evidence is not valid base64"))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|_| ApiError::bad_request("delivery_evidence is not valid JSON"))?;
+    if value.get("v") != Some(&serde_json::json!(1)) {
+        return Err(ApiError::bad_request(
+            "delivery_evidence has an unsupported version",
+        ));
+    }
+    let delivered: BTreeMap<RangeId, Vec<String>> = value
+        .get("delivered")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| ApiError::bad_request("delivery_evidence has invalid delivered positions"))?
+        .unwrap_or_default();
+    let withheld: BTreeMap<RangeId, Vec<String>> = value
+        .get("withheld")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| ApiError::bad_request("delivery_evidence has invalid withheld positions"))?
+        .unwrap_or_default();
+    let total = delivered.values().map(Vec::len).sum::<usize>()
+        + withheld.values().map(Vec::len).sum::<usize>();
+    if total > crate::reader::SUBSCRIPTION_DEFERRED_MAX_POSITIONS {
+        return Err(ApiError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "delivery_evidence exceeds the position bound".to_owned(),
+
+            code: None,
+        });
+    }
+    Ok(Some((delivered, withheld)))
+}
+
+/// Positions present in both sets — the deferred entries a delivery
+/// actually picked up, so the ack clears exactly those.
+fn intersect_deferred(
+    delivered: &BTreeMap<RangeId, Vec<String>>,
+    deferred: &BTreeMap<RangeId, Vec<String>>,
+) -> BTreeMap<RangeId, Vec<String>> {
+    delivered
+        .iter()
+        .filter_map(|(range, cursors)| {
+            let held = deferred.get(range)?;
+            let hit: Vec<String> = cursors
+                .iter()
+                .filter(|cursor| held.contains(*cursor))
+                .cloned()
+                .collect();
+            (!hit.is_empty()).then_some((*range, hit))
+        })
+        .collect()
+}
+
 async fn member_feed_selection(
     state: &AppState,
     definition: &crate::control::SubscriptionDefinition,
@@ -4028,6 +4404,7 @@ async fn ensure_member_feed_entry(
                     positions,
                     quarantined: BTreeMap::new(),
                     skipped: BTreeMap::new(),
+                    deferred: BTreeMap::new(),
                 },
             )]),
         )
@@ -4141,6 +4518,7 @@ async fn resolve_seek_cursor_positions(
             after_cursor: Some(cursor.to_owned()),
             tail_count: None,
             ingest_threshold: None,
+            cursors: None,
             single_range: true,
             page_limit: Some(1),
         },
@@ -4182,6 +4560,7 @@ async fn resolve_timestamp_positions(
                 after_cursor: None,
                 tail_count: None,
                 ingest_threshold: Some(threshold),
+                cursors: None,
                 single_range: true,
                 page_limit: Some(1),
             },
@@ -4395,6 +4774,7 @@ async fn subscription_seek(
                 positions: positions.clone(),
                 quarantined: seek_view.quarantined.clone(),
                 skipped: seek_view.skipped.clone(),
+                deferred: BTreeMap::new(),
             },
         );
     }
@@ -4426,6 +4806,12 @@ async fn subscription_seek(
         quarantine_remove: BTreeMap::new(),
         skipped: seek_view.skipped.clone(),
         skip_add: BTreeMap::new(),
+        // Owed-work evidence names positions in the abandoned frontier and
+        // clears with it; a backward seek lets them reflow through the new
+        // frontier instead.
+        deferred: BTreeMap::new(),
+        deferred_add: BTreeMap::new(),
+        deferred_remove: BTreeMap::new(),
         tick: frontier.tick,
         lease_ops: Vec::new(),
     };
@@ -5142,6 +5528,7 @@ async fn bootstrap_pipe_frontier(
                         positions,
                         quarantined: BTreeMap::new(),
                         skipped: BTreeMap::new(),
+                        deferred: BTreeMap::new(),
                     },
                 );
             }
@@ -5174,6 +5561,9 @@ async fn bootstrap_pipe_frontier(
         quarantine_remove: BTreeMap::new(),
         skipped: BTreeMap::new(),
         skip_add: BTreeMap::new(),
+        deferred: BTreeMap::new(),
+        deferred_add: BTreeMap::new(),
+        deferred_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     })
@@ -8158,6 +8548,8 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
                     quarantined: prior_entry
                         .map_or_else(BTreeMap::new, |entry| entry.quarantined.clone()),
                     skipped: prior_entry.map_or_else(BTreeMap::new, |entry| entry.skipped.clone()),
+                    deferred: prior_entry
+                        .map_or_else(BTreeMap::new, |entry| entry.deferred.clone()),
                 },
             );
         }
@@ -8191,6 +8583,15 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
                     .map_or_else(BTreeMap::new, |prior| prior.skipped.clone()),
             },
             skip_add: BTreeMap::new(),
+            deferred: match (member_feed, prior_entry) {
+                (_, Some(entry)) => entry.deferred.clone(),
+                (Some(_), None) => BTreeMap::new(),
+                (None, None) => committed
+                    .as_ref()
+                    .map_or_else(BTreeMap::new, |prior| prior.deferred.clone()),
+            },
+            deferred_add: BTreeMap::new(),
+            deferred_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -9616,6 +10017,7 @@ impl FrozenLineage<'_> {
                     after_cursor: None,
                     tail_count: None,
                     ingest_threshold: None,
+                    cursors: None,
                     single_range: true,
                     page_limit: Some(count - entries.len()),
                 },
@@ -9686,6 +10088,7 @@ impl CutoverPrefix for FrozenLineage<'_> {
                 after_cursor: Some(cursor.to_string()),
                 tail_count: None,
                 ingest_threshold: None,
+                cursors: None,
                 single_range: true,
                 page_limit: Some(1),
             },
@@ -12378,6 +12781,69 @@ struct AdminSubscriptionProgressQuery {
 /// state. An unreachable or epoch-fenced replica reports its own outcome
 /// instead of failing the whole read, so a wedged Subscription stays
 /// diagnosable while it is still wedged.
+/// Per-Feed frontier lag for the admin progress view: records committed
+/// at each Active Range tail but still undelivered under the frontier
+/// position. A range whose position no longer resolves or cannot be read
+/// is reported rather than silently dropped.
+async fn subscription_feed_lag(
+    state: &AppState,
+    feed_id: uuid::Uuid,
+    frontier: &BTreeMap<RangeId, String>,
+) -> serde_json::Value {
+    let mut behind_total = 0_u64;
+    let mut ranges = serde_json::Map::new();
+    for range_assignment in state
+        .control
+        .active_range_assignments_for_feed(feed_id)
+        .await
+    {
+        let position = frontier
+            .get(&range_assignment.range_id)
+            .cloned()
+            .unwrap_or_default();
+        let read = fetch_range_page(
+            state,
+            ReadRangePageRequest {
+                assignment: range_assignment.clone(),
+                after: None,
+                expected_commit: None,
+                after_cursor: if position.is_empty() {
+                    None
+                } else {
+                    Some(position)
+                },
+                // One leading frame is enough: resolved_after names the
+                // committed position the frontier Cursor resolves to, and
+                // committed is the tail.
+                tail_count: None,
+                ingest_threshold: None,
+                cursors: None,
+                single_range: true,
+                page_limit: Some(1),
+            },
+        )
+        .await;
+        match read {
+            Ok(page) => {
+                let consumed = page.resolved_after.map_or(0, |position| position.value());
+                let behind = page.committed.value().saturating_sub(consumed);
+                behind_total = behind_total.saturating_add(behind);
+                ranges.insert(
+                    range_assignment.range_id.to_string(),
+                    json!({ "behind": behind }),
+                );
+            }
+            Err(error) => {
+                ranges.insert(
+                    range_assignment.range_id.to_string(),
+                    json!({ "behind": null, "error": error.message }),
+                );
+            }
+        }
+    }
+    json!({ "records_behind": behind_total, "ranges": ranges })
+}
+
 async fn admin_subscription_progress(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -12397,6 +12863,7 @@ async fn admin_subscription_progress(
             "tick": mutation.tick,
             "quarantined": mutation.quarantined,
             "skipped": mutation.skipped,
+            "deferred": mutation.deferred,
         })
     });
     let member_state = coordinator.member_state().await.ok();
@@ -12408,61 +12875,23 @@ async fn admin_subscription_progress(
     // rather than silently dropped.
     let lag = match (committed_mutation.as_ref(), definition.source.feed_id()) {
         (Some(mutation), Some(feed_id)) => {
-            let frontier = mutation.positions.clone();
-            let mut behind_total = 0_u64;
-            let mut ranges = serde_json::Map::new();
-            for range_assignment in state
-                .control
-                .active_range_assignments_for_feed(feed_id)
-                .await
-            {
-                let position = frontier
-                    .get(&range_assignment.range_id)
-                    .cloned()
-                    .unwrap_or_default();
-                let read = fetch_range_page(
-                    &state,
-                    ReadRangePageRequest {
-                        assignment: range_assignment.clone(),
-                        after: None,
-                        expected_commit: None,
-                        after_cursor: if position.is_empty() {
-                            None
-                        } else {
-                            Some(position)
-                        },
-                        // One leading frame is enough: resolved_after names
-                        // the committed position the frontier Cursor resolves
-                        // to, and committed is the tail.
-                        tail_count: None,
-                        ingest_threshold: None,
-                        single_range: true,
-                        page_limit: Some(1),
-                    },
-                )
-                .await;
-                match read {
-                    Ok(page) => {
-                        let consumed = page.resolved_after.map_or(0, |position| position.value());
-                        let behind = page.committed.value().saturating_sub(consumed);
-                        behind_total = behind_total.saturating_add(behind);
-                        ranges.insert(
-                            range_assignment.range_id.to_string(),
-                            json!({ "behind": behind }),
-                        );
-                    }
-                    Err(error) => {
-                        ranges.insert(
-                            range_assignment.range_id.to_string(),
-                            json!({ "behind": null, "error": error.message }),
-                        );
-                    }
-                }
-            }
-            json!({ "records_behind": behind_total, "ranges": ranges })
+            subscription_feed_lag(&state, feed_id, &mutation.positions).await
         }
-        (Some(_), None) => json!({ "records_behind": null,
-            "detail": "Domain-source Subscriptions report per-Feed lag when member delivery lands" }),
+        (Some(mutation), None) => {
+            // Domain-scope progress is per member Feed — report each
+            // member's lag plus the aggregate, so operators see which
+            // Feed the delivery owes without enumerating progress rows.
+            let mut behind_total = 0_u64;
+            let mut feeds = serde_json::Map::new();
+            for (feed_id, entry) in &mutation.member_progress {
+                let view = subscription_feed_lag(&state, *feed_id, &entry.positions).await;
+                if let Some(behind) = view.get("records_behind").and_then(|v| v.as_u64()) {
+                    behind_total = behind_total.saturating_add(behind);
+                }
+                feeds.insert(feed_id.to_string(), view);
+            }
+            json!({ "records_behind": behind_total, "feeds": feeds })
+        }
         (None, _) => serde_json::Value::Null,
     };
     let replicas = coordinator
@@ -14185,6 +14614,10 @@ struct ReadRangePageRequest {
     /// streaming frames; the reply's `ingest_boundary` carries the result.
     #[serde(default)]
     ingest_threshold: Option<i64>,
+    /// Bounded point reads: return the frame at each committed Cursor —
+    /// member fetches re-deliver deferred positions through this mode.
+    #[serde(default)]
+    cursors: Option<Vec<String>>,
     #[serde(default)]
     single_range: bool,
     #[serde(default)]
@@ -14416,6 +14849,7 @@ async fn read_owned_range_page(
                     after: request.after,
                     tail_count: request.tail_count,
                     ingest_threshold: request.ingest_threshold,
+                    cursors: request.cursors.as_deref(),
                 },
                 expected_commit,
                 request.page_limit.unwrap_or(1),
@@ -14443,9 +14877,10 @@ async fn read_owned_range_page(
     } else if request.after_cursor.is_some()
         || request.tail_count.is_some()
         || request.ingest_threshold.is_some()
+        || request.cursors.is_some()
     {
         return Err(ApiError::bad_request(
-            "Cursor, tail, and ingest read modes require single-range routing",
+            "Cursor, tail, ingest, and point read modes require single-range routing",
         ));
     } else {
         service
@@ -14676,6 +15111,7 @@ async fn read_single_range(
                 after_cursor: after_cursor.take(),
                 tail_count: (mode.tail && boundary.is_none()).then_some(limit),
                 ingest_threshold: None,
+                cursors: None,
                 single_range: true,
                 page_limit: Some(limit.saturating_sub(frames.len()).clamp(1, 32)),
             },
@@ -14771,6 +15207,7 @@ async fn reader_range_head(
             after_cursor: after_cursor.map(str::to_owned),
             tail_count: None,
             ingest_threshold: None,
+            cursors: None,
             single_range: true,
             page_limit: Some(1),
         },
@@ -14967,6 +15404,7 @@ impl RangeFrameStream<'_> {
                     after_cursor,
                     tail_count: None,
                     ingest_threshold: None,
+                    cursors: None,
                     page_limit: Some(128),
                 },
             )
@@ -15157,6 +15595,7 @@ async fn read_complete_feed(
                 after_cursor: None,
                 tail_count: None,
                 ingest_threshold: None,
+                cursors: None,
                 single_range: false,
                 page_limit: Some(128),
             };
@@ -15425,6 +15864,7 @@ async fn lookup_feed_record(
                 after_cursor: Some(query.cursor.clone()),
                 tail_count: None,
                 ingest_threshold: None,
+                cursors: None,
                 single_range: true,
                 page_limit: Some(1),
             },
@@ -15449,6 +15889,7 @@ async fn lookup_feed_record(
                 after_cursor: None,
                 tail_count: None,
                 ingest_threshold: None,
+                cursors: None,
                 single_range: true,
                 page_limit: Some(1),
             },
@@ -19123,6 +19564,9 @@ mod tests {
             quarantine_remove: BTreeMap::new(),
             skipped: BTreeMap::new(),
             skip_add: BTreeMap::new(),
+            deferred: BTreeMap::new(),
+            deferred_add: BTreeMap::new(),
+            deferred_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -19260,6 +19704,9 @@ mod tests {
             quarantine_remove: BTreeMap::new(),
             skipped: BTreeMap::new(),
             skip_add: BTreeMap::new(),
+            deferred: BTreeMap::new(),
+            deferred_add: BTreeMap::new(),
+            deferred_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -19478,6 +19925,9 @@ mod tests {
             quarantine_remove: BTreeMap::new(),
             skipped: BTreeMap::new(),
             skip_add: BTreeMap::new(),
+            deferred: BTreeMap::new(),
+            deferred_add: BTreeMap::new(),
+            deferred_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -20612,6 +21062,7 @@ mod tests {
                     quarantined: BTreeMap::new(),
                     skipped: BTreeMap::new(),
                     tick: 5,
+                    deferred: BTreeMap::new(),
                 }],
             }])
             .await
@@ -22624,6 +23075,9 @@ mod tests {
                 quarantine_remove: BTreeMap::new(),
                 skipped: BTreeMap::new(),
                 skip_add: BTreeMap::new(),
+                deferred: BTreeMap::new(),
+                deferred_add: BTreeMap::new(),
+                deferred_remove: BTreeMap::new(),
                 tick: 0,
                 lease_ops: Vec::new(),
             })
@@ -23800,6 +24254,9 @@ mod tests {
                 quarantine_remove: BTreeMap::new(),
                 skipped: BTreeMap::new(),
                 skip_add: BTreeMap::new(),
+                deferred: BTreeMap::new(),
+                deferred_add: BTreeMap::new(),
+                deferred_remove: BTreeMap::new(),
                 tick: 0,
                 lease_ops: Vec::new(),
             };

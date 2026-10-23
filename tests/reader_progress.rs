@@ -762,6 +762,9 @@ async fn subscription_coordinator_uses_private_catalog_placement_and_refuses_leg
         quarantine_remove: BTreeMap::new(),
         skipped: BTreeMap::new(),
         skip_add: BTreeMap::new(),
+        deferred: BTreeMap::new(),
+        deferred_add: BTreeMap::new(),
+        deferred_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -843,6 +846,9 @@ async fn quorum_subscription_read_fails_closed_on_loss_disagreement_and_ambiguou
         quarantine_remove: BTreeMap::new(),
         skipped: BTreeMap::new(),
         skip_add: BTreeMap::new(),
+        deferred: BTreeMap::new(),
+        deferred_add: BTreeMap::new(),
+        deferred_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -963,6 +969,9 @@ async fn ambiguous_subscription_retry_reconciles_after_restart_without_guessing(
         quarantine_remove: BTreeMap::new(),
         skipped: BTreeMap::new(),
         skip_add: BTreeMap::new(),
+        deferred: BTreeMap::new(),
+        deferred_add: BTreeMap::new(),
+        deferred_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -1070,6 +1079,9 @@ async fn progress_coordinator_refuses_replies_claiming_another_replica() {
         quarantine_remove: BTreeMap::new(),
         skipped: BTreeMap::new(),
         skip_add: BTreeMap::new(),
+        deferred: BTreeMap::new(),
+        deferred_add: BTreeMap::new(),
+        deferred_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -1143,6 +1155,9 @@ async fn subscription_progress_coordinator_requires_matching_prepare_and_commit_
         quarantine_remove: BTreeMap::new(),
         skipped: BTreeMap::new(),
         skip_add: BTreeMap::new(),
+        deferred: BTreeMap::new(),
+        deferred_add: BTreeMap::new(),
+        deferred_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -1251,6 +1266,9 @@ async fn subscription_progress_coordinator_refuses_contradictory_replica_evidenc
         quarantine_remove: BTreeMap::new(),
         skipped: BTreeMap::new(),
         skip_add: BTreeMap::new(),
+        deferred: BTreeMap::new(),
+        deferred_add: BTreeMap::new(),
+        deferred_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -1302,6 +1320,9 @@ fn prepared_subscription_progress_remains_invisible_after_replica_restart() {
         quarantine_remove: BTreeMap::new(),
         skipped: BTreeMap::new(),
         skip_add: BTreeMap::new(),
+        deferred: BTreeMap::new(),
+        deferred_add: BTreeMap::new(),
+        deferred_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     };
@@ -1586,6 +1607,9 @@ fn progress_mutation(
         quarantine_remove: BTreeMap::new(),
         skipped: BTreeMap::new(),
         skip_add: BTreeMap::new(),
+        deferred: BTreeMap::new(),
+        deferred_add: BTreeMap::new(),
+        deferred_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     }
@@ -2425,6 +2449,7 @@ async fn subscription_member_leases_replicate_survive_restart_and_recover() {
                 work_id: work,
                 member_id: member,
                 member_epoch: 1,
+                key_window: None,
                 lease_ticks: 30,
             },
         ],
@@ -2457,6 +2482,7 @@ async fn subscription_member_leases_replicate_survive_restart_and_recover() {
                 work_id: work,
                 member_id: other,
                 member_epoch: 1,
+                key_window: None,
                 lease_ticks: 10,
             },
         ],
@@ -2488,6 +2514,7 @@ async fn subscription_member_leases_replicate_survive_restart_and_recover() {
             work_id: work,
             member_id: other,
             member_epoch: 1,
+            key_window: None,
             lease_ticks: 20,
         }],
     );
@@ -2652,6 +2679,7 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
                 work_id: work,
                 member_id: member,
                 member_epoch: 1,
+                key_window: None,
                 lease_ticks: 30,
             }],
         )
@@ -2666,6 +2694,7 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
         lease_epoch: lease.lease_epoch,
         expires_at_tick: lease.expires_at_tick,
         exhausted_applied: false,
+        key_window: None,
     };
     assert_eq!(grant.expires_at_tick, 40);
     assert!(coordinator.can_member_ack(&grant, 20).await.unwrap());
@@ -2684,7 +2713,8 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
                 Uuid::from_u128(22_004),
                 "rf1_acked".to_owned(),
                 frontier.positions.clone(),
-                SubscriptionQuarantineDelta::default()
+                SubscriptionQuarantineDelta::default(),
+                whitewater::reader::SubscriptionDeferredDelta::default(),
             )
             .await,
         Err(SubscriptionProgressError::Lease(
@@ -2703,7 +2733,8 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
                 Uuid::from_u128(22_005),
                 "rf1_acked".to_owned(),
                 frontier.positions.clone(),
-                SubscriptionQuarantineDelta::default()
+                SubscriptionQuarantineDelta::default(),
+                whitewater::reader::SubscriptionDeferredDelta::default(),
             )
             .await,
         Err(SubscriptionProgressError::Lease(
@@ -2724,6 +2755,7 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
                 "ack-pos".to_owned(),
             )]),
             SubscriptionQuarantineDelta::default(),
+            whitewater::reader::SubscriptionDeferredDelta::default(),
         )
         .await
         .unwrap();
@@ -2746,6 +2778,7 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
                 work_id: work,
                 member_id: member,
                 member_epoch: 1,
+                key_window: None,
                 lease_ticks: 5,
             }],
         )
@@ -2760,6 +2793,7 @@ async fn subscription_member_api_fences_acks_by_quorum_leases() {
         lease_epoch: members.leases[&work].lease_epoch,
         expires_at_tick: members.leases[&work].expires_at_tick,
         exhausted_applied: false,
+        key_window: None,
     };
     assert!(!coordinator
         .can_member_ack(&renewed_grant, 36)
@@ -2898,6 +2932,7 @@ async fn epoch_stale_replica_rows_are_lagging_witnesses_for_reads_and_writes() {
         work_id: Uuid::from_u128(9_004),
         member_id: Uuid::from_u128(9_002),
         member_epoch: 1,
+        key_window: None,
         lease_ticks: 10,
     }];
     recovered.reconcile_retry(retry).await.unwrap();
@@ -3119,6 +3154,7 @@ async fn subscription_acks_carry_a_bounded_quarantine_set() {
                 work_id: work,
                 member_id: member,
                 member_epoch: 1,
+                key_window: None,
                 lease_ticks: 30,
             }],
         )
@@ -3133,6 +3169,7 @@ async fn subscription_acks_carry_a_bounded_quarantine_set() {
         lease_epoch: lease.lease_epoch,
         expires_at_tick: lease.expires_at_tick,
         exhausted_applied: false,
+        key_window: None,
     };
 
     // An ack may only quarantine positions inside the ranges it commits;
@@ -3149,7 +3186,8 @@ async fn subscription_acks_carry_a_bounded_quarantine_set() {
                 SubscriptionQuarantineDelta {
                     add: BTreeMap::from([(foreign, vec!["poison-1".to_owned()])]),
                     remove: BTreeMap::new(),
-                }
+                },
+                whitewater::reader::SubscriptionDeferredDelta::default(),
             )
             .await,
         Err(SubscriptionProgressError::Conflict)
@@ -3167,6 +3205,7 @@ async fn subscription_acks_carry_a_bounded_quarantine_set() {
                 add: BTreeMap::from([(range, vec!["poison-1".to_owned(), "poison-2".to_owned()])]),
                 remove: BTreeMap::new(),
             },
+            whitewater::reader::SubscriptionDeferredDelta::default(),
         )
         .await
         .unwrap();
@@ -3194,6 +3233,7 @@ async fn subscription_acks_carry_a_bounded_quarantine_set() {
                 work_id: work,
                 member_id: member,
                 member_epoch: 1,
+                key_window: None,
                 lease_ticks: 30,
             }],
         )
@@ -3205,6 +3245,7 @@ async fn subscription_acks_carry_a_bounded_quarantine_set() {
         lease_epoch: lease.lease_epoch,
         expires_at_tick: lease.expires_at_tick,
         exhausted_applied: false,
+        key_window: None,
         ..grant
     };
     let acked = coordinator
@@ -3218,6 +3259,7 @@ async fn subscription_acks_carry_a_bounded_quarantine_set() {
                 add: BTreeMap::new(),
                 remove: BTreeMap::from([(range, vec!["poison-1".to_owned()])]),
             },
+            whitewater::reader::SubscriptionDeferredDelta::default(),
         )
         .await
         .unwrap();
@@ -3461,6 +3503,7 @@ fn domain_progress_mutation(
                         )]),
                         quarantined: BTreeMap::new(),
                         skipped: BTreeMap::new(),
+                        deferred: BTreeMap::new(),
                     },
                 )
             })
@@ -3474,6 +3517,9 @@ fn domain_progress_mutation(
         quarantine_remove: BTreeMap::new(),
         skipped: BTreeMap::new(),
         skip_add: BTreeMap::new(),
+        deferred: BTreeMap::new(),
+        deferred_add: BTreeMap::new(),
+        deferred_remove: BTreeMap::new(),
         tick: 0,
         lease_ops: Vec::new(),
     }
@@ -3575,6 +3621,7 @@ async fn domain_subscription_member_frontiers_advance_independently() {
                 work_id: work,
                 member_id: member,
                 member_epoch: 1,
+                key_window: None,
                 lease_ticks: 30,
             }],
         )
@@ -3588,6 +3635,7 @@ async fn domain_subscription_member_frontiers_advance_independently() {
         lease_epoch: members.leases[&work].lease_epoch,
         expires_at_tick: members.leases[&work].expires_at_tick,
         exhausted_applied: false,
+        key_window: None,
     };
 
     // Acknowledging alpha moves only its entry; beta's frontier — and the
@@ -3606,6 +3654,7 @@ async fn domain_subscription_member_frontiers_advance_independently() {
                 add: BTreeMap::from([(alpha_range, vec!["poison-1".to_owned()])]),
                 remove: BTreeMap::new(),
             },
+            whitewater::reader::SubscriptionDeferredDelta::default(),
         )
         .await
         .unwrap();
@@ -3636,6 +3685,7 @@ async fn domain_subscription_member_frontiers_advance_independently() {
                 work_id: work,
                 member_id: member,
                 member_epoch: 1,
+                key_window: None,
                 lease_ticks: 30,
             }],
         )
@@ -3649,6 +3699,7 @@ async fn domain_subscription_member_frontiers_advance_independently() {
         lease_epoch: members.leases[&work].lease_epoch,
         expires_at_tick: members.leases[&work].expires_at_tick,
         exhausted_applied: false,
+        key_window: None,
     };
     let acked_b = coordinator
         .acknowledge_member(
@@ -3662,6 +3713,7 @@ async fn domain_subscription_member_frontiers_advance_independently() {
                 "bp1".to_owned(),
             )]),
             SubscriptionQuarantineDelta::default(),
+            whitewater::reader::SubscriptionDeferredDelta::default(),
         )
         .await
         .unwrap();
@@ -3703,6 +3755,7 @@ async fn domain_subscription_member_frontiers_advance_independently() {
                     )]),
                     quarantined: BTreeMap::new(),
                     skipped: BTreeMap::new(),
+                    deferred: BTreeMap::new(),
                 },
             )]),
         )
@@ -3725,6 +3778,7 @@ async fn domain_subscription_member_frontiers_advance_independently() {
                         positions: BTreeMap::new(),
                         quarantined: BTreeMap::new(),
                         skipped: BTreeMap::new(),
+                        deferred: BTreeMap::new(),
                     },
                 )]),
             )
@@ -3769,6 +3823,7 @@ async fn domain_progress_validation_fences_delta_and_drift_violations() {
         positions: BTreeMap::from([(RangeId::from_uuid(Uuid::from_u128(52_000)), "p".to_owned())]),
         quarantined: BTreeMap::new(),
         skipped: BTreeMap::new(),
+        deferred: BTreeMap::new(),
     };
     #[allow(clippy::too_many_arguments)]
     fn base(
@@ -3799,6 +3854,9 @@ async fn domain_progress_validation_fences_delta_and_drift_violations() {
             quarantine_remove: BTreeMap::new(),
             skipped: BTreeMap::new(),
             skip_add: BTreeMap::new(),
+            deferred: BTreeMap::new(),
+            deferred_add: BTreeMap::new(),
+            deferred_remove: BTreeMap::new(),
             tick: 1,
             lease_ops: Vec::new(),
         }
@@ -3936,6 +3994,7 @@ fn member_view_scopes_delta_evidence_to_the_named_feed() {
                     positions: BTreeMap::from([(range, "ap".to_owned())]),
                     quarantined: BTreeMap::from([(range, vec!["aq".to_owned()])]),
                     skipped: BTreeMap::new(),
+                    deferred: BTreeMap::new(),
                 },
             ),
             (
@@ -3945,6 +4004,7 @@ fn member_view_scopes_delta_evidence_to_the_named_feed() {
                     positions: BTreeMap::from([(range, "bp".to_owned())]),
                     quarantined: BTreeMap::new(),
                     skipped: BTreeMap::from([(range, vec!["bs".to_owned()])]),
+                    deferred: BTreeMap::new(),
                 },
             ),
         ]),
@@ -3957,6 +4017,9 @@ fn member_view_scopes_delta_evidence_to_the_named_feed() {
         quarantine_remove: BTreeMap::new(),
         skipped: BTreeMap::new(),
         skip_add: BTreeMap::new(),
+        deferred: BTreeMap::new(),
+        deferred_add: BTreeMap::new(),
+        deferred_remove: BTreeMap::new(),
         tick: 5,
         lease_ops: Vec::new(),
     };
@@ -3980,5 +4043,179 @@ fn member_view_scopes_delta_evidence_to_the_named_feed() {
     assert_eq!(
         row.expected_frontier_cursor(Some(Uuid::from_u128(61_999))),
         None
+    );
+}
+
+#[tokio::test]
+async fn domain_subscription_deferred_positions_fold_and_remove_through_member_acks() {
+    use whitewater::reader::{
+        SubscriptionDeferredDelta, SubscriptionLeaseOp, SubscriptionQuarantineDelta,
+        SubscriptionWorkLease,
+    };
+
+    let directory = TempDir::new().unwrap();
+    let nodes = progress_nodes();
+    let controller = progress_controller(&directory, &nodes);
+    let subscription = domain_subscription(&controller).await;
+    let domain_id = subscription.source.domain_id().unwrap();
+    let alpha = controller
+        .active_feed_by_name("orders.alpha")
+        .await
+        .unwrap()
+        .feed_id;
+
+    let dirs = [
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+        TempDir::new().unwrap(),
+    ];
+    let transport = Arc::new(TestProgressTransport::new(&dirs, &nodes));
+    let coordinator = SubscriptionProgressCoordinator::for_subscription(
+        &controller,
+        subscription.subscription_id,
+        transport.clone(),
+    )
+    .await
+    .unwrap();
+    coordinator
+        .apply(domain_progress_mutation(
+            subscription.subscription_id,
+            domain_id,
+            &[(alpha, "alpha_0")],
+        ))
+        .await
+        .unwrap();
+
+    let member = Uuid::from_u128(77_001);
+    let work = Uuid::from_u128(77_002);
+    coordinator
+        .apply_member_ops(
+            Uuid::from_u128(77_010),
+            10,
+            vec![
+                SubscriptionLeaseOp::Join {
+                    member_id: member,
+                    member_epoch: 1,
+                },
+                SubscriptionLeaseOp::Claim {
+                    work_id: work,
+                    member_id: member,
+                    member_epoch: 1,
+                    key_window: Some(5),
+                    lease_ticks: 60,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    let members = coordinator.member_state().await.unwrap();
+    assert_eq!(members.leases[&work].key_window, Some(5));
+    let grant = SubscriptionWorkLease {
+        work_id: work,
+        member_id: member,
+        member_epoch: 1,
+        lease_epoch: members.leases[&work].lease_epoch,
+        expires_at_tick: members.leases[&work].expires_at_tick,
+        exhausted_applied: false,
+        key_window: Some(5),
+    };
+
+    // The first filtered ack withholds two positions for other windows:
+    // they land durably in alpha's deferred set while the frontier
+    // advances past them.
+    let alpha_range = RangeId::from_uuid(Uuid::from_u128(61_001));
+    let acked = coordinator
+        .acknowledge_member(
+            &grant,
+            20,
+            Uuid::from_u128(77_011),
+            alpha,
+            "alpha_1".to_owned(),
+            BTreeMap::from([(alpha_range, "alpha-p1".to_owned())]),
+            SubscriptionQuarantineDelta::default(),
+            SubscriptionDeferredDelta {
+                add: BTreeMap::from([(
+                    alpha_range,
+                    vec!["deferred-1".to_owned(), "deferred-2".to_owned()],
+                )]),
+                remove: BTreeMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        acked.member_progress[&alpha].deferred[&alpha_range],
+        vec!["deferred-1".to_owned(), "deferred-2".to_owned()]
+    );
+    for node in &nodes {
+        let committed = transport.stores[node]
+            .local_committed(subscription.subscription_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            committed.member_progress[&alpha].deferred[&alpha_range],
+            vec!["deferred-1".to_owned(), "deferred-2".to_owned()]
+        );
+    }
+
+    // Removing a position nobody deferred refuses rather than dropping
+    // owed work silently.
+    coordinator
+        .apply_member_ops(
+            Uuid::from_u128(77_012),
+            30,
+            vec![SubscriptionLeaseOp::Claim {
+                work_id: work,
+                member_id: member,
+                member_epoch: 1,
+                key_window: Some(5),
+                lease_ticks: 60,
+            }],
+        )
+        .await
+        .unwrap();
+    let members = coordinator.member_state().await.unwrap();
+    let grant = SubscriptionWorkLease {
+        lease_epoch: members.leases[&work].lease_epoch,
+        expires_at_tick: members.leases[&work].expires_at_tick,
+        ..grant
+    };
+    let refused = coordinator
+        .acknowledge_member(
+            &grant,
+            40,
+            Uuid::from_u128(77_013),
+            alpha,
+            "alpha_2".to_owned(),
+            BTreeMap::from([(alpha_range, "alpha-p2".to_owned())]),
+            SubscriptionQuarantineDelta::default(),
+            SubscriptionDeferredDelta {
+                add: BTreeMap::new(),
+                remove: BTreeMap::from([(alpha_range, vec!["phantom".to_owned()])]),
+            },
+        )
+        .await;
+    assert!(refused.is_err());
+
+    // Delivering a deferred position clears exactly that evidence.
+    let acked = coordinator
+        .acknowledge_member(
+            &grant,
+            41,
+            Uuid::from_u128(77_014),
+            alpha,
+            "alpha_3".to_owned(),
+            BTreeMap::from([(alpha_range, "alpha-p3".to_owned())]),
+            SubscriptionQuarantineDelta::default(),
+            SubscriptionDeferredDelta {
+                add: BTreeMap::new(),
+                remove: BTreeMap::from([(alpha_range, vec!["deferred-1".to_owned()])]),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        acked.member_progress[&alpha].deferred[&alpha_range],
+        vec!["deferred-2".to_owned()]
     );
 }

@@ -361,6 +361,73 @@ def main():
     if len(dsibling["records"]) != 2: raise AssertionError(dsibling)
     phase("domain member frontiers verified")
 
+    # Per-Key work windows: two members pin different windows and drain the
+    # feed — each record lands on exactly the lease whose coverage owns its
+    # KeyToken window, withheld positions defer durably, and deferred work
+    # redelivers to the covering window until the set empties.
+    import base64
+    wfeed, wwriter, wsub = f"{domain}.windows", f"writerw{suffix}", f"{domain}.windowed"
+    status, setup = post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"CREATE FEED {wfeed}; CREATE WRITER {wwriter} TO {wfeed}; OPEN WRITER SESSION {wwriter}; CREATE SUBSCRIPTION {wsub} FROM {wfeed} START AT BEGINNING;"})
+    if status != 200: raise AssertionError(setup)
+    wepoch = setup["results"][2]["data"]["session_epoch"]
+    wkeys = {}
+    for index in range(8):
+        key = base64.b64encode(f"wk{index}".encode()).decode()
+        wkeys[key] = True
+        status, appended = post(ENDPOINTS[1], "/v1/writers/append", {"request_id": str(uuid.uuid4()), "writer": wwriter, "session_epoch": wepoch, "event_time_ns": str(index), "key_base64": key, "payload_base64": "dg==", "metadata_base64": {}})
+        if status != 200: raise AssertionError(appended)
+
+    wmember_a, wmember_b = str(uuid.uuid4()), str(uuid.uuid4())
+    member_ready(ENDPOINTS[0], f"{members}/join", {"subscription": wsub, "request_id": str(uuid.uuid4()), "member_id": wmember_a})
+    member_ready(ENDPOINTS[1], f"{members}/join", {"subscription": wsub, "request_id": str(uuid.uuid4()), "member_id": wmember_b})
+    wclaim_a = member_ready(ENDPOINTS[0], f"{members}/claim", {"subscription": wsub, "request_id": str(uuid.uuid4()), "member_id": wmember_a, "member_epoch": 1, "work_id": str(uuid.uuid4()), "lease_ticks": 600, "key_window": 0})
+    wclaim_b = member_ready(ENDPOINTS[1], f"{members}/claim", {"subscription": wsub, "request_id": str(uuid.uuid4()), "member_id": wmember_b, "member_epoch": 1, "work_id": str(uuid.uuid4()), "lease_ticks": 600, "key_window": 128})
+    wlease_a, wwork_a = wclaim_a["lease"]["lease_epoch"], wclaim_a["lease"]["work_id"]
+    wlease_b, wwork_b = wclaim_b["lease"]["lease_epoch"], wclaim_b["lease"]["work_id"]
+    if wclaim_a["lease"].get("key_window") != 0 or wclaim_b["lease"].get("key_window") != 128: raise AssertionError((wclaim_a, wclaim_b))
+
+    # The same window cannot be pinned twice while its lease lives.
+    status, busy = post(ENDPOINTS[0], f"{members}/claim", {"subscription": wsub, "request_id": str(uuid.uuid4()), "member_id": wmember_a, "member_epoch": 1, "work_id": str(uuid.uuid4()), "lease_ticks": 60, "key_window": 0})
+    if status != 409: raise AssertionError(busy)
+    # Out-of-range windows refuse outright.
+    status, invalid = post(ENDPOINTS[0], f"{members}/claim", {"subscription": wsub, "request_id": str(uuid.uuid4()), "member_id": wmember_a, "member_epoch": 1, "work_id": str(uuid.uuid4()), "lease_ticks": 60, "key_window": 256})
+    if status != 400: raise AssertionError(invalid)
+
+    delivered, seen_twice = {}, 0
+    for _ in range(40):
+        for member_id, work_id, lease_epoch, endpoint in ((wmember_a, wwork_a, wlease_a, ENDPOINTS[0]), (wmember_b, wwork_b, wlease_b, ENDPOINTS[1])):
+            page = member_ready(endpoint, f"{members}/fetch", {"subscription": wsub, "request_id": str(uuid.uuid4()), "member_id": member_id, "member_epoch": 1, "work_id": work_id, "lease_epoch": lease_epoch, "limit": 8})
+            if page.get("key_window") is None: raise AssertionError(page)
+            evidence = page.get("delivery_evidence")
+            if evidence is None and page["cursor"] is not None: raise AssertionError("windowed fetch issued no delivery evidence")
+            if page["cursor"] is None: continue
+            # Windowed acks must echo the evidence; refusing without it is
+            # what keeps a member from silently consuming other windows' work.
+            if page["records"]:
+                status, refused = post(endpoint, f"{members}/ack", {"subscription": wsub, "request_id": str(uuid.uuid4()), "member_id": member_id, "member_epoch": 1, "work_id": work_id, "lease_epoch": lease_epoch, "cursor": page["cursor"], "positions": page["positions"]})
+                if status != 409: raise AssertionError(refused)
+                for record in page["records"]:
+                    key = record["key_base64"]
+                    if key in delivered: seen_twice += 1
+                    delivered[key] = member_id
+            member_ready(endpoint, f"{members}/ack", {"subscription": wsub, "request_id": str(uuid.uuid4()), "member_id": member_id, "member_epoch": 1, "work_id": work_id, "lease_epoch": lease_epoch, "cursor": page["cursor"], "positions": page["positions"], "delivery_evidence": evidence})
+            # The ack completes this work's lease; re-claim the same window.
+            claim = member_ready(endpoint, f"{members}/claim", {"subscription": wsub, "request_id": str(uuid.uuid4()), "member_id": member_id, "member_epoch": 1, "work_id": work_id, "lease_ticks": 600, "key_window": 0 if member_id == wmember_a else 128})
+            lease_epoch = claim["lease"]["lease_epoch"]
+            if member_id == wmember_a: wlease_a = lease_epoch
+            else: wlease_b = lease_epoch
+        if len(delivered) == 8:
+            status, progress = get(ENDPOINTS[0], f"/v1/admin/subscriptions/progress?subscription={wsub}")
+            deferred_total = sum(len(v) for v in progress["committed"]["deferred"].values()) if progress.get("committed") else -1
+            if deferred_total == 0: break
+            time.sleep(0.5)
+    else: raise AssertionError(f"windowed drain stalled: {len(delivered)}/8 delivered")
+    if seen_twice != 0: raise AssertionError(f"{seen_twice} records delivered twice across windows")
+    if len(delivered) != 8: raise AssertionError(delivered)
+    for key in wkeys:
+        if key not in delivered: raise AssertionError(f"key {key} never delivered")
+    phase("per-Key work windows drained exactly once")
+
     # Killing Nodes one at a time: a replica loss never fails member calls,
     # and the owner kill is detected by the ownership_epoch bump the
     # endpoint's transparent recovery performs before serving the mutation.

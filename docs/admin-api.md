@@ -131,7 +131,7 @@ curl -X POST http://localhost:7071/v1/admin/wcl \
 
 `POST /v1/control/execute` remains an authenticated compatibility alias during the prototype and should not be used by new clients.
 
-`CREATE SUBSCRIPTION orders.billing FROM orders.created;` or the typed `create_subscription` command declares one logical Subscription in the same Domain as its source Feed. `SHOW SUBSCRIPTIONS`, `DESCRIBE SUBSCRIPTION`, rename and safe drop operate on its metadata; the result has `stage=declared`. The source may instead name the whole Domain — `CREATE SUBSCRIPTION orders.everything FROM DOMAIN orders;` or `{"command":"create_subscription","name":"orders.everything","domain":"orders"}` — binding immutable Domain identity and covering every current and future Feed. Member Feeds attach in the same catalog commit that creates them — the durable discovery boundary — honoring the declared start for existing Feeds and the first retained record for newly discovered ones; a cross-Domain move drains fenced membership rather than silently discarding pending work, an explicit drop retires fenced rows, and `DESCRIBE SUBSCRIPTION` reports per-Feed `member_feeds` states. Membership is bounded (4096 member Feeds per Subscription; attach refuses rather than silently skipping). Member join on a Domain source still refuses 409 until shared delivery lands. No member can join it yet, no shared Cursor or lease is persisted, and no internal/public Feed is created for offsets or transaction decisions. Continue using existing named Reader sessions for working consumption until Subscription delivery is implemented. Internal `/internal/subscription-progress/prepare`, `/internal/subscription-progress/commit`, and `/internal/subscription-progress/committed` accept bounded Node requests and check receiver/owner/epoch against private placement. Development mode uses the shared Control Plane credential; optional mTLS mode moves these routes to a separate listener with CA-validated client certificates pinned to internal Node IDs and disables the HTTP routes. Setting only part of the mTLS configuration fails startup. The committed endpoint reports **one replica's local Fjall state**, not an acknowledgement: the internal coordinator compares assigned replica replies, checks their claimed NodeId/SubscriptionId/epoch, requires matching quorum evidence, and refuses disagreements. JSON claims alone are not Node identity; only the pinned mTLS listener authenticates request peers. These are not application APIs, forwarded commit-vote evidence is not independently signed, the other internal services still lack production transport security, and this does not make Subscriptions joinable or progress RF3-recoverable.
+`CREATE SUBSCRIPTION orders.billing FROM orders.created;` or the typed `create_subscription` command declares one logical Subscription in the same Domain as its source Feed. `SHOW SUBSCRIPTIONS`, `DESCRIBE SUBSCRIPTION`, rename and safe drop operate on its metadata; the result has `stage=declared`. The source may instead name the whole Domain — `CREATE SUBSCRIPTION orders.everything FROM DOMAIN orders;` or `{"command":"create_subscription","name":"orders.everything","domain":"orders"}` — binding immutable Domain identity and covering every current and future Feed. Member Feeds attach in the same catalog commit that creates them — the durable discovery boundary — honoring the declared start for existing Feeds and the first retained record for newly discovered ones; a cross-Domain move drains fenced membership rather than silently discarding pending work, an explicit drop retires fenced rows, and `DESCRIBE SUBSCRIPTION` reports per-Feed `member_feeds` states. Membership is bounded (4096 member Feeds per Subscription; attach refuses rather than silently skipping). Members join a Domain source today: each member Feed carries an independent frontier in the same committed row, a member `fetch`/`acknowledge`/`seek` names its member Feed through `feed` (name or id), and Pipe bootstrap seeds one frontier per member Feed while excluding every Feed the Pipe writes from the source probe set. No internal/public Feed is created for offsets or transaction decisions. Internal `/internal/subscription-progress/prepare`, `/internal/subscription-progress/commit`, and `/internal/subscription-progress/committed` accept bounded Node requests and check receiver/owner/epoch against private placement. Development mode uses the shared Control Plane credential; optional mTLS mode moves these routes to a separate listener with CA-validated client certificates pinned to internal Node IDs and disables the HTTP routes. Setting only part of the mTLS configuration fails startup. The committed endpoint reports **one replica's local Fjall state**, not an acknowledgement: the internal coordinator compares assigned replica replies, checks their claimed NodeId/SubscriptionId/epoch, requires matching quorum evidence, and refuses disagreements. JSON claims alone are not Node identity; only the pinned mTLS listener authenticates request peers. These are not application APIs, forwarded commit-vote evidence is not independently signed, the other internal services still lack production transport security, and this does not make Subscriptions joinable or progress RF3-recoverable.
 
 ## Execute typed commands
 
@@ -345,7 +345,13 @@ POST /v1/subscriptions/members/join
 
 POST /v1/subscriptions/members/claim
 { "subscription": "orders.billing", "request_id": "...", "member_id": "...",
-  "member_epoch": 2, "work_id": "...", "lease_ticks": 60 }
+  "member_epoch": 2, "work_id": "...", "lease_ticks": 60,
+  "key_window": 7 }
+  -> key_window is optional: a lease may pin one of the Subscription's 256
+     Key work windows. The window is exclusive while the lease lives — a
+     second claim on it is refused (409 lease.busy), an out-of-range value
+     is refused (400), and re-claiming the same work_id under a different
+     window is a competing claim, not a replay.
 
 POST /v1/subscriptions/members/renew
 { "...": "...", "lease_epoch": 1, "lease_ticks": 90 }
@@ -364,12 +370,28 @@ POST /v1/subscriptions/members/transfer
 
 POST /v1/subscriptions/members/fetch
 { "...": "...", "work_id": "...", "lease_epoch": 1, "limit": 100 }
+  -> Under a Key-windowed lease the page contains only records whose Key
+     maps into the lease's coverage — its pinned window plus the unclaimed
+     windows dealt deterministically across live windowed leases — plus
+     previously deferred positions that coverage now owns, served ahead of
+     the head so per-Key order holds. The response reports the lease's
+     `key_window` and `delivery_evidence`, opaque server-issued evidence
+     naming exactly which fetched positions were delivered and which were
+     withheld for other windows.
 
 POST /v1/subscriptions/members/ack
 { "...": "...", "work_id": "...", "lease_epoch": 1,
   "cursor": "...", "positions": { "<range-id>": "<position>" },
   "quarantine": { "<range-id>": ["<cursor>", "..."] },
-  "release_quarantine": { "<range-id>": ["<cursor>", "..."] } }
+  "release_quarantine": { "<range-id>": ["<cursor>", "..."] },
+  "delivery_evidence": "..." }
+  -> A Key-windowed ack must echo the fetch's `delivery_evidence`
+     verbatim (409 without it): withheld positions defer durably to the
+     windows that own them rather than being silently consumed, and
+     delivered positions clear any matching deferred evidence. Members
+     can only defer positions a windowed fetch actually withheld and only
+     clear deferred positions it was actually delivered — invented
+     evidence conflicts or is rejected.
 
 GET /v1/subscriptions/members/state?subscription=orders.billing
 ```
@@ -388,10 +410,23 @@ later ack removes once resolved. The cumulative set rides the committed
 frontier mutation durably and bounded (1024 positions, addable only from the
 ranges the ack commits), is reported on the admin progress view as
 `committed.quarantined`, and carries forward through `SEEK SUBSCRIPTION`
-repositions so reprocessing the same window still shows its poison evidence. Concurrent members may fetch overlapping windows — progress
-is fenced by the committed Cursor at `ack`, not by delivery, so failover is
-at-least-once until per-Key work windows arrive. Per-Key work subdivision is
-not yet implemented.
+repositions so reprocessing the same window still shows its poison evidence.
+
+Per-Key work subdivision is implemented as 256 deterministic Key windows
+(`KeyToken % 256`): a `claim` may pin one window, and every window no live
+lease pins is dealt round-robin across the live windowed leases in durable
+`work_id` order, so the Key space is covered exactly once without a global
+rebalance — a member joining, leaving, or losing a lease only re-deals the
+windows, and a lease expiry/transfer moves its coverage with it. Windowed
+fetches deliver only records inside the lease's coverage; the rest of the
+passed span defers into the committed `deferred` set (bounded 4096
+positions, reported on the admin progress view) and redelivers to the
+lease that owns it ahead of new head work, so same-Key order is preserved.
+Unwindowed leases keep the legacy unfiltered contract and see no coverage —
+mixing windowed and unwindowed members is deliberately at-least-once. A
+`SEEK SUBSCRIPTION` clears deferred positions with the frontier they
+belonged to, and split/merge cutovers translate them alongside quarantine
+and skip evidence.
 
 All member mutations first probe the private progress owner: if it is lost,
 the endpoint runs the quorum-backed owner-recovery path — adopting the highest

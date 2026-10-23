@@ -229,6 +229,10 @@ pub struct RangeReadSpec<'a> {
     /// Ingest-clock probe: resolve the committed ingest boundary without
     /// streaming frames; the reply carries `ingest_boundary` instead.
     pub ingest_threshold: Option<i64>,
+    /// Bounded point reads: resolve each committed Cursor and return the
+    /// frame at that exact position — used by Subscription member fetches
+    /// re-delivering deferred positions owed to a Key window.
+    pub cursors: Option<&'a [String]>,
 }
 
 #[derive(Clone)]
@@ -904,6 +908,7 @@ impl ReplicaAppendService {
             spec.after.is_some(),
             spec.tail_count.is_some(),
             spec.ingest_threshold.is_some(),
+            spec.cursors.is_some(),
         ]
         .iter()
         .filter(|set| **set)
@@ -912,7 +917,17 @@ impl ReplicaAppendService {
         {
             return Err(ReplicaAppendError::rejected(
                 ReplicaAppendErrorCode::InvalidFrame,
-                "Cursor, physical continuation, tail, and ingest-threshold starts cannot be combined",
+                "Cursor, physical continuation, tail, ingest-threshold, and point-read starts cannot be combined",
+            ));
+        }
+        if spec.cursors.as_ref().is_some_and(|cursors| {
+            cursors.is_empty()
+                || cursors.len() > 64
+                || cursors.iter().any(|c| c.is_empty() || c.len() > 256)
+        }) {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::InvalidFrame,
+                "point-reads require 1-64 bounded Cursors",
             ));
         }
         let store = self.store_for(assignment).await?;
@@ -963,9 +978,44 @@ impl ReplicaAppendService {
             spec.after
         };
         // An ingest probe resolves its boundary in the index and serves no
-        // frames; other modes stream the bounded page after `start`.
+        // frames; `cursors` point-reads resolve each Cursor to its frame;
+        // other modes stream the bounded page after `start`.
         let frames = if spec.ingest_threshold.is_some() {
             Vec::new()
+        } else if let Some(cursors) = spec.cursors {
+            let mut frames = Vec::with_capacity(cursors.len());
+            for cursor in cursors {
+                let position = store
+                    .committed_position_for_cursor(cursor)
+                    .await
+                    .map_err(map_store_error)?
+                    .filter(|position| position.value() <= boundary.value())
+                    .ok_or_else(|| {
+                        ReplicaAppendError::rejected(
+                            ReplicaAppendErrorCode::PositionConflict,
+                            "Cursor is unknown, uncommitted, or belongs to another Feed",
+                        )
+                    })?;
+                let frame = store
+                    .read_committed_bounded(
+                        Some(RangePosition::new(position.value().saturating_sub(1))),
+                        1,
+                        MAX_COMMITTED_READ_BYTES,
+                    )
+                    .await
+                    .map_err(map_store_error)?
+                    .into_iter()
+                    .next()
+                    .filter(|frame| frame.position == position)
+                    .ok_or_else(|| {
+                        ReplicaAppendError::rejected(
+                            ReplicaAppendErrorCode::PositionConflict,
+                            "Cursor resolved to a committed position whose frame is unavailable",
+                        )
+                    })?;
+                frames.push(frame);
+            }
+            frames
         } else {
             store
                 .read_committed_bounded(start, page_limit.clamp(1, 32), MAX_COMMITTED_READ_BYTES)

@@ -705,6 +705,11 @@ pub struct SubscriptionCutoverTranslation {
     /// replays the positions.
     #[serde(default)]
     pub skipped: BTreeMap<RangeId, Vec<String>>,
+    /// Owed-work positions still deferred to member Key windows; they
+    /// translate onto the new range map like the other evidence sets so a
+    /// split or merge cannot strand undelivered work.
+    #[serde(default)]
+    pub deferred: BTreeMap<RangeId, Vec<String>>,
     pub tick: u64,
 }
 

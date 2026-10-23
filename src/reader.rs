@@ -530,6 +530,11 @@ pub struct SubscriptionWorkLease {
     /// new grant builds a fresh `SubscriptionWorkLease`.
     #[serde(default)]
     pub exhausted_applied: bool,
+    /// The Key window this claim pinned, if any: `None` keeps the legacy
+    /// unfiltered delivery contract while `Some(window)` scopes fetches to
+    /// the lease's coverage and requires delivery evidence at ack.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_window: Option<u16>,
 }
 
 /// One incremental lease handoff: the work item, the current holder's
@@ -554,6 +559,17 @@ pub const SUBSCRIPTION_QUARANTINE_MAX_POSITIONS: usize = 1024;
 /// bounded evidence like quarantine, but never releasable — skip is a final
 /// disposition, while explicit SEEK remains the replay mechanism.
 pub const SUBSCRIPTION_SKIP_MAX_POSITIONS: usize = 1024;
+/// Per-Key work subdivision: a lease that pins a Key window exclusively
+/// serves the records whose `KeyToken` maps into its coverage, and every
+/// window no live windowed lease claims is dealt across those leases in
+/// `work_id` order — a pure function of committed member state, identical
+/// on every replica, so coverage needs no assignment protocol and never
+/// rebalances pinned work.
+pub const SUBSCRIPTION_WORK_WINDOWS: u16 = 256;
+/// Positions a frontier moved past while leaving them owed to another
+/// Key window — transient re-delivery evidence that drains when the
+/// covering lease consumes them, bounded like quarantine evidence.
+pub const SUBSCRIPTION_DEFERRED_MAX_POSITIONS: usize = 4096;
 
 /// The quarantine deltas one acknowledgement applies to the cumulative
 /// frontier set: positions newly declared delivered-but-not-processed, and
@@ -584,6 +600,10 @@ pub enum SubscriptionLeaseOp {
         member_id: Uuid,
         member_epoch: u64,
         lease_ticks: u64,
+        /// Optional Key window the claim pins; absent keeps unfiltered
+        /// delivery for that lease.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_window: Option<u16>,
     },
     Renew {
         work_id: Uuid,
@@ -627,6 +647,8 @@ pub enum SubscriptionLeaseError {
     StaleLease,
     #[error("lease budget is exhausted")]
     Capacity,
+    #[error("key window is out of range")]
+    InvalidWindow,
     #[error("lease clock moved backwards or counter overflowed")]
     InvalidClock,
 }
@@ -680,6 +702,7 @@ impl SubscriptionLeaseTracker {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn claim(
         &mut self,
         work_id: Uuid,
@@ -688,6 +711,7 @@ impl SubscriptionLeaseTracker {
         now_tick: u64,
         lease_ticks: u64,
         max_member_work: usize,
+        key_window: Option<u16>,
     ) -> Result<SubscriptionWorkLease, SubscriptionLeaseError> {
         self.check_tick(now_tick, lease_ticks)?;
         if self.member_epochs.get(&member_id) != Some(&member_epoch) {
@@ -696,10 +720,28 @@ impl SubscriptionLeaseTracker {
         if max_member_work == 0 {
             return Err(SubscriptionLeaseError::Capacity);
         }
+        if key_window.is_some_and(|window| window >= SUBSCRIPTION_WORK_WINDOWS) {
+            return Err(SubscriptionLeaseError::InvalidWindow);
+        }
+        if key_window.is_some_and(|window| {
+            self.leases.values().any(|lease| {
+                lease.work_id != work_id
+                    && lease.key_window == Some(window)
+                    && now_tick < lease.expires_at_tick
+            })
+        }) {
+            return Err(SubscriptionLeaseError::Busy);
+        }
         if let Some(existing) = self.leases.get(&work_id) {
             if now_tick < existing.expires_at_tick {
                 if existing.member_id == member_id && existing.member_epoch == member_epoch {
-                    return Ok(existing.clone());
+                    // A re-claim is only the same work when the pinned
+                    // window matches; a different window on live work is
+                    // a different claim competing for the work_id.
+                    if existing.key_window == key_window {
+                        return Ok(existing.clone());
+                    }
+                    return Err(SubscriptionLeaseError::Busy);
                 }
                 return Err(SubscriptionLeaseError::Busy);
             }
@@ -734,6 +776,7 @@ impl SubscriptionLeaseTracker {
             lease_epoch,
             expires_at_tick,
             exhausted_applied: false,
+            key_window,
         };
         self.leases.insert(work_id, granted.clone());
         self.last_tick = now_tick;
@@ -831,6 +874,12 @@ impl SubscriptionLeaseTracker {
             lease_epoch,
             expires_at_tick,
             exhausted_applied: false,
+            // The pinned window moves with the work: the recipient takes
+            // over the same coverage the previous holder served.
+            key_window: self
+                .leases
+                .get(&transfer.work_id)
+                .and_then(|lease| lease.key_window),
         };
         self.leases.insert(transfer.work_id, grant.clone());
         self.last_tick = now_tick;
@@ -882,6 +931,7 @@ impl SubscriptionLeaseTracker {
                 member_id,
                 member_epoch,
                 lease_ticks,
+                key_window,
             } => self
                 .claim(
                     *work_id,
@@ -890,6 +940,7 @@ impl SubscriptionLeaseTracker {
                     now_tick,
                     *lease_ticks,
                     SUBSCRIPTION_LEASE_MAX_MEMBER_WORK,
+                    *key_window,
                 )
                 .map(|_| ()),
             SubscriptionLeaseOp::Renew {
@@ -907,6 +958,7 @@ impl SubscriptionLeaseTracker {
                         lease_epoch: *lease_epoch,
                         expires_at_tick: 0,
                         exhausted_applied: false,
+                        key_window: None,
                     },
                     now_tick,
                     *lease_ticks,
@@ -924,6 +976,7 @@ impl SubscriptionLeaseTracker {
                 lease_epoch: *lease_epoch,
                 expires_at_tick: 0,
                 exhausted_applied: false,
+                key_window: None,
             }),
             SubscriptionLeaseOp::Transfer {
                 work_id,
@@ -959,6 +1012,7 @@ impl SubscriptionLeaseTracker {
                     lease_epoch: *lease_epoch,
                     expires_at_tick: 0,
                     exhausted_applied: false,
+                    key_window: None,
                 },
                 now_tick,
             ),
@@ -1312,6 +1366,11 @@ pub struct MemberFeedProgress {
     /// Cumulative positions permanently skipped on this Feed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skipped: BTreeMap<RangeId, Vec<String>>,
+    /// Positions this Feed's frontier passed while leaving them owed to
+    /// another member Key window — drained when the covering lease
+    /// consumes them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deferred: BTreeMap<RangeId, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1369,6 +1428,83 @@ pub struct SubscriptionProgressMutation {
     /// request replays and a changed one conflicts rather than restating.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skip_add: BTreeMap<RangeId, Vec<String>>,
+    /// Cumulative positions the frontier passed while leaving them owed
+    /// to other member Key windows — transient owed-work evidence that
+    /// drains when the covering lease consumes them.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deferred: BTreeMap<RangeId, Vec<String>>,
+    /// The positions this mutation newly deferred (a filtered page's
+    /// withheld records) and newly cleared (previously-deferred positions
+    /// the ack consumed); replay evidence like the quarantine deltas.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deferred_add: BTreeMap<RangeId, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub deferred_remove: BTreeMap<RangeId, Vec<String>>,
+}
+
+/// The deferred-position deltas one filtered-window acknowledgement
+/// applies to the cumulative owed set: positions the page withheld for
+/// other windows (`add`) and previously-deferred positions it consumed
+/// (`remove`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SubscriptionDeferredDelta {
+    pub add: BTreeMap<RangeId, Vec<String>>,
+    pub remove: BTreeMap<RangeId, Vec<String>>,
+}
+
+/// Deterministic Key → work-window mapping shared by member fetch
+/// filtering and coverage derivation.
+pub fn subscription_work_window(key: &[u8]) -> u16 {
+    let token = crate::active_range::routing::KeyToken::from_key(key).as_bytes();
+    (u64::from_be_bytes([
+        token[0], token[1], token[2], token[3], token[4], token[5], token[6], token[7],
+    ]) % SUBSCRIPTION_WORK_WINDOWS as u64) as u16
+}
+
+/// Total exclusive work-window coverage across the live windowed leases:
+/// a claimed window belongs to its lease and every window no lease claims
+/// is dealt round-robin across the live windowed leases in `work_id`
+/// order, so the full Key space is always covered exactly once. Unwindowed
+/// leases hold no coverage — they keep the legacy unfiltered contract.
+/// The result is a pure function of committed member state: identical on
+/// every replica, no assignment protocol, and pinned windows never move.
+pub fn subscription_work_coverage(
+    leases: &BTreeMap<Uuid, SubscriptionWorkLease>,
+    now_tick: u64,
+) -> BTreeMap<Uuid, BTreeSet<u16>> {
+    let windowed: Vec<Uuid> = leases
+        .iter()
+        .filter(|(_, lease)| now_tick < lease.expires_at_tick && lease.key_window.is_some())
+        .map(|(work_id, _)| *work_id)
+        .collect();
+    let claimed: BTreeSet<u16> = leases
+        .values()
+        .filter(|lease| now_tick < lease.expires_at_tick)
+        .filter_map(|lease| lease.key_window)
+        .collect();
+    let mut coverage: BTreeMap<Uuid, BTreeSet<u16>> = windowed
+        .iter()
+        .map(|work_id| {
+            (
+                *work_id,
+                leases
+                    .get(work_id)
+                    .and_then(|lease| lease.key_window)
+                    .into_iter()
+                    .collect::<BTreeSet<u16>>(),
+            )
+        })
+        .collect();
+    let n = windowed.len();
+    for window in 0..SUBSCRIPTION_WORK_WINDOWS {
+        if claimed.contains(&window) {
+            continue;
+        }
+        if let Some(work_id) = windowed.get(window as usize % n.max(1)) {
+            coverage.entry(*work_id).or_default().insert(window);
+        }
+    }
+    coverage
 }
 
 /// The per-Feed frontier entries a Domain-source mutation may carry:
@@ -1407,6 +1543,18 @@ fn member_progress_bounds_ok(entry: &MemberFeedProgress) -> bool {
             .skipped
             .keys()
             .all(|range| entry.positions.contains_key(range))
+        && entry.deferred.len() <= 128
+        && entry
+            .deferred
+            .values()
+            .flatten()
+            .all(|value| !value.is_empty() && value.len() <= 256)
+        && entry.deferred.values().map(Vec::len).sum::<usize>()
+            <= SUBSCRIPTION_DEFERRED_MAX_POSITIONS
+        && entry
+            .deferred
+            .keys()
+            .all(|range| entry.positions.contains_key(range))
 }
 
 /// Validate the Domain-source member-Feed rules on a proposed mutation:
@@ -1439,6 +1587,7 @@ fn member_progress_valid(
             if entry.cursor != mutation.cursor
                 || entry.positions != mutation.positions
                 || entry.quarantined != mutation.quarantined
+                || entry.deferred != mutation.deferred
                 || entry.skipped != mutation.skipped
             {
                 return Err(SubscriptionProgressError::Conflict);
@@ -1448,6 +1597,8 @@ fn member_progress_valid(
             if !mutation.quarantine_add.is_empty()
                 || !mutation.quarantine_remove.is_empty()
                 || !mutation.skip_add.is_empty()
+                || !mutation.deferred_add.is_empty()
+                || !mutation.deferred_remove.is_empty()
             {
                 return Err(SubscriptionProgressError::Conflict);
             }
@@ -1456,6 +1607,7 @@ fn member_progress_valid(
                     || committed.positions != mutation.positions
                     || committed.quarantined != mutation.quarantined
                     || committed.skipped != mutation.skipped
+                    || committed.deferred != mutation.deferred
                 {
                     return Err(SubscriptionProgressError::Conflict);
                 }
@@ -1574,6 +1726,17 @@ impl SubscriptionProgressMutation {
             } else {
                 BTreeMap::new()
             },
+            deferred: entry.deferred.clone(),
+            deferred_add: if delta_is_mine {
+                self.deferred_add.clone()
+            } else {
+                BTreeMap::new()
+            },
+            deferred_remove: if delta_is_mine {
+                self.deferred_remove.clone()
+            } else {
+                BTreeMap::new()
+            },
             member_progress: BTreeMap::new(),
             member_feed: None,
             ..self.clone()
@@ -1601,6 +1764,9 @@ fn same_progress_identity(
         && left.quarantine_remove == right.quarantine_remove
         && left.skipped == right.skipped
         && left.skip_add == right.skip_add
+        && left.deferred == right.deferred
+        && left.deferred_add == right.deferred_add
+        && left.deferred_remove == right.deferred_remove
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1682,6 +1848,7 @@ impl SubscriptionLeaseError {
             Self::Busy => "lease.busy",
             Self::StaleLease => "lease.stale_lease",
             Self::Capacity => "lease.capacity",
+            Self::InvalidWindow => "lease.invalid_window",
             Self::InvalidClock => "lease.invalid_clock",
         }
     }
@@ -1691,6 +1858,7 @@ impl SubscriptionLeaseError {
             "lease.busy" => Self::Busy,
             "lease.stale_lease" => Self::StaleLease,
             "lease.capacity" => Self::Capacity,
+            "lease.invalid_window" => Self::InvalidWindow,
             "lease.invalid_clock" => Self::InvalidClock,
             _ => return None,
         })
@@ -1875,6 +2043,18 @@ impl FjallSubscriptionProgressReplica {
                     .skipped
                     .keys()
                     .all(|range| mutation.positions.contains_key(range))
+                || mutation.deferred.len() > 128
+                || mutation
+                    .deferred
+                    .values()
+                    .flatten()
+                    .any(|value| value.is_empty() || value.len() > 256)
+                || mutation.deferred.values().map(Vec::len).sum::<usize>()
+                    > SUBSCRIPTION_DEFERRED_MAX_POSITIONS
+                || !mutation
+                    .deferred
+                    .keys()
+                    .all(|range| mutation.positions.contains_key(range))
                 || mutation.expected_cursor.as_ref().is_some_and(|expected| {
                     expected.is_empty()
                         || expected.len() > 256
@@ -1981,6 +2161,18 @@ impl FjallSubscriptionProgressReplica {
                 > SUBSCRIPTION_SKIP_MAX_POSITIONS
             || !mutation
                 .skipped
+                .keys()
+                .all(|range| mutation.positions.contains_key(range))
+            || mutation.deferred.len() > 128
+            || mutation
+                .deferred
+                .values()
+                .flatten()
+                .any(|value| value.is_empty() || value.len() > 256)
+            || mutation.deferred.values().map(Vec::len).sum::<usize>()
+                > SUBSCRIPTION_DEFERRED_MAX_POSITIONS
+            || !mutation
+                .deferred
                 .keys()
                 .all(|range| mutation.positions.contains_key(range))
             || mutation.lease_ops.len() > SUBSCRIPTION_LEASE_MAX_OPS
@@ -2840,6 +3032,10 @@ pub struct ExhaustedDelivery {
     pub exhausted: BTreeMap<RangeId, Vec<String>>,
     /// Whether the evidence parks for release (quarantine) or is final (skip).
     pub disposition: crate::control::SubscriptionExhaustedDisposition,
+    /// Positions the exhausted page passed that belong to other member
+    /// Key windows — owed work to defer rather than park, empty for
+    /// unwindowed leases.
+    pub deferred_add: BTreeMap<RangeId, Vec<String>>,
 }
 
 impl SubscriptionProgressCoordinator {
@@ -3620,13 +3816,15 @@ impl SubscriptionProgressCoordinator {
         mutation.tick = tick;
         mutation.lease_ops = lease_ops;
         // A lease-only mutation carries no member-Feed delta on Domain
-        // rows: the top-level frontier fields copy forward verbatim and
-        // stale per-Feed evidence must not restate.
+        // rows and no frontier evidence anywhere: the top-level frontier
+        // fields copy forward verbatim and stale deltas must not restate.
+        mutation.quarantine_add = BTreeMap::new();
+        mutation.quarantine_remove = BTreeMap::new();
+        mutation.skip_add = BTreeMap::new();
+        mutation.deferred_add = BTreeMap::new();
+        mutation.deferred_remove = BTreeMap::new();
         if !mutation.member_progress.is_empty() {
             mutation.member_feed = None;
-            mutation.quarantine_add = BTreeMap::new();
-            mutation.quarantine_remove = BTreeMap::new();
-            mutation.skip_add = BTreeMap::new();
         }
         self.apply(mutation.clone()).await?;
         Ok(mutation)
@@ -3671,12 +3869,15 @@ impl SubscriptionProgressCoordinator {
         mutation.quarantine_add = BTreeMap::new();
         mutation.quarantine_remove = BTreeMap::new();
         mutation.skip_add = BTreeMap::new();
+        mutation.deferred_add = BTreeMap::new();
+        mutation.deferred_remove = BTreeMap::new();
         mutation.lease_ops = Vec::new();
         mutation.member_progress.extend(additions);
         self.apply(mutation.clone()).await?;
         Ok(mutation)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn acknowledge(
         &self,
         grant: &SubscriptionWorkLease,
@@ -3685,9 +3886,12 @@ impl SubscriptionProgressCoordinator {
         cursor: String,
         positions: BTreeMap<RangeId, String>,
         quarantine: SubscriptionQuarantineDelta,
+        deferred: SubscriptionDeferredDelta,
     ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
-        self.acknowledge_inner(grant, tick, request_id, None, cursor, positions, quarantine)
-            .await
+        self.acknowledge_inner(
+            grant, tick, request_id, None, cursor, positions, quarantine, deferred,
+        )
+        .await
     }
 
     /// Acknowledge delivered positions on one member Feed of a
@@ -3704,6 +3908,7 @@ impl SubscriptionProgressCoordinator {
         cursor: String,
         positions: BTreeMap<RangeId, String>,
         quarantine: SubscriptionQuarantineDelta,
+        deferred: SubscriptionDeferredDelta,
     ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
         self.acknowledge_inner(
             grant,
@@ -3713,6 +3918,7 @@ impl SubscriptionProgressCoordinator {
             cursor,
             positions,
             quarantine,
+            deferred,
         )
         .await
     }
@@ -3727,11 +3933,16 @@ impl SubscriptionProgressCoordinator {
         cursor: String,
         positions: BTreeMap<RangeId, String>,
         quarantine: SubscriptionQuarantineDelta,
+        deferred: SubscriptionDeferredDelta,
     ) -> Result<SubscriptionProgressMutation, SubscriptionProgressError> {
         let SubscriptionQuarantineDelta {
             add: quarantine_add,
             remove: quarantine_remove,
         } = quarantine;
+        let SubscriptionDeferredDelta {
+            add: deferred_add,
+            remove: deferred_remove,
+        } = deferred;
         let current = self
             .read_committed()
             .await?
@@ -3787,6 +3998,41 @@ impl SubscriptionProgressCoordinator {
         {
             return Err(SubscriptionProgressError::TooLarge);
         }
+        // Deferred owed positions fold exactly like quarantine: withheld
+        // evidence adds to the owed set while consumed evidence releases
+        // it — and removal may only name positions actually owed.
+        let mut deferred = prior_entry
+            .as_ref()
+            .map(|entry| entry.deferred.clone())
+            .unwrap_or_else(|| current.deferred.clone());
+        if !deferred_remove.iter().all(|(range, cursors)| {
+            cursors.iter().all(|cursor| {
+                deferred
+                    .get(range)
+                    .is_some_and(|held| held.contains(cursor))
+            })
+        }) {
+            return Err(SubscriptionProgressError::Conflict);
+        }
+        for (range, cursors) in &deferred_remove {
+            if let Some(held) = deferred.get_mut(range) {
+                held.retain(|cursor| !cursors.contains(cursor));
+                if held.is_empty() {
+                    deferred.remove(range);
+                }
+            }
+        }
+        for (range, cursors) in &deferred_add {
+            let held = deferred.entry(*range).or_default();
+            for cursor in cursors {
+                if !held.contains(cursor) {
+                    held.push(cursor.clone());
+                }
+            }
+        }
+        if deferred.values().map(Vec::len).sum::<usize>() > SUBSCRIPTION_DEFERRED_MAX_POSITIONS {
+            return Err(SubscriptionProgressError::TooLarge);
+        }
         let mut member_progress = current.member_progress.clone();
         if let Some(feed) = member_feed {
             member_progress.insert(
@@ -3796,6 +4042,7 @@ impl SubscriptionProgressCoordinator {
                     positions: positions.clone(),
                     quarantined: quarantined.clone(),
                     skipped: skipped.clone(),
+                    deferred: deferred.clone(),
                 },
             );
         }
@@ -3821,6 +4068,9 @@ impl SubscriptionProgressCoordinator {
             quarantine_remove,
             skipped,
             skip_add: BTreeMap::new(),
+            deferred,
+            deferred_add,
+            deferred_remove,
             tick,
             lease_ops: vec![SubscriptionLeaseOp::Release {
                 work_id: grant.work_id,
@@ -3853,6 +4103,7 @@ impl SubscriptionProgressCoordinator {
             positions,
             exhausted,
             disposition,
+            deferred_add,
         } = decision;
         let current = self
             .read_committed()
@@ -3881,6 +4132,29 @@ impl SubscriptionProgressCoordinator {
             .as_ref()
             .map(|entry| entry.quarantined.clone())
             .unwrap_or_else(|| current.quarantined.clone());
+        // A position the exhausted disposition quarantines or skips is a
+        // decided delivery, so it stops being owed to a Key window.
+        let mut deferred = prior_entry
+            .as_ref()
+            .map(|entry| entry.deferred.clone())
+            .unwrap_or_else(|| current.deferred.clone());
+        let mut deferred_remove: BTreeMap<RangeId, Vec<String>> = BTreeMap::new();
+        for (range, cursors) in &exhausted {
+            if let Some(held) = deferred.get_mut(range) {
+                let removed: Vec<String> = cursors
+                    .iter()
+                    .filter(|cursor| held.contains(*cursor))
+                    .cloned()
+                    .collect();
+                if !removed.is_empty() {
+                    held.retain(|cursor| !removed.contains(cursor));
+                    deferred_remove.insert(*range, removed);
+                }
+                if held.is_empty() {
+                    deferred.remove(range);
+                }
+            }
+        }
         let mut skip_add = BTreeMap::new();
         let mut quarantine_add = BTreeMap::new();
         match disposition {
@@ -3915,6 +4189,17 @@ impl SubscriptionProgressCoordinator {
                 skip_add = exhausted;
             }
         }
+        for (range, cursors) in &deferred_add {
+            let held = deferred.entry(*range).or_default();
+            for cursor in cursors {
+                if !held.contains(cursor) {
+                    held.push(cursor.clone());
+                }
+            }
+        }
+        if deferred.values().map(Vec::len).sum::<usize>() > SUBSCRIPTION_DEFERRED_MAX_POSITIONS {
+            return Err(SubscriptionProgressError::TooLarge);
+        }
         let mut member_progress = current.member_progress.clone();
         if let Some(feed) = member_feed {
             member_progress.insert(
@@ -3924,6 +4209,7 @@ impl SubscriptionProgressCoordinator {
                     positions: positions.clone(),
                     quarantined: quarantined.clone(),
                     skipped: skipped.clone(),
+                    deferred: deferred.clone(),
                 },
             );
         }
@@ -3949,6 +4235,9 @@ impl SubscriptionProgressCoordinator {
             quarantine_remove: BTreeMap::new(),
             skipped,
             skip_add,
+            deferred,
+            deferred_add,
+            deferred_remove,
             tick,
             lease_ops: vec![SubscriptionLeaseOp::ApplyExhausted {
                 work_id: grant.work_id,
@@ -4080,6 +4369,9 @@ mod tests {
             quarantine_remove: BTreeMap::new(),
             skipped: BTreeMap::new(),
             skip_add: BTreeMap::new(),
+            deferred: BTreeMap::new(),
+            deferred_add: BTreeMap::new(),
+            deferred_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -4204,6 +4496,9 @@ mod tests {
             quarantine_remove: BTreeMap::new(),
             skipped: BTreeMap::new(),
             skip_add: BTreeMap::new(),
+            deferred: BTreeMap::new(),
+            deferred_add: BTreeMap::new(),
+            deferred_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -4414,35 +4709,35 @@ mod tests {
         let second_work = Uuid::from_u128(4);
         assert_eq!(
             leases
-                .claim(first_work, first_member, 1, 100, 20, 1)
+                .claim(first_work, first_member, 1, 100, 20, 1, None)
                 .unwrap_err(),
             SubscriptionLeaseError::StaleLease
         );
         leases.fence_member(first_member, 1).unwrap();
         leases.fence_member(second_member, 1).unwrap();
         let first = leases
-            .claim(first_work, first_member, 1, 100, 20, 1)
+            .claim(first_work, first_member, 1, 100, 20, 1, None)
             .unwrap();
         assert_eq!(
             leases
-                .claim(first_work, first_member, 1, 100, 20, 1)
+                .claim(first_work, first_member, 1, 100, 20, 1, None)
                 .unwrap(),
             first
         );
         assert_eq!(
             leases
-                .claim(first_work, second_member, 1, 101, 20, 1)
+                .claim(first_work, second_member, 1, 101, 20, 1, None)
                 .unwrap_err(),
             SubscriptionLeaseError::Busy
         );
         assert_eq!(
             leases
-                .claim(second_work, first_member, 1, 101, 20, 1)
+                .claim(second_work, first_member, 1, 101, 20, 1, None)
                 .unwrap_err(),
             SubscriptionLeaseError::Capacity
         );
         let second = leases
-            .claim(second_work, second_member, 1, 102, 20, 1)
+            .claim(second_work, second_member, 1, 102, 20, 1, None)
             .unwrap();
         assert!(leases.can_ack(&first, 103));
         assert!(leases.can_ack(&second, 103));
@@ -4450,12 +4745,12 @@ mod tests {
         assert!(!leases.can_ack(&first, 103));
         assert_eq!(
             leases
-                .claim(first_work, first_member, 1, 103, 20, 1)
+                .claim(first_work, first_member, 1, 103, 20, 1, None)
                 .unwrap_err(),
             SubscriptionLeaseError::StaleLease
         );
         let renewed_session = leases
-            .claim(first_work, first_member, 2, 103, 20, 1)
+            .claim(first_work, first_member, 2, 103, 20, 1, None)
             .unwrap();
         assert!(renewed_session.lease_epoch > first.lease_epoch);
         assert!(!leases.can_ack(&first, 104));
@@ -4465,31 +4760,31 @@ mod tests {
         );
         assert_eq!(
             leases
-                .claim(first_work, second_member, 1, 110, 20, 1)
+                .claim(first_work, second_member, 1, 110, 20, 1, None)
                 .unwrap_err(),
             SubscriptionLeaseError::Busy
         );
         let replacement = leases
-            .claim(first_work, second_member, 1, 123, 20, 2)
+            .claim(first_work, second_member, 1, 123, 20, 2, None)
             .unwrap();
         assert!(replacement.lease_epoch > renewed_session.lease_epoch);
         assert!(!leases.can_ack(&renewed_session, 124));
         assert!(!leases.can_ack(&second, 124));
         assert_eq!(
             leases
-                .claim(Uuid::from_u128(5), first_member, 2, 125, 20, 1)
+                .claim(Uuid::from_u128(5), first_member, 2, 125, 20, 1, None)
                 .unwrap_err(),
             SubscriptionLeaseError::Capacity
         );
         assert_eq!(
             leases
-                .claim(first_work, second_member, 1, 120, 20, 2)
+                .claim(first_work, second_member, 1, 120, 20, 2, None)
                 .unwrap_err(),
             SubscriptionLeaseError::InvalidClock
         );
         assert_eq!(
             leases
-                .claim(first_work, second_member, 1, u64::MAX, 2, 2)
+                .claim(first_work, second_member, 1, u64::MAX, 2, 2, None)
                 .unwrap_err(),
             SubscriptionLeaseError::InvalidClock
         );
@@ -4614,6 +4909,9 @@ mod tests {
             quarantine_remove: BTreeMap::new(),
             skipped: BTreeMap::new(),
             skip_add: BTreeMap::new(),
+            deferred: BTreeMap::new(),
+            deferred_add: BTreeMap::new(),
+            deferred_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         }
@@ -4648,6 +4946,7 @@ mod tests {
             work_id: work,
             member_id: member,
             member_epoch: 1,
+            key_window: None,
             lease_ticks: 30,
         }];
         commit_direct(&replica, &claim);
@@ -4670,6 +4969,7 @@ mod tests {
             work_id: Uuid::from_u128(615),
             member_id: other,
             member_epoch: 1,
+            key_window: None,
             lease_ticks: 10,
         }];
         assert!(matches!(
@@ -4693,6 +4993,7 @@ mod tests {
                 work_id: work,
                 member_id: other,
                 member_epoch: 1,
+                key_window: None,
                 lease_ticks: 10,
             },
         ];
@@ -4782,6 +5083,7 @@ mod tests {
                 work_id: work,
                 member_id: member,
                 member_epoch: 1,
+                key_window: None,
                 lease_ticks: 30,
             },
             SubscriptionLeaseOp::Join {
@@ -4862,6 +5164,7 @@ mod tests {
                 work_id: work,
                 member_id: member,
                 member_epoch: 1,
+                key_window: None,
                 lease_ticks: 20,
             },
         ];
@@ -4914,6 +5217,7 @@ mod tests {
                 work_id: Uuid::from_u128(10_000 + index),
                 member_id: member,
                 member_epoch: 1,
+                key_window: None,
                 lease_ticks: 10,
             })
             .collect();
@@ -5252,6 +5556,9 @@ mod tests {
             quarantine_remove: BTreeMap::new(),
             skipped: BTreeMap::new(),
             skip_add: BTreeMap::new(),
+            deferred: BTreeMap::new(),
+            deferred_add: BTreeMap::new(),
+            deferred_remove: BTreeMap::new(),
             tick: 0,
             lease_ops: Vec::new(),
         };
@@ -5289,7 +5596,7 @@ mod tests {
         let work = Uuid::from_u128(9);
         tracker.fence_member(alice, 1).unwrap();
         tracker.fence_member(bob, 1).unwrap();
-        let grant = tracker.claim(work, alice, 1, 10, 30, 4).unwrap();
+        let grant = tracker.claim(work, alice, 1, 10, 30, 4, None).unwrap();
         assert!(tracker.can_ack(&grant, 10));
 
         // Stale source evidence and unjoined targets refuse.
@@ -5369,11 +5676,11 @@ mod tests {
         // Transfer respects the target's per-member bound.
         for extra in 0..3u128 {
             tracker
-                .claim(Uuid::from_u128(100 + extra), bob, 1, 12, 30, 4)
+                .claim(Uuid::from_u128(100 + extra), bob, 1, 12, 30, 4, None)
                 .unwrap();
         }
         let overflow = Uuid::from_u128(200);
-        let held = tracker.claim(overflow, alice, 1, 12, 30, 4).unwrap();
+        let held = tracker.claim(overflow, alice, 1, 12, 30, 4, None).unwrap();
         assert_eq!(
             tracker.transfer(
                 &SubscriptionLeaseTransfer {
@@ -5416,6 +5723,7 @@ mod tests {
                 work_id: work,
                 member_id: holder,
                 member_epoch: 1,
+                key_window: None,
                 lease_ticks: 30,
             },
         ];
@@ -5493,6 +5801,7 @@ mod tests {
             work_id: work,
             member_id: member,
             member_epoch: 1,
+            key_window: None,
             lease_ticks: 30,
         }];
         commit_direct(&replica, &claim);
@@ -5567,6 +5876,7 @@ mod tests {
             work_id: work,
             member_id: member,
             member_epoch: 1,
+            key_window: None,
             lease_ticks: 10,
         }];
         commit_direct(&replica, &reclaim);
@@ -5735,5 +6045,70 @@ mod tests {
             vec!["left-record".to_owned(), "right-record".to_owned()]
         );
         assert!(!skipped.contains_key(&right));
+    }
+    #[test]
+    fn subscription_work_windows_cover_the_key_space_exactly_once() {
+        // Two windowed leases each pin a window; the remaining windows
+        // deal deterministically across them so every Key maps to
+        // exactly one live lease.
+        let mut tracker = SubscriptionLeaseTracker::new(16);
+        let alice = Uuid::from_u128(1);
+        let bob = Uuid::from_u128(2);
+        tracker.fence_member(alice, 1).unwrap();
+        tracker.fence_member(bob, 1).unwrap();
+        let work_a = Uuid::from_u128(9);
+        let work_b = Uuid::from_u128(10);
+        tracker.claim(work_a, alice, 1, 10, 30, 4, Some(7)).unwrap();
+
+        // The same pinned window cannot be claimed twice while live.
+        let work_c = Uuid::from_u128(11);
+        assert_eq!(
+            tracker.claim(work_c, alice, 1, 10, 30, 4, Some(7)),
+            Err(SubscriptionLeaseError::Busy)
+        );
+        // Out-of-range windows refuse.
+        assert_eq!(
+            tracker.claim(work_c, alice, 1, 10, 30, 4, Some(SUBSCRIPTION_WORK_WINDOWS)),
+            Err(SubscriptionLeaseError::InvalidWindow)
+        );
+        tracker.claim(work_b, bob, 1, 10, 30, 4, Some(11)).unwrap();
+
+        let coverage = subscription_work_coverage(&tracker.leases, 10);
+        let mut union: BTreeSet<u16> = BTreeSet::new();
+        for (work, windows) in &coverage {
+            assert!(windows.contains(&tracker.leases.get(work).unwrap().key_window.unwrap()));
+            for window in windows {
+                assert!(union.insert(*window));
+            }
+        }
+        assert_eq!(union.len(), SUBSCRIPTION_WORK_WINDOWS as usize);
+        // Deterministic: the same committed state reproduces it exactly.
+        assert_eq!(coverage, subscription_work_coverage(&tracker.leases, 10));
+        // An unwindowed lease holds no coverage — the legacy contract.
+        let work_d = Uuid::from_u128(12);
+        tracker.claim(work_d, alice, 1, 10, 30, 4, None).unwrap();
+        assert!(!subscription_work_coverage(&tracker.leases, 10).contains_key(&work_d));
+    }
+
+    #[test]
+    fn subscription_work_window_reclaim_replays_and_conflicts() {
+        let mut tracker = SubscriptionLeaseTracker::new(16);
+        let alice = Uuid::from_u128(1);
+        tracker.fence_member(alice, 1).unwrap();
+        let work = Uuid::from_u128(9);
+        let grant = tracker.claim(work, alice, 1, 10, 30, 4, Some(3)).unwrap();
+        // Same member re-claiming the same window replays the lease.
+        assert_eq!(tracker.claim(work, alice, 1, 11, 30, 4, Some(3)), Ok(grant));
+        // Same work_id under a different window is a competing claim.
+        assert_eq!(
+            tracker.claim(work, alice, 1, 11, 30, 4, Some(4)),
+            Err(SubscriptionLeaseError::Busy)
+        );
+        // Expiry frees the pinned window for another claimant.
+        let other = Uuid::from_u128(10);
+        assert_eq!(
+            tracker.claim(other, alice, 1, 41, 30, 4, Some(3)),
+            Ok(tracker.leases.get(&other).unwrap().clone())
+        );
     }
 }

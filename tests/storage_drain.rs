@@ -690,6 +690,9 @@ async fn drain_executor_vacates_subscription_progress_references() {
             quarantine_remove: BTreeMap::new(),
             skipped: BTreeMap::new(),
             skip_add: BTreeMap::new(),
+            deferred: BTreeMap::new(),
+            deferred_add: BTreeMap::new(),
+            deferred_remove: BTreeMap::new(),
             tick: 1,
             lease_ops: Vec::new(),
         })

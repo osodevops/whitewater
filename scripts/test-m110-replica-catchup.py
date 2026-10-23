@@ -43,12 +43,12 @@ def call(endpoint, path, body=None):
         try:
             return _call_once(endpoint, path, body)
         except urllib.error.HTTPError as error:
-            body = error.read() or b"{}"
+            error_body = error.read() or b"{}"
             if error.code < 500:
                 # Ownership transitions surface a NotCurrentOwner-shaped
                 # 409 while placement settles; bounded retries ride it
                 # out, but log the body so real conflicts stay visible.
-                print(f"transient {error.code}: {body[:300]}", file=sys.stderr)
+                print(f"transient {error.code}: {error_body[:300]}", file=sys.stderr)
             last = error
             time.sleep(0.5)
         except OSError as error:
