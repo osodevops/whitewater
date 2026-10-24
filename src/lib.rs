@@ -21,4 +21,5 @@ pub mod reader;
 pub mod sdk;
 pub mod state_store;
 pub mod storage;
+pub mod testing;
 pub mod writer;

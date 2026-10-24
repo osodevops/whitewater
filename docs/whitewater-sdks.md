@@ -136,6 +136,7 @@ That distinction keeps the promise meaningful: a shared method name or a working
 
 ## Further reading
 
+- [Application guides](guides/README.md) and the [SDK support matrix](sdk-support-matrix.md)
 - [Whitewater Streams and cross-language technical contract](streams-clients.md)
 - [Why Whitewater](why-whitewater.md)
 - [Kafka pain points](kafka-pain-points.md)
