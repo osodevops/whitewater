@@ -83,9 +83,18 @@ def main():
     status, _ = post(ENDPOINTS[1], "/v1/writers/append", stale)
     if status == 200: raise AssertionError("stale Writer epoch was accepted")
     post(ENDPOINTS[0], "/v1/admin/wcl", {"request_id": str(uuid.uuid4()), "script": f"REVOKE WRITER SESSION {writer} EPOCH {new_epoch};"})
-    revoked = dict(append); revoked.update({"request_id": str(uuid.uuid4()), "session_epoch": new_epoch})
-    status, _ = post(ENDPOINTS[2], "/v1/writers/append", revoked)
-    if status == 200: raise AssertionError("revoked Writer session was accepted")
+    # Session revocation is a catalog change that propagates to each
+    # Node's session registry asynchronously; probe ENDPOINTS[2] until
+    # the revoked epoch is rejected rather than racing that applier.
+    deadline = time.time() + 15
+    while True:
+        revoked = dict(append); revoked.update({"request_id": str(uuid.uuid4()), "session_epoch": new_epoch})
+        status, _ = post(ENDPOINTS[2], "/v1/writers/append", revoked)
+        if status != 200:
+            break
+        if time.time() >= deadline:
+            raise AssertionError("revoked Writer session was accepted")
+        time.sleep(0.5)
     print(json.dumps({"status": "ok", "writer": writer, "epoch": epoch, "new_epoch": new_epoch, "message_id": results[0]["message_id"], "feedback": results[0]["feedback"]}, indent=2))
 
 if __name__ == "__main__":
