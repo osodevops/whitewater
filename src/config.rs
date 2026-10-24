@@ -65,6 +65,19 @@ pub struct NodeConfig {
     /// default 0 = disabled). Same shared-config requirement.
     pub min_disk_free_bytes: u64,
     pub subscription_mtls: Option<SubscriptionMtlsConfig>,
+    /// Root of the object store sealed segments upload to
+    /// (`WHITEWATER_OBJECT_STORE_DIR`). `None` disables tiering entirely;
+    /// the filesystem implementation used by development and test
+    /// topologies treats this as a shared or per-Node directory.
+    pub object_store_dir: Option<PathBuf>,
+    /// How often the tiering pass scans for newly sealed segments
+    /// (`WHITEWATER_TIER_SCAN_MS`, default 30s).
+    pub tier_scan_interval: Duration,
+    /// Committed-segment rotation bound (`WHITEWATER_MAX_SEGMENT_BYTES`,
+    /// default 256 MiB). Identical semantics on every replica; a divergent
+    /// bound diverges segment boundaries and therefore manifest digests,
+    /// so it must be configured uniformly.
+    pub max_segment_bytes: u64,
 }
 
 impl NodeConfig {
@@ -139,6 +152,20 @@ impl NodeConfig {
         let capacity_report_max_age =
             Duration::from_millis(parse_env("WHITEWATER_CAPACITY_REPORT_MAX_AGE_MS", 0)?);
         let min_disk_free_bytes = parse_env("WHITEWATER_STORAGE_MIN_DISK_FREE_BYTES", 0)?;
+        let object_store_dir = env::var("WHITEWATER_OBJECT_STORE_DIR")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
+        let tier_scan_interval =
+            Duration::from_millis(parse_env("WHITEWATER_TIER_SCAN_MS", 30_000)?);
+        let max_segment_bytes = parse_env("WHITEWATER_MAX_SEGMENT_BYTES", 256 * 1024 * 1024)?;
+        if max_segment_bytes == 0 {
+            anyhow::bail!("WHITEWATER_MAX_SEGMENT_BYTES must be greater than zero");
+        }
+        if tier_scan_interval.is_zero() {
+            anyhow::bail!("WHITEWATER_TIER_SCAN_MS must be greater than zero");
+        }
         let tls = [
             env::var("WHITEWATER_SUBSCRIPTION_MTLS_BIND").ok(),
             env::var("WHITEWATER_SUBSCRIPTION_MTLS_CERT").ok(),
@@ -209,6 +236,9 @@ impl NodeConfig {
             capacity_report_max_age,
             min_disk_free_bytes,
             subscription_mtls,
+            object_store_dir,
+            tier_scan_interval,
+            max_segment_bytes,
         })
     }
 }

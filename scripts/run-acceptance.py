@@ -82,6 +82,10 @@ VERIFY_READS = (
     "test-m4-large-history.py",
     "test-m4-throughput-transparency.py",
     "test-sdk-rust.py",
+    # Recreates the shared fixture with compose.verify.tier.yml layered on
+    # and restores the base definition — the same bounce-then-restore
+    # profile as test-m4-auto-split.py.
+    "test-tiered-upload.py",
     "test-wcl-cli-write.py",
 )
 

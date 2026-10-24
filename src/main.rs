@@ -164,12 +164,69 @@ async fn main() -> Result<()> {
         .clone()
         .filter(|_| config.node_capabilities.storage)
         .map(|local_node| {
-            Arc::new(ReplicaAppendService::new(
+            Arc::new(ReplicaAppendService::with_options(
                 config.data_dir.join("active-ranges"),
                 local_node,
                 control.clone(),
+                whitewater::active_range::store::FileActiveRangeStoreOptions {
+                    max_segment_bytes: config.max_segment_bytes,
+                    ..whitewater::active_range::store::FileActiveRangeStoreOptions::default()
+                },
             ))
         });
+
+    // Sealed-segment tiering runs only on storage Nodes with a configured
+    // object store: each tick verifies manifests and uploads every newly
+    // sealed segment's artifacts exactly once, marked durably so restarts
+    // resume cleanly. Blocking filesystem work stays on spawn_blocking.
+    if let Some(object_root) = config.object_store_dir.clone() {
+        if replica_append.is_some() {
+            let ranges_root = config.data_dir.join("active-ranges");
+            let interval = config.tier_scan_interval;
+            tokio::spawn(async move {
+                use whitewater::active_range::tier::{tier_scan_once, FileSystemObjectStore};
+                let mut ticker = tokio::time::interval(interval);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let root = ranges_root.clone();
+                    let objects = object_root.clone();
+                    // The object store root opens lazily every tick: a
+                    // late-mounted or briefly unavailable backend self-heals
+                    // on the next pass instead of disabling tiering for the
+                    // process lifetime.
+                    let report = tokio::task::spawn_blocking(move || {
+                        FileSystemObjectStore::open(&objects)
+                            .map(|store| tier_scan_once(root.as_path(), &store))
+                    })
+                    .await;
+                    match report {
+                        Ok(Ok(report)) if !report.failed.is_empty() => {
+                            tracing::warn!(
+                                uploaded = report.uploaded,
+                                failed = ?report.failed,
+                                "sealed-segment tier scan completed with failures"
+                            );
+                        }
+                        Ok(Ok(report)) if report.uploaded > 0 => {
+                            tracing::info!(
+                                uploaded = report.uploaded,
+                                already_tiered = report.already_tiered,
+                                "sealed-segment tier scan uploaded artifacts"
+                            );
+                        }
+                        Ok(Ok(_)) => {}
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "object store root is not usable")
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "sealed-segment tier scan worker failed")
+                        }
+                    }
+                }
+            });
+        }
+    }
     let subscription_progress = if let Some(local) = &replica_append {
         let path = config.data_dir.join("subscription-progress");
         let replica =

@@ -9,6 +9,7 @@ pub mod replication;
 pub mod routing;
 pub mod split;
 pub mod store;
+pub mod tier;
 
 pub use commit_proof::{CommitProofReporter, CommitProofSink};
 pub use drain::{

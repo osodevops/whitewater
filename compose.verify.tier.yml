@@ -1,0 +1,22 @@
+# Sealed-segment tiering override for scripts/test-tiered-upload.py.
+# Layered over compose.verify.yml via
+#   COMPOSE_FILE=compose.verify.yml<os.pathsep>compose.verify.tier.yml
+# (`:` on Linux runners, `;` on Windows hosts — the test sets it)
+# so the shared Riverbed keeps tiering disabled by default; the script
+# force-recreates the project with this file and restores the base
+# definition afterwards.
+services:
+  node1: &tier-node
+    environment:
+      WHITEWATER_OBJECT_STORE_DIR: /var/lib/whitewater-tier
+      WHITEWATER_MAX_SEGMENT_BYTES: "262144"
+      WHITEWATER_TIER_SCAN_MS: "1000"
+    volumes:
+      - tier-objects:/var/lib/whitewater-tier
+  node2:
+    <<: *tier-node
+  node3:
+    <<: *tier-node
+
+volumes:
+  tier-objects:

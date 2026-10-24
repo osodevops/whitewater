@@ -351,16 +351,16 @@ struct LoadedRange {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-struct PersistedRangeState {
+pub(crate) struct PersistedRangeState {
     version: u32,
-    feed_id: Uuid,
-    range_id: RangeId,
-    generation: RangeGeneration,
+    pub(crate) feed_id: Uuid,
+    pub(crate) range_id: RangeId,
+    pub(crate) generation: RangeGeneration,
     ownership_epoch: OwnershipEpoch,
     appended: u64,
     flushed: u64,
     committed: u64,
-    active_segment: u64,
+    pub(crate) active_segment: u64,
     deduplication: Vec<PersistedDeduplicationState>,
     #[serde(default)]
     pending_effect: Option<PendingEffect>,
@@ -404,7 +404,7 @@ struct DecodedEntry {
 }
 
 #[derive(Clone, Debug)]
-struct EntryIndex {
+pub(crate) struct EntryIndex {
     position: RangePosition,
     identity: AppendIdentity,
     cursor: String,
@@ -943,7 +943,7 @@ fn range_directory(root: &Path, descriptor: &ActiveRangeDescriptor) -> PathBuf {
         .join(format!("generation-{}", descriptor.generation.value()))
 }
 
-fn segment_path(directory: &Path, segment: u64) -> PathBuf {
+pub(crate) fn segment_path(directory: &Path, segment: u64) -> PathBuf {
     directory.join(format!("segment-{segment:06}.log"))
 }
 
@@ -1702,10 +1702,9 @@ pub(crate) struct SegmentManifest {
     pub last_position: u64,
     /// BLAKE3-256 hex of the whole sealed segment file.
     pub segment_digest: String,
-    pub sealed_at_ns: i64,
 }
 
-fn manifest_path(directory: &Path, segment: u64) -> PathBuf {
+pub(crate) fn manifest_path(directory: &Path, segment: u64) -> PathBuf {
     directory.join(format!("segment-manifest-{segment:06}.json"))
 }
 
@@ -1719,7 +1718,7 @@ fn hash_segment_file(path: &Path) -> Result<blake3::Hash, ActiveRangeStoreError>
 /// Streams the sealed segment file once, binds its digest and coverage to
 /// the range identity, and persists the manifest with the same
 /// tmp+rename+dir-sync durability contract as the index checkpoint.
-fn write_segment_manifest(
+pub(crate) fn write_segment_manifest(
     directory: &Path,
     segment: u64,
     persisted: &PersistedRangeState,
@@ -1746,11 +1745,10 @@ fn write_segment_manifest(
         first_position: first.position.value(),
         last_position: last.position.value(),
         segment_digest: hash_segment_file(&path)?.to_hex().to_string(),
-        sealed_at_ns: unix_ns(),
     };
     let serialized = serde_json::to_vec(&manifest)?;
     let target = manifest_path(directory, segment);
-    let temporary = target.with_extension("tmp");
+    let temporary = target.with_extension(format!("{}.tmp", Uuid::new_v4()));
     {
         let mut file = File::create(&temporary)?;
         file.write_all(&serialized)?;
@@ -1764,7 +1762,7 @@ fn write_segment_manifest(
 /// Reads a manifest only when it parses and binds to the expected
 /// Feed/Range/generation/segment identity — anything else is treated as
 /// absent so the heal path can re-derive it from the sealed file itself.
-fn read_segment_manifest(
+pub(crate) fn read_segment_manifest(
     directory: &Path,
     segment: u64,
     persisted: &PersistedRangeState,
@@ -1783,7 +1781,7 @@ fn read_segment_manifest(
 /// The sealed file is the local source of truth, so healing rewrites a
 /// torn or absent manifest with the digest the bytes actually hold; a
 /// mismatched file then fails closed at `verify_sealed_segment` time.
-fn ensure_segment_manifest(
+pub(crate) fn ensure_segment_manifest(
     directory: &Path,
     segment: u64,
     persisted: &PersistedRangeState,
@@ -1796,14 +1794,30 @@ fn ensure_segment_manifest(
     Ok(())
 }
 
+/// Returns the sealed segment's manifest, healing it from the file when
+/// absent — the single entry point the object-store uploader uses per
+/// segment. A missing or invalid manifest is re-derived by rescanning the
+/// sealed file, which is always accurate: the segment is immutable, and a
+/// pre-upgrade or torn-write absence heals itself rather than blocking
+/// upload forever.
+pub(crate) fn sealed_segment_manifest(
+    directory: &Path,
+    segment: u64,
+    persisted: &PersistedRangeState,
+) -> Result<SegmentManifest, ActiveRangeStoreError> {
+    if let Some(manifest) = read_segment_manifest(directory, segment, persisted) {
+        return Ok(manifest);
+    }
+    let entries = recover_segment(&segment_path(directory, segment), segment, false)?;
+    write_segment_manifest(directory, segment, persisted, &entries)
+}
+
 /// Rehashes the sealed segment file and checks it against the persisted
 /// manifest — the fail-closed primitive the object-store upload path runs
 /// before trusting local bytes, proving "seal and verify" per segment
 /// rather than per frame. A missing/invalid manifest, a length drift, or
-/// a digest mismatch all surface as `CorruptSegment`. Test-only until the
-/// object-store uploader lands as the production caller.
-#[cfg(test)]
-fn verify_sealed_segment(
+/// a digest mismatch all surface as `CorruptSegment`.
+pub(crate) fn verify_sealed_segment(
     directory: &Path,
     segment: u64,
     persisted: &PersistedRangeState,
@@ -1825,15 +1839,6 @@ fn verify_sealed_segment(
         ));
     }
     Ok(manifest)
-}
-
-fn unix_ns() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-        .try_into()
-        .unwrap_or(i64::MAX)
 }
 
 /// Loads a sealed segment's checkpoint when it is present and valid.
@@ -2045,7 +2050,7 @@ fn recover_segments(
     Ok((entries, deduplication))
 }
 
-fn recover_segment(
+pub(crate) fn recover_segment(
     path: &Path,
     segment: u64,
     allow_torn_tail: bool,
@@ -2420,12 +2425,12 @@ fn persist_state_lazy(
 }
 
 #[cfg(unix)]
-fn sync_directory(directory: &Path) -> Result<(), std::io::Error> {
+pub(crate) fn sync_directory(directory: &Path) -> Result<(), std::io::Error> {
     File::open(directory)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> Result<(), std::io::Error> {
+pub(crate) fn sync_directory(_directory: &Path) -> Result<(), std::io::Error> {
     Ok(())
 }
 
@@ -2932,7 +2937,6 @@ mod tests {
             manifest.segment_digest,
             blake3::hash(&file_bytes).to_hex().to_string()
         );
-        assert!(manifest.sealed_at_ns > 0);
     }
 
     #[tokio::test]

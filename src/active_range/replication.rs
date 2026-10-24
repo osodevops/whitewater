@@ -18,7 +18,8 @@ use crate::{
 use super::{
     ActiveRangeAppend, ActiveRangeAssignment, ActiveRangeDescriptor, ActiveRangeError,
     ActiveRangeStore, ActiveRangeStoreError, AppendIdentity, CommitPosition, FileActiveRangeStore,
-    OwnershipEpoch, RangeGeneration, RangeId, RangePosition, StorageNodeId,
+    FileActiveRangeStoreOptions, OwnershipEpoch, RangeGeneration, RangeId, RangePosition,
+    StorageNodeId,
 };
 
 pub const MAX_REPLICA_FRAME_BASE64_BYTES: usize = MAX_FRAME_BYTES.div_ceil(3) * 4;
@@ -252,6 +253,7 @@ pub struct ReplicaAppendService {
     // must not interleave, but unrelated ranges pipeline on this Node.
     append_gates: Arc<Mutex<std::collections::BTreeMap<RangeId, Arc<Mutex<()>>>>>,
     index_apply: Arc<std::sync::RwLock<Option<Arc<crate::index_build::IndexCommitApply>>>>,
+    store_options: FileActiveRangeStoreOptions,
 }
 
 impl ReplicaAppendService {
@@ -259,6 +261,24 @@ impl ReplicaAppendService {
         root: impl Into<PathBuf>,
         local_node: StorageNodeId,
         control: Arc<ControlController>,
+    ) -> Self {
+        Self::with_options(
+            root,
+            local_node,
+            control,
+            FileActiveRangeStoreOptions::default(),
+        )
+    }
+
+    /// Same as `new` but carries the segment-size bound into every store
+    /// this service opens — wired from `WHITEWATER_MAX_SEGMENT_BYTES` so
+    /// development and test topologies can exercise rotation and tiering
+    /// without writing 256 MiB of history first.
+    pub fn with_options(
+        root: impl Into<PathBuf>,
+        local_node: StorageNodeId,
+        control: Arc<ControlController>,
+        store_options: FileActiveRangeStoreOptions,
     ) -> Self {
         Self {
             root: Arc::new(root.into()),
@@ -270,6 +290,7 @@ impl ReplicaAppendService {
             quorum_blocked_ranges: Arc::new(RwLock::new(HashSet::new())),
             append_gates: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             index_apply: Arc::new(std::sync::RwLock::new(None)),
+            store_options,
         }
     }
 
@@ -1369,8 +1390,9 @@ impl ReplicaAppendService {
             generation: assignment.generation,
             ownership_epoch: assignment.ownership_epoch,
         };
+        let store_options = self.store_options;
         let opened = tokio::task::spawn_blocking(move || {
-            FileActiveRangeStore::open(root.as_ref(), descriptor)
+            FileActiveRangeStore::open_with_options(root.as_ref(), descriptor, store_options)
         })
         .await
         .map_err(|error| ReplicaAppendError::storage(error.to_string()))?
