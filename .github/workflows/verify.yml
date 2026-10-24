@@ -35,7 +35,7 @@ jobs:
       # A failed leg must not cancel the others — they are the coverage.
       fail-fast: false
       matrix:
-        lane: [verify-mutating, verify-reads-a, verify-reads-b, isolated-zone, pipe, hotkeys, disk-full]
+        lane: [verify-mutating, verify-reads-a, verify-reads-b, sdk-languages, isolated-zone, pipe, hotkeys, disk-full]
     env:
       # Hosted runners throttle under load — give owner recovery headroom.
       MANY_READERS_OWNER_RECOVERY_TIMEOUT: "360"
@@ -48,6 +48,34 @@ jobs:
       # the build so every leg is not a cold Rust compile.
       - uses: dtolnay/rust-toolchain@1.90.0
       - uses: Swatinem/rust-cache@v2
+      # The cross-language gate runs each sibling SDK's corpus runner
+      # against this lane's Riverbed; checkouts land beside this repo and
+      # the script discovers them via WHITEWATER_<LANG>_DIR.
+      - if: matrix.lane == 'sdk-languages'
+        uses: actions/checkout@v4
+        with:
+          repository: osodevops/whitewater-go
+          path: whitewater-go
+      - if: matrix.lane == 'sdk-languages'
+        uses: actions/checkout@v4
+        with:
+          repository: osodevops/whitewater-python
+          path: whitewater-python
+      - if: matrix.lane == 'sdk-languages'
+        uses: actions/checkout@v4
+        with:
+          repository: osodevops/whitewater-java
+          path: whitewater-java
+      - if: matrix.lane == 'sdk-languages'
+        uses: actions/checkout@v4
+        with:
+          repository: osodevops/whitewater-node
+          path: whitewater-node
+      - if: matrix.lane == 'sdk-languages'
+        uses: actions/checkout@v4
+        with:
+          repository: osodevops/whitewater-dotnet
+          path: whitewater-dotnet
       # Runners arrive with a large pre-cached image set; reclaim it before
       # the suite builds images and stacks container layers on the same disk.
       - name: Reclaim Docker disk space
@@ -58,6 +86,13 @@ jobs:
         run: python scripts/run-acceptance.py
         env:
           WHITEWATER_ACCEPTANCE_LANE: ${{ matrix.lane }}
+          # Sibling SDK checkouts for the sdk-languages leg (nested paths —
+          # the gate resolves each via its WHITEWATER_<LANG>_DIR override).
+          WHITEWATER_GO_DIR: ${{ github.workspace }}/whitewater-go
+          WHITEWATER_PYTHON_DIR: ${{ github.workspace }}/whitewater-python
+          WHITEWATER_JAVA_DIR: ${{ github.workspace }}/whitewater-java
+          WHITEWATER_NODE_DIR: ${{ github.workspace }}/whitewater-node
+          WHITEWATER_DOTNET_DIR: ${{ github.workspace }}/whitewater-dotnet
       - name: Upload acceptance diagnostics
         if: failure()
         uses: actions/upload-artifact@v4

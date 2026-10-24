@@ -137,11 +137,12 @@ class AcceptanceLaneTests(unittest.TestCase):
         lanes, _ = runner.parse_invocation(["--lanes", "2"], {})
         self.assertEqual(
             [lane.name for lane in lanes],
-            ["verify-mutating", "verify-reads-a", "isolated-zone", "pipe", "hotkeys", "disk-full"],
+            ["verify-mutating", "verify-reads-a", "sdk-languages",
+             "isolated-zone", "pipe", "hotkeys", "disk-full"],
         )
         self.assertEqual(lanes[1].scripts, runner.VERIFY_READS)
         lanes, _ = runner.parse_invocation([], {"WHITEWATER_ACCEPTANCE_LANES": "3"})
-        self.assertEqual(len(lanes), 7)
+        self.assertEqual(len(lanes), 8)
         self.assertEqual(lanes[1].scripts + lanes[2].scripts, runner.VERIFY_READS)
 
     def test_no_lane_selector_is_the_serial_legacy_mode(self):
@@ -168,7 +169,12 @@ class AcceptanceLaneTests(unittest.TestCase):
         ]
         self.assertEqual(
             verify_projects,
-            ["whitewater-verification", "whitewater-verification-a", "whitewater-verification-b"],
+            [
+                "whitewater-verification",
+                "whitewater-verification-a",
+                "whitewater-verification-b",
+                "whitewater-verification-sdk",
+            ],
         )
 
     def test_fixture_lane_provisions_before_running_scripts(self):

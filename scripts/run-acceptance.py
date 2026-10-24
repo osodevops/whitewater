@@ -99,6 +99,9 @@ ISOLATED_ZONE = (
 )
 # All three pipe scripts drive the same `whitewater-pipe` project — serial.
 PIPE = ("test-enrich-pipe.py", "test-pipe-forward.py", "test-window-pipe.py")
+# The six-SDK corpus gate runs every language runner against one fixture
+# Riverbed; chaos fixtures bounce Nodes, so it owns a dedicated lane.
+SDK_LANGUAGES = ("test-sdk-languages.py",)
 HOTKEYS = ("test-hot-keys.py",)
 # The disk-full fault scenario owns the 7671-7673 port block and its
 # `whitewater-disk-full` project — disjoint from every other lane.
@@ -216,6 +219,17 @@ def lane_catalog(verify_count: int = DEFAULT_VERIFY_LANES) -> list[Lane]:
             )
         )
     return lanes + [
+        # The SDK lane's fixture publishes the first port block past the
+        # verify lanes and the first free /24 after their subnet indexes.
+        Lane(
+            "sdk-languages",
+            SDK_LANGUAGES,
+            fixture=True,
+            base_port=EXTRA_VERIFY_BASE_PORT
+            + VERIFY_LANE_PORT_STRIDE * (verify_count - 1),
+            project_suffix="-sdk",
+            subnet_index=verify_count,
+        ),
         Lane("isolated-zone", ISOLATED_ZONE),
         Lane("pipe", PIPE),
         Lane("hotkeys", HOTKEYS),

@@ -544,6 +544,115 @@ impl Client {
         Ok(rows.iter().filter_map(pipe_info).collect())
     }
 
+    /// `DEFINE PIPE` for a forward (copy) Pipe: each record the
+    /// Subscription delivers lands unchanged on `output_feed`. Names
+    /// pass through verbatim — the server enforces the dotted-name
+    /// grammar and returns the catalog row as a [`PipeInfo`]-shaped
+    /// result entry.
+    pub async fn define_forward_pipe(
+        &self,
+        name: &str,
+        subscription: &str,
+        output_feed: &str,
+    ) -> Result<Vec<Value>, SdkError> {
+        self.commands(vec![json!({
+            "command": "define_pipe",
+            "name": name,
+            "subscription": subscription,
+            "output_feed": output_feed,
+            "operation": PipeOperation::forward().to_wire(),
+        })])
+        .await
+    }
+
+    /// `DEFINE PIPE` for an enrich Pipe: each record the Subscription
+    /// delivers resolves one `output_store` row through the operation's
+    /// `key` and lands on `output_feed` with the journaled lookup
+    /// result. `operation` must come from [`PipeOperation::enrich`] —
+    /// a mismatched step refuses locally. `quarantine_feed` names the
+    /// miss-quarantine target and is valid only when the operation's
+    /// `on_miss` is [`EnrichMiss::Quarantine`]; that combination is
+    /// also required — a quarantine miss without a feed refuses locally.
+    pub async fn define_enrich_pipe(
+        &self,
+        name: &str,
+        subscription: &str,
+        output_feed: &str,
+        output_store: &str,
+        operation: impl Into<PipeOperation>,
+        quarantine_feed: Option<&str>,
+    ) -> Result<Vec<Value>, SdkError> {
+        let operation = operation.into();
+        let PipeOperation::Enrich { key, on_miss, .. } = &operation else {
+            return Err(SdkError::Refused(
+                "enrich pipes take PipeOperation::enrich(...)".to_owned(),
+            ));
+        };
+        key.validate()?;
+        match (on_miss, quarantine_feed) {
+            (EnrichMiss::Quarantine, None) => {
+                return Err(SdkError::Refused(
+                    "on_miss quarantine requires a quarantine_feed".to_owned(),
+                ));
+            }
+            (_, Some(_)) if *on_miss != EnrichMiss::Quarantine => {
+                return Err(SdkError::Refused(
+                    "a quarantine_feed is only valid with on_miss quarantine".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        let mut command = json!({
+            "command": "define_pipe",
+            "name": name,
+            "subscription": subscription,
+            "output_feed": output_feed,
+            "output_store": output_store,
+            "operation": operation.to_wire(),
+        });
+        if let Some(feed) = quarantine_feed {
+            command["quarantine_feed"] = json!(feed);
+        }
+        self.commands(vec![command]).await
+    }
+
+    /// `DEFINE PIPE` for a window Pipe: each record the Subscription
+    /// delivers accumulates into `window_ns`-wide panes of the
+    /// `output_store` view (which must declare non-unique named keys
+    /// `key` and `pane`). `operation` must come from
+    /// [`PipeOperation::window`] — a mismatched step refuses locally,
+    /// as do the lateness/retention bound combinations the server
+    /// rejects. `emit_feed` publishes closed panes and requires the
+    /// operation to declare `max_late_ns` or `watermark_ns` — without a
+    /// lateness bound no pane ever provably closes.
+    pub async fn define_window_pipe(
+        &self,
+        name: &str,
+        subscription: &str,
+        output_store: &str,
+        operation: impl Into<PipeOperation>,
+        emit_feed: Option<&str>,
+    ) -> Result<Vec<Value>, SdkError> {
+        let operation = operation.into();
+        let PipeOperation::Window(window) = &operation else {
+            return Err(SdkError::Refused(
+                "window pipes take PipeOperation::window(...)".to_owned(),
+            ));
+        };
+        window.validate(emit_feed.is_some())?;
+        let mut command = json!({
+            "command": "define_pipe",
+            "name": name,
+            "subscription": subscription,
+            "output_store": output_store,
+            "operation": operation.to_wire(),
+        });
+        if let Some(feed) = emit_feed {
+            command["emit_feed"] = json!(feed);
+        }
+        self.commands(vec![command]).await
+    }
+
     /// Temporary read against a Feed without declaring a Reader:
     /// bounded history walks, live tails, or fresh-only waits per
     /// `options` — see `TemporaryFetch`.
@@ -1210,6 +1319,496 @@ fn wire_typed(value: &TypedValue) -> Value {
         TypedValue::Bytes(value) => {
             json!({"kind": "bytes", "value_base64": STANDARD.encode(value)})
         }
+    }
+}
+
+/// How a committed record projects to a typed lookup value — the wire
+/// `IndexFieldSpec` shape shared by Pipe keys, window aggregations, and
+/// feed-sourced StateStore named keys. Build with [`Extractor::record_key`],
+/// [`Extractor::metadata`], or [`Extractor::json`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Extractor {
+    /// The source record's application Key.
+    RecordKey,
+    /// A named record Metadata entry.
+    Metadata(String),
+    /// A JSON-path projection over the record payload.
+    Json(String),
+}
+
+impl Extractor {
+    /// The source record's application Key.
+    pub fn record_key() -> Self {
+        Self::RecordKey
+    }
+
+    /// A named record Metadata entry.
+    pub fn metadata(name: impl Into<String>) -> Result<Self, SdkError> {
+        let name = name.into();
+        if name.trim().is_empty() || name.len() > 256 {
+            return Err(SdkError::Refused(
+                "metadata extractor name must be 1..=256 bytes".to_owned(),
+            ));
+        }
+        Ok(Self::Metadata(name))
+    }
+
+    /// A `json` version-1 path projection over the record payload.
+    pub fn json(field: impl Into<String>) -> Result<Self, SdkError> {
+        let field = field.into();
+        if field.trim().is_empty() || field.len() > 512 {
+            return Err(SdkError::Refused(
+                "json extractor field must be 1..=512 bytes".to_owned(),
+            ));
+        }
+        Ok(Self::Json(field))
+    }
+
+    /// The wire `IndexFieldSpec` object the catalog stores.
+    pub fn to_wire(&self) -> Value {
+        match self {
+            Self::RecordKey => json!({ "kind": "key" }),
+            Self::Metadata(name) => json!({ "kind": "metadata", "name": name }),
+            Self::Json(field) => json!({
+                "kind": "projection",
+                "extractor": "json",
+                "version": 1,
+                "field": field,
+            }),
+        }
+    }
+
+    /// The field-spec bounds the server enforces on Pipe declarations;
+    /// enum-literal construction re-checks here so a malformed spec
+    /// still fails before it reaches the wire.
+    fn validate(&self) -> Result<(), SdkError> {
+        let invalid = || SdkError::Refused(format!("invalid pipe field spec {}", self.to_wire()));
+        match self {
+            Self::RecordKey => Ok(()),
+            Self::Metadata(name) if !name.is_empty() && name.len() <= 256 => Ok(()),
+            Self::Json(field) if !field.is_empty() && field.len() <= 512 => Ok(()),
+            _ => Err(invalid()),
+        }
+    }
+}
+
+/// What a `window` Pipe adds to each pane's accumulator: `count`
+/// records, `sum` an extracted integer, or `average` tracking
+/// count+sum (readers divide).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WindowAggregation {
+    /// Count records per (group Key, pane).
+    Count,
+    /// Sum one extracted integer value per pane.
+    Sum(Extractor),
+    /// Track count and integer sum per pane; readers divide.
+    Average(Extractor),
+}
+
+impl WindowAggregation {
+    /// Count records per (group Key, pane).
+    pub fn count() -> Self {
+        Self::Count
+    }
+
+    /// Sum one extracted integer value per pane.
+    pub fn sum(value: Extractor) -> Self {
+        Self::Sum(value)
+    }
+
+    /// Track count and integer sum per pane; readers divide.
+    pub fn average(value: Extractor) -> Self {
+        Self::Average(value)
+    }
+
+    /// The wire aggregation object.
+    pub fn to_wire(&self) -> Value {
+        match self {
+            Self::Count => json!({ "aggregation": "count" }),
+            Self::Sum(value) => {
+                json!({ "aggregation": "sum", "value": value.to_wire() })
+            }
+            Self::Average(value) => {
+                json!({ "aggregation": "average", "value": value.to_wire() })
+            }
+        }
+    }
+}
+
+/// Which record clock a `window` Pipe buckets into panes. Both clocks
+/// are signed 64-bit Unix epoch nanoseconds on the record itself.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowTime {
+    /// `event_time_ns` — the application-stamped occurrence clock (default).
+    #[default]
+    Event,
+    /// `ingest_time_ns` — the durable-arrival clock.
+    Ingest,
+}
+
+impl WindowTime {
+    /// The wire value (`"event"`/`"ingest"`).
+    pub fn to_wire(&self) -> Value {
+        match self {
+            Self::Event => json!("event"),
+            Self::Ingest => json!("ingest"),
+        }
+    }
+}
+
+/// How fresh an `enrich` Pipe lookup row must be before it is journaled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EnrichFreshness {
+    /// Serve the replica's applied state (default; resolution is
+    /// journaled either way).
+    #[default]
+    Latest,
+    /// Require applied to cover committed at read entry; lag yields a
+    /// retryable drive failure.
+    Strict,
+}
+
+impl EnrichFreshness {
+    /// The wire value (`"latest"`/`"strict"`).
+    pub fn to_wire(&self) -> Value {
+        match self {
+            Self::Latest => json!("latest"),
+            Self::Strict => json!("strict"),
+        }
+    }
+}
+
+/// What an `enrich` Pipe lookup miss does to the output record.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EnrichMiss {
+    /// Forward the record with `enrich.matched = false` (default).
+    #[default]
+    Forward,
+    /// Consume without emitting; the input frontier still commits.
+    Drop,
+    /// Route the miss to the declared quarantine Feed.
+    Quarantine,
+}
+
+impl EnrichMiss {
+    /// The wire value (`"forward"`/`"drop"`/`"quarantine"`).
+    pub fn to_wire(&self) -> Value {
+        match self {
+            Self::Forward => json!("forward"),
+            Self::Drop => json!("drop"),
+            Self::Quarantine => json!("quarantine"),
+        }
+    }
+}
+
+/// The declaration a `window` PipeOperation accumulates: fixed
+/// `window_ns`-wide panes of a managed StateStore view plus the
+/// lateness, retention, and cost bounds the drive enforces. Built by
+/// [`PipeOperation::window`]; chain the option setters, then pass to
+/// [`Client::define_window_pipe`].
+///
+/// A pane only provably closes under a declared lateness bound —
+/// `max_late_ns` or `watermark_ns`, which are alternative models —
+/// so `emit_feed` on the define requires one of them, `grace_ns`
+/// requires `watermark_ns`, and `expire_ns` must exceed `grace_ns` and
+/// `max_late_ns` when they are declared. Lateness bounds are
+/// meaningless under the ingest clock; the server — and
+/// [`Client::define_window_pipe`] — refuse those combinations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowOperation {
+    window_ns: u64,
+    key: Extractor,
+    aggregation: WindowAggregation,
+    time: WindowTime,
+    max_late_ns: Option<u64>,
+    watermark_ns: Option<u64>,
+    grace_ns: Option<u64>,
+    expire_ns: Option<u64>,
+    key_limit: Option<u64>,
+    byte_limit: Option<u64>,
+}
+
+impl WindowOperation {
+    /// Which record clock assigns panes; [`WindowTime::Event`] default.
+    pub fn time(mut self, time: WindowTime) -> Self {
+        self.time = time;
+        self
+    }
+
+    /// Ingest-clock lateness bound: a record arriving further behind
+    /// its `event_time_ns` quarantines into a countable `late` row.
+    /// Mutually exclusive with `watermark_ns`; event clock only.
+    pub fn max_late_ns(mut self, bound: u64) -> Self {
+        self.max_late_ns = Some(bound);
+        self
+    }
+
+    /// Event-time lateness model: panes close once the durable horizon
+    /// `max(event_time) - watermark_ns` passes their end. Mutually
+    /// exclusive with `max_late_ns`; event clock only.
+    pub fn watermark_ns(mut self, bound: u64) -> Self {
+        self.watermark_ns = Some(bound);
+        self
+    }
+
+    /// Revision bound — requires `watermark_ns`: an emitted pane still
+    /// accepts revising events while `horizon <= pane_end + grace_ns`.
+    pub fn grace_ns(mut self, bound: u64) -> Self {
+        self.grace_ns = Some(bound);
+        self
+    }
+
+    /// Pane retention bound: a pane row deletes once
+    /// `pane_end + expire_ns` falls behind the close clock. Must exceed
+    /// `grace_ns` and `max_late_ns` when declared.
+    pub fn expire_ns(mut self, bound: u64) -> Self {
+        self.expire_ns = Some(bound);
+        self
+    }
+
+    /// Bound on distinct active group Keys in pane/sentinel state.
+    pub fn key_limit(mut self, limit: u64) -> Self {
+        self.key_limit = Some(limit);
+        self
+    }
+
+    /// Bound on accounted pane-state bytes.
+    pub fn byte_limit(mut self, limit: u64) -> Self {
+        self.byte_limit = Some(limit);
+        self
+    }
+
+    /// The wire `PipeOperation` object.
+    pub fn to_wire(&self) -> Value {
+        let mut wire = json!({
+            "operation": "window",
+            "window_ns": self.window_ns,
+            "key": self.key.to_wire(),
+            "aggregation": self.aggregation.to_wire(),
+            "time": self.time.to_wire(),
+        });
+        let object = wire.as_object_mut().expect("window wire is an object");
+        for (name, bound) in [
+            ("max_late_ns", self.max_late_ns),
+            ("watermark_ns", self.watermark_ns),
+            ("grace_ns", self.grace_ns),
+            ("expire_ns", self.expire_ns),
+            ("key_limit", self.key_limit),
+            ("byte_limit", self.byte_limit),
+        ] {
+            if let Some(bound) = bound {
+                object.insert(name.to_owned(), json!(bound));
+            }
+        }
+        wire
+    }
+
+    /// The bounds the server can check without catalog state — mirrored
+    /// locally so a malformed declaration fails before the round-trip.
+    fn validate(&self, emit_feed: bool) -> Result<(), SdkError> {
+        fn refused(message: &str) -> SdkError {
+            SdkError::Refused(message.to_owned())
+        }
+        if self.window_ns == 0 {
+            return Err(refused("window_ns must be a non-zero duration"));
+        }
+        self.key.validate()?;
+        if let WindowAggregation::Sum(value) | WindowAggregation::Average(value) = &self.aggregation
+        {
+            value.validate()?;
+        }
+        let ingest = matches!(self.time, WindowTime::Ingest);
+        if let Some(bound) = self.max_late_ns {
+            if bound == 0 {
+                return Err(refused("max_late_ns requires a non-zero duration"));
+            }
+            if ingest {
+                return Err(refused("max_late_ns is meaningless under the ingest clock"));
+            }
+        }
+        if self.max_late_ns.is_some() && self.watermark_ns.is_some() {
+            return Err(refused(
+                "max_late_ns and watermark_ns are alternative lateness models — declare exactly one",
+            ));
+        }
+        if let Some(bound) = self.watermark_ns {
+            if bound == 0 {
+                return Err(refused("watermark_ns requires a non-zero duration"));
+            }
+            if ingest {
+                return Err(refused(
+                    "watermark_ns is meaningless under the ingest clock",
+                ));
+            }
+        }
+        if let Some(bound) = self.grace_ns {
+            if bound == 0 {
+                return Err(refused("grace_ns requires a non-zero duration"));
+            }
+            if self.watermark_ns.is_none() {
+                return Err(refused("grace_ns requires watermark_ns"));
+            }
+        }
+        if let Some(expire) = self.expire_ns {
+            if expire == 0 {
+                return Err(refused("expire_ns requires a non-zero duration"));
+            }
+            if let Some(grace) = self.grace_ns {
+                if expire <= grace {
+                    return Err(refused("expire_ns must exceed grace_ns"));
+                }
+            }
+            if let Some(late) = self.max_late_ns {
+                if expire <= late {
+                    return Err(refused("expire_ns must exceed max_late_ns"));
+                }
+            }
+        }
+        if matches!(self.key_limit, Some(0)) {
+            return Err(refused("key_limit requires a non-zero bound"));
+        }
+        if self
+            .key_limit
+            .map(|limit| limit > crate::pipe::WINDOW_MAX_KEY_LIMIT)
+            .unwrap_or(false)
+        {
+            return Err(refused("key_limit accepts at most 512 active Keys"));
+        }
+        if matches!(self.byte_limit, Some(0)) {
+            return Err(refused("byte_limit requires a non-zero bound"));
+        }
+        if self
+            .byte_limit
+            .map(|limit| limit > crate::pipe::WINDOW_MAX_BYTE_LIMIT)
+            .unwrap_or(false)
+        {
+            return Err(refused("byte_limit accepts at most 256 KiB"));
+        }
+        // Without a lateness bound no pane ever provably closes — the
+        // server refuses `EMIT TO FEED` the same way.
+        if emit_feed && self.max_late_ns.is_none() && self.watermark_ns.is_none() {
+            return Err(refused("emit_feed requires max_late_ns or watermark_ns"));
+        }
+        Ok(())
+    }
+}
+
+/// The processing step a Pipe applies to each delivered input record.
+/// Build with [`PipeOperation::forward`], [`PipeOperation::enrich`], or
+/// [`PipeOperation::window`]; the wire form is internally tagged on
+/// `operation` — see [`PipeOperation::to_wire`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PipeOperation {
+    /// Copy each delivered record to the output Feed unchanged.
+    Forward,
+    /// Point-lookup enrichment: resolve one StateStore row by the
+    /// projected `key` and copy its payload into output Metadata
+    /// (`enrich.payload`, `enrich.matched`). The resolution rides inside
+    /// the effect journal, so replayed outputs are byte-identical.
+    Enrich {
+        /// Which record value addresses the lookup row's key.
+        key: Extractor,
+        /// How fresh the lookup row must be; [`EnrichFreshness::Latest`]
+        /// is the safe default.
+        freshness: EnrichFreshness,
+        /// Optional declared named secondary key to resolve through
+        /// instead of the store's primary key.
+        named: Option<String>,
+        /// What a lookup miss does to the output record.
+        on_miss: EnrichMiss,
+    },
+    /// Rolling-window accumulation — see [`WindowOperation`].
+    Window(WindowOperation),
+}
+
+impl PipeOperation {
+    /// Copy each delivered record to the output Feed unchanged.
+    pub fn forward() -> Self {
+        Self::Forward
+    }
+
+    /// Point-lookup enrichment against a StateStore: resolve one row by
+    /// the projected `key` and copy its payload into output Metadata
+    /// (`enrich.payload`, `enrich.matched`). `named` resolves through a
+    /// declared named secondary key instead of the primary key.
+    pub fn enrich(
+        key: Extractor,
+        freshness: EnrichFreshness,
+        named: Option<&str>,
+        on_miss: EnrichMiss,
+    ) -> Self {
+        Self::Enrich {
+            key,
+            freshness,
+            named: named.map(str::to_owned),
+            on_miss,
+        }
+    }
+
+    /// Enrich with defaults: latest freshness, forward-on-miss.
+    pub fn enrich_default(key: Extractor) -> Self {
+        Self::enrich(key, EnrichFreshness::Latest, None, EnrichMiss::Forward)
+    }
+
+    /// Accumulate each delivered record into fixed `window_ns`-wide
+    /// panes of a managed StateStore view, grouped by `key` under
+    /// `aggregation`. Returns the [`WindowOperation`] declaration —
+    /// chain the lateness/retention/limit setters on it before passing
+    /// it to [`Client::define_window_pipe`].
+    pub fn window(
+        window_ns: u64,
+        key: Extractor,
+        aggregation: WindowAggregation,
+    ) -> Result<WindowOperation, SdkError> {
+        if window_ns == 0 {
+            return Err(SdkError::Refused(
+                "window_ns must be a non-zero duration".to_owned(),
+            ));
+        }
+        Ok(WindowOperation {
+            window_ns,
+            key,
+            aggregation,
+            time: WindowTime::Event,
+            max_late_ns: None,
+            watermark_ns: None,
+            grace_ns: None,
+            expire_ns: None,
+            key_limit: None,
+            byte_limit: None,
+        })
+    }
+
+    /// The wire `PipeOperation` object — internally tagged on
+    /// `operation`.
+    pub fn to_wire(&self) -> Value {
+        match self {
+            Self::Forward => json!({ "operation": "forward" }),
+            Self::Enrich {
+                key,
+                freshness,
+                named,
+                on_miss,
+            } => {
+                let mut wire = json!({
+                    "operation": "enrich",
+                    "key": key.to_wire(),
+                    "freshness": freshness.to_wire(),
+                    "on_miss": on_miss.to_wire(),
+                });
+                if let Some(named) = named {
+                    wire["named"] = json!(named);
+                }
+                wire
+            }
+            Self::Window(window) => window.to_wire(),
+        }
+    }
+}
+
+impl From<WindowOperation> for PipeOperation {
+    fn from(window: WindowOperation) -> Self {
+        Self::Window(window)
     }
 }
 
@@ -2276,5 +2875,373 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| request.1 == "/v1/admin/commands"));
+    }
+
+    #[test]
+    fn extractors_and_aggregations_serialize_the_wire_tags() {
+        assert_eq!(Extractor::record_key().to_wire(), json!({"kind": "key"}));
+        assert_eq!(
+            Extractor::metadata("customer_id").unwrap().to_wire(),
+            json!({"kind": "metadata", "name": "customer_id"})
+        );
+        assert_eq!(
+            Extractor::json("total").unwrap().to_wire(),
+            json!({"kind": "projection", "extractor": "json", "version": 1, "field": "total"})
+        );
+        assert!(Extractor::metadata("").is_err());
+        assert!(Extractor::metadata("   ").is_err());
+        assert!(Extractor::json("").is_err());
+        // Direct enum construction still fails at declaration time.
+        assert!(Extractor::Metadata("".to_owned()).validate().is_err());
+        assert!(Extractor::Json("".to_owned()).validate().is_err());
+
+        assert_eq!(
+            WindowAggregation::count().to_wire(),
+            json!({"aggregation": "count"})
+        );
+        assert_eq!(
+            WindowAggregation::sum(Extractor::record_key()).to_wire(),
+            json!({"aggregation": "sum", "value": {"kind": "key"}})
+        );
+        assert_eq!(
+            WindowAggregation::average(Extractor::metadata("amount").unwrap()).to_wire(),
+            json!({"aggregation": "average", "value": {"kind": "metadata", "name": "amount"}})
+        );
+    }
+
+    #[test]
+    fn pipe_operations_serialize_their_wire_shapes() {
+        assert_eq!(
+            PipeOperation::forward().to_wire(),
+            json!({"operation": "forward"})
+        );
+        // Enrich defaults: latest freshness, forward-on-miss, no named key.
+        assert_eq!(
+            PipeOperation::enrich_default(Extractor::record_key()).to_wire(),
+            json!({
+                "operation": "enrich",
+                "key": {"kind": "key"},
+                "freshness": "latest",
+                "on_miss": "forward"
+            })
+        );
+        // A named strict lookup with quarantine carries every field.
+        assert_eq!(
+            PipeOperation::enrich(
+                Extractor::metadata("customer_id").unwrap(),
+                EnrichFreshness::Strict,
+                Some("by_id"),
+                EnrichMiss::Quarantine,
+            )
+            .to_wire(),
+            json!({
+                "operation": "enrich",
+                "key": {"kind": "metadata", "name": "customer_id"},
+                "freshness": "strict",
+                "named": "by_id",
+                "on_miss": "quarantine"
+            })
+        );
+        // Window emits only the declared bounds; watermark/grace ride
+        // the event-time close model.
+        let window: PipeOperation = PipeOperation::window(
+            3_600_000_000_000,
+            Extractor::record_key(),
+            WindowAggregation::sum(Extractor::json("total").unwrap()),
+        )
+        .unwrap()
+        .watermark_ns(60_000_000_000)
+        .grace_ns(30_000_000_000)
+        .expire_ns(86_400_000_000_000)
+        .key_limit(64)
+        .byte_limit(65_536)
+        .into();
+        assert_eq!(
+            window.to_wire(),
+            json!({
+                "operation": "window",
+                "window_ns": 3_600_000_000_000_u64,
+                "key": {"kind": "key"},
+                "aggregation": {"aggregation": "sum", "value": {"kind": "projection", "extractor": "json", "version": 1, "field": "total"}},
+                "time": "event",
+                "watermark_ns": 60_000_000_000_u64,
+                "grace_ns": 30_000_000_000_u64,
+                "expire_ns": 86_400_000_000_000_u64,
+                "key_limit": 64,
+                "byte_limit": 65_536
+            })
+        );
+        // An unbounded window emits none of the optional keys.
+        let bare: PipeOperation = PipeOperation::window(
+            1_000_000_000,
+            Extractor::record_key(),
+            WindowAggregation::count(),
+        )
+        .unwrap()
+        .into();
+        let wire = bare.to_wire();
+        assert_eq!(wire["time"], "event");
+        for absent in [
+            "max_late_ns",
+            "watermark_ns",
+            "grace_ns",
+            "expire_ns",
+            "key_limit",
+            "byte_limit",
+        ] {
+            assert!(wire.get(absent).is_none(), "{absent} must stay absent");
+        }
+    }
+
+    #[tokio::test]
+    async fn define_forward_pipe_posts_the_typed_command() {
+        let (client, transport) = client(vec![(200, json!({"results": [{"status": "ok"}]}))]);
+        let results = client
+            .define_forward_pipe("orders.relay", "orders.audit", "orders.archive")
+            .await
+            .unwrap();
+        assert_eq!(results[0]["status"], "ok");
+        let requests = transport.take_requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].1, "/v1/admin/commands");
+        // The exact command map — no extra or absent keys.
+        assert_eq!(
+            requests[0].2["commands"][0],
+            json!({
+                "command": "define_pipe",
+                "name": "orders.relay",
+                "subscription": "orders.audit",
+                "output_feed": "orders.archive",
+                "operation": {"operation": "forward"}
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn define_enrich_pipe_serializes_lookup_and_quarantine() {
+        let (client, transport) = client(vec![(200, json!({"results": [{"status": "ok"}]}))]);
+        client
+            .define_enrich_pipe(
+                "orders.enrich",
+                "orders.audit",
+                "orders.enriched",
+                "orders.customers",
+                PipeOperation::enrich(
+                    Extractor::metadata("customer_id").unwrap(),
+                    EnrichFreshness::Strict,
+                    Some("by_id"),
+                    EnrichMiss::Quarantine,
+                ),
+                Some("orders.quarantine"),
+            )
+            .await
+            .unwrap();
+        let requests = transport.take_requests();
+        assert_eq!(
+            requests[0].2["commands"][0],
+            json!({
+                "command": "define_pipe",
+                "name": "orders.enrich",
+                "subscription": "orders.audit",
+                "output_feed": "orders.enriched",
+                "output_store": "orders.customers",
+                "quarantine_feed": "orders.quarantine",
+                "operation": {
+                    "operation": "enrich",
+                    "key": {"kind": "metadata", "name": "customer_id"},
+                    "freshness": "strict",
+                    "named": "by_id",
+                    "on_miss": "quarantine"
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn define_window_pipe_serializes_bounds_and_emit() {
+        let (client, transport) = client(vec![(200, json!({"results": [{"status": "ok"}]}))]);
+        client
+            .define_window_pipe(
+                "orders.hourly",
+                "orders.audit",
+                "orders.hourlyspend",
+                PipeOperation::window(
+                    3_600_000_000_000,
+                    Extractor::record_key(),
+                    WindowAggregation::count(),
+                )
+                .unwrap()
+                .watermark_ns(60_000_000_000)
+                .grace_ns(5_000_000_000),
+                Some("orders.closed"),
+            )
+            .await
+            .unwrap();
+        let requests = transport.take_requests();
+        assert_eq!(
+            requests[0].2["commands"][0],
+            json!({
+                "command": "define_pipe",
+                "name": "orders.hourly",
+                "subscription": "orders.audit",
+                "output_store": "orders.hourlyspend",
+                "emit_feed": "orders.closed",
+                "operation": {
+                    "operation": "window",
+                    "window_ns": 3_600_000_000_000_u64,
+                    "key": {"kind": "key"},
+                    "aggregation": {"aggregation": "count"},
+                    "time": "event",
+                    "watermark_ns": 60_000_000_000_u64,
+                    "grace_ns": 5_000_000_000_u64
+                }
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn pipe_defines_refuse_malformed_operations_locally() {
+        let (client, transport) = client(Vec::new());
+        // A zero window can never be constructed.
+        assert!(matches!(
+            PipeOperation::window(0, Extractor::record_key(), WindowAggregation::count()),
+            Err(SdkError::Refused(_))
+        ));
+        // A mismatched operation refuses on the typed define.
+        assert!(matches!(
+            client
+                .define_enrich_pipe("p", "s", "a.b", "a.s", PipeOperation::forward(), None)
+                .await,
+            Err(SdkError::Refused(_))
+        ));
+        assert!(matches!(
+            client
+                .define_window_pipe("p", "s", "a.s", PipeOperation::forward(), None)
+                .await,
+            Err(SdkError::Refused(_))
+        ));
+        assert!(matches!(
+            client
+                .define_window_pipe(
+                    "p",
+                    "s",
+                    "a.s",
+                    PipeOperation::enrich_default(Extractor::record_key()),
+                    None,
+                )
+                .await,
+            Err(SdkError::Refused(_))
+        ));
+        // The quarantine Feed pairs with on_miss quarantine — neither
+        // direction may be missing.
+        assert!(matches!(
+            client
+                .define_enrich_pipe(
+                    "p",
+                    "s",
+                    "a.b",
+                    "a.s",
+                    PipeOperation::enrich_default(Extractor::record_key()),
+                    Some("a.q"),
+                )
+                .await,
+            Err(SdkError::Refused(_))
+        ));
+        assert!(matches!(
+            client
+                .define_enrich_pipe(
+                    "p",
+                    "s",
+                    "a.b",
+                    "a.s",
+                    PipeOperation::enrich(
+                        Extractor::record_key(),
+                        EnrichFreshness::Latest,
+                        None,
+                        EnrichMiss::Quarantine,
+                    ),
+                    None,
+                )
+                .await,
+            Err(SdkError::Refused(_))
+        ));
+        // Emitting closed panes requires a lateness bound.
+        assert!(matches!(
+            client
+                .define_window_pipe(
+                    "p",
+                    "s",
+                    "a.s",
+                    PipeOperation::window(
+                        1_000_000_000,
+                        Extractor::record_key(),
+                        WindowAggregation::count(),
+                    )
+                    .unwrap(),
+                    Some("a.emit"),
+                )
+                .await,
+            Err(SdkError::Refused(_))
+        ));
+        // One lateness model per Pipe; grace rides the watermark.
+        assert!(matches!(
+            client
+                .define_window_pipe(
+                    "p",
+                    "s",
+                    "a.s",
+                    PipeOperation::window(
+                        1_000_000_000,
+                        Extractor::record_key(),
+                        WindowAggregation::count(),
+                    )
+                    .unwrap()
+                    .max_late_ns(1_000_000)
+                    .watermark_ns(1_000_000),
+                    None,
+                )
+                .await,
+            Err(SdkError::Refused(_))
+        ));
+        assert!(matches!(
+            client
+                .define_window_pipe(
+                    "p",
+                    "s",
+                    "a.s",
+                    PipeOperation::window(
+                        1_000_000_000,
+                        Extractor::record_key(),
+                        WindowAggregation::count(),
+                    )
+                    .unwrap()
+                    .grace_ns(1_000_000),
+                    None,
+                )
+                .await,
+            Err(SdkError::Refused(_))
+        ));
+        // Lateness bounds under the ingest clock are meaningless.
+        assert!(matches!(
+            client
+                .define_window_pipe(
+                    "p",
+                    "s",
+                    "a.s",
+                    PipeOperation::window(
+                        1_000_000_000,
+                        Extractor::record_key(),
+                        WindowAggregation::count(),
+                    )
+                    .unwrap()
+                    .time(WindowTime::Ingest)
+                    .max_late_ns(1_000_000),
+                    None,
+                )
+                .await,
+            Err(SdkError::Refused(_))
+        ));
+        // Nothing malformed ever reached the wire.
+        assert!(transport.take_requests().is_empty());
     }
 }
