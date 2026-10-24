@@ -1,0 +1,47 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # Same pin as verify.yml and rust-toolchain.toml (channel 1.90.0,
+      # matching Cargo.toml rust-version = "1.90").
+      - uses: dtolnay/rust-toolchain@1.90.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Stamp package version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=${VERSION}" >> "${GITHUB_ENV}"
+          # Rewrite only the [package] table's own version key: the range
+          # /^\[package\]/,/^\[/ ends at the next table header, so the many
+          # dependency `version = ` keys (inline tables and later tables)
+          # are untouched.
+          sed -i "/^\[package\]/,/^\[/ s/^version = .*/version = \"${VERSION}\"/" Cargo.toml
+          git diff -- Cargo.toml
+          # Fail closed if the sed touched anything besides the one
+          # [package] version line (1 added + 1 deleted = 2).
+          diff_lines="$(git diff --numstat -- Cargo.toml | awk '{print $1 + $2}')"
+          echo "changed lines in Cargo.toml: ${diff_lines}"
+          test "${diff_lines}" = "2"
+      - name: Build and verify crate package
+        run: cargo package --allow-dirty
+      - name: Collect release artifacts
+        run: |
+          mkdir -p dist
+          cp target/package/whitewater-*.crate dist/
+          cd dist
+          sha256sum whitewater-*.crate > checksums.txt
+          ls -l
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${{ github.ref_name }}" dist/* --generate-notes --title "whitewater ${{ env.VERSION }}"

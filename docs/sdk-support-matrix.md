@@ -19,8 +19,33 @@ skipping a language.
 | C#/.NET | `Whitewater.Client` (NuGet id) | 0.1.0 | .NET 8.0 | `whitewater-dotnet` |
 
 All six are pre-release packages consumed from source checkouts today; no
-registry publish workflow exists yet — treat every coordinate above as the
+public registry artifacts exist yet — treat every coordinate above as the
 declaration of intent for the release pipeline, not a published artifact.
+
+## Reproducible releases
+
+Each repository's `.github/workflows/release.yml` fires on a `v*` git tag and
+produces the same contract everywhere:
+
+1. The tag is the single version source — `vX.Y.Z` is injected into the
+   package manifest (`Cargo.toml`, `pyproject.toml`, `pom.xml`,
+   `package.json`, `dotnet pack -p:Version`; Go modules take the tag itself).
+2. The package is built in the workflow's pinned toolchain (rust 1.90,
+   Go 1.22, Python 3.12, Temurin 17, Node 20, .NET 8).
+3. `sha256sum` emits `checksums.txt` next to every artifact.
+4. `gh release create` attaches artifacts + checksums to a GitHub Release.
+
+| SDK | Release artifact(s) |
+|---|---|
+| Rust | `whitewater-<ver>.crate` (`cargo package`) |
+| Go | `whitewater-go-<ver>.tar.gz` (`git archive`) — proxy.golang.org consumes the tag itself |
+| Python | `whitewater_client-<ver>-py3-none-any.whl` + `whitewater_client-<ver>.tar.gz` (`python -m build`) |
+| Java | `whitewater-client-<ver>.jar` + `whitewater-client-<ver>.pom` (`mvn versions:set` + `package`) |
+| Node.js | `whitewater-client-<ver>.tgz` (`npm pack`) |
+| .NET | `Whitewater.Client.<ver>.nupkg` + `.snupkg` (`dotnet pack`) |
+
+Registry publishing (crates.io, PyPI, Maven Central, npmjs, NuGet.org) is a
+separate credential-gated step and is not claimed here.
 
 ## Capability parity
 
