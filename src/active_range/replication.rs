@@ -1390,7 +1390,7 @@ impl ReplicaAppendService {
             generation: assignment.generation,
             ownership_epoch: assignment.ownership_epoch,
         };
-        let store_options = self.store_options;
+        let store_options = self.store_options.clone();
         let opened = tokio::task::spawn_blocking(move || {
             FileActiveRangeStore::open_with_options(root.as_ref(), descriptor, store_options)
         })

@@ -18,9 +18,11 @@
 //! test topologies, and the contract an S3-style backend must satisfy.
 
 use std::{
+    collections::HashMap,
     fs::{self, File},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Condvar, Mutex},
 };
 
 use serde::{Deserialize, Serialize};
@@ -29,7 +31,7 @@ use uuid::Uuid;
 
 use super::store::{
     sealed_segment_manifest, sync_directory, verify_sealed_segment, ActiveRangeStoreError,
-    PersistedRangeState, SegmentManifest,
+    PersistedRangeState, RemoteSegmentSource, SegmentManifest,
 };
 
 #[derive(Debug, Error)]
@@ -66,6 +68,7 @@ pub trait ObjectStore: Send + Sync {
 /// `put` stages through a unique temporary name and renames atomically so
 /// a key is never half-visible, matching the durability contract real
 /// object stores give a completed PUT.
+#[derive(Debug)]
 pub struct FileSystemObjectStore {
     root: PathBuf,
 }
@@ -161,13 +164,13 @@ pub(crate) fn tier_marker_path(directory: &Path, segment: u64) -> PathBuf {
     directory.join(format!("segment-tier-{segment:06}.json"))
 }
 
-fn read_tier_marker(directory: &Path, segment: u64) -> Option<TierMarker> {
+pub(crate) fn read_tier_marker(directory: &Path, segment: u64) -> Option<TierMarker> {
     let bytes = fs::read(tier_marker_path(directory, segment)).ok()?;
     let marker = serde_json::from_slice::<TierMarker>(&bytes).ok()?;
     (marker.version == TIER_MARKER_VERSION && marker.segment == segment).then_some(marker)
 }
 
-fn write_tier_marker(directory: &Path, marker: &TierMarker) -> Result<(), TierError> {
+pub(crate) fn write_tier_marker(directory: &Path, marker: &TierMarker) -> Result<(), TierError> {
     let serialized = serde_json::to_vec(marker)?;
     let target = tier_marker_path(directory, marker.segment);
     let temporary = target.with_extension(format!("{}.tmp", Uuid::new_v4()));
@@ -179,6 +182,280 @@ fn write_tier_marker(directory: &Path, marker: &TierMarker) -> Result<(), TierEr
     fs::rename(&temporary, &target)?;
     sync_parent(&target)?;
     Ok(())
+}
+
+/// Local cache file a fetched remote segment lands in. The `cache-`
+/// prefix keeps it out of every `segment-*` scan while letting a reopen
+/// adopt it without a fresh remote read.
+fn cache_segment_path(directory: &Path, segment: u64) -> PathBuf {
+    directory.join(format!("cache-segment-{segment:06}.log"))
+}
+
+/// One remote fetch's shared outcome: the winner records the verdict and
+/// releases every waiter, so N concurrent Readers cost one object `get`.
+#[derive(Debug)]
+struct FetchSlot {
+    outcome: Mutex<Option<Result<PathBuf, String>>>,
+    ready: Condvar,
+}
+
+/// Read-side counterpart of the uploader — the `RemoteSegmentSource`
+/// implementation the range store consults when a sealed segment's local
+/// file is absent.
+///
+/// Guarantees:
+/// - marker + manifest provenance is re-checked before every fetch, so a
+///   demoted file without a verified remote copy fails closed;
+/// - fetches dedupe per object key (single-flight) and bound remote
+///   concurrency Node-wide — a burst of historical Readers cannot
+///   stampede object storage;
+/// - admitted bytes are BLAKE3-verified against the manifest digest and
+///   installed atomically before their path is ever returned;
+/// - the per-range byte budget surfaces through `remote_cache_bytes`,
+///   enforced by the store's coldest-first demotion.
+pub struct TierSource {
+    object_root: Option<PathBuf>,
+    store: Mutex<Option<Arc<dyn ObjectStore>>>,
+    remote_cache_bytes: u64,
+    max_concurrent_fetches: usize,
+    inflight: Mutex<HashMap<String, Arc<FetchSlot>>>,
+    permits: Mutex<usize>,
+    permits_ready: Condvar,
+}
+
+impl std::fmt::Debug for TierSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TierSource")
+            .field("remote_cache_bytes", &self.remote_cache_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TierSource {
+    /// `remote_cache_bytes` is the per-range ceiling on materialized
+    /// remote segments; remote fetches never exceed
+    /// `MAX_CONCURRENT_FETCHES` in flight across every range on the Node.
+    pub fn new(object_root: PathBuf, remote_cache_bytes: u64) -> Self {
+        Self {
+            object_root: Some(object_root),
+            store: Mutex::new(None),
+            remote_cache_bytes,
+            max_concurrent_fetches: Self::MAX_CONCURRENT_FETCHES,
+            inflight: Mutex::new(HashMap::new()),
+            permits: Mutex::new(0),
+            permits_ready: Condvar::new(),
+        }
+    }
+
+    /// Test seam: serve fetches from an injected backend so single-flight
+    /// and verification behavior are observable without a directory root.
+    #[cfg(test)]
+    pub(crate) fn with_store(store: Arc<dyn ObjectStore>, remote_cache_bytes: u64) -> Self {
+        Self {
+            object_root: None,
+            store: Mutex::new(Some(store)),
+            remote_cache_bytes,
+            max_concurrent_fetches: Self::MAX_CONCURRENT_FETCHES,
+            inflight: Mutex::new(HashMap::new()),
+            permits: Mutex::new(0),
+            permits_ready: Condvar::new(),
+        }
+    }
+
+    /// A small fixed bound: historical fetches are already single-flight
+    /// per object, so four parallel object reads is plenty of overlap
+    /// without letting a cold-reader burst queue behind itself.
+    const MAX_CONCURRENT_FETCHES: usize = 4;
+
+    fn acquire_permit(&self) {
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while *permits >= self.max_concurrent_fetches {
+            permits = self
+                .permits_ready
+                .wait(permits)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        *permits += 1;
+    }
+
+    fn release_permit(&self) {
+        let mut permits = self
+            .permits
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *permits = permits.saturating_sub(1);
+        self.permits_ready.notify_one();
+    }
+
+    /// The object store root opens lazily and caches: a late-mounted
+    /// backend fails the first reads with a clear error and self-heals as
+    /// soon as the directory appears, matching the uploader's contract.
+    fn object_store(&self) -> Result<Arc<dyn ObjectStore>, ActiveRangeStoreError> {
+        let mut store = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(store) = store.as_ref() {
+            return Ok(store.clone());
+        }
+        let root = self.object_root.clone().ok_or_else(|| {
+            ActiveRangeStoreError::RemoteFetch("no object store root configured".to_owned())
+        })?;
+        let opened: Arc<dyn ObjectStore> = Arc::new(
+            FileSystemObjectStore::open(root)
+                .map_err(|error| ActiveRangeStoreError::RemoteFetch(error.to_string()))?,
+        );
+        *store = Some(opened.clone());
+        Ok(opened)
+    }
+
+    /// Re-verifies a cache file's whole-file digest against the manifest
+    /// before reuse — a torn or tampered cache write never serves.
+    fn cache_file_valid(&self, path: &Path, manifest: &SegmentManifest) -> bool {
+        path.is_file()
+            && fs::read(path)
+                .map(|bytes| {
+                    bytes.len() as u64 == manifest.bytes
+                        && blake3::hash(&bytes).to_hex().as_str() == manifest.segment_digest
+                })
+                .unwrap_or(false)
+    }
+
+    /// Winner's half of the single-flight: bounded remote read, digest
+    /// verification, atomic cache install, then record + release.
+    fn fetch_and_admit(
+        &self,
+        directory: &Path,
+        key: &str,
+        manifest: &SegmentManifest,
+        cache: &Path,
+    ) -> Result<PathBuf, String> {
+        self.acquire_permit();
+        let outcome = self
+            .fetch_and_admit_inner(directory, key, manifest, cache)
+            .map_err(|error| error.to_string());
+        self.release_permit();
+        outcome
+    }
+
+    fn fetch_and_admit_inner(
+        &self,
+        directory: &Path,
+        key: &str,
+        manifest: &SegmentManifest,
+        cache: &Path,
+    ) -> Result<PathBuf, ActiveRangeStoreError> {
+        let bytes = self
+            .object_store()?
+            .get(key)
+            .map_err(|error| ActiveRangeStoreError::RemoteFetch(error.to_string()))?;
+        if bytes.len() as u64 != manifest.bytes
+            || blake3::hash(&bytes).to_hex().as_str() != manifest.segment_digest
+        {
+            return Err(ActiveRangeStoreError::RemoteFetch(format!(
+                "remote object {key} failed digest verification against manifest {}",
+                manifest.segment_digest
+            )));
+        }
+        // A concurrent eviction may have removed a previous cache file
+        // between the existence check and this install — the write is
+        // atomic, so whichever order wins leaves a complete file.
+        let temporary = cache.with_extension("tmp");
+        fs::write(&temporary, &bytes).map_err(ActiveRangeStoreError::Io)?;
+        // Windows grants fsync only on handles opened with write access.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&temporary)
+            .and_then(|file| file.sync_all())
+            .map_err(ActiveRangeStoreError::Io)?;
+        fs::rename(&temporary, cache).map_err(ActiveRangeStoreError::Io)?;
+        sync_directory(directory).map_err(ActiveRangeStoreError::Io)?;
+        Ok(cache.to_path_buf())
+    }
+}
+
+impl RemoteSegmentSource for TierSource {
+    fn fetch_sealed(
+        &self,
+        directory: &Path,
+        segment: u64,
+        manifest: &SegmentManifest,
+    ) -> Result<PathBuf, ActiveRangeStoreError> {
+        // Provenance is cheap and rechecked on every fetch: a demoted
+        // file without a verified remote copy fails closed rather than
+        // trusting an object that may belong to another range.
+        let marker_ok = read_tier_marker(directory, segment).is_some_and(|marker| {
+            marker.segment == segment && marker.segment_digest == manifest.segment_digest
+        });
+        if !marker_ok {
+            return Err(ActiveRangeStoreError::RemoteFetch(format!(
+                "sealed segment {segment} has no verified remote copy marker"
+            )));
+        }
+        let cache = cache_segment_path(directory, segment);
+        if self.cache_file_valid(&cache, manifest) {
+            return Ok(cache);
+        }
+        if cache.exists() {
+            let _ = fs::remove_file(&cache);
+        }
+        let key = segment_object_key(manifest);
+        let (slot, winner) = {
+            let mut inflight = self
+                .inflight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match inflight.get(&key) {
+                Some(slot) => (slot.clone(), false),
+                None => {
+                    let slot = Arc::new(FetchSlot {
+                        outcome: Mutex::new(None),
+                        ready: Condvar::new(),
+                    });
+                    inflight.insert(key.clone(), slot.clone());
+                    (slot, true)
+                }
+            }
+        };
+        if winner {
+            let outcome = self.fetch_and_admit(directory, &key, manifest, &cache);
+            {
+                let mut recorded = slot
+                    .outcome
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                *recorded = Some(outcome.clone());
+            }
+            slot.ready.notify_all();
+            self.inflight
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&key);
+            return outcome.map_err(ActiveRangeStoreError::RemoteFetch);
+        }
+        let mut outcome = slot
+            .outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while outcome.is_none() {
+            outcome = slot
+                .ready
+                .wait(outcome)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        outcome
+            .clone()
+            .ok_or_else(|| ActiveRangeStoreError::Worker("fetch slot poisoned".to_owned()))?
+            .map_err(ActiveRangeStoreError::RemoteFetch)
+    }
+
+    fn remote_cache_bytes(&self) -> u64 {
+        self.remote_cache_bytes
+    }
 }
 
 /// Object keys bind the segment's content digest, so replicas dedupe and
@@ -193,7 +470,7 @@ fn object_key_prefix(manifest: &SegmentManifest) -> String {
     )
 }
 
-fn segment_object_key(manifest: &SegmentManifest) -> String {
+pub(crate) fn segment_object_key(manifest: &SegmentManifest) -> String {
     format!("{}.log", object_key_prefix(manifest))
 }
 
@@ -625,5 +902,180 @@ mod tests {
         // Segment 1 is the open tail: no manifest, no marker, no remote key.
         assert!(!tier_marker_path(&directory, 1).exists());
         assert!(!manifest_path(&directory, 1).exists());
+    }
+
+    // --- TierSource: remote fetch, single-flight, verification ---
+
+    use crate::active_range::store::RemoteSegmentSource;
+    use std::time::Duration;
+
+    /// A `get` that sleeps before serving — the only way to prove
+    /// concurrent fetches dedupe is to leave the first fetch in flight
+    /// long enough for the rest to arrive.
+    struct SlowGetStore {
+        inner: FileSystemObjectStore,
+        gets: Mutex<u64>,
+        delay: Duration,
+    }
+
+    impl std::fmt::Debug for SlowGetStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("SlowGetStore")
+        }
+    }
+
+    impl ObjectStore for SlowGetStore {
+        fn put(&self, key: &str, source: &Path) -> Result<u64, TierError> {
+            self.inner.put(key, source)
+        }
+
+        fn get(&self, key: &str) -> Result<Vec<u8>, TierError> {
+            *self.gets.lock().unwrap() += 1;
+            std::thread::sleep(self.delay);
+            self.inner.get(key)
+        }
+
+        fn head(&self, key: &str) -> Result<Option<u64>, TierError> {
+            self.inner.head(key)
+        }
+    }
+
+    /// A manifest + marker + remote object for one synthetic sealed span —
+    /// the provenance `fetch_sealed` requires, without a full range.
+    fn staged_remote_segment(
+        directory: &Path,
+        objects: &FileSystemObjectStore,
+        descriptor: &ActiveRangeDescriptor,
+        segment: u64,
+        bytes: &[u8],
+    ) -> SegmentManifest {
+        let manifest = SegmentManifest {
+            version: 1,
+            feed_id: descriptor.feed_id,
+            range_id: descriptor.range_id,
+            generation: descriptor.generation,
+            segment,
+            bytes: bytes.len() as u64,
+            entries: 0,
+            first_position: 0,
+            last_position: 0,
+            segment_digest: blake3::hash(bytes).to_hex().to_string(),
+        };
+        let staging = tempfile::TempDir::new().unwrap();
+        let source_path = staging.path().join("segment.log");
+        fs::write(&source_path, bytes).unwrap();
+        objects
+            .put(&segment_object_key(&manifest), &source_path)
+            .unwrap();
+        write_tier_marker(
+            directory,
+            &TierMarker {
+                version: TIER_MARKER_VERSION,
+                segment,
+                object_key: segment_object_key(&manifest),
+                manifest_key: manifest_object_key(&manifest),
+                checkpoint_key: None,
+                bytes: manifest.bytes,
+                segment_digest: manifest.segment_digest.clone(),
+                uploaded_at_ns: 0,
+            },
+        )
+        .unwrap();
+        manifest
+    }
+
+    #[test]
+    fn concurrent_fetches_share_one_object_read() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let objects_root = tempfile::TempDir::new().unwrap();
+        let objects = FileSystemObjectStore::open(objects_root.path()).unwrap();
+        let descriptor = descriptor();
+        let manifest = staged_remote_segment(
+            directory.path(),
+            &objects,
+            &descriptor,
+            0,
+            b"sealed segment bytes",
+        );
+        let slow = Arc::new(SlowGetStore {
+            inner: FileSystemObjectStore::open(objects_root.path()).unwrap(),
+            gets: Mutex::new(0),
+            delay: Duration::from_millis(50),
+        });
+        let source = Arc::new(TierSource::with_store(slow.clone(), 1 << 20));
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let source = source.clone();
+            let directory = directory.path().to_path_buf();
+            let manifest = manifest.clone();
+            handles.push(std::thread::spawn(move || {
+                source.fetch_sealed(&directory, 0, &manifest)
+            }));
+        }
+        for handle in handles {
+            assert!(handle.join().unwrap().is_ok());
+        }
+        assert_eq!(
+            *slow.gets.lock().unwrap(),
+            1,
+            "concurrent fetches stampeded"
+        );
+    }
+
+    #[test]
+    fn fetch_refuses_a_span_without_verified_remote_provenance() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let objects_root = tempfile::TempDir::new().unwrap();
+        let objects = FileSystemObjectStore::open(objects_root.path()).unwrap();
+        let descriptor = descriptor();
+        let manifest = staged_remote_segment(
+            directory.path(),
+            &objects,
+            &descriptor,
+            0,
+            b"sealed segment bytes",
+        );
+        fs::remove_file(tier_marker_path(directory.path(), 0)).unwrap();
+        let source = TierSource::with_store(
+            Arc::new(FileSystemObjectStore::open(objects_root.path()).unwrap()),
+            1 << 20,
+        );
+        let error = source.fetch_sealed(directory.path(), 0, &manifest);
+        assert!(
+            matches!(error, Err(ActiveRangeStoreError::RemoteFetch(_))),
+            "fetch without a marker must fail closed: {error:?}"
+        );
+    }
+
+    #[test]
+    fn fetch_rejects_remote_bytes_that_forged_the_manifest_digest() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let objects_root = tempfile::TempDir::new().unwrap();
+        let objects = FileSystemObjectStore::open(objects_root.path()).unwrap();
+        let descriptor = descriptor();
+        let manifest = staged_remote_segment(
+            directory.path(),
+            &objects,
+            &descriptor,
+            0,
+            b"sealed segment bytes",
+        );
+        // Overwrite the content-addressed object with different bytes.
+        fs::write(
+            objects_root.path().join(segment_object_key(&manifest)),
+            b"forged replacement",
+        )
+        .unwrap();
+        let source = TierSource::with_store(
+            Arc::new(FileSystemObjectStore::open(objects_root.path()).unwrap()),
+            1 << 20,
+        );
+        let error = source.fetch_sealed(directory.path(), 0, &manifest);
+        assert!(
+            matches!(error, Err(ActiveRangeStoreError::RemoteFetch(_))),
+            "forged remote bytes must fail digest verification: {error:?}"
+        );
+        assert!(!cache_segment_path(directory.path(), 0).exists());
     }
 }

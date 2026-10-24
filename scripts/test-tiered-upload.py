@@ -83,6 +83,12 @@ def main():
         # The fresh shared volume is root-owned; the node runs as uid 10001.
         # One chown covers all three replicas — it is the same volume.
         node_exec("node1", f"chown -R 10001:10001 {TIER_DIR}", user="root")
+        # The named tier volume survives compose recreates, so objects from
+        # previous runs accumulate under foreign feed prefixes. They would
+        # inflate the dedupe count and demand markers for segments this run
+        # never wrote — empty the disposable store for the fresh-run
+        # contract the assertions assume.
+        node_exec("node1", f"find {TIER_DIR} -mindepth 1 -delete", user="root")
         time.sleep(6)
 
         suffix = f"tier{int(time.time())}{uuid.uuid4().hex[:6]}"
@@ -153,10 +159,20 @@ def main():
             raise AssertionError(f"replicas duplicated objects: {all_logs} files vs {len(objects)} digests")
 
         # Each replica persisted a tier marker naming the same remote key —
-        # restart-idempotent proof the upload completed and verified.
+        # restart-idempotent proof the upload completed and verified. The
+        # shared object set fills at whichever replica adopts first, while a
+        # node's own tick still walks its segments (rehash, verify, mark);
+        # markers are monotonic, so allow the laggard ticks to finish.
         for node in ("node1", "node2", "node3"):
-            markers, _ = node_exec(node, "find /var/lib/whitewater/active-ranges -name 'segment-tier-*.json' -type f | wc -l")
-            if int(markers) < len(objects):
+            deadline = time.time() + 90
+            markers = 0
+            while time.time() < deadline:
+                raw, _ = node_exec(node, "find /var/lib/whitewater/active-ranges -name 'segment-tier-*.json' -type f | wc -l")
+                markers = int(raw)
+                if markers >= len(objects):
+                    break
+                time.sleep(2)
+            if markers < len(objects):
                 raise AssertionError(f"{node} persisted {markers} tier markers, expected >= {len(objects)}")
 
         print(json.dumps({"status": "ok", "tiered_segments": len(objects), "digests": sorted(objects)[:3]}, indent=2))

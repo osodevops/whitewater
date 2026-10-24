@@ -159,6 +159,16 @@ async fn main() -> Result<()> {
     // A Node that resolved a storage identity for internal-plane auth but
     // declared no storage capability serves no replica services; placement
     // already excludes it through the eligible set.
+    // The read side of tiering is a single TierSource shared by every
+    // range the store opens: remote fetches dedupe and bound concurrency
+    // Node-wide, and each range enforces the configured per-range cache
+    // budget through coldest-first demotion.
+    let tier_source = config.object_store_dir.clone().map(|root| {
+        std::sync::Arc::new(whitewater::active_range::tier::TierSource::new(
+            root,
+            config.remote_cache_bytes,
+        ))
+    });
     let replica_append = config
         .storage_node_id
         .clone()
@@ -170,6 +180,12 @@ async fn main() -> Result<()> {
                 control.clone(),
                 whitewater::active_range::store::FileActiveRangeStoreOptions {
                     max_segment_bytes: config.max_segment_bytes,
+                    tier: tier_source.clone().map(|source| {
+                        source
+                            as std::sync::Arc<
+                                dyn whitewater::active_range::store::RemoteSegmentSource,
+                            >
+                    }),
                     ..whitewater::active_range::store::FileActiveRangeStoreOptions::default()
                 },
             ))

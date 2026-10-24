@@ -78,6 +78,12 @@ pub struct NodeConfig {
     /// bound diverges segment boundaries and therefore manifest digests,
     /// so it must be configured uniformly.
     pub max_segment_bytes: u64,
+    /// Per-range ceiling on cached remote sealed-segment bytes
+    /// (`WHITEWATER_REMOTE_CACHE_BYTES`, default 1 GiB). Materialized
+    /// segments beyond the budget demote back to remote coldest-first;
+    /// zero disables materialization entirely, which fails historical
+    /// reads on demoted ranges rather than caching unbounded.
+    pub remote_cache_bytes: u64,
 }
 
 impl NodeConfig {
@@ -166,6 +172,7 @@ impl NodeConfig {
         if tier_scan_interval.is_zero() {
             anyhow::bail!("WHITEWATER_TIER_SCAN_MS must be greater than zero");
         }
+        let remote_cache_bytes = parse_env("WHITEWATER_REMOTE_CACHE_BYTES", 1024 * 1024 * 1024)?;
         let tls = [
             env::var("WHITEWATER_SUBSCRIPTION_MTLS_BIND").ok(),
             env::var("WHITEWATER_SUBSCRIPTION_MTLS_CERT").ok(),
@@ -239,6 +246,7 @@ impl NodeConfig {
             object_store_dir,
             tier_scan_interval,
             max_segment_bytes,
+            remote_cache_bytes,
         })
     }
 }

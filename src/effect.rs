@@ -1947,15 +1947,7 @@ impl HttpEffectJournalTransport {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.bytes().await.unwrap_or_default();
-            let code = body
-                .get(..4096)
-                .and_then(|head| serde_json::from_slice::<serde_json::Value>(head).ok())
-                .and_then(|value| {
-                    value
-                        .get("code")
-                        .and_then(|code| code.as_str())
-                        .map(str::to_owned)
-                });
+            let code = refusal_code(&body);
             tracing::warn!(
                 node = %node,
                 path,
@@ -1980,6 +1972,23 @@ impl HttpEffectJournalTransport {
         )
         .map_err(|_| EffectJournalError::Unavailable)
     }
+}
+
+/// Decodes the wire `code` a journal replica embedded in an error body.
+/// Only the leading 4 KiB is inspected — coded refusals are small, and a
+/// body beyond the head falls back to status mapping. Slicing the head
+/// (not `body.get(..4096)`, which is `None` for shorter bodies) keeps
+/// coded refusals from collapsing into a bare `Conflict`.
+fn refusal_code(body: &[u8]) -> Option<String> {
+    let head = &body[..body.len().min(4096)];
+    serde_json::from_slice::<serde_json::Value>(head)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("code")
+                .and_then(|code| code.as_str())
+                .map(str::to_owned)
+        })
 }
 
 #[async_trait::async_trait]
@@ -2921,5 +2930,25 @@ mod tests {
             coordinator.apply_committed(foreign.effect_id, &sink).await,
             Err(EffectJournalError::InvalidAssignment)
         ));
+    }
+
+    #[test]
+    fn refusal_code_decodes_wire_codes_regardless_of_body_size() {
+        // Regression: `body.get(..4096)` returns `None` for a body shorter
+        // than 4 KiB, collapsing coded refusals (placement fences, stale
+        // epochs) into a bare `Conflict` that aborts effect application.
+        let coded = br#"{"code":"invalid_assignment","error":"placement moved"}"#;
+        assert!(matches!(
+            refusal_code(coded)
+                .as_deref()
+                .and_then(EffectJournalError::from_code),
+            Some(EffectJournalError::InvalidAssignment)
+        ));
+        assert_eq!(refusal_code(b"plain refusal"), None);
+        assert_eq!(refusal_code(b"{}"), None);
+        let mut oversized = br#"{"code":"conflict","pad":""#.to_vec();
+        oversized.extend(std::iter::repeat_n(b' ', 5000));
+        oversized.extend_from_slice(b"}");
+        assert_eq!(refusal_code(&oversized), None);
     }
 }

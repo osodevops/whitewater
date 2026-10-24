@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, File, OpenOptions},
     io::{ErrorKind, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -119,10 +119,35 @@ pub struct ActiveRangeSnapshot {
     pub pending_effect: Option<PendingEffect>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Verified remote copy of a sealed segment, implemented by
+/// `active_range::tier::TierSource`. Reads consult it only for a sealed
+/// segment whose local file is absent while a manifest plus tier marker
+/// prove a verified remote copy — the active append path stays purely
+/// local, and a Node with no object store configured serves everything it
+/// holds locally and reports remote reads as unavailable.
+pub trait RemoteSegmentSource: std::fmt::Debug + Send + Sync {
+    /// Fetches the segment's remote object into the local cache, verifies
+    /// its bytes against the manifest digest, and returns the cache path.
+    /// Implementations must bound remote concurrency and deduplicate
+    /// concurrent fetches of the same object.
+    fn fetch_sealed(
+        &self,
+        directory: &Path,
+        segment: u64,
+        manifest: &SegmentManifest,
+    ) -> Result<PathBuf, ActiveRangeStoreError>;
+    /// Per-range ceiling on concurrently cached remote bytes; materialized
+    /// segments beyond the budget demote back to remote coldest-first.
+    fn remote_cache_bytes(&self) -> u64;
+}
+
+#[derive(Clone, Debug)]
 pub struct FileActiveRangeStoreOptions {
     pub max_segment_bytes: u64,
     pub max_range_bytes: Option<u64>,
+    /// Remote-read source for sealed segments whose local file is absent.
+    /// `None` (the default) keeps every read local.
+    pub tier: Option<std::sync::Arc<dyn RemoteSegmentSource>>,
 }
 
 impl Default for FileActiveRangeStoreOptions {
@@ -130,6 +155,7 @@ impl Default for FileActiveRangeStoreOptions {
         Self {
             max_segment_bytes: 256 * 1024 * 1024,
             max_range_bytes: None,
+            tier: None,
         }
     }
 }
@@ -166,6 +192,8 @@ pub enum ActiveRangeStoreError {
     DiskCapacityExceeded { required: u64, limit: u64 },
     #[error("committed frame exceeds the bounded read byte budget; streaming larger frames is not available")]
     ReadBudgetExceeded,
+    #[error("remote segment read unavailable: {0}")]
+    RemoteFetch(String),
     #[error("replica append has a position gap: expected={expected}, supplied={supplied}")]
     PositionGap {
         expected: RangePosition,
@@ -329,6 +357,9 @@ pub struct FileActiveRangeStore {
 struct FileActiveRangeStoreInner {
     directory: PathBuf,
     options: FileActiveRangeStoreOptions,
+    /// Remote-read source consulted only for sealed segments whose local
+    /// file is absent; `None` serves every read locally.
+    tier: Option<Arc<dyn RemoteSegmentSource>>,
     loaded: Mutex<LoadedRange>,
     /// Set when a mutating store operation fails at the persistence layer —
     /// I/O, worker, or integrity errors — and cleared by the next successful
@@ -344,10 +375,40 @@ struct LoadedRange {
     cursor_positions: HashMap<String, RangePosition>,
     digest_positions: HashMap<[u8; 32], RangePosition>,
     deduplication: HashMap<WriterKey, DeduplicationState>,
+    /// Sealed segments whose local file is absent but whose tier marker
+    /// proves a verified remote copy — the permanent remote-span registry
+    /// for this range. Entries may be materialized on demand; demotion
+    /// removes their spliced entries but the span stays remote forever.
+    remote: BTreeMap<u64, SegmentManifest>,
+    /// Remote segments currently fetched into the local cache. Their
+    /// entries are spliced into `entries` and resolved through the cache
+    /// path rather than the range directory.
+    materialized: BTreeMap<u64, MaterializedSegment>,
+    /// Sum of `MaterializedSegment::bytes` — the per-range cache budget is
+    /// enforced against this, never against on-disk accounting.
+    materialized_bytes: u64,
+    /// Monotonic stamp for LRU ordering of `materialized`.
+    use_seq: u64,
     /// True while committed ingest_time_ns is non-decreasing in position
     /// order; a backwards clock step disables indexed ingest seeks, which
     /// callers resolve by scanning instead.
     ingest_monotonic: bool,
+}
+
+/// A remote segment fetched into the tier cache: the cache file path, its
+/// byte cost against the per-range budget, the last-read stamp used for
+/// coldest-first demotion, and the span's own recovered entry index.
+/// Remote spans never splice into `entries` — reads resolve remote
+/// positions through this index, so demotion can never leave `entries`
+/// sparse.
+#[derive(Debug)]
+struct MaterializedSegment {
+    path: PathBuf,
+    bytes: u64,
+    last_used: u64,
+    /// Recovered entries for this span only — dense and position-ordered,
+    /// verified against the manifest's coverage at admission.
+    entries: Vec<EntryIndex>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -447,8 +508,17 @@ impl FileActiveRangeStore {
         if persisted.ownership_epoch < descriptor.ownership_epoch {
             persisted.ownership_epoch = descriptor.ownership_epoch;
         }
-        let (entries, recovered_deduplication) = recover_segments(&directory, &persisted)?;
-        let surviving_positions = entries.iter().map(|entry| entry.position.value()).collect();
+        let (entries, recovered_deduplication, remote) = recover_segments(&directory, &persisted)?;
+        // Remote-only sealed positions still exist — a Writer whose dedup
+        // high-water landed in a tiered segment keeps its state, or a stale
+        // sequence would replay a second copy of committed history.
+        let mut surviving_positions = entries
+            .iter()
+            .map(|entry| entry.position.value())
+            .collect::<std::collections::HashSet<_>>();
+        for manifest in remote.values() {
+            surviving_positions.extend(manifest.first_position..=manifest.last_position);
+        }
         let recovered_deduplication = merge_deduplication(
             recovered_deduplication,
             persisted.deduplication.clone(),
@@ -472,10 +542,20 @@ impl FileActiveRangeStore {
                 "duplicate frame digest identity".to_owned(),
             ));
         }
-        let ingest_monotonic = entries
-            .windows(2)
-            .all(|pair| pair[0].ingest_time_ns <= pair[1].ingest_time_ns);
-        let recovered_position = entries.last().map_or(0, |entry| entry.position.value());
+        // Ingest order is provable only where entry bytes were recovered
+        // locally; a still-remote gap makes the claim unprovable until the
+        // span materializes and recomputes the check.
+        let ingest_monotonic = remote.is_empty()
+            && entries
+                .windows(2)
+                .all(|pair| pair[0].ingest_time_ns <= pair[1].ingest_time_ns);
+        let recovered_position = entries
+            .last()
+            .map(|entry| entry.position.value())
+            .into_iter()
+            .chain(remote.values().map(|manifest| manifest.last_position))
+            .max()
+            .unwrap_or(0);
         if persisted.committed > recovered_position {
             return Err(ActiveRangeStoreError::InvalidState(format!(
                 "commit position {} exceeds recovered position {recovered_position}",
@@ -500,6 +580,7 @@ impl FileActiveRangeStore {
         Ok(Self {
             inner: Arc::new(FileActiveRangeStoreInner {
                 directory,
+                tier: options.tier.clone(),
                 options,
                 persistence_failure: std::sync::atomic::AtomicBool::new(false),
                 loaded: Mutex::new(LoadedRange {
@@ -509,6 +590,10 @@ impl FileActiveRangeStore {
                     cursor_positions,
                     digest_positions,
                     deduplication: recovered_deduplication,
+                    remote,
+                    materialized: BTreeMap::new(),
+                    materialized_bytes: 0,
+                    use_seq: 0,
                     ingest_monotonic,
                 }),
             }),
@@ -569,19 +654,28 @@ impl FileActiveRangeStore {
         &self,
     ) -> Result<Vec<SegmentManifest>, ActiveRangeStoreError> {
         self.blocking(|inner| {
-            let persisted = inner
-                .loaded
-                .lock()
-                .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?
-                .persisted
-                .clone();
+            let (persisted, remote) = {
+                let loaded = inner
+                    .loaded
+                    .lock()
+                    .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+                (loaded.persisted.clone(), loaded.remote.clone())
+            };
             let mut manifests = Vec::new();
             for segment in 0..persisted.active_segment {
-                manifests.push(verify_sealed_segment(
-                    &inner.directory,
-                    segment,
-                    &persisted,
-                )?);
+                // A demoted segment has no local bytes to rehash; its
+                // stored manifest is the provenance record the uploader
+                // already verified, so report it rather than failing the
+                // scan on an absent file.
+                if let Some(manifest) = remote.get(&segment) {
+                    manifests.push(manifest.clone());
+                } else {
+                    manifests.push(verify_sealed_segment(
+                        &inner.directory,
+                        segment,
+                        &persisted,
+                    )?);
+                }
             }
             Ok(manifests)
         })
@@ -641,6 +735,7 @@ impl ActiveRangeStore for FileActiveRangeStore {
         requests: Vec<ActiveRangeAppend>,
     ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError> {
         self.blocking_mutation(move |inner| {
+            prematerialize_for_appends(inner, &requests)?;
             let mut loaded = inner
                 .loaded
                 .lock()
@@ -709,25 +804,8 @@ impl ActiveRangeStore for FileActiveRangeStore {
         after: Option<RangePosition>,
         limit: usize,
     ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
-        self.blocking(move |inner| {
-            let loaded = inner
-                .loaded
-                .lock()
-                .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
-            let after = after.map_or(0, RangePosition::value);
-            let start = loaded
-                .entries
-                .partition_point(|entry| entry.position.value() <= after);
-            loaded
-                .entries
-                .iter()
-                .skip(start)
-                .take_while(|entry| entry.position.value() <= loaded.persisted.appended)
-                .take(limit.clamp(1, 10_000))
-                .map(|entry| read_indexed_frame(&inner.directory, entry))
-                .collect()
-        })
-        .await
+        self.blocking(move |inner| read_uncommitted(inner, after, limit))
+            .await
     }
 
     async fn committed_position_for_cursor(
@@ -736,15 +814,34 @@ impl ActiveRangeStore for FileActiveRangeStore {
     ) -> Result<Option<RangePosition>, ActiveRangeStoreError> {
         let cursor = cursor.to_owned();
         self.blocking(move |inner| {
-            let loaded = inner
-                .loaded
-                .lock()
-                .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
-            Ok(loaded
-                .cursor_positions
-                .get(&cursor)
-                .copied()
-                .filter(|position| position.value() <= loaded.persisted.committed))
+            // A Cursor whose frame sits on a demoted segment resolves only
+            // after the span materializes — the position index survives
+            // demotion, but it is populated from entries, so an uncached
+            // remote span reports absent until fetched.
+            loop {
+                let next = {
+                    let loaded = inner.loaded.lock().map_err(|_| {
+                        ActiveRangeStoreError::Worker("range lock poisoned".to_owned())
+                    })?;
+                    if let Some(position) = loaded
+                        .cursor_positions
+                        .get(&cursor)
+                        .copied()
+                        .filter(|position| position.value() <= loaded.persisted.committed)
+                    {
+                        return Ok(Some(position));
+                    }
+                    loaded
+                        .remote
+                        .values()
+                        .find(|manifest| !loaded.materialized.contains_key(&manifest.segment))
+                        .cloned()
+                };
+                match next {
+                    Some(manifest) => materialize_remote(inner, &manifest)?,
+                    None => return Ok(None),
+                }
+            }
         })
         .await
     }
@@ -1038,6 +1135,76 @@ fn snapshot(loaded: &LoadedRange) -> Result<ActiveRangeSnapshot, ActiveRangeStor
     })
 }
 
+/// Remote spans holding dedup evidence for `requests`. Expected
+/// positions, frame digests, request cursors, and writer-sequence
+/// high-water marks can all point at a demoted sealed segment; the
+/// entries.find lookups inside `append_locked` must see them as dense
+/// history or an idempotent retry degrades into a false PositionConflict.
+/// Fetching happens here — before the write lock — so the byte-level
+/// dedup comparisons still run against real frame content.
+fn prematerialize_for_appends(
+    inner: &FileActiveRangeStoreInner,
+    requests: &[ActiveRangeAppend],
+) -> Result<(), ActiveRangeStoreError> {
+    loop {
+        let needed = {
+            let loaded = inner
+                .loaded
+                .lock()
+                .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+            let mut needed: Vec<SegmentManifest> = Vec::new();
+            let mut consider = |position: RangePosition| {
+                let position = position.value();
+                if let Some(manifest) = loaded.remote.values().find(|manifest| {
+                    !loaded.materialized.contains_key(&manifest.segment)
+                        && manifest.first_position <= position
+                        && position <= manifest.last_position
+                }) {
+                    if needed
+                        .iter()
+                        .all(|span: &SegmentManifest| span.segment != manifest.segment)
+                    {
+                        needed.push(manifest.clone());
+                    }
+                }
+            };
+            for request in requests {
+                if let Some(supplied) = request
+                    .expected_position
+                    .filter(|supplied| supplied.value() <= loaded.persisted.appended)
+                {
+                    consider(supplied);
+                }
+                let frame_digest = blake3::hash(&request.frame);
+                if let Some(position) = loaded
+                    .digest_positions
+                    .get(frame_digest.as_bytes())
+                    .copied()
+                {
+                    consider(position);
+                }
+                if let Some(position) = loaded.cursor_positions.get(&request.cursor).copied() {
+                    consider(position);
+                }
+                let writer_key = WriterKey {
+                    writer_session_id: request.identity.writer_session_id,
+                    writer_epoch: request.identity.writer_epoch,
+                };
+                if let Some(deduplication) = loaded.deduplication.get(&writer_key) {
+                    consider(deduplication.position);
+                }
+            }
+            needed
+        };
+        if needed.is_empty() {
+            return Ok(());
+        }
+        for manifest in needed {
+            materialize_remote(inner, &manifest)?;
+        }
+    }
+}
+
 fn append(
     inner: &FileActiveRangeStoreInner,
     request: ActiveRangeAppend,
@@ -1052,6 +1219,7 @@ fn append(
     {
         return Err(ActiveRangeStoreError::WriterIdentityMismatch);
     }
+    prematerialize_for_appends(inner, std::slice::from_ref(&request))?;
     let mut loaded = inner
         .loaded
         .lock()
@@ -1115,10 +1283,7 @@ fn append_locked(
     );
     if let Some(supplied) = request.expected_position {
         if supplied < next_position {
-            let existing = loaded
-                .entries
-                .iter()
-                .find(|entry| entry.position == supplied)
+            let existing = entry_at(loaded, supplied)
                 .ok_or(ActiveRangeStoreError::PositionConflict(supplied))?;
             if existing.identity != request.identity || existing.frame_digest != frame_digest {
                 tracing::warn!(
@@ -1154,11 +1319,8 @@ fn append_locked(
         }
     }
     if let Some(position) = loaded.digest_positions.get(&frame_digest).copied() {
-        let existing = loaded
-            .entries
-            .iter()
-            .find(|entry| entry.position == position)
-            .ok_or(ActiveRangeStoreError::PositionConflict(position))?;
+        let existing =
+            entry_at(loaded, position).ok_or(ActiveRangeStoreError::PositionConflict(position))?;
         return Ok(ActiveRangeAppendResult {
             position: existing.position,
             message_id: existing.message_id,
@@ -1178,12 +1340,9 @@ fn append_locked(
         // own earlier append, while a re-sequenced retry carries a stale or
         // future sequence that would otherwise wedge the retry as a
         // StaleWriterSequence against the stream's high-water mark.
-        let existing = loaded
-            .entries
-            .iter()
-            .find(|entry| entry.position == existing_position)
+        let existing = entry_at(loaded, existing_position)
             .ok_or(ActiveRangeStoreError::PositionConflict(existing_position))?;
-        let existing_frame = read_indexed_frame(&inner.directory, existing)?;
+        let existing_frame = read_indexed_frame(&inner.directory, loaded, &existing)?;
         let existing_record = decode_record(&existing_frame.frame)?;
         if same_request_record(&existing_record, record) {
             // The API layer allocated this retry a fresh sequence before the
@@ -1234,14 +1393,12 @@ fn append_locked(
         if let Some(previous) = loaded.deduplication.get(&writer_key) {
             if request.identity.sequence == previous.sequence {
                 if frame_digest != previous.frame_digest {
-                    let existing = loaded
-                        .entries
-                        .iter()
-                        .find(|entry| entry.position == previous.position)
-                        .ok_or(ActiveRangeStoreError::WriterSequenceConflict {
+                    let existing = entry_at(loaded, previous.position).ok_or(
+                        ActiveRangeStoreError::WriterSequenceConflict {
                             latest: previous.sequence,
-                        })?;
-                    let existing_frame = read_indexed_frame(&inner.directory, existing)?;
+                        },
+                    )?;
+                    let existing_frame = read_indexed_frame(&inner.directory, loaded, &existing)?;
                     let existing_record = decode_record(&existing_frame.frame)?;
                     if !same_request_record(&existing_record, record) {
                         return Err(ActiveRangeStoreError::WriterSequenceConflict {
@@ -1423,28 +1580,275 @@ fn commit(
     Ok(())
 }
 
+/// The remote manifest covering `position`, when the position belongs to
+/// a demoted sealed span. Remote manifests pin coverage permanently, so
+/// this lookup never depends on cache state.
+fn remote_manifest_containing(loaded: &LoadedRange, position: u64) -> Option<&SegmentManifest> {
+    loaded
+        .remote
+        .values()
+        .find(|manifest| manifest.first_position <= position && position <= manifest.last_position)
+}
+
+/// Entry lookup that sees remote spans: local `entries` first, then the
+/// per-span index of a materialized segment. Positions still remote-only
+/// return `None` — callers materialize first when they need the bytes.
+fn entry_at(loaded: &LoadedRange, position: RangePosition) -> Option<EntryIndex> {
+    let position_value = position.value();
+    if let Ok(index) = loaded
+        .entries
+        .binary_search_by_key(&position_value, |entry| entry.position.value())
+    {
+        return Some(loaded.entries[index].clone());
+    }
+    let manifest = remote_manifest_containing(loaded, position_value)?;
+    loaded
+        .materialized
+        .get(&manifest.segment)?
+        .entries
+        .iter()
+        .find(|entry| entry.position == position)
+        .cloned()
+}
+
+/// Fetches one remote sealed segment through the configured tier source,
+/// rescans the cache copy into a per-span entry index, and registers it
+/// in the materialized overlay. The remote read happens with the range
+/// lock released so a slow object store never stalls appends; the
+/// manifest's span and digest were verified at upload, and `fetch_sealed`
+/// re-verifies fetched bytes before admitting them to cache.
+fn materialize_remote(
+    inner: &FileActiveRangeStoreInner,
+    manifest: &SegmentManifest,
+) -> Result<(), ActiveRangeStoreError> {
+    let tier = inner.tier.clone().ok_or_else(|| {
+        ActiveRangeStoreError::RemoteFetch(format!(
+            "segment {} is remote-only and no object store is configured",
+            manifest.segment
+        ))
+    })?;
+    let path = tier.fetch_sealed(&inner.directory, manifest.segment, manifest)?;
+    let recovered = recover_segment(&path, manifest.segment, false)?;
+    if recovered.len() as u64 != manifest.entries
+        || recovered.first().map(|entry| entry.position.value()) != Some(manifest.first_position)
+        || recovered.last().map(|entry| entry.position.value()) != Some(manifest.last_position)
+    {
+        return Err(ActiveRangeStoreError::CorruptSegment {
+            path,
+            reason: format!(
+                "cached copy does not cover manifest span {}..={} (entries={})",
+                manifest.first_position, manifest.last_position, manifest.entries
+            ),
+        });
+    }
+    let mut loaded = inner
+        .loaded
+        .lock()
+        .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+    if loaded.materialized.contains_key(&manifest.segment) {
+        return Ok(());
+    }
+    if !loaded.remote.contains_key(&manifest.segment) {
+        return Err(ActiveRangeStoreError::InvalidState(format!(
+            "materialized segment {} is not registered remote",
+            manifest.segment
+        )));
+    }
+    for entry in &recovered {
+        loaded
+            .cursor_positions
+            .insert(entry.cursor.clone(), entry.position);
+        loaded
+            .digest_positions
+            .insert(entry.frame_digest, entry.position);
+    }
+    loaded.use_seq = loaded.use_seq.saturating_add(1);
+    let last_used = loaded.use_seq;
+    loaded.materialized.insert(
+        manifest.segment,
+        MaterializedSegment {
+            path,
+            bytes: manifest.bytes,
+            last_used,
+            entries: recovered,
+        },
+    );
+    loaded.materialized_bytes = loaded.materialized_bytes.saturating_add(manifest.bytes);
+    demote_to_budget(inner, &mut loaded);
+    Ok(())
+}
+
+/// Demotes the coldest cached remote segments until the configured cache
+/// budget holds. Eviction drops the span's per-segment index and cache
+/// file — the manifest stays pinned in `remote`, so the span
+/// re-materializes on the next read — and `entries` is untouched because
+/// remote spans never lived there. The last materialized segment is
+/// never evicted even when it alone exceeds the budget: a span must stay
+/// servable after its fetch, or a sub-segment budget would loop
+/// fetch-and-evict forever.
+fn demote_to_budget(inner: &FileActiveRangeStoreInner, loaded: &mut LoadedRange) {
+    let Some(tier) = inner.tier.as_ref() else {
+        return;
+    };
+    let budget = tier.remote_cache_bytes();
+    while loaded.materialized_bytes > budget && loaded.materialized.len() > 1 {
+        let Some((segment, evicted)) = loaded
+            .materialized
+            .iter()
+            .min_by_key(|(_, materialized)| materialized.last_used)
+            .map(|(segment, materialized)| {
+                (*segment, (materialized.path.clone(), materialized.bytes))
+            })
+        else {
+            break;
+        };
+        loaded.materialized.remove(&segment);
+        loaded.materialized_bytes = loaded.materialized_bytes.saturating_sub(evicted.1);
+        let _ = std::fs::remove_file(evicted.0);
+    }
+}
+
+/// Position-ordered window read shared by the committed, uncommitted, and
+/// byte-bounded paths. Each next position resolves exactly one way: a
+/// local entry, or a remote span that materializes under a dropped lock
+/// and then serves through its per-segment index. Dense positions are
+/// the store's own invariant — a hole that is neither local nor remote is
+/// an InvalidState, never a silent skip.
+fn read_window(
+    inner: &FileActiveRangeStoreInner,
+    after: Option<RangePosition>,
+    limit: u64,
+    committed_only: bool,
+    max_bytes: Option<usize>,
+) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
+    let mut next = after.map_or(0, RangePosition::value).saturating_add(1);
+    let mut frames = Vec::new();
+    let mut bytes = 0_usize;
+    loop {
+        let fetch = {
+            let mut loaded = inner
+                .loaded
+                .lock()
+                .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+            let bound = if committed_only {
+                loaded.persisted.committed
+            } else {
+                loaded.persisted.appended
+            };
+            if next > bound || frames.len() as u64 >= limit {
+                return Ok(frames);
+            }
+            let remaining = (limit - frames.len() as u64) as usize;
+            match remote_manifest_containing(&loaded, next).cloned() {
+                Some(manifest) if !loaded.materialized.contains_key(&manifest.segment) => {
+                    Some(manifest)
+                }
+                Some(manifest) => {
+                    let materialized = loaded
+                        .materialized
+                        .get(&manifest.segment)
+                        .expect("materialized checked above");
+                    let offset = (next - manifest.first_position) as usize;
+                    let take = remaining.min((manifest.last_position - next + 1) as usize);
+                    let mut served = 0_usize;
+                    for entry in materialized.entries.iter().skip(offset).take(take) {
+                        if entry.position.value() != next {
+                            return Err(ActiveRangeStoreError::InvalidState(format!(
+                                "remote index gap at position {next}"
+                            )));
+                        }
+                        let frame = read_indexed_frame(&inner.directory, &loaded, entry)?;
+                        if let Some(cap) = max_bytes {
+                            let size = crate::codec::logical_frame_size(&frame.frame)?;
+                            let candidate = bytes
+                                .checked_add(size)
+                                .ok_or(ActiveRangeStoreError::ReadBudgetExceeded)?;
+                            if candidate > cap {
+                                if frames.is_empty() {
+                                    return Err(ActiveRangeStoreError::ReadBudgetExceeded);
+                                }
+                                return Ok(frames);
+                            }
+                            bytes = candidate;
+                        }
+                        frames.push(frame);
+                        next = next.saturating_add(1);
+                        served += 1;
+                    }
+                    if served == 0 {
+                        return Err(ActiveRangeStoreError::InvalidState(format!(
+                            "remote index missing position {next}"
+                        )));
+                    }
+                    loaded.use_seq = loaded.use_seq.saturating_add(1);
+                    let stamp = loaded.use_seq;
+                    if let Some(materialized) = loaded.materialized.get_mut(&manifest.segment) {
+                        materialized.last_used = stamp;
+                    }
+                    None
+                }
+                None => {
+                    let start = loaded
+                        .entries
+                        .partition_point(|entry| entry.position.value() < next);
+                    let mut served = 0_usize;
+                    for entry in loaded
+                        .entries
+                        .iter()
+                        .skip(start)
+                        .take_while(|entry| entry.position.value() <= bound)
+                        .take(remaining)
+                    {
+                        if entry.position.value() != next {
+                            break;
+                        }
+                        let frame = read_indexed_frame(&inner.directory, &loaded, entry)?;
+                        if let Some(cap) = max_bytes {
+                            let size = crate::codec::logical_frame_size(&frame.frame)?;
+                            let candidate = bytes
+                                .checked_add(size)
+                                .ok_or(ActiveRangeStoreError::ReadBudgetExceeded)?;
+                            if candidate > cap {
+                                if frames.is_empty() {
+                                    return Err(ActiveRangeStoreError::ReadBudgetExceeded);
+                                }
+                                return Ok(frames);
+                            }
+                            bytes = candidate;
+                        }
+                        frames.push(frame);
+                        next = next.saturating_add(1);
+                        served += 1;
+                    }
+                    if served == 0 && next <= bound {
+                        return Err(ActiveRangeStoreError::InvalidState(format!(
+                            "position {next} is neither local nor remote"
+                        )));
+                    }
+                    None
+                }
+            }
+        };
+        if let Some(manifest) = fetch {
+            materialize_remote(inner, &manifest)?;
+        }
+    }
+}
+
+fn read_uncommitted(
+    inner: &FileActiveRangeStoreInner,
+    after: Option<RangePosition>,
+    limit: usize,
+) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
+    read_window(inner, after, limit.clamp(1, 10_000) as u64, false, None)
+}
+
 fn read_committed(
     inner: &FileActiveRangeStoreInner,
     after: Option<RangePosition>,
     limit: usize,
 ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
-    let loaded = inner
-        .loaded
-        .lock()
-        .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
-    let after = after.map_or(0, RangePosition::value);
-    let limit = limit.clamp(1, 10_000);
-    let start = loaded
-        .entries
-        .partition_point(|entry| entry.position.value() <= after);
-    loaded
-        .entries
-        .iter()
-        .skip(start)
-        .take_while(|entry| entry.position.value() <= loaded.persisted.committed)
-        .take(limit)
-        .map(|entry| read_indexed_frame(&inner.directory, entry))
-        .collect()
+    read_window(inner, after, limit.clamp(1, 10_000) as u64, true, None)
 }
 
 fn read_committed_bounded(
@@ -1453,37 +1857,13 @@ fn read_committed_bounded(
     limit: usize,
     max_bytes: usize,
 ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
-    let loaded = inner
-        .loaded
-        .lock()
-        .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
-    let start = loaded
-        .entries
-        .partition_point(|entry| entry.position.value() <= after.map_or(0, RangePosition::value));
-    let mut frames = Vec::new();
-    let mut bytes = 0_usize;
-    for entry in loaded
-        .entries
-        .iter()
-        .skip(start)
-        .take_while(|entry| entry.position.value() <= loaded.persisted.committed)
-        .take(limit.clamp(1, 128))
-    {
-        let frame = read_indexed_frame(&inner.directory, entry)?;
-        let size = crate::codec::logical_frame_size(&frame.frame)?;
-        let next = bytes
-            .checked_add(size)
-            .ok_or(ActiveRangeStoreError::ReadBudgetExceeded)?;
-        if next > max_bytes {
-            if frames.is_empty() {
-                return Err(ActiveRangeStoreError::ReadBudgetExceeded);
-            }
-            break;
-        }
-        frames.push(frame);
-        bytes = next;
-    }
-    Ok(frames)
+    read_window(
+        inner,
+        after,
+        limit.clamp(1, 128) as u64,
+        true,
+        Some(max_bytes),
+    )
 }
 
 fn truncate_uncommitted(
@@ -1508,7 +1888,11 @@ fn truncate_uncommitted_locked(
     let committed = loaded.persisted.committed;
     if loaded.entries.iter().any(|entry| {
         entry.position.value() > committed && entry.segment != loaded.persisted.active_segment
-    }) {
+    }) || loaded
+        .remote
+        .values()
+        .any(|manifest| manifest.last_position > committed)
+    {
         return Err(ActiveRangeStoreError::UncommittedSealedSegment);
     }
     let active_length = loaded
@@ -1688,7 +2072,7 @@ fn write_segment_checkpoint(
 const SEGMENT_MANIFEST_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct SegmentManifest {
+pub struct SegmentManifest {
     pub version: u32,
     pub feed_id: Uuid,
     pub range_id: RangeId,
@@ -1994,14 +2378,58 @@ fn corroborate_segment_checkpoint(
     Ok(())
 }
 
+type RecoveredSegments = (
+    Vec<EntryIndex>,
+    HashMap<WriterKey, DeduplicationState>,
+    BTreeMap<u64, SegmentManifest>,
+);
+
 fn recover_segments(
     directory: &Path,
     persisted: &PersistedRangeState,
-) -> Result<(Vec<EntryIndex>, HashMap<WriterKey, DeduplicationState>), ActiveRangeStoreError> {
+) -> Result<RecoveredSegments, ActiveRangeStoreError> {
     let mut entries = Vec::new();
+    let mut remote = BTreeMap::new();
     let mut expected_position = 1_u64;
     for segment in 0..=persisted.active_segment {
         let segment_start = entries.len();
+        let path = segment_path(directory, segment);
+        if !path.exists() {
+            if segment == persisted.active_segment {
+                File::create(&path)?.sync_all()?;
+            } else {
+                // A sealed file is legitimately absent only when the range
+                // proves a verified remote copy: the manifest binds span
+                // and digest, the tier marker binds the uploaded object.
+                // Anything less stays fail-closed corruption, and the
+                // detection must run before checkpoint loading because a
+                // checkpoint can outlive the file it indexes.
+                let manifest = read_segment_manifest(directory, segment, persisted)
+                    .filter(|manifest| manifest.first_position == expected_position);
+                let marker_matches = manifest.as_ref().is_some_and(|manifest| {
+                    super::tier::read_tier_marker(directory, segment).is_some_and(|marker| {
+                        marker.segment == segment
+                            && marker.segment_digest == manifest.segment_digest
+                    })
+                });
+                match manifest {
+                    Some(manifest) if marker_matches => {
+                        expected_position = manifest
+                            .last_position
+                            .checked_add(1)
+                            .ok_or(ActiveRangeStoreError::PositionOverflow)?;
+                        remote.insert(segment, manifest);
+                        continue;
+                    }
+                    _ => {
+                        return Err(ActiveRangeStoreError::CorruptSegment {
+                            path,
+                            reason: "sealed segment is missing".to_owned(),
+                        });
+                    }
+                }
+            }
+        }
         if segment < persisted.active_segment {
             if let Some(checkpointed) =
                 load_segment_checkpoint(directory, segment, persisted, expected_position)
@@ -2012,17 +2440,6 @@ fn recover_segments(
                 entries.extend(checkpointed);
                 ensure_segment_manifest(directory, segment, persisted, &entries[segment_start..])?;
                 continue;
-            }
-        }
-        let path = segment_path(directory, segment);
-        if !path.exists() {
-            if segment == persisted.active_segment {
-                File::create(&path)?.sync_all()?;
-            } else {
-                return Err(ActiveRangeStoreError::CorruptSegment {
-                    path,
-                    reason: "sealed segment is missing".to_owned(),
-                });
             }
         }
         let allow_torn_tail = segment == persisted.active_segment;
@@ -2047,7 +2464,7 @@ fn recover_segments(
         }
     }
     let deduplication = deduplication_from_entries(&entries);
-    Ok((entries, deduplication))
+    Ok((entries, deduplication, remote))
 }
 
 pub(crate) fn recover_segment(
@@ -2261,16 +2678,22 @@ fn same_request_record(left: &StoredRecord, right: &StoredRecord) -> bool {
 
 fn read_indexed_frame(
     directory: &Path,
+    loaded: &LoadedRange,
     entry: &EntryIndex,
 ) -> Result<StoredRangeFrame, ActiveRangeStoreError> {
-    let mut file = File::open(segment_path(directory, entry.segment))?;
+    let path = loaded
+        .materialized
+        .get(&entry.segment)
+        .map(|materialized| materialized.path.clone())
+        .unwrap_or_else(|| segment_path(directory, entry.segment));
+    let mut file = File::open(&path)?;
     let frame_end = entry
         .frame_offset
         .checked_add(entry.frame_length)
         .ok_or(ActiveRangeStoreError::PositionOverflow)?;
     if frame_end > file.metadata()?.len() {
         return Err(corrupt(
-            &segment_path(directory, entry.segment),
+            &path,
             format!(
                 "stored frame at RangePosition {} extends beyond the segment: offset={}, bytes={}",
                 entry.position, entry.frame_offset, entry.frame_length
@@ -2896,7 +3319,7 @@ mod tests {
             descriptor.clone(),
             FileActiveRangeStoreOptions {
                 max_segment_bytes: 2_048,
-                max_range_bytes: None,
+                ..FileActiveRangeStoreOptions::default()
             },
         )
         .unwrap();
@@ -3059,5 +3482,360 @@ mod tests {
                     .starts_with("segment-manifest-")
             })
             .count()
+    }
+
+    // --- remote-only sealed segments + hot cache ---
+
+    use crate::active_range::tier::{FileSystemObjectStore, ObjectStore, TierSource};
+
+    /// Counting `get` wrapper so fetch-vs-cache-hit behavior is provable.
+    struct CountingGetStore {
+        inner: FileSystemObjectStore,
+        gets: Mutex<std::collections::HashMap<String, u64>>,
+    }
+
+    impl CountingGetStore {
+        fn open(root: &Path) -> Self {
+            Self {
+                inner: FileSystemObjectStore::open(root).unwrap(),
+                gets: Mutex::new(std::collections::HashMap::new()),
+            }
+        }
+
+        fn gets(&self, key: &str) -> u64 {
+            *self.gets.lock().unwrap().get(key).unwrap_or(&0)
+        }
+    }
+
+    impl std::fmt::Debug for CountingGetStore {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("CountingGetStore")
+        }
+    }
+
+    impl ObjectStore for CountingGetStore {
+        fn put(
+            &self,
+            key: &str,
+            source: &Path,
+        ) -> Result<u64, crate::active_range::tier::TierError> {
+            self.inner.put(key, source)
+        }
+
+        fn get(&self, key: &str) -> Result<Vec<u8>, crate::active_range::tier::TierError> {
+            *self.gets.lock().unwrap().entry(key.to_owned()).or_insert(0) += 1;
+            self.inner.get(key)
+        }
+
+        fn head(&self, key: &str) -> Result<Option<u64>, crate::active_range::tier::TierError> {
+            self.inner.head(key)
+        }
+    }
+
+    fn remote_options(
+        store: Arc<dyn ObjectStore>,
+        remote_cache_bytes: u64,
+    ) -> FileActiveRangeStoreOptions {
+        FileActiveRangeStoreOptions {
+            max_segment_bytes: 2_048,
+            tier: Some(Arc::new(TierSource::with_store(store, remote_cache_bytes))),
+            ..FileActiveRangeStoreOptions::default()
+        }
+    }
+
+    /// Tiers `segments` to `object_root`, deletes their local log files,
+    /// and returns their manifests — the exact state a range reopens into
+    /// after immutable history demotes to object storage.
+    fn demote_segments_to_remote(
+        root: &Path,
+        descriptor: &ActiveRangeDescriptor,
+        object_root: &Path,
+        segments: &[u64],
+    ) -> Vec<SegmentManifest> {
+        let objects = FileSystemObjectStore::open(object_root).unwrap();
+        let report = crate::active_range::tier::tier_scan_once(root, &objects);
+        assert!(
+            report.failed.is_empty(),
+            "tier scan failed: {:?}",
+            report.failed
+        );
+        let directory = range_directory(root, descriptor);
+        let persisted: PersistedRangeState =
+            serde_json::from_slice(&fs::read(directory.join("range-state.json")).unwrap()).unwrap();
+        let mut manifests = Vec::new();
+        for segment in segments {
+            assert!(
+                crate::active_range::tier::read_tier_marker(&directory, *segment).is_some(),
+                "segment {segment} was not tiered"
+            );
+            manifests.push(read_segment_manifest(&directory, *segment, &persisted).unwrap());
+            fs::remove_file(segment_path(&directory, *segment)).unwrap();
+        }
+        manifests
+    }
+
+    #[tokio::test]
+    async fn remote_only_segment_opens_and_serves_committed_reads() {
+        let root = tempfile::TempDir::new().unwrap();
+        let objects = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        let committed = store.read_committed(None, 10_000).await.unwrap().len() as u64;
+        drop(store);
+        let manifests = demote_segments_to_remote(root.path(), &descriptor, objects.path(), &[0]);
+
+        let reopened = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor.clone(),
+            remote_options(
+                Arc::new(FileSystemObjectStore::open(objects.path()).unwrap()),
+                1 << 30,
+            ),
+        )
+        .unwrap();
+        let frames = reopened.read_committed(None, 10_000).await.unwrap();
+        assert_eq!(frames.len() as u64, committed);
+        for (index, frame) in frames.iter().enumerate() {
+            assert_eq!(frame.position.value(), index as u64 + 1);
+        }
+        // The remote span's frames carry the manifest's coverage.
+        assert_eq!(
+            frames[manifests[0].first_position as usize - 1]
+                .position
+                .value(),
+            manifests[0].first_position
+        );
+        // A cursor buried in the remote span still resolves — the fetch
+        // repopulates the position index on materialize.
+        let position = reopened
+            .committed_position_for_cursor("cursor-1")
+            .await
+            .unwrap();
+        assert_eq!(position, Some(RangePosition::new(1)));
+    }
+
+    #[tokio::test]
+    async fn missing_sealed_segment_without_tier_marker_fails_closed() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        drop(store);
+        let directory = range_directory(root.path(), &descriptor);
+        // Manifest present but no verified remote copy: fail closed.
+        fs::remove_file(segment_path(&directory, 0)).unwrap();
+        let result = FileActiveRangeStore::open(root.path(), descriptor);
+        assert!(matches!(
+            result.err(),
+            Some(ActiveRangeStoreError::CorruptSegment { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_read_without_tier_source_reports_unavailable() {
+        let root = tempfile::TempDir::new().unwrap();
+        let objects = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        drop(store);
+        demote_segments_to_remote(root.path(), &descriptor, objects.path(), &[0]);
+
+        // Open succeeds — provenance is intact — but reads have nowhere to
+        // fetch from and must say so rather than silently skip history.
+        let reopened = FileActiveRangeStore::open(root.path(), descriptor).unwrap();
+        let error = reopened.read_committed(None, 16).await.unwrap_err();
+        assert!(
+            matches!(error, ActiveRangeStoreError::RemoteFetch(ref message) if message.contains("no object store")),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_dedup_survives_remote_demotion() {
+        let root = tempfile::TempDir::new().unwrap();
+        let objects = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        drop(store);
+        demote_segments_to_remote(root.path(), &descriptor, objects.path(), &[0]);
+
+        let reopened = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor.clone(),
+            remote_options(
+                Arc::new(FileSystemObjectStore::open(objects.path()).unwrap()),
+                1 << 30,
+            ),
+        )
+        .unwrap();
+        // Replay append sequence 1 byte-for-byte — its position lives in
+        // the demoted segment, so dedup must materialize, byte-compare,
+        // and return the original position rather than a duplicate.
+        let record = StoredRecord {
+            message_id: Uuid::from_u128(701),
+            producer_id: Uuid::from_u128(3),
+            producer_sequence: 1,
+            event_time_ns: 1,
+            ingest_time_ns: 10,
+            key: b"key".to_vec(),
+            payload: vec![0xCD; 512],
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let result = reopened
+            .append(ActiveRangeAppend {
+                generation: descriptor.generation,
+                ownership_epoch: descriptor.ownership_epoch,
+                expected_position: Some(RangePosition::new(1)),
+                identity: AppendIdentity {
+                    writer_session_id: Uuid::from_u128(3),
+                    writer_epoch: 1,
+                    sequence: 1,
+                },
+                cursor: "cursor-1".to_owned(),
+                frame: crate::codec::encode_record(&record).unwrap(),
+                pending_effect: None,
+            })
+            .await
+            .unwrap();
+        assert!(result.deduplicated);
+        assert_eq!(result.position, RangePosition::new(1));
+    }
+
+    #[tokio::test]
+    async fn cache_budget_demotes_coldest_remote_segment() {
+        let root = tempfile::TempDir::new().unwrap();
+        let objects_root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        let directory = range_directory(root.path(), &descriptor);
+        let persisted: PersistedRangeState =
+            serde_json::from_slice(&fs::read(directory.join("range-state.json")).unwrap()).unwrap();
+        let mut appended = persisted.appended;
+        while appended < 128 && persisted_segment_count(&directory) < 2 {
+            append_committed_records(&store, &descriptor, appended + 1, 1, 512).await;
+            appended += 1;
+        }
+        assert_eq!(persisted_segment_count(&directory), 2);
+        drop(store);
+        let manifests =
+            demote_segments_to_remote(root.path(), &descriptor, objects_root.path(), &[0, 1]);
+
+        // Budget fits exactly one segment: reading span 0 then span 1
+        // demotes 0; reading 0 again costs a second remote get.
+        let counting = Arc::new(CountingGetStore::open(objects_root.path()));
+        let reopened = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor.clone(),
+            remote_options(counting.clone(), manifests[0].bytes),
+        )
+        .unwrap();
+        let key0 = crate::active_range::tier::segment_object_key(&manifests[0]);
+        let key1 = crate::active_range::tier::segment_object_key(&manifests[1]);
+
+        // Reads walk contiguous positions, so each read's limit is the
+        // span's own coverage — a longer limit would legitimately fetch
+        // the next span inside the same call.
+        let span0 = manifests[0].entries as usize;
+        let first = reopened
+            .read_committed(
+                Some(RangePosition::new(manifests[0].first_position - 1)),
+                span0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(first[0].position.value(), manifests[0].first_position);
+        assert_eq!(counting.gets(&key0), 1);
+        let cache0 = directory.join("cache-segment-000000.log");
+        assert!(cache0.exists());
+
+        let second = reopened
+            .read_committed(
+                Some(RangePosition::new(manifests[1].first_position - 1)),
+                manifests[1].entries as usize,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second[0].position.value(), manifests[1].first_position);
+        assert_eq!(counting.gets(&key1), 1);
+        // Demotion evicted span 0 back to remote — file and entries gone.
+        assert!(!cache0.exists());
+
+        let third = reopened
+            .read_committed(
+                Some(RangePosition::new(manifests[0].first_position - 1)),
+                span0,
+            )
+            .await
+            .unwrap();
+        assert_eq!(third[0].position.value(), manifests[0].first_position);
+        assert_eq!(counting.gets(&key0), 2);
+    }
+
+    #[tokio::test]
+    async fn remote_fetch_rejects_forged_object_bytes() {
+        let root = tempfile::TempDir::new().unwrap();
+        let objects_root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        drop(store);
+        let manifests =
+            demote_segments_to_remote(root.path(), &descriptor, objects_root.path(), &[0]);
+        // An attacker/corruption rewrites the object under its
+        // content-addressed key — the digest mismatch must refuse
+        // admission rather than serve poisoned history.
+        let key = crate::active_range::tier::segment_object_key(&manifests[0]);
+        fs::write(objects_root.path().join(&key), b"forged bytes").unwrap();
+
+        let reopened = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor,
+            remote_options(
+                Arc::new(FileSystemObjectStore::open(objects_root.path()).unwrap()),
+                1 << 30,
+            ),
+        )
+        .unwrap();
+        let error = reopened.read_committed(None, 16).await.unwrap_err();
+        assert!(
+            matches!(error, ActiveRangeStoreError::RemoteFetch(_)),
+            "unexpected error: {error}"
+        );
+        let directory = range_directory(root.path(), &test_descriptor());
+        assert!(!directory.join("cache-segment-000000.log").exists());
+    }
+
+    #[tokio::test]
+    async fn cache_file_survives_reopen_without_remote_read() {
+        let root = tempfile::TempDir::new().unwrap();
+        let objects_root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        drop(store);
+        let manifests =
+            demote_segments_to_remote(root.path(), &descriptor, objects_root.path(), &[0]);
+
+        let counting = Arc::new(CountingGetStore::open(objects_root.path()));
+        let key = crate::active_range::tier::segment_object_key(&manifests[0]);
+        let options = remote_options(counting.clone(), 1 << 30);
+        {
+            let reopened = FileActiveRangeStore::open_with_options(
+                root.path(),
+                descriptor.clone(),
+                options.clone(),
+            )
+            .unwrap();
+            reopened.read_committed(None, 4).await.unwrap();
+            assert_eq!(counting.gets(&key), 1);
+        }
+        // Reopen with a fresh source over the same backend: the cache file
+        // the first run installed verifies against the manifest and is
+        // adopted without another remote get. The read returns the whole
+        // committed prefix — three frames here — and the object counter
+        // must not move.
+        let reopened =
+            FileActiveRangeStore::open_with_options(root.path(), descriptor, options).unwrap();
+        let frames = reopened.read_committed(None, 16).await.unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(frames[0].position, RangePosition::new(1));
+        assert_eq!(counting.gets(&key), 1);
     }
 }

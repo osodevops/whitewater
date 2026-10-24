@@ -490,6 +490,7 @@ async fn committed_segments_rotate_and_remain_readable() {
         FileActiveRangeStoreOptions {
             max_segment_bytes: 1,
             max_range_bytes: None,
+            ..FileActiveRangeStoreOptions::default()
         },
     )
     .unwrap();
@@ -601,6 +602,7 @@ async fn disk_capacity_exhaustion_rejects_append_without_advancing_progress() {
         FileActiveRangeStoreOptions {
             max_segment_bytes: 1024 * 1024,
             max_range_bytes: Some(1),
+            ..FileActiveRangeStoreOptions::default()
         },
     )
     .unwrap();
@@ -1270,6 +1272,7 @@ async fn sealed_segments_persist_index_checkpoints_that_reopen_uses() {
         FileActiveRangeStoreOptions {
             max_segment_bytes: 1,
             max_range_bytes: None,
+            ..FileActiveRangeStoreOptions::default()
         },
     )
     .unwrap();
@@ -1301,6 +1304,7 @@ async fn sealed_segments_persist_index_checkpoints_that_reopen_uses() {
         FileActiveRangeStoreOptions {
             max_segment_bytes: 1,
             max_range_bytes: None,
+            ..FileActiveRangeStoreOptions::default()
         },
     )
     .unwrap();
@@ -1341,6 +1345,7 @@ async fn an_invalid_index_checkpoint_falls_back_to_the_segment_rescan() {
         FileActiveRangeStoreOptions {
             max_segment_bytes: 1,
             max_range_bytes: None,
+            ..FileActiveRangeStoreOptions::default()
         },
     )
     .unwrap();
@@ -1370,6 +1375,7 @@ async fn an_invalid_index_checkpoint_falls_back_to_the_segment_rescan() {
         FileActiveRangeStoreOptions {
             max_segment_bytes: 1,
             max_range_bytes: None,
+            ..FileActiveRangeStoreOptions::default()
         },
     )
     .unwrap();
@@ -1403,6 +1409,7 @@ async fn a_stale_index_checkpoint_never_hides_sealed_segment_corruption() {
         FileActiveRangeStoreOptions {
             max_segment_bytes: 1,
             max_range_bytes: None,
+            ..FileActiveRangeStoreOptions::default()
         },
     )
     .unwrap();
