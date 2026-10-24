@@ -557,6 +557,36 @@ impl FileActiveRangeStore {
             .persistence_failure
             .load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Rehashes every sealed segment against its persisted manifest and
+    /// returns the manifests in segment order — the fail-closed integrity
+    /// proof the object-store upload path runs before shipping bytes
+    /// off-Node. Segments still open for append are excluded by
+    /// definition: the active tail is mutable and carries no manifest.
+    /// Test-only until the uploader lands as the production caller.
+    #[cfg(test)]
+    pub(crate) async fn verify_sealed_segments(
+        &self,
+    ) -> Result<Vec<SegmentManifest>, ActiveRangeStoreError> {
+        self.blocking(|inner| {
+            let persisted = inner
+                .loaded
+                .lock()
+                .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?
+                .persisted
+                .clone();
+            let mut manifests = Vec::new();
+            for segment in 0..persisted.active_segment {
+                manifests.push(verify_sealed_segment(
+                    &inner.directory,
+                    segment,
+                    &persisted,
+                )?);
+            }
+            Ok(manifests)
+        })
+        .await
+    }
 }
 
 /// Errors that mean the replica cannot durably accept writes — disk
@@ -1569,6 +1599,12 @@ fn rotate_if_needed(
         &next,
         &sealed_entries,
     )?;
+    write_segment_manifest(
+        &inner.directory,
+        loaded.persisted.active_segment,
+        &next,
+        &sealed_entries,
+    )?;
     loaded.persisted = next;
     loaded.active_file = next_file;
     Ok(())
@@ -1640,6 +1676,164 @@ fn write_segment_checkpoint(
     fs::rename(&temporary, &path)?;
     sync_directory(directory)?;
     Ok(())
+}
+
+/// A sealed segment is immutable and content-addressable: its manifest is
+/// the integrity contract every later tier — object-store upload, replica
+/// repair, operator verification — checks before trusting the bytes. The
+/// whole-segment digest is computed once at rotation from the fsynced file
+/// (durable bytes, not remembered write buffers) and the manifest is
+/// self-healed at reopen when an older deployment or a torn write left a
+/// sealed segment without one.
+const SEGMENT_MANIFEST_VERSION: u32 = 1;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct SegmentManifest {
+    pub version: u32,
+    pub feed_id: Uuid,
+    pub range_id: RangeId,
+    pub generation: RangeGeneration,
+    pub segment: u64,
+    /// Exact byte length of the sealed segment file.
+    pub bytes: u64,
+    /// Committed entries covered, dense from `first_position`.
+    pub entries: u64,
+    pub first_position: u64,
+    pub last_position: u64,
+    /// BLAKE3-256 hex of the whole sealed segment file.
+    pub segment_digest: String,
+    pub sealed_at_ns: i64,
+}
+
+fn manifest_path(directory: &Path, segment: u64) -> PathBuf {
+    directory.join(format!("segment-manifest-{segment:06}.json"))
+}
+
+fn hash_segment_file(path: &Path) -> Result<blake3::Hash, ActiveRangeStoreError> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update_reader(&mut file)?;
+    Ok(hasher.finalize())
+}
+
+/// Streams the sealed segment file once, binds its digest and coverage to
+/// the range identity, and persists the manifest with the same
+/// tmp+rename+dir-sync durability contract as the index checkpoint.
+fn write_segment_manifest(
+    directory: &Path,
+    segment: u64,
+    persisted: &PersistedRangeState,
+    entries: &[EntryIndex],
+) -> Result<SegmentManifest, ActiveRangeStoreError> {
+    let first = entries.first().ok_or_else(|| {
+        ActiveRangeStoreError::InvalidState("sealed segment has no entries".to_owned())
+    })?;
+    let last = entries.last().ok_or_else(|| {
+        ActiveRangeStoreError::InvalidState("sealed segment has no entries".to_owned())
+    })?;
+    let path = segment_path(directory, segment);
+    let manifest = SegmentManifest {
+        version: SEGMENT_MANIFEST_VERSION,
+        feed_id: persisted.feed_id,
+        range_id: persisted.range_id,
+        generation: persisted.generation,
+        segment,
+        bytes: path.metadata()?.len(),
+        entries: entries
+            .len()
+            .try_into()
+            .map_err(|_| ActiveRangeStoreError::PositionOverflow)?,
+        first_position: first.position.value(),
+        last_position: last.position.value(),
+        segment_digest: hash_segment_file(&path)?.to_hex().to_string(),
+        sealed_at_ns: unix_ns(),
+    };
+    let serialized = serde_json::to_vec(&manifest)?;
+    let target = manifest_path(directory, segment);
+    let temporary = target.with_extension("tmp");
+    {
+        let mut file = File::create(&temporary)?;
+        file.write_all(&serialized)?;
+        file.sync_all()?;
+    }
+    fs::rename(&temporary, &target)?;
+    sync_directory(directory)?;
+    Ok(manifest)
+}
+
+/// Reads a manifest only when it parses and binds to the expected
+/// Feed/Range/generation/segment identity — anything else is treated as
+/// absent so the heal path can re-derive it from the sealed file itself.
+fn read_segment_manifest(
+    directory: &Path,
+    segment: u64,
+    persisted: &PersistedRangeState,
+) -> Option<SegmentManifest> {
+    let bytes = fs::read(manifest_path(directory, segment)).ok()?;
+    let manifest = serde_json::from_slice::<SegmentManifest>(&bytes).ok()?;
+    (manifest.version == SEGMENT_MANIFEST_VERSION
+        && manifest.feed_id == persisted.feed_id
+        && manifest.range_id == persisted.range_id
+        && manifest.generation == persisted.generation
+        && manifest.segment == segment)
+        .then_some(manifest)
+}
+
+/// Re-derives the manifest for a sealed segment that lacks a valid one.
+/// The sealed file is the local source of truth, so healing rewrites a
+/// torn or absent manifest with the digest the bytes actually hold; a
+/// mismatched file then fails closed at `verify_sealed_segment` time.
+fn ensure_segment_manifest(
+    directory: &Path,
+    segment: u64,
+    persisted: &PersistedRangeState,
+    entries: &[EntryIndex],
+) -> Result<(), ActiveRangeStoreError> {
+    if entries.is_empty() || read_segment_manifest(directory, segment, persisted).is_some() {
+        return Ok(());
+    }
+    write_segment_manifest(directory, segment, persisted, entries)?;
+    Ok(())
+}
+
+/// Rehashes the sealed segment file and checks it against the persisted
+/// manifest — the fail-closed primitive the object-store upload path runs
+/// before trusting local bytes, proving "seal and verify" per segment
+/// rather than per frame. A missing/invalid manifest, a length drift, or
+/// a digest mismatch all surface as `CorruptSegment`. Test-only until the
+/// object-store uploader lands as the production caller.
+#[cfg(test)]
+fn verify_sealed_segment(
+    directory: &Path,
+    segment: u64,
+    persisted: &PersistedRangeState,
+) -> Result<SegmentManifest, ActiveRangeStoreError> {
+    let path = segment_path(directory, segment);
+    let manifest = read_segment_manifest(directory, segment, persisted)
+        .ok_or_else(|| corrupt(&path, "sealed segment manifest is missing or invalid"))?;
+    let bytes = path.metadata()?.len();
+    if bytes != manifest.bytes {
+        return Err(corrupt(
+            &path,
+            "sealed segment length does not match its manifest",
+        ));
+    }
+    if hash_segment_file(&path)?.to_hex().to_string() != manifest.segment_digest {
+        return Err(corrupt(
+            &path,
+            "sealed segment digest does not match its manifest",
+        ));
+    }
+    Ok(manifest)
+}
+
+fn unix_ns() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 /// Loads a sealed segment's checkpoint when it is present and valid.
@@ -1802,6 +1996,7 @@ fn recover_segments(
     let mut entries = Vec::new();
     let mut expected_position = 1_u64;
     for segment in 0..=persisted.active_segment {
+        let segment_start = entries.len();
         if segment < persisted.active_segment {
             if let Some(checkpointed) =
                 load_segment_checkpoint(directory, segment, persisted, expected_position)
@@ -1810,6 +2005,7 @@ fn recover_segments(
                     .checked_add(checkpointed.len() as u64)
                     .ok_or(ActiveRangeStoreError::PositionOverflow)?;
                 entries.extend(checkpointed);
+                ensure_segment_manifest(directory, segment, persisted, &entries[segment_start..])?;
                 continue;
             }
         }
@@ -1840,6 +2036,9 @@ fn recover_segments(
                 .checked_add(1)
                 .ok_or(ActiveRangeStoreError::PositionOverflow)?;
             entries.push(entry);
+        }
+        if segment < persisted.active_segment {
+            ensure_segment_manifest(directory, segment, persisted, &entries[segment_start..])?;
         }
     }
     let deduplication = deduplication_from_entries(&entries);
@@ -2631,5 +2830,230 @@ mod tests {
             .await
             .unwrap_err();
         assert!(!store.persistence_failure());
+    }
+
+    /// Appends and commits `count` records through the production store
+    /// path so segment rotation, sealing, and manifest writes all run real
+    /// write-path code.
+    async fn append_committed_records(
+        store: &FileActiveRangeStore,
+        descriptor: &ActiveRangeDescriptor,
+        start: u64,
+        count: u64,
+        payload_len: usize,
+    ) {
+        for sequence in start..start + count {
+            let record = StoredRecord {
+                message_id: Uuid::from_u128(700 + sequence as u128),
+                producer_id: Uuid::from_u128(3),
+                producer_sequence: sequence,
+                event_time_ns: sequence as i64,
+                ingest_time_ns: sequence as i64 * 10,
+                key: b"key".to_vec(),
+                payload: vec![0xCD; payload_len],
+                metadata: std::collections::BTreeMap::new(),
+            };
+            store
+                .append(ActiveRangeAppend {
+                    generation: descriptor.generation,
+                    ownership_epoch: descriptor.ownership_epoch,
+                    expected_position: Some(RangePosition::new(sequence)),
+                    identity: AppendIdentity {
+                        writer_session_id: Uuid::from_u128(3),
+                        writer_epoch: 1,
+                        sequence,
+                    },
+                    cursor: format!("cursor-{sequence}"),
+                    frame: crate::codec::encode_record(&record).unwrap(),
+                    pending_effect: None,
+                })
+                .await
+                .unwrap();
+            store
+                .commit(
+                    descriptor.generation,
+                    descriptor.ownership_epoch,
+                    CommitPosition::new(sequence),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Opens a store whose tiny segment bound seals a segment after only a
+    /// handful of committed entries, then appends until segment 0 rotates.
+    async fn rotated_store(
+        root: &Path,
+        descriptor: &ActiveRangeDescriptor,
+    ) -> FileActiveRangeStore {
+        let store = FileActiveRangeStore::open_with_options(
+            root,
+            descriptor.clone(),
+            FileActiveRangeStoreOptions {
+                max_segment_bytes: 2_048,
+                max_range_bytes: None,
+            },
+        )
+        .unwrap();
+        let directory = range_directory(root, descriptor);
+        let mut appended = 0_u64;
+        while appended < 64 && !manifest_path(&directory, 0).exists() {
+            append_committed_records(&store, descriptor, appended + 1, 1, 512).await;
+            appended += 1;
+        }
+        assert!(
+            manifest_path(&directory, 0).exists(),
+            "64 committed entries never sealed segment 0"
+        );
+        store
+    }
+
+    #[tokio::test]
+    async fn sealing_a_segment_writes_a_manifest_binding_its_content_digest() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        let directory = range_directory(root.path(), &descriptor);
+
+        let manifests = store.verify_sealed_segments().await.unwrap();
+        assert_eq!(manifests.len(), 1);
+        let manifest = &manifests[0];
+        assert_eq!(manifest.version, SEGMENT_MANIFEST_VERSION);
+        assert_eq!(manifest.feed_id, descriptor.feed_id);
+        assert_eq!(manifest.range_id, descriptor.range_id);
+        assert_eq!(manifest.generation, descriptor.generation);
+        assert_eq!(manifest.segment, 0);
+        assert_eq!(manifest.first_position, 1);
+        assert_eq!(manifest.last_position, manifest.entries);
+
+        let file_bytes = fs::read(segment_path(&directory, 0)).unwrap();
+        assert_eq!(manifest.bytes as usize, file_bytes.len());
+        assert_eq!(
+            manifest.segment_digest,
+            blake3::hash(&file_bytes).to_hex().to_string()
+        );
+        assert!(manifest.sealed_at_ns > 0);
+    }
+
+    #[tokio::test]
+    async fn verify_fails_closed_on_a_tampered_sealed_segment() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        let directory = range_directory(root.path(), &descriptor);
+        let path = segment_path(&directory, 0);
+
+        // Flip one committed byte mid-file: the per-frame digests still
+        // index fine, but the whole-segment manifest digest must refuse.
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[40] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+        match store.verify_sealed_segments().await {
+            Err(ActiveRangeStoreError::CorruptSegment { reason, .. }) => {
+                assert!(reason.contains("digest"));
+            }
+            other => panic!("expected CorruptSegment, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_fails_closed_on_a_tampered_manifest() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        let directory = range_directory(root.path(), &descriptor);
+
+        // A manifest naming a foreign Feed identity no longer binds this
+        // segment: verification treats it as missing/invalid.
+        let raw = fs::read(manifest_path(&directory, 0)).unwrap();
+        let mut manifest = serde_json::from_slice::<SegmentManifest>(&raw).unwrap();
+        manifest.feed_id = Uuid::from_u128(999);
+        fs::write(
+            manifest_path(&directory, 0),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        match store.verify_sealed_segments().await {
+            Err(ActiveRangeStoreError::CorruptSegment { reason, .. }) => {
+                assert!(reason.contains("manifest"));
+            }
+            other => panic!("expected CorruptSegment, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_active_segment_never_carries_a_manifest() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        let directory = range_directory(root.path(), &descriptor);
+
+        // Segment 1 is the open tail: mutable, unsealed, manifest-free.
+        let persisted: PersistedRangeState =
+            serde_json::from_slice(&fs::read(directory.join("range-state.json")).unwrap()).unwrap();
+        assert_eq!(persisted.active_segment, 1);
+        assert!(!manifest_path(&directory, 1).exists());
+        match verify_sealed_segment(&directory, 1, &persisted) {
+            Err(ActiveRangeStoreError::CorruptSegment { reason, .. }) => {
+                assert!(reason.contains("manifest"));
+            }
+            other => panic!("expected CorruptSegment, got {other:?}"),
+        }
+        assert!(store.verify_sealed_segments().await.unwrap().len() == 1);
+    }
+
+    #[tokio::test]
+    async fn reopen_heals_a_missing_sealed_segment_manifest() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        let directory = range_directory(root.path(), &descriptor);
+        let original = store.verify_sealed_segments().await.unwrap()[0].clone();
+        fs::remove_file(manifest_path(&directory, 0)).unwrap();
+        drop(store);
+
+        let reopened = FileActiveRangeStore::open(root.path(), descriptor.clone()).unwrap();
+        let healed = reopened.verify_sealed_segments().await.unwrap();
+        assert_eq!(healed.len(), 1);
+        assert_eq!(healed[0].segment_digest, original.segment_digest);
+        assert_eq!(healed[0].bytes, original.bytes);
+        assert_eq!(healed[0].entries, original.entries);
+    }
+
+    #[tokio::test]
+    async fn successive_sealed_segments_each_carry_a_verified_manifest() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        let directory = range_directory(root.path(), &descriptor);
+        let persisted: PersistedRangeState =
+            serde_json::from_slice(&fs::read(directory.join("range-state.json")).unwrap()).unwrap();
+        let mut appended = persisted.appended;
+
+        // Drive a second rotation so both sealed segments verify.
+        while appended < 128 && persisted_segment_count(&directory) < 2 {
+            append_committed_records(&store, &descriptor, appended + 1, 1, 512).await;
+            appended += 1;
+        }
+        let manifests = store.verify_sealed_segments().await.unwrap();
+        assert!(manifests.len() >= 2);
+        for (index, manifest) in manifests.iter().enumerate() {
+            assert_eq!(manifest.segment, index as u64);
+        }
+        assert_eq!(manifests[1].first_position, manifests[0].last_position + 1);
+    }
+
+    fn persisted_segment_count(directory: &Path) -> usize {
+        fs::read_dir(directory)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("segment-manifest-")
+            })
+            .count()
     }
 }

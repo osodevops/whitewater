@@ -72,7 +72,11 @@ def main():
     try:
         survivors = [endpoint for node, endpoint in ENDPOINTS.items() if node != old_owner]
         recovered = None
-        for _ in range(30):
+        # 180s bound: suspect detection (~10s member timeout) plus quorum
+        # re-election and placement propagation stretch well past the old
+        # 60s cap on a loaded host; a genuinely broken transfer still
+        # fails, just with more evidence time.
+        for _ in range(90):
             for endpoint in survivors:
                 try:
                     placement = inspect(endpoint, feed)

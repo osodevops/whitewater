@@ -1611,7 +1611,7 @@ Definition of Done:
 
 
 
-- [ ] Seal immutable checksummed segments.
+- [x] Seal immutable checksummed segments. Rotation already sealed only fully-committed segments (uncommitted tails never seal, enforced by `UncommittedSealedSegment`); each sealed segment now gets a durable `segment-manifest-{n:06}.json` binding a whole-file BLAKE3-256 content digest to Feed/Range/generation/segment identity, byte length, dense committed-position coverage, and seal time — written at rotation from the fsynced file (durable bytes, not remembered write buffers), with the same tmp+rename+dir-sync contract as the index checkpoint. Reopen self-heals a missing/invalid manifest by re-deriving it from the sealed file (the local source of truth); `verify_sealed_segment` rehashes and compares, failing closed as `CorruptSegment` on missing/invalid manifests, length drift, or digest mismatch — the fail-closed primitive the object-store upload path runs before shipping bytes off-Node. `store::tests` covers seal-time manifest correctness, tampered-file and tampered-manifest refusal, active-tail exclusion, reopen healing, and successive manifests across rotations; `tests/active_range_store.rs` counts `.log` files precisely (manifests are sidecars, not segments).
 
 - [ ] Upload and verify object-store copies.
 

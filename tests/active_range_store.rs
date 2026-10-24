@@ -512,6 +512,7 @@ async fn committed_segments_rotate_and_remain_readable() {
             .unwrap()
             .filter_map(Result::ok)
             .filter(|entry| entry.file_name().to_string_lossy().starts_with("segment-"))
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".log"))
             .count(),
         2
     );
