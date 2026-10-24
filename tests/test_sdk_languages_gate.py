@@ -116,6 +116,35 @@ class SdkLanguagesGatePlanTests(unittest.TestCase):
         self.assertEqual(spec["toolchain"], ["go"])
         self.assertEqual(spec["steps"], [])
 
+    def test_python_install_pulls_the_dev_test_extra(self):
+        # `pip install -e .` alone leaves the hosted runner without
+        # pytest — the SDK declares it under the `dev` extra.
+        _, _, runners = gate.plan(self.base_env())
+        install = runners["python"]["steps"][0]
+        self.assertIn(".[dev]", install)
+
+    def test_java_leg_runs_mvnw_through_sh_off_windows(self):
+        # whitewater-java's mvnw may arrive without the +x bit (mode
+        # 100644 committed on Windows); `sh mvnw` runs it regardless.
+        spec = gate.java_leg("/tmp/whitewater-java")
+        argv = spec["steps"][0]
+        if gate.WINDOWS:
+            self.assertEqual(
+                argv[0], os.path.join("/tmp/whitewater-java", "mvnw.cmd"))
+        else:
+            self.assertEqual(argv[0], "sh")
+            self.assertIn("mvnw", argv[1])
+
+    def test_run_steps_turns_a_launch_error_into_a_leg_failure(self):
+        # A PermissionError on the step binary used to crash the gate
+        # with a raw traceback; it now reports a failed leg like any
+        # other nonzero exit.
+        def deny(*args, **kwargs):
+            raise PermissionError(13, "Permission denied", "mvnw")
+        with patch.object(gate.subprocess, "run", side_effect=deny):
+            code = gate.run_steps([["./mvnw", "verify"]], "/tmp", {}, 60)
+        self.assertEqual(code, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -84,6 +84,9 @@ def run_steps(steps, cwd, env, timeout_s):
             code = run.returncode
         except subprocess.TimeoutExpired:
             code = -9
+        except OSError as exc:
+            print(f"    $ {' '.join(argv)}: launch failed: {exc}", flush=True)
+            return 1
         elapsed = time.monotonic() - started
         print(f"    $ {' '.join(argv)} -> {code} ({elapsed:.0f}s)", flush=True)
         if code != 0:
@@ -140,12 +143,18 @@ def java_leg(directory):
     wrapper = None
     if directory:
         wrapper = os.path.join(directory, "mvnw.cmd" if WINDOWS else "mvnw")
+    if WINDOWS:
+        invoke = [wrapper or "mvnw"]
+    else:
+        # A checkout that lost the +x bit (Windows-committed mode 100644)
+        # still runs through sh — mvnw is a POSIX script.
+        invoke = ["sh", wrapper or "mvnw"]
     return {
         "dir": directory,
         "toolchain": ["java"],
-        "steps": [[wrapper or "mvnw", "-q", "verify",
-                   "-Dit.test=ConformanceRunnerIT",
-                   "-DfailIfNoTests=false"]],
+        "steps": [invoke + ["-q", "verify",
+                            "-Dit.test=ConformanceRunnerIT",
+                            "-DfailIfNoTests=false"]],
     }
 
 
@@ -197,7 +206,7 @@ def plan(env=os.environ):
             "dir": locate("python", "whitewater-python"),
             "toolchain": [sys.executable],
             "steps": [
-                [sys.executable, "-m", "pip", "install", "-q", "-e", "."],
+                [sys.executable, "-m", "pip", "install", "-q", "-e", ".[dev]"],
                 [sys.executable, "-m", "pytest",
                  "tests/conformance/test_conformance.py", "-q"],
             ],
