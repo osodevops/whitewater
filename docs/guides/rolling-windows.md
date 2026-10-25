@@ -1,7 +1,7 @@
 # Rolling windows
 
 A managed **Window Pipe** accumulates each delivered record into fixed
-`window_ns`-wide panes of a managed StateStore view — no sliding-step,
+window-wide panes of a managed StateStore view — no sliding-step,
 pane, watermark-thread, or local-state plumbing in application code. The
 declaration names: the pane width, the business Key extractor, the
 aggregation (`count` / `sum` / `average` over an extracted value), and
@@ -10,10 +10,16 @@ closed pane as a `window.emitted` record carrying exact
 `group`/`count`/`sum`/`store_seq` evidence — an emit feed requires an
 explicit lateness bound (see [late-event policy](late-event-policy.md)).
 
-Optional bounds: `key_limit`/`byte_limit` cap pane memory; `expire_ns`
+Every duration is declared in the SDK's native time type — `Time.h(1)`
+in Java and Node, `time.Hour` in Go, `timedelta` in Python,
+`TimeSpan` in .NET, `Duration` in Rust — and the SDK extracts
+nanoseconds internally for the wire; callers never spell raw nanosecond
+counts.
+
+Optional bounds: `key_limit`/`byte_limit` cap pane memory; `expire`
 bounds pane retention after provable close; lateness is configured in
-[late-event policy](late-event-policy.md) (`max_late_ns`, or
-`watermark_ns` + `grace_ns`).
+[late-event policy](late-event-policy.md) (`max_late`, or
+`watermark` + `grace`).
 
 Set up:
 
@@ -29,13 +35,13 @@ CREATE SUBSCRIPTION windowing FROM FEED stats.measurements;
 
 ```rust
 let hourly = PipeOperation::window(
-    3_600_000_000_000,                            // window_ns
+    Duration::from_secs(3600),                    // 1h panes
     Extractor::record_key(),                      // group by application Key
     WindowAggregation::count(),
 )?
 .time(WindowTime::Event)
-.watermark_ns(60_000_000_000)
-.expire_ns(86_400_000_000_000);
+.watermark(Duration::from_secs(60))
+.expire(Duration::from_secs(86_400));
 client.define_window_pipe("stats.hourly", "stats.windowing",
     "stats.by_customer", hourly, Some("stats.closed")).await?;
 ```
@@ -43,21 +49,21 @@ client.define_window_pipe("stats.hourly", "stats.windowing",
 ```go
 _, err := client.DefineWindowPipe(ctx, "stats.hourly", "stats.windowing",
     "stats.by_customer",
-    whitewater.WindowOperation(3_600_000_000_000,
+    whitewater.WindowOperation(time.Hour,
         whitewater.KeyExtractor(), whitewater.CountAggregation(),
         whitewater.WindowOptions{
-            Time:        whitewater.WindowEventTime,
-            WatermarkNs: 60_000_000_000,
-            ExpireNs:    86_400_000_000_000}),
+            Time:      whitewater.WindowEventTime,
+            Watermark: time.Minute,
+            Expire:    24 * time.Hour}),
     "stats.closed")
 ```
 
 ```python
 client.define_window_pipe("stats.hourly", "stats.windowing",
     "stats.by_customer",
-    PipeOperation.window(3_600_000_000_000,
+    PipeOperation.window(timedelta(hours=1),
         Extractor.record_key(), WindowAggregation.count(),
-        watermark_ns=60_000_000_000, expire_ns=86_400_000_000_000),
+        watermark=timedelta(minutes=1), expire=timedelta(days=1)),
     emit_feed="stats.closed")
 ```
 
@@ -65,29 +71,29 @@ client.define_window_pipe("stats.hourly", "stats.windowing",
 client.commands(Commands.begin()
     .defineWindowPipe("stats.hourly", "stats.windowing",
         "stats.by_customer",
-        PipeOperation.window(3_600_000_000_000L,
+        PipeOperation.window(Time.h(1),
             Extractor.recordKey(), WindowAggregation.count(),
-            WindowTime.EVENT, null, 60_000_000_000L, null,
-            86_400_000_000_000L, null, null),
+            WindowTime.EVENT, null, Time.m(1), null,
+            Time.d(1), null, null),
         "stats.closed"));
 ```
 
 ```ts
 await client.defineWindowPipe("stats.hourly", "stats.windowing",
   "stats.by_customer",
-  PipeOperation.window(3_600_000_000_000, Extractor.recordKey(),
+  PipeOperation.window(Time.h(1), Extractor.recordKey(),
     WindowAggregation.count(),
-    { watermarkNs: 60_000_000_000, expireNs: 86_400_000_000_000 }),
+    { watermark: Time.m(1), expire: Time.d(1) }),
   "stats.closed");
 ```
 
 ```csharp
 await client.DefineWindowPipeAsync("stats.hourly", "stats.windowing",
     "stats.by_customer",
-    PipeOperation.Window(3_600_000_000_000,
+    PipeOperation.Window(TimeSpan.FromHours(1),
         Extractor.RecordKey(), WindowAggregation.Count(),
-        WindowTime.Event, watermarkNs: 60_000_000_000,
-        expireNs: 86_400_000_000_000),
+        WindowTime.Event, watermark: TimeSpan.FromMinutes(1),
+        expire: TimeSpan.FromDays(1)),
     "stats.closed");
 ```
 
@@ -98,10 +104,9 @@ to divide. The extractor can be `record_key()`/`RecordKey()`/`KeyExtractor()`,
 projections come from the payload.
 
 Every SDK validates locally what the server re-checks authoritatively:
-`window_ns` must be a positive integer count of nanoseconds (Node rejects
-a `bigint` beyond `Number.MAX_SAFE_INTEGER` rather than rounding), the
-operation kind must match the helper, and the lateness-model rules below
-fail before the command ships.
+the window must be a positive duration in the SDK's native time type,
+the operation kind must match the helper, and the lateness-model rules
+below fail before the command ships.
 
 ## Reading results
 

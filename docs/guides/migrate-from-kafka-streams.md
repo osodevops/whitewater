@@ -15,7 +15,7 @@ SDK is a facade, not a second processing framework to operate.
 | `consumer.poll` loop | supervised `consumer()` / member claim-fetch-ack | offset commit plumbing, `enable.auto.commit` traps |
 | `KStream.transform`/DSL topology | managed **Pipe** (forward / enrich / window) | topology builder, `StreamsBuilder`, `KafkaStreams` lifecycle |
 | RocksDB state stores | server-side **StateStore** with named keys | local state dirs, standby replicas, restore time |
-| `windowedBy` + grace | `PipeOperation.window(...)` + `max_late_ns`/`watermark_ns`/`grace_ns` | window-store plumbing, suppression, retention config |
+| `windowedBy` + grace | `PipeOperation.window(...)` + `maxLate`/`watermark`/`grace` durations | window-store plumbing, suppression, retention config |
 | `Materialized.as` + Interactive Queries | `store.get`/`get_by`/`iterate` + declared Index queries | IQ plumbing, metadata discovery, host:port state RPC |
 | Exactly-once `processing.guarantee` | Pipe effect journal (atomic consume/declare/apply) | transaction timeouts, `__consumer_offsets`, fenced producers |
 | `DeserializationExceptionHandler` → DLQ | `EnrichMiss`/`quarantine_feed`, `late` rows | hand-rolled DLQ producers + poison-pill loops |
@@ -65,7 +65,9 @@ business types only.
   instead of silently stale rows.
 - **Windows**: `windowedBy().aggregate()` + grace/retention config maps
   to `PipeOperation.window(width, key, aggregation)` +
-  `watermark_ns`/`grace_ns`/`expire_ns`/`max_late_ns` — see
+  `watermark`/`grace`/`expire`/`maxLate` durations (each SDK's native
+  time type — `Time.h(1)`, `time.Hour`, `timedelta`, `TimeSpan`,
+  `Duration`) — see
   [late-event policy](late-event-policy.md) for the semantics mapping.
 
 ## Not yet covered
