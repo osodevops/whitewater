@@ -366,6 +366,9 @@ struct FileActiveRangeStoreInner {
     /// mutation. Recovery probes read it as replica write health: a replica
     /// that cannot durably accept writes must not remain an Append Owner.
     persistence_failure: std::sync::atomic::AtomicBool,
+    /// Collapses speculative prefetch storms: a read burst across cold
+    /// remote spans spawns at most one in-flight read-ahead per range.
+    prefetch_running: std::sync::atomic::AtomicBool,
 }
 
 struct LoadedRange {
@@ -583,6 +586,7 @@ impl FileActiveRangeStore {
                 tier: options.tier.clone(),
                 options,
                 persistence_failure: std::sync::atomic::AtomicBool::new(false),
+                prefetch_running: std::sync::atomic::AtomicBool::new(false),
                 loaded: Mutex::new(LoadedRange {
                     persisted,
                     active_file,
@@ -604,6 +608,21 @@ impl FileActiveRangeStore {
     where
         T: Send + 'static,
         F: FnOnce(&FileActiveRangeStoreInner) -> Result<T, ActiveRangeStoreError> + Send + 'static,
+    {
+        let inner = Arc::clone(&self.inner);
+        tokio::task::spawn_blocking(move || operation(&inner))
+            .await
+            .map_err(|error| ActiveRangeStoreError::Worker(error.to_string()))?
+    }
+
+    /// Same as `blocking`, but the closure sees the inner Arc so work it
+    /// starts — like read-ahead prefetch — can outlive the call.
+    async fn blocking_arc<T, F>(&self, operation: F) -> Result<T, ActiveRangeStoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Arc<FileActiveRangeStoreInner>) -> Result<T, ActiveRangeStoreError>
+            + Send
+            + 'static,
     {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || operation(&inner))
@@ -785,7 +804,7 @@ impl ActiveRangeStore for FileActiveRangeStore {
         after: Option<RangePosition>,
         limit: usize,
     ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
-        self.blocking(move |inner| read_committed(inner, after, limit))
+        self.blocking_arc(move |inner| read_committed(inner, after, limit))
             .await
     }
 
@@ -795,7 +814,7 @@ impl ActiveRangeStore for FileActiveRangeStore {
         limit: usize,
         max_bytes: usize,
     ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
-        self.blocking(move |inner| read_committed_bounded(inner, after, limit, max_bytes))
+        self.blocking_arc(move |inner| read_committed_bounded(inner, after, limit, max_bytes))
             .await
     }
 
@@ -804,7 +823,7 @@ impl ActiveRangeStore for FileActiveRangeStore {
         after: Option<RangePosition>,
         limit: usize,
     ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
-        self.blocking(move |inner| read_uncommitted(inner, after, limit))
+        self.blocking_arc(move |inner| read_uncommitted(inner, after, limit))
             .await
     }
 
@@ -1715,7 +1734,103 @@ fn demote_to_budget(inner: &FileActiveRangeStoreInner, loaded: &mut LoadedRange)
 /// the store's own invariant — a hole that is neither local nor remote is
 /// an InvalidState, never a silent skip.
 fn read_window(
-    inner: &FileActiveRangeStoreInner,
+    inner: &Arc<FileActiveRangeStoreInner>,
+    after: Option<RangePosition>,
+    limit: u64,
+    committed_only: bool,
+    max_bytes: Option<usize>,
+) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
+    let outcome = read_window_inner(inner, after, limit, committed_only, max_bytes);
+    // Sequential historical readers stall once per segment boundary
+    // without read-ahead; a read that reached remote spans warms the
+    // next few so the cursor keeps moving. Spans strictly after the
+    // served tail are the only candidates, so a read that ends on local
+    // data selects nothing and no prefetch thread spawns. Errors are
+    // irrelevant — prefetch is a hint and every span refetches on demand.
+    if let Ok(frames) = &outcome {
+        if let Some(last) = frames.last().map(|frame| frame.position.value()) {
+            prefetch_remote(inner, last);
+        }
+    }
+    outcome
+}
+
+/// Speculative read-ahead for historical scans: materialize up to
+/// `PREFETCH_REMOTE_SPANS` sealed remote spans positioned after `last`,
+/// skipping what already fits the cache only when the budget has room.
+/// One in-flight prefetch per range collapses read storms; fetch
+/// single-flights collapse duplicate objects across ranges. Runs on a
+/// detached thread — the read path stays unblocked and the worker lock
+/// is never held across remote I/O.
+const PREFETCH_REMOTE_SPANS: usize = 2;
+
+fn prefetch_remote(inner: &Arc<FileActiveRangeStoreInner>, last: u64) {
+    let spans = {
+        let Ok(loaded) = inner.loaded.lock() else {
+            return;
+        };
+        let Some(budget) = inner.tier.as_ref().map(|tier| tier.remote_cache_bytes()) else {
+            return;
+        };
+        if inner
+            .prefetch_running
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        let mut pending = loaded.materialized_bytes;
+        let mut spans = Vec::new();
+        for manifest in loaded.remote.values() {
+            if manifest.first_position <= last
+                || loaded.materialized.contains_key(&manifest.segment)
+            {
+                continue;
+            }
+            if pending.saturating_add(manifest.bytes) > budget {
+                break;
+            }
+            pending = pending.saturating_add(manifest.bytes);
+            spans.push(manifest.clone());
+            if spans.len() >= PREFETCH_REMOTE_SPANS {
+                break;
+            }
+        }
+        spans
+    };
+    if spans.is_empty() {
+        inner
+            .prefetch_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
+    let fallback = Arc::clone(inner);
+    let inner = Arc::clone(inner);
+    let spawned = std::thread::Builder::new()
+        .name("whitewater-remote-prefetch".to_owned())
+        .spawn(move || {
+            // The guard clears the in-flight flag even if a fetch panics —
+            // a wedged flag would silently disable read-ahead for the
+            // range's remaining lifetime.
+            struct ClearOnExit<'a>(&'a std::sync::atomic::AtomicBool);
+            impl Drop for ClearOnExit<'_> {
+                fn drop(&mut self) {
+                    self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _guard = ClearOnExit(&inner.prefetch_running);
+            for manifest in spans {
+                let _ = materialize_remote(&inner, &manifest);
+            }
+        });
+    if spawned.is_err() {
+        fallback
+            .prefetch_running
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn read_window_inner(
+    inner: &Arc<FileActiveRangeStoreInner>,
     after: Option<RangePosition>,
     limit: u64,
     committed_only: bool,
@@ -1836,7 +1951,7 @@ fn read_window(
 }
 
 fn read_uncommitted(
-    inner: &FileActiveRangeStoreInner,
+    inner: &Arc<FileActiveRangeStoreInner>,
     after: Option<RangePosition>,
     limit: usize,
 ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
@@ -1844,7 +1959,7 @@ fn read_uncommitted(
 }
 
 fn read_committed(
-    inner: &FileActiveRangeStoreInner,
+    inner: &Arc<FileActiveRangeStoreInner>,
     after: Option<RangePosition>,
     limit: usize,
 ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
@@ -1852,7 +1967,7 @@ fn read_committed(
 }
 
 fn read_committed_bounded(
-    inner: &FileActiveRangeStoreInner,
+    inner: &Arc<FileActiveRangeStoreInner>,
     after: Option<RangePosition>,
     limit: usize,
     max_bytes: usize,
@@ -3837,5 +3952,214 @@ mod tests {
         assert_eq!(frames.len(), 3);
         assert_eq!(frames[0].position, RangePosition::new(1));
         assert_eq!(counting.gets(&key), 1);
+    }
+
+    /// Appends through the production path until `sealed` manifests exist —
+    /// the multi-span remote history prefetch tests need.
+    async fn multi_sealed_store(
+        root: &Path,
+        descriptor: &ActiveRangeDescriptor,
+        sealed: u64,
+    ) -> FileActiveRangeStore {
+        let store = FileActiveRangeStore::open_with_options(
+            root,
+            descriptor.clone(),
+            FileActiveRangeStoreOptions {
+                max_segment_bytes: 2_048,
+                ..FileActiveRangeStoreOptions::default()
+            },
+        )
+        .unwrap();
+        let directory = range_directory(root, descriptor);
+        let mut appended = 0_u64;
+        while appended < 256
+            && (0..sealed).any(|segment| !manifest_path(&directory, segment).exists())
+        {
+            append_committed_records(&store, descriptor, appended + 1, 1, 512).await;
+            appended += 1;
+        }
+        for segment in 0..sealed {
+            assert!(
+                manifest_path(&directory, segment).exists(),
+                "256 appends never sealed segment {segment}"
+            );
+        }
+        store
+    }
+
+    /// Polls until a remote span materializes — the prefetch thread is
+    /// detached, so the assertion converges rather than assuming a tick.
+    fn materialized_within(store: &FileActiveRangeStore, segment: u64, attempts: u32) -> bool {
+        for _ in 0..attempts {
+            if store
+                .inner
+                .loaded
+                .lock()
+                .unwrap()
+                .materialized
+                .contains_key(&segment)
+            {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[tokio::test]
+    async fn remote_reads_prefetch_the_next_sealed_spans() {
+        let root = tempfile::TempDir::new().unwrap();
+        let objects = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = multi_sealed_store(root.path(), &descriptor, 3).await;
+        let committed = store.read_committed(None, 10_000).await.unwrap().len() as u64;
+        drop(store);
+        demote_segments_to_remote(root.path(), &descriptor, objects.path(), &[0, 1, 2]);
+
+        let reopened = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor.clone(),
+            remote_options(
+                Arc::new(FileSystemObjectStore::open(objects.path()).unwrap()),
+                1 << 30,
+            ),
+        )
+        .unwrap();
+        // One frame from span 0 is enough to trigger read-ahead.
+        let frames = reopened.read_committed(None, 1).await.unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(materialized_within(&reopened, 0, 1));
+        assert!(materialized_within(&reopened, 1, 200));
+        assert!(materialized_within(&reopened, 2, 200));
+        // The warm spans serve without another fetch pass.
+        let all = reopened.read_committed(None, 10_000).await.unwrap();
+        assert_eq!(all.len() as u64, committed);
+    }
+
+    #[tokio::test]
+    async fn prefetch_stays_inside_the_remote_cache_budget() {
+        let root = tempfile::TempDir::new().unwrap();
+        let objects = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = multi_sealed_store(root.path(), &descriptor, 3).await;
+        drop(store);
+        let manifests =
+            demote_segments_to_remote(root.path(), &descriptor, objects.path(), &[0, 1, 2]);
+        // Budget admits span 0 plus span 1 only — span 2 must not be
+        // prefetched past the budget even though read-ahead wants it.
+        let budget = manifests[0].bytes + manifests[1].bytes;
+
+        let reopened = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor.clone(),
+            remote_options(
+                Arc::new(FileSystemObjectStore::open(objects.path()).unwrap()),
+                budget,
+            ),
+        )
+        .unwrap();
+        reopened.read_committed(None, 1).await.unwrap();
+        assert!(materialized_within(&reopened, 0, 1));
+        assert!(materialized_within(&reopened, 1, 200));
+        // Span 2 may never materialize — give the prefetch thread ample
+        // time to prove it is not coming.
+        assert!(!materialized_within(&reopened, 2, 50));
+    }
+
+    #[tokio::test]
+    async fn a_tail_read_never_prefetches_remote_history() {
+        let root = tempfile::TempDir::new().unwrap();
+        let objects = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = multi_sealed_store(root.path(), &descriptor, 3).await;
+        drop(store);
+        let manifests =
+            demote_segments_to_remote(root.path(), &descriptor, objects.path(), &[0, 1]);
+
+        let reopened = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor.clone(),
+            remote_options(
+                Arc::new(FileSystemObjectStore::open(objects.path()).unwrap()),
+                1 << 30,
+            ),
+        )
+        .unwrap();
+        // Read only the live tail — the remote spans all sit before the
+        // served position, so prefetch selects nothing and no fetch runs.
+        let after = Some(RangePosition::new(manifests[1].last_position));
+        let frames = reopened.read_committed(after, 16).await.unwrap();
+        assert!(!frames.is_empty());
+        assert!(frames.iter().all(|frame| {
+            !manifests.iter().any(|m| {
+                m.first_position <= frame.position.value()
+                    && frame.position.value() <= m.last_position
+            })
+        }));
+        assert!(
+            reopened
+                .inner
+                .loaded
+                .lock()
+                .unwrap()
+                .materialized
+                .is_empty(),
+            "a local-tail read fetched remote history"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_prefetch_never_fails_the_read_that_triggered_it() {
+        let root = tempfile::TempDir::new().unwrap();
+        let objects = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = multi_sealed_store(root.path(), &descriptor, 3).await;
+        let span0_last = {
+            let directory = range_directory(root.path(), &descriptor);
+            let persisted: PersistedRangeState =
+                serde_json::from_slice(&fs::read(directory.join("range-state.json")).unwrap())
+                    .unwrap();
+            read_segment_manifest(&directory, 0, &persisted)
+                .unwrap()
+                .last_position
+        };
+        drop(store);
+        let manifests =
+            demote_segments_to_remote(root.path(), &descriptor, objects.path(), &[0, 1]);
+        // Corrupt span 1's object after tiering — the verified fetch must
+        // reject it, and the prefetch that hits it must die quietly.
+        let damaged = objects
+            .path()
+            .join(crate::active_range::tier::segment_object_key(&manifests[1]));
+        fs::write(&damaged, b"corrupted remote bytes").unwrap();
+
+        let reopened = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor.clone(),
+            remote_options(
+                Arc::new(FileSystemObjectStore::open(objects.path()).unwrap()),
+                1 << 30,
+            ),
+        )
+        .unwrap();
+        // Serve only span 0 — the triggered prefetch of span 1 fails on
+        // the corrupted bytes but the foreground read must not notice.
+        let frames = reopened.read_committed(None, 1).await.unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(materialized_within(&reopened, 0, 1));
+        // Let the failed prefetch settle, then demand span 1: the read
+        // fails closed on the corrupted object rather than serving it.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let error = reopened
+            .read_committed(Some(RangePosition::new(span0_last)), 8)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ActiveRangeStoreError::InvalidState(_)
+                | ActiveRangeStoreError::CorruptSegment { .. }
+                | ActiveRangeStoreError::RemoteFetch(_)
+                | ActiveRangeStoreError::Io(_)
+        ));
     }
 }
