@@ -199,6 +199,7 @@ async fn main() -> Result<()> {
         if replica_append.is_some() {
             let ranges_root = config.data_dir.join("active-ranges");
             let interval = config.tier_scan_interval;
+            let policy_control = Arc::clone(&control);
             tokio::spawn(async move {
                 use whitewater::active_range::tier::{tier_scan_once, FileSystemObjectStore};
                 let mut ticker = tokio::time::interval(interval);
@@ -211,9 +212,13 @@ async fn main() -> Result<()> {
                     // late-mounted or briefly unavailable backend self-heals
                     // on the next pass instead of disabling tiering for the
                     // process lifetime.
+                    let policies = policy_control.effective_history_policies().await;
                     let report = tokio::task::spawn_blocking(move || {
-                        FileSystemObjectStore::open(&objects)
-                            .map(|store| tier_scan_once(root.as_path(), &store))
+                        FileSystemObjectStore::open(&objects).map(|store| {
+                            tier_scan_once(root.as_path(), &store, &|feed_id| {
+                                policies.get(&feed_id).cloned()
+                            })
+                        })
                     })
                     .await;
                     match report {

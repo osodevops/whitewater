@@ -484,6 +484,27 @@ impl AdminClient {
         .await
     }
 
+    /// Declare or replace the History Policy on a Domain or Feed —
+    /// fields the scope names override the inherited policy.
+    pub async fn set_history_policy(
+        &self,
+        scope: crate::control::HistoryPolicyScope,
+        policy: crate::control::HistoryPolicy,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::SetHistoryPolicy { scope, policy })
+            .await
+    }
+
+    /// Remove a Domain or Feed's declared History Policy override so it
+    /// returns to pure inheritance.
+    pub async fn clear_history_policy(
+        &self,
+        scope: crate::control::HistoryPolicyScope,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::ClearHistoryPolicy { scope })
+            .await
+    }
+
     pub async fn show(&self, kind: ShowKind) -> Result<ControlExecution, AdminClientError> {
         self.execute_one(Command::Show { kind }).await
     }

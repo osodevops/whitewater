@@ -185,6 +185,8 @@ struct FakeRiverbed {
     stores: BTreeMap<String, FakeStore>,
     pipes: BTreeMap<String, FakePipe>,
     indexes: BTreeMap<String, Value>,
+    /// `"domain:<name>"`/`"feed:<name>"` -> declared policy override.
+    history_policies: BTreeMap<String, crate::control::HistoryPolicy>,
     revision: u64,
     cursors: u64,
 }
@@ -816,6 +818,41 @@ impl FakeRiverbed {
                 Ok((format!("described {name}"), self.describe(kind, name)?))
             }
             Command::Rename { kind, current, new } => self.rename(kind, current, new),
+            Command::SetHistoryPolicy { scope, policy } => {
+                let key = match &scope {
+                    crate::control::HistoryPolicyScope::Domain { name } => {
+                        if !self.domains.contains_key(name.as_str()) {
+                            return Err(ControlError::NotFound(format!("Domain {name}")));
+                        }
+                        format!("domain:{name}")
+                    }
+                    crate::control::HistoryPolicyScope::Feed { name } => {
+                        if !self.feeds.contains_key(name.as_str()) {
+                            return Err(ControlError::NotFound(format!("Feed {name}")));
+                        }
+                        format!("feed:{name}")
+                    }
+                };
+                self.history_policies.insert(key.clone(), policy.clone());
+                Ok((
+                    format!("set History Policy on {key}"),
+                    json!({ "name": key }),
+                ))
+            }
+            Command::ClearHistoryPolicy { scope } => {
+                let key = match &scope {
+                    crate::control::HistoryPolicyScope::Domain { name } => {
+                        format!("domain:{name}")
+                    }
+                    crate::control::HistoryPolicyScope::Feed { name } => {
+                        format!("feed:{name}")
+                    }
+                };
+                if self.history_policies.remove(&key).is_none() {
+                    return Err(ControlError::NotFound(format!("History Policy on {key}")));
+                }
+                Ok((format!("cleared History Policy on {key}"), json!({})))
+            }
             _ => Ok(("ok".to_owned(), json!({}))),
         }
     }
@@ -975,6 +1012,11 @@ impl FakeRiverbed {
                 .filter_map(|name| self.pipe_row(name))
                 .collect::<Vec<_>>()),
             ShowKind::Indexes => json!(self.indexes.values().cloned().collect::<Vec<_>>()),
+            ShowKind::HistoryPolicies => json!(self
+                .history_policies
+                .iter()
+                .map(|(name, policy)| json!({ "name": name, "policy": policy }))
+                .collect::<Vec<_>>()),
             _ => json!([]),
         }
     }
@@ -2075,6 +2117,8 @@ fn command_label(command: &Command) -> &'static str {
         Command::Describe { .. } => "DESCRIBE",
         Command::Rename { .. } => "RENAME",
         Command::SeekSubscription { .. } => "SEEK SUBSCRIPTION",
+        Command::SetHistoryPolicy { .. } => "SET HISTORY POLICY",
+        Command::ClearHistoryPolicy { .. } => "DROP HISTORY POLICY",
         _ => "COMMAND",
     }
 }
@@ -2094,6 +2138,7 @@ fn show_label(kind: &ShowKind) -> &'static str {
         ShowKind::Pipes => "PIPES",
         ShowKind::Indexes => "INDEXES",
         ShowKind::StateStores => "STATESTORES",
+        ShowKind::HistoryPolicies => "HISTORY POLICIES",
     }
 }
 

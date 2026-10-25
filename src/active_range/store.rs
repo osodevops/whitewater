@@ -3668,7 +3668,7 @@ mod tests {
         segments: &[u64],
     ) -> Vec<SegmentManifest> {
         let objects = FileSystemObjectStore::open(object_root).unwrap();
-        let report = crate::active_range::tier::tier_scan_once(root, &objects);
+        let report = crate::active_range::tier::tier_scan_once(root, &objects, &|_| None);
         assert!(
             report.failed.is_empty(),
             "tier scan failed: {:?}",

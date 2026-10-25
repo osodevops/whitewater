@@ -1048,6 +1048,16 @@ fn wcl_command_scope(command: &crate::control::Command) -> WclCommandScope {
             }
             _ => WclCommandScope::Domains(vec![resource(name)]),
         },
+        Command::SetHistoryPolicy { scope, .. } | Command::ClearHistoryPolicy { scope } => {
+            match scope {
+                crate::control::HistoryPolicyScope::Domain { name } => {
+                    WclCommandScope::Domains(vec![domain(name)])
+                }
+                crate::control::HistoryPolicyScope::Feed { name } => {
+                    WclCommandScope::Domains(vec![resource(name)])
+                }
+            }
+        }
         Command::RebuildIndexesInDomain { domain } => {
             WclCommandScope::Domains(vec![ScopedName::Domain(domain.clone())])
         }
@@ -22208,6 +22218,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        // History Policy edits are lifecycle mutations on the scoped
+        // resource: a Domain-manage key sets its own Feed's policy but
+        // not a foreign one, and data-plane keys never reach it.
+        let set = app
+            .clone()
+            .oneshot(wcl(
+                "SET HISTORY POLICY ON FEED orders.events EXPIRE AFTER 30d;",
+                Some(domain_secret),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(set.status(), StatusCode::OK);
+        for key in [
+            Some(reader_secret),
+            Some(writer_secret),
+            Some(billing_secret),
+            None,
+        ] {
+            let denied = app
+                .clone()
+                .oneshot(wcl(
+                    "SET HISTORY POLICY ON FEED orders.events TIER AFTER 1h;",
+                    key,
+                ))
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        }
+        let foreign = app
+            .clone()
+            .oneshot(wcl(
+                "SET HISTORY POLICY ON FEED billing.invoices TIER AFTER 1h;",
+                Some(domain_secret),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::UNAUTHORIZED);
         // DESCRIBE reads span the resource's Domain; SHOW enumerates the
         // whole catalog and needs read on *.
         let described = app

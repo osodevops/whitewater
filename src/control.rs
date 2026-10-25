@@ -49,6 +49,71 @@ pub struct FeedDefinition {
     pub created_at_ns: i64,
 }
 
+/// Declared retained-history policy for a Domain or Feed: how long a
+/// sealed segment stays local before it is eligible to tier, when
+/// retained history expires entirely, and an optional per-range
+/// retained byte ceiling. Every field inherits independently — a Feed
+/// override supplies only the fields it names and keeps the rest of
+/// its Domain's policy; absent everywhere means the built-in default
+/// (sealed segments tier immediately, history never expires).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryPolicy {
+    /// Sealed segments younger than this stay local — the "hot local
+    /// duration" of the History Policy contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_after_ns: Option<u64>,
+    /// Sealed history expires once its newest record's ingest time is
+    /// this old. Enforcement lands with the deletion contract item;
+    /// the field is declared and validated here so policy intent is
+    /// already durable and explainable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expire_after_ns: Option<u64>,
+    /// Per-range retained-history byte ceiling; oldest sealed spans
+    /// expire first when the range exceeds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_retained_bytes: Option<u64>,
+}
+
+impl HistoryPolicy {
+    /// Field-level override: `lower` supplies every field `self` does
+    /// not declare. A Feed policy layered over its Domain's resolves
+    /// the effective policy a storage Node enforces.
+    pub fn layered_over(&self, lower: &HistoryPolicy) -> HistoryPolicy {
+        HistoryPolicy {
+            tier_after_ns: self.tier_after_ns.or(lower.tier_after_ns),
+            expire_after_ns: self.expire_after_ns.or(lower.expire_after_ns),
+            max_retained_bytes: self.max_retained_bytes.or(lower.max_retained_bytes),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tier_after_ns.is_none()
+            && self.expire_after_ns.is_none()
+            && self.max_retained_bytes.is_none()
+    }
+}
+
+/// A History Policy binds to exactly one catalog target: a Domain's
+/// policy is the inherited default for every Feed it owns; a Feed
+/// policy overrides individual fields for that Feed alone.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HistoryPolicyScope {
+    Domain { name: String },
+    Feed { name: String },
+}
+
+/// The durable catalog row: which resolved definition holds the
+/// declared override, its name at set time, and when it last changed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HistoryPolicyAssignment {
+    pub scope_kind: String,
+    pub target_id: Uuid,
+    pub name: String,
+    pub policy: HistoryPolicy,
+    pub updated_at_ns: i64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StateStoreSourceRequest {
@@ -1012,6 +1077,11 @@ struct CatalogState {
     grants: BTreeMap<Uuid, NamespaceGrant>,
     #[serde(default)]
     api_keys: BTreeMap<Uuid, ApiKeyIdentity>,
+    /// Declared History Policy overrides keyed by the target
+    /// definition's id (a `space_id` or `feed_id`). Definitions own the
+    /// row so renames keep the policy and drops cascade it away.
+    #[serde(default)]
+    history_policies: BTreeMap<Uuid, HistoryPolicyAssignment>,
     #[serde(default)]
     active_ranges: BTreeMap<Uuid, ActiveRangeAssignment>,
     #[serde(default)]
@@ -1082,6 +1152,7 @@ impl Default for CatalogState {
             roles: BTreeMap::new(),
             grants: BTreeMap::new(),
             api_keys: BTreeMap::new(),
+            history_policies: BTreeMap::new(),
             active_ranges: BTreeMap::new(),
             range_maps: BTreeMap::new(),
             range_assignments: BTreeMap::new(),
@@ -1129,6 +1200,7 @@ pub enum ShowKind {
     Grants,
     ApiKeys,
     StorageNodes,
+    HistoryPolicies,
     Pipes,
     Indexes,
     StateStores,
@@ -1386,6 +1458,17 @@ pub enum Command {
     /// fenced on every Node's request-time authorization view.
     RevokeApiKey {
         name: String,
+    },
+    /// Upsert the declared History Policy on a Domain or Feed —
+    /// field-level override of the inherited policy.
+    SetHistoryPolicy {
+        scope: HistoryPolicyScope,
+        policy: HistoryPolicy,
+    },
+    /// Remove the declared override so the target returns to pure
+    /// inheritance (Domains revert to built-in defaults).
+    ClearHistoryPolicy {
+        scope: HistoryPolicyScope,
     },
     ExplainAccess {
         role: String,
@@ -2527,6 +2610,34 @@ impl ControlController {
             .get(&subscription_id)
             .filter(|item| item.status == ResourceStatus::Active)
             .and_then(|item| item.source.feed_id().or_else(|| item.source.domain_id()))
+    }
+
+    /// Every active Feed's effective History Policy — the per-tick
+    /// snapshot a storage-side scanner uses so it never awaits on the
+    /// catalog inside blocking work.
+    pub async fn effective_history_policies(
+        &self,
+    ) -> std::collections::HashMap<Uuid, HistoryPolicy> {
+        let state = self.state.lock().await;
+        state
+            .feeds
+            .values()
+            .filter(|feed| feed.status == ResourceStatus::Active)
+            .map(|feed| (feed.feed_id, effective_history_policy(&state, feed)))
+            .collect()
+    }
+
+    /// The History Policy a storage Node enforces for `feed_id`: the
+    /// Feed's declared override layered over its Domain's. `None` when
+    /// the Feed is gone — an unresolvable target must not silently
+    /// inherit some other Feed's bounds.
+    pub async fn effective_history_policy_for_feed(&self, feed_id: Uuid) -> Option<HistoryPolicy> {
+        let state = self.state.lock().await;
+        state
+            .feeds
+            .get(&feed_id)
+            .filter(|feed| feed.status == ResourceStatus::Active)
+            .map(|feed| effective_history_policy(&state, feed))
     }
 
     pub(crate) async fn active_reader_frontier(&self, reader_id: Uuid) -> Option<ReaderFrontier> {
@@ -4093,6 +4204,41 @@ impl ControlController {
             }
             Command::Rename { kind, current, new } => self.rename(state, kind, &current, &new),
             Command::Drop { kind, name } => self.drop_resource(state, kind, &name),
+            Command::SetHistoryPolicy { scope, policy } => {
+                validate_history_policy(&policy)?;
+                let (scope_kind, target_id, name) = resolve_history_target(state, &scope)?;
+                let assignment = HistoryPolicyAssignment {
+                    scope_kind: scope_kind.to_owned(),
+                    target_id,
+                    name: name.clone(),
+                    policy,
+                    updated_at_ns: issued_at_ns,
+                };
+                state
+                    .history_policies
+                    .insert(target_id, assignment.clone());
+                Ok((
+                    format!("set History Policy on {scope_kind} {name}"),
+                    json!(assignment),
+                ))
+            }
+            Command::ClearHistoryPolicy { scope } => {
+                let (scope_kind, target_id, name) = resolve_history_target(state, &scope)?;
+                state
+                    .history_policies
+                    .remove(&target_id)
+                    .map(|_| {
+                        (
+                            format!("cleared History Policy on {scope_kind} {name}"),
+                            json!({ "scope_kind": scope_kind, "name": name }),
+                        )
+                    })
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "History Policy on {scope_kind} {name}"
+                        ))
+                    })
+            }
             Command::Show { kind } => Ok((
                 format!("showing {}", show_name(&kind)),
                 show_resources(
@@ -5941,6 +6087,7 @@ impl ControlController {
                 for members in state.subscription_feed_memberships.values_mut() {
                     members.remove(&feed_id);
                 }
+                state.history_policies.remove(&feed_id);
                 Ok((
                     format!("dropped Feed {name} without purging stored history"),
                     json!(dropped),
@@ -5962,6 +6109,7 @@ impl ControlController {
                 }
                 let item = state.spaces.get_mut(&space_id).expect("Space exists");
                 item.status = ResourceStatus::Dropped;
+                state.history_policies.remove(&space_id);
                 Ok((format!("dropped Domain {name}"), json!(item.clone())))
             }
             ResourceKind::Writer => drop_named(&mut state.writers, name, "Writer"),
@@ -6843,12 +6991,25 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 name: token(&tokens, 2)?.to_owned(),
             })
         }
-        Some("DROP") => Ok(Command::Drop {
-            kind: parse_resource_kind(token(&tokens, 1)?)?,
-            name: token(&tokens, 2)?.to_owned(),
-        }),
+        Some("DROP") => {
+            // DROP HISTORY POLICY ON DOMAIN|FEED <name> removes the
+            // declared override; every other DROP stays resource-named.
+            if keyword(1).as_deref() == Some("HISTORY") {
+                expect_keyword(&tokens, 2, "POLICY")?;
+                expect_keyword(&tokens, 3, "ON")?;
+                let scope = parse_history_policy_scope(&tokens, 4)?;
+                return Ok(Command::ClearHistoryPolicy { scope });
+            }
+            Ok(Command::Drop {
+                kind: parse_resource_kind(token(&tokens, 1)?)?,
+                name: token(&tokens, 2)?.to_owned(),
+            })
+        }
         Some("SHOW") => Ok(Command::Show {
-            kind: if token(&tokens, 1)?.eq_ignore_ascii_case("STORAGE") {
+            kind: if token(&tokens, 1)?.eq_ignore_ascii_case("HISTORY") {
+                expect_keyword(&tokens, 2, "POLICIES")?;
+                ShowKind::HistoryPolicies
+            } else if token(&tokens, 1)?.eq_ignore_ascii_case("STORAGE") {
                 expect_keyword(&tokens, 2, "NODES")?;
                 ShowKind::StorageNodes
             } else if token(&tokens, 1)?.eq_ignore_ascii_case("API") {
@@ -6992,6 +7153,61 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                     .map_err(|error| ControlError::Syntax(error.to_string()))?,
                 capacity,
             })
+        }
+        Some("SET") => {
+            // SET HISTORY POLICY ON DOMAIN|FEED <name>
+            //     (TIER AFTER <dur> | EXPIRE AFTER <dur> | MAX RETAINED BYTES <n>)+
+            expect_keyword(&tokens, 1, "HISTORY")?;
+            expect_keyword(&tokens, 2, "POLICY")?;
+            expect_keyword(&tokens, 3, "ON")?;
+            let scope = parse_history_policy_scope(&tokens, 4)?;
+            let mut position = 6;
+            if position >= tokens.len() {
+                return Err(ControlError::Syntax(
+                    "SET HISTORY POLICY requires at least one of TIER AFTER, EXPIRE AFTER,                      or MAX RETAINED BYTES"
+                        .to_owned(),
+                ));
+            }
+            let mut policy = HistoryPolicy::default();
+            while position < tokens.len() {
+                match token(&tokens, position)?.to_ascii_uppercase().as_str() {
+                    "TIER" => {
+                        expect_keyword(&tokens, position + 1, "AFTER")?;
+                        policy.tier_after_ns =
+                            Some(parse_duration_ns(token(&tokens, position + 2)?)?);
+                        position += 3;
+                    }
+                    "EXPIRE" => {
+                        expect_keyword(&tokens, position + 1, "AFTER")?;
+                        policy.expire_after_ns =
+                            Some(parse_duration_ns(token(&tokens, position + 2)?)?);
+                        position += 3;
+                    }
+                    "MAX" => {
+                        expect_keyword(&tokens, position + 1, "RETAINED")?;
+                        expect_keyword(&tokens, position + 2, "BYTES")?;
+                        let bytes: u64 = token(&tokens, position + 3)?.parse().map_err(|_| {
+                            ControlError::Syntax(format!(
+                                "MAX RETAINED BYTES '{}' is not a whole number",
+                                token(&tokens, position + 3).unwrap_or("")
+                            ))
+                        })?;
+                        if bytes == 0 {
+                            return Err(ControlError::Syntax(
+                                "MAX RETAINED BYTES must be positive".to_owned(),
+                            ));
+                        }
+                        policy.max_retained_bytes = Some(bytes);
+                        position += 4;
+                    }
+                    other => {
+                        return Err(ControlError::Syntax(format!(
+                            "SET HISTORY POLICY accepts TIER AFTER <dur>, EXPIRE AFTER <dur>,                              or MAX RETAINED BYTES <n>, not {other}"
+                        )))
+                    }
+                }
+            }
+            Ok(Command::SetHistoryPolicy { scope, policy })
         }
         Some("DESCRIBE") => Ok(Command::Describe {
             kind: parse_resource_kind(token(&tokens, 1)?)?,
@@ -7251,6 +7467,83 @@ fn parse_duration_ns(token: &str) -> Result<u64, ControlError> {
         .ok_or_else(|| {
             ControlError::Syntax(format!("WINDOW duration '{token}' overflows or is zero"))
         })
+}
+
+/// `ON DOMAIN <name>` or `ON FEED <name>` — the shared scope clause
+/// `SET HISTORY POLICY` and `DROP HISTORY POLICY` both parse.
+fn parse_history_policy_scope(
+    tokens: &[String],
+    position: usize,
+) -> Result<HistoryPolicyScope, ControlError> {
+    match token(tokens, position)?.to_ascii_uppercase().as_str() {
+        "DOMAIN" | "SPACE" => Ok(HistoryPolicyScope::Domain {
+            name: token(tokens, position + 1)?.to_owned(),
+        }),
+        "FEED" => Ok(HistoryPolicyScope::Feed {
+            name: token(tokens, position + 1)?.to_owned(),
+        }),
+        other => Err(ControlError::Syntax(format!(
+            "HISTORY POLICY scope is ON DOMAIN <name> or ON FEED <name>, not ON {other}"
+        ))),
+    }
+}
+
+/// A declared policy must bound at least one dimension; every
+/// declared bound must be positive. `parse_duration_ns` already
+/// refuses zero and overflow for the duration fields.
+fn validate_history_policy(policy: &HistoryPolicy) -> Result<(), ControlError> {
+    if policy.is_empty() {
+        return Err(ControlError::InvalidOperation(
+            "SET HISTORY POLICY requires at least one of TIER AFTER, EXPIRE AFTER,              or MAX RETAINED BYTES — use DROP HISTORY POLICY to revert to inheritance"
+                .to_owned(),
+        ));
+    }
+    if policy.max_retained_bytes == Some(0) {
+        return Err(ControlError::InvalidOperation(
+            "MAX RETAINED BYTES must be positive".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve a scope's name to its live definition: the row keys on the
+/// definition id so renames keep the policy and dropped resources
+/// refuse further policy edits.
+fn resolve_history_target(
+    state: &CatalogState,
+    scope: &HistoryPolicyScope,
+) -> Result<(&'static str, Uuid, String), ControlError> {
+    match scope {
+        HistoryPolicyScope::Domain { name } => {
+            let space = active_space(state, name)?;
+            Ok(("Domain", space.space_id, space.name.clone()))
+        }
+        HistoryPolicyScope::Feed { name } => {
+            let feed = active_feed(state, name)?;
+            Ok(("Feed", feed.feed_id, feed.name.clone()))
+        }
+    }
+}
+
+/// The policy a storage Node actually enforces for a Feed: the Feed's
+/// declared override layered field-by-field over its Domain's, with
+/// undeclared fields falling back to the built-in defaults (tier
+/// immediately, never expire).
+fn effective_history_policy(state: &CatalogState, feed: &FeedDefinition) -> HistoryPolicy {
+    let domain = state
+        .history_policies
+        .get(&feed.space_id)
+        .map(|assignment| &assignment.policy);
+    let own = state
+        .history_policies
+        .get(&feed.feed_id)
+        .map(|assignment| &assignment.policy);
+    match (own, domain) {
+        (Some(own), Some(domain)) => own.layered_over(domain),
+        (Some(own), None) => own.clone(),
+        (None, Some(domain)) => domain.clone(),
+        (None, None) => HistoryPolicy::default(),
+    }
 }
 
 /// Window keys and aggregated values come only from deterministic record
@@ -8128,6 +8421,7 @@ fn show_resources(
             .values()
             .filter(|item| item.stage != StateStoreStage::Dropped)
             .collect::<Vec<_>>()),
+        ShowKind::HistoryPolicies => json!(state.history_policies.values().collect::<Vec<_>>()),
         ShowKind::Roles => json!(state
             .roles
             .values()
@@ -8185,8 +8479,25 @@ fn describe_resource(
     name: &str,
 ) -> Result<Value, ControlError> {
     match kind {
-        ResourceKind::Domain | ResourceKind::Space => Ok(json!(active_space(state, name)?)),
-        ResourceKind::Feed => Ok(json!(active_feed(state, name)?)),
+        ResourceKind::Domain | ResourceKind::Space => {
+            let space = active_space(state, name)?;
+            let mut value = json!(space);
+            value["history_policy"] = json!(state
+                .history_policies
+                .get(&space.space_id)
+                .map(|assignment| assignment.policy.clone()));
+            Ok(value)
+        }
+        ResourceKind::Feed => {
+            let feed = active_feed(state, name)?;
+            let mut value = json!(feed);
+            value["history_policy"] = json!(state
+                .history_policies
+                .get(&feed.feed_id)
+                .map(|assignment| assignment.policy.clone()));
+            value["effective_history_policy"] = json!(effective_history_policy(state, feed));
+            Ok(value)
+        }
         ResourceKind::Writer => state
             .writers
             .values()
@@ -8714,6 +9025,8 @@ fn command_label(command: &Command) -> String {
         Command::UndrainStorageNode { .. } => "UNDRAIN STORAGE NODE",
         Command::InspectStorageDrain { .. } => "INSPECT DRAIN",
         Command::ReportStorageNodeCapacity { .. } => "REPORT STORAGE NODE CAPACITY",
+        Command::SetHistoryPolicy { .. } => "SET HISTORY POLICY",
+        Command::ClearHistoryPolicy { .. } => "DROP HISTORY POLICY",
     }
     .to_owned()
 }
@@ -8746,6 +9059,7 @@ fn show_name(kind: &ShowKind) -> &'static str {
         ShowKind::Grants => "Grants",
         ShowKind::ApiKeys => "API Keys",
         ShowKind::StorageNodes => "Storage Nodes",
+        ShowKind::HistoryPolicies => "History Policies",
     }
 }
 
@@ -13202,5 +13516,209 @@ mod tests {
             .execute_commands_with_request_id(vec![phantom], Uuid::from_u128(6))
             .await
             .is_err());
+    }
+
+    #[test]
+    fn parser_supports_history_policy_verbs() {
+        let commands = parse_wcl(
+            "SET HISTORY POLICY ON DOMAIN orders TIER AFTER 30m EXPIRE AFTER 7d;              SET HISTORY POLICY ON FEED orders.events EXPIRE AFTER 14d MAX RETAINED BYTES 4096;              DROP HISTORY POLICY ON FEED orders.events;              DROP HISTORY POLICY ON DOMAIN orders;              SHOW HISTORY POLICIES;",
+        )
+        .unwrap();
+        assert_eq!(commands.len(), 5);
+        assert!(matches!(
+            &commands[0],
+            Command::SetHistoryPolicy {
+                scope: HistoryPolicyScope::Domain { name },
+                policy
+            } if name == "orders"
+                && policy.tier_after_ns == Some(30 * 60 * 1_000_000_000)
+                && policy.expire_after_ns == Some(7 * 86_400 * 1_000_000_000)
+                && policy.max_retained_bytes.is_none()
+        ));
+        assert!(matches!(
+            &commands[1],
+            Command::SetHistoryPolicy {
+                scope: HistoryPolicyScope::Feed { name },
+                policy
+            } if name == "orders.events"
+                && policy.tier_after_ns.is_none()
+                && policy.expire_after_ns == Some(14 * 86_400 * 1_000_000_000)
+                && policy.max_retained_bytes == Some(4_096)
+        ));
+        assert!(matches!(
+            &commands[2],
+            Command::ClearHistoryPolicy {
+                scope: HistoryPolicyScope::Feed { name }
+            } if name == "orders.events"
+        ));
+        assert!(matches!(
+            &commands[3],
+            Command::ClearHistoryPolicy {
+                scope: HistoryPolicyScope::Domain { name }
+            } if name == "orders"
+        ));
+        assert!(matches!(
+            &commands[4],
+            Command::Show {
+                kind: ShowKind::HistoryPolicies
+            }
+        ));
+        for bad in [
+            "SET HISTORY POLICY ON FEED orders.events;",
+            "SET HISTORY POLICY ON orders TIER AFTER 1h;",
+            "SET HISTORY POLICY ON FEED orders.events TIER 1h;",
+            "SET HISTORY POLICY ON FEED orders.events MAX RETAINED BYTES 0;",
+            "SET HISTORY POLICY ON FEED orders.events TIER AFTER 0s;",
+            "DROP HISTORY POLICY ON FEED;",
+            "DROP HISTORY ON FEED orders.events;",
+            "SHOW HISTORY;",
+        ] {
+            assert!(parse_wcl(bad).is_err(), "{bad} must not parse");
+        }
+    }
+
+    #[tokio::test]
+    async fn history_policy_lifecycle_inherits_overrides_and_survives_reopen() {
+        let directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader
+            .execute("CREATE DOMAIN orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        leader
+            .execute("SET HISTORY POLICY ON DOMAIN orders TIER AFTER 30m EXPIRE AFTER 7d;")
+            .await
+            .unwrap();
+        leader
+            .execute("SET HISTORY POLICY ON FEED orders.events EXPIRE AFTER 14d;")
+            .await
+            .unwrap();
+
+        let feed_id = leader
+            .active_feed_by_name("orders.events")
+            .await
+            .unwrap()
+            .feed_id;
+        let effective = leader
+            .effective_history_policy_for_feed(feed_id)
+            .await
+            .unwrap();
+        // The Feed override layers over the Domain's: expire from the
+        // Feed, tier inherited, bytes undeclared anywhere.
+        assert_eq!(effective.expire_after_ns, Some(14 * 86_400 * 1_000_000_000));
+        assert_eq!(effective.tier_after_ns, Some(30 * 60 * 1_000_000_000));
+        assert_eq!(effective.max_retained_bytes, None);
+
+        let shown = leader.execute("SHOW HISTORY POLICIES;").await.unwrap();
+        let rows: Vec<Value> = serde_json::from_value(shown.results[0].data.clone()).unwrap();
+        assert_eq!(rows.len(), 2);
+
+        let described = leader
+            .execute("DESCRIBE FEED orders.events;")
+            .await
+            .unwrap();
+        let detail = &described.results[0].data;
+        assert_eq!(
+            detail["history_policy"]["expire_after_ns"],
+            json!(14 * 86_400 * 1_000_000_000_u64)
+        );
+        assert!(detail["history_policy"]["tier_after_ns"].is_null());
+        assert_eq!(
+            detail["effective_history_policy"]["tier_after_ns"],
+            json!(30 * 60 * 1_000_000_000_u64)
+        );
+
+        // Catalog state survives a controller reopen — a synced replica
+        // must resolve the same effective policy.
+        drop(leader);
+        let reopened = new_controller(&directory);
+        let effective = reopened
+            .effective_history_policy_for_feed(feed_id)
+            .await
+            .unwrap();
+        assert_eq!(effective.expire_after_ns, Some(14 * 86_400 * 1_000_000_000));
+        assert_eq!(effective.tier_after_ns, Some(30 * 60 * 1_000_000_000));
+
+        // Renaming the Feed keeps its policy — rows key on the id, not
+        // the mutable name.
+        reopened
+            .execute("RENAME FEED orders.events TO orders.audit;")
+            .await
+            .unwrap();
+        let effective = reopened
+            .effective_history_policy_for_feed(feed_id)
+            .await
+            .unwrap();
+        assert_eq!(effective.expire_after_ns, Some(14 * 86_400 * 1_000_000_000));
+
+        // Clearing reverts the Feed to pure Domain inheritance.
+        reopened
+            .execute("DROP HISTORY POLICY ON FEED orders.audit;")
+            .await
+            .unwrap();
+        let effective = reopened
+            .effective_history_policy_for_feed(feed_id)
+            .await
+            .unwrap();
+        assert_eq!(effective.expire_after_ns, Some(7 * 86_400 * 1_000_000_000));
+        assert!(reopened
+            .execute("DROP HISTORY POLICY ON FEED orders.audit;")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn history_policy_refuses_empty_invalid_and_dropped_targets() {
+        let directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader
+            .execute("CREATE DOMAIN orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        // An all-absent policy is a no-op declaration — refuse it so a
+        // mistyped statement cannot masquerade as a cleared override.
+        assert!(leader
+            .execute_commands(vec![Command::SetHistoryPolicy {
+                scope: HistoryPolicyScope::Feed {
+                    name: "orders.events".to_owned(),
+                },
+                policy: HistoryPolicy::default(),
+            }])
+            .await
+            .is_err());
+        assert!(leader
+            .execute_commands(vec![Command::SetHistoryPolicy {
+                scope: HistoryPolicyScope::Feed {
+                    name: "orders.events".to_owned(),
+                },
+                policy: HistoryPolicy {
+                    max_retained_bytes: Some(0),
+                    ..HistoryPolicy::default()
+                },
+            }])
+            .await
+            .is_err());
+        for statement in [
+            "SET HISTORY POLICY ON DOMAIN missing TIER AFTER 1h;",
+            "SET HISTORY POLICY ON FEED orders.missing TIER AFTER 1h;",
+            "DROP HISTORY POLICY ON DOMAIN missing;",
+            "DROP HISTORY POLICY ON FEED orders.missing;",
+        ] {
+            assert!(leader.execute(statement).await.is_err(), "{statement}");
+        }
+        // A dropped Feed cannot take new policy, and its row leaves
+        // with it.
+        leader
+            .execute("SET HISTORY POLICY ON FEED orders.events EXPIRE AFTER 1d;")
+            .await
+            .unwrap();
+        leader.execute("DROP FEED orders.events;").await.unwrap();
+        assert!(leader
+            .execute("SET HISTORY POLICY ON FEED orders.events EXPIRE AFTER 1d;")
+            .await
+            .is_err());
+        let shown = leader.execute("SHOW HISTORY POLICIES;").await.unwrap();
+        let rows: Vec<Value> = serde_json::from_value(shown.results[0].data.clone()).unwrap();
+        assert!(rows.is_empty());
     }
 }
