@@ -1050,14 +1050,22 @@ fn wcl_command_scope(command: &crate::control::Command) -> WclCommandScope {
         },
         Command::SetHistoryPolicy { scope, .. } | Command::ClearHistoryPolicy { scope } => {
             match scope {
-                crate::control::HistoryPolicyScope::Domain { name } => {
+                crate::control::PolicyScope::Domain { name } => {
                     WclCommandScope::Domains(vec![domain(name)])
                 }
-                crate::control::HistoryPolicyScope::Feed { name } => {
+                crate::control::PolicyScope::Feed { name } => {
                     WclCommandScope::Domains(vec![resource(name)])
                 }
             }
         }
+        Command::SetSchema { scope, .. } | Command::ClearSchema { scope } => match scope {
+            crate::control::PolicyScope::Domain { name } => {
+                WclCommandScope::Domains(vec![domain(name)])
+            }
+            crate::control::PolicyScope::Feed { name } => {
+                WclCommandScope::Domains(vec![resource(name)])
+            }
+        },
         Command::RebuildIndexesInDomain { domain } => {
             WclCommandScope::Domains(vec![ScopedName::Domain(domain.clone())])
         }
@@ -22250,6 +22258,39 @@ mod tests {
             .clone()
             .oneshot(wcl(
                 "SET HISTORY POLICY ON FEED billing.invoices TIER AFTER 1h;",
+                Some(domain_secret),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::UNAUTHORIZED);
+        // Schema declarations are the same lifecycle mutation: Domain
+        // manage sets its own Feed's schema but not a foreign one.
+        let set = app
+            .clone()
+            .oneshot(wcl(
+                "SET SCHEMA ON FEED orders.events VALUE JSON;",
+                Some(domain_secret),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(set.status(), StatusCode::OK);
+        for key in [
+            Some(reader_secret),
+            Some(writer_secret),
+            Some(billing_secret),
+            None,
+        ] {
+            let denied = app
+                .clone()
+                .oneshot(wcl("SET SCHEMA ON FEED orders.events VALUE AVRO;", key))
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        }
+        let foreign = app
+            .clone()
+            .oneshot(wcl(
+                "SET SCHEMA ON FEED billing.invoices VALUE JSON;",
                 Some(domain_secret),
             ))
             .await

@@ -187,6 +187,8 @@ struct FakeRiverbed {
     indexes: BTreeMap<String, Value>,
     /// `"domain:<name>"`/`"feed:<name>"` -> declared policy override.
     history_policies: BTreeMap<String, crate::control::HistoryPolicy>,
+    /// `"domain:<name>"`/`"feed:<name>"` -> declared schema override.
+    schemas: BTreeMap<String, crate::control::FeedSchema>,
     revision: u64,
     cursors: u64,
 }
@@ -820,13 +822,13 @@ impl FakeRiverbed {
             Command::Rename { kind, current, new } => self.rename(kind, current, new),
             Command::SetHistoryPolicy { scope, policy } => {
                 let key = match &scope {
-                    crate::control::HistoryPolicyScope::Domain { name } => {
+                    crate::control::PolicyScope::Domain { name } => {
                         if !self.domains.contains_key(name.as_str()) {
                             return Err(ControlError::NotFound(format!("Domain {name}")));
                         }
                         format!("domain:{name}")
                     }
-                    crate::control::HistoryPolicyScope::Feed { name } => {
+                    crate::control::PolicyScope::Feed { name } => {
                         if !self.feeds.contains_key(name.as_str()) {
                             return Err(ControlError::NotFound(format!("Feed {name}")));
                         }
@@ -841,10 +843,10 @@ impl FakeRiverbed {
             }
             Command::ClearHistoryPolicy { scope } => {
                 let key = match &scope {
-                    crate::control::HistoryPolicyScope::Domain { name } => {
+                    crate::control::PolicyScope::Domain { name } => {
                         format!("domain:{name}")
                     }
-                    crate::control::HistoryPolicyScope::Feed { name } => {
+                    crate::control::PolicyScope::Feed { name } => {
                         format!("feed:{name}")
                     }
                 };
@@ -852,6 +854,38 @@ impl FakeRiverbed {
                     return Err(ControlError::NotFound(format!("History Policy on {key}")));
                 }
                 Ok((format!("cleared History Policy on {key}"), json!({})))
+            }
+            Command::SetSchema { scope, schema } => {
+                let key = match &scope {
+                    crate::control::PolicyScope::Domain { name } => {
+                        if !self.domains.contains_key(name.as_str()) {
+                            return Err(ControlError::NotFound(format!("Domain {name}")));
+                        }
+                        format!("domain:{name}")
+                    }
+                    crate::control::PolicyScope::Feed { name } => {
+                        if !self.feeds.contains_key(name.as_str()) {
+                            return Err(ControlError::NotFound(format!("Feed {name}")));
+                        }
+                        format!("feed:{name}")
+                    }
+                };
+                self.schemas.insert(key.clone(), schema.clone());
+                Ok((format!("set schema on {key}"), json!({ "name": key })))
+            }
+            Command::ClearSchema { scope } => {
+                let key = match &scope {
+                    crate::control::PolicyScope::Domain { name } => {
+                        format!("domain:{name}")
+                    }
+                    crate::control::PolicyScope::Feed { name } => {
+                        format!("feed:{name}")
+                    }
+                };
+                if self.schemas.remove(&key).is_none() {
+                    return Err(ControlError::NotFound(format!("schema on {key}")));
+                }
+                Ok((format!("cleared schema on {key}"), json!({})))
             }
             _ => Ok(("ok".to_owned(), json!({}))),
         }
@@ -971,12 +1005,16 @@ impl FakeRiverbed {
             ShowKind::Feeds => json!(self
                 .feeds
                 .iter()
-                .map(|(name, feed)| json!({
-                    "feed_id": feed.feed_id,
-                    "name": name,
-                    "space_id": feed.space_id,
-                    "status": "active",
-                }))
+                .map(|(name, feed)| {
+                    json!({
+                        "feed_id": feed.feed_id,
+                        "name": name,
+                        "space_id": feed.space_id,
+                        "status": "active",
+                        "schema": self.schemas.get(&format!("feed:{name}")),
+                        "effective_schema": self.effective_schema(name),
+                    })
+                })
                 .collect::<Vec<_>>()),
             ShowKind::Writers => json!(self
                 .writers
@@ -1017,6 +1055,11 @@ impl FakeRiverbed {
                 .iter()
                 .map(|(name, policy)| json!({ "name": name, "policy": policy }))
                 .collect::<Vec<_>>()),
+            ShowKind::Schemas => json!(self
+                .schemas
+                .iter()
+                .map(|(name, schema)| json!({ "name": name, "schema": schema }))
+                .collect::<Vec<_>>()),
             _ => json!([]),
         }
     }
@@ -1027,7 +1070,14 @@ impl FakeRiverbed {
             ResourceKind::Domain | ResourceKind::Space => self
                 .domains
                 .get(name)
-                .map(|space_id| json!({ "space_id": space_id, "name": name, "status": "active" }))
+                .map(|space_id| {
+                    json!({
+                        "space_id": space_id,
+                        "name": name,
+                        "status": "active",
+                        "schema": self.schemas.get(&format!("domain:{name}")),
+                    })
+                })
                 .ok_or_else(missing),
             ResourceKind::Feed => self
                 .feeds
@@ -1039,6 +1089,8 @@ impl FakeRiverbed {
                         "space_id": feed.space_id,
                         "storage_name": format!("/feeds/{}", feed.feed_id.simple()),
                         "status": "active",
+                        "schema": self.schemas.get(&format!("feed:{name}")),
+                        "effective_schema": self.effective_schema(name),
                     })
                 })
                 .ok_or_else(missing),
@@ -1076,6 +1128,31 @@ impl FakeRiverbed {
                 .then(|| self.store_json(name))
                 .ok_or_else(missing),
             ResourceKind::Role => Err(missing()),
+        }
+    }
+
+    /// The Feed schema a client should honor: the feed's declared
+    /// override layered over its Domain's — `Null` when undeclared.
+    fn effective_schema(&self, feed_name: &str) -> Value {
+        let Some(feed) = self.feeds.get(feed_name) else {
+            return Value::Null;
+        };
+        let own = self.schemas.get(&format!("feed:{feed_name}"));
+        let domain_name = self
+            .domains
+            .iter()
+            .find(|(_, space_id)| **space_id == feed.space_id)
+            .map(|(name, _)| name.clone());
+        let domain = domain_name
+            .as_ref()
+            .and_then(|name| self.schemas.get(&format!("domain:{name}")));
+        match (own, domain) {
+            (Some(own), Some(domain)) => {
+                serde_json::to_value(own.layered_over(domain)).unwrap_or(Value::Null)
+            }
+            (Some(own), None) => serde_json::to_value(own).unwrap_or(Value::Null),
+            (None, Some(domain)) => serde_json::to_value(domain).unwrap_or(Value::Null),
+            (None, None) => Value::Null,
         }
     }
 
@@ -2119,6 +2196,8 @@ fn command_label(command: &Command) -> &'static str {
         Command::SeekSubscription { .. } => "SEEK SUBSCRIPTION",
         Command::SetHistoryPolicy { .. } => "SET HISTORY POLICY",
         Command::ClearHistoryPolicy { .. } => "DROP HISTORY POLICY",
+        Command::SetSchema { .. } => "SET SCHEMA",
+        Command::ClearSchema { .. } => "DROP SCHEMA",
         _ => "COMMAND",
     }
 }
@@ -2139,6 +2218,7 @@ fn show_label(kind: &ShowKind) -> &'static str {
         ShowKind::Indexes => "INDEXES",
         ShowKind::StateStores => "STATESTORES",
         ShowKind::HistoryPolicies => "HISTORY POLICIES",
+        ShowKind::Schemas => "SCHEMAS",
     }
 }
 

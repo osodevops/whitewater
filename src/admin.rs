@@ -488,7 +488,7 @@ impl AdminClient {
     /// fields the scope names override the inherited policy.
     pub async fn set_history_policy(
         &self,
-        scope: crate::control::HistoryPolicyScope,
+        scope: crate::control::PolicyScope,
         policy: crate::control::HistoryPolicy,
     ) -> Result<ControlExecution, AdminClientError> {
         self.execute_one(Command::SetHistoryPolicy { scope, policy })
@@ -499,10 +499,29 @@ impl AdminClient {
     /// returns to pure inheritance.
     pub async fn clear_history_policy(
         &self,
-        scope: crate::control::HistoryPolicyScope,
+        scope: crate::control::PolicyScope,
     ) -> Result<ControlExecution, AdminClientError> {
         self.execute_one(Command::ClearHistoryPolicy { scope })
             .await
+    }
+
+    /// Declare or replace record schema metadata on a Domain or Feed
+    /// — sides the scope names override the inherited declaration.
+    pub async fn set_schema(
+        &self,
+        scope: crate::control::PolicyScope,
+        schema: crate::control::FeedSchema,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::SetSchema { scope, schema }).await
+    }
+
+    /// Remove a Domain or Feed's declared schema override so it
+    /// returns to pure inheritance (or schema-agnostic bytes).
+    pub async fn clear_schema(
+        &self,
+        scope: crate::control::PolicyScope,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::ClearSchema { scope }).await
     }
 
     pub async fn show(&self, kind: ShowKind) -> Result<ControlExecution, AdminClientError> {

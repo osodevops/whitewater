@@ -98,7 +98,7 @@ impl HistoryPolicy {
 /// policy overrides individual fields for that Feed alone.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum HistoryPolicyScope {
+pub enum PolicyScope {
     Domain { name: String },
     Feed { name: String },
 }
@@ -111,6 +111,67 @@ pub struct HistoryPolicyAssignment {
     pub target_id: Uuid,
     pub name: String,
     pub policy: HistoryPolicy,
+    pub updated_at_ns: i64,
+}
+
+/// One side of a declared record schema: the wire format applications
+/// write and readers decode, plus the registry-style locator tooling
+/// resolves definitions through. Descriptive metadata only — the
+/// storage engine stays schema-neutral; compatibility gates,
+/// validation, and a versioned registry land with the schema
+/// companion service.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchemaDecl {
+    /// `json`, `jsonschema`, `avro`, `protobuf`, `text`, `bytes`, or
+    /// `custom.<name>` for formats outside the built-in set.
+    pub format: String,
+    /// Optional registry subject or logical name (`orders-value`,
+    /// `com.acme.Order`) the schema companion resolves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    /// Optional inline schema definition (JSON Schema, IDL, DDL).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<String>,
+}
+
+/// Declared record schema metadata for a Domain or Feed: which format
+/// record keys and payloads carry. Every field inherits independently
+/// — a Feed override supplies only the sides it names and keeps the
+/// rest of its Domain's declaration; absent everywhere means
+/// schema-agnostic bytes (the built-in default).
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeedSchema {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<SchemaDecl>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<SchemaDecl>,
+}
+
+impl FeedSchema {
+    /// Field-level override: `lower` supplies every side `self` does
+    /// not declare. A Feed schema layered over its Domain's resolves
+    /// the effective schema a Feed surface reports.
+    pub fn layered_over(&self, lower: &FeedSchema) -> FeedSchema {
+        FeedSchema {
+            key: self.key.clone().or_else(|| lower.key.clone()),
+            value: self.value.clone().or_else(|| lower.value.clone()),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.key.is_none() && self.value.is_none()
+    }
+}
+
+/// The durable catalog row for a declared schema: which resolved
+/// definition holds the override, its name at set time, and when it
+/// last changed. Renames keep the row; drops cascade it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SchemaAssignment {
+    pub scope_kind: String,
+    pub target_id: Uuid,
+    pub name: String,
+    pub schema: FeedSchema,
     pub updated_at_ns: i64,
 }
 
@@ -1082,6 +1143,10 @@ struct CatalogState {
     /// row so renames keep the policy and drops cascade it away.
     #[serde(default)]
     history_policies: BTreeMap<Uuid, HistoryPolicyAssignment>,
+    /// Declared record schema metadata keyed the same way — a
+    /// `space_id` carries the Domain default; a `feed_id` overrides it.
+    #[serde(default)]
+    schemas: BTreeMap<Uuid, SchemaAssignment>,
     #[serde(default)]
     active_ranges: BTreeMap<Uuid, ActiveRangeAssignment>,
     #[serde(default)]
@@ -1153,6 +1218,7 @@ impl Default for CatalogState {
             grants: BTreeMap::new(),
             api_keys: BTreeMap::new(),
             history_policies: BTreeMap::new(),
+            schemas: BTreeMap::new(),
             active_ranges: BTreeMap::new(),
             range_maps: BTreeMap::new(),
             range_assignments: BTreeMap::new(),
@@ -1201,6 +1267,7 @@ pub enum ShowKind {
     ApiKeys,
     StorageNodes,
     HistoryPolicies,
+    Schemas,
     Pipes,
     Indexes,
     StateStores,
@@ -1462,13 +1529,24 @@ pub enum Command {
     /// Upsert the declared History Policy on a Domain or Feed —
     /// field-level override of the inherited policy.
     SetHistoryPolicy {
-        scope: HistoryPolicyScope,
+        scope: PolicyScope,
         policy: HistoryPolicy,
     },
     /// Remove the declared override so the target returns to pure
     /// inheritance (Domains revert to built-in defaults).
     ClearHistoryPolicy {
-        scope: HistoryPolicyScope,
+        scope: PolicyScope,
+    },
+    /// Upsert declared record schema metadata on a Domain or Feed —
+    /// field-level override of the inherited declaration.
+    SetSchema {
+        scope: PolicyScope,
+        schema: FeedSchema,
+    },
+    /// Remove the declared schema override so the target returns to
+    /// pure inheritance (or schema-agnostic bytes).
+    ClearSchema {
+        scope: PolicyScope,
     },
     ExplainAccess {
         role: String,
@@ -4206,7 +4284,7 @@ impl ControlController {
             Command::Drop { kind, name } => self.drop_resource(state, kind, &name),
             Command::SetHistoryPolicy { scope, policy } => {
                 validate_history_policy(&policy)?;
-                let (scope_kind, target_id, name) = resolve_history_target(state, &scope)?;
+                let (scope_kind, target_id, name) = resolve_policy_target(state, &scope)?;
                 let assignment = HistoryPolicyAssignment {
                     scope_kind: scope_kind.to_owned(),
                     target_id,
@@ -4223,7 +4301,7 @@ impl ControlController {
                 ))
             }
             Command::ClearHistoryPolicy { scope } => {
-                let (scope_kind, target_id, name) = resolve_history_target(state, &scope)?;
+                let (scope_kind, target_id, name) = resolve_policy_target(state, &scope)?;
                 state
                     .history_policies
                     .remove(&target_id)
@@ -4237,6 +4315,37 @@ impl ControlController {
                         ControlError::NotFound(format!(
                             "History Policy on {scope_kind} {name}"
                         ))
+                    })
+            }
+            Command::SetSchema { scope, schema } => {
+                validate_feed_schema(&schema)?;
+                let (scope_kind, target_id, name) = resolve_policy_target(state, &scope)?;
+                let assignment = SchemaAssignment {
+                    scope_kind: scope_kind.to_owned(),
+                    target_id,
+                    name: name.clone(),
+                    schema,
+                    updated_at_ns: issued_at_ns,
+                };
+                state.schemas.insert(target_id, assignment.clone());
+                Ok((
+                    format!("set schema on {scope_kind} {name}"),
+                    json!(assignment),
+                ))
+            }
+            Command::ClearSchema { scope } => {
+                let (scope_kind, target_id, name) = resolve_policy_target(state, &scope)?;
+                state
+                    .schemas
+                    .remove(&target_id)
+                    .map(|_| {
+                        (
+                            format!("cleared schema on {scope_kind} {name}"),
+                            json!({ "scope_kind": scope_kind, "name": name }),
+                        )
+                    })
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!("schema on {scope_kind} {name}"))
                     })
             }
             Command::Show { kind } => Ok((
@@ -6088,6 +6197,7 @@ impl ControlController {
                     members.remove(&feed_id);
                 }
                 state.history_policies.remove(&feed_id);
+                state.schemas.remove(&feed_id);
                 Ok((
                     format!("dropped Feed {name} without purging stored history"),
                     json!(dropped),
@@ -6110,6 +6220,7 @@ impl ControlController {
                 let item = state.spaces.get_mut(&space_id).expect("Space exists");
                 item.status = ResourceStatus::Dropped;
                 state.history_policies.remove(&space_id);
+                state.schemas.remove(&space_id);
                 Ok((format!("dropped Domain {name}"), json!(item.clone())))
             }
             ResourceKind::Writer => drop_named(&mut state.writers, name, "Writer"),
@@ -6997,8 +7108,13 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             if keyword(1).as_deref() == Some("HISTORY") {
                 expect_keyword(&tokens, 2, "POLICY")?;
                 expect_keyword(&tokens, 3, "ON")?;
-                let scope = parse_history_policy_scope(&tokens, 4)?;
+                let scope = parse_policy_scope(&tokens, 4, "HISTORY POLICY")?;
                 return Ok(Command::ClearHistoryPolicy { scope });
+            }
+            if keyword(1).as_deref() == Some("SCHEMA") {
+                expect_keyword(&tokens, 2, "ON")?;
+                let scope = parse_policy_scope(&tokens, 3, "SCHEMA")?;
+                return Ok(Command::ClearSchema { scope });
             }
             Ok(Command::Drop {
                 kind: parse_resource_kind(token(&tokens, 1)?)?,
@@ -7015,6 +7131,8 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             } else if token(&tokens, 1)?.eq_ignore_ascii_case("API") {
                 expect_keyword(&tokens, 2, "KEYS")?;
                 ShowKind::ApiKeys
+            } else if token(&tokens, 1)?.eq_ignore_ascii_case("SCHEMAS") {
+                ShowKind::Schemas
             } else {
                 parse_show_kind(token(&tokens, 1)?)?
             },
@@ -7154,13 +7272,13 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 capacity,
             })
         }
-        Some("SET") => {
+        Some("SET") => match keyword(1).as_deref() {
             // SET HISTORY POLICY ON DOMAIN|FEED <name>
             //     (TIER AFTER <dur> | EXPIRE AFTER <dur> | MAX RETAINED BYTES <n>)+
-            expect_keyword(&tokens, 1, "HISTORY")?;
+            Some("HISTORY") => {
             expect_keyword(&tokens, 2, "POLICY")?;
             expect_keyword(&tokens, 3, "ON")?;
-            let scope = parse_history_policy_scope(&tokens, 4)?;
+            let scope = parse_policy_scope(&tokens, 4, "HISTORY POLICY")?;
             let mut position = 6;
             if position >= tokens.len() {
                 return Err(ControlError::Syntax(
@@ -7208,7 +7326,47 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 }
             }
             Ok(Command::SetHistoryPolicy { scope, policy })
-        }
+            }
+            // SET SCHEMA ON DOMAIN|FEED <name>
+            //     (KEY <format> [SUBJECT <s>] [DEFINITION <text>] |
+            //      VALUE <format> [SUBJECT <s>] [DEFINITION <text>])+
+            Some("SCHEMA") => {
+                expect_keyword(&tokens, 2, "ON")?;
+                let scope = parse_policy_scope(&tokens, 3, "SCHEMA")?;
+                let mut position = 5;
+                if position >= tokens.len() {
+                    return Err(ControlError::Syntax(
+                        "SET SCHEMA requires at least one of KEY <format> or VALUE <format>"
+                            .to_owned(),
+                    ));
+                }
+                let mut schema = FeedSchema::default();
+                while position < tokens.len() {
+                    let side = token(&tokens, position)?.to_ascii_uppercase();
+                    match side.as_str() {
+                        "KEY" | "VALUE" => {
+                            let (decl, next) = parse_schema_decl(&tokens, position + 1)?;
+                            if side == "KEY" {
+                                schema.key = Some(decl);
+                            } else {
+                                schema.value = Some(decl);
+                            }
+                            position = next;
+                        }
+                        other => {
+                            return Err(ControlError::Syntax(format!(
+                                "SET SCHEMA accepts KEY <format> or VALUE <format> clauses, not {other}"
+                            )))
+                        }
+                    }
+                }
+                Ok(Command::SetSchema { scope, schema })
+            }
+            other => Err(ControlError::Syntax(format!(
+                "SET accepts HISTORY POLICY or SCHEMA, not {}",
+                other.unwrap_or("<missing>")
+            ))),
+        },
         Some("DESCRIBE") => Ok(Command::Describe {
             kind: parse_resource_kind(token(&tokens, 1)?)?,
             name: token(&tokens, 2)?.to_owned(),
@@ -7470,20 +7628,21 @@ fn parse_duration_ns(token: &str) -> Result<u64, ControlError> {
 }
 
 /// `ON DOMAIN <name>` or `ON FEED <name>` — the shared scope clause
-/// `SET HISTORY POLICY` and `DROP HISTORY POLICY` both parse.
-fn parse_history_policy_scope(
+/// `SET`/`DROP` policy and schema statements both parse.
+fn parse_policy_scope(
     tokens: &[String],
     position: usize,
-) -> Result<HistoryPolicyScope, ControlError> {
+    context: &str,
+) -> Result<PolicyScope, ControlError> {
     match token(tokens, position)?.to_ascii_uppercase().as_str() {
-        "DOMAIN" | "SPACE" => Ok(HistoryPolicyScope::Domain {
+        "DOMAIN" | "SPACE" => Ok(PolicyScope::Domain {
             name: token(tokens, position + 1)?.to_owned(),
         }),
-        "FEED" => Ok(HistoryPolicyScope::Feed {
+        "FEED" => Ok(PolicyScope::Feed {
             name: token(tokens, position + 1)?.to_owned(),
         }),
         other => Err(ControlError::Syntax(format!(
-            "HISTORY POLICY scope is ON DOMAIN <name> or ON FEED <name>, not ON {other}"
+            "{context} scope is ON DOMAIN <name> or ON FEED <name>, not ON {other}"
         ))),
     }
 }
@@ -7506,19 +7665,133 @@ fn validate_history_policy(policy: &HistoryPolicy) -> Result<(), ControlError> {
     Ok(())
 }
 
+/// `KEY|VALUE <format> [SUBJECT <name>] [DEFINITION <text>]` — one
+/// schema clause `SET SCHEMA` parses; returns the decl and the
+/// position after it.
+fn parse_schema_decl(
+    tokens: &[String],
+    position: usize,
+) -> Result<(SchemaDecl, usize), ControlError> {
+    let mut position = position;
+    let format = match token(tokens, position)?.to_ascii_uppercase().as_str() {
+        "JSON" => "json".to_owned(),
+        "JSONSCHEMA" => "jsonschema".to_owned(),
+        "AVRO" => "avro".to_owned(),
+        "PROTOBUF" => "protobuf".to_owned(),
+        "TEXT" => "text".to_owned(),
+        "BYTES" => "bytes".to_owned(),
+        "CUSTOM" => {
+            let name = token(tokens, position + 1)?.to_ascii_lowercase();
+            validate_schema_format_name(&name)?;
+            position += 1;
+            format!("custom.{name}")
+        }
+        other => {
+            return Err(ControlError::Syntax(format!(
+                "schema format is JSON, JSONSCHEMA, AVRO, PROTOBUF, TEXT, BYTES, or CUSTOM <name>, not {other}"
+            )))
+        }
+    };
+    position += 1;
+    let mut decl = SchemaDecl {
+        format,
+        ..SchemaDecl::default()
+    };
+    while position < tokens.len() {
+        match token(tokens, position)?.to_ascii_uppercase().as_str() {
+            "SUBJECT" => {
+                decl.subject = Some(token(tokens, position + 1)?.to_owned());
+                position += 2;
+            }
+            "DEFINITION" => {
+                decl.definition = Some(token(tokens, position + 1)?.to_owned());
+                position += 2;
+            }
+            _ => break,
+        }
+    }
+    Ok((decl, position))
+}
+
+/// `custom.<name>` format names keep the explainable lowercase
+/// grammar so catalog rows stay greppable.
+fn validate_schema_format_name(name: &str) -> Result<(), ControlError> {
+    let valid = !name.is_empty()
+        && name.len() <= 128
+        && name.chars().all(|c| {
+            c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_' || c == '-'
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(ControlError::InvalidOperation(format!(
+            "custom schema format name '{name}' must be 1-128 lowercase alnum/./_/- characters"
+        )))
+    }
+}
+
+/// A declared schema must name at least one side; every declared
+/// `format` is a built-in or a well-formed `custom.<name>` — typed
+/// commands validate here since they bypass the WCL parser.
+fn validate_feed_schema(schema: &FeedSchema) -> Result<(), ControlError> {
+    if schema.is_empty() {
+        return Err(ControlError::InvalidOperation(
+            "SET SCHEMA requires at least one of KEY <format> or VALUE <format> — use DROP SCHEMA to revert to inheritance"
+                .to_owned(),
+        ));
+    }
+    for decl in [&schema.key, &schema.value].into_iter().flatten() {
+        let builtin = matches!(
+            decl.format.as_str(),
+            "json" | "jsonschema" | "avro" | "protobuf" | "text" | "bytes"
+        );
+        let custom = decl
+            .format
+            .strip_prefix("custom.")
+            .is_some_and(|name| validate_schema_format_name(name).is_ok());
+        if !builtin && !custom {
+            return Err(ControlError::InvalidOperation(format!(
+                "unknown schema format '{}'",
+                decl.format
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The schema a Feed surface actually reports: the Feed's declared
+/// override layered side-by-side over its Domain's — `None` when
+/// nothing is declared anywhere (schema-agnostic bytes).
+fn effective_schema(state: &CatalogState, feed: &FeedDefinition) -> Option<FeedSchema> {
+    let domain = state
+        .schemas
+        .get(&feed.space_id)
+        .map(|assignment| &assignment.schema);
+    let own = state
+        .schemas
+        .get(&feed.feed_id)
+        .map(|assignment| &assignment.schema);
+    match (own, domain) {
+        (Some(own), Some(domain)) => Some(own.layered_over(domain)),
+        (Some(own), None) => Some(own.clone()),
+        (None, Some(domain)) => Some(domain.clone()),
+        (None, None) => None,
+    }
+}
+
 /// Resolve a scope's name to its live definition: the row keys on the
-/// definition id so renames keep the policy and dropped resources
-/// refuse further policy edits.
-fn resolve_history_target(
+/// definition id so renames keep the assignment and dropped resources
+/// refuse further edits.
+fn resolve_policy_target(
     state: &CatalogState,
-    scope: &HistoryPolicyScope,
+    scope: &PolicyScope,
 ) -> Result<(&'static str, Uuid, String), ControlError> {
     match scope {
-        HistoryPolicyScope::Domain { name } => {
+        PolicyScope::Domain { name } => {
             let space = active_space(state, name)?;
             Ok(("Domain", space.space_id, space.name.clone()))
         }
-        HistoryPolicyScope::Feed { name } => {
+        PolicyScope::Feed { name } => {
             let feed = active_feed(state, name)?;
             Ok(("Feed", feed.feed_id, feed.name.clone()))
         }
@@ -8364,6 +8637,15 @@ fn show_resources(
             .feeds
             .values()
             .filter(|item| item.status == ResourceStatus::Active)
+            .map(|item| {
+                let mut row = serde_json::to_value(item).unwrap_or_else(|_| json!({}));
+                row["schema"] = json!(state
+                    .schemas
+                    .get(&item.feed_id)
+                    .map(|assignment| assignment.schema.clone()));
+                row["effective_schema"] = json!(effective_schema(state, item));
+                row
+            })
             .collect::<Vec<_>>()),
         ShowKind::Writers => json!(state
             .writers
@@ -8422,6 +8704,7 @@ fn show_resources(
             .filter(|item| item.stage != StateStoreStage::Dropped)
             .collect::<Vec<_>>()),
         ShowKind::HistoryPolicies => json!(state.history_policies.values().collect::<Vec<_>>()),
+        ShowKind::Schemas => json!(state.schemas.values().collect::<Vec<_>>()),
         ShowKind::Roles => json!(state
             .roles
             .values()
@@ -8486,6 +8769,10 @@ fn describe_resource(
                 .history_policies
                 .get(&space.space_id)
                 .map(|assignment| assignment.policy.clone()));
+            value["schema"] = json!(state
+                .schemas
+                .get(&space.space_id)
+                .map(|assignment| assignment.schema.clone()));
             Ok(value)
         }
         ResourceKind::Feed => {
@@ -8496,6 +8783,11 @@ fn describe_resource(
                 .get(&feed.feed_id)
                 .map(|assignment| assignment.policy.clone()));
             value["effective_history_policy"] = json!(effective_history_policy(state, feed));
+            value["schema"] = json!(state
+                .schemas
+                .get(&feed.feed_id)
+                .map(|assignment| assignment.schema.clone()));
+            value["effective_schema"] = json!(effective_schema(state, feed));
             Ok(value)
         }
         ResourceKind::Writer => state
@@ -9027,6 +9319,8 @@ fn command_label(command: &Command) -> String {
         Command::ReportStorageNodeCapacity { .. } => "REPORT STORAGE NODE CAPACITY",
         Command::SetHistoryPolicy { .. } => "SET HISTORY POLICY",
         Command::ClearHistoryPolicy { .. } => "DROP HISTORY POLICY",
+        Command::SetSchema { .. } => "SET SCHEMA",
+        Command::ClearSchema { .. } => "DROP SCHEMA",
     }
     .to_owned()
 }
@@ -9060,6 +9354,7 @@ fn show_name(kind: &ShowKind) -> &'static str {
         ShowKind::ApiKeys => "API Keys",
         ShowKind::StorageNodes => "Storage Nodes",
         ShowKind::HistoryPolicies => "History Policies",
+        ShowKind::Schemas => "Schemas",
     }
 }
 
@@ -13528,7 +13823,7 @@ mod tests {
         assert!(matches!(
             &commands[0],
             Command::SetHistoryPolicy {
-                scope: HistoryPolicyScope::Domain { name },
+                scope: PolicyScope::Domain { name },
                 policy
             } if name == "orders"
                 && policy.tier_after_ns == Some(30 * 60 * 1_000_000_000)
@@ -13538,7 +13833,7 @@ mod tests {
         assert!(matches!(
             &commands[1],
             Command::SetHistoryPolicy {
-                scope: HistoryPolicyScope::Feed { name },
+                scope: PolicyScope::Feed { name },
                 policy
             } if name == "orders.events"
                 && policy.tier_after_ns.is_none()
@@ -13548,13 +13843,13 @@ mod tests {
         assert!(matches!(
             &commands[2],
             Command::ClearHistoryPolicy {
-                scope: HistoryPolicyScope::Feed { name }
+                scope: PolicyScope::Feed { name }
             } if name == "orders.events"
         ));
         assert!(matches!(
             &commands[3],
             Command::ClearHistoryPolicy {
-                scope: HistoryPolicyScope::Domain { name }
+                scope: PolicyScope::Domain { name }
             } if name == "orders"
         ));
         assert!(matches!(
@@ -13679,7 +13974,7 @@ mod tests {
         // mistyped statement cannot masquerade as a cleared override.
         assert!(leader
             .execute_commands(vec![Command::SetHistoryPolicy {
-                scope: HistoryPolicyScope::Feed {
+                scope: PolicyScope::Feed {
                     name: "orders.events".to_owned(),
                 },
                 policy: HistoryPolicy::default(),
@@ -13688,7 +13983,7 @@ mod tests {
             .is_err());
         assert!(leader
             .execute_commands(vec![Command::SetHistoryPolicy {
-                scope: HistoryPolicyScope::Feed {
+                scope: PolicyScope::Feed {
                     name: "orders.events".to_owned(),
                 },
                 policy: HistoryPolicy {
@@ -13718,6 +14013,227 @@ mod tests {
             .await
             .is_err());
         let shown = leader.execute("SHOW HISTORY POLICIES;").await.unwrap();
+        let rows: Vec<Value> = serde_json::from_value(shown.results[0].data.clone()).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn schema_wcl_parses_set_drop_and_show() {
+        let commands = parse_wcl(
+            "SET SCHEMA ON DOMAIN orders VALUE JSON SUBJECT 'order-v1';              SET SCHEMA ON FEED orders.events KEY TEXT VALUE PROTOBUF SUBJECT 'com.acme.Order';              SET SCHEMA ON FEED orders.events VALUE CUSTOM msgpack;              DROP SCHEMA ON FEED orders.events;              DROP SCHEMA ON DOMAIN orders;              SHOW SCHEMAS;",
+        )
+        .unwrap();
+        assert_eq!(commands.len(), 6);
+        assert!(matches!(
+            &commands[0],
+            Command::SetSchema {
+                scope: PolicyScope::Domain { name },
+                schema
+            } if name == "orders"
+                && schema.value.as_ref().is_some_and(|decl| decl.format == "json"
+                    && decl.subject.as_deref() == Some("order-v1"))
+                && schema.key.is_none()
+        ));
+        assert!(matches!(
+            &commands[1],
+            Command::SetSchema {
+                scope: PolicyScope::Feed { name },
+                schema
+            } if name == "orders.events"
+                && schema.key.as_ref().is_some_and(|decl| decl.format == "text")
+                && schema.value.as_ref().is_some_and(|decl| decl.format == "protobuf"
+                    && decl.subject.as_deref() == Some("com.acme.Order"))
+        ));
+        assert!(matches!(
+            &commands[2],
+            Command::SetSchema {
+                scope: PolicyScope::Feed { name },
+                schema
+            } if name == "orders.events"
+                && schema.value.as_ref().is_some_and(|decl| decl.format == "custom.msgpack")
+        ));
+        assert!(matches!(
+            &commands[3],
+            Command::ClearSchema {
+                scope: PolicyScope::Feed { name }
+            } if name == "orders.events"
+        ));
+        assert!(matches!(
+            &commands[4],
+            Command::ClearSchema {
+                scope: PolicyScope::Domain { name }
+            } if name == "orders"
+        ));
+        assert!(matches!(
+            &commands[5],
+            Command::Show {
+                kind: ShowKind::Schemas
+            }
+        ));
+        for bad in [
+            "SET SCHEMA ON FEED orders.events;",
+            "SET SCHEMA ON orders VALUE JSON;",
+            "SET SCHEMA ON FEED orders.events VALUE;",
+            "SET SCHEMA ON FEED orders.events VALUE YAML;",
+            "SET SCHEMA ON FEED orders.events VALUE JSON GARBAGE 'x';",
+            "SET SCHEMA ON FEED orders.events VALUE CUSTOM 'Bad Name';",
+            "DROP SCHEMA ON FEED;",
+            "DROP SCHEMA orders.events;",
+            "SHOW SCHEMA;",
+        ] {
+            assert!(parse_wcl(bad).is_err(), "{bad} must not parse");
+        }
+    }
+
+    #[tokio::test]
+    async fn schema_lifecycle_inherits_overrides_and_survives_reopen() {
+        let directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader
+            .execute("CREATE DOMAIN orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        leader
+            .execute("SET SCHEMA ON DOMAIN orders VALUE JSON SUBJECT 'order-v1';")
+            .await
+            .unwrap();
+        leader
+            .execute("SET SCHEMA ON FEED orders.events KEY TEXT;")
+            .await
+            .unwrap();
+
+        // The Feed override layers over the Domain's: key from the
+        // Feed, value inherited.
+        let described = leader
+            .execute("DESCRIBE FEED orders.events;")
+            .await
+            .unwrap();
+        let detail = &described.results[0].data;
+        assert_eq!(detail["schema"]["key"]["format"], json!("text"));
+        assert!(detail["schema"]["value"].is_null());
+        assert_eq!(detail["effective_schema"]["key"]["format"], json!("text"));
+        assert_eq!(detail["effective_schema"]["value"]["format"], json!("json"));
+        assert_eq!(
+            detail["effective_schema"]["value"]["subject"],
+            json!("order-v1")
+        );
+
+        // SHOW FEEDS rows carry the same declared + effective schema —
+        // the Domain snapshot SDKs build on.
+        let shown = leader.execute("SHOW FEEDS;").await.unwrap();
+        let rows: Vec<Value> = serde_json::from_value(shown.results[0].data.clone()).unwrap();
+        let feed_row = rows
+            .iter()
+            .find(|row| row["name"] == "orders.events")
+            .unwrap();
+        assert_eq!(feed_row["effective_schema"]["key"]["format"], json!("text"));
+
+        let schemas = leader.execute("SHOW SCHEMAS;").await.unwrap();
+        let rows: Vec<Value> = serde_json::from_value(schemas.results[0].data.clone()).unwrap();
+        assert_eq!(rows.len(), 2);
+
+        // Catalog state survives a controller reopen — a synced replica
+        // resolves the same effective schema.
+        drop(leader);
+        let reopened = new_controller(&directory);
+        let described = reopened
+            .execute("DESCRIBE FEED orders.events;")
+            .await
+            .unwrap();
+        assert_eq!(
+            described.results[0].data["effective_schema"]["key"]["format"],
+            json!("text")
+        );
+
+        // Renaming the Feed keeps its schema — rows key on the id.
+        reopened
+            .execute("RENAME FEED orders.events TO orders.audit;")
+            .await
+            .unwrap();
+        let described = reopened
+            .execute("DESCRIBE FEED orders.audit;")
+            .await
+            .unwrap();
+        assert_eq!(
+            described.results[0].data["effective_schema"]["key"]["format"],
+            json!("text")
+        );
+
+        // Clearing reverts the Feed to pure Domain inheritance.
+        reopened
+            .execute("DROP SCHEMA ON FEED orders.audit;")
+            .await
+            .unwrap();
+        let described = reopened
+            .execute("DESCRIBE FEED orders.audit;")
+            .await
+            .unwrap();
+        assert!(described.results[0].data["schema"].is_null());
+        assert_eq!(
+            described.results[0].data["effective_schema"]["value"]["format"],
+            json!("json")
+        );
+        assert!(reopened
+            .execute("DROP SCHEMA ON FEED orders.audit;")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn schema_refuses_empty_invalid_and_dropped_targets() {
+        let directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader
+            .execute("CREATE DOMAIN orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        // An all-absent schema is a no-op declaration — refuse it.
+        assert!(leader
+            .execute_commands(vec![Command::SetSchema {
+                scope: PolicyScope::Feed {
+                    name: "orders.events".to_owned(),
+                },
+                schema: FeedSchema::default(),
+            }])
+            .await
+            .is_err());
+        // An unknown format is refused by typed commands too — they
+        // bypass the WCL parser.
+        assert!(leader
+            .execute_commands(vec![Command::SetSchema {
+                scope: PolicyScope::Feed {
+                    name: "orders.events".to_owned(),
+                },
+                schema: FeedSchema {
+                    value: Some(SchemaDecl {
+                        format: "yaml".to_owned(),
+                        ..SchemaDecl::default()
+                    }),
+                    ..FeedSchema::default()
+                },
+            }])
+            .await
+            .is_err());
+        for statement in [
+            "SET SCHEMA ON DOMAIN missing VALUE JSON;",
+            "SET SCHEMA ON FEED orders.missing VALUE JSON;",
+            "DROP SCHEMA ON DOMAIN missing;",
+            "DROP SCHEMA ON FEED orders.missing;",
+        ] {
+            assert!(leader.execute(statement).await.is_err(), "{statement}");
+        }
+        // A dropped Feed cannot take a new schema, and its row leaves
+        // with it.
+        leader
+            .execute("SET SCHEMA ON FEED orders.events VALUE JSON;")
+            .await
+            .unwrap();
+        leader.execute("DROP FEED orders.events;").await.unwrap();
+        assert!(leader
+            .execute("SET SCHEMA ON FEED orders.events VALUE JSON;")
+            .await
+            .is_err());
+        let shown = leader.execute("SHOW SCHEMAS;").await.unwrap();
         let rows: Vec<Value> = serde_json::from_value(shown.results[0].data.clone()).unwrap();
         assert!(rows.is_empty());
     }

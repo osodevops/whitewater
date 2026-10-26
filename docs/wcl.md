@@ -673,11 +673,111 @@ SHOW INDEXES;
 
 SHOW STATESTORES;
 
+SHOW HISTORY POLICIES;
+
+SHOW SCHEMAS;
+
 ```
 
 
 
 Dropped resources are excluded from `SHOW` results.
+
+
+
+## History Policy
+
+
+
+A History Policy declares how long a sealed segment stays hot-local,
+
+when retained history expires entirely, and an optional per-range
+
+retained byte ceiling. Every field inherits independently: a Domain's
+
+policy is the default for every Feed it owns, and a Feed override
+
+supplies only the fields it names.
+
+
+
+```sql
+
+SET HISTORY POLICY ON DOMAIN orders TIER AFTER 30m EXPIRE AFTER 7d;
+
+SET HISTORY POLICY ON FEED orders.events EXPIRE AFTER 14d;
+
+DROP HISTORY POLICY ON FEED orders.events;
+
+SHOW HISTORY POLICIES;
+
+```
+
+
+
+`DESCRIBE DOMAIN|FEED` reports the declared override plus the resolved
+
+`effective_history_policy`. `TIER AFTER` gates when a sealed segment
+
+becomes eligible to tier; `EXPIRE AFTER` and `MAX RETAINED BYTES` are
+
+declared and durable now while their deletion mechanics land with the
+
+retention workstream. Renames keep the policy, drops cascade it, and
+
+empty or all-absent policies refuse — use `DROP` to revert to
+
+inheritance.
+
+
+
+## Record schema metadata
+
+
+
+A Feed may declare the schema record keys and payloads carry — the
+
+format applications write and readers decode. Storage stays
+
+schema-neutral bytes; the declaration is catalog metadata tooling and
+
+SDKs read to resolve formats without re-declaring types. A Domain
+
+declaration is the inherited default; a Feed override supplies only
+
+the sides it names (`KEY` and `VALUE` inherit independently):
+
+
+
+```sql
+
+SET SCHEMA ON DOMAIN orders VALUE JSON SUBJECT 'order-v1';
+
+SET SCHEMA ON FEED orders.events KEY TEXT VALUE PROTOBUF
+
+  SUBJECT 'com.acme.Order' DEFINITION 'syntax = "proto3"; ...';
+
+SET SCHEMA ON FEED orders.events VALUE CUSTOM msgpack;
+
+DROP SCHEMA ON FEED orders.events;
+
+SHOW SCHEMAS;
+
+```
+
+
+
+Formats are `JSON`, `JSONSCHEMA`, `AVRO`, `PROTOBUF`, `TEXT`, `BYTES`,
+
+or `CUSTOM <name>`. `DESCRIBE DOMAIN` reports the declared default;
+
+`DESCRIBE FEED` and `SHOW FEEDS` report both the declared `schema` and
+
+the resolved `effective_schema` (null when nothing is declared —
+
+schema-agnostic bytes). Renames keep the declaration, drops cascade
+
+it, and unknown formats or all-absent declarations refuse.
 
 
 
