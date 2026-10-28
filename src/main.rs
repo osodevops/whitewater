@@ -265,7 +265,16 @@ async fn main() -> Result<()> {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|elapsed| elapsed.as_nanos() as i64)
                     .unwrap_or(0);
-                let sweep = service.retention_sweep(&policies, objects, now).await;
+                let held = policy_control.legal_hold_feed_ids().await;
+                let sweep = service
+                    .retention_sweep(&policies, &held, objects, now)
+                    .await;
+                if sweep.held_ranges > 0 {
+                    tracing::info!(
+                        held = sweep.held_ranges,
+                        "history retention sweep skipped legal-held ranges"
+                    );
+                }
                 if !sweep.skipped.is_empty() {
                     tracing::warn!(
                         deleted = sweep.deleted_segments,

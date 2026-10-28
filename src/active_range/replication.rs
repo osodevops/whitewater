@@ -242,6 +242,10 @@ pub struct RangeReadSpec<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct RetentionSweepReport {
     pub ranges_scanned: u64,
+    /// Ranges skipped because their Feed is frozen by a legal hold —
+    /// counted separately from errors so an operator can see the
+    /// freeze working.
+    pub held_ranges: u64,
     pub deleted_segments: u64,
     pub reclaimed_bytes: u64,
     pub skipped: Vec<String>,
@@ -339,6 +343,7 @@ impl ReplicaAppendService {
     pub async fn retention_sweep(
         &self,
         policies: &HashMap<Uuid, crate::control::HistoryPolicy>,
+        legal_holds: &HashSet<Uuid>,
         objects: Option<Arc<dyn super::tier::ObjectStore>>,
         now: i64,
     ) -> RetentionSweepReport {
@@ -352,6 +357,12 @@ impl ReplicaAppendService {
                 None => continue,
             };
             report.ranges_scanned += 1;
+            // A legal hold freezes every destruction path: neither
+            // expiry nor the byte budget may touch this Feed's history.
+            if legal_holds.contains(&persisted.feed_id) {
+                report.held_ranges += 1;
+                continue;
+            }
             let Some(policy) = policies.get(&persisted.feed_id).cloned() else {
                 continue;
             };

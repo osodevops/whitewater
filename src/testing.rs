@@ -187,6 +187,8 @@ struct FakeRiverbed {
     indexes: BTreeMap<String, Value>,
     /// `"domain:<name>"`/`"feed:<name>"` -> declared policy override.
     history_policies: BTreeMap<String, crate::control::HistoryPolicy>,
+    /// Feed name -> declared legal hold (the mock fences DROP FEED on it).
+    legal_holds: BTreeMap<String, crate::control::LegalHold>,
     /// `"domain:<name>"`/`"feed:<name>"` -> declared schema override.
     schemas: BTreeMap<String, crate::control::FeedSchema>,
     revision: u64,
@@ -855,6 +857,26 @@ impl FakeRiverbed {
                 }
                 Ok((format!("cleared History Policy on {key}"), json!({})))
             }
+            Command::SetLegalHold { feed, reason } => {
+                let feed_row = self
+                    .feeds
+                    .get(feed.as_str())
+                    .ok_or_else(|| ControlError::NotFound(format!("Feed {feed}")))?;
+                let hold = crate::control::LegalHold {
+                    feed_id: feed_row.feed_id,
+                    name: feed.clone(),
+                    reason: reason.clone(),
+                    set_at_ns: 0,
+                };
+                self.legal_holds.insert(feed.clone(), hold.clone());
+                Ok((format!("set legal hold on Feed {feed}"), json!(hold)))
+            }
+            Command::DropLegalHold { feed } => {
+                if self.legal_holds.remove(feed.as_str()).is_none() {
+                    return Err(ControlError::NotFound(format!("legal hold on Feed {feed}")));
+                }
+                Ok((format!("dropped legal hold on Feed {feed}"), json!({})))
+            }
             Command::SetSchema { scope, schema } => {
                 let key = match &scope {
                     crate::control::PolicyScope::Domain { name } => {
@@ -914,7 +936,14 @@ impl FakeRiverbed {
     ) -> Result<(String, Value), ControlError> {
         let removed = match kind {
             ResourceKind::Domain | ResourceKind::Space => self.domains.remove(name).is_some(),
-            ResourceKind::Feed => self.feeds.remove(name).is_some(),
+            ResourceKind::Feed => {
+                if self.legal_holds.contains_key(name) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "drop the legal hold on Feed {name} before dropping it"
+                    )));
+                }
+                self.feeds.remove(name).is_some()
+            }
             ResourceKind::Writer => self.writers.remove(name).is_some(),
             ResourceKind::Reader => self.readers.remove(name).is_some(),
             ResourceKind::Subscription => self.subscriptions.remove(name).is_some(),
@@ -1055,6 +1084,7 @@ impl FakeRiverbed {
                 .iter()
                 .map(|(name, policy)| json!({ "name": name, "policy": policy }))
                 .collect::<Vec<_>>()),
+            ShowKind::LegalHolds => json!(self.legal_holds.values().collect::<Vec<_>>()),
             ShowKind::Schemas => json!(self
                 .schemas
                 .iter()
@@ -2196,6 +2226,8 @@ fn command_label(command: &Command) -> &'static str {
         Command::SeekSubscription { .. } => "SEEK SUBSCRIPTION",
         Command::SetHistoryPolicy { .. } => "SET HISTORY POLICY",
         Command::ClearHistoryPolicy { .. } => "DROP HISTORY POLICY",
+        Command::SetLegalHold { .. } => "SET LEGAL HOLD",
+        Command::DropLegalHold { .. } => "DROP LEGAL HOLD",
         Command::SetSchema { .. } => "SET SCHEMA",
         Command::ClearSchema { .. } => "DROP SCHEMA",
         _ => "COMMAND",
@@ -2218,6 +2250,7 @@ fn show_label(kind: &ShowKind) -> &'static str {
         ShowKind::Indexes => "INDEXES",
         ShowKind::StateStores => "STATESTORES",
         ShowKind::HistoryPolicies => "HISTORY POLICIES",
+        ShowKind::LegalHolds => "LEGAL HOLDS",
         ShowKind::Schemas => "SCHEMAS",
     }
 }

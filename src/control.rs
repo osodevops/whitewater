@@ -114,6 +114,25 @@ pub struct HistoryPolicyAssignment {
     pub updated_at_ns: i64,
 }
 
+/// A legal hold freezes all destruction of a Feed's retained history:
+/// expiry, byte-budget trimming, cryptographic erasure, and `DROP FEED`
+/// all refuse while one exists. The row keys on the immutable FeedId so
+/// `RENAME FEED` cannot evade it, and the free-text reason is the
+/// audit-facing matter reference an operator reads back under
+/// `SHOW LEGAL HOLDS` or `DESCRIBE FEED`. Dropping the hold is the
+/// explicit unfreeze step — a hold is never inherited, cascaded, or
+/// removed implicitly.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LegalHold {
+    pub feed_id: Uuid,
+    /// The Feed's name when the hold was last (re)declared — display
+    /// convenience only; `feed_id` is the identity that fences.
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub set_at_ns: i64,
+}
+
 /// One side of a declared record schema: the wire format applications
 /// write and readers decode, plus the registry-style locator tooling
 /// resolves definitions through. Descriptive metadata only — the
@@ -1143,6 +1162,9 @@ struct CatalogState {
     /// row so renames keep the policy and drops cascade it away.
     #[serde(default)]
     history_policies: BTreeMap<Uuid, HistoryPolicyAssignment>,
+    /// Legal holds keyed by FeedId — the freeze that every history-
+    /// destruction path consults before deleting retained bytes.
+    legal_holds: BTreeMap<Uuid, LegalHold>,
     /// Declared record schema metadata keyed the same way — a
     /// `space_id` carries the Domain default; a `feed_id` overrides it.
     #[serde(default)]
@@ -1218,6 +1240,7 @@ impl Default for CatalogState {
             grants: BTreeMap::new(),
             api_keys: BTreeMap::new(),
             history_policies: BTreeMap::new(),
+            legal_holds: BTreeMap::new(),
             schemas: BTreeMap::new(),
             active_ranges: BTreeMap::new(),
             range_maps: BTreeMap::new(),
@@ -1267,6 +1290,7 @@ pub enum ShowKind {
     ApiKeys,
     StorageNodes,
     HistoryPolicies,
+    LegalHolds,
     Schemas,
     Pipes,
     Indexes,
@@ -1536,6 +1560,18 @@ pub enum Command {
     /// inheritance (Domains revert to built-in defaults).
     ClearHistoryPolicy {
         scope: PolicyScope,
+    },
+    /// Declare a legal hold on a Feed: expiry, byte-budget deletion,
+    /// cryptographic erasure, and `DROP FEED` all refuse while it
+    /// stands. Re-declaring refreshes the reason and timestamp.
+    SetLegalHold {
+        feed: String,
+        reason: Option<String>,
+    },
+    /// Remove a declared legal hold — the explicit unfreeze step an
+    /// operator runs before any destructive operation resumes.
+    DropLegalHold {
+        feed: String,
     },
     /// Upsert declared record schema metadata on a Domain or Feed —
     /// field-level override of the inherited declaration.
@@ -2716,6 +2752,21 @@ impl ControlController {
             .get(&feed_id)
             .filter(|feed| feed.status == ResourceStatus::Active)
             .map(|feed| effective_history_policy(&state, feed))
+    }
+
+    /// The Feeds currently frozen by legal holds, by immutable FeedId —
+    /// the set every history-destruction sweep consults before deleting
+    /// retained bytes. Tombstoned definitions keep their holds so a drop
+    /// race cannot unfreeze evidence.
+    pub async fn legal_hold_feed_ids(&self) -> std::collections::HashSet<Uuid> {
+        let state = self.state.lock().await;
+        state.legal_holds.keys().copied().collect()
+    }
+
+    /// The declared legal hold on `feed_id`, for DESCRIBE output.
+    pub async fn legal_hold_for_feed(&self, feed_id: Uuid) -> Option<LegalHold> {
+        let state = self.state.lock().await;
+        state.legal_holds.get(&feed_id).cloned()
     }
 
     pub(crate) async fn active_reader_frontier(&self, reader_id: Uuid) -> Option<ReaderFrontier> {
@@ -4316,6 +4367,36 @@ impl ControlController {
                             "History Policy on {scope_kind} {name}"
                         ))
                     })
+            }
+            Command::SetLegalHold { feed, reason } => {
+                let (feed_id, feed_name) = {
+                    let resolved = active_feed(state, &feed)?;
+                    (resolved.feed_id, resolved.name.clone())
+                };
+                let hold = LegalHold {
+                    feed_id,
+                    name: feed_name.clone(),
+                    reason,
+                    set_at_ns: issued_at_ns,
+                };
+                state.legal_holds.insert(feed_id, hold.clone());
+                Ok((format!("set legal hold on Feed {feed_name}"), json!(hold)))
+            }
+            Command::DropLegalHold { feed } => {
+                let (feed_id, feed_name) = {
+                    let resolved = active_feed(state, &feed)?;
+                    (resolved.feed_id, resolved.name.clone())
+                };
+                state
+                    .legal_holds
+                    .remove(&feed_id)
+                    .map(|hold| {
+                        (
+                            format!("dropped legal hold on Feed {feed_name}"),
+                            json!(hold),
+                        )
+                    })
+                    .ok_or_else(|| ControlError::NotFound(format!("legal hold on Feed {feed}")))
             }
             Command::SetSchema { scope, schema } => {
                 validate_feed_schema(&schema)?;
@@ -6160,6 +6241,14 @@ impl ControlController {
         match kind {
             ResourceKind::Feed => {
                 let feed_id = active_feed(state, name)?.feed_id;
+                // A legal hold outranks every other drop precondition:
+                // destroying the definition while history is frozen is
+                // the audit bypass the hold exists to prevent.
+                if state.legal_holds.contains_key(&feed_id) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "drop the legal hold on Feed {name} before dropping it"
+                    )));
+                }
                 if state
                     .writers
                     .values()
@@ -6197,6 +6286,7 @@ impl ControlController {
                     members.remove(&feed_id);
                 }
                 state.history_policies.remove(&feed_id);
+                state.legal_holds.remove(&feed_id);
                 state.schemas.remove(&feed_id);
                 Ok((
                     format!("dropped Feed {name} without purging stored history"),
@@ -7105,6 +7195,14 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
         Some("DROP") => {
             // DROP HISTORY POLICY ON DOMAIN|FEED <name> removes the
             // declared override; every other DROP stays resource-named.
+            if keyword(1).as_deref() == Some("LEGAL") {
+                expect_keyword(&tokens, 2, "HOLD")?;
+                expect_keyword(&tokens, 3, "ON")?;
+                expect_keyword(&tokens, 4, "FEED")?;
+                return Ok(Command::DropLegalHold {
+                    feed: token(&tokens, 5)?.to_owned(),
+                });
+            }
             if keyword(1).as_deref() == Some("HISTORY") {
                 expect_keyword(&tokens, 2, "POLICY")?;
                 expect_keyword(&tokens, 3, "ON")?;
@@ -7125,6 +7223,9 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             kind: if token(&tokens, 1)?.eq_ignore_ascii_case("HISTORY") {
                 expect_keyword(&tokens, 2, "POLICIES")?;
                 ShowKind::HistoryPolicies
+            } else if token(&tokens, 1)?.eq_ignore_ascii_case("LEGAL") {
+                expect_keyword(&tokens, 2, "HOLDS")?;
+                ShowKind::LegalHolds
             } else if token(&tokens, 1)?.eq_ignore_ascii_case("STORAGE") {
                 expect_keyword(&tokens, 2, "NODES")?;
                 ShowKind::StorageNodes
@@ -7273,6 +7374,27 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             })
         }
         Some("SET") => match keyword(1).as_deref() {
+            // SET LEGAL HOLD ON FEED <name> [REASON '<text>']
+            Some("LEGAL") => {
+                expect_keyword(&tokens, 2, "HOLD")?;
+                expect_keyword(&tokens, 3, "ON")?;
+                expect_keyword(&tokens, 4, "FEED")?;
+                let feed = token(&tokens, 5)?.to_owned();
+                let reason = match token(&tokens, 6).ok() {
+                    None => None,
+                    Some(_) => {
+                        expect_keyword(&tokens, 6, "REASON")?;
+                        let reason = token(&tokens, 7)?.to_owned();
+                        if reason.is_empty() {
+                            return Err(ControlError::Syntax(
+                                "REASON requires a quoted value".to_owned(),
+                            ));
+                        }
+                        Some(reason)
+                    }
+                };
+                Ok(Command::SetLegalHold { feed, reason })
+            }
             // SET HISTORY POLICY ON DOMAIN|FEED <name>
             //     (TIER AFTER <dur> | EXPIRE AFTER <dur> | MAX RETAINED BYTES <n>)+
             Some("HISTORY") => {
@@ -8704,6 +8826,7 @@ fn show_resources(
             .filter(|item| item.stage != StateStoreStage::Dropped)
             .collect::<Vec<_>>()),
         ShowKind::HistoryPolicies => json!(state.history_policies.values().collect::<Vec<_>>()),
+        ShowKind::LegalHolds => json!(state.legal_holds.values().collect::<Vec<_>>()),
         ShowKind::Schemas => json!(state.schemas.values().collect::<Vec<_>>()),
         ShowKind::Roles => json!(state
             .roles
@@ -8783,6 +8906,7 @@ fn describe_resource(
                 .get(&feed.feed_id)
                 .map(|assignment| assignment.policy.clone()));
             value["effective_history_policy"] = json!(effective_history_policy(state, feed));
+            value["legal_hold"] = json!(state.legal_holds.get(&feed.feed_id));
             value["schema"] = json!(state
                 .schemas
                 .get(&feed.feed_id)
@@ -9319,6 +9443,8 @@ fn command_label(command: &Command) -> String {
         Command::ReportStorageNodeCapacity { .. } => "REPORT STORAGE NODE CAPACITY",
         Command::SetHistoryPolicy { .. } => "SET HISTORY POLICY",
         Command::ClearHistoryPolicy { .. } => "DROP HISTORY POLICY",
+        Command::SetLegalHold { .. } => "SET LEGAL HOLD",
+        Command::DropLegalHold { .. } => "DROP LEGAL HOLD",
         Command::SetSchema { .. } => "SET SCHEMA",
         Command::ClearSchema { .. } => "DROP SCHEMA",
     }
@@ -9354,6 +9480,7 @@ fn show_name(kind: &ShowKind) -> &'static str {
         ShowKind::ApiKeys => "API Keys",
         ShowKind::StorageNodes => "Storage Nodes",
         ShowKind::HistoryPolicies => "History Policies",
+        ShowKind::LegalHolds => "Legal Holds",
         ShowKind::Schemas => "Schemas",
     }
 }
@@ -13958,6 +14085,129 @@ mod tests {
         assert_eq!(effective.expire_after_ns, Some(7 * 86_400 * 1_000_000_000));
         assert!(reopened
             .execute("DROP HISTORY POLICY ON FEED orders.audit;")
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn parser_supports_legal_hold_verbs() {
+        let commands = parse_wcl(
+            "SET LEGAL HOLD ON FEED orders.events;              SET LEGAL HOLD ON FEED orders.audit REASON 'matter 2024-118';              DROP LEGAL HOLD ON FEED orders.events;              SHOW LEGAL HOLDS;",
+        )
+        .unwrap();
+        assert_eq!(commands.len(), 4);
+        assert!(matches!(
+            &commands[0],
+            Command::SetLegalHold { feed, reason }
+                if feed == "orders.events" && reason.is_none()
+        ));
+        assert!(matches!(
+            &commands[1],
+            Command::SetLegalHold { feed, reason }
+                if feed == "orders.audit" && reason.as_deref() == Some("matter 2024-118")
+        ));
+        assert!(matches!(
+            &commands[2],
+            Command::DropLegalHold { feed } if feed == "orders.events"
+        ));
+        assert!(matches!(
+            &commands[3],
+            Command::Show {
+                kind: ShowKind::LegalHolds
+            }
+        ));
+        // Malformed shapes stay syntax errors, not silent misreads.
+        assert!(parse_wcl("SET LEGAL HOLD ON DOMAIN orders;").is_err());
+        assert!(parse_wcl("SET LEGAL HOLD orders.events;").is_err());
+        assert!(parse_wcl("DROP LEGAL HOLD orders.events;").is_err());
+    }
+
+    #[tokio::test]
+    async fn legal_hold_fences_drop_and_survives_rename_and_reopen() {
+        let directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader
+            .execute("CREATE DOMAIN orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        let feed_id = leader
+            .active_feed_by_name("orders.events")
+            .await
+            .unwrap()
+            .feed_id;
+
+        leader
+            .execute("SET LEGAL HOLD ON FEED orders.events REASON 'matter 118';")
+            .await
+            .unwrap();
+        let hold = leader.legal_hold_for_feed(feed_id).await.unwrap();
+        assert_eq!(hold.reason.as_deref(), Some("matter 118"));
+        assert_eq!(leader.legal_hold_feed_ids().await.len(), 1);
+
+        // SHOW LEGAL HOLDS + DESCRIBE FEED surface the freeze.
+        let shown = leader.execute("SHOW LEGAL HOLDS;").await.unwrap();
+        let rows: Vec<Value> = serde_json::from_value(shown.results[0].data.clone()).unwrap();
+        assert_eq!(rows.len(), 1);
+        let described = leader
+            .execute("DESCRIBE FEED orders.events;")
+            .await
+            .unwrap();
+        assert_eq!(
+            described.results[0].data["legal_hold"]["feed_id"],
+            json!(feed_id)
+        );
+
+        // The hold outranks drop: even an unattached Feed refuses while
+        // the freeze stands — the tombstone would retire the evidence.
+        let refused = leader
+            .execute("DROP FEED orders.events;")
+            .await
+            .unwrap_err();
+        assert!(refused.to_string().contains("legal hold"), "{refused}");
+
+        // Re-declaring refreshes the reason; renaming keeps the hold
+        // because rows key on the immutable FeedId.
+        leader
+            .execute("SET LEGAL HOLD ON FEED orders.events REASON 'matter 119';")
+            .await
+            .unwrap();
+        leader
+            .execute("RENAME FEED orders.events TO orders.audit;")
+            .await
+            .unwrap();
+        let hold = leader.legal_hold_for_feed(feed_id).await.unwrap();
+        assert_eq!(hold.reason.as_deref(), Some("matter 119"));
+        assert!(leader.execute("DROP FEED orders.audit;").await.is_err());
+
+        // A synced replica sees the same freeze after reopen.
+        drop(leader);
+        let reopened = new_controller(&directory);
+        assert!(reopened.legal_hold_feed_ids().await.contains(&feed_id));
+        assert!(reopened.execute("DROP FEED orders.audit;").await.is_err());
+
+        // The unfreeze is explicit: drop the hold, then the Feed drops.
+        reopened
+            .execute("DROP LEGAL HOLD ON FEED orders.audit;")
+            .await
+            .unwrap();
+        assert!(reopened.legal_hold_feed_ids().await.is_empty());
+        reopened.execute("DROP FEED orders.audit;").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn legal_hold_refuses_missing_feeds_and_absent_drops() {
+        let directory = TempDir::new().unwrap();
+        let leader = new_controller(&directory);
+        leader
+            .execute("CREATE DOMAIN orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        assert!(leader
+            .execute("SET LEGAL HOLD ON FEED orders.missing;")
+            .await
+            .is_err());
+        assert!(leader
+            .execute("DROP LEGAL HOLD ON FEED orders.events;")
             .await
             .is_err());
     }

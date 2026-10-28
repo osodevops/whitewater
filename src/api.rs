@@ -1058,6 +1058,9 @@ fn wcl_command_scope(command: &crate::control::Command) -> WclCommandScope {
                 }
             }
         }
+        Command::SetLegalHold { feed, .. } | Command::DropLegalHold { feed } => {
+            WclCommandScope::Domains(vec![resource(feed)])
+        }
         Command::SetSchema { scope, .. } | Command::ClearSchema { scope } => match scope {
             crate::control::PolicyScope::Domain { name } => {
                 WclCommandScope::Domains(vec![domain(name)])
