@@ -140,6 +140,15 @@ pub struct WindowEmission {
     /// revision. The scanner stamps it from the `emitted` marker row, so
     /// a replayed scan reports the identical revision.
     pub revision: u64,
+    /// The pane row's journal applied cursor at scan time. The emitted
+    /// marker commits in the same drive's `AccumulateRows` before the
+    /// pane row's `DeleteRow`, so a racing scan can observe pane row and
+    /// marker together: a marker cursor at or past this cursor means the
+    /// row is the already-published pre-delete view — not a
+    /// re-accumulation — and must not emit again. A cursor strictly
+    /// newer than the marker's means the pane accumulated evidence the
+    /// marker never sealed, which is a real late-event re-emission.
+    pub row_cursor: String,
 }
 
 /// Deterministic identity for the effect one Pipe cycle declares over a
@@ -1185,6 +1194,8 @@ pub fn window_emission_from_row(
         store_seq: 0,
         // The scanner stamps the marker-derived revision.
         revision: 0,
+        // The scanner stamps the pane row's applied journal cursor.
+        row_cursor: String::new(),
     })
 }
 
@@ -1616,6 +1627,7 @@ mod tests {
                 sum: 42,
                 store_seq: 0,
                 revision: 0,
+                row_cursor: String::new(),
             })
         );
         // The late-sentinel row never expires or emits.
@@ -1677,6 +1689,7 @@ mod tests {
             sum: 30,
             store_seq: 41,
             revision: 2,
+            row_cursor: String::new(),
         };
         let payload = window_emission_payload(
             &emission,

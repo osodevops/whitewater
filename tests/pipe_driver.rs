@@ -2111,6 +2111,7 @@ fn pane_emission(group: IndexValue, pane: u64, count: u64, sum: i128) -> WindowE
         sum,
         store_seq: 7,
         revision: 1,
+        row_cursor: String::new(),
     }
 }
 

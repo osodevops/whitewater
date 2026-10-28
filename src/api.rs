@@ -7653,6 +7653,7 @@ async fn resolve_window_emissions(
                 // The serving replica's applied journal sequence is the
                 // version evidence for every result this scan produced.
                 emission.store_seq = scan_seq;
+                emission.row_cursor = row.applied_cursor.clone();
                 emissions.push(emission)
             }
             crate::pipe::WindowPaneDisposition::Expire => expired.push(row.key.clone()),
@@ -7672,7 +7673,8 @@ async fn resolve_window_emissions(
     // the scan's — the marker strictly precedes any pane row needing a
     // revision, so a replica at or beyond `scan_seq` answers
     // conclusively.
-    for emission in &mut emissions {
+    let mut skip = vec![false; emissions.len()];
+    for (index, emission) in emissions.iter_mut().enumerate() {
         let marker = serve_state_store_read(
             state,
             &assignment,
@@ -7688,13 +7690,32 @@ async fn resolve_window_emissions(
                 "emitted-marker read served a store version older than the emission scan",
             ));
         }
-        emission.revision = marker
-            .result
-            .row
-            .and_then(|row| crate::index::decode_accumulator(&row.payload))
+        let Some(marker_row) = marker.result.row else {
+            emission.revision = 1;
+            continue;
+        };
+        // The marker commits in the emitting drive's `AccumulateRows`
+        // strictly before its pane `DeleteRow`, so a concurrent scan can
+        // observe both rows. A marker cursor at or past the pane row's
+        // means this evidence was already published — the surviving row
+        // is the pending-delete view, and re-emitting it would publish a
+        // revisioned duplicate of identical content. A pane cursor newer
+        // than the marker's means the row re-accumulated after the last
+        // emission — the revision path this marker exists to serve.
+        if marker_row.applied_cursor.as_str() >= emission.row_cursor.as_str() {
+            // The row is emitted evidence awaiting its own `DeleteRow` —
+            // deleting it here repairs the interrupted pair rather than
+            // stranding the row until the emitting drive replays.
+            expired.push(emission.row_key.clone());
+            skip[index] = true;
+            continue;
+        }
+        emission.revision = crate::index::decode_accumulator(&marker_row.payload)
             .map(|(count, _): (u64, i128)| count.saturating_add(1))
             .unwrap_or(1);
     }
+    let mut keep = skip.into_iter();
+    emissions.retain(|_| !keep.next().unwrap_or(false));
     emissions.sort_by(|a, b| a.row_key.cmp(&b.row_key));
     expired.sort();
     Ok((
