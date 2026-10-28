@@ -195,24 +195,33 @@ async fn main() -> Result<()> {
     // object store: each tick verifies manifests and uploads every newly
     // sealed segment's artifacts exactly once, marked durably so restarts
     // resume cleanly. Blocking filesystem work stays on spawn_blocking.
-    if let Some(object_root) = config.object_store_dir.clone() {
-        if replica_append.is_some() {
-            let ranges_root = config.data_dir.join("active-ranges");
-            let interval = config.tier_scan_interval;
-            let policy_control = Arc::clone(&control);
-            tokio::spawn(async move {
-                use whitewater::active_range::tier::{tier_scan_once, FileSystemObjectStore};
-                let mut ticker = tokio::time::interval(interval);
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    ticker.tick().await;
+    // Sealed-segment tiering + history retention share one tick: the
+    // upload pass runs only with a configured object store, while the
+    // retention sweep runs on every storage Node — expiry and the
+    // retained-bytes ceiling apply whether or not history tiers.
+    if replica_append.is_some() {
+        let service = replica_append.clone().expect("checked above");
+        let object_root = config.object_store_dir.clone();
+        let ranges_root = config.data_dir.join("active-ranges");
+        let interval = config.tier_scan_interval;
+        let policy_control = Arc::clone(&control);
+        tokio::spawn(async move {
+            use whitewater::active_range::tier::{
+                tier_scan_once, FileSystemObjectStore, ObjectStore,
+            };
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let policies = policy_control.effective_history_policies().await;
+                if let Some(object_root) = &object_root {
                     let root = ranges_root.clone();
                     let objects = object_root.clone();
+                    let policies = policies.clone();
                     // The object store root opens lazily every tick: a
                     // late-mounted or briefly unavailable backend self-heals
                     // on the next pass instead of disabling tiering for the
                     // process lifetime.
-                    let policies = policy_control.effective_history_policies().await;
                     let report = tokio::task::spawn_blocking(move || {
                         FileSystemObjectStore::open(&objects).map(|store| {
                             tier_scan_once(root.as_path(), &store, &|feed_id| {
@@ -245,8 +254,33 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-            });
-        }
+                // Retention deletes sealed spans the policy expired or
+                // over-budgeted; without an object store there are simply
+                // no remote artifacts to delete alongside the local ones.
+                let objects: Option<Arc<dyn ObjectStore>> = object_root
+                    .as_ref()
+                    .and_then(|root| FileSystemObjectStore::open(root).ok())
+                    .map(|store| Arc::new(store) as Arc<dyn ObjectStore>);
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos() as i64)
+                    .unwrap_or(0);
+                let sweep = service.retention_sweep(&policies, objects, now).await;
+                if !sweep.skipped.is_empty() {
+                    tracing::warn!(
+                        deleted = sweep.deleted_segments,
+                        skipped = ?sweep.skipped,
+                        "history retention sweep completed with skips"
+                    );
+                } else if sweep.deleted_segments > 0 {
+                    tracing::info!(
+                        deleted = sweep.deleted_segments,
+                        reclaimed_bytes = sweep.reclaimed_bytes,
+                        "history retention sweep deleted expired spans"
+                    );
+                }
+            }
+        });
     }
     let subscription_progress = if let Some(local) = &replica_append {
         let path = config.data_dir.join("subscription-progress");

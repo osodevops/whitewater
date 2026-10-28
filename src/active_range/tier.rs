@@ -63,6 +63,11 @@ pub trait ObjectStore: Send + Sync {
     fn get(&self, key: &str) -> Result<Vec<u8>, TierError>;
     /// `Some(len)` when the object exists, `None` when it does not.
     fn head(&self, key: &str) -> Result<Option<u64>, TierError>;
+
+    /// Removes an object; `NotFound` succeeds — deletion is idempotent
+    /// because every RF3 replica runs the same retention pass and may
+    /// race to delete shared objects.
+    fn delete(&self, key: &str) -> Result<(), TierError>;
 }
 
 /// Directory-rooted object store for development and test topologies:
@@ -131,6 +136,18 @@ impl ObjectStore for FileSystemObjectStore {
         match target.metadata() {
             Ok(meta) => Ok(Some(meta.len())),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(TierError::Io(error)),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<(), TierError> {
+        let target = self.target(key)?;
+        match fs::remove_file(&target) {
+            Ok(()) => {
+                let _ = sync_parent(&target);
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(TierError::Io(error)),
         }
     }
@@ -668,7 +685,7 @@ fn sealed_at(generation_dir: &Path, segment: u64) -> Option<i64> {
     None
 }
 
-fn generation_directories(root: &Path) -> Vec<PathBuf> {
+pub(crate) fn generation_directories(root: &Path) -> Vec<PathBuf> {
     let mut directories = Vec::new();
     let Ok(feeds) = fs::read_dir(root) else {
         return directories;
@@ -775,6 +792,10 @@ mod tests {
 
         fn head(&self, key: &str) -> Result<Option<u64>, TierError> {
             self.inner.head(key)
+        }
+
+        fn delete(&self, key: &str) -> Result<(), TierError> {
+            self.inner.delete(key)
         }
     }
 
@@ -988,6 +1009,10 @@ mod tests {
         fn head(&self, key: &str) -> Result<Option<u64>, TierError> {
             self.inner.head(key)
         }
+
+        fn delete(&self, key: &str) -> Result<(), TierError> {
+            self.inner.delete(key)
+        }
     }
 
     /// A manifest + marker + remote object for one synthetic sealed span —
@@ -1009,6 +1034,7 @@ mod tests {
             entries: 0,
             first_position: 0,
             last_position: 0,
+            last_ingest_time_ns: Some(0),
             segment_digest: blake3::hash(bytes).to_hex().to_string(),
         };
         let staging = tempfile::TempDir::new().unwrap();

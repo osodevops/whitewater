@@ -236,6 +236,17 @@ pub struct RangeReadSpec<'a> {
     pub cursors: Option<&'a [String]>,
 }
 
+/// Outcome of one `retention_sweep` over every range directory on this
+/// Node: spans deleted, bytes reclaimed, and per-range skips/failures a
+/// later tick retries — one corrupt range never stalls the rest.
+#[derive(Clone, Debug, Default)]
+pub struct RetentionSweepReport {
+    pub ranges_scanned: u64,
+    pub deleted_segments: u64,
+    pub reclaimed_bytes: u64,
+    pub skipped: Vec<String>,
+}
+
 #[derive(Clone)]
 pub struct ReplicaAppendService {
     root: Arc<PathBuf>,
@@ -316,6 +327,75 @@ impl ReplicaAppendService {
 
     pub fn local_node(&self) -> &StorageNodeId {
         &self.local_node
+    }
+
+    /// Applies each Feed's effective History Policy to this Node's range
+    /// storage: sealed spans past `expire_after_ns` or over
+    /// `max_retained_bytes` are deleted as one contiguous prefix and the
+    /// durable retained floor advances. Live stores expire under their
+    /// range lock; unopened directories take the identical filesystem
+    /// pass. Every replica resolves the same content-derived manifest
+    /// fields, so keep/delete decisions agree without coordination.
+    pub async fn retention_sweep(
+        &self,
+        policies: &HashMap<Uuid, crate::control::HistoryPolicy>,
+        objects: Option<Arc<dyn super::tier::ObjectStore>>,
+        now: i64,
+    ) -> RetentionSweepReport {
+        let mut report = RetentionSweepReport::default();
+        for directory in super::tier::generation_directories(self.root.as_path()) {
+            let state_path = directory.join("range-state.json");
+            let mut persisted = match std::fs::read(&state_path).ok().and_then(|bytes| {
+                serde_json::from_slice::<super::store::PersistedRangeState>(&bytes).ok()
+            }) {
+                Some(state) => state,
+                None => continue,
+            };
+            report.ranges_scanned += 1;
+            let Some(policy) = policies.get(&persisted.feed_id).cloned() else {
+                continue;
+            };
+            if policy.expire_after_ns.is_none() && policy.max_retained_bytes.is_none() {
+                continue;
+            }
+            let key = (persisted.range_id, persisted.generation);
+            let live = self.stores.read().await.get(&key).cloned();
+            let outcome = match live {
+                Some(store) => store.apply_retention(&policy, objects.clone(), now).await,
+                None => {
+                    let objects = objects.clone();
+                    let path = directory.clone();
+                    tokio::task::spawn_blocking(move || {
+                        super::store::expire_range_directory(
+                            &path,
+                            &mut persisted,
+                            &policy,
+                            objects.as_deref(),
+                            now,
+                        )
+                    })
+                    .await
+                    .map_err(|error| super::store::ActiveRangeStoreError::Worker(error.to_string()))
+                    .and_then(|inner| inner)
+                }
+            };
+            match outcome {
+                Ok(expired) => {
+                    report.deleted_segments += expired.deleted_segments;
+                    report.reclaimed_bytes += expired.reclaimed_bytes;
+                    report.skipped.extend(
+                        expired
+                            .skipped
+                            .into_iter()
+                            .map(|why| format!("{}: {why}", directory.display())),
+                    );
+                }
+                Err(error) => report
+                    .skipped
+                    .push(format!("{}: {error}", directory.display())),
+            }
+        }
+        report
     }
 
     async fn append_gate(&self, range_id: RangeId) -> Arc<Mutex<()>> {

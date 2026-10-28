@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     codec::{decode_record, CodecError, MAX_FRAME_BYTES},
+    control::HistoryPolicy,
     domain::StoredRecord,
 };
 
@@ -213,6 +214,10 @@ pub enum ActiveRangeStoreError {
     CorruptSegment { path: PathBuf, reason: String },
     #[error("an immutable segment contains uncommitted records")]
     UncommittedSealedSegment,
+    #[error(
+        "range position {position} was deleted by history retention; retained history starts at {retained_from}"
+    )]
+    RetentionExpired { position: u64, retained_from: u64 },
     #[error("Active Range tail is held by pending effect {0:?}")]
     PendingEffectOccupied(PendingEffect),
     #[error("storage worker failed: {0}")]
@@ -425,6 +430,12 @@ pub(crate) struct PersistedRangeState {
     flushed: u64,
     committed: u64,
     pub(crate) active_segment: u64,
+    /// Retention floor: positions strictly below this were deleted by the
+    /// expiry/budget sweep (or an erasure). Always lands on a sealed
+    /// segment boundary — `last_deleted.last_position + 1` — so leading
+    /// segment files may legitimately be absent with a retention marker.
+    #[serde(default)]
+    pub(crate) retained_from_position: Option<u64>,
     deduplication: Vec<PersistedDeduplicationState>,
     #[serde(default)]
     pending_effect: Option<PendingEffect>,
@@ -654,6 +665,23 @@ impl FileActiveRangeStore {
         result
     }
 
+    /// Applies the Feed's effective History Policy: deletes sealed spans
+    /// past `expire_after_ns` or over `max_retained_bytes` as one
+    /// contiguous prefix, advancing the retained floor durably. Runs as a
+    /// store mutation — the floor, in-memory indexes, and on-disk state
+    /// move atomically; remote object deletion uses the supplied store
+    /// when configured.
+    pub(crate) async fn apply_retention(
+        &self,
+        policy: &HistoryPolicy,
+        objects: Option<Arc<dyn super::tier::ObjectStore>>,
+        now: i64,
+    ) -> Result<ExpireReport, ActiveRangeStoreError> {
+        let policy = policy.clone();
+        self.blocking_mutation(move |inner| expire_loaded(inner, &policy, objects.as_deref(), now))
+            .await
+    }
+
     /// True when the last mutating store operation failed at the persistence
     /// layer and no mutation has succeeded since.
     pub fn persistence_failure(&self) -> bool {
@@ -848,6 +876,13 @@ impl ActiveRangeStore for FileActiveRangeStore {
                         .copied()
                         .filter(|position| position.value() <= loaded.persisted.committed)
                     {
+                        let floor = loaded.persisted.retained_from_position.unwrap_or(1).max(1);
+                        if position.value() < floor {
+                            return Err(ActiveRangeStoreError::RetentionExpired {
+                                position: position.value(),
+                                retained_from: floor,
+                            });
+                        }
                         return Ok(Some(position));
                     }
                     loaded
@@ -1047,6 +1082,7 @@ impl PersistedRangeState {
             flushed: 0,
             committed: 0,
             active_segment: 0,
+            retained_from_position: None,
             deduplication: Vec::new(),
             pending_effect: None,
         }
@@ -1837,6 +1873,26 @@ fn read_window_inner(
     max_bytes: Option<usize>,
 ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
     let mut next = after.map_or(0, RangePosition::value).saturating_add(1);
+    // History below the retention floor is gone: a cursor resuming below
+    // it fails closed rather than silently skipping lost positions, while
+    // an open-ended history read (`after = None`) clamps to the retained
+    // beginning — the same honesty rule the API documents.
+    {
+        let loaded = inner
+            .loaded
+            .lock()
+            .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+        let floor = loaded.persisted.retained_from_position.unwrap_or(1).max(1);
+        if next < floor {
+            if after.is_some() {
+                return Err(ActiveRangeStoreError::RetentionExpired {
+                    position: next,
+                    retained_from: floor,
+                });
+            }
+            next = floor;
+        }
+    }
     let mut frames = Vec::new();
     let mut bytes = 0_usize;
     loop {
@@ -1852,6 +1908,16 @@ fn read_window_inner(
             };
             if next > bound || frames.len() as u64 >= limit {
                 return Ok(frames);
+            }
+            // Retention may have advanced the floor under an in-progress
+            // scan — continuing positions are gone, so the read fails
+            // closed instead of jumping over deleted history.
+            let floor = loaded.persisted.retained_from_position.unwrap_or(1).max(1);
+            if next < floor {
+                return Err(ActiveRangeStoreError::RetentionExpired {
+                    position: next,
+                    retained_from: floor,
+                });
             }
             let remaining = (limit - frames.len() as u64) as usize;
             match remote_manifest_containing(&loaded, next).cloned() {
@@ -2201,6 +2267,81 @@ pub struct SegmentManifest {
     pub last_position: u64,
     /// BLAKE3-256 hex of the whole sealed segment file.
     pub segment_digest: String,
+    /// Ingest timestamp of the span's newest committed record —
+    /// content-derived like every other manifest field, so every RF3
+    /// replica computes identical bytes and the expiry sweep makes the
+    /// same keep/delete decision everywhere. `None` only on manifests
+    /// written before the field existed; they re-heal on first touch.
+    #[serde(default)]
+    pub last_ingest_time_ns: Option<i64>,
+}
+
+/// Why the retention sweep deleted a sealed span. `Expired` is the
+/// `expire_after_ns` ingest-age bound; `Budget` is `max_retained_bytes`
+/// trimming oldest-first; `Erased` is a cryptographic-erasure or legal
+/// destruction event (Slice 3 — declared now so marker files are stable).
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RetentionReason {
+    Expired,
+    Budget,
+    Erased,
+}
+
+/// Durable record that a sealed span was deleted by the retention sweep,
+/// written before the span's files are removed so a crash mid-delete can
+/// never make the absence look like corruption. The marker is
+/// self-proving — it carries the span's coverage, so recovery tolerates
+/// the missing segment even when its manifest is also gone. Deterministic
+/// content (no wall-clock fields) keeps replicas byte-identical.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RetentionMarker {
+    pub version: u32,
+    pub segment: u64,
+    pub segment_digest: String,
+    pub first_position: u64,
+    pub last_position: u64,
+    pub reason: RetentionReason,
+    pub retained_from_position: u64,
+}
+
+const RETENTION_MARKER_VERSION: u32 = 1;
+
+pub(crate) fn retention_marker_path(directory: &Path, segment: u64) -> PathBuf {
+    directory.join(format!("segment-retention-{segment:06}.json"))
+}
+
+pub(crate) fn read_retention_marker(directory: &Path, segment: u64) -> Option<RetentionMarker> {
+    let bytes = fs::read(retention_marker_path(directory, segment)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn write_retention_marker(
+    directory: &Path,
+    manifest: &SegmentManifest,
+    reason: RetentionReason,
+    retained_from: u64,
+) -> Result<(), ActiveRangeStoreError> {
+    let marker = RetentionMarker {
+        version: RETENTION_MARKER_VERSION,
+        segment: manifest.segment,
+        segment_digest: manifest.segment_digest.clone(),
+        first_position: manifest.first_position,
+        last_position: manifest.last_position,
+        reason,
+        retained_from_position: retained_from,
+    };
+    let serialized = serde_json::to_vec(&marker)?;
+    let target = retention_marker_path(directory, manifest.segment);
+    let temporary = target.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    {
+        let mut file = File::create(&temporary)?;
+        file.write_all(&serialized)?;
+        file.sync_all()?;
+    }
+    fs::rename(&temporary, &target)?;
+    sync_directory(directory)?;
+    Ok(())
 }
 
 pub(crate) fn manifest_path(directory: &Path, segment: u64) -> PathBuf {
@@ -2244,6 +2385,7 @@ pub(crate) fn write_segment_manifest(
         first_position: first.position.value(),
         last_position: last.position.value(),
         segment_digest: hash_segment_file(&path)?.to_hex().to_string(),
+        last_ingest_time_ns: Some(last.ingest_time_ns),
     };
     let serialized = serde_json::to_vec(&manifest)?;
     let target = manifest_path(directory, segment);
@@ -2305,7 +2447,12 @@ pub(crate) fn sealed_segment_manifest(
     persisted: &PersistedRangeState,
 ) -> Result<SegmentManifest, ActiveRangeStoreError> {
     if let Some(manifest) = read_segment_manifest(directory, segment, persisted) {
-        return Ok(manifest);
+        if manifest.last_ingest_time_ns.is_some() {
+            return Ok(manifest);
+        }
+        // A pre-field manifest is valid but cannot drive the expiry
+        // sweep; re-derive it from the sealed file so the content-
+        // derived ingest bound converges identically on every replica.
     }
     let entries = recover_segment(&segment_path(directory, segment), segment, false)?;
     write_segment_manifest(directory, segment, persisted, &entries)
@@ -2505,7 +2652,11 @@ fn recover_segments(
 ) -> Result<RecoveredSegments, ActiveRangeStoreError> {
     let mut entries = Vec::new();
     let mut remote = BTreeMap::new();
-    let mut expected_position = 1_u64;
+    // The retention floor is the lowest position that may still be read;
+    // everything below it was deleted by the expiry/budget sweep and
+    // proves itself through a self-describing retention marker.
+    let floor = persisted.retained_from_position.unwrap_or(1).max(1);
+    let mut expected_position = floor;
     for segment in 0..=persisted.active_segment {
         let segment_start = entries.len();
         let path = segment_path(directory, segment);
@@ -2513,14 +2664,30 @@ fn recover_segments(
             if segment == persisted.active_segment {
                 File::create(&path)?.sync_all()?;
             } else {
-                // A sealed file is legitimately absent only when the range
-                // proves a verified remote copy: the manifest binds span
-                // and digest, the tier marker binds the uploaded object.
+                // A sealed file is legitimately absent in two cases: the
+                // retention sweep deleted it (self-proving marker below
+                // the floor), or the range proves a verified remote copy
+                // (manifest binds span/digest, tier marker binds object).
                 // Anything less stays fail-closed corruption, and the
                 // detection must run before checkpoint loading because a
                 // checkpoint can outlive the file it indexes.
+                let retention = read_retention_marker(directory, segment).filter(|marker| {
+                    marker.version == RETENTION_MARKER_VERSION
+                        && marker.segment == segment
+                        && marker.last_position < floor
+                });
+                if let Some(marker) = retention {
+                    expected_position = expected_position.max(
+                        marker
+                            .last_position
+                            .checked_add(1)
+                            .ok_or(ActiveRangeStoreError::PositionOverflow)?,
+                    );
+                    continue;
+                }
                 let manifest = read_segment_manifest(directory, segment, persisted)
-                    .filter(|manifest| manifest.first_position == expected_position);
+                    .filter(|manifest| manifest.first_position == expected_position)
+                    .filter(|manifest| manifest.last_position >= floor);
                 let marker_matches = manifest.as_ref().is_some_and(|manifest| {
                     super::tier::read_tier_marker(directory, segment).is_some_and(|marker| {
                         marker.segment == segment
@@ -2546,9 +2713,13 @@ fn recover_segments(
             }
         }
         if segment < persisted.active_segment {
-            if let Some(checkpointed) =
+            if let Some(mut checkpointed) =
                 load_segment_checkpoint(directory, segment, persisted, expected_position)
             {
+                // Positions below the floor in a still-present file are
+                // expired survivors of an interrupted sweep — drop them
+                // from the index; the next pass reclaims the bytes.
+                checkpointed.retain(|entry| entry.position.value() >= floor);
                 expected_position = expected_position
                     .checked_add(checkpointed.len() as u64)
                     .ok_or(ActiveRangeStoreError::PositionOverflow)?;
@@ -2560,6 +2731,9 @@ fn recover_segments(
         let allow_torn_tail = segment == persisted.active_segment;
         let recovered = recover_segment(&path, segment, allow_torn_tail)?;
         for entry in recovered {
+            if entry.position.value() < floor {
+                continue;
+            }
             if entry.position.value() != expected_position {
                 return Err(ActiveRangeStoreError::CorruptSegment {
                     path: path.clone(),
@@ -2917,6 +3091,265 @@ fn persisted_deduplication(
         .collect::<Vec<_>>();
     values.sort_by_key(|value| (value.writer_session_id, value.writer_epoch));
     values
+}
+
+/// Outcome of one retention pass over a range directory: how many sealed
+/// spans were deleted, how many bytes they held, and where the retained
+/// floor now sits. `skipped` names spans the sweep could not decide on
+/// this pass (a remote-only manifest still missing its ingest bound, or a
+/// segment whose manifest could not be verified) — they retry next tick.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ExpireReport {
+    pub deleted_segments: u64,
+    pub reclaimed_bytes: u64,
+    pub retained_from: u64,
+    pub skipped: Vec<String>,
+}
+
+/// The sealed spans the History Policy marks for deletion, as a single
+/// contiguous prefix of the range. Retention deletes prefixes only — a
+/// middle span never becomes a hole below retained history because read
+/// scans resolve coverage position by position (the same prefix contract
+/// Kafka's segment-level retention carries, derived deterministically
+/// from manifest content so every replica decides identically).
+fn retention_delete_set(
+    directory: &Path,
+    persisted: &PersistedRangeState,
+    policy: &HistoryPolicy,
+    now: i64,
+    skipped: &mut Vec<String>,
+) -> Result<Vec<(SegmentManifest, RetentionReason)>, ActiveRangeStoreError> {
+    let floor = persisted.retained_from_position.unwrap_or(1).max(1);
+    let mut manifests = Vec::new();
+    for segment in 0..persisted.active_segment {
+        match sealed_segment_manifest(directory, segment, persisted) {
+            Ok(manifest) if manifest.last_position < floor => continue,
+            Ok(manifest) => manifests.push(manifest),
+            Err(error) => {
+                skipped.push(format!("segment-{segment:06}: {error}"));
+            }
+        }
+    }
+    // Manifests arrive in segment order, which is position order.
+    let expire_after = policy
+        .expire_after_ns
+        .and_then(|bound| i64::try_from(bound).ok());
+    let mut reasons: Vec<Option<RetentionReason>> = manifests
+        .iter()
+        .map(|manifest| {
+            let expired = expire_after.is_some_and(|expire| {
+                manifest
+                    .last_ingest_time_ns
+                    .is_some_and(|ingest| ingest.saturating_add(expire) < now)
+            });
+            expired.then_some(RetentionReason::Expired)
+        })
+        .collect();
+    // Budget trim: oldest sealed spans go first until survivors fit the
+    // declared retained-bytes ceiling.
+    if let Some(budget) = policy.max_retained_bytes {
+        let mut retained: u64 = manifests.iter().map(|m| m.bytes).sum();
+        for (index, manifest) in manifests.iter().enumerate() {
+            if retained <= budget {
+                break;
+            }
+            retained = retained.saturating_sub(manifest.bytes);
+            if reasons[index].is_none() {
+                reasons[index] = Some(RetentionReason::Budget);
+            }
+        }
+    }
+    // The delete set is the longest qualifying prefix.
+    let mut delete_set = Vec::new();
+    for (manifest, reason) in manifests.into_iter().zip(reasons.into_iter()) {
+        match reason {
+            Some(reason) => delete_set.push((manifest, reason)),
+            None => break,
+        }
+    }
+    Ok(delete_set)
+}
+
+/// Removes a deleted span's physical artifacts: remote objects (when an
+/// object store is configured and a tier marker names them), the local
+/// segment file, its checkpoint, and the tier marker itself. The
+/// manifest and the retention marker stay — they are the durable proof
+/// of what was deleted and where the floor sits. Missing files are
+/// ignored so a retried pass is idempotent.
+fn retention_delete_span(
+    directory: &Path,
+    manifest: &SegmentManifest,
+    objects: Option<&dyn super::tier::ObjectStore>,
+    report: &mut ExpireReport,
+) {
+    if let Some(store) = objects {
+        if let Some(marker) = super::tier::read_tier_marker(directory, manifest.segment) {
+            for key in [
+                marker.object_key,
+                marker.manifest_key,
+                marker.checkpoint_key.unwrap_or_default(),
+            ] {
+                if key.is_empty() {
+                    continue;
+                }
+                if let Err(error) = store.delete(&key) {
+                    report.skipped.push(format!("object {key}: {error}"));
+                }
+            }
+        }
+    }
+    for path in [
+        segment_path(directory, manifest.segment),
+        checkpoint_path(directory, manifest.segment),
+        super::tier::tier_marker_path(directory, manifest.segment),
+    ] {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => report.skipped.push(format!("{}: {error}", path.display())),
+        }
+    }
+}
+
+/// Filesystem-level expiry for a range whose store is not loaded: marker
+/// writes, floor advance, state persist, then the physical deletes. The
+/// running-store path (`expire_loaded`) performs the identical sequence
+/// plus in-memory index updates under the range lock.
+pub(crate) fn expire_range_directory(
+    directory: &Path,
+    persisted: &mut PersistedRangeState,
+    policy: &HistoryPolicy,
+    objects: Option<&dyn super::tier::ObjectStore>,
+    now: i64,
+) -> Result<ExpireReport, ActiveRangeStoreError> {
+    let mut report = ExpireReport::default();
+    let delete_set = retention_delete_set(directory, persisted, policy, now, &mut report.skipped)?;
+    report.retained_from = persisted.retained_from_position.unwrap_or(1).max(1);
+    if delete_set.is_empty() {
+        return Ok(report);
+    }
+    let floor = delete_set
+        .last()
+        .map(|(manifest, _)| manifest.last_position)
+        .and_then(|last| last.checked_add(1))
+        .ok_or(ActiveRangeStoreError::PositionOverflow)?;
+    for (manifest, reason) in &delete_set {
+        write_retention_marker(directory, manifest, *reason, floor)?;
+    }
+    persisted.retained_from_position = Some(floor);
+    persist_state(directory, persisted)?;
+    report.retained_from = floor;
+    report.deleted_segments = delete_set.len() as u64;
+    report.reclaimed_bytes = delete_set.iter().map(|(m, _)| m.bytes).sum();
+    for (manifest, _) in &delete_set {
+        retention_delete_span(directory, manifest, objects, &mut report);
+    }
+    Ok(report)
+}
+
+/// The running-store expiry pass: identical durable sequence to
+/// `expire_range_directory`, performed under the range lock so the
+/// floor, the in-memory indexes, and the on-disk state move atomically.
+/// Physical deletes run after the lock releases — a crash between leaves
+/// orphaned files the next pass reclaims, never a torn state.
+fn expire_loaded(
+    inner: &FileActiveRangeStoreInner,
+    policy: &HistoryPolicy,
+    objects: Option<&dyn super::tier::ObjectStore>,
+    now: i64,
+) -> Result<ExpireReport, ActiveRangeStoreError> {
+    let mut report = ExpireReport::default();
+    let (delete_set, dropped_cache) = {
+        let mut loaded = inner
+            .loaded
+            .lock()
+            .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+        let delete_set = retention_delete_set(
+            &inner.directory,
+            &loaded.persisted,
+            policy,
+            now,
+            &mut report.skipped,
+        )?;
+        report.retained_from = loaded.persisted.retained_from_position.unwrap_or(1).max(1);
+        if delete_set.is_empty() {
+            return Ok(report);
+        }
+        let floor = delete_set
+            .last()
+            .map(|(manifest, _)| manifest.last_position)
+            .and_then(|last| last.checked_add(1))
+            .ok_or(ActiveRangeStoreError::PositionOverflow)?;
+        for (manifest, reason) in &delete_set {
+            write_retention_marker(&inner.directory, manifest, *reason, floor)?;
+        }
+        // In-memory views drop below the floor before the floor persists:
+        // a read that wins the lock between the two updates sees entries
+        // with no floor, which is the safe direction (a stale read of
+        // present bytes is still accurate data).
+        loaded
+            .remote
+            .retain(|_, manifest| manifest.last_position >= floor);
+        let mut dropped_cache = Vec::new();
+        let kept: BTreeMap<u64, MaterializedSegment> = std::mem::take(&mut loaded.materialized)
+            .into_iter()
+            .filter(|(segment, span)| {
+                if loaded.remote.contains_key(segment) {
+                    true
+                } else {
+                    dropped_cache.push(span.path.clone());
+                    false
+                }
+            })
+            .collect();
+        loaded.materialized = kept;
+        loaded.materialized_bytes = loaded.materialized.values().map(|span| span.bytes).sum();
+        loaded
+            .entries
+            .retain(|entry| entry.position.value() >= floor);
+        loaded
+            .cursor_positions
+            .retain(|_, position| position.value() >= floor);
+        loaded
+            .digest_positions
+            .retain(|_, position| position.value() >= floor);
+        let mut surviving: std::collections::HashSet<u64> = loaded
+            .entries
+            .iter()
+            .map(|entry| entry.position.value())
+            .collect();
+        for manifest in loaded.remote.values() {
+            surviving.extend(manifest.first_position..=manifest.last_position);
+        }
+        loaded.deduplication = merge_deduplication(
+            deduplication_from_entries(&loaded.entries),
+            loaded.persisted.deduplication.clone(),
+            &surviving,
+        );
+        loaded.ingest_monotonic = loaded.remote.is_empty()
+            && loaded
+                .entries
+                .windows(2)
+                .all(|pair| pair[0].ingest_time_ns <= pair[1].ingest_time_ns);
+        let mut next = loaded.persisted.clone();
+        next.retained_from_position = Some(floor);
+        next.deduplication = persisted_deduplication(&loaded.deduplication);
+        persist_state(&inner.directory, &next)?;
+        loaded.persisted = next;
+        report.retained_from = floor;
+        report.deleted_segments = delete_set.len() as u64;
+        report.reclaimed_bytes = delete_set.iter().map(|(m, _)| m.bytes).sum();
+        (delete_set, dropped_cache)
+    };
+    for (manifest, _) in &delete_set {
+        retention_delete_span(&inner.directory, manifest, objects, &mut report);
+    }
+    // Remove materialized cache copies of deleted spans after the lock
+    // released — the registry dropped them already, so these are orphans.
+    for path in dropped_cache {
+        let _ = fs::remove_file(path);
+    }
+    Ok(report)
 }
 
 fn persist_state(
@@ -3645,6 +4078,10 @@ mod tests {
         fn head(&self, key: &str) -> Result<Option<u64>, crate::active_range::tier::TierError> {
             self.inner.head(key)
         }
+
+        fn delete(&self, key: &str) -> Result<(), crate::active_range::tier::TierError> {
+            self.inner.delete(key)
+        }
     }
 
     fn remote_options(
@@ -3687,6 +4124,317 @@ mod tests {
             fs::remove_file(segment_path(&directory, *segment)).unwrap();
         }
         manifests
+    }
+
+    #[tokio::test]
+    async fn expiry_deletes_the_sealed_prefix_and_advances_the_retained_floor() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        let directory = range_directory(root.path(), &descriptor);
+        let committed = store.read_committed(None, 10_000).await.unwrap();
+        let persisted: PersistedRangeState =
+            serde_json::from_slice(&fs::read(directory.join("range-state.json")).unwrap()).unwrap();
+        let manifest0 = read_segment_manifest(&directory, 0, &persisted).unwrap();
+
+        let policy = HistoryPolicy {
+            expire_after_ns: Some(1),
+            ..HistoryPolicy::default()
+        };
+        let report = store
+            .apply_retention(&policy, None, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_segments, 1);
+        assert_eq!(report.retained_from, manifest0.last_position + 1);
+
+        // The marker is the durable tombstone; the bytes are gone.
+        let marker = read_retention_marker(&directory, 0).unwrap();
+        assert_eq!(marker.reason, RetentionReason::Expired);
+        assert_eq!(marker.last_position, manifest0.last_position);
+        assert_eq!(marker.retained_from_position, report.retained_from);
+        assert!(!segment_path(&directory, 0).exists());
+        assert!(manifest_path(&directory, 0).exists());
+
+        // Open-ended history reads clamp to the retained beginning; a
+        // resume below the floor fails closed rather than skipping lost
+        // positions.
+        let page = store.read_committed(None, 10_000).await.unwrap();
+        assert_eq!(
+            page.first().unwrap().position,
+            RangePosition::new(report.retained_from)
+        );
+        match store.read_committed(Some(RangePosition::new(1)), 1).await {
+            Err(ActiveRangeStoreError::RetentionExpired {
+                position,
+                retained_from,
+            }) => {
+                assert_eq!(position, 2);
+                assert_eq!(retained_from, report.retained_from);
+            }
+            other => panic!("expected RetentionExpired, got {other:?}"),
+        }
+        // Deleted cursors resolve as unknown — dedup/index state for the
+        // span was dropped with it.
+        assert_eq!(
+            store
+                .committed_position_for_cursor("cursor-1")
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Restart: recovery tolerates the absent span via the marker and
+        // serves only retained history.
+        drop(store);
+        let reopened = FileActiveRangeStore::open(root.path(), descriptor).unwrap();
+        let page = reopened.read_committed(None, 10_000).await.unwrap();
+        assert_eq!(
+            page.len() as u64,
+            committed.len() as u64 - manifest0.entries
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_trims_oldest_sealed_spans_first() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        let directory = range_directory(root.path(), &descriptor);
+        // Force a second seal so two sealed spans exist.
+        let mut appended = store.read_committed(None, 10_000).await.unwrap().len() as u64;
+        let mut spins = 0_u64;
+        while spins < 128 && !manifest_path(&directory, 1).exists() {
+            append_committed_records(&store, &descriptor, appended + 1, 1, 512).await;
+            appended += 1;
+            spins += 1;
+        }
+        assert!(
+            manifest_path(&directory, 1).exists(),
+            "segment 1 never sealed"
+        );
+        let persisted: PersistedRangeState =
+            serde_json::from_slice(&fs::read(directory.join("range-state.json")).unwrap()).unwrap();
+        let manifest1 = read_segment_manifest(&directory, 1, &persisted).unwrap();
+
+        // Budget fits only the newest span — the oldest is reclaimed.
+        let policy = HistoryPolicy {
+            max_retained_bytes: Some(manifest1.bytes),
+            ..HistoryPolicy::default()
+        };
+        let report = store
+            .apply_retention(&policy, None, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_segments, 1);
+        let marker = read_retention_marker(&directory, 0).unwrap();
+        assert_eq!(marker.reason, RetentionReason::Budget);
+        assert!(segment_path(&directory, 1).exists());
+    }
+
+    #[tokio::test]
+    async fn expiry_never_deletes_the_active_segment_or_splits_a_prefix() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor.clone(),
+            FileActiveRangeStoreOptions {
+                max_segment_bytes: 2_048,
+                ..FileActiveRangeStoreOptions::default()
+            },
+        )
+        .unwrap();
+        let directory = range_directory(root.path(), &descriptor);
+        // Segment 0 seals holding FRESH ingest times; segment 1 seals
+        // holding OLD ones — expiry qualifies the younger segment while
+        // the elder survives, so the delete set is not a prefix.
+        let mut appended = 0_u64;
+        while appended < 64 && !manifest_path(&directory, 0).exists() {
+            append_committed_records_ingest(&store, &descriptor, appended + 1, 1, 512, 10_000)
+                .await;
+            appended += 1;
+        }
+        assert!(manifest_path(&directory, 0).exists());
+        let mut spins = 0_u64;
+        while spins < 128 && !manifest_path(&directory, 1).exists() {
+            append_committed_records_ingest(&store, &descriptor, appended + 1, 1, 512, 1).await;
+            appended += 1;
+            spins += 1;
+        }
+        assert!(
+            manifest_path(&directory, 1).exists(),
+            "segment 1 never sealed"
+        );
+
+        let policy = HistoryPolicy {
+            expire_after_ns: Some(100),
+            ..HistoryPolicy::default()
+        };
+        // now=5_000: segment 1's ingest (1) expired; segment 0's (10_000) did not.
+        let report = store.apply_retention(&policy, None, 5_000).await.unwrap();
+        assert_eq!(
+            report.deleted_segments, 0,
+            "a non-prefix delete must never open a hole in retained history"
+        );
+        assert_eq!(report.retained_from, 1);
+        assert!(segment_path(&directory, 0).exists());
+        assert!(segment_path(&directory, 1).exists());
+
+        // And the active segment itself is never eligible even when its
+        // records are old — only sealed spans expire.
+        let fresh = FileActiveRangeStore::open(
+            root.path().join("fresh"),
+            ActiveRangeDescriptor {
+                feed_id: Uuid::from_u128(9),
+                range_id: RangeId::from_uuid(Uuid::from_u128(9)),
+                generation: RangeGeneration::new(1),
+                ownership_epoch: OwnershipEpoch::new(1),
+            },
+        )
+        .unwrap();
+        append_committed_records(
+            &fresh,
+            &ActiveRangeDescriptor {
+                feed_id: Uuid::from_u128(9),
+                range_id: RangeId::from_uuid(Uuid::from_u128(9)),
+                generation: RangeGeneration::new(1),
+                ownership_epoch: OwnershipEpoch::new(1),
+            },
+            1,
+            3,
+            64,
+        )
+        .await;
+        let report = fresh
+            .apply_retention(&policy, None, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(report.deleted_segments, 0);
+        assert_eq!(fresh.read_committed(None, 10).await.unwrap().len(), 3);
+    }
+
+    async fn append_committed_records_ingest(
+        store: &FileActiveRangeStore,
+        descriptor: &ActiveRangeDescriptor,
+        start: u64,
+        count: u64,
+        payload_len: usize,
+        ingest_time_ns: i64,
+    ) {
+        for sequence in start..start + count {
+            let record = StoredRecord {
+                message_id: Uuid::from_u128(900 + sequence as u128),
+                producer_id: Uuid::from_u128(3),
+                producer_sequence: sequence,
+                event_time_ns: sequence as i64,
+                ingest_time_ns,
+                key: b"key".to_vec(),
+                payload: vec![0xCD; payload_len],
+                metadata: std::collections::BTreeMap::new(),
+            };
+            store
+                .append(ActiveRangeAppend {
+                    generation: descriptor.generation,
+                    ownership_epoch: descriptor.ownership_epoch,
+                    expected_position: Some(RangePosition::new(sequence)),
+                    identity: AppendIdentity {
+                        writer_session_id: Uuid::from_u128(3),
+                        writer_epoch: 1,
+                        sequence,
+                    },
+                    cursor: format!("cursor-{sequence}"),
+                    frame: crate::codec::encode_record(&record).unwrap(),
+                    pending_effect: None,
+                })
+                .await
+                .unwrap();
+            store
+                .commit(
+                    descriptor.generation,
+                    descriptor.ownership_epoch,
+                    CommitPosition::new(sequence),
+                )
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn closed_range_directory_expires_without_a_live_store() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        let directory = range_directory(root.path(), &descriptor);
+        drop(store);
+        let mut persisted: PersistedRangeState =
+            serde_json::from_slice(&fs::read(directory.join("range-state.json")).unwrap()).unwrap();
+        let manifest0 = read_segment_manifest(&directory, 0, &persisted).unwrap();
+
+        let report = expire_range_directory(
+            &directory,
+            &mut persisted,
+            &HistoryPolicy {
+                expire_after_ns: Some(1),
+                ..HistoryPolicy::default()
+            },
+            None,
+            i64::MAX,
+        )
+        .unwrap();
+        assert_eq!(report.deleted_segments, 1);
+        // The state file advanced durably even though no store was open.
+        let on_disk: PersistedRangeState =
+            serde_json::from_slice(&fs::read(directory.join("range-state.json")).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.retained_from_position,
+            Some(manifest0.last_position + 1)
+        );
+        let reopened = FileActiveRangeStore::open(root.path(), descriptor).unwrap();
+        let page = reopened.read_committed(None, 10_000).await.unwrap();
+        assert_eq!(
+            page.first().unwrap().position,
+            RangePosition::new(manifest0.last_position + 1)
+        );
+    }
+
+    #[tokio::test]
+    async fn expiry_deletes_remote_objects_and_drops_the_remote_registry() {
+        let root = tempfile::TempDir::new().unwrap();
+        let objects = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        let directory = range_directory(root.path(), &descriptor);
+        drop(store);
+        demote_segments_to_remote(root.path(), &descriptor, objects.path(), &[0]);
+
+        let mut persisted: PersistedRangeState =
+            serde_json::from_slice(&fs::read(directory.join("range-state.json")).unwrap()).unwrap();
+        let marker = crate::active_range::tier::read_tier_marker(&directory, 0).unwrap();
+        let store = FileSystemObjectStore::open(objects.path()).unwrap();
+        let report = expire_range_directory(
+            &directory,
+            &mut persisted,
+            &HistoryPolicy {
+                expire_after_ns: Some(1),
+                ..HistoryPolicy::default()
+            },
+            Some(&store),
+            i64::MAX,
+        )
+        .unwrap();
+        assert_eq!(report.deleted_segments, 1);
+        // Every remote artifact for the span is gone, idempotently.
+        for key in [marker.object_key, marker.manifest_key] {
+            assert!(store.head(&key).unwrap().is_none(), "object {key} survived");
+        }
+        if let Some(key) = marker.checkpoint_key {
+            assert!(store.head(&key).unwrap().is_none(), "object {key} survived");
+        }
+        // A remote-only span that was deleted cannot be "not tiered" —
+        // the retention marker, not the tier marker, proves the absence.
+        assert!(read_retention_marker(&directory, 0).is_some());
+        assert!(crate::active_range::tier::read_tier_marker(&directory, 0).is_none());
     }
 
     #[tokio::test]
