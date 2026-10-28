@@ -1224,10 +1224,12 @@ struct CatalogState {
     history_policies: BTreeMap<Uuid, HistoryPolicyAssignment>,
     /// Legal holds keyed by FeedId — the freeze that every history-
     /// destruction path consults before deleting retained bytes.
+    #[serde(default)]
     legal_holds: BTreeMap<Uuid, LegalHold>,
     /// Per-Feed data-encryption keys, minted at `CREATE FEED ... ENCRYPTED`.
     /// Rows persist after destruction (status flips, material cleared)
     /// so erasure stays auditable.
+    #[serde(default)]
     feed_keys: BTreeMap<Uuid, FeedKey>,
     /// Declared record schema metadata keyed the same way — a
     /// `space_id` carries the Domain default; a `feed_id` overrides it.
