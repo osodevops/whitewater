@@ -26,6 +26,12 @@ fn generate_development_mtls_material() {
         rcgen::CertificateParams::new(vec!["whitewater-dev-ca".to_owned()]).unwrap();
     ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
     ca_params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
+    // Distinct CA vs leaf DNs: without them both default to rcgen's shared
+    // placeholder subject, and chain-verifying tools such as openssl
+    // misread the CA-signed leaf as a self-signed certificate.
+    let mut ca_dn = rcgen::DistinguishedName::new();
+    ca_dn.push(rcgen::DnType::CommonName, "whitewater-dev-ca");
+    ca_params.distinguished_name = ca_dn;
     let ca = ca_params.self_signed(&ca_key).unwrap();
     std::fs::write(out.join("ca.pem"), ca.pem()).unwrap();
 
@@ -34,6 +40,9 @@ fn generate_development_mtls_material() {
     for node in nodes.split(',').map(str::trim).filter(|n| !n.is_empty()) {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(vec![node.to_owned()]).unwrap();
+        let mut dn = rcgen::DistinguishedName::new();
+        dn.push(rcgen::DnType::CommonName, node.to_owned());
+        params.distinguished_name = dn;
         params.extended_key_usages = vec![
             rcgen::ExtendedKeyUsagePurpose::ClientAuth,
             rcgen::ExtendedKeyUsagePurpose::ServerAuth,

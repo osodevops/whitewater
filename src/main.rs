@@ -53,6 +53,14 @@ async fn main() -> Result<()> {
         .init();
 
     let mut config = NodeConfig::from_env()?;
+    if matches!(
+        config.internal_transport,
+        whitewater::config::InternalTransport::Insecure
+    ) {
+        eprintln!(
+            "warning: WHITEWATER_INTERNAL_TRANSPORT=insecure — the inter-Node plane is              running the shared-key prototype transport without peer encryption or              certificate identity; do not use outside development/test Riverbeds"
+        );
+    }
     // The volume carries the storage identity across container replacement:
     // adopt a persisted identity when the environment forgot it, and refuse
     // a configured identity that contradicts the volume's bound owner.

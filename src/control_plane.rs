@@ -377,6 +377,12 @@ impl RaftStorage<ControlTypeConfig> for PersistentRaftStore {
 struct ControlNetworkFactory {
     key: String,
     http: reqwest::Client,
+    /// Configured voter endpoints override addresses persisted in raft
+    /// membership records: a Riverbed that adopts mTLS after boot still
+    /// carries the old shared-key URLs inside its committed membership,
+    /// and trusting those stale addresses would strand every outbound RPC
+    /// on a listener that no longer serves the internal plane.
+    configured_peers: Arc<BTreeMap<ControlNodeId, BasicNode>>,
 }
 
 struct ControlNetwork {
@@ -390,9 +396,14 @@ impl RaftNetworkFactory<ControlTypeConfig> for ControlNetworkFactory {
     type Network = ControlNetwork;
 
     async fn new_client(&mut self, target: ControlNodeId, node: &BasicNode) -> Self::Network {
+        let address = self
+            .configured_peers
+            .get(&target)
+            .map(|peer| peer.addr.as_str())
+            .unwrap_or(node.addr.as_str());
         ControlNetwork {
             target,
-            address: node.addr.trim_end_matches('/').to_owned(),
+            address: address.trim_end_matches('/').to_owned(),
             key: self.key.clone(),
             http: self.http.clone(),
         }
@@ -640,6 +651,7 @@ impl ControlPlane {
         let network = ControlNetworkFactory {
             key: key.clone(),
             http: http.clone(),
+            configured_peers: Arc::new(peers.clone()),
         };
         let raft = Raft::new(node_id, config, network, log_store, state_machine)
             .await
@@ -910,7 +922,13 @@ fn unix_ns() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::internal_peer_url;
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+
+    use openraft::network::RaftNetworkFactory;
+    use openraft::BasicNode;
+
+    use super::{internal_peer_url, ControlNetworkFactory};
 
     #[test]
     fn internal_peer_url_keeps_fully_schemed_endpoints_verbatim() {
@@ -936,5 +954,28 @@ mod tests {
             internal_peer_url("control-1:7070/", "/internal/control-plane/write"),
             "http://control-1:7070/internal/control-plane/write"
         );
+    }
+
+    #[tokio::test]
+    async fn configured_peer_endpoint_overrides_the_persisted_membership_address() {
+        // A Riverbed that adopts mTLS after boot keeps the stale shared-key
+        // address inside its committed membership; outbound RPCs must dial
+        // the configured endpoint instead of trusting the record.
+        let configured = BTreeMap::from([
+            (2, BasicNode::new("https://control-2:7271")),
+            (3, BasicNode::new("https://control-3:7271")),
+        ]);
+        let mut factory = ControlNetworkFactory {
+            key: "k".to_owned(),
+            http: reqwest::Client::new(),
+            configured_peers: Arc::new(configured),
+        };
+        let persisted = BasicNode::new("node2:7070");
+        let client = RaftNetworkFactory::new_client(&mut factory, 2, &persisted).await;
+        assert_eq!(client.address, "https://control-2:7271");
+        // Voters outside the configured map still use the membership record.
+        let learner = BasicNode::new("node9:7070");
+        let client = RaftNetworkFactory::new_client(&mut factory, 9, &learner).await;
+        assert_eq!(client.address, "node9:7070");
     }
 }

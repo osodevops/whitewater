@@ -10,6 +10,19 @@ use anyhow::{Context, Result};
 
 use crate::{active_range::StorageNodeId, node::NodeCapabilities};
 
+/// How the inter-Node plane authenticates and encrypts. `mtls` (the
+/// default) requires the full `WHITEWATER_SUBSCRIPTION_MTLS_*` certificate
+/// bundle — or an operator-verified orchestrator transport that satisfies
+/// the same peer-identity, rotation, audit, and downgrade guarantees —
+/// so a deployment never silently falls back to plaintext. `insecure`
+/// is the explicit development/test opt-down that keeps the shared-key
+/// prototype transport; it is a named posture, never an accident.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InternalTransport {
+    Mtls,
+    Insecure,
+}
+
 #[derive(Clone, Debug)]
 pub struct SubscriptionMtlsConfig {
     pub bind_addr: SocketAddr,
@@ -65,6 +78,11 @@ pub struct NodeConfig {
     /// default 0 = disabled). Same shared-config requirement.
     pub min_disk_free_bytes: u64,
     pub subscription_mtls: Option<SubscriptionMtlsConfig>,
+    /// Inter-Node transport posture (`WHITEWATER_INTERNAL_TRANSPORT`).
+    /// Defaults to `InternalTransport::Mtls`, which refuses to boot
+    /// without certificate material; `Insecure` is the explicit
+    /// development/test opt-down.
+    pub internal_transport: InternalTransport,
     /// Root of the object store sealed segments upload to
     /// (`WHITEWATER_OBJECT_STORE_DIR`). `None` disables tiering entirely;
     /// the filesystem implementation used by development and test
@@ -221,6 +239,9 @@ impl NodeConfig {
         {
             anyhow::bail!("Subscription mTLS listener must not share the public HTTP bind address");
         }
+        let internal_transport =
+            parse_internal_transport(env::var("WHITEWATER_INTERNAL_TRANSPORT").ok())?;
+        validate_internal_transport(internal_transport, subscription_mtls.as_ref())?;
         Ok(Self {
             node_id,
             bind_addr,
@@ -243,6 +264,7 @@ impl NodeConfig {
             capacity_report_max_age,
             min_disk_free_bytes,
             subscription_mtls,
+            internal_transport,
             object_store_dir,
             tier_scan_interval,
             max_segment_bytes,
@@ -480,6 +502,37 @@ fn discover_local_ip() -> IpAddr {
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST))
 }
 
+/// Parse `WHITEWATER_INTERNAL_TRANSPORT`: unset means `mtls` (the secure
+/// default); the only other accepted values are `mtls` and `insecure`.
+fn parse_internal_transport(value: Option<String>) -> Result<InternalTransport> {
+    match value {
+        None => Ok(InternalTransport::Mtls),
+        Some(value) if value.eq_ignore_ascii_case("mtls") => Ok(InternalTransport::Mtls),
+        Some(value) if value.eq_ignore_ascii_case("insecure") => Ok(InternalTransport::Insecure),
+        Some(value) => anyhow::bail!(
+            "WHITEWATER_INTERNAL_TRANSPORT must be `mtls` or `insecure`, got {value:?}"
+        ),
+    }
+}
+
+/// The inter-Node transport contract: `mtls` requires certificate
+/// material; `insecure` must never coexist with it — a bundle plus the
+/// opt-down is a contradictory posture and fails closed.
+fn validate_internal_transport(
+    transport: InternalTransport,
+    subscription_mtls: Option<&SubscriptionMtlsConfig>,
+) -> Result<()> {
+    match (transport, subscription_mtls.is_some()) {
+        (InternalTransport::Mtls, false) => anyhow::bail!(
+            "inter-Node transport defaults to authenticated mTLS: configure the full              WHITEWATER_SUBSCRIPTION_MTLS_* certificate bundle (or rely on a verified              orchestrator-provided transport), or set              WHITEWATER_INTERNAL_TRANSPORT=insecure for development and test Riverbeds              that accept the shared-key prototype transport"
+        ),
+        (InternalTransport::Insecure, true) => anyhow::bail!(
+            "WHITEWATER_INTERNAL_TRANSPORT=insecure contradicts a configured              WHITEWATER_SUBSCRIPTION_MTLS_* bundle; remove the certificate material or              drop the opt-down"
+        ),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -591,6 +644,36 @@ mod tests {
         assert!(parse_peer_pins("").is_err());
     }
 
+    #[test]
+    fn internal_transport_defaults_secure_and_fences_contradictions() {
+        assert_eq!(
+            parse_internal_transport(None).unwrap(),
+            InternalTransport::Mtls
+        );
+        assert_eq!(
+            parse_internal_transport(Some("mtls".to_owned())).unwrap(),
+            InternalTransport::Mtls
+        );
+        assert_eq!(
+            parse_internal_transport(Some("INSECURE".to_owned())).unwrap(),
+            InternalTransport::Insecure
+        );
+        assert!(parse_internal_transport(Some("plaintext".to_owned())).is_err());
+        // The secure default refuses to run without certificate material.
+        assert!(validate_internal_transport(InternalTransport::Mtls, None).is_err());
+        assert!(validate_internal_transport(InternalTransport::Insecure, None).is_ok());
+        // An opt-down beside configured certificates is contradictory.
+        let bundle = SubscriptionMtlsConfig {
+            bind_addr: "0.0.0.0:7271".parse().unwrap(),
+            cert_path: PathBuf::from("cert.pem"),
+            key_path: PathBuf::from("key.pem"),
+            ca_path: PathBuf::from("ca.pem"),
+            peer_pins: BTreeMap::new(),
+            peer_endpoints: BTreeMap::new(),
+        };
+        assert!(validate_internal_transport(InternalTransport::Mtls, Some(&bundle)).is_ok());
+        assert!(validate_internal_transport(InternalTransport::Insecure, Some(&bundle)).is_err());
+    }
     #[test]
     fn subscription_peer_endpoints_reject_duplicates_and_missing_values() {
         let endpoints = parse_peer_endpoints(

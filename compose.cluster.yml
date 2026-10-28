@@ -10,6 +10,7 @@ services:
       WHITEWATER_MEMBER_TIMEOUT_MS: 5000
       WHITEWATER_NODE_CAPACITY: 100
       WHITEWATER_ADMIN_API_KEY: ${WHITEWATER_ADMIN_API_KEY:-whitewater-local-development-admin-key}
+      WHITEWATER_INTERNAL_TRANSPORT: ${WHITEWATER_INTERNAL_TRANSPORT:-insecure}
     expose:
       - "7070"
     ports:

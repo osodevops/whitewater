@@ -396,6 +396,8 @@ The bind address must differ from the public listener. The certificate/key and C
 
 When mTLS is configured, the public listener does not serve any `/internal/*` route, so a failed TLS handshake cannot fall back to plaintext. The shared-key internal plane remains available only when mTLS is not configured.
 
+`WHITEWATER_INTERNAL_TRANSPORT` selects the inter-Node posture: unset or `mtls` (the default) requires the full certificate bundle above and refuses to boot without it — a deployment can never silently fall back to shared-key HTTP. `insecure` is the explicit development/test opt-down that keeps the prototype transport; it refuses to coexist with configured certificate material, and Nodes log a loud warning at boot when it is set. A verified orchestrator-provided transport (service mesh or equivalent) may satisfy the same guarantee — the operator then runs `insecure` inside the verified boundary after confirming peer identity, rotation, audit, and downgrade prevention are enforced there.
+
 
 
 Live Compose evidence exists (`scripts/test-mtls-plane.py` with `compose.mtls.yml` and `tests/dev_cert_gen.rs` provisioning): raft election, internal-route absence from the public listener, uncertified-client refusal, member joins driven from a non-owner Node, drain/retire, and continued appends all pass over the pinned-certificate plane. Independently registered storage Nodes distribute certificate pins through the replicated catalog (`REGISTER STORAGE NODE ... WITH CERT PIN`), and the listener accepts catalog-pinned peers exactly like configured ones. Remaining gaps: per-request caller identity binding beyond cert-to-Node pinning, independently signed commit-vote evidence, and live acceptance with a non-voter storage Node.
