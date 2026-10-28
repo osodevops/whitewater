@@ -149,6 +149,12 @@ pub struct FileActiveRangeStoreOptions {
     /// Remote-read source for sealed segments whose local file is absent.
     /// `None` (the default) keeps every read local.
     pub tier: Option<std::sync::Arc<dyn RemoteSegmentSource>>,
+    /// The Feed's data-encryption key state, resolved from the catalog
+    /// when the store opens. `Active` encrypts sealed segments on seal
+    /// (deterministic nonce — every replica derives identical
+    /// ciphertext) and decrypts them for reads; `Destroyed` fails reads
+    /// as erased; `None` means an unencrypted Feed.
+    pub feed_key: Option<crate::control::FeedKeyState>,
 }
 
 impl Default for FileActiveRangeStoreOptions {
@@ -157,6 +163,7 @@ impl Default for FileActiveRangeStoreOptions {
             max_segment_bytes: 256 * 1024 * 1024,
             max_range_bytes: None,
             tier: None,
+            feed_key: None,
         }
     }
 }
@@ -218,6 +225,8 @@ pub enum ActiveRangeStoreError {
         "range position {position} was deleted by history retention; retained history starts at {retained_from}"
     )]
     RetentionExpired { position: u64, retained_from: u64 },
+    #[error("history was cryptographically erased — the Feed's data key is destroyed")]
+    FeedErased,
     #[error("Active Range tail is held by pending effect {0:?}")]
     PendingEffectOccupied(PendingEffect),
     #[error("storage worker failed: {0}")]
@@ -417,6 +426,14 @@ struct MaterializedSegment {
     /// Recovered entries for this span only — dense and position-ordered,
     /// verified against the manifest's coverage at admission.
     entries: Vec<EntryIndex>,
+    /// Decrypted segment bytes for encrypted spans. Plaintext lives in
+    /// memory only — the cache file on disk always holds ciphertext so a
+    /// destroyed key leaves nothing readable behind (the crypto-erasure
+    /// contract). Entry offsets index this plaintext view.
+    plaintext: Option<std::sync::Arc<Vec<u8>>>,
+    /// Local sealed segments materialize plaintext in place: eviction
+    /// must drop the buffer only, never the segment file itself.
+    local: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -522,7 +539,8 @@ impl FileActiveRangeStore {
         if persisted.ownership_epoch < descriptor.ownership_epoch {
             persisted.ownership_epoch = descriptor.ownership_epoch;
         }
-        let (entries, recovered_deduplication, remote) = recover_segments(&directory, &persisted)?;
+        let (entries, recovered_deduplication, remote) =
+            recover_segments(&directory, &persisted, options.feed_key.as_ref())?;
         // Remote-only sealed positions still exist — a Writer whose dedup
         // high-water landed in a tiered segment keeps its state, or a stale
         // sequence would replay a second copy of committed history.
@@ -1683,7 +1701,28 @@ fn materialize_remote(
         ))
     })?;
     let path = tier.fetch_sealed(&inner.directory, manifest.segment, manifest)?;
-    let recovered = recover_segment(&path, manifest.segment, false)?;
+    let encryption = inner
+        .options
+        .feed_key
+        .as_ref()
+        .map(|key| SegmentEncryption {
+            feed_id: manifest.feed_id,
+            range_id: manifest.range_id,
+            generation: manifest.generation,
+            key,
+        });
+    let recovered = recover_segment(&path, manifest.segment, false, encryption)?;
+    // Serving plaintext requires the decrypted bytes in memory — the
+    // cache file keeps ciphertext so an erased key orphans nothing
+    // readable.
+    let plaintext = fs::read(&path).ok().and_then(|bytes| {
+        bytes
+            .starts_with(ENCRYPTED_SEGMENT_MAGIC)
+            .then(|| decrypt_segment_bytes(&path, &bytes, manifest.segment, encryption))
+            .transpose()
+            .ok()
+            .flatten()
+    });
     if recovered.len() as u64 != manifest.entries
         || recovered.first().map(|entry| entry.position.value()) != Some(manifest.first_position)
         || recovered.last().map(|entry| entry.position.value()) != Some(manifest.last_position)
@@ -1726,10 +1765,62 @@ fn materialize_remote(
             bytes: manifest.bytes,
             last_used,
             entries: recovered,
+            plaintext: plaintext.map(std::sync::Arc::new),
+            local: false,
         },
     );
     loaded.materialized_bytes = loaded.materialized_bytes.saturating_add(manifest.bytes);
     demote_to_budget(inner, &mut loaded);
+    Ok(())
+}
+
+/// Local sealed encrypted segments read through a decrypted in-memory
+/// view — the ciphertext file stays untouched, so eviction only drops
+/// the buffer and the next read re-decrypts. `None` for a plaintext
+/// file or the active segment (never ciphertext).
+fn ensure_local_plaintext(
+    inner: &FileActiveRangeStoreInner,
+    loaded: &mut LoadedRange,
+    segment: u64,
+) -> Result<(), ActiveRangeStoreError> {
+    if segment == loaded.persisted.active_segment || loaded.materialized.contains_key(&segment) {
+        return Ok(());
+    }
+    let path = segment_path(&inner.directory, segment);
+    let mut head = [0_u8; ENCRYPTED_SEGMENT_MAGIC.len()];
+    {
+        let mut file = File::open(&path)?;
+        if file.read_exact(&mut head).is_err() || head != *ENCRYPTED_SEGMENT_MAGIC {
+            return Ok(());
+        }
+    }
+    let bytes = fs::read(&path)?;
+    let encryption = inner
+        .options
+        .feed_key
+        .as_ref()
+        .map(|key| SegmentEncryption {
+            feed_id: loaded.persisted.feed_id,
+            range_id: loaded.persisted.range_id,
+            generation: loaded.persisted.generation,
+            key,
+        });
+    let plaintext = decrypt_segment_bytes(&path, &bytes, segment, encryption)?;
+    loaded.use_seq = loaded.use_seq.saturating_add(1);
+    let stamp = loaded.use_seq;
+    loaded.materialized.insert(
+        segment,
+        MaterializedSegment {
+            path,
+            bytes: bytes.len() as u64,
+            last_used: stamp,
+            entries: Vec::new(),
+            plaintext: Some(std::sync::Arc::new(plaintext)),
+            local: true,
+        },
+    );
+    loaded.materialized_bytes = loaded.materialized_bytes.saturating_add(bytes.len() as u64);
+    demote_to_budget(inner, loaded);
     Ok(())
 }
 
@@ -1742,24 +1833,58 @@ fn materialize_remote(
 /// servable after its fetch, or a sub-segment budget would loop
 /// fetch-and-evict forever.
 fn demote_to_budget(inner: &FileActiveRangeStoreInner, loaded: &mut LoadedRange) {
-    let Some(tier) = inner.tier.as_ref() else {
-        return;
-    };
-    let budget = tier.remote_cache_bytes();
-    while loaded.materialized_bytes > budget && loaded.materialized.len() > 1 {
+    // The remote cache budget only applies when tiering exists; the
+    // local plaintext cap below bounds memory either way.
+    let budget = inner.tier.as_ref().map(|tier| tier.remote_cache_bytes());
+    while budget.is_some_and(|cap| loaded.materialized_bytes > cap) && loaded.materialized.len() > 1
+    {
         let Some((segment, evicted)) = loaded
             .materialized
             .iter()
             .min_by_key(|(_, materialized)| materialized.last_used)
             .map(|(segment, materialized)| {
-                (*segment, (materialized.path.clone(), materialized.bytes))
+                (
+                    *segment,
+                    (
+                        materialized.path.clone(),
+                        materialized.bytes,
+                        materialized.local,
+                    ),
+                )
             })
         else {
             break;
         };
         loaded.materialized.remove(&segment);
         loaded.materialized_bytes = loaded.materialized_bytes.saturating_sub(evicted.1);
-        let _ = std::fs::remove_file(evicted.0);
+        // `local` entries hold decrypted views of a real segment — only
+        // remote cache files are deleted on eviction.
+        if !evicted.2 {
+            let _ = std::fs::remove_file(evicted.0);
+        }
+    }
+    // Local plaintext views are unbudgeted (no tier required) — cap the
+    // count so a long scan across encrypted history cannot grow memory
+    // without bound. Eviction drops only the buffer; bytes stay on disk.
+    const LOCAL_PLAINTEXT_SPANS: usize = 4;
+    while loaded
+        .materialized
+        .values()
+        .filter(|span| span.local)
+        .count()
+        > LOCAL_PLAINTEXT_SPANS
+    {
+        let Some((segment, evicted)) = loaded
+            .materialized
+            .iter()
+            .filter(|(_, span)| span.local)
+            .min_by_key(|(_, span)| span.last_used)
+            .map(|(segment, span)| (*segment, span.bytes))
+        else {
+            break;
+        };
+        loaded.materialized.remove(&segment);
+        loaded.materialized_bytes = loaded.materialized_bytes.saturating_sub(evicted);
     }
 }
 
@@ -1972,17 +2097,26 @@ fn read_window_inner(
                     let start = loaded
                         .entries
                         .partition_point(|entry| entry.position.value() < next);
+                    // Sealed encrypted spans serve from an in-memory
+                    // plaintext view — materialize each span just before
+                    // its first entry serves, so the local-span cap only
+                    // ever evicts already-served views.
+                    let mut materialized_segment = None;
                     let mut served = 0_usize;
-                    for entry in loaded
-                        .entries
-                        .iter()
-                        .skip(start)
-                        .take_while(|entry| entry.position.value() <= bound)
-                        .take(remaining)
-                    {
-                        if entry.position.value() != next {
+                    let mut index = start;
+                    while served < remaining {
+                        let Some(entry) = loaded.entries.get(index) else {
+                            break;
+                        };
+                        if entry.position.value() > bound || entry.position.value() != next {
                             break;
                         }
+                        let segment = entry.segment;
+                        if materialized_segment != Some(segment) {
+                            ensure_local_plaintext(inner, &mut loaded, segment)?;
+                            materialized_segment = Some(segment);
+                        }
+                        let entry = &loaded.entries[index];
                         let frame = read_indexed_frame(&inner.directory, &loaded, entry)?;
                         if let Some(cap) = max_bytes {
                             let size = crate::codec::logical_frame_size(&frame.frame)?;
@@ -2000,6 +2134,7 @@ fn read_window_inner(
                         frames.push(frame);
                         next = next.saturating_add(1);
                         served += 1;
+                        index += 1;
                     }
                     if served == 0 && next <= bound {
                         return Err(ActiveRangeStoreError::InvalidState(format!(
@@ -2164,6 +2299,17 @@ fn rotate_if_needed(
         &next,
         &sealed_entries,
     )?;
+    // Encrypt-on-seal: the manifest hashes the file, so the ciphertext
+    // flip must land first — every replica derives identical bytes from
+    // the DEK-bound deterministic nonce.
+    if let Some(crate::control::FeedKeyState::Active(dek)) = &inner.options.feed_key {
+        encrypt_sealed_file_if_needed(
+            &inner.directory,
+            loaded.persisted.active_segment,
+            &next,
+            dek,
+        )?;
+    }
     write_segment_manifest(
         &inner.directory,
         loaded.persisted.active_segment,
@@ -2427,9 +2573,15 @@ pub(crate) fn ensure_segment_manifest(
     segment: u64,
     persisted: &PersistedRangeState,
     entries: &[EntryIndex],
+    key: Option<&crate::control::FeedKeyState>,
 ) -> Result<(), ActiveRangeStoreError> {
     if entries.is_empty() || read_segment_manifest(directory, segment, persisted).is_some() {
         return Ok(());
+    }
+    // The manifest's digest must bind the ciphertext, so the encrypt
+    // flip happens before hashing — deterministic across replicas.
+    if let Some(crate::control::FeedKeyState::Active(dek)) = key {
+        encrypt_sealed_file_if_needed(directory, segment, persisted, dek)?;
     }
     write_segment_manifest(directory, segment, persisted, entries)?;
     Ok(())
@@ -2445,6 +2597,7 @@ pub(crate) fn sealed_segment_manifest(
     directory: &Path,
     segment: u64,
     persisted: &PersistedRangeState,
+    key: Option<&crate::control::FeedKeyState>,
 ) -> Result<SegmentManifest, ActiveRangeStoreError> {
     if let Some(manifest) = read_segment_manifest(directory, segment, persisted) {
         if manifest.last_ingest_time_ns.is_some() {
@@ -2454,7 +2607,18 @@ pub(crate) fn sealed_segment_manifest(
         // sweep; re-derive it from the sealed file so the content-
         // derived ingest bound converges identically on every replica.
     }
-    let entries = recover_segment(&segment_path(directory, segment), segment, false)?;
+    // Encrypt-before-manifest keeps the digest bound to the final bytes:
+    // a replica that crashed between seal and encrypt converges here.
+    if let Some(crate::control::FeedKeyState::Active(dek)) = key {
+        encrypt_sealed_file_if_needed(directory, segment, persisted, dek)?;
+    }
+    let ctx = key.map(|key| SegmentEncryption {
+        feed_id: persisted.feed_id,
+        range_id: persisted.range_id,
+        generation: persisted.generation,
+        key,
+    });
+    let entries = recover_segment(&segment_path(directory, segment), segment, false, ctx)?;
     write_segment_manifest(directory, segment, persisted, &entries)
 }
 
@@ -2649,7 +2813,14 @@ type RecoveredSegments = (
 fn recover_segments(
     directory: &Path,
     persisted: &PersistedRangeState,
+    key: Option<&crate::control::FeedKeyState>,
 ) -> Result<RecoveredSegments, ActiveRangeStoreError> {
+    let encryption = key.map(|key| SegmentEncryption {
+        feed_id: persisted.feed_id,
+        range_id: persisted.range_id,
+        generation: persisted.generation,
+        key,
+    });
     let mut entries = Vec::new();
     let mut remote = BTreeMap::new();
     // The retention floor is the lowest position that may still be read;
@@ -2724,12 +2895,18 @@ fn recover_segments(
                     .checked_add(checkpointed.len() as u64)
                     .ok_or(ActiveRangeStoreError::PositionOverflow)?;
                 entries.extend(checkpointed);
-                ensure_segment_manifest(directory, segment, persisted, &entries[segment_start..])?;
+                ensure_segment_manifest(
+                    directory,
+                    segment,
+                    persisted,
+                    &entries[segment_start..],
+                    key,
+                )?;
                 continue;
             }
         }
         let allow_torn_tail = segment == persisted.active_segment;
-        let recovered = recover_segment(&path, segment, allow_torn_tail)?;
+        let recovered = recover_segment(&path, segment, allow_torn_tail, encryption)?;
         for entry in recovered {
             if entry.position.value() < floor {
                 continue;
@@ -2749,27 +2926,240 @@ fn recover_segments(
             entries.push(entry);
         }
         if segment < persisted.active_segment {
-            ensure_segment_manifest(directory, segment, persisted, &entries[segment_start..])?;
+            ensure_segment_manifest(
+                directory,
+                segment,
+                persisted,
+                &entries[segment_start..],
+                key,
+            )?;
         }
     }
     let deduplication = deduplication_from_entries(&entries);
     Ok((entries, deduplication, remote))
 }
 
+/// On-disk marker identifying an encrypted sealed segment. The 8-byte
+/// magic prefixes the XChaCha20-Poly1305 ciphertext — self-describing so
+/// recovery, manifest heal, and reads never guess the encoding.
+pub(crate) const ENCRYPTED_SEGMENT_MAGIC: &[u8; 8] = b"WWENC01\0";
+
+/// Deterministic per-segment nonce: `BLAKE3(dek ‖ feed ‖ range ‖
+/// generation ‖ segment)` truncated to the 24-byte XNonce. Identical
+/// inputs on every replica derive identical ciphertext, which keeps the
+/// sealed manifest's whole-file digest byte-identical across RF3 — the
+/// same determinism contract the rest of the sealed-file machinery
+/// depends on.
+fn seal_nonce(
+    dek: &[u8; 32],
+    feed_id: Uuid,
+    range_id: RangeId,
+    generation: u64,
+    segment: u64,
+) -> [u8; 24] {
+    let mut hasher = blake3::Hasher::new_keyed(dek);
+    hasher.update(b"whitewater-segment-encryption-v1");
+    hasher.update(feed_id.as_bytes());
+    hasher.update(range_id.as_uuid().as_bytes());
+    hasher.update(&generation.to_le_bytes());
+    hasher.update(&segment.to_le_bytes());
+    let digest = hasher.finalize();
+    let mut nonce = [0_u8; 24];
+    nonce.copy_from_slice(&digest.as_bytes()[..24]);
+    nonce
+}
+
+fn seal_cipher(dek: &[u8; 32]) -> chacha20poly1305::XChaCha20Poly1305 {
+    use chacha20poly1305::KeyInit;
+    chacha20poly1305::XChaCha20Poly1305::new(dek.into())
+}
+
+/// Rewrites a sealed plaintext segment as `magic ‖ ciphertext` when the
+/// Feed's key is active — the encrypt-on-seal step. Temp-write + rename +
+/// dir-sync makes the flip atomic; a crash before the rename leaves
+/// plaintext that the next manifest/heal pass encrypts instead. Returns
+/// true when bytes changed. A file already carrying the magic is a no-op.
+pub(crate) fn encrypt_sealed_file_if_needed(
+    directory: &Path,
+    segment: u64,
+    persisted: &PersistedRangeState,
+    dek: &[u8; 32],
+) -> Result<bool, ActiveRangeStoreError> {
+    use chacha20poly1305::aead::Aead;
+    let path = segment_path(directory, segment);
+    let plaintext = fs::read(&path)?;
+    if plaintext.starts_with(ENCRYPTED_SEGMENT_MAGIC) {
+        return Ok(false);
+    }
+    let nonce = seal_nonce(
+        dek,
+        persisted.feed_id,
+        persisted.range_id,
+        persisted.generation.value(),
+        segment,
+    );
+    let ciphertext = seal_cipher(dek)
+        .encrypt((&nonce).into(), plaintext.as_slice())
+        .map_err(|_| {
+            ActiveRangeStoreError::InvalidState(format!(
+                "encryption failed for sealed segment {segment}"
+            ))
+        })?;
+    let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+    {
+        let mut file = File::create(&temporary)?;
+        file.write_all(ENCRYPTED_SEGMENT_MAGIC)?;
+        file.write_all(&ciphertext)?;
+        file.sync_all()?;
+    }
+    fs::rename(&temporary, &path)?;
+    sync_directory(directory)?;
+    Ok(true)
+}
+
+/// Decrypts a magic-prefixed segment body under `persisted`'s identity.
+/// Returns `None` for plaintext input. The AEAD tag check is the
+/// integrity proof — a tampered ciphertext fails the tag, which is
+/// stronger evidence than the per-frame CRC.
+fn decrypt_segment_bytes(
+    path: &Path,
+    bytes: &[u8],
+    segment: u64,
+    encryption: Option<SegmentEncryption<'_>>,
+) -> Result<Vec<u8>, ActiveRangeStoreError> {
+    use chacha20poly1305::aead::Aead;
+    debug_assert!(bytes.starts_with(ENCRYPTED_SEGMENT_MAGIC));
+    let Some(ctx) = encryption else {
+        return Err(corrupt(
+            path,
+            "encrypted segment without a resolved Feed key",
+        ));
+    };
+    match ctx.key {
+        crate::control::FeedKeyState::Active(dek) => {
+            let nonce = seal_nonce(
+                dek,
+                ctx.feed_id,
+                ctx.range_id,
+                ctx.generation.value(),
+                segment,
+            );
+            seal_cipher(dek)
+                .decrypt((&nonce).into(), &bytes[ENCRYPTED_SEGMENT_MAGIC.len()..])
+                .map_err(|_| corrupt(path, "encrypted segment failed AEAD verification"))
+        }
+        crate::control::FeedKeyState::Destroyed => Err(ActiveRangeStoreError::FeedErased),
+    }
+}
+
+/// What a sealed-segment decrypt needs beyond the key itself: the
+/// identity bound into the deterministic nonce. Carried by hand instead
+/// of re-reading `PersistedRangeState` so remote-materialized segments
+/// can decrypt from their manifest's provenance fields.
+#[derive(Clone, Copy)]
+pub(crate) struct SegmentEncryption<'a> {
+    pub feed_id: Uuid,
+    pub range_id: RangeId,
+    pub generation: RangeGeneration,
+    pub key: &'a crate::control::FeedKeyState,
+}
+
+/// A segment byte source: the real file (plaintext path, torn-tail
+/// truncation allowed) or a decrypted in-memory buffer (AEAD-verified
+/// ciphertext — whole or corrupt, never truncatable).
+enum SegmentStream<'a> {
+    File(&'a mut File),
+    Buffer(std::io::Cursor<&'a [u8]>),
+}
+
+impl SegmentStream<'_> {
+    fn read_exact(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        match self {
+            SegmentStream::File(file) => file.read_exact(buf),
+            SegmentStream::Buffer(cursor) => Read::read_exact(cursor, buf),
+        }
+    }
+
+    fn seek(&mut self, position: u64) -> std::io::Result<u64> {
+        match self {
+            SegmentStream::File(file) => file.seek(SeekFrom::Start(position)),
+            SegmentStream::Buffer(cursor) => cursor.seek(SeekFrom::Start(position)),
+        }
+    }
+
+    /// Truncating a torn tail is only meaningful on the real file.
+    fn truncate(&mut self, valid_length: u64) -> std::io::Result<()> {
+        match self {
+            SegmentStream::File(file) => {
+                file.set_len(valid_length)?;
+                file.sync_all()
+            }
+            SegmentStream::Buffer(_) => Err(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "cannot truncate a decrypted segment buffer",
+            )),
+        }
+    }
+}
+
+/// Streams range entries out of a sealed or active segment. Plaintext
+/// files stream straight through; files carrying the encryption magic
+/// are AEAD-decrypted to memory first — the entries index the plaintext
+/// view, which is the same coordinate space `EntryIndex` always uses.
+/// `encryption` supplies identity + key state; a magic file under a
+/// destroyed key fails `FeedErased`, and under no resolved key fails as
+/// corruption rather than guessing.
 pub(crate) fn recover_segment(
     path: &Path,
     segment: u64,
     allow_torn_tail: bool,
+    encryption: Option<SegmentEncryption<'_>>,
 ) -> Result<Vec<EntryIndex>, ActiveRangeStoreError> {
     let mut file = OpenOptions::new().read(true).write(true).open(path)?;
     let file_length = file.metadata()?.len();
+    let mut head = [0_u8; ENCRYPTED_SEGMENT_MAGIC.len()];
+    if file.read_exact(&mut head).is_ok() && head == *ENCRYPTED_SEGMENT_MAGIC {
+        let bytes = fs::read(path)?;
+        let plaintext = decrypt_segment_bytes(path, &bytes, segment, encryption)?;
+        let mut stream = SegmentStream::Buffer(std::io::Cursor::new(&plaintext[..]));
+        return parse_segment_stream(&mut stream, plaintext.len() as u64, path, segment, false);
+    }
+    if matches!(
+        encryption.map(|ctx| ctx.key),
+        Some(crate::control::FeedKeyState::Destroyed)
+    ) {
+        // A plaintext file under a destroyed key is sweep-pending
+        // residue — serve it as erased, never as live history.
+        return Err(ActiveRangeStoreError::FeedErased);
+    }
+    let mut stream = SegmentStream::File(&mut file);
+    parse_segment_stream(&mut stream, file_length, path, segment, allow_torn_tail)
+}
+
+/// The plaintext-view parse loop shared by raw files and decrypted
+/// buffers. `valid_length` tracks the last fully decoded entry end —
+/// identical to the pre-encryption file stream.
+fn parse_segment_stream(
+    stream: &mut SegmentStream<'_>,
+    stream_length: u64,
+    path: &Path,
+    segment: u64,
+    allow_torn_tail: bool,
+) -> Result<Vec<EntryIndex>, ActiveRangeStoreError> {
     let mut entries = Vec::new();
     let mut valid_length = 0_u64;
-    while valid_length < file_length {
-        file.seek(SeekFrom::Start(valid_length))?;
+    while valid_length < stream_length {
+        stream.seek(valid_length)?;
         let mut length_bytes = [0_u8; 4];
-        if let Err(error) = file.read_exact(&mut length_bytes) {
-            return recover_torn_or_fail(file, path, allow_torn_tail, valid_length, error, entries);
+        if let Err(error) = stream.read_exact(&mut length_bytes) {
+            return recover_torn_or_fail(
+                stream,
+                path,
+                allow_torn_tail,
+                valid_length,
+                error,
+                entries,
+            );
         }
         let body_length = u32::from_be_bytes(length_bytes) as usize;
         if body_length > MAX_ENTRY_BODY_BYTES {
@@ -2781,9 +3171,9 @@ pub(crate) fn recover_segment(
         let entry_end = valid_length
             .checked_add(entry_length as u64)
             .ok_or(ActiveRangeStoreError::PositionOverflow)?;
-        if entry_end > file_length {
+        if entry_end > stream_length {
             return recover_torn_or_fail(
-                file,
+                stream,
                 path,
                 allow_torn_tail,
                 valid_length,
@@ -2792,9 +3182,9 @@ pub(crate) fn recover_segment(
             );
         }
         let mut body = vec![0_u8; body_length];
-        file.read_exact(&mut body)?;
+        stream.read_exact(&mut body)?;
         let mut checksum_bytes = [0_u8; 4];
-        file.read_exact(&mut checksum_bytes)?;
+        stream.read_exact(&mut checksum_bytes)?;
         if crc32fast::hash(&body) != u32::from_be_bytes(checksum_bytes) {
             return Err(corrupt(path, "entry checksum is invalid"));
         }
@@ -2825,7 +3215,7 @@ pub(crate) fn recover_segment(
 }
 
 fn recover_torn_or_fail(
-    file: File,
+    stream: &mut SegmentStream<'_>,
     path: &Path,
     allow_torn_tail: bool,
     valid_length: u64,
@@ -2833,8 +3223,7 @@ fn recover_torn_or_fail(
     entries: Vec<EntryIndex>,
 ) -> Result<Vec<EntryIndex>, ActiveRangeStoreError> {
     if allow_torn_tail && error.kind() == ErrorKind::UnexpectedEof {
-        file.set_len(valid_length)?;
-        file.sync_all()?;
+        stream.truncate(valid_length)?;
         Ok(entries)
     } else {
         Err(ActiveRangeStoreError::CorruptSegment {
@@ -2970,16 +3359,46 @@ fn read_indexed_frame(
     loaded: &LoadedRange,
     entry: &EntryIndex,
 ) -> Result<StoredRangeFrame, ActiveRangeStoreError> {
+    let frame_end = entry
+        .frame_offset
+        .checked_add(entry.frame_length)
+        .ok_or(ActiveRangeStoreError::PositionOverflow)?;
+    // Encrypted spans serve from the decrypted in-memory view; the bytes
+    // on disk are ciphertext whose offsets mean nothing.
+    if let Some(plaintext) = loaded
+        .materialized
+        .get(&entry.segment)
+        .and_then(|materialized| materialized.plaintext.as_ref())
+    {
+        if frame_end > plaintext.len() as u64 {
+            return Err(corrupt(
+                &segment_path(directory, entry.segment),
+                format!(
+                    "stored frame at RangePosition {} extends beyond the segment: offset={}, bytes={}",
+                    entry.position, entry.frame_offset, entry.frame_length
+                ),
+            ));
+        }
+        let frame = plaintext[entry.frame_offset as usize..frame_end as usize].to_vec();
+        if *blake3::hash(&frame).as_bytes() != entry.frame_digest {
+            return Err(corrupt(
+                &segment_path(directory, entry.segment),
+                "record frame changed after recovery",
+            ));
+        }
+        return Ok(StoredRangeFrame {
+            position: entry.position,
+            identity: entry.identity.clone(),
+            cursor: entry.cursor.clone(),
+            frame,
+        });
+    }
     let path = loaded
         .materialized
         .get(&entry.segment)
         .map(|materialized| materialized.path.clone())
         .unwrap_or_else(|| segment_path(directory, entry.segment));
     let mut file = File::open(&path)?;
-    let frame_end = entry
-        .frame_offset
-        .checked_add(entry.frame_length)
-        .ok_or(ActiveRangeStoreError::PositionOverflow)?;
     if frame_end > file.metadata()?.len() {
         return Err(corrupt(
             &path,
@@ -3117,12 +3536,13 @@ fn retention_delete_set(
     persisted: &PersistedRangeState,
     policy: &HistoryPolicy,
     now: i64,
+    key: Option<&crate::control::FeedKeyState>,
     skipped: &mut Vec<String>,
 ) -> Result<Vec<(SegmentManifest, RetentionReason)>, ActiveRangeStoreError> {
     let floor = persisted.retained_from_position.unwrap_or(1).max(1);
     let mut manifests = Vec::new();
     for segment in 0..persisted.active_segment {
-        match sealed_segment_manifest(directory, segment, persisted) {
+        match sealed_segment_manifest(directory, segment, persisted, key) {
             Ok(manifest) if manifest.last_position < floor => continue,
             Ok(manifest) => manifests.push(manifest),
             Err(error) => {
@@ -3211,6 +3631,65 @@ fn retention_delete_span(
     }
 }
 
+/// Cryptographic-erasure purge: deletes every remote artifact the tier
+/// markers name, then removes the whole range directory — spans, state,
+/// manifests, checkpoints, markers. The Feed's DEK is already destroyed
+/// by the time this runs, so any ciphertext that outlives the purge is
+/// unreadable regardless. Remote delete failures are reported, not
+/// fatal: the local purge still completes.
+pub(crate) fn purge_range_directory(
+    directory: &Path,
+    persisted: &PersistedRangeState,
+    objects: Option<&dyn super::tier::ObjectStore>,
+    report: &mut super::replication::RetentionSweepReport,
+) -> Result<(), ActiveRangeStoreError> {
+    if let Some(store) = objects {
+        for segment in 0..=persisted.active_segment {
+            if let Some(marker) = super::tier::read_tier_marker(directory, segment) {
+                for key in [
+                    marker.object_key,
+                    marker.manifest_key,
+                    marker.checkpoint_key.unwrap_or_default(),
+                ] {
+                    if key.is_empty() {
+                        continue;
+                    }
+                    if let Err(error) = store.delete(&key) {
+                        report.skipped.push(format!("object {key}: {error}"));
+                    }
+                }
+            }
+        }
+    }
+    if directory.exists() {
+        report.reclaimed_bytes = report
+            .reclaimed_bytes
+            .saturating_add(directory_size(directory));
+        fs::remove_dir_all(directory)?;
+    }
+    Ok(())
+}
+
+fn directory_size(directory: &Path) -> u64 {
+    fn walk(path: &Path) -> u64 {
+        let Ok(entries) = fs::read_dir(path) else {
+            return 0;
+        };
+        entries
+            .flatten()
+            .map(|entry| {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path)
+                } else {
+                    path.metadata().map(|meta| meta.len()).unwrap_or(0)
+                }
+            })
+            .sum()
+    }
+    walk(directory)
+}
+
 /// Filesystem-level expiry for a range whose store is not loaded: marker
 /// writes, floor advance, state persist, then the physical deletes. The
 /// running-store path (`expire_loaded`) performs the identical sequence
@@ -3221,9 +3700,11 @@ pub(crate) fn expire_range_directory(
     policy: &HistoryPolicy,
     objects: Option<&dyn super::tier::ObjectStore>,
     now: i64,
+    key: Option<&crate::control::FeedKeyState>,
 ) -> Result<ExpireReport, ActiveRangeStoreError> {
     let mut report = ExpireReport::default();
-    let delete_set = retention_delete_set(directory, persisted, policy, now, &mut report.skipped)?;
+    let delete_set =
+        retention_delete_set(directory, persisted, policy, now, key, &mut report.skipped)?;
     report.retained_from = persisted.retained_from_position.unwrap_or(1).max(1);
     if delete_set.is_empty() {
         return Ok(report);
@@ -3269,6 +3750,7 @@ fn expire_loaded(
             &loaded.persisted,
             policy,
             now,
+            inner.options.feed_key.as_ref(),
             &mut report.skipped,
         )?;
         report.retained_from = loaded.persisted.retained_from_position.unwrap_or(1).max(1);
@@ -4032,6 +4514,276 @@ mod tests {
             .count()
     }
 
+    // --- per-Feed encryption: seal-time DEK + deterministic nonces ---
+
+    fn test_dek(seed: u8) -> [u8; 32] {
+        *blake3::hash(&[seed; 16]).as_bytes()
+    }
+
+    async fn encrypted_rotated_store(
+        root: &Path,
+        descriptor: &ActiveRangeDescriptor,
+        dek: [u8; 32],
+    ) -> FileActiveRangeStore {
+        let store = FileActiveRangeStore::open_with_options(
+            root,
+            descriptor.clone(),
+            FileActiveRangeStoreOptions {
+                max_segment_bytes: 2_048,
+                feed_key: Some(crate::control::FeedKeyState::Active(dek)),
+                ..FileActiveRangeStoreOptions::default()
+            },
+        )
+        .unwrap();
+        let directory = range_directory(root, descriptor);
+        let mut appended = 0_u64;
+        while appended < 64 && !manifest_path(&directory, 0).exists() {
+            append_committed_records(&store, descriptor, appended + 1, 1, 512).await;
+            appended += 1;
+        }
+        assert!(
+            manifest_path(&directory, 0).exists(),
+            "64 committed entries never sealed segment 0"
+        );
+        store
+    }
+
+    #[tokio::test]
+    async fn sealing_an_encrypted_segment_writes_self_describing_ciphertext() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = encrypted_rotated_store(root.path(), &descriptor, test_dek(1)).await;
+        let directory = range_directory(root.path(), &descriptor);
+
+        let bytes = fs::read(segment_path(&directory, 0)).unwrap();
+        assert!(
+            bytes.starts_with(ENCRYPTED_SEGMENT_MAGIC),
+            "sealed file is not marked ciphertext"
+        );
+        // The manifest's digest binds the ciphertext, not the plaintext —
+        // the content addressing RF3 replicas dedupe/adopt on.
+        let persisted: PersistedRangeState =
+            serde_json::from_slice(&fs::read(directory.join("range-state.json")).unwrap()).unwrap();
+        let manifest = read_segment_manifest(&directory, 0, &persisted).unwrap();
+        assert_eq!(
+            manifest.segment_digest,
+            blake3::hash(&bytes).to_hex().to_string()
+        );
+        assert_eq!(manifest.bytes as usize, bytes.len());
+        drop(store);
+    }
+
+    #[tokio::test]
+    async fn encrypted_segments_derive_identical_ciphertext_across_replicas() {
+        let dek = test_dek(7);
+        let descriptor = test_descriptor();
+        let mut ciphertexts = Vec::new();
+        for _replica in 0..3 {
+            let root = tempfile::TempDir::new().unwrap();
+            let store = encrypted_rotated_store(root.path(), &descriptor, dek).await;
+            let directory = range_directory(root.path(), &descriptor);
+            ciphertexts.push(fs::read(segment_path(&directory, 0)).unwrap());
+            drop(store);
+        }
+        assert_eq!(ciphertexts[0], ciphertexts[1]);
+        assert_eq!(ciphertexts[1], ciphertexts[2]);
+    }
+
+    #[tokio::test]
+    async fn encrypted_store_reopens_and_serves_decrypted_reads() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let dek = test_dek(2);
+        let store = encrypted_rotated_store(root.path(), &descriptor, dek).await;
+        let committed = store.read_committed(None, 10_000).await.unwrap();
+        drop(store);
+
+        let reopened = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor,
+            FileActiveRangeStoreOptions {
+                max_segment_bytes: 2_048,
+                feed_key: Some(crate::control::FeedKeyState::Active(dek)),
+                ..FileActiveRangeStoreOptions::default()
+            },
+        )
+        .unwrap();
+        let frames = reopened.read_committed(None, 10_000).await.unwrap();
+        assert_eq!(frames.len(), committed.len());
+        for (left, right) in committed.iter().zip(frames.iter()) {
+            assert_eq!(left.position, right.position);
+            assert_eq!(left.frame, right.frame);
+        }
+    }
+
+    #[tokio::test]
+    async fn tampered_ciphertext_fails_aead_before_parsing() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let dek = test_dek(3);
+        let store = encrypted_rotated_store(root.path(), &descriptor, dek).await;
+        drop(store);
+        let directory = range_directory(root.path(), &descriptor);
+        let path = segment_path(&directory, 0);
+
+        let mut bytes = fs::read(&path).unwrap();
+        let mid = ENCRYPTED_SEGMENT_MAGIC.len() + 40;
+        bytes[mid] ^= 0xFF;
+        fs::write(&path, &bytes).unwrap();
+
+        let encryption = Some(SegmentEncryption {
+            feed_id: descriptor.feed_id,
+            range_id: descriptor.range_id,
+            generation: descriptor.generation,
+            key: &crate::control::FeedKeyState::Active(dek),
+        });
+        match recover_segment(&path, 0, false, encryption) {
+            Err(ActiveRangeStoreError::CorruptSegment { reason, .. }) => {
+                assert!(reason.contains("AEAD"), "{reason}");
+            }
+            other => panic!("expected CorruptSegment, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn destroyed_key_serves_ciphertext_as_erased() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let dek = test_dek(4);
+        let store = encrypted_rotated_store(root.path(), &descriptor, dek).await;
+        drop(store);
+        let directory = range_directory(root.path(), &descriptor);
+        let path = segment_path(&directory, 0);
+
+        // Destroyed key: the ciphertext exists but is cryptographically
+        // unreadable — FeedErased, never a decrypt attempt.
+        let destroyed = crate::control::FeedKeyState::Destroyed;
+        let encryption = Some(SegmentEncryption {
+            feed_id: descriptor.feed_id,
+            range_id: descriptor.range_id,
+            generation: descriptor.generation,
+            key: &destroyed,
+        });
+        assert!(matches!(
+            recover_segment(&path, 0, false, encryption),
+            Err(ActiveRangeStoreError::FeedErased)
+        ));
+        // No resolved key at all: fail as corruption, never guess.
+        assert!(matches!(
+            recover_segment(&path, 0, false, None),
+            Err(ActiveRangeStoreError::CorruptSegment { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn reopening_an_encrypted_store_with_a_destroyed_key_refuses() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let dek = test_dek(5);
+        let store = encrypted_rotated_store(root.path(), &descriptor, dek).await;
+        drop(store);
+
+        let result = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor,
+            FileActiveRangeStoreOptions {
+                max_segment_bytes: 2_048,
+                feed_key: Some(crate::control::FeedKeyState::Destroyed),
+                ..FileActiveRangeStoreOptions::default()
+            },
+        );
+        assert!(matches!(
+            result.err(),
+            Some(ActiveRangeStoreError::FeedErased)
+        ));
+    }
+
+    #[tokio::test]
+    async fn local_plaintext_views_evict_past_the_span_cap() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let dek = test_dek(6);
+        let store = encrypted_rotated_store(root.path(), &descriptor, dek).await;
+        let directory = range_directory(root.path(), &descriptor);
+        let persisted: PersistedRangeState =
+            serde_json::from_slice(&fs::read(directory.join("range-state.json")).unwrap()).unwrap();
+        let mut appended = persisted.appended;
+        // Six sealed segments — two more than LOCAL_PLAINTEXT_SPANS.
+        while appended < 256 && persisted_segment_count(&directory) < 6 {
+            append_committed_records(&store, &descriptor, appended + 1, 1, 256).await;
+            appended += 1;
+        }
+        assert!(persisted_segment_count(&directory) >= 6);
+
+        // One full scan materializes each encrypted span it touches.
+        let frames = store.read_committed(None, 10_000).await.unwrap();
+        assert!(frames.len() as u64 >= appended - 1);
+        let loaded = store.inner.loaded.lock().unwrap();
+        let local_spans = loaded
+            .materialized
+            .values()
+            .filter(|span| span.local)
+            .count();
+        assert!(
+            local_spans <= 4,
+            "local plaintext spans exceeded the cap: {local_spans}"
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_remote_segment_materializes_and_serves_reads() {
+        let root = tempfile::TempDir::new().unwrap();
+        let objects = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let dek = test_dek(8);
+        let store = encrypted_rotated_store(root.path(), &descriptor, dek).await;
+        let committed = store.read_committed(None, 10_000).await.unwrap();
+        drop(store);
+
+        // Tier with the key resolver — upload carries ciphertext.
+        let object_store = FileSystemObjectStore::open(objects.path()).unwrap();
+        let report = crate::active_range::tier::tier_scan_once(
+            root.path(),
+            &object_store,
+            &|_| None,
+            &|_| Some(crate::control::FeedKeyState::Active(dek)),
+        );
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+        let directory = range_directory(root.path(), &descriptor);
+        assert!(
+            crate::active_range::tier::read_tier_marker(&directory, 0).is_some(),
+            "segment 0 was not tiered"
+        );
+        fs::remove_file(segment_path(&directory, 0)).unwrap();
+
+        let reopened = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor,
+            FileActiveRangeStoreOptions {
+                max_segment_bytes: 2_048,
+                tier: Some(Arc::new(TierSource::with_store(
+                    Arc::new(FileSystemObjectStore::open(objects.path()).unwrap()),
+                    1 << 30,
+                ))),
+                feed_key: Some(crate::control::FeedKeyState::Active(dek)),
+                ..FileActiveRangeStoreOptions::default()
+            },
+        )
+        .unwrap();
+        let frames = reopened.read_committed(None, 10_000).await.unwrap();
+        assert_eq!(frames.len(), committed.len());
+        for (left, right) in committed.iter().zip(frames.iter()) {
+            assert_eq!(left.frame, right.frame);
+        }
+        // The materialized cache file keeps ciphertext — plaintext lives
+        // only in the in-memory view.
+        let loaded = reopened.inner.loaded.lock().unwrap();
+        let span = loaded.materialized.get(&0).expect("remote span cached");
+        let cache_bytes = fs::read(&span.path).unwrap();
+        assert!(cache_bytes.starts_with(ENCRYPTED_SEGMENT_MAGIC));
+        assert!(span.plaintext.is_some());
+    }
+
     // --- remote-only sealed segments + hot cache ---
 
     use crate::active_range::tier::{FileSystemObjectStore, ObjectStore, TierSource};
@@ -4105,7 +4857,8 @@ mod tests {
         segments: &[u64],
     ) -> Vec<SegmentManifest> {
         let objects = FileSystemObjectStore::open(object_root).unwrap();
-        let report = crate::active_range::tier::tier_scan_once(root, &objects, &|_| None);
+        let report =
+            crate::active_range::tier::tier_scan_once(root, &objects, &|_| None, &|_| None);
         assert!(
             report.failed.is_empty(),
             "tier scan failed: {:?}",
@@ -4380,6 +5133,7 @@ mod tests {
             },
             None,
             i64::MAX,
+            None,
         )
         .unwrap();
         assert_eq!(report.deleted_segments, 1);
@@ -4421,6 +5175,7 @@ mod tests {
             },
             Some(&store),
             i64::MAX,
+            None,
         )
         .unwrap();
         assert_eq!(report.deleted_segments, 1);

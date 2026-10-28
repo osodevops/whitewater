@@ -79,7 +79,10 @@ async fn feed_placed_on(
     for attempt in 0..12_u64 {
         let feed = format!("orders.joined{attempt}");
         control
-            .execute_commands(vec![Command::CreateFeed { name: feed.clone() }])
+            .execute_commands(vec![Command::CreateFeed {
+                name: feed.clone(),
+                encrypted: false,
+            }])
             .await
             .unwrap();
         let feed_id = control.active_feed_by_name(&feed).await.unwrap().feed_id;

@@ -1001,7 +1001,8 @@ fn wcl_command_scope(command: &crate::control::Command) -> WclCommandScope {
     let resource = |name: &str| ScopedName::Resource(name.to_owned());
     let domain = |name: &str| ScopedName::Domain(name.to_owned());
     match command {
-        Command::CreateFeed { name }
+        Command::CreateFeed { name, .. }
+        | Command::EraseFeed { feed: name }
         | Command::RebuildIndex { name }
         | Command::PausePipe { name }
         | Command::ResumePipe { name }
@@ -19306,6 +19307,7 @@ mod tests {
                     },
                     Command::CreateFeed {
                         name: "orders.events".to_owned(),
+                        encrypted: false,
                     },
                 ])
                 .await
@@ -19347,6 +19349,7 @@ mod tests {
                     },
                     Command::CreateFeed {
                         name: "orders.events".to_owned(),
+                        encrypted: false,
                     },
                     Command::CreateWriter {
                         name: "orders.writer".to_owned(),
@@ -19392,6 +19395,7 @@ mod tests {
                     },
                     Command::CreateFeed {
                         name: "orders.events".to_owned(),
+                        encrypted: false,
                     },
                     Command::CreateReader {
                         name: "orders.audit".to_owned(),
@@ -19438,6 +19442,7 @@ mod tests {
                     },
                     Command::CreateFeed {
                         name: "orders.events".to_owned(),
+                        encrypted: false,
                     },
                     Command::CreateSubscription {
                         name: "orders.billing".to_owned(),
@@ -19481,6 +19486,7 @@ mod tests {
                 },
                 Command::CreateFeed {
                     name: "orders.events".to_owned(),
+                    encrypted: false,
                 },
             ])
             .await
@@ -21631,6 +21637,7 @@ mod tests {
                 },
                 Command::CreateFeed {
                     name: "orders.created".to_owned(),
+                    encrypted: false,
                 },
             ],
         })
@@ -22548,6 +22555,7 @@ mod tests {
                         },
                         Command::CreateFeed {
                             name: "orders.created".to_owned(),
+                            encrypted: false,
                         },
                     ],
                 })
@@ -22632,6 +22640,7 @@ mod tests {
         let created = control
             .execute_commands(vec![Command::CreateFeed {
                 name: feed.to_owned(),
+                encrypted: false,
             }])
             .await
             .unwrap();
@@ -23178,6 +23187,7 @@ mod tests {
                 },
                 Command::CreateFeed {
                     name: "orders.events".to_owned(),
+                    encrypted: false,
                 },
                 Command::CreateSubscription {
                     name: "orders.billing".to_owned(),
@@ -23213,6 +23223,7 @@ mod tests {
                 },
                 Command::CreateFeed {
                     name: "orders.deep".to_owned(),
+                    encrypted: false,
                 },
                 Command::CreateSubscription {
                     name: "orders.deeptime".to_owned(),

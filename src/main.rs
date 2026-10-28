@@ -214,19 +214,25 @@ async fn main() -> Result<()> {
             loop {
                 ticker.tick().await;
                 let policies = policy_control.effective_history_policies().await;
+                let feed_keys = policy_control.feed_key_states().await;
+                let erased = policy_control.erased_feed_ids().await;
                 if let Some(object_root) = &object_root {
                     let root = ranges_root.clone();
                     let objects = object_root.clone();
                     let policies = policies.clone();
+                    let feed_keys = feed_keys.clone();
                     // The object store root opens lazily every tick: a
                     // late-mounted or briefly unavailable backend self-heals
                     // on the next pass instead of disabling tiering for the
                     // process lifetime.
                     let report = tokio::task::spawn_blocking(move || {
                         FileSystemObjectStore::open(&objects).map(|store| {
-                            tier_scan_once(root.as_path(), &store, &|feed_id| {
-                                policies.get(&feed_id).cloned()
-                            })
+                            tier_scan_once(
+                                root.as_path(),
+                                &store,
+                                &|feed_id| policies.get(&feed_id).cloned(),
+                                &|feed_id| feed_keys.get(&feed_id).cloned(),
+                            )
                         })
                     })
                     .await;
@@ -267,7 +273,7 @@ async fn main() -> Result<()> {
                     .unwrap_or(0);
                 let held = policy_control.legal_hold_feed_ids().await;
                 let sweep = service
-                    .retention_sweep(&policies, &held, objects, now)
+                    .retention_sweep(&policies, &held, &erased, &feed_keys, objects, now)
                     .await;
                 if sweep.held_ranges > 0 {
                     tracing::info!(

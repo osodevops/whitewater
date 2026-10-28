@@ -242,6 +242,10 @@ pub struct RangeReadSpec<'a> {
 #[derive(Clone, Debug, Default)]
 pub struct RetentionSweepReport {
     pub ranges_scanned: u64,
+    /// Ranges fully purged because their Feed was cryptographically
+    /// erased — a stronger outcome than expiry: the whole directory,
+    /// not a retained-prefix deletion.
+    pub erased_ranges: u64,
     /// Ranges skipped because their Feed is frozen by a legal hold —
     /// counted separately from errors so an operator can see the
     /// freeze working.
@@ -344,6 +348,8 @@ impl ReplicaAppendService {
         &self,
         policies: &HashMap<Uuid, crate::control::HistoryPolicy>,
         legal_holds: &HashSet<Uuid>,
+        erased: &HashSet<Uuid>,
+        feed_keys: &HashMap<Uuid, crate::control::FeedKeyState>,
         objects: Option<Arc<dyn super::tier::ObjectStore>>,
         now: i64,
     ) -> RetentionSweepReport {
@@ -363,6 +369,30 @@ impl ReplicaAppendService {
                 report.held_ranges += 1;
                 continue;
             }
+            // ERASE marked the Feed: purge the whole range directory —
+            // every span plus the persisted state — after deleting its
+            // remote objects. The DEK is already destroyed, so any
+            // ciphertext that escapes the purge is unreadable anyway.
+            if erased.contains(&persisted.feed_id) {
+                // Drop any live store first so no in-memory writer
+                // outlives the purge or re-creates the directory.
+                self.stores
+                    .write()
+                    .await
+                    .remove(&(persisted.range_id, persisted.generation));
+                match super::store::purge_range_directory(
+                    &directory,
+                    &persisted,
+                    objects.as_deref(),
+                    &mut report,
+                ) {
+                    Ok(()) => report.erased_ranges += 1,
+                    Err(error) => report
+                        .skipped
+                        .push(format!("{}: {error}", directory.display())),
+                }
+                continue;
+            }
             let Some(policy) = policies.get(&persisted.feed_id).cloned() else {
                 continue;
             };
@@ -371,6 +401,7 @@ impl ReplicaAppendService {
             }
             let key = (persisted.range_id, persisted.generation);
             let live = self.stores.read().await.get(&key).cloned();
+            let feed_key = feed_keys.get(&persisted.feed_id).cloned();
             let outcome = match live {
                 Some(store) => store.apply_retention(&policy, objects.clone(), now).await,
                 None => {
@@ -383,6 +414,7 @@ impl ReplicaAppendService {
                             &policy,
                             objects.as_deref(),
                             now,
+                            feed_key.as_ref(),
                         )
                     })
                     .await
@@ -1481,7 +1513,12 @@ impl ReplicaAppendService {
             generation: assignment.generation,
             ownership_epoch: assignment.ownership_epoch,
         };
-        let store_options = self.store_options.clone();
+        let mut store_options = self.store_options.clone();
+        // Per-Feed DEK state: seal encrypts under Active, reads decrypt
+        // through it, Destroyed fails closed as erased. Resolved at open
+        // so a lagged catalog never silently stores plaintext on an
+        // encrypted Feed.
+        store_options.feed_key = self.control.feed_key_state(assignment.feed_id).await;
         let opened = tokio::task::spawn_blocking(move || {
             FileActiveRangeStore::open_with_options(root.as_ref(), descriptor, store_options)
         })
@@ -1601,6 +1638,12 @@ fn map_store_error(error: ActiveRangeStoreError) -> ReplicaAppendError {
         ActiveRangeStoreError::PendingEffectOccupied(occupant) => {
             ReplicaAppendError::pending_occupied(occupant)
         }
+        // Retention and erasure are terminal: the bytes are gone by
+        // contract, so the read must refuse immediately rather than
+        // surface as a retryable storage failure.
+        ActiveRangeStoreError::RetentionExpired { .. } | ActiveRangeStoreError::FeedErased => {
+            ReplicaAppendError::rejected(ReplicaAppendErrorCode::InvalidFrame, error.to_string())
+        }
         other => ReplicaAppendError::storage(other.to_string()),
     }
 }
@@ -1636,6 +1679,7 @@ mod tests {
                 },
                 Command::CreateFeed {
                     name: "orders.events".to_owned(),
+                    encrypted: false,
                 },
             ])
             .await
@@ -1739,6 +1783,7 @@ mod tests {
                 },
                 Command::CreateFeed {
                     name: "orders.events".to_owned(),
+                    encrypted: false,
                 },
             ])
             .await

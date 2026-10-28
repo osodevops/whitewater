@@ -967,6 +967,7 @@ mod tests {
                 },
                 Command::CreateFeed {
                     name: "orders.events".to_owned(),
+                    encrypted: false,
                 },
             ])
             .await

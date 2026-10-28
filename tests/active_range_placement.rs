@@ -35,6 +35,7 @@ async fn create_feed(controller: &ControlController, request_id: Uuid) {
                 },
                 Command::CreateFeed {
                     name: "orders.created".to_owned(),
+                    encrypted: false,
                 },
             ],
             request_id,
@@ -364,6 +365,7 @@ async fn followers_apply_the_leaders_embedded_placement_not_their_local_candidat
             2,
             Command::CreateFeed {
                 name: "orders.created".to_owned(),
+                encrypted: false,
             },
         )
         .await
@@ -400,6 +402,7 @@ async fn feed_creation_is_refused_when_three_storage_nodes_are_not_available() {
     let result = controller
         .execute_commands(vec![Command::CreateFeed {
             name: "orders.created".to_owned(),
+            encrypted: false,
         }])
         .await;
     assert!(matches!(
@@ -971,6 +974,7 @@ async fn registered_storage_nodes_join_the_eligible_pool_and_survive_restart() {
                 },
                 Command::CreateFeed {
                     name: format!("space{index}.events"),
+                    encrypted: false,
                 },
             ])
             .await
@@ -1045,6 +1049,7 @@ async fn feed_creation_spreads_replicas_across_a_widened_eligible_pool() {
                 },
                 Command::CreateFeed {
                     name: format!("space{index}.events"),
+                    encrypted: false,
                 },
             ])
             .await
@@ -1250,6 +1255,7 @@ async fn split_right_replicas_stay_on_the_source_replica_set() {
             .execute_commands_with_request_id(
                 vec![Command::CreateFeed {
                     name: feed.to_string(),
+                    encrypted: false,
                 }],
                 Uuid::from_u128(701 + index as u128),
             )
@@ -2081,6 +2087,7 @@ async fn draining_a_storage_node_excludes_new_placement_and_survives_restart() {
                 },
                 Command::CreateFeed {
                     name: format!("space{index}.events"),
+                    encrypted: false,
                 },
             ])
             .await

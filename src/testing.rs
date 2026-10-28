@@ -435,7 +435,7 @@ impl FakeRiverbed {
                     }),
                 ))
             }
-            Command::CreateFeed { name } => {
+            Command::CreateFeed { name, .. } => {
                 Self::validate_name(name)?;
                 if self.feeds.contains_key(name) {
                     return Err(ControlError::AlreadyExists(format!("Feed {name}")));
@@ -815,6 +815,24 @@ impl FakeRiverbed {
                 ))
             }
             Command::Drop { kind, name } => self.drop_resource(kind, name),
+            Command::EraseFeed { feed } => {
+                // Mirror the catalog fences: holds first, attachments second.
+                if self.legal_holds.contains_key(feed.as_str()) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "drop the legal hold on Feed {feed} before erasing it"
+                    )));
+                }
+                if !self.feeds.contains_key(feed.as_str()) {
+                    return Err(ControlError::NotFound(format!("Feed {feed}")));
+                }
+                let removed = self.feeds.remove(feed.as_str()).is_some();
+                self.legal_holds.remove(feed.as_str());
+                self.history_policies.remove(&format!("feed:{feed}"));
+                Ok((
+                    format!("erased Feed {feed}: stored history is being purged"),
+                    json!({ "name": feed, "erased": removed }),
+                ))
+            }
             Command::Show { kind } => {
                 Ok((format!("showing {}", show_label(kind)), self.show(kind)))
             }
@@ -2203,6 +2221,7 @@ fn command_label(command: &Command) -> &'static str {
         Command::CreateDomain { .. } => "CREATE DOMAIN",
         Command::CreateSpace { .. } => "CREATE SPACE",
         Command::CreateFeed { .. } => "CREATE FEED",
+        Command::EraseFeed { .. } => "ERASE FEED",
         Command::DefineStateStore { .. } => "DEFINE STATE STORE",
         Command::DefineIndex { .. } => "DEFINE INDEX",
         Command::RebuildIndex { .. } => "REBUILD INDEX",

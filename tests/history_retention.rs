@@ -95,6 +95,7 @@ async fn legal_hold_freezes_the_retention_sweep_until_dropped() {
             },
             Command::CreateFeed {
                 name: "orders.created".to_owned(),
+                encrypted: false,
             },
         ])
         .await
@@ -157,7 +158,14 @@ async fn legal_hold_freezes_the_retention_sweep_until_dropped() {
         .unwrap();
     let held: HashSet<Uuid> = controller.legal_hold_feed_ids().await;
     let report = service
-        .retention_sweep(&policies, &held, None, i64::MAX)
+        .retention_sweep(
+            &policies,
+            &held,
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            i64::MAX,
+        )
         .await;
     assert_eq!(report.held_ranges, 1);
     assert_eq!(report.deleted_segments, 0);
@@ -175,9 +183,129 @@ async fn legal_hold_freezes_the_retention_sweep_until_dropped() {
         .unwrap();
     let held: HashSet<Uuid> = controller.legal_hold_feed_ids().await;
     let report = service
-        .retention_sweep(&policies, &held, None, i64::MAX)
+        .retention_sweep(
+            &policies,
+            &held,
+            &HashSet::new(),
+            &HashMap::new(),
+            None,
+            i64::MAX,
+        )
         .await;
     assert_eq!(report.held_ranges, 0);
     assert_eq!(report.deleted_segments, 1);
     assert!(!directory.join("segment-000000.log").exists());
+}
+
+#[tokio::test]
+async fn erased_feed_range_directory_is_purged_by_the_sweep() {
+    let catalog_directory = TempDir::new().unwrap();
+    let replica_root = TempDir::new().unwrap();
+    let store: Arc<dyn LogStore> =
+        Arc::new(FileLogStore::open(catalog_directory.path().join("data")).unwrap());
+    let controller = Arc::new(
+        ControlController::open_with_storage_nodes(
+            catalog_directory.path().join("catalog.json"),
+            store,
+            ["storage-1", "storage-2", "storage-3"]
+                .into_iter()
+                .map(|node| StorageNodeId::try_new(node).unwrap())
+                .collect(),
+        )
+        .unwrap(),
+    );
+    controller
+        .execute_commands(vec![
+            Command::CreateSpace {
+                name: "orders".to_owned(),
+            },
+            Command::CreateFeed {
+                name: "orders.secret".to_owned(),
+                encrypted: true,
+            },
+        ])
+        .await
+        .unwrap();
+    let feed_id: Uuid = controller
+        .active_feed_by_name("orders.secret")
+        .await
+        .map(|feed| feed.feed_id)
+        .unwrap();
+    let assignment = controller.active_range_assignment(feed_id).await.unwrap();
+    let descriptor = ActiveRangeDescriptor {
+        feed_id,
+        range_id: assignment.range_id,
+        generation: assignment.generation,
+        ownership_epoch: assignment.ownership_epoch,
+    };
+    let dek = match controller.feed_key_state(feed_id).await {
+        Some(whitewater::control::FeedKeyState::Active(dek)) => dek,
+        other => panic!("encrypted Feed carries no Active DEK: {other:?}"),
+    };
+
+    // Seal one encrypted segment, then close the store.
+    let directory = replica_root
+        .path()
+        .join(descriptor.feed_id.to_string())
+        .join(descriptor.range_id.as_uuid().to_string())
+        .join(format!("generation-{}", descriptor.generation.value()));
+    {
+        let store = FileActiveRangeStore::open_with_options(
+            replica_root.path(),
+            descriptor.clone(),
+            FileActiveRangeStoreOptions {
+                max_segment_bytes: 2_048,
+                feed_key: Some(whitewater::control::FeedKeyState::Active(dek)),
+                ..FileActiveRangeStoreOptions::default()
+            },
+        )
+        .unwrap();
+        let mut appended = 0_u64;
+        while appended < 64 && !directory.join("segment-000001.log").exists() {
+            append_committed(&store, &descriptor, appended + 1, 1, 512).await;
+            appended += 1;
+        }
+        assert!(
+            directory.join("segment-000001.log").exists(),
+            "segment 0 never sealed"
+        );
+        let sealed = std::fs::read(directory.join("segment-000000.log")).unwrap();
+        assert!(
+            sealed.starts_with(b"WWENC01\0"),
+            "sealed segment is not ciphertext"
+        );
+    }
+
+    // ERASE tombstones the Feed and destroys the DEK in one apply.
+    controller
+        .execute("ERASE FEED orders.secret;")
+        .await
+        .unwrap();
+    assert!(matches!(
+        controller.feed_key_state(feed_id).await,
+        Some(whitewater::control::FeedKeyState::Destroyed)
+    ));
+    let erased: HashSet<Uuid> = controller.erased_feed_ids().await;
+    assert!(erased.contains(&feed_id));
+
+    let service = ReplicaAppendService::new(
+        replica_root.path(),
+        StorageNodeId::try_new("storage-1").unwrap(),
+        controller.clone(),
+    );
+    let report = service
+        .retention_sweep(
+            &HashMap::new(),
+            &HashSet::new(),
+            &erased,
+            &HashMap::new(),
+            None,
+            i64::MAX,
+        )
+        .await;
+    assert_eq!(report.erased_ranges, 1, "{:?}", report.skipped);
+    assert!(
+        !directory.exists(),
+        "erased Feed's range directory survived the purge"
+    );
 }

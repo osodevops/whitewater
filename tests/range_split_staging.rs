@@ -138,6 +138,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
             },
             Command::CreateFeed {
                 name: "orders.events".to_owned(),
+                encrypted: false,
             },
         ])
         .await
@@ -604,6 +605,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
             },
             Command::CreateFeed {
                 name: "orders.events".to_owned(),
+                encrypted: false,
             },
         ])
         .await
@@ -987,6 +989,7 @@ async fn failed_split_activation_unfreezes_and_retains_the_plan() {
             },
             Command::CreateFeed {
                 name: "orders.events".to_owned(),
+                encrypted: false,
             },
         ])
         .await

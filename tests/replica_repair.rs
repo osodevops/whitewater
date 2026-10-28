@@ -154,6 +154,7 @@ async fn missing_committed_frames_are_verified_transferred_and_dedup_rebuilt() {
             },
             Command::CreateFeed {
                 name: "orders.events".to_owned(),
+                encrypted: false,
             },
         ])
         .await
@@ -263,6 +264,7 @@ async fn corrupt_replica_directory_is_quarantined_before_rebuild() {
             },
             Command::CreateFeed {
                 name: "orders.events".to_owned(),
+                encrypted: false,
             },
         ])
         .await
@@ -368,6 +370,7 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
             },
             Command::CreateFeed {
                 name: "orders.events".to_owned(),
+                encrypted: false,
             },
         ])
         .await
@@ -715,6 +718,7 @@ async fn follower_move_copy_resumes_staged_prefix_after_target_restart() {
             },
             Command::CreateFeed {
                 name: "orders.events".to_owned(),
+                encrypted: false,
             },
         ])
         .await
@@ -867,6 +871,7 @@ async fn follower_move_stages_the_prefix_before_freezing_the_tail() {
             },
             Command::CreateFeed {
                 name: "orders.events".to_owned(),
+                encrypted: false,
             },
         ])
         .await

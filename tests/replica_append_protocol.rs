@@ -48,6 +48,7 @@ impl Fixture {
                 },
                 Command::CreateFeed {
                     name: "orders.created".to_owned(),
+                    encrypted: false,
                 },
             ])
             .await

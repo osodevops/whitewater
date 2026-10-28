@@ -178,6 +178,7 @@ impl Fixture {
                     },
                     Command::CreateFeed {
                         name: "orders.events".to_owned(),
+                        encrypted: false,
                     },
                 ],
                 Uuid::from_u128(600),
@@ -1977,6 +1978,7 @@ async fn minted_sequences_parallelize_across_ranges_on_one_node() {
         .execute_commands_with_request_id(
             vec![Command::CreateFeed {
                 name: "orders.second".to_owned(),
+                encrypted: false,
             }],
             Uuid::from_u128(601),
         )

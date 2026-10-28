@@ -3468,6 +3468,7 @@ mod tests {
                 },
                 crate::control::Command::CreateFeed {
                     name: "orders.events".to_owned(),
+                    encrypted: false,
                 },
             ])
             .await

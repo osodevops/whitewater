@@ -47,6 +47,66 @@ pub struct FeedDefinition {
     pub storage_name: String,
     pub status: ResourceStatus,
     pub created_at_ns: i64,
+    /// Declared at creation (`CREATE FEED <name> ENCRYPTED`): sealed
+    /// segments encrypt under the Feed's data-encryption key so all
+    /// three replicas store byte-identical ciphertext and `ERASE FEED`
+    /// can cryptographically shred retained history by destroying the
+    /// key. Binding encryption to creation keeps the seal decision
+    /// deterministic — no mid-history flag flip can split replicas
+    /// across plaintext/ciphertext boundaries.
+    #[serde(default)]
+    pub encrypted: bool,
+    /// Set by `ERASE FEED`: the Feed is tombstoned and every range's
+    /// stored artifacts are purged. Distinct from a plain DROP so
+    /// operators can audit the difference between "definition retired,
+    /// history retained" and "history destroyed".
+    #[serde(default)]
+    pub erased_at_ns: Option<i64>,
+}
+
+/// A Feed's data-encryption key (DEK). Replicated through the catalog
+/// like every other declaration so all replicas seal identical
+/// ciphertext. PROTOTYPE LIMITATION: key material lives in catalog
+/// state — every Control Plane voter holds the DEKs, which is
+/// consistent with the current development-transport posture but is
+/// NOT a production key-management story. The real seam (KMS/HSM
+/// envelope wrapping, rotation, and Node-scoped unwrap) is tracked
+/// under the M9 security work; until then `ERASE FEED` destroys the
+/// replicated key material and every copy derived from it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FeedKey {
+    pub feed_id: Uuid,
+    /// 32-byte DEK as lowercase hex; cleared when the key is destroyed
+    /// so no catalog copy retains recoverable material.
+    #[serde(default)]
+    pub dek_hex: String,
+    pub status: FeedKeyStatus,
+    pub created_at_ns: i64,
+    #[serde(default)]
+    pub destroyed_at_ns: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedKeyStatus {
+    Active,
+    /// The DEK was destroyed by `ERASE FEED` — every ciphertext sealed
+    /// under it is permanently unrecoverable even if bytes survive
+    /// somewhere (object store, backups, drained caches).
+    Destroyed,
+}
+
+/// The key state a storage Node resolves for one Feed when opening
+/// ranges or healing manifests — distinct from "no key row exists"
+/// because a Destroyed row is positive evidence of erasure, not a
+/// missing declaration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FeedKeyState {
+    /// Sealed segments encrypt on seal; reads decrypt through it.
+    Active([u8; 32]),
+    /// The key is gone; ciphertext is unrecoverable. Reads fail as
+    /// erased, never as corruption.
+    Destroyed,
 }
 
 /// Declared retained-history policy for a Domain or Feed: how long a
@@ -1165,6 +1225,10 @@ struct CatalogState {
     /// Legal holds keyed by FeedId — the freeze that every history-
     /// destruction path consults before deleting retained bytes.
     legal_holds: BTreeMap<Uuid, LegalHold>,
+    /// Per-Feed data-encryption keys, minted at `CREATE FEED ... ENCRYPTED`.
+    /// Rows persist after destruction (status flips, material cleared)
+    /// so erasure stays auditable.
+    feed_keys: BTreeMap<Uuid, FeedKey>,
     /// Declared record schema metadata keyed the same way — a
     /// `space_id` carries the Domain default; a `feed_id` overrides it.
     #[serde(default)]
@@ -1241,6 +1305,7 @@ impl Default for CatalogState {
             api_keys: BTreeMap::new(),
             history_policies: BTreeMap::new(),
             legal_holds: BTreeMap::new(),
+            feed_keys: BTreeMap::new(),
             schemas: BTreeMap::new(),
             active_ranges: BTreeMap::new(),
             range_maps: BTreeMap::new(),
@@ -1308,6 +1373,16 @@ pub enum Command {
     },
     CreateFeed {
         name: String,
+        /// `CREATE FEED <name> ENCRYPTED` — mints the Feed's DEK at
+        /// creation so every sealed segment is ciphertext.
+        #[serde(default)]
+        encrypted: bool,
+    },
+    /// Cryptographic erasure: tombstone the Feed, destroy its DEK, and
+    /// purge every range's stored artifacts on all storage Nodes.
+    /// Refuses while a legal hold stands or consumers are attached.
+    EraseFeed {
+        feed: String,
     },
     DefineStateStore {
         name: String,
@@ -2769,6 +2844,69 @@ impl ControlController {
         state.legal_holds.get(&feed_id).cloned()
     }
 
+    /// Feeds marked for cryptographic erasure — `ERASE FEED` tombstoned
+    /// them and every storage Node's sweep must purge their stored
+    /// artifacts. Held feeds cannot appear here (the hold fences ERASE),
+    /// but the sweep checks holds first anyway — defense in depth.
+    pub async fn erased_feed_ids(&self) -> std::collections::HashSet<Uuid> {
+        let state = self.state.lock().await;
+        state
+            .feeds
+            .values()
+            .filter(|feed| feed.erased_at_ns.is_some())
+            .map(|feed| feed.feed_id)
+            .collect()
+    }
+
+    /// Per-Feed DEK state for every declared key row, for the storage
+    /// sweep's manifest-heal and seal decisions. Feeds without a row
+    /// (unencrypted) do not appear.
+    pub async fn feed_key_states(&self) -> std::collections::HashMap<Uuid, FeedKeyState> {
+        let state = self.state.lock().await;
+        state
+            .feed_keys
+            .values()
+            .map(|key| {
+                let state = match key.status {
+                    FeedKeyStatus::Active => {
+                        let mut dek = [0_u8; 32];
+                        let decoded = (0..32)
+                            .map(|i| {
+                                u8::from_str_radix(
+                                    key.dek_hex.get(i * 2..i * 2 + 2).unwrap_or("00"),
+                                    16,
+                                )
+                                .unwrap_or(0)
+                            })
+                            .collect::<Vec<u8>>();
+                        dek.copy_from_slice(&decoded);
+                        FeedKeyState::Active(dek)
+                    }
+                    FeedKeyStatus::Destroyed => FeedKeyState::Destroyed,
+                };
+                (key.feed_id, state)
+            })
+            .collect()
+    }
+
+    /// One Feed's key state for store-open resolution. `None` means the
+    /// Feed is unencrypted (no key row was ever minted).
+    pub async fn feed_key_state(&self, feed_id: Uuid) -> Option<FeedKeyState> {
+        let state = self.state.lock().await;
+        state.feed_keys.get(&feed_id).map(|key| match key.status {
+            FeedKeyStatus::Active => {
+                let mut dek = [0_u8; 32];
+                for (i, byte) in dek.iter_mut().enumerate() {
+                    *byte =
+                        u8::from_str_radix(key.dek_hex.get(i * 2..i * 2 + 2).unwrap_or("00"), 16)
+                            .unwrap_or(0);
+                }
+                FeedKeyState::Active(dek)
+            }
+            FeedKeyStatus::Destroyed => FeedKeyState::Destroyed,
+        })
+    }
+
     pub(crate) async fn active_reader_frontier(&self, reader_id: Uuid) -> Option<ReaderFrontier> {
         let state = self.state.lock().await;
         state
@@ -3221,7 +3359,7 @@ impl ControlController {
                 state.spaces.insert(definition.space_id, definition.clone());
                 Ok((format!("created Domain {name}"), json!(definition)))
             }
-            Command::CreateFeed { name } => {
+            Command::CreateFeed { name, encrypted } => {
                 validate_dotted_name(&name)?;
                 ensure_name_available(
                     state.feeds.values().map(|item| (&item.name, &item.status)),
@@ -3252,8 +3390,31 @@ impl ControlController {
                     storage_name,
                     status: ResourceStatus::Active,
                     created_at_ns: issued_at_ns,
+                    encrypted,
+                    erased_at_ns: None,
                 };
                 state.feeds.insert(feed_id, definition.clone());
+                if encrypted {
+                    // The DEK derives deterministically from the request
+                    // id — every replica applying this command derives
+                    // identical key material, so segment ciphertext
+                    // (and its manifest digest) agree across RF3.
+                    let mut hasher = blake3::Hasher::new();
+                    hasher.update(b"whitewater-feed-dek-v1");
+                    hasher.update(request_id.as_bytes());
+                    hasher.update(feed_id.as_bytes());
+                    let dek: [u8; 32] = *hasher.finalize().as_bytes();
+                    state.feed_keys.insert(
+                        feed_id,
+                        FeedKey {
+                            feed_id,
+                            dek_hex: dek.iter().map(|b| format!("{b:02x}")).collect(),
+                            status: FeedKeyStatus::Active,
+                            created_at_ns: issued_at_ns,
+                            destroyed_at_ns: None,
+                        },
+                    );
+                }
                 state.range_maps.insert(
                     feed_id,
                     RangeMap::single(assignment.range_id, assignment.generation),
@@ -4397,6 +4558,74 @@ impl ControlController {
                         )
                     })
                     .ok_or_else(|| ControlError::NotFound(format!("legal hold on Feed {feed}")))
+            }
+            Command::EraseFeed { feed } => {
+                let resolved = active_feed(state, &feed)?;
+                let feed_id = resolved.feed_id;
+                // Erasure is destruction: the same fences as DROP apply,
+                // legal hold first — an erase under hold is exactly the
+                // evidence destruction the hold exists to prevent.
+                if state.legal_holds.contains_key(&feed_id) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "drop the legal hold on Feed {feed} before erasing it"
+                    )));
+                }
+                if state
+                    .writers
+                    .values()
+                    .any(|item| item.status == ResourceStatus::Active && item.feed_id == feed_id)
+                    || state
+                        .readers
+                        .values()
+                        .any(|item| item.status == ResourceStatus::Active && item.feed_id == feed_id)
+                    || state.subscriptions.values().any(|item| {
+                        item.status == ResourceStatus::Active
+                            && (item.source.feed_id() == Some(feed_id)
+                                || (item.source.domain_id().is_some()
+                                    && item.space_id == resolved.space_id))
+                    })
+                    || state.pipes.values().any(|item| {
+                        item.status == ResourceStatus::Active
+                            && item.output_feed_id == Some(feed_id)
+                    })
+                {
+                    return Err(ControlError::InvalidOperation(
+                        "drop attached Writers, Readers, Subscriptions, and Pipes first".to_owned(),
+                    ));
+                }
+                let item = state.feeds.get_mut(&feed_id).expect("Feed exists");
+                item.status = ResourceStatus::Dropped;
+                item.erased_at_ns = Some(issued_at_ns);
+                let erased = item.clone();
+                // Key destruction makes retained ciphertext
+                // unrecoverable everywhere — object stores, backups,
+                // drained caches — even before the physical purge lands.
+                let key_destroyed = if let Some(key) = state.feed_keys.get_mut(&feed_id) {
+                    key.status = FeedKeyStatus::Destroyed;
+                    key.dek_hex.clear();
+                    key.destroyed_at_ns = Some(issued_at_ns);
+                    true
+                } else {
+                    false
+                };
+                for members in state.subscription_feed_memberships.values_mut() {
+                    members.remove(&feed_id);
+                }
+                state.history_policies.remove(&feed_id);
+                state.legal_holds.remove(&feed_id);
+                state.schemas.remove(&feed_id);
+                Ok((
+                    if key_destroyed {
+                        format!(
+                            "erased Feed {feed}: data key destroyed; stored history is being purged"
+                        )
+                    } else {
+                        format!(
+                            "erased Feed {feed}: stored history is being purged; no encryption key existed"
+                        )
+                    },
+                    json!(erased),
+                ))
             }
             Command::SetSchema { scope, schema } => {
                 validate_feed_schema(&schema)?;
@@ -6499,9 +6728,19 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             Some("SPACE") => Ok(Command::CreateSpace {
                 name: token(&tokens, 2)?.to_owned(),
             }),
-            Some("FEED") => Ok(Command::CreateFeed {
-                name: token(&tokens, 2)?.to_owned(),
-            }),
+            Some("FEED") => {
+                let name = token(&tokens, 2)?.to_owned();
+                let encrypted = match token(&tokens, 3).ok() {
+                    None => false,
+                    Some(flag) if flag.eq_ignore_ascii_case("ENCRYPTED") => true,
+                    Some(other) => {
+                        return Err(ControlError::Syntax(format!(
+                            "CREATE FEED accepts only ENCRYPTED after the name, not {other}"
+                        )))
+                    }
+                };
+                Ok(Command::CreateFeed { name, encrypted })
+            }
             Some("ROLE") => Ok(Command::CreateRole {
                 name: token(&tokens, 2)?.to_owned(),
             }),
@@ -7217,6 +7456,12 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             Ok(Command::Drop {
                 kind: parse_resource_kind(token(&tokens, 1)?)?,
                 name: token(&tokens, 2)?.to_owned(),
+            })
+        }
+        Some("ERASE") => {
+            expect_keyword(&tokens, 1, "FEED")?;
+            Ok(Command::EraseFeed {
+                feed: token(&tokens, 2)?.to_owned(),
             })
         }
         Some("SHOW") => Ok(Command::Show {
@@ -8907,6 +9152,8 @@ fn describe_resource(
                 .map(|assignment| assignment.policy.clone()));
             value["effective_history_policy"] = json!(effective_history_policy(state, feed));
             value["legal_hold"] = json!(state.legal_holds.get(&feed.feed_id));
+            value["encrypted"] = json!(feed.encrypted);
+            value["erased_at_ns"] = json!(feed.erased_at_ns);
             value["schema"] = json!(state
                 .schemas
                 .get(&feed.feed_id)
@@ -9368,6 +9615,7 @@ fn command_label(command: &Command) -> String {
         Command::CreateDomain { .. } => "CREATE DOMAIN",
         Command::CreateSpace { .. } => "CREATE SPACE",
         Command::CreateFeed { .. } => "CREATE FEED",
+        Command::EraseFeed { .. } => "ERASE FEED",
         Command::DefineStateStore { .. } => "DEFINE STATE STORE",
         Command::DefineIndex { .. } => "DEFINE INDEX",
         Command::RebuildIndex { .. } => "REBUILD INDEX",
@@ -10332,6 +10580,62 @@ mod tests {
         let repeated = left.apply_replicated(request.clone()).await;
         assert_eq!(repeated, left_result);
         assert_eq!(left.revision().await, 1);
+    }
+
+    #[tokio::test]
+    async fn encrypted_feed_dek_derives_identically_across_replicas() {
+        let left_directory = TempDir::new().unwrap();
+        let right_directory = TempDir::new().unwrap();
+        let left = new_controller(&left_directory);
+        let right = new_controller(&right_directory);
+        let request_id = Uuid::new_v4();
+        // The Domain must exist on both replicas before the Feed applies.
+        let space = ReplicatedCommand {
+            request_id: Uuid::new_v4(),
+            issued_at_ns: 1_700_000_000_000_000_000,
+            command: Command::CreateSpace {
+                name: "orders".to_owned(),
+            },
+            fixed_active_range: None,
+            fixed_subscription_progress: None,
+            fixed_state_store: None,
+        };
+        left.apply_replicated(space.clone()).await;
+        right.apply_replicated(space).await;
+        let create = ReplicatedCommand {
+            request_id,
+            issued_at_ns: 1_700_000_000_100_000_000,
+            command: Command::CreateFeed {
+                name: "orders.events".to_owned(),
+                encrypted: true,
+            },
+            fixed_active_range: Some(FixedActiveRangePlacement {
+                owner: StorageNodeId::try_new("storage-1").unwrap(),
+                replicas: [
+                    StorageNodeId::try_new("storage-1").unwrap(),
+                    StorageNodeId::try_new("storage-2").unwrap(),
+                    StorageNodeId::try_new("storage-3").unwrap(),
+                ],
+            }),
+            fixed_subscription_progress: None,
+            fixed_state_store: None,
+        };
+        let left_result = left.apply_replicated(create.clone()).await;
+        let right_result = right.apply_replicated(create).await;
+        assert!(left_result.error.is_none(), "{:?}", left_result.error);
+        assert_eq!(left_result, right_result);
+
+        // Every replica applying the same command must hold identical key
+        // material — ciphertext is only byte-identical when the DEK is.
+        let feed_id = derived_resource_id(request_id, "feed");
+        let left_key = left.feed_key_state(feed_id).await;
+        let right_key = right.feed_key_state(feed_id).await;
+        match (left_key, right_key) {
+            (Some(FeedKeyState::Active(left)), Some(FeedKeyState::Active(right))) => {
+                assert_eq!(left, right);
+            }
+            other => panic!("expected Active DEKs on both replicas, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -358,7 +358,34 @@ impl AdminClient {
         &self,
         name: impl Into<String>,
     ) -> Result<ControlExecution, AdminClientError> {
-        self.execute_one(Command::CreateFeed { name: name.into() })
+        self.execute_one(Command::CreateFeed {
+            name: name.into(),
+            encrypted: false,
+        })
+        .await
+    }
+
+    /// `CREATE FEED <name> ENCRYPTED` — mints the Feed's DEK so sealed
+    /// history stores ciphertext and `ERASE FEED` can crypto-shred it.
+    pub async fn create_encrypted_feed(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::CreateFeed {
+            name: name.into(),
+            encrypted: true,
+        })
+        .await
+    }
+
+    /// `ERASE FEED <name>` — destroys the Feed's DEK (when encrypted)
+    /// and purges every range's stored artifacts. Fenced by legal
+    /// holds and attached consumers, like DROP.
+    pub async fn erase_feed(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::EraseFeed { feed: name.into() })
             .await
     }
 

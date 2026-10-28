@@ -551,8 +551,9 @@ pub(crate) fn upload_sealed_segment(
     segment: u64,
     persisted: &PersistedRangeState,
     store: &dyn ObjectStore,
+    key: Option<&crate::control::FeedKeyState>,
 ) -> Result<TierMarker, TierError> {
-    sealed_segment_manifest(directory, segment, persisted)?;
+    sealed_segment_manifest(directory, segment, persisted, key)?;
     let manifest = verify_sealed_segment(directory, segment, persisted)?;
     let manifest_bytes = manifest.segment_digest.clone();
 
@@ -624,6 +625,7 @@ pub fn tier_scan_once(
     root: &Path,
     store: &dyn ObjectStore,
     policy: &dyn Fn(Uuid) -> Option<HistoryPolicy>,
+    keys: &dyn Fn(Uuid) -> Option<crate::control::FeedKeyState>,
 ) -> TierScanReport {
     let mut report = TierScanReport::default();
     let now = unix_ns();
@@ -651,7 +653,13 @@ pub fn tier_scan_once(
                     continue;
                 }
             }
-            match upload_sealed_segment(&generation_dir, segment, &persisted, store) {
+            match upload_sealed_segment(
+                &generation_dir,
+                segment,
+                &persisted,
+                store,
+                keys(persisted.feed_id).as_ref(),
+            ) {
                 Ok(_) => report.uploaded += 1,
                 Err(error) => report.failed.push(format!(
                     "{}/segment-{segment:06}: {error}",
@@ -831,7 +839,7 @@ mod tests {
         let directory = sealed_range_root(ranges.path(), &descriptor, 20);
         let store = FileSystemObjectStore::open(objects.path()).unwrap();
 
-        let report = tier_scan_once(ranges.path(), &store, &|_| None);
+        let report = tier_scan_once(ranges.path(), &store, &|_| None, &|_| None);
         assert_eq!(report.uploaded, 1);
         assert!(report.failed.is_empty(), "{:?}", report.failed);
 
@@ -863,7 +871,7 @@ mod tests {
         assert_eq!(manifest.last_position, 20);
 
         // A second tick recognizes the marker and does nothing.
-        let again = tier_scan_once(ranges.path(), &store, &|_| None);
+        let again = tier_scan_once(ranges.path(), &store, &|_| None, &|_| None);
         assert_eq!(again.uploaded, 0);
         assert_eq!(again.already_tiered, 1);
         assert!(again.failed.is_empty());
@@ -889,7 +897,7 @@ mod tests {
         }
 
         let first = FileSystemObjectStore::open(objects.path()).unwrap();
-        let report = tier_scan_once(replica_one.path(), &first, &|_| None);
+        let report = tier_scan_once(replica_one.path(), &first, &|_| None, &|_| None);
         assert_eq!(report.uploaded, 1);
         let remote_len = first.head(
             &serde_json::from_slice::<TierMarker>(
@@ -901,7 +909,7 @@ mod tests {
 
         // Replica two scans the same object keys: all adopted, zero puts.
         let spy = SpyStore::open(objects.path());
-        let second = tier_scan_once(replica_two.path(), &spy, &|_| None);
+        let second = tier_scan_once(replica_two.path(), &spy, &|_| None, &|_| None);
         assert_eq!(second.uploaded, 1, "{:?}", second.failed);
         assert_eq!(spy.puts(), 0, "replica must adopt, not rewrite");
         assert!(tier_marker_path(&directory_two, 0).exists());
@@ -930,7 +938,7 @@ mod tests {
         fs::write(&poison_file, b"not the segment").unwrap();
         store.put(&key, &poison_file).unwrap();
 
-        let report = tier_scan_once(ranges.path(), &store, &|_| None);
+        let report = tier_scan_once(ranges.path(), &store, &|_| None, &|_| None);
         assert_eq!(report.uploaded, 0);
         assert_eq!(report.failed.len(), 1);
         assert!(report.failed[0].contains("different content"));
@@ -948,7 +956,7 @@ mod tests {
         assert!(!manifest_path(&directory, 0).exists());
 
         let store = FileSystemObjectStore::open(objects.path()).unwrap();
-        let report = tier_scan_once(ranges.path(), &store, &|_| None);
+        let report = tier_scan_once(ranges.path(), &store, &|_| None, &|_| None);
         assert_eq!(report.uploaded, 1, "{:?}", report.failed);
         // Healed manifest binds the file's real digest.
         let manifest: SegmentManifest =
@@ -968,7 +976,7 @@ mod tests {
         let descriptor = descriptor();
         let directory = sealed_range_root(ranges.path(), &descriptor, 4);
         let store = FileSystemObjectStore::open(objects.path()).unwrap();
-        tier_scan_once(ranges.path(), &store, &|_| None);
+        tier_scan_once(ranges.path(), &store, &|_| None, &|_| None);
 
         // Segment 1 is the open tail: no manifest, no marker, no remote key.
         assert!(!tier_marker_path(&directory, 1).exists());
@@ -1166,22 +1174,32 @@ mod tests {
 
         // A fresh segment inside the declared hot-local window must not
         // tier — the scan defers it until the policy's duration passes.
-        let hot = tier_scan_once(ranges.path(), &store, &|feed| {
-            (feed == feed_id).then(|| HistoryPolicy {
-                tier_after_ns: Some(30 * 24 * 60 * 60 * 1_000_000_000),
-                ..HistoryPolicy::default()
-            })
-        });
+        let hot = tier_scan_once(
+            ranges.path(),
+            &store,
+            &|feed| {
+                (feed == feed_id).then(|| HistoryPolicy {
+                    tier_after_ns: Some(30 * 24 * 60 * 60 * 1_000_000_000),
+                    ..HistoryPolicy::default()
+                })
+            },
+            &|_| None,
+        );
         assert_eq!(hot.uploaded, 0, "{:?}", hot.failed);
         assert_eq!(hot.hot_deferred, 1);
 
         // The same segment past its hot window tiers normally.
-        let aged = tier_scan_once(ranges.path(), &store, &|feed| {
-            (feed == feed_id).then(|| HistoryPolicy {
-                tier_after_ns: Some(1),
-                ..HistoryPolicy::default()
-            })
-        });
+        let aged = tier_scan_once(
+            ranges.path(),
+            &store,
+            &|feed| {
+                (feed == feed_id).then(|| HistoryPolicy {
+                    tier_after_ns: Some(1),
+                    ..HistoryPolicy::default()
+                })
+            },
+            &|_| None,
+        );
         assert_eq!(aged.uploaded, 1, "{:?}", aged.failed);
         assert_eq!(aged.hot_deferred, 0);
 
@@ -1189,7 +1207,7 @@ mod tests {
         // mean the built-in default: tier immediately.
         let orphan = tempfile::TempDir::new().unwrap();
         sealed_range_root(orphan.path(), &descriptor, 8);
-        let unresolved = tier_scan_once(orphan.path(), &store, &|_| None);
+        let unresolved = tier_scan_once(orphan.path(), &store, &|_| None, &|_| None);
         assert_eq!(unresolved.uploaded, 1, "{:?}", unresolved.failed);
         assert_eq!(unresolved.hot_deferred, 0);
     }
