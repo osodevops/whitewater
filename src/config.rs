@@ -89,7 +89,7 @@ pub struct NodeConfig {
     /// topologies treats this as a shared or per-Node directory.
     pub object_store_dir: Option<PathBuf>,
     /// How often the tiering pass scans for newly sealed segments
-    /// (`WHITEWATER_TIER_SCAN_MS`, default 30s).
+    /// (`WHITEWATER_TIER_SCAN_MS`, default 5m).
     pub tier_scan_interval: Duration,
     /// Committed-segment rotation bound (`WHITEWATER_MAX_SEGMENT_BYTES`,
     /// default 256 MiB). Identical semantics on every replica; a divergent
@@ -182,7 +182,7 @@ impl NodeConfig {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
         let tier_scan_interval =
-            Duration::from_millis(parse_env("WHITEWATER_TIER_SCAN_MS", 30_000)?);
+            Duration::from_millis(parse_env("WHITEWATER_TIER_SCAN_MS", 300_000)?);
         let max_segment_bytes = parse_env("WHITEWATER_MAX_SEGMENT_BYTES", 256 * 1024 * 1024)?;
         if max_segment_bytes == 0 {
             anyhow::bail!("WHITEWATER_MAX_SEGMENT_BYTES must be greater than zero");
