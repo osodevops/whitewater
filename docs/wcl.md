@@ -442,6 +442,64 @@ with it.
 
 
 
+### Distributary
+
+A Distributary is the built-in cross-Riverbed copy mechanism: a managed
+pull of one remote Feed into one local Feed, named for a branch that
+carries water out of the main river to another. Declare the remote
+route once, then bind remote Feeds to local targets:
+
+```wcl
+CREATE RIVERBED LINK upstream
+  AT 'https://dr-1:9392,https://dr-2:9392'
+  WITH KEY ENV WHITEWATER_DR_KEY;
+
+CREATE DISTRIBUTARY mirror.orders FROM LINK upstream
+  FEED orders.events INTO mirror.orders_copy;
+```
+
+A Riverbed Link names up to eight remote endpoints plus the environment
+variable each Node reads for the remote credential — the replicated
+catalog stores the variable name, never key material. A Distributary
+preserves each record's Key, `event_time_ns`, and Metadata while
+minting new local Cursors; the destination's history is its own, so a
+promoted copy is a real Feed, not a tombstone reference.
+
+Durable progress lives on the remote as a named Reader frontier derived
+from the Distributary's id: the owner Node's driver opens a remote
+Reader session, copies a bounded page, and acknowledges the delivered
+cursor only after every append lands. A crash between append and ack
+makes the remote redeliver; each record's append rides a request id
+derived from `(distributary_id, source_cursor)`, so the destination
+dedups the replay — copy semantics are effectively-once, never
+at-most-once. Feed-derived StateStores on the destination simply
+re-derive from the copied Feed; manual StateStore journal shipping is
+not yet implemented.
+
+Each Distributary carries an epoch-fenced lease like a Pipe compute
+lease. The lease owner drives; a remote Reader session open fences the
+previous epoch, so a move can never run two drivers over the same
+frontier. `SHOW DISTRIBUTARIES` reports `lease_owner` and `lease_epoch`;
+`MOVE DISTRIBUTARY LEASE` fails the copy over to another storage-eligible
+Node, and `DRAIN STORAGE NODE` plans the move automatically:
+
+```wcl
+SHOW DISTRIBUTARIES;
+MOVE DISTRIBUTARY LEASE mirror.orders TO NODE storage-2;
+DROP DISTRIBUTARY mirror.orders;
+DROP LINK upstream;
+```
+
+The drive loop runs on every Node (`WHITEWATER_DISTRIBUTARY_DRIVE_INTERVAL_MS`,
+default 1000ms, minimum 100ms) and acts only on locally-held leases; it
+needs `WHITEWATER_ADMIN_API_KEY` for local appends, matching the drain
+supervisor's credential. A Link cannot drop while Distributaries use it,
+and a target Feed cannot drop or erase under an active Distributary.
+Automatic lease recovery on owner loss is not yet implemented — until
+then a dead owner stalls its Distributaries until an operator `MOVE`
+lands; failover is safe, just manual.
+
+
 ### Role
 
 

@@ -968,7 +968,7 @@ impl FakeRiverbed {
             ResourceKind::Pipe => self.pipes.remove(name).is_some(),
             ResourceKind::Index => self.indexes.remove(name).is_some(),
             ResourceKind::StateStore => self.stores.remove(name).is_some(),
-            ResourceKind::Role => false,
+            ResourceKind::Role | ResourceKind::RiverbedLink | ResourceKind::Distributary => false,
         };
         if !removed {
             return Err(ControlError::NotFound(name.to_owned()));
@@ -1027,7 +1027,7 @@ impl FakeRiverbed {
                 .remove(current)
                 .map(|item| self.stores.insert(new.to_owned(), item))
                 .is_some(),
-            ResourceKind::Role => false,
+            ResourceKind::Role | ResourceKind::RiverbedLink | ResourceKind::Distributary => false,
         };
         if !renamed {
             return Err(ControlError::NotFound(current.to_owned()));
@@ -1175,7 +1175,9 @@ impl FakeRiverbed {
                 .contains_key(name)
                 .then(|| self.store_json(name))
                 .ok_or_else(missing),
-            ResourceKind::Role => Err(missing()),
+            ResourceKind::Role | ResourceKind::RiverbedLink | ResourceKind::Distributary => {
+                Err(missing())
+            }
         }
     }
 
@@ -2273,6 +2275,8 @@ fn show_label(kind: &ShowKind) -> &'static str {
         ShowKind::Schemas => "SCHEMAS",
         ShowKind::AuditEvents => "AUDIT EVENTS",
         ShowKind::Compatibility => "COMPATIBILITY",
+        ShowKind::RiverbedLinks => "RIVERBED LINKS",
+        ShowKind::Distributaries => "DISTRIBUTARIES",
     }
 }
 

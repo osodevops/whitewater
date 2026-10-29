@@ -666,6 +666,54 @@ pub struct PipeComputeLease {
     pub compute_epoch: u64,
 }
 
+/// A declared route to another Riverbed: reachable endpoints plus the
+/// name of a per-Node environment variable holding the credential. Key
+/// material is resolved locally at drive time — the replicated catalog
+/// never stores secrets.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RiverbedLink {
+    pub link_id: Uuid,
+    pub name: String,
+    /// Base URLs of the remote Riverbed's Nodes, tried in order.
+    pub endpoints: Vec<String>,
+    /// Environment variable each Node reads for the remote API key.
+    pub key_env: String,
+    pub status: ResourceStatus,
+    pub created_at_ns: i64,
+}
+
+/// A declared Distributary: a managed copy of one remote Feed into one
+/// local Feed, preserving Key, `event_time_ns`, and Metadata while
+/// minting new local Cursors. Durable progress lives on the remote as a
+/// named Reader frontier derived from `distributary_id`, so a lease move
+/// resumes where the last owner acknowledged — the local lease only
+/// decides which Node drives.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DistributaryDefinition {
+    pub distributary_id: Uuid,
+    pub name: String,
+    /// Local Domain the target Feed lives in.
+    pub space_id: Uuid,
+    pub link_id: Uuid,
+    /// Feed name on the remote Riverbed.
+    pub source_feed: String,
+    pub target_feed_id: Uuid,
+    pub status: ResourceStatus,
+    pub created_at_ns: i64,
+}
+
+/// Which storage-eligible Node may drive a Distributary right now. The
+/// same single-epoch compare-and-set discipline as `PipeComputeLease`;
+/// raced drives converge on remote Reader session fencing, so an
+/// in-flight drive finishing on the previous owner cannot double-ack.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DistributaryLease {
+    pub distributary_id: Uuid,
+    pub owner: StorageNodeId,
+    /// Bumped on every move; fences stale drain plans and operator moves.
+    pub epoch: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriterDefinition {
     pub writer_id: Uuid,
@@ -1320,6 +1368,12 @@ struct CatalogState {
     #[serde(default)]
     pipe_compute_leases: BTreeMap<Uuid, PipeComputeLease>,
     #[serde(default)]
+    riverbed_links: BTreeMap<Uuid, RiverbedLink>,
+    #[serde(default)]
+    distributaries: BTreeMap<Uuid, DistributaryDefinition>,
+    #[serde(default)]
+    distributary_leases: BTreeMap<Uuid, DistributaryLease>,
+    #[serde(default)]
     subscription_feed_memberships: BTreeMap<Uuid, BTreeMap<Uuid, SubscriptionFeedMembership>>,
     #[serde(default)]
     state_store_assignments: BTreeMap<Uuid, crate::state_store::StateStoreAssignment>,
@@ -1452,6 +1506,9 @@ impl Default for CatalogState {
             subscription_progress_assignments: BTreeMap::new(),
             pending_subscription_cutovers: BTreeMap::new(),
             pipe_compute_leases: BTreeMap::new(),
+            riverbed_links: BTreeMap::new(),
+            distributaries: BTreeMap::new(),
+            distributary_leases: BTreeMap::new(),
             subscription_feed_memberships: BTreeMap::new(),
             state_store_assignments: BTreeMap::new(),
             reader_frontiers: BTreeMap::new(),
@@ -1497,6 +1554,8 @@ pub enum ResourceKind {
     Pipe,
     Index,
     StateStore,
+    RiverbedLink,
+    Distributary,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1517,6 +1576,8 @@ pub enum ShowKind {
     Schemas,
     Pipes,
     Indexes,
+    RiverbedLinks,
+    Distributaries,
     StateStores,
     AuditEvents,
     Compatibility,
@@ -1621,6 +1682,29 @@ pub enum Command {
         #[serde(default)]
         emit_feed: Option<String>,
         operation: Box<PipeOperation>,
+    },
+    /// Declare a route to another Riverbed. `key_env` names the
+    /// environment variable holding the credential — the replicated
+    /// catalog stores the variable name, never the key material.
+    DefineRiverbedLink {
+        name: String,
+        endpoints: Vec<String>,
+        key_env: String,
+    },
+    /// Declare a Distributary: managed copy of the remote `source_feed`
+    /// reachable through `link` into local `target_feed`. Drops flow
+    /// through the generic `Command::Drop` resource path.
+    DefineDistributary {
+        name: String,
+        link: String,
+        source_feed: String,
+        target_feed: String,
+    },
+    MoveDistributaryLease {
+        distributary: String,
+        new_owner: StorageNodeId,
+        #[serde(default)]
+        expected_epoch: Option<u64>,
     },
     CreateWriter {
         name: String,
@@ -2142,7 +2226,12 @@ impl Command {
             | Self::PrepareOwnerMove { feed: name, .. }
             | Self::ActivateOwnerMove { feed: name, .. }
             | Self::AbortOwnerMove { feed: name, .. }
-            | Self::MovePipeComputeLease { pipe: name, .. } => Some(name.clone()),
+            | Self::MovePipeComputeLease { pipe: name, .. }
+            | Self::DefineRiverbedLink { name, .. }
+            | Self::DefineDistributary { name, .. }
+            | Self::MoveDistributaryLease {
+                distributary: name, ..
+            } => Some(name.clone()),
             Self::SetHistoryPolicy { scope, .. }
             | Self::ClearHistoryPolicy { scope }
             | Self::SetSchema { scope, .. }
@@ -3477,6 +3566,39 @@ impl ControlController {
             .filter(|pipe| pipe.status == ResourceStatus::Active)
             .cloned()
             .collect()
+    }
+
+    /// Every declared Distributary lease; the driver supervisor diffs this
+    /// against the local NodeId to decide what to drive.
+    pub async fn distributary_leases(&self) -> Vec<DistributaryLease> {
+        self.state
+            .lock()
+            .await
+            .distributary_leases
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub async fn active_distributaries(&self) -> Vec<DistributaryDefinition> {
+        self.state
+            .lock()
+            .await
+            .distributaries
+            .values()
+            .filter(|item| item.status == ResourceStatus::Active)
+            .cloned()
+            .collect()
+    }
+
+    pub async fn riverbed_link(&self, link_id: Uuid) -> Option<RiverbedLink> {
+        self.state
+            .lock()
+            .await
+            .riverbed_links
+            .get(&link_id)
+            .filter(|item| item.status == ResourceStatus::Active)
+            .cloned()
     }
 
     /// Every active Pipe consuming one Subscription's progress assignment;
@@ -4952,9 +5074,13 @@ impl ControlController {
                         item.status == ResourceStatus::Active
                             && item.output_feed_id == Some(feed_id)
                     })
+                    || state.distributaries.values().any(|item| {
+                        item.status == ResourceStatus::Active
+                            && item.target_feed_id == feed_id
+                    })
                 {
                     return Err(ControlError::InvalidOperation(
-                        "drop attached Writers, Readers, Subscriptions, and Pipes first".to_owned(),
+                        "drop attached Writers, Readers, Subscriptions, Pipes, and Distributaries first".to_owned(),
                     ));
                 }
                 let item = state.feeds.get_mut(&feed_id).expect("Feed exists");
@@ -5571,6 +5697,175 @@ impl ControlController {
                 Ok((
                     format!(
                         "moved Pipe {pipe} compute lease to {new_owner} at epoch {next_epoch}"
+                    ),
+                    json!(next),
+                ))
+            }
+            Command::DefineRiverbedLink {
+                name,
+                endpoints,
+                key_env,
+            } => {
+                validate_dotted_name(&name)?;
+                ensure_name_available(
+                    state
+                        .riverbed_links
+                        .values()
+                        .map(|item| (&item.name, &item.status)),
+                    &name,
+                )?;
+                if endpoints.is_empty() || endpoints.len() > 8 {
+                    return Err(ControlError::InvalidOperation(
+                        "a Riverbed Link names between 1 and 8 endpoints".to_owned(),
+                    ));
+                }
+                for endpoint in &endpoints {
+                    if !(endpoint.starts_with("http://") || endpoint.starts_with("https://"))
+                        || endpoint.len() > 512
+                    {
+                        return Err(ControlError::InvalidOperation(format!(
+                            "Riverbed Link endpoint {endpoint} must be an http:// or https:// URL"
+                        )));
+                    }
+                }
+                if key_env.is_empty()
+                    || key_env.len() > 128
+                    || !key_env
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                    || !key_env.bytes().next().is_some_and(|b| b.is_ascii_uppercase())
+                {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "Riverbed Link credential {key_env} must name an environment variable (A-Z, 0-9, _)"
+                    )));
+                }
+                let link = RiverbedLink {
+                    link_id: derived_resource_id(request_id, "riverbed-link"),
+                    name: name.clone(),
+                    endpoints: endpoints.clone(),
+                    key_env: key_env.clone(),
+                    status: ResourceStatus::Active,
+                    created_at_ns: issued_at_ns,
+                };
+                state.riverbed_links.insert(link.link_id, link.clone());
+                Ok((format!("declared Riverbed Link {name}"), json!(link)))
+            }
+            Command::DefineDistributary {
+                name,
+                link,
+                source_feed,
+                target_feed,
+            } => {
+                validate_dotted_name(&name)?;
+                ensure_name_available(
+                    state
+                        .distributaries
+                        .values()
+                        .map(|item| (&item.name, &item.status)),
+                    &name,
+                )?;
+                let link_record = state
+                    .riverbed_links
+                    .values()
+                    .find(|item| item.name == *link && item.status == ResourceStatus::Active)
+                    .cloned()
+                    .ok_or_else(|| ControlError::NotFound(format!("Riverbed Link {link}")))?;
+                let feed = active_feed(state, &target_feed)?;
+                let owner = self
+                    .storage_pool(state, issued_at_ns)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        ControlError::InvalidOperation(
+                            "no storage-eligible Node can hold the Distributary lease".to_owned(),
+                        )
+                    })?;
+                let definition = DistributaryDefinition {
+                    distributary_id: derived_resource_id(request_id, "distributary"),
+                    name: name.clone(),
+                    space_id: feed.space_id,
+                    link_id: link_record.link_id,
+                    source_feed: source_feed.clone(),
+                    target_feed_id: feed.feed_id,
+                    status: ResourceStatus::Active,
+                    created_at_ns: issued_at_ns,
+                };
+                state
+                    .distributaries
+                    .insert(definition.distributary_id, definition.clone());
+                let lease = DistributaryLease {
+                    distributary_id: definition.distributary_id,
+                    owner,
+                    epoch: 1,
+                };
+                state
+                    .distributary_leases
+                    .insert(definition.distributary_id, lease);
+                Ok((
+                    format!(
+                        "declared Distributary {name}; no records flow until a Distributary driver exists"
+                    ),
+                    json!(definition),
+                ))
+            }
+            Command::MoveDistributaryLease {
+                distributary,
+                new_owner,
+                expected_epoch,
+            } => {
+                let definition = state
+                    .distributaries
+                    .values()
+                    .find(|item| {
+                        item.name == *distributary && item.status == ResourceStatus::Active
+                    })
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!("Distributary {distributary}"))
+                    })?;
+                let current = state
+                    .distributary_leases
+                    .get(&definition.distributary_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "Distributary lease for {distributary}"
+                        ))
+                    })?;
+                if let Some(expected) = expected_epoch {
+                    if current.epoch != expected {
+                        return Err(ControlError::InvalidOperation(
+                            "Distributary lease changed while the move was being planned"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                if current.owner == new_owner {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "{new_owner} already owns the lease for Distributary {distributary}"
+                    )));
+                }
+                if !self.storage_eligible(state, &new_owner, issued_at_ns) {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "lease target {new_owner} is not eligible for storage"
+                    )));
+                }
+                let next_epoch = current.epoch.checked_add(1).ok_or_else(|| {
+                    ControlError::InvalidOperation(
+                        "Distributary lease epoch overflowed".to_owned(),
+                    )
+                })?;
+                let next = DistributaryLease {
+                    distributary_id: definition.distributary_id,
+                    owner: new_owner.clone(),
+                    epoch: next_epoch,
+                };
+                state
+                    .distributary_leases
+                    .insert(definition.distributary_id, next.clone());
+                Ok((
+                    format!(
+                        "moved Distributary {distributary} lease to {new_owner} at epoch {next_epoch}"
                     ),
                     json!(next),
                 ))
@@ -6819,6 +7114,12 @@ impl ControlController {
             }
             ResourceKind::Role => rename_named(&mut state.roles, current, new, "Role"),
             ResourceKind::Pipe => rename_named(&mut state.pipes, current, new, "Pipe"),
+            ResourceKind::RiverbedLink => {
+                rename_named(&mut state.riverbed_links, current, new, "Riverbed Link")
+            }
+            ResourceKind::Distributary => {
+                rename_named(&mut state.distributaries, current, new, "Distributary")
+            }
             ResourceKind::Index => {
                 // Declared Indexes are catalog-only: renaming changes the
                 // definition name without touching storage state.
@@ -6916,9 +7217,12 @@ impl ControlController {
                         item.status == ResourceStatus::Active
                             && item.output_feed_id == Some(feed_id)
                     })
+                    || state.distributaries.values().any(|item| {
+                        item.status == ResourceStatus::Active && item.target_feed_id == feed_id
+                    })
                 {
                     return Err(ControlError::InvalidOperation(
-                        "drop attached Writers, Readers, Subscriptions, and Pipes first".to_owned(),
+                        "drop attached Writers, Readers, Subscriptions, Pipes, and Distributaries first".to_owned(),
                     ));
                 }
                 let item = state.feeds.get_mut(&feed_id).expect("Feed exists");
@@ -6991,6 +7295,33 @@ impl ControlController {
                 if outcome.is_ok() {
                     if let Some(pipe) = state.pipes.values().find(|item| item.name == name) {
                         state.pipe_compute_leases.remove(&pipe.pipe_id);
+                    }
+                }
+                outcome
+            }
+            ResourceKind::RiverbedLink => {
+                let link_id = state
+                    .riverbed_links
+                    .values()
+                    .find(|item| item.name == name && item.status == ResourceStatus::Active)
+                    .ok_or_else(|| ControlError::NotFound(format!("Riverbed Link {name}")))?
+                    .link_id;
+                if state
+                    .distributaries
+                    .values()
+                    .any(|item| item.status == ResourceStatus::Active && item.link_id == link_id)
+                {
+                    return Err(ControlError::InvalidOperation(
+                        "drop the Distributaries using this Riverbed Link first".to_owned(),
+                    ));
+                }
+                drop_named(&mut state.riverbed_links, name, "Riverbed Link")
+            }
+            ResourceKind::Distributary => {
+                let outcome = drop_named(&mut state.distributaries, name, "Distributary");
+                if outcome.is_ok() {
+                    if let Some(item) = state.distributaries.values().find(|d| d.name == name) {
+                        state.distributary_leases.remove(&item.distributary_id);
                     }
                 }
                 outcome
@@ -7164,6 +7495,38 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 Ok(Command::CreateWriter {
                     name: token(&tokens, 2)?.to_owned(),
                     feed: token(&tokens, 4)?.to_owned(),
+                })
+            }
+            Some("RIVERBED") => {
+                // CREATE RIVERBED LINK <name> AT '<url[,url...]>' WITH KEY ENV <VAR>
+                expect_keyword(&tokens, 2, "LINK")?;
+                expect_keyword(&tokens, 4, "AT")?;
+                let endpoints: Vec<String> = token(&tokens, 5)?
+                    .split(',')
+                    .map(|item| item.trim().to_owned())
+                    .filter(|item| !item.is_empty())
+                    .collect();
+                expect_keyword(&tokens, 6, "WITH")?;
+                expect_keyword(&tokens, 7, "KEY")?;
+                expect_keyword(&tokens, 8, "ENV")?;
+                Ok(Command::DefineRiverbedLink {
+                    name: token(&tokens, 3)?.to_owned(),
+                    endpoints,
+                    key_env: token(&tokens, 9)?.to_owned(),
+                })
+            }
+            Some("DISTRIBUTARY") => {
+                // CREATE DISTRIBUTARY <name> FROM LINK <link>
+                //   FEED <remote_feed> INTO <local_feed>
+                expect_keyword(&tokens, 3, "FROM")?;
+                expect_keyword(&tokens, 4, "LINK")?;
+                expect_keyword(&tokens, 6, "FEED")?;
+                expect_keyword(&tokens, 8, "INTO")?;
+                Ok(Command::DefineDistributary {
+                    name: token(&tokens, 2)?.to_owned(),
+                    link: token(&tokens, 5)?.to_owned(),
+                    source_feed: token(&tokens, 7)?.to_owned(),
+                    target_feed: token(&tokens, 9)?.to_owned(),
                 })
             }
             Some("PIPE") => {
@@ -7822,18 +8185,32 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 new: token(&tokens, 4)?.to_owned(),
             })
         }
-        Some("MOVE") => {
-            expect_keyword(&tokens, 1, "PIPE")?;
-            expect_keyword(&tokens, 2, "COMPUTE")?;
-            expect_keyword(&tokens, 4, "TO")?;
-            expect_keyword(&tokens, 5, "NODE")?;
-            Ok(Command::MovePipeComputeLease {
-                pipe: token(&tokens, 3)?.to_owned(),
-                new_owner: StorageNodeId::try_new(token(&tokens, 6)?.to_owned())
-                    .map_err(|error| ControlError::Syntax(error.to_string()))?,
-                expected_compute_epoch: None,
-            })
-        }
+        Some("MOVE") => match keyword(1).as_deref() {
+            Some("DISTRIBUTARY") => {
+                // MOVE DISTRIBUTARY LEASE <name> TO NODE <node>
+                expect_keyword(&tokens, 2, "LEASE")?;
+                expect_keyword(&tokens, 4, "TO")?;
+                expect_keyword(&tokens, 5, "NODE")?;
+                Ok(Command::MoveDistributaryLease {
+                    distributary: token(&tokens, 3)?.to_owned(),
+                    new_owner: StorageNodeId::try_new(token(&tokens, 6)?.to_owned())
+                        .map_err(|error| ControlError::Syntax(error.to_string()))?,
+                    expected_epoch: None,
+                })
+            }
+            _ => {
+                expect_keyword(&tokens, 1, "PIPE")?;
+                expect_keyword(&tokens, 2, "COMPUTE")?;
+                expect_keyword(&tokens, 4, "TO")?;
+                expect_keyword(&tokens, 5, "NODE")?;
+                Ok(Command::MovePipeComputeLease {
+                    pipe: token(&tokens, 3)?.to_owned(),
+                    new_owner: StorageNodeId::try_new(token(&tokens, 6)?.to_owned())
+                        .map_err(|error| ControlError::Syntax(error.to_string()))?,
+                    expected_compute_epoch: None,
+                })
+            }
+        },
         Some("PAUSE") => {
             expect_keyword(&tokens, 1, "PIPE")?;
             Ok(Command::PausePipe {
@@ -8341,6 +8718,8 @@ fn parse_resource_kind(token: &str) -> Result<ResourceKind, ControlError> {
         "INDEX" => Ok(ResourceKind::Index),
         "STATESTORE" => Ok(ResourceKind::StateStore),
         "ROLE" => Ok(ResourceKind::Role),
+        "LINK" => Ok(ResourceKind::RiverbedLink),
+        "DISTRIBUTARY" => Ok(ResourceKind::Distributary),
         _ => Err(ControlError::Syntax(format!(
             "unsupported resource type {token}"
         ))),
@@ -8360,6 +8739,8 @@ fn parse_show_kind(token: &str) -> Result<ShowKind, ControlError> {
         "STATESTORES" => Ok(ShowKind::StateStores),
         "ROLES" => Ok(ShowKind::Roles),
         "GRANTS" => Ok(ShowKind::Grants),
+        "LINKS" => Ok(ShowKind::RiverbedLinks),
+        "DISTRIBUTARIES" => Ok(ShowKind::Distributaries),
         _ => Err(ControlError::Syntax(format!(
             "unsupported SHOW resource {token}"
         ))),
@@ -8804,7 +9185,7 @@ fn validate_named_keys(named_keys: &[NamedStateStoreKey]) -> Result<(), ControlE
     Ok(())
 }
 
-fn validate_dotted_name(name: &str) -> Result<(), ControlError> {
+pub(crate) fn validate_dotted_name(name: &str) -> Result<(), ControlError> {
     if name.is_empty() || name.len() > 512 || name.starts_with('.') || name.ends_with('.') {
         return Err(ControlError::InvalidName(name.to_owned()));
     }
@@ -9306,6 +9687,8 @@ impl_named_resource!(ReaderDefinition);
 impl_named_resource!(SubscriptionDefinition);
 impl_named_resource!(PipeDefinition);
 impl_named_resource!(RoleDefinition);
+impl_named_resource!(RiverbedLink);
+impl_named_resource!(DistributaryDefinition);
 
 fn rename_named<T: Clone + Serialize + NamedResource>(
     items: &mut BTreeMap<Uuid, T>,
@@ -9542,6 +9925,30 @@ fn show_resources(
             })
             .collect::<Vec<_>>()),
         ShowKind::Indexes => json!(state.indexes.values().collect::<Vec<_>>()),
+        ShowKind::RiverbedLinks => json!(state
+            .riverbed_links
+            .values()
+            .filter(|item| item.status == ResourceStatus::Active)
+            .collect::<Vec<_>>()),
+        ShowKind::Distributaries => json!(state
+            .distributaries
+            .values()
+            .filter(|item| item.status == ResourceStatus::Active)
+            .map(|item| {
+                let mut row = serde_json::to_value(item).unwrap_or_else(|_| json!({}));
+                if let Some(link) = state.riverbed_links.get(&item.link_id) {
+                    row["link"] = json!(link.name.clone());
+                }
+                if let Some(feed) = state.feeds.get(&item.target_feed_id) {
+                    row["target_feed"] = json!(feed.name.clone());
+                }
+                if let Some(lease) = state.distributary_leases.get(&item.distributary_id) {
+                    row["lease_owner"] = json!(lease.owner.as_str());
+                    row["lease_epoch"] = json!(lease.epoch);
+                }
+                row
+            })
+            .collect::<Vec<_>>()),
         ShowKind::ApiKeys => json!(state
             .api_keys
             .values()
@@ -9709,6 +10116,30 @@ fn describe_resource(
             .map(|item| json!(item))
             .ok_or_else(|| ControlError::NotFound(format!("StateStore {name}"))),
         ResourceKind::Role => Ok(json!(active_role(state, name)?)),
+        ResourceKind::RiverbedLink => state
+            .riverbed_links
+            .values()
+            .find(|item| item.name == name && item.status == ResourceStatus::Active)
+            .map(|item| json!(item))
+            .ok_or_else(|| ControlError::NotFound(format!("Riverbed Link {name}"))),
+        ResourceKind::Distributary => {
+            let item = state
+                .distributaries
+                .values()
+                .find(|item| item.name == name && item.status == ResourceStatus::Active)
+                .ok_or_else(|| ControlError::NotFound(format!("Distributary {name}")))?;
+            let mut row = serde_json::to_value(item).unwrap_or_else(|_| json!({}));
+            if let Some(link) = state.riverbed_links.get(&item.link_id) {
+                row["link"] = json!(link.name.clone());
+            }
+            if let Some(feed) = state.feeds.get(&item.target_feed_id) {
+                row["target_feed"] = json!(feed.name.clone());
+            }
+            if let Some(lease) = state.distributary_leases.get(&item.distributary_id) {
+                row["lease"] = json!(lease);
+            }
+            Ok(row)
+        }
     }
 }
 
@@ -9762,6 +10193,13 @@ fn storage_node_in_use(state: &CatalogState, node: &StorageNodeId) -> Option<&'s
         .any(|lease| lease.owner == *node)
     {
         return Some("a Pipe compute lease");
+    }
+    if state
+        .distributary_leases
+        .values()
+        .any(|lease| lease.owner == *node)
+    {
+        return Some("a Distributary lease");
     }
     None
 }
@@ -10042,6 +10480,26 @@ fn storage_drain_plan(
             )),
         }
     }
+    for (distributary_id, lease) in state.distributary_leases.iter() {
+        if lease.owner != *node {
+            continue;
+        }
+        let Some(distributary) = state.distributaries.get(distributary_id) else {
+            continue;
+        };
+        let excluded: BTreeSet<StorageNodeId> = [node.clone()].into_iter().collect();
+        match drain_replacement(state, controller, &excluded, distributary_id, now_ns) {
+            Some(replacement) => moves.push(Command::MoveDistributaryLease {
+                distributary: distributary.name.clone(),
+                new_owner: replacement,
+                expected_epoch: Some(lease.epoch),
+            }),
+            None => unplannable.push(format!(
+                "Distributary {} lease has no eligible replacement Node for {node}",
+                distributary.name
+            )),
+        }
+    }
     StorageDrainPlan {
         storage_pool: storage_eligibility_report(
             state,
@@ -10189,6 +10647,9 @@ fn command_label(command: &Command) -> String {
         Command::MoveSubscriptionProgressReplica { .. } => "MOVE SUBSCRIPTION PROGRESS REPLICA",
         Command::RecoverStateStoreOwner { .. } => "RECOVER STATE STORE OWNER",
         Command::MovePipeComputeLease { .. } => "MOVE PIPE COMPUTE LEASE",
+        Command::DefineRiverbedLink { .. } => "DEFINE RIVERBED LINK",
+        Command::DefineDistributary { .. } => "DEFINE DISTRIBUTARY",
+        Command::MoveDistributaryLease { .. } => "MOVE DISTRIBUTARY LEASE",
         Command::RegisterStorageNode { .. } => "REGISTER STORAGE NODE",
         Command::RetireStorageNode { .. } => "RETIRE STORAGE NODE",
         Command::DrainStorageNode { .. } => "DRAIN STORAGE NODE",
@@ -10216,6 +10677,8 @@ fn resource_name(kind: &ResourceKind) -> &'static str {
         ResourceKind::Index => "Index",
         ResourceKind::StateStore => "StateStore",
         ResourceKind::Role => "Role",
+        ResourceKind::RiverbedLink => "Riverbed Link",
+        ResourceKind::Distributary => "Distributary",
     }
 }
 
@@ -10228,6 +10691,8 @@ fn show_name(kind: &ShowKind) -> &'static str {
         ShowKind::Subscriptions => "Subscriptions",
         ShowKind::Pipes => "Pipes",
         ShowKind::Indexes => "Indexes",
+        ShowKind::RiverbedLinks => "Riverbed Links",
+        ShowKind::Distributaries => "Distributaries",
         ShowKind::StateStores => "StateStores",
         ShowKind::Roles => "Roles",
         ShowKind::Grants => "Grants",
@@ -14215,6 +14680,202 @@ mod tests {
             .await
             .unwrap();
         assert!(reopened.pipe_compute_lease(pipe.pipe_id).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn distributaries_declare_lease_move_and_persist() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute("CREATE DOMAIN accounts; CREATE FEED accounts.mirrored;")
+            .await
+            .unwrap();
+        // A Riverbed Link declares endpoints plus an env-var credential
+        // reference — never key material.
+        let declared = controller
+            .execute(
+                "CREATE RIVERBED LINK dr AT 'https://dr-1:9392,https://dr-2:9392' \
+                 WITH KEY ENV WHITEWATER_DR_KEY;",
+            )
+            .await
+            .unwrap();
+        let link_id = declared.results[0].data["link_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            declared.results[0].data["endpoints"],
+            json!(["https://dr-1:9392", "https://dr-2:9392"])
+        );
+        // Endpoint and credential shape are validated in apply so every
+        // replica refuses the same bad declaration.
+        for script in [
+            "CREATE RIVERBED LINK bad1 AT 'ftp://x' WITH KEY ENV K;",
+            "CREATE RIVERBED LINK bad2 AT '' WITH KEY ENV K;",
+            "CREATE RIVERBED LINK bad3 AT 'https://x' WITH KEY ENV lowercase;",
+            "CREATE RIVERBED LINK dr AT 'https://y' WITH KEY ENV K2;",
+        ] {
+            assert!(controller.execute(script).await.is_err(), "{script}");
+        }
+        // The Distributary binds a remote Feed to a local target Feed and
+        // seeds a lease on a storage-eligible Node at epoch 1.
+        let defined = controller
+            .execute(
+                "CREATE DISTRIBUTARY accounts.mirror FROM LINK dr \
+                 FEED orders.events INTO accounts.mirrored;",
+            )
+            .await
+            .unwrap();
+        assert_eq!(defined.results[0].data["source_feed"], "orders.events");
+        assert_eq!(
+            defined.results[0].data["link_id"].as_str().unwrap(),
+            link_id
+        );
+        let leases = controller.distributary_leases().await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].epoch, 1);
+        // Unknown link, unknown target Feed, and a duplicate name refuse.
+        for script in [
+            "CREATE DISTRIBUTARY accounts.a FROM LINK missing FEED orders.events INTO accounts.mirrored;",
+            "CREATE DISTRIBUTARY accounts.b FROM LINK dr FEED orders.events INTO accounts.missing;",
+            "CREATE DISTRIBUTARY accounts.mirror FROM LINK dr FEED orders.events INTO accounts.mirrored;",
+        ] {
+            assert!(controller.execute(script).await.is_err(), "{script}");
+        }
+        // SHOW surfaces the resolved link, target Feed, and lease.
+        let shown = controller.execute("SHOW DISTRIBUTARIES;").await.unwrap();
+        let row = &shown.results[0].data[0];
+        assert_eq!(row["name"], "accounts.mirror");
+        assert_eq!(row["link"], "dr");
+        assert_eq!(row["target_feed"], "accounts.mirrored");
+        assert_eq!(row["lease_owner"], leases[0].owner.as_str());
+        assert_eq!(row["lease_epoch"], 1);
+        let links = controller.execute("SHOW LINKS;").await.unwrap();
+        assert_eq!(links.results[0].data.as_array().unwrap().len(), 1);
+        let described = controller
+            .execute("DESCRIBE DISTRIBUTARY accounts.mirror;")
+            .await
+            .unwrap();
+        assert_eq!(described.results[0].data["lease"]["epoch"], 1);
+        // The link cannot drop while a Distributary uses it, and the
+        // target Feed cannot drop under an active Distributary.
+        assert!(controller.execute("DROP LINK dr;").await.is_err());
+        assert!(controller
+            .execute("DROP FEED accounts.mirrored;")
+            .await
+            .is_err());
+        // MOVE DISTRIBUTARY LEASE migrates with an epoch bump; a stale
+        // expected epoch, an ineligible target, and a no-op move refuse.
+        let target = ["storage-1", "storage-2", "storage-3"]
+            .into_iter()
+            .map(|node| StorageNodeId::try_new(node).unwrap())
+            .find(|node| *node != leases[0].owner)
+            .unwrap();
+        controller
+            .execute(&format!(
+                "MOVE DISTRIBUTARY LEASE accounts.mirror TO NODE {target};"
+            ))
+            .await
+            .unwrap();
+        let moved = &controller.distributary_leases().await[0];
+        assert_eq!(moved.owner, target);
+        assert_eq!(moved.epoch, 2);
+        assert!(controller
+            .execute_commands(vec![Command::MoveDistributaryLease {
+                distributary: "accounts.mirror".to_owned(),
+                new_owner: leases[0].owner.clone(),
+                expected_epoch: Some(1),
+            }])
+            .await
+            .is_err());
+        assert!(controller
+            .execute("MOVE DISTRIBUTARY LEASE accounts.mirror TO NODE storage-9;")
+            .await
+            .is_err());
+        assert!(controller
+            .execute(&format!(
+                "MOVE DISTRIBUTARY LEASE accounts.mirror TO NODE {target};"
+            ))
+            .await
+            .is_err());
+        // The drain plan vacates the lease like every other placement.
+        let plan = controller.storage_drain_plan(&target).await.unwrap();
+        assert!(plan
+            .moves
+            .iter()
+            .any(|command| matches!(command, Command::MoveDistributaryLease { .. })));
+        // Definitions, link, and lease survive a catalog snapshot/reopen.
+        drop(controller);
+        let reopened = new_controller(&directory);
+        let persisted = &reopened.distributary_leases().await[0];
+        assert_eq!(persisted.owner, target);
+        assert_eq!(persisted.epoch, 2);
+        assert_eq!(reopened.active_distributaries().await.len(), 1);
+        // Dropping the Distributary retires its lease and frees the link
+        // and target Feed for later drops.
+        reopened
+            .execute("DROP DISTRIBUTARY accounts.mirror;")
+            .await
+            .unwrap();
+        assert!(reopened.distributary_leases().await.is_empty());
+        reopened.execute("DROP LINK dr;").await.unwrap();
+        reopened
+            .execute("DROP FEED accounts.mirrored;")
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn distributary_wcl_parses() {
+        let commands = parse_wcl(
+            "CREATE RIVERBED LINK dr AT 'https://a:1,https://b:2' WITH KEY ENV DR_KEY; \
+             CREATE DISTRIBUTARY accounts.m FROM LINK dr FEED orders.e INTO accounts.m2; \
+             MOVE DISTRIBUTARY LEASE accounts.m TO NODE storage-2; \
+             DROP DISTRIBUTARY accounts.m; DROP LINK dr; SHOW LINKS; SHOW DISTRIBUTARIES;",
+        )
+        .unwrap();
+        assert!(matches!(
+            &commands[0],
+            Command::DefineRiverbedLink { endpoints, key_env, .. }
+                if endpoints.len() == 2 && key_env == "DR_KEY"
+        ));
+        assert!(matches!(
+            &commands[1],
+            Command::DefineDistributary { source_feed, target_feed, .. }
+                if source_feed == "orders.e" && target_feed == "accounts.m2"
+        ));
+        assert!(matches!(
+            &commands[2],
+            Command::MoveDistributaryLease { .. }
+        ));
+        assert!(matches!(
+            &commands[3],
+            Command::Drop {
+                kind: ResourceKind::Distributary,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &commands[4],
+            Command::Drop {
+                kind: ResourceKind::RiverbedLink,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &commands[5],
+            Command::Show {
+                kind: ShowKind::RiverbedLinks,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &commands[6],
+            Command::Show {
+                kind: ShowKind::Distributaries,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

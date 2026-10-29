@@ -10,6 +10,7 @@ pub mod control;
 pub mod control_plane;
 pub mod cursor;
 pub mod demand;
+pub mod distributary;
 pub mod domain;
 pub mod effect;
 pub mod index;

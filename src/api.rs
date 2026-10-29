@@ -5783,6 +5783,131 @@ pub async fn drive_local_pipes(state: &AppState, limit: usize) -> Vec<PipeDriveO
     outcomes
 }
 
+/// One supervisor tick: drive every active Distributary whose lease
+/// owner is this Node. The driver set is owned by the calling task and
+/// reconciled here — a Distributary whose lease moved or was dropped is
+/// evicted, and a lease epoch bump resets session state so a stale
+/// remote Reader epoch cannot linger.
+pub async fn drive_local_distributaries(
+    state: &AppState,
+    drivers: &mut std::collections::HashMap<Uuid, crate::distributary::DistributaryDriver>,
+    local: &crate::admin::AdminClient,
+    limit: usize,
+) -> Vec<crate::distributary::DistributaryDriveOutcome> {
+    use crate::distributary::{DistributaryDriveOutcome, DistributaryDriveState};
+    let Some(local_node) = state.storage_node_id.clone() else {
+        drivers.clear();
+        return Vec::new();
+    };
+    let distributaries = state.control.active_distributaries().await;
+    let leases: std::collections::HashMap<Uuid, crate::control::DistributaryLease> = state
+        .control
+        .distributary_leases()
+        .await
+        .into_iter()
+        .map(|lease| (lease.distributary_id, lease))
+        .collect();
+    // Evict drivers for dropped Distributaries or leases that moved
+    // away; remote session fencing covers an in-flight cycle finishing
+    // after the move.
+    drivers.retain(|id, _| {
+        distributaries
+            .iter()
+            .any(|item| item.distributary_id == *id)
+            && leases
+                .get(id)
+                .is_some_and(|lease| lease.owner == local_node)
+    });
+    let mut outcomes = Vec::new();
+    for definition in distributaries {
+        let Some(lease) = leases.get(&definition.distributary_id) else {
+            outcomes.push(DistributaryDriveOutcome::Failed {
+                distributary_id: definition.distributary_id,
+                message: "Distributary lease is unavailable".to_owned(),
+            });
+            continue;
+        };
+        if lease.owner != local_node {
+            outcomes.push(DistributaryDriveOutcome::NotOwner);
+            continue;
+        }
+        let Some(target_feed) = state
+            .control
+            .active_feed_by_id(definition.target_feed_id)
+            .await
+            .map(|feed| feed.name)
+        else {
+            outcomes.push(DistributaryDriveOutcome::Failed {
+                distributary_id: definition.distributary_id,
+                message: "target Feed is unavailable".to_owned(),
+            });
+            continue;
+        };
+        // A lease epoch bump discards session state even when ownership
+        // stayed local — a raced move out and back must reopen the
+        // remote Reader rather than resume a fenced epoch.
+        if drivers
+            .get(&definition.distributary_id)
+            .is_some_and(|driver| driver.state.lease_epoch != lease.epoch)
+        {
+            drivers.remove(&definition.distributary_id);
+        }
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            drivers.entry(definition.distributary_id)
+        {
+            let Some(link) = state.control.riverbed_link(definition.link_id).await else {
+                outcomes.push(DistributaryDriveOutcome::Failed {
+                    distributary_id: definition.distributary_id,
+                    message: "Riverbed Link is unavailable".to_owned(),
+                });
+                continue;
+            };
+            match crate::distributary::RemotePool::new(&link) {
+                Ok(remote) => {
+                    entry.insert(crate::distributary::DistributaryDriver {
+                        state: DistributaryDriveState {
+                            lease_epoch: lease.epoch,
+                            ..Default::default()
+                        },
+                        remote,
+                    });
+                }
+                Err(message) => {
+                    outcomes.push(DistributaryDriveOutcome::Failed {
+                        distributary_id: definition.distributary_id,
+                        message,
+                    });
+                    continue;
+                }
+            }
+        }
+        let driver = drivers
+            .get_mut(&definition.distributary_id)
+            .expect("driver inserted above");
+        match crate::distributary::drive_distributary_once(
+            local,
+            &mut driver.remote,
+            &definition,
+            &target_feed,
+            &mut driver.state,
+            limit,
+        )
+        .await
+        {
+            Ok(0) => outcomes.push(DistributaryDriveOutcome::Idle),
+            Ok(count) => outcomes.push(DistributaryDriveOutcome::Copied {
+                distributary_id: definition.distributary_id,
+                count,
+            }),
+            Err(message) => outcomes.push(DistributaryDriveOutcome::Failed {
+                distributary_id: definition.distributary_id,
+                message,
+            }),
+        }
+    }
+    outcomes
+}
+
 async fn subscription_member_state(
     State(state): State<AppState>,
     headers: HeaderMap,

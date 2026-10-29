@@ -1028,6 +1028,59 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let distributary_task = match (
+        app_state.storage_node_id.clone(),
+        std::env::var("WHITEWATER_ADMIN_API_KEY").ok(),
+    ) {
+        (Some(_), Some(admin_key)) => {
+            let state = app_state.clone();
+            let interval_ms = std::env::var("WHITEWATER_DISTRIBUTARY_DRIVE_INTERVAL_MS")
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(1_000)
+                .max(100);
+            let local = whitewater::admin::AdminClient::new(
+                format!("http://127.0.0.1:{}", config.bind_addr.port()),
+                admin_key,
+            );
+            let mut shutdown = shutdown_tx.subscribe();
+            Some(tokio::spawn(async move {
+                let mut drivers: std::collections::HashMap<
+                    uuid::Uuid,
+                    whitewater::distributary::DistributaryDriver,
+                > = std::collections::HashMap::new();
+                let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+                loop {
+                    tokio::select! {
+                        _ = interval.tick() => {
+                            for outcome in whitewater::api::drive_local_distributaries(
+                                &state,
+                                &mut drivers,
+                                &local,
+                                64,
+                            ).await {
+                                use whitewater::distributary::DistributaryDriveOutcome;
+                                match outcome {
+                                    DistributaryDriveOutcome::Copied { distributary_id, count } => {
+                                        tracing::debug!(%distributary_id, count, "distributary cycle copied records")
+                                    }
+                                    DistributaryDriveOutcome::Failed { distributary_id, message } => {
+                                        tracing::warn!(%distributary_id, %message, "distributary drive cycle failed")
+                                    }
+                                    DistributaryDriveOutcome::Idle
+                                    | DistributaryDriveOutcome::NotOwner => {}
+                                }
+                            }
+                        }
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() { break; }
+                        }
+                    }
+                }
+            }))
+        }
+        _ => None,
+    };
     // Member operations recover a lost Subscription progress owner inside
     // their own request window, but that path needs live member traffic. The
     // leader-driven supervisor is the backstop: it probes placements even
@@ -1152,6 +1205,9 @@ async fn main() -> Result<()> {
     }
     if let Some(pipe_task) = pipe_task {
         let _ = pipe_task.await;
+    }
+    if let Some(task) = distributary_task {
+        let _ = task.await;
     }
     if let Some(task) = subscription_recovery_task {
         let _ = task.await;

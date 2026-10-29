@@ -1,0 +1,120 @@
+name: whitewater-distributary
+
+# Distributary fixture: two three-Node Riverbeds on one network —
+# `src-*` is the source on 8171-8173, `dst-*` the destination on
+# 8181-8183. Destination Nodes carry WHITEWATER_DIST_KEY, the credential
+# the link resolves locally to reach the source; key material never
+# enters the replicated catalog.
+x-src-node: &src-node
+  image: whitewater-verify-node:latest
+  build:
+    context: .
+  environment: &src-environment
+    WHITEWATER_SEEDS: src1:7070,src2:7070,src3:7070
+    WHITEWATER_NODE_CAPACITY: 100
+    WHITEWATER_ADMIN_API_KEY: ${WHITEWATER_ADMIN_API_KEY:-whitewater-local-development-admin-key}
+    WHITEWATER_CONTROL_NODES: 1@src1:7070,2@src2:7070,3@src3:7070
+    WHITEWATER_CONTROL_PLANE_KEY: ${WHITEWATER_CONTROL_PLANE_KEY:-whitewater-local-development-control-key}
+    WHITEWATER_INTERNAL_TRANSPORT: ${WHITEWATER_INTERNAL_TRANSPORT:-insecure}
+    WHITEWATER_AUTO_SPLIT_APPEND_RATE: 1000000000
+    WHITEWATER_AUTO_MERGE_SUSTAINED_SAMPLES: 1000000000
+
+x-dst-node: &dst-node
+  image: whitewater-verify-node:latest
+  build:
+    context: .
+  environment: &dst-environment
+    WHITEWATER_SEEDS: dst1:7070,dst2:7070,dst3:7070
+    WHITEWATER_NODE_CAPACITY: 100
+    WHITEWATER_ADMIN_API_KEY: ${WHITEWATER_ADMIN_API_KEY:-whitewater-local-development-admin-key}
+    WHITEWATER_CONTROL_NODES: 1@dst1:7070,2@dst2:7070,3@dst3:7070
+    WHITEWATER_CONTROL_PLANE_KEY: ${WHITEWATER_CONTROL_PLANE_KEY:-whitewater-local-development-control-key}
+    WHITEWATER_INTERNAL_TRANSPORT: ${WHITEWATER_INTERNAL_TRANSPORT:-insecure}
+    WHITEWATER_AUTO_SPLIT_APPEND_RATE: 1000000000
+    WHITEWATER_AUTO_MERGE_SUSTAINED_SAMPLES: 1000000000
+    # The credential the `upstream` Riverbed Link resolves on each Node.
+    # The source's admin key authorizes Reader declaration, open, fetch,
+    # and acknowledge on the remote Riverbed.
+    WHITEWATER_DIST_KEY: ${WHITEWATER_DIST_KEY:-whitewater-local-development-admin-key}
+    WHITEWATER_DISTRIBUTARY_DRIVE_INTERVAL_MS: ${WHITEWATER_DISTRIBUTARY_DRIVE_INTERVAL_MS:-250}
+
+services:
+  src1:
+    <<: *src-node
+    ports:
+      - "8171:7070"
+    environment:
+      <<: *src-environment
+      WHITEWATER_NODE_ID: whitewater-distributary-src1
+      WHITEWATER_CONTROL_NODE_ID: 1
+      WHITEWATER_ADVERTISE_URL: http://src1:7070
+    volumes:
+      - src1-data:/var/lib/whitewater
+
+  src2:
+    <<: *src-node
+    ports:
+      - "8172:7070"
+    environment:
+      <<: *src-environment
+      WHITEWATER_NODE_ID: whitewater-distributary-src2
+      WHITEWATER_CONTROL_NODE_ID: 2
+      WHITEWATER_ADVERTISE_URL: http://src2:7070
+    volumes:
+      - src2-data:/var/lib/whitewater
+
+  src3:
+    <<: *src-node
+    ports:
+      - "8173:7070"
+    environment:
+      <<: *src-environment
+      WHITEWATER_NODE_ID: whitewater-distributary-src3
+      WHITEWATER_CONTROL_NODE_ID: 3
+      WHITEWATER_ADVERTISE_URL: http://src3:7070
+    volumes:
+      - src3-data:/var/lib/whitewater
+
+  dst1:
+    <<: *dst-node
+    ports:
+      - "8181:7070"
+    environment:
+      <<: *dst-environment
+      WHITEWATER_NODE_ID: whitewater-distributary-dst1
+      WHITEWATER_CONTROL_NODE_ID: 1
+      WHITEWATER_ADVERTISE_URL: http://dst1:7070
+    volumes:
+      - dst1-data:/var/lib/whitewater
+
+  dst2:
+    <<: *dst-node
+    ports:
+      - "8182:7070"
+    environment:
+      <<: *dst-environment
+      WHITEWATER_NODE_ID: whitewater-distributary-dst2
+      WHITEWATER_CONTROL_NODE_ID: 2
+      WHITEWATER_ADVERTISE_URL: http://dst2:7070
+    volumes:
+      - dst2-data:/var/lib/whitewater
+
+  dst3:
+    <<: *dst-node
+    ports:
+      - "8183:7070"
+    environment:
+      <<: *dst-environment
+      WHITEWATER_NODE_ID: whitewater-distributary-dst3
+      WHITEWATER_CONTROL_NODE_ID: 3
+      WHITEWATER_ADVERTISE_URL: http://dst3:7070
+    volumes:
+      - dst3-data:/var/lib/whitewater
+
+volumes:
+  src1-data:
+  src2-data:
+  src3-data:
+  dst1-data:
+  dst2-data:
+  dst3-data:
