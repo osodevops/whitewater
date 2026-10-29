@@ -100,6 +100,7 @@ ISOLATED_ZONE = (
     "test-storage-drain.py",
     "test-m4-owner-move.py",
     "test-many-readers.py",
+    "test-backup-restore.py",
 )
 # All three pipe scripts drive the same `whitewater-pipe` project — serial.
 PIPE = ("test-enrich-pipe.py", "test-pipe-forward.py", "test-window-pipe.py")

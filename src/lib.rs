@@ -2,6 +2,7 @@ pub mod active_range;
 pub mod admin;
 pub mod api;
 pub mod autoscale;
+pub mod backup;
 pub mod codec;
 pub mod config;
 pub mod conformance;

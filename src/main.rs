@@ -53,6 +53,32 @@ async fn main() -> Result<()> {
         .init();
 
     let mut config = NodeConfig::from_env()?;
+    // Disaster-recovery entry point: `WHITEWATER_RESTORE_FROM` seeds an
+    // empty data directory from a backup taken by `POST /v1/admin/backup`
+    // before any store opens. Restores into a non-empty directory refuse
+    // to boot — an existing Riverbed's volumes are never clobbered
+    // implicitly; wiping them is a deliberate operator act.
+    if let Some(source) = std::env::var("WHITEWATER_RESTORE_FROM")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        match whitewater::backup::restore_backup(&config.data_dir, std::path::Path::new(&source))
+            .map_err(|error| anyhow::anyhow!("restore from {source} failed: {error}"))?
+        {
+            whitewater::backup::RestoreOutcome::Restored(manifest) => eprintln!(
+                "restored backup taken at {} (catalog revision {}, {} files, {} bytes) into {}",
+                manifest.taken_at_ns,
+                manifest.catalog_revision,
+                manifest.files,
+                manifest.bytes,
+                config.data_dir.display()
+            ),
+            whitewater::backup::RestoreOutcome::AlreadyRestored(manifest) => eprintln!(
+                "data directory already holds a restored volume (catalog revision {}); continuing",
+                manifest.catalog_revision
+            ),
+        }
+    }
     if matches!(
         config.internal_transport,
         whitewater::config::InternalTransport::Insecure

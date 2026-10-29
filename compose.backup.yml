@@ -1,0 +1,67 @@
+name: whitewater-backup
+
+# Backup/restore DR fixture: a dedicated three-Node Riverbed on the
+# 8071-8073 block. Each Node also mounts a host-side per-Node backup
+# directory under .backup-artifacts/ — bind mounts survive `down -v`, so
+# the test can destroy every data volume and restore from what remains.
+x-node: &node
+  image: whitewater-verify-node:latest
+  build:
+    context: .
+  environment: &node-environment
+    WHITEWATER_SEEDS: node1:7070,node2:7070,node3:7070
+    WHITEWATER_NODE_CAPACITY: 100
+    WHITEWATER_ADMIN_API_KEY: ${WHITEWATER_ADMIN_API_KEY:-whitewater-local-development-admin-key}
+    WHITEWATER_CONTROL_NODES: 1@node1:7070,2@node2:7070,3@node3:7070
+    WHITEWATER_CONTROL_PLANE_KEY: ${WHITEWATER_CONTROL_PLANE_KEY:-whitewater-local-development-control-key}
+    WHITEWATER_INTERNAL_TRANSPORT: ${WHITEWATER_INTERNAL_TRANSPORT:-insecure}
+    WHITEWATER_AUTO_SPLIT_APPEND_RATE: 1000000000
+    WHITEWATER_AUTO_MERGE_SUSTAINED_SAMPLES: 1000000000
+    # Set to /backups only for the restore `up` — each service mounts its
+    # own backup directory at that path.
+    WHITEWATER_RESTORE_FROM: ${WHITEWATER_RESTORE_FROM:-}
+
+services:
+  node1:
+    <<: *node
+    ports:
+      - "8071:7070"
+    environment:
+      <<: *node-environment
+      WHITEWATER_NODE_ID: whitewater-backup-node1
+      WHITEWATER_CONTROL_NODE_ID: 1
+      WHITEWATER_ADVERTISE_URL: http://node1:7070
+    volumes:
+      - node1-data:/var/lib/whitewater
+      - ./.backup-artifacts/node1:/backups
+
+  node2:
+    <<: *node
+    ports:
+      - "8072:7070"
+    environment:
+      <<: *node-environment
+      WHITEWATER_NODE_ID: whitewater-backup-node2
+      WHITEWATER_CONTROL_NODE_ID: 2
+      WHITEWATER_ADVERTISE_URL: http://node2:7070
+    volumes:
+      - node2-data:/var/lib/whitewater
+      - ./.backup-artifacts/node2:/backups
+
+  node3:
+    <<: *node
+    ports:
+      - "8073:7070"
+    environment:
+      <<: *node-environment
+      WHITEWATER_NODE_ID: whitewater-backup-node3
+      WHITEWATER_CONTROL_NODE_ID: 3
+      WHITEWATER_ADVERTISE_URL: http://node3:7070
+    volumes:
+      - node3-data:/var/lib/whitewater
+      - ./.backup-artifacts/node3:/backups
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:

@@ -7,6 +7,7 @@
 Thumbs.db
 /.mtls-certs/
 /.mtls-join-certs/
+/.backup-artifacts/
 /C:/
 /.cargo-home/
 /.cargo-cache/

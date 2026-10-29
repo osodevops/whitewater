@@ -2896,6 +2896,16 @@ impl ControlController {
         response
     }
 
+    /// The directory this controller's catalog file sits in — the
+    /// Node's data directory. Used by backup to copy the whole tree the
+    /// catalog describes.
+    pub fn data_dir(&self) -> PathBuf {
+        self.path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.path.as_ref().clone())
+    }
+
     pub async fn snapshot_bytes(&self) -> Result<Vec<u8>, ControlError> {
         Ok(serde_json::to_vec(&*self.state.lock().await)?)
     }
@@ -10051,7 +10061,14 @@ fn persist_state(path: &Path, state: &CatalogState) -> Result<(), ControlError> 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(path, serde_json::to_vec_pretty(state)?)?;
+    // Temp + fsync + rename: a crash or a concurrent backup copy must
+    // always observe a complete catalog, never a torn serialization.
+    let bytes = serde_json::to_vec_pretty(state)?;
+    let temporary = path.with_extension("tmp");
+    let mut file = std::fs::File::create(&temporary)?;
+    std::io::Write::write_all(&mut file, &bytes)?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
     Ok(())
 }
 

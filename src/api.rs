@@ -733,6 +733,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/demand/indexes", get(admin_index_demand))
         .route("/v1/admin/demand/feeds", get(admin_feed_demand))
         .route("/v1/admin/control-plane", get(control_plane_status))
+        .route("/v1/admin/backup", post(admin_backup))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
@@ -11214,6 +11215,63 @@ async fn abandon_owner_move_plan(state: &AppState, plan: &RangeOwnerMovePlan) ->
 /// re-prepare. The caller must name the exact `plan_id` shown by
 /// `INSPECT PLACEMENT FOR FEED`, so an inspected-but-stale remedy cannot
 /// remove a newer plan staged after the inspection.
+#[derive(Debug, Deserialize)]
+pub struct AdminBackupRequest {
+    /// Absolute path the Node copies its data directory into. Must be
+    /// empty or absent — a backup never merges into existing files.
+    pub destination: String,
+}
+
+/// `POST /v1/admin/backup` — crash-consistent per-Node archive. Copies
+/// the data directory (range segments, journals, raft log, identity)
+/// plus the committed catalog snapshot, then writes `manifest.json` as
+/// the completeness marker. Restore is boot-time
+/// (`WHITEWATER_RESTORE_FROM`), not this endpoint — a Node never
+/// rewrites its own live state.
+async fn admin_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AdminBackupRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let snapshot = state
+        .control
+        .snapshot_bytes()
+        .await
+        .map_err(|error| ApiError::unavailable(format!("catalog snapshot failed: {error}")))?;
+    let catalog_schema_version = serde_json::from_slice::<serde_json::Value>(&snapshot)
+        .ok()
+        .and_then(|value| value["schema_version"].as_u64())
+        .unwrap_or(crate::control::CATALOG_SCHEMA_VERSION as u64)
+        as u32;
+    let manifest = crate::backup::BackupManifest {
+        format_version: crate::backup::BACKUP_FORMAT_VERSION,
+        storage_node_id: state.storage_node_id.as_ref().map(ToString::to_string),
+        build: crate::node::BUILD_VERSION.to_owned(),
+        protocol_version: crate::node::NODE_PROTOCOL_VERSION,
+        catalog_schema_version,
+        catalog_revision: state.control.revision().await,
+        taken_at_ns: unix_ns(),
+        files: 0,
+        bytes: 0,
+    };
+    let data_dir = state.control.data_dir();
+    let destination = std::path::PathBuf::from(request.destination);
+    // Copying gigabytes of segments is blocking IO — keep it off Tokio.
+    let manifest = tokio::task::spawn_blocking(move || {
+        crate::backup::create_backup(&data_dir, &destination, &snapshot, manifest)
+    })
+    .await
+    .map_err(|error| ApiError::unavailable(format!("backup task failed: {error}")))?
+    .map_err(|error| match error {
+        crate::backup::BackupError::Invalid(message) => ApiError::bad_request(message),
+        crate::backup::BackupError::Io(error) => {
+            ApiError::unavailable(format!("backup copy failed: {error}"))
+        }
+    })?;
+    Ok(Json(serde_json::to_value(manifest).unwrap_or_default()))
+}
+
 async fn admin_abandon_range_operation(
     State(state): State<AppState>,
     headers: HeaderMap,
