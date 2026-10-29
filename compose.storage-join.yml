@@ -9,7 +9,10 @@ x-node: &node
     WHITEWATER_ADMIN_API_KEY: ${WHITEWATER_ADMIN_API_KEY:-whitewater-local-development-admin-key}
     WHITEWATER_CONTROL_NODES: 1@control-1:7070,2@control-2:7070,3@control-3:7070
     WHITEWATER_CONTROL_PLANE_KEY: ${WHITEWATER_CONTROL_PLANE_KEY:-whitewater-local-development-control-key}
-    WHITEWATER_INTERNAL_TRANSPORT: ${WHITEWATER_INTERNAL_TRANSPORT:-insecure}
+    # This fixture carries a WHITEWATER_SUBSCRIPTION_MTLS_* bundle on every
+    # Node — the internal plane authenticates over mTLS whenever cert
+    # material exists, so `insecure` would be both untrue and refused.
+    WHITEWATER_INTERNAL_TRANSPORT: ${WHITEWATER_INTERNAL_TRANSPORT:-mtls}
     WHITEWATER_AUTO_SPLIT_APPEND_RATE: 1000000000
     WHITEWATER_AUTO_MERGE_SUSTAINED_SAMPLES: 1000000000
 
