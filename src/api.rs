@@ -814,16 +814,17 @@ async fn execute_admin_wcl(
     {
         return Ok(Json(execution));
     }
+    let actor = request_actor(&state, &headers);
     Ok(Json(match &state.control_plane {
         Some(control_plane) => {
             control_plane
-                .execute_commands_with_request_id(commands, request_id)
+                .execute_commands_as(actor, commands, request_id)
                 .await?
         }
         None => {
             state
                 .control
-                .execute_commands_with_request_id(commands, request_id)
+                .execute_commands_as(actor, commands, request_id)
                 .await?
         }
     }))
@@ -852,16 +853,17 @@ async fn execute_admin_commands(
     {
         return Ok(Json(execution));
     }
+    let actor = request_actor(&state, &headers);
     Ok(Json(match &state.control_plane {
         Some(control_plane) => {
             control_plane
-                .execute_commands_with_request_id(request.commands, request_id)
+                .execute_commands_as(actor, request.commands, request_id)
                 .await?
         }
         None => {
             state
                 .control
-                .execute_commands_with_request_id(request.commands, request_id)
+                .execute_commands_as(actor, request.commands, request_id)
                 .await?
         }
     }))
@@ -919,6 +921,28 @@ fn authenticate_credential(state: &AppState, headers: &HeaderMap) -> Result<(), 
         .admin_auth
         .authenticate(authorization, &state.control.issued_api_keys(), unix_ns())?;
     Ok(())
+}
+
+/// Resolve the request's caller into an `AuditActor` for the replicated
+/// command trail: `None` from `verified_identity` is the configured
+/// bootstrap credential, `Some` an issued key's declared name. Callers
+/// authenticate first, so an `Err` here is defensive — `Unknown`
+/// records the anomaly rather than dropping the mutation.
+fn request_actor(state: &AppState, headers: &HeaderMap) -> crate::control::AuditActor {
+    let authorization = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let issued = state.control.issued_api_keys();
+    match state
+        .admin_auth
+        .verified_identity(authorization, &issued, unix_ns())
+    {
+        Ok(Some(identity)) => crate::control::AuditActor::ApiKey {
+            name: identity.name.clone(),
+        },
+        Ok(None) => crate::control::AuditActor::BootstrapKey,
+        Err(_) => crate::control::AuditActor::Unknown,
+    }
 }
 
 /// Authorize `read` against a Subscription's declared source — a
@@ -1330,7 +1354,7 @@ async fn control_plane_commands(
     let control_plane = authorize_internal(&state, &headers)?;
     let leader_id = control_plane.status().await.leader_id;
     let response = match control_plane
-        .execute_commands_with_request_id(request.commands, request.request_id)
+        .execute_commands_as(request.actor, request.commands, request.request_id)
         .await
     {
         Ok(execution) => InternalCommandsResponse {
@@ -22414,6 +22438,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fenced.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn audit_events_record_the_authenticated_caller() {
+        let directory = TempDir::new().unwrap();
+        let app = admin_test_router(&directory);
+        let bootstrap = Some("this-is-a-long-development-api-key");
+        let manage_secret = "ops-audit-key-0123456789abcdef";
+        let digest = blake3::hash(manage_secret.as_bytes()).to_hex().to_string();
+        let wcl = |script: &str, key: Option<&str>| {
+            admin_request(
+                "/v1/admin/wcl",
+                json!({ "request_id": Uuid::new_v4(), "script": script }),
+                key,
+            )
+        };
+        let setup = app
+            .clone()
+            .oneshot(wcl(
+                &format!(
+                    "CREATE ROLE ops.audits; \
+                     GRANT manage ON NAMESPACE * TO ROLE ops.audits; \
+                     ISSUE API KEY ops.auditkey ROLE ops.audits DIGEST {digest};"
+                ),
+                bootstrap,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(setup.status(), StatusCode::OK);
+        // The issued identity mutates; the bootstrap key mutates too.
+        let issued = app
+            .clone()
+            .oneshot(wcl("CREATE DOMAIN audit.issued", Some(manage_secret)))
+            .await
+            .unwrap();
+        assert_eq!(issued.status(), StatusCode::OK);
+        let bootstrapped = app
+            .clone()
+            .oneshot(wcl("CREATE DOMAIN audit.bootstrap", bootstrap))
+            .await
+            .unwrap();
+        assert_eq!(bootstrapped.status(), StatusCode::OK);
+
+        let shown = app
+            .oneshot(wcl("SHOW AUDIT EVENTS", bootstrap))
+            .await
+            .unwrap();
+        assert_eq!(shown.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(shown.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let execution: crate::control::ControlExecution = serde_json::from_slice(&bytes).unwrap();
+        let events: Vec<crate::control::AuditEvent> =
+            serde_json::from_value(execution.results[0].data.clone()).unwrap();
+        let actor_of = |target: &str| {
+            events
+                .iter()
+                .find(|event| {
+                    event.action == "CREATE DOMAIN" && event.target.as_deref() == Some(target)
+                })
+                .unwrap_or_else(|| panic!("no audit event for {target}"))
+                .actor
+                .clone()
+        };
+        assert_eq!(
+            actor_of("audit.issued"),
+            crate::control::AuditActor::ApiKey {
+                name: "ops.auditkey".to_owned()
+            }
+        );
+        assert_eq!(
+            actor_of("audit.bootstrap"),
+            crate::control::AuditActor::BootstrapKey
+        );
     }
 
     #[tokio::test]

@@ -29,7 +29,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use crate::control::{
-    derive_command_request_id, parse_wcl, Command, ControlController, ControlError,
+    derive_command_request_id, parse_wcl, AuditActor, Command, ControlController, ControlError,
     ControlExecution, ReplicatedCommand, ReplicatedCommandResult,
 };
 
@@ -533,6 +533,12 @@ pub struct FullSnapshotRequest {
 pub struct InternalCommandsRequest {
     pub request_id: Uuid,
     pub commands: Vec<Command>,
+    /// The externally authenticated caller the forwarding Node
+    /// resolved — the leader stamps it onto every replicated command
+    /// so audit evidence survives the hop. Nodes running older builds
+    /// omit it and decode as `Unknown`.
+    #[serde(default)]
+    pub actor: crate::control::AuditActor,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -708,6 +714,18 @@ impl ControlPlane {
         commands: Vec<Command>,
         request_id: Uuid,
     ) -> Result<ControlExecution, ControlPlaneError> {
+        self.execute_commands_as(AuditActor::System, commands, request_id)
+            .await
+    }
+
+    /// Execute commands with the authenticated caller recorded for the
+    /// audit trail — see `AuditActor`.
+    pub async fn execute_commands_as(
+        &self,
+        actor: AuditActor,
+        commands: Vec<Command>,
+        request_id: Uuid,
+    ) -> Result<ControlExecution, ControlPlaneError> {
         if commands.is_empty() {
             return Err(ControlPlaneError::Rejected(
                 "request contains no commands".to_owned(),
@@ -715,7 +733,9 @@ impl ControlPlane {
         }
         match self.raft.current_leader().await {
             Some(leader_id) if leader_id != self.node_id => {
-                return self.forward_commands(leader_id, commands, request_id).await;
+                return self
+                    .forward_commands(leader_id, actor, commands, request_id)
+                    .await;
             }
             None => {
                 return Err(ControlPlaneError::Unavailable(
@@ -748,7 +768,12 @@ impl ControlPlane {
                 None => {
                     let replicated = self
                         .controller
-                        .prepare_replicated(command_request_id, issued_at_ns, command)
+                        .prepare_replicated(
+                            actor.clone(),
+                            command_request_id,
+                            issued_at_ns,
+                            command,
+                        )
                         .await?;
                     self.submit(replicated).await?
                 }
@@ -772,6 +797,7 @@ impl ControlPlane {
     async fn forward_commands(
         &self,
         leader_id: ControlNodeId,
+        actor: AuditActor,
         commands: Vec<Command>,
         request_id: Uuid,
     ) -> Result<ControlExecution, ControlPlaneError> {
@@ -788,6 +814,7 @@ impl ControlPlane {
             .json(&InternalCommandsRequest {
                 request_id,
                 commands,
+                actor,
             })
             .send()
             .await

@@ -94,6 +94,7 @@ async fn domain_typed_command_and_legacy_space_share_replicated_identity() {
     );
     let command = leader
         .prepare_replicated(
+            whitewater::control::AuditActor::System,
             Uuid::from_u128(777),
             1_700_000_000,
             Command::CreateDomain {
@@ -200,6 +201,7 @@ async fn follower_uses_leader_subscription_placement_not_local_candidates() {
         .unwrap();
     let command = leader
         .prepare_replicated(
+            whitewater::control::AuditActor::System,
             Uuid::from_u128(50_001),
             1_700_000_000,
             Command::CreateSubscription {
@@ -351,6 +353,7 @@ async fn followers_apply_the_leaders_embedded_placement_not_their_local_candidat
     );
     let create_space = leader
         .prepare_replicated(
+            whitewater::control::AuditActor::System,
             Uuid::from_u128(401),
             1,
             Command::CreateSpace {
@@ -361,6 +364,7 @@ async fn followers_apply_the_leaders_embedded_placement_not_their_local_candidat
         .unwrap();
     let create_feed = leader
         .prepare_replicated(
+            whitewater::control::AuditActor::System,
             Uuid::from_u128(402),
             2,
             Command::CreateFeed {

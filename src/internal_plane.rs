@@ -133,6 +133,7 @@ impl CapacityReporter {
                 node: self.node.clone(),
                 capacity: NodeCapacity::sample(&self.data_dir, self.failure_domain.clone()),
             }],
+            actor: crate::control::AuditActor::System,
         };
         for endpoint in &self.endpoints {
             let url = format!(

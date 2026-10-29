@@ -107,7 +107,7 @@ impl AdminAuthenticator {
     /// bootstrap key matched, `Ok(Some(identity))` for an unexpired
     /// issued identity, and `Err` for missing, unknown, or expired
     /// credentials. Grant evaluation is the caller's concern.
-    fn verified_identity<'a>(
+    pub(crate) fn verified_identity<'a>(
         &self,
         authorization: Option<&str>,
         issued: &'a IssuedApiKeySet,
@@ -552,7 +552,20 @@ impl AdminClient {
     }
 
     pub async fn show(&self, kind: ShowKind) -> Result<ControlExecution, AdminClientError> {
-        self.execute_one(Command::Show { kind }).await
+        self.execute_one(Command::Show { kind, limit: None }).await
+    }
+
+    /// Page the replicated audit trail — `None` returns the whole
+    /// bounded ring, `Some(n)` the newest `n` events.
+    pub async fn show_audit_events(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<ControlExecution, AdminClientError> {
+        self.execute_one(Command::Show {
+            kind: ShowKind::AuditEvents,
+            limit,
+        })
+        .await
     }
 
     pub async fn describe(

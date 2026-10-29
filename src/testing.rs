@@ -833,7 +833,7 @@ impl FakeRiverbed {
                     json!({ "name": feed, "erased": removed }),
                 ))
             }
-            Command::Show { kind } => {
+            Command::Show { kind, .. } => {
                 Ok((format!("showing {}", show_label(kind)), self.show(kind)))
             }
             Command::Describe { kind, name } => {
@@ -2271,6 +2271,7 @@ fn show_label(kind: &ShowKind) -> &'static str {
         ShowKind::HistoryPolicies => "HISTORY POLICIES",
         ShowKind::LegalHolds => "LEGAL HOLDS",
         ShowKind::Schemas => "SCHEMAS",
+        ShowKind::AuditEvents => "AUDIT EVENTS",
     }
 }
 

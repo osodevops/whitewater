@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -161,6 +161,15 @@ impl HistoryPolicy {
 pub enum PolicyScope {
     Domain { name: String },
     Feed { name: String },
+}
+
+impl PolicyScope {
+    /// The scoped resource name for audit targets and error messages.
+    pub fn target_name(&self) -> &str {
+        match self {
+            Self::Domain { name } | Self::Feed { name } => name,
+        }
+    }
 }
 
 /// The durable catalog row: which resolved definition holds the
@@ -1181,6 +1190,78 @@ impl CapacityPolicy {
     }
 }
 
+/// Hard bound on the replicated audit trail. This must stay a shared
+/// constant — a configurable bound could diverge replicas (one Node's
+/// ring evicting earlier than another's produces different catalog
+/// snapshots), so tuning it takes the replicated-baseline route the
+/// `CapacityPolicy` uses, not a per-Node env.
+pub const AUDIT_EVENT_LIMIT: usize = 16_384;
+
+/// The authenticated identity behind an administrative mutation,
+/// recorded at propose time so every replica applies the same actor.
+/// The bootstrap credential and Node-internal producers are named
+/// kinds; issued API keys record their declared name — never a digest.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AuditActor {
+    /// The configured `WHITEWATER_ADMIN_API_KEY` credential.
+    BootstrapKey,
+    /// A catalog-issued API-key identity, by declared name.
+    ApiKey { name: String },
+    /// An internal Node caller once the internal plane can prove one.
+    Node { id: String },
+    /// A Node-internal producer with no external caller (self-issued
+    /// movement, cutover, and drain commands).
+    System,
+    /// Persisted entries predating actor recording.
+    Unknown,
+}
+
+impl Default for AuditActor {
+    fn default() -> Self {
+        Self::Unknown
+    }
+}
+
+/// How the apply path settled the audited command. Refusals still ride
+/// the replicated log (their result is cached for idempotent replay),
+/// so a refused administrative *attempt* is auditable evidence, not a
+/// silently dropped rejection.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum AuditOutcome {
+    Committed,
+    Refused { error: String },
+}
+
+/// One committed administrative mutation. Events are append-only
+/// inside `CatalogState` and survive eviction only by rolling off the
+/// bounded front — that is retention, never mutation of surviving
+/// rows. Fields derive entirely from replicated inputs (request id,
+/// leader-stamped time, actor, command, apply verdict) so every
+/// replica persists byte-identical events.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct AuditEvent {
+    /// Audit-local ordinal; keeps rising across ring eviction.
+    pub seq: u64,
+    /// Catalog revision the command committed under. A refused apply
+    /// never advances the revision, so its events repeat the current
+    /// one — `seq` is the ordering guarantee.
+    pub revision: u64,
+    /// Leader-stamped `issued_at_ns` — identical on every replica.
+    pub at_ns: i64,
+    pub request_id: Uuid,
+    pub actor: AuditActor,
+    /// WCL-style command label (`CREATE FEED`, `GRANT`, ...).
+    pub action: String,
+    /// Primary resource name (or id) the command acts on.
+    pub target: Option<String>,
+    /// Secondary context where a single name cannot carry it (grant
+    /// namespaces, rename destinations, legal-hold reasons).
+    pub detail: Option<String>,
+    pub outcome: AuditOutcome,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CatalogState {
     schema_version: u32,
@@ -1268,9 +1349,30 @@ struct CatalogState {
     range_commit_proofs: BTreeMap<RangeId, RangeCommitProof>,
     #[serde(default)]
     applied_requests: BTreeMap<Uuid, ReplicatedCommandResult>,
+    /// Append-only administrative audit trail, newest events at the
+    /// back, bounded by `AUDIT_EVENT_LIMIT`. Replicated through the
+    /// same commit path as every other mutation so all replicas and
+    /// snapshots carry identical evidence.
+    #[serde(default)]
+    audit_events: VecDeque<AuditEvent>,
+    /// Next audit ordinal — survives ring eviction so `seq` never
+    /// repeats within a catalog lifetime.
+    #[serde(default)]
+    audit_seq: u64,
 }
 
 impl CatalogState {
+    /// Record one audited command outcome, evicting the oldest rows
+    /// once the ring exceeds `AUDIT_EVENT_LIMIT`.
+    fn push_audit_event(&mut self, mut event: AuditEvent) {
+        self.audit_seq = self.audit_seq.saturating_add(1);
+        event.seq = self.audit_seq;
+        self.audit_events.push_back(event);
+        while self.audit_events.len() > AUDIT_EVENT_LIMIT {
+            self.audit_events.pop_front();
+        }
+    }
+
     fn migrate_range_metadata(&mut self) {
         for (feed_id, assignment) in &self.active_ranges {
             self.range_maps
@@ -1324,6 +1426,8 @@ impl Default for CatalogState {
             completed_owner_move_plans: BTreeMap::new(),
             range_commit_proofs: BTreeMap::new(),
             applied_requests: BTreeMap::new(),
+            audit_events: VecDeque::new(),
+            audit_seq: 0,
         }
     }
 }
@@ -1362,6 +1466,7 @@ pub enum ShowKind {
     Pipes,
     Indexes,
     StateStores,
+    AuditEvents,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1585,6 +1690,10 @@ pub enum Command {
     },
     Show {
         kind: ShowKind,
+        /// Optional row cap — parsed from `SHOW ... LIMIT <n>` for
+        /// the bounded audit trail; every other listing ignores it.
+        #[serde(default)]
+        limit: Option<usize>,
     },
     Describe {
         kind: ResourceKind,
@@ -1898,6 +2007,136 @@ impl Command {
         )
     }
 
+    /// Whether the command is an administrative mutation worth an audit
+    /// event. The audit trail excludes read-only commands and the
+    /// high-frequency data-plane bookkeeping (session open/close,
+    /// per-batch sequence allocation, reader progress, catch-up
+    /// progress records, and capacity heartbeats) that would churn the
+    /// bounded ring without telling an operator anything new —
+    /// lifecycle, security, policy, and movement commands all record.
+    pub fn is_audited(&self) -> bool {
+        !matches!(
+            self,
+            Self::Show { .. }
+                | Self::Describe { .. }
+                | Self::ExplainAccess { .. }
+                | Self::InspectPlacement { .. }
+                | Self::InspectStorageDrain { .. }
+                | Self::GetIndex { .. }
+                | Self::OpenWriterSession { .. }
+                | Self::AllocateWriterSequence { .. }
+                | Self::AllocateWriterRangeSequence { .. }
+                | Self::RepairWriterRangeSequence { .. }
+                | Self::OpenReaderSession { .. }
+                | Self::RecordReaderDelivery { .. }
+                | Self::RecordReaderFrontier { .. }
+                | Self::AcknowledgeReader { .. }
+                | Self::CloseReaderSession { .. }
+                | Self::RecordRangeCommitProof { .. }
+                | Self::RecordActiveRangeSplitCatchUp { .. }
+                | Self::RecordActiveRangeMergeStaging { .. }
+                | Self::RecordFollowerMoveCatchUp { .. }
+                | Self::RecordOwnerMoveCatchUp { .. }
+                | Self::ReportStorageNodeCapacity { .. }
+        )
+    }
+
+    /// The primary resource an audited command acts on, for display.
+    fn audit_target(&self) -> Option<String> {
+        match self {
+            Self::CreateDomain { name }
+            | Self::CreateSpace { name }
+            | Self::CreateFeed { name, .. }
+            | Self::EraseFeed { feed: name }
+            | Self::DefineStateStore { name, .. }
+            | Self::DefineIndex { name, .. }
+            | Self::RebuildIndex { name }
+            | Self::RebuildIndexesInDomain { domain: name }
+            | Self::PausePipe { name }
+            | Self::ResumePipe { name }
+            | Self::DefinePipe { name, .. }
+            | Self::CreateWriter { name, .. }
+            | Self::RevokeWriterSession { writer: name, .. }
+            | Self::CreateReader { name, .. }
+            | Self::CreateSubscription { name, .. }
+            | Self::CreateRole { name }
+            | Self::Grant { role: name, .. }
+            | Self::RevokeGrant { role: name, .. }
+            | Self::IssueApiKey { name, .. }
+            | Self::RevokeApiKey { name }
+            | Self::Drop { name, .. }
+            | Self::Rename { current: name, .. }
+            | Self::SetLegalHold { feed: name, .. }
+            | Self::DropLegalHold { feed: name }
+            | Self::SeekReader { reader: name, .. }
+            | Self::SeekSubscription { name, .. }
+            | Self::TransferActiveRangeOwnership { feed: name, .. }
+            | Self::RecoverActiveRangeOwnership { feed: name, .. }
+            | Self::PrepareActiveRangeSplit { feed: name, .. }
+            | Self::ActivateActiveRangeSplit { feed: name, .. }
+            | Self::PrepareActiveRangeMerge { feed: name, .. }
+            | Self::ActivateActiveRangeMerge { feed: name, .. }
+            | Self::PrepareFollowerMove { feed: name, .. }
+            | Self::ActivateFollowerMove { feed: name, .. }
+            | Self::AbortFollowerMove { feed: name, .. }
+            | Self::PrepareOwnerMove { feed: name, .. }
+            | Self::ActivateOwnerMove { feed: name, .. }
+            | Self::AbortOwnerMove { feed: name, .. }
+            | Self::MovePipeComputeLease { pipe: name, .. } => Some(name.clone()),
+            Self::SetHistoryPolicy { scope, .. }
+            | Self::ClearHistoryPolicy { scope }
+            | Self::SetSchema { scope, .. }
+            | Self::ClearSchema { scope } => Some(scope.target_name().to_owned()),
+            Self::CompleteIndexBuild { index_id, .. }
+            | Self::AbandonActiveRangeSplit {
+                feed_id: index_id, ..
+            }
+            | Self::AbandonActiveRangeMerge {
+                feed_id: index_id, ..
+            }
+            | Self::AbandonFollowerMove {
+                feed_id: index_id, ..
+            }
+            | Self::AbandonOwnerMove {
+                feed_id: index_id, ..
+            }
+            | Self::ClearSubscriptionCutover {
+                subscription_id: index_id,
+                ..
+            }
+            | Self::RecoverSubscriptionProgressOwner {
+                subscription_id: index_id,
+                ..
+            }
+            | Self::MoveSubscriptionProgressReplica {
+                subscription_id: index_id,
+                ..
+            }
+            | Self::RecoverStateStoreOwner {
+                store_id: index_id, ..
+            } => Some(index_id.to_string()),
+            Self::RegisterStorageNode { node, .. }
+            | Self::RetireStorageNode { node }
+            | Self::DrainStorageNode { node }
+            | Self::UndrainStorageNode { node } => Some(node.to_string()),
+            _ => None,
+        }
+    }
+
+    /// Secondary audit context where a single target name cannot carry
+    /// the command's meaning — grant namespaces, rename destinations,
+    /// legal-hold reasons.
+    fn audit_detail(&self) -> Option<String> {
+        match self {
+            Self::Grant { namespace, .. } | Self::RevokeGrant { namespace, .. } => {
+                Some(namespace.clone())
+            }
+            Self::Rename { new, .. } => Some(new.clone()),
+            Self::SetLegalHold { reason, .. } => reason.clone(),
+            _ => None,
+        }
+    }
+
     /// Whether the command's own data carries its idempotency: an
     /// advance-only committed-frontier proof can re-apply harmlessly
     /// (same position and digest is a no-op, a conflicting digest must
@@ -1972,6 +2211,11 @@ pub struct ReplicatedCommand {
     pub request_id: Uuid,
     pub issued_at_ns: i64,
     pub command: Command,
+    /// The authenticated caller recorded at propose time — stamped
+    /// once so every replica audits the same identity. Replicated
+    /// entries predating the field decode as `Unknown`.
+    #[serde(default)]
+    pub actor: AuditActor,
     #[serde(default)]
     pub fixed_active_range: Option<FixedActiveRangePlacement>,
     #[serde(default)]
@@ -2101,6 +2345,7 @@ impl ControlController {
 
     pub async fn prepare_replicated(
         &self,
+        actor: AuditActor,
         request_id: Uuid,
         issued_at_ns: i64,
         command: Command,
@@ -2154,6 +2399,7 @@ impl ControlController {
             request_id,
             issued_at_ns,
             command,
+            actor,
             fixed_active_range,
             fixed_subscription_progress,
             fixed_state_store,
@@ -2403,6 +2649,19 @@ impl ControlController {
         commands: Vec<Command>,
         request_id: Uuid,
     ) -> Result<ControlExecution, ControlError> {
+        self.execute_commands_as(AuditActor::System, commands, request_id)
+            .await
+    }
+
+    /// Execute commands on behalf of a known caller — the actor rides
+    /// the replicated command so every replica audits the same
+    /// identity. Node-internal producers keep `AuditActor::System`.
+    pub async fn execute_commands_as(
+        &self,
+        actor: AuditActor,
+        commands: Vec<Command>,
+        request_id: Uuid,
+    ) -> Result<ControlExecution, ControlError> {
         if commands.is_empty() {
             return Err(ControlError::Syntax(
                 "request contains no commands".to_owned(),
@@ -2425,6 +2684,7 @@ impl ControlController {
             }
             let replicated = self
                 .prepare_replicated(
+                    actor.clone(),
                     derive_command_request_id(request_id, index),
                     issued_at_ns,
                     command,
@@ -2487,11 +2747,16 @@ impl ControlController {
             request_id,
             issued_at_ns,
             command,
+            actor,
             fixed_active_range,
             fixed_subscription_progress,
             fixed_state_store,
         } = request;
         let statement = command_label(&command);
+        let audited = command.is_audited();
+        let audit_action = audited.then(|| statement.clone());
+        let audit_target = audited.then(|| command.audit_target()).flatten();
+        let audit_detail = audited.then(|| command.audit_detail()).flatten();
         let cache_response = command.caches_applied_response();
         let response = match self
             .apply(
@@ -2525,6 +2790,30 @@ impl ControlController {
                 error: Some(error.to_string()),
             },
         };
+        if let Some(action) = audit_action {
+            // The event lands in state before persist_state so a failed
+            // write rolls the audit row back with the mutation it would
+            // otherwise claim happened — evidence never outlives the
+            // change it records.
+            let outcome = if response.error.is_none() {
+                AuditOutcome::Committed
+            } else {
+                AuditOutcome::Refused {
+                    error: response.error.clone().unwrap_or_default(),
+                }
+            };
+            state.push_audit_event(AuditEvent {
+                seq: 0,
+                revision: response.revision,
+                at_ns: issued_at_ns,
+                request_id,
+                actor,
+                action,
+                target: audit_target,
+                detail: audit_detail,
+                outcome,
+            });
+        }
         if cache_response {
             state.applied_requests.insert(request_id, response.clone());
         }
@@ -4660,11 +4949,12 @@ impl ControlController {
                         ControlError::NotFound(format!("schema on {scope_kind} {name}"))
                     })
             }
-            Command::Show { kind } => Ok((
+            Command::Show { kind, limit } => Ok((
                 format!("showing {}", show_name(&kind)),
                 show_resources(
                     state,
                     kind,
+                    limit,
                     &self.eligible_storage_nodes,
                     &self.capacity_policy,
                 ),
@@ -7466,25 +7756,42 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 feed: token(&tokens, 2)?.to_owned(),
             })
         }
-        Some("SHOW") => Ok(Command::Show {
-            kind: if token(&tokens, 1)?.eq_ignore_ascii_case("HISTORY") {
+        Some("SHOW") => {
+            let (kind, limit) = if token(&tokens, 1)?.eq_ignore_ascii_case("HISTORY") {
                 expect_keyword(&tokens, 2, "POLICIES")?;
-                ShowKind::HistoryPolicies
+                (ShowKind::HistoryPolicies, None)
             } else if token(&tokens, 1)?.eq_ignore_ascii_case("LEGAL") {
                 expect_keyword(&tokens, 2, "HOLDS")?;
-                ShowKind::LegalHolds
+                (ShowKind::LegalHolds, None)
             } else if token(&tokens, 1)?.eq_ignore_ascii_case("STORAGE") {
                 expect_keyword(&tokens, 2, "NODES")?;
-                ShowKind::StorageNodes
+                (ShowKind::StorageNodes, None)
             } else if token(&tokens, 1)?.eq_ignore_ascii_case("API") {
                 expect_keyword(&tokens, 2, "KEYS")?;
-                ShowKind::ApiKeys
+                (ShowKind::ApiKeys, None)
+            } else if token(&tokens, 1)?.eq_ignore_ascii_case("AUDIT") {
+                expect_keyword(&tokens, 2, "EVENTS")?;
+                let limit = match tokens.get(3) {
+                    Some(keyword) if keyword.eq_ignore_ascii_case("LIMIT") => Some(
+                        token(&tokens, 4)?
+                            .parse::<usize>()
+                            .map_err(|_| ControlError::Syntax("invalid audit LIMIT".to_owned()))?,
+                    ),
+                    None => None,
+                    Some(other) => {
+                        return Err(ControlError::Syntax(format!(
+                            "expected LIMIT after SHOW AUDIT EVENTS, found {other}"
+                        )))
+                    }
+                };
+                (ShowKind::AuditEvents, limit)
             } else if token(&tokens, 1)?.eq_ignore_ascii_case("SCHEMAS") {
-                ShowKind::Schemas
+                (ShowKind::Schemas, None)
             } else {
-                parse_show_kind(token(&tokens, 1)?)?
-            },
-        }),
+                (parse_show_kind(token(&tokens, 1)?)?, None)
+            };
+            Ok(Command::Show { kind, limit })
+        }
         Some("REGISTER") => {
             expect_keyword(&tokens, 1, "STORAGE")?;
             expect_keyword(&tokens, 2, "NODE")?;
@@ -8993,10 +9300,22 @@ fn drop_named<T: Clone + Serialize + NamedResource>(
 fn show_resources(
     state: &CatalogState,
     kind: ShowKind,
+    limit: Option<usize>,
     configured: &BTreeSet<StorageNodeId>,
     policy: &CapacityPolicy,
 ) -> Value {
     match kind {
+        ShowKind::AuditEvents => {
+            // Newest-first: the events an operator wants are the most
+            // recent administrative actions. `LIMIT` is the caller's
+            // page size; the full bounded trail is the default.
+            json!(state
+                .audit_events
+                .iter()
+                .rev()
+                .take(limit.unwrap_or(usize::MAX))
+                .collect::<Vec<_>>())
+        }
         ShowKind::Domains | ShowKind::Spaces => json!(state
             .spaces
             .values()
@@ -9732,6 +10051,7 @@ fn show_name(kind: &ShowKind) -> &'static str {
         ShowKind::HistoryPolicies => "History Policies",
         ShowKind::LegalHolds => "Legal Holds",
         ShowKind::Schemas => "Schemas",
+        ShowKind::AuditEvents => "Audit Events",
     }
 }
 
@@ -9807,7 +10127,8 @@ mod tests {
         assert!(matches!(
             &commands[1],
             Command::Show {
-                kind: ShowKind::Domains
+                kind: ShowKind::Domains,
+                ..
             }
         ));
         assert!(matches!(
@@ -9835,7 +10156,8 @@ mod tests {
         assert!(matches!(
             &commands[6],
             Command::Show {
-                kind: ShowKind::Spaces
+                kind: ShowKind::Spaces,
+                ..
             }
         ));
         assert_eq!(
@@ -10568,6 +10890,7 @@ mod tests {
             command: Command::CreateSpace {
                 name: "orders".to_owned(),
             },
+            actor: AuditActor::System,
             fixed_active_range: None,
             fixed_subscription_progress: None,
             fixed_state_store: None,
@@ -10598,6 +10921,7 @@ mod tests {
             command: Command::CreateSpace {
                 name: "orders".to_owned(),
             },
+            actor: AuditActor::System,
             fixed_active_range: None,
             fixed_subscription_progress: None,
             fixed_state_store: None,
@@ -10611,6 +10935,7 @@ mod tests {
                 name: "orders.events".to_owned(),
                 encrypted: true,
             },
+            actor: AuditActor::System,
             fixed_active_range: Some(FixedActiveRangePlacement {
                 owner: StorageNodeId::try_new("storage-1").unwrap(),
                 replicas: [
@@ -10638,6 +10963,216 @@ mod tests {
             }
             other => panic!("expected Active DEKs on both replicas, got {other:?}"),
         }
+    }
+
+    async fn show_audit(control: &ControlController, limit: Option<usize>) -> Vec<AuditEvent> {
+        let mut execution = control
+            .execute_commands(vec![Command::Show {
+                kind: ShowKind::AuditEvents,
+                limit,
+            }])
+            .await
+            .unwrap();
+        serde_json::from_value(execution.results.remove(0).data).unwrap()
+    }
+
+    #[tokio::test]
+    async fn audit_events_record_mutations_and_refusals_with_actor() {
+        let directory = TempDir::new().unwrap();
+        let control = new_controller(&directory);
+        let actor = AuditActor::ApiKey {
+            name: "ci-bot".to_owned(),
+        };
+        control
+            .execute_commands_as(
+                actor.clone(),
+                vec![
+                    Command::CreateDomain {
+                        name: "orders".to_owned(),
+                    },
+                    Command::CreateFeed {
+                        name: "orders.events".to_owned(),
+                        encrypted: false,
+                    },
+                ],
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap();
+        // A refused attempt commits its verdict and audits the try.
+        control
+            .execute_commands_as(
+                actor.clone(),
+                vec![Command::CreateDomain {
+                    name: "orders".to_owned(),
+                }],
+                Uuid::new_v4(),
+            )
+            .await
+            .unwrap_err();
+
+        let events = show_audit(&control, None).await;
+        assert_eq!(events.len(), 3);
+        // Newest first: the refusal, then the two commits.
+        let refused = &events[0];
+        assert_eq!(refused.action, "CREATE DOMAIN");
+        assert_eq!(refused.target.as_deref(), Some("orders"));
+        match &refused.outcome {
+            AuditOutcome::Refused { error } => assert!(!error.is_empty()),
+            other => panic!("expected refusal, got {other:?}"),
+        }
+        for (event, action, target) in [
+            (&events[1], "CREATE FEED", "orders.events"),
+            (&events[2], "CREATE DOMAIN", "orders"),
+        ] {
+            assert_eq!(event.action, action);
+            assert_eq!(event.target.as_deref(), Some(target));
+            assert_eq!(event.actor, actor);
+            assert_eq!(event.outcome, AuditOutcome::Committed);
+            assert!(event.at_ns > 0);
+        }
+        // seq is the strict ordering even when revisions repeat (a
+        // refused apply never bumps the catalog revision).
+        assert!(events[0].seq > events[1].seq && events[1].seq > events[2].seq);
+        assert!(events[0].revision <= events[2].revision + 1);
+    }
+
+    #[tokio::test]
+    async fn audit_events_skip_data_plane_and_progress_commands() {
+        let directory = TempDir::new().unwrap();
+        let control = new_controller(&directory);
+        control
+            .execute("CREATE DOMAIN orders; CREATE FEED orders.events; CREATE READER orders.audit FROM orders.events;")
+            .await
+            .unwrap();
+        let events_before = show_audit(&control, None).await.len();
+        // Session/progress commands churn per-request — refused or
+        // committed, none of them is administrative evidence.
+        for command in [
+            Command::OpenReaderSession {
+                reader: "orders.audit".to_owned(),
+                capacity: 4,
+            },
+            Command::CloseReaderSession {
+                reader: "orders.audit".to_owned(),
+                session_epoch: 1,
+            },
+            Command::AllocateWriterSequence {
+                writer: "missing".to_owned(),
+                session_epoch: 1,
+            },
+        ] {
+            // Committed or refused is irrelevant — neither may audit.
+            let _ = control.execute_commands(vec![command]).await;
+        }
+        assert_eq!(show_audit(&control, None).await.len(), events_before);
+    }
+
+    #[tokio::test]
+    async fn audit_events_default_actor_is_system_and_survive_reopen() {
+        let directory = TempDir::new().unwrap();
+        let catalog = directory.path().join("catalog.json");
+        {
+            let control = new_controller(&directory);
+            control
+                .execute_commands(vec![Command::CreateDomain {
+                    name: "orders".to_owned(),
+                }])
+                .await
+                .unwrap();
+        }
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let reopened = ControlController::open_with_storage_nodes(
+            catalog,
+            store,
+            ["storage-1", "storage-2", "storage-3"]
+                .into_iter()
+                .map(|node| StorageNodeId::try_new(node).unwrap())
+                .collect(),
+        )
+        .unwrap();
+        let events = show_audit(&reopened, None).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].actor, AuditActor::System);
+        assert_eq!(events[0].action, "CREATE DOMAIN");
+    }
+
+    #[tokio::test]
+    async fn audit_events_limit_pages_the_ring() {
+        let directory = TempDir::new().unwrap();
+        let control = new_controller(&directory);
+        control
+            .execute("CREATE DOMAIN a; CREATE DOMAIN b; CREATE DOMAIN c;")
+            .await
+            .unwrap();
+        let page = show_audit(&control, Some(2)).await;
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].target.as_deref(), Some("c"));
+        assert_eq!(page[1].target.as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn audit_ring_evicts_oldest_and_seq_never_repeats() {
+        let mut state = CatalogState::default();
+        let event = |seq| AuditEvent {
+            seq,
+            revision: 1,
+            at_ns: 1,
+            request_id: Uuid::nil(),
+            actor: AuditActor::System,
+            action: "CREATE DOMAIN".to_owned(),
+            target: None,
+            detail: None,
+            outcome: AuditOutcome::Committed,
+        };
+        for _ in 0..AUDIT_EVENT_LIMIT + 10 {
+            state.push_audit_event(event(0));
+        }
+        assert_eq!(state.audit_events.len(), AUDIT_EVENT_LIMIT);
+        assert_eq!(
+            state.audit_events.front().unwrap().seq,
+            (AUDIT_EVENT_LIMIT + 10 - AUDIT_EVENT_LIMIT + 1) as u64
+        );
+        assert_eq!(
+            state.audit_events.back().unwrap().seq,
+            (AUDIT_EVENT_LIMIT + 10) as u64
+        );
+    }
+
+    #[test]
+    fn replicated_command_decodes_without_actor() {
+        // Persisted pre-upgrade entries carry no actor: they must keep
+        // replaying, auditing themselves as Unknown rather than failing.
+        let decoded: ReplicatedCommand = serde_json::from_value(json!({
+            "request_id": Uuid::nil(),
+            "issued_at_ns": 1_700_000_000_i64,
+            "command": { "command": "create_domain", "name": "orders" },
+        }))
+        .unwrap();
+        assert_eq!(decoded.actor, AuditActor::Unknown);
+    }
+
+    #[test]
+    fn show_audit_events_parses_with_and_without_limit() {
+        let commands = parse_wcl("SHOW AUDIT EVENTS").unwrap();
+        assert!(matches!(
+            &commands[0],
+            Command::Show {
+                kind: ShowKind::AuditEvents,
+                limit: None
+            }
+        ));
+        let commands = parse_wcl("SHOW AUDIT EVENTS LIMIT 7").unwrap();
+        assert!(matches!(
+            &commands[0],
+            Command::Show {
+                kind: ShowKind::AuditEvents,
+                limit: Some(7)
+            }
+        ));
+        assert!(parse_wcl("SHOW AUDIT EVENTS TAIL 7").is_err());
+        assert!(parse_wcl("SHOW AUDIT EVENTS LIMIT nope").is_err());
     }
 
     #[tokio::test]
@@ -14288,7 +14823,8 @@ mod tests {
         assert!(matches!(
             &commands[4],
             Command::Show {
-                kind: ShowKind::HistoryPolicies
+                kind: ShowKind::HistoryPolicies,
+                ..
             }
         ));
         for bad in [
@@ -14419,7 +14955,8 @@ mod tests {
         assert!(matches!(
             &commands[3],
             Command::Show {
-                kind: ShowKind::LegalHolds
+                kind: ShowKind::LegalHolds,
+                ..
             }
         ));
         // Malformed shapes stay syntax errors, not silent misreads.
@@ -14623,7 +15160,8 @@ mod tests {
         assert!(matches!(
             &commands[5],
             Command::Show {
-                kind: ShowKind::Schemas
+                kind: ShowKind::Schemas,
+                ..
             }
         ));
         for bad in [
