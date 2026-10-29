@@ -33,6 +33,14 @@ pub struct MemberAnnouncement {
     /// Self-reported measured resources; all-zero means unreported.
     #[serde(default)]
     pub resources: NodeCapacity,
+    /// Self-reported internal protocol level — `0` on peers predating
+    /// version advertisement. Advertised only; the authoritative gate
+    /// lives in the Control Plane capacity-report path.
+    #[serde(default)]
+    pub protocol_version: u32,
+    /// Self-reported package version for upgrade visibility.
+    #[serde(default)]
+    pub build: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -44,6 +52,10 @@ pub struct MemberView {
     pub capabilities: NodeCapabilities,
     #[serde(default)]
     pub resources: NodeCapacity,
+    #[serde(default)]
+    pub protocol_version: u32,
+    #[serde(default)]
+    pub build: String,
     pub last_seen_ms: u64,
     pub local: bool,
 }
@@ -164,6 +176,8 @@ impl MembershipService {
                 capacity: state.announcement.capacity,
                 capabilities: state.announcement.capabilities,
                 resources: state.announcement.resources.clone(),
+                protocol_version: state.announcement.protocol_version,
+                build: state.announcement.build.clone(),
                 last_seen_ms: state.last_seen_ms,
                 local: state.announcement.node_id == self.local.node_id,
             })
@@ -312,6 +326,8 @@ mod tests {
             capacity: 100,
             capabilities: NodeCapabilities::all(),
             resources: NodeCapacity::default(),
+            protocol_version: 0,
+            build: String::new(),
         };
         let service = MembershipService::new(
             local,
@@ -326,6 +342,8 @@ mod tests {
                 capacity: 50,
                 capabilities: NodeCapabilities::all(),
                 resources: NodeCapacity::default(),
+                protocol_version: 0,
+                build: String::new(),
             })
             .await;
         assert_eq!(service.members().await.len(), 2);
@@ -347,5 +365,41 @@ mod tests {
         assert!(decoded.capabilities.compute);
         assert!(decoded.capabilities.gateway);
         assert_eq!(decoded.resources, NodeCapacity::default());
+    }
+
+    #[test]
+    fn pre_version_announcements_decode_as_unversioned() {
+        // Peers predating version advertisement carry no protocol/build
+        // fields; they decode as level-0 "unknown version" rather than
+        // failing to join the member view.
+        let decoded: MemberAnnouncement =
+            serde_json::from_str(r#"{"node_id":"n1","api_url":"http://n1:7070","capacity":100}"#)
+                .unwrap();
+        assert_eq!(decoded.protocol_version, 0);
+        assert_eq!(decoded.build, "");
+    }
+
+    #[tokio::test]
+    async fn member_views_carry_advertised_versions() {
+        let service = MembershipService::new(
+            MemberAnnouncement {
+                node_id: "one".to_owned(),
+                api_url: "http://one:7070".to_owned(),
+                capacity: 100,
+                capabilities: NodeCapabilities::all(),
+                resources: NodeCapacity::default(),
+                protocol_version: crate::node::NODE_PROTOCOL_VERSION,
+                build: "9.9.9".to_owned(),
+            },
+            vec![],
+            Duration::from_secs(1),
+            Duration::from_secs(10),
+        );
+        let members = service.members().await;
+        assert_eq!(
+            members[0].protocol_version,
+            crate::node::NODE_PROTOCOL_VERSION
+        );
+        assert_eq!(members[0].build, "9.9.9");
     }
 }

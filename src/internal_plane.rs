@@ -132,6 +132,8 @@ impl CapacityReporter {
             commands: vec![Command::ReportStorageNodeCapacity {
                 node: self.node.clone(),
                 capacity: NodeCapacity::sample(&self.data_dir, self.failure_domain.clone()),
+                protocol_version: crate::node::NODE_PROTOCOL_VERSION,
+                build: crate::node::BUILD_VERSION.to_owned(),
             }],
             actor: crate::control::AuditActor::System,
         };

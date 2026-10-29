@@ -1167,7 +1167,38 @@ pub struct StorageNodeRecord {
 pub struct CapacityReport {
     pub capacity: NodeCapacity,
     pub reported_at_ns: i64,
+    /// The protocol level the reporting Node claimed — `0` on reports
+    /// from binaries predating version advertisement.
+    #[serde(default)]
+    pub protocol_version: u32,
+    /// The package version the reporting Node claimed.
+    #[serde(default)]
+    pub build: String,
 }
+
+/// Evidence that a storage identity tried to report from an
+/// incompatible protocol level: the claimed level, build, and newest
+/// refusal instant. The row commits *with* the refusal so `SHOW
+/// COMPATIBILITY` can explain "why isn't my new Node joining" from
+/// replicated state rather than a dropped log line.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IncompatibleNodeReport {
+    pub protocol_version: u32,
+    pub build: String,
+    pub refused_at_ns: i64,
+}
+
+/// The catalog state-layout version this binary can read and write. A
+/// Node opened against a *newer* schema is a rollback across an
+/// irreversible storage migration: it must fail closed rather than
+/// silently misread fields it does not understand. Bump this only when
+/// persisted state changes in a way older binaries cannot tolerate —
+/// additive `#[serde(default)]` fields stay compatible at 1.
+pub const CATALOG_SCHEMA_VERSION: u32 = 1;
+
+/// Bound on distinct identities remembered as incompatible reporters:
+/// a churning Node updates its own row rather than growing the map.
+const MAX_INCOMPATIBLE_REPORTS: usize = 256;
 
 /// The shared minimum-baseline policy: which capacity evidence a Node
 /// must commit before placement may target it. Both bounds default off;
@@ -1345,6 +1376,10 @@ struct CatalogState {
     /// inside apply read identical data on every replica.
     #[serde(default)]
     capacity_reports: BTreeMap<StorageNodeId, CapacityReport>,
+    /// Refused incompatible-version reporters — durable gate evidence
+    /// bounded by `MAX_INCOMPATIBLE_REPORTS` distinct identities.
+    #[serde(default)]
+    incompatible_reports: BTreeMap<StorageNodeId, IncompatibleNodeReport>,
     #[serde(default)]
     range_commit_proofs: BTreeMap<RangeId, RangeCommitProof>,
     #[serde(default)]
@@ -1359,6 +1394,22 @@ struct CatalogState {
     /// repeats within a catalog lifetime.
     #[serde(default)]
     audit_seq: u64,
+}
+
+/// The rollback boundary, enforced at catalog open and snapshot
+/// install: a Node asked to read state written by a *newer* schema was
+/// rolled back across an irreversible storage migration. It refuses
+/// rather than silently misreading fields it cannot interpret.
+fn reject_rollback_past_schema(schema_version: u32, path: &Path) -> Result<(), ControlError> {
+    if schema_version > CATALOG_SCHEMA_VERSION {
+        return Err(ControlError::InvalidOperation(format!(
+            "catalog at {} is schema version {schema_version} but this binary supports \
+             {CATALOG_SCHEMA_VERSION}: the Node was rolled back across an irreversible \
+             catalog migration — restore the newer binary or rebuild state",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 impl CatalogState {
@@ -1388,7 +1439,7 @@ impl CatalogState {
 impl Default for CatalogState {
     fn default() -> Self {
         Self {
-            schema_version: 1,
+            schema_version: CATALOG_SCHEMA_VERSION,
             revision: 0,
             spaces: BTreeMap::new(),
             feeds: BTreeMap::new(),
@@ -1418,6 +1469,7 @@ impl Default for CatalogState {
             retired_storage_nodes: BTreeSet::new(),
             draining_storage_nodes: BTreeSet::new(),
             capacity_reports: BTreeMap::new(),
+            incompatible_reports: BTreeMap::new(),
             range_split_plans: BTreeMap::new(),
             range_merge_plans: BTreeMap::new(),
             range_move_plans: BTreeMap::new(),
@@ -1467,6 +1519,7 @@ pub enum ShowKind {
     Indexes,
     StateStores,
     AuditEvents,
+    Compatibility,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1991,6 +2044,13 @@ pub enum Command {
     ReportStorageNodeCapacity {
         node: StorageNodeId,
         capacity: NodeCapacity,
+        /// The reporter's claimed protocol level — `0` when the
+        /// reporting binary predates version advertisement.
+        #[serde(default)]
+        protocol_version: u32,
+        /// The reporter's claimed package version.
+        #[serde(default)]
+        build: String,
     },
 }
 
@@ -2305,7 +2365,9 @@ impl ControlController {
     ) -> Result<Self, ControlError> {
         let path = path.into();
         let mut state = if path.exists() {
-            serde_json::from_slice(&fs::read(&path)?)?
+            let state: CatalogState = serde_json::from_slice(&fs::read(&path)?)?;
+            reject_rollback_past_schema(state.schema_version, &path)?;
+            state
         } else {
             CatalogState::default()
         };
@@ -2840,6 +2902,7 @@ impl ControlController {
 
     pub async fn install_snapshot_bytes(&self, bytes: &[u8]) -> Result<(), ControlError> {
         let mut state: CatalogState = serde_json::from_slice(bytes)?;
+        reject_rollback_past_schema(state.schema_version, &self.path)?;
         state.migrate_range_metadata();
         persist_state(&self.path, &state)?;
         let issued_api_keys = issued_api_key_view(&state);
@@ -5632,7 +5695,55 @@ impl ControlController {
                     json!(plan),
                 ))
             }
-            Command::ReportStorageNodeCapacity { node, capacity } => {
+            Command::ReportStorageNodeCapacity {
+                node,
+                capacity,
+                protocol_version,
+                build,
+            } => {
+                // Protocol gate: a versioned report outside the levels
+                // this binary serves means the Node rolled ahead of — or
+                // fell too far behind — this Riverbed. The refusal is
+                // committed evidence in `incompatible_reports`, not just
+                // a dropped response; version `0` is a pre-version Node
+                // mid-upgrade and stays accepted.
+                if protocol_version > crate::node::NODE_PROTOCOL_VERSION
+                    || (protocol_version > 0
+                        && protocol_version < crate::node::MIN_NODE_PROTOCOL_VERSION)
+                {
+                    state
+                        .incompatible_reports
+                        .entry(node.clone())
+                        .and_modify(|row| {
+                            row.protocol_version = protocol_version;
+                            row.build = build.clone();
+                            row.refused_at_ns = row.refused_at_ns.max(issued_at_ns);
+                        })
+                        .or_insert_with(|| IncompatibleNodeReport {
+                            protocol_version,
+                            build: build.clone(),
+                            refused_at_ns: issued_at_ns,
+                        });
+                    while state.incompatible_reports.len() > MAX_INCOMPATIBLE_REPORTS {
+                        let oldest = state
+                            .incompatible_reports
+                            .iter()
+                            .min_by_key(|(_, row)| row.refused_at_ns)
+                            .map(|(id, _)| id.clone());
+                        match oldest {
+                            Some(id) => {
+                                state.incompatible_reports.remove(&id);
+                            }
+                            None => break,
+                        }
+                    }
+                    return Err(ControlError::InvalidOperation(format!(
+                        "storage Node {node} reports unsupported protocol {protocol_version} \
+                         (this binary serves {}..={})",
+                        crate::node::MIN_NODE_PROTOCOL_VERSION,
+                        crate::node::NODE_PROTOCOL_VERSION
+                    )));
+                }
                 let known = state.storage_nodes.contains_key(&node)
                     || self.eligible_storage_nodes.contains(&node);
                 if !known {
@@ -5652,6 +5763,8 @@ impl ControlController {
                         CapacityReport {
                             capacity,
                             reported_at_ns: issued_at_ns,
+                            protocol_version,
+                            build: build.clone(),
                         },
                     );
                 }
@@ -7787,6 +7900,8 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 (ShowKind::AuditEvents, limit)
             } else if token(&tokens, 1)?.eq_ignore_ascii_case("SCHEMAS") {
                 (ShowKind::Schemas, None)
+            } else if token(&tokens, 1)?.eq_ignore_ascii_case("COMPATIBILITY") {
+                (ShowKind::Compatibility, None)
             } else {
                 (parse_show_kind(token(&tokens, 1)?)?, None)
             };
@@ -7925,6 +8040,10 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
                 node: StorageNodeId::try_new(token(&tokens, 3)?.to_owned())
                     .map_err(|error| ControlError::Syntax(error.to_string()))?,
                 capacity,
+                // WCL-issued reports are operator tooling, not a Node's
+                // self-report — they carry no claimed version.
+                protocol_version: 0,
+                build: String::new(),
             })
         }
         Some("SET") => match keyword(1).as_deref() {
@@ -9316,6 +9435,55 @@ fn show_resources(
                 .take(limit.unwrap_or(usize::MAX))
                 .collect::<Vec<_>>())
         }
+        ShowKind::Compatibility => json!({
+            // The rollback boundary: the catalog layout this state was
+            // written as versus the newest this binary can read. A Node
+            // whose persisted schema exceeds the supported level refuses
+            // to boot rather than misread it.
+            "catalog_schema_version": state.schema_version,
+            "supported_catalog_schema_version": CATALOG_SCHEMA_VERSION,
+            // The protocol gate: levels this binary accepts in
+            // self-reported capacity reports. A report outside them is
+            // refused and recorded below.
+            "node_protocol_version": crate::node::NODE_PROTOCOL_VERSION,
+            "min_node_protocol_version": crate::node::MIN_NODE_PROTOCOL_VERSION,
+            "build": crate::node::BUILD_VERSION,
+            // Every identity the Riverbed knows: configured-eligible
+            // Nodes, registered Nodes, and reporters — deduplicated and
+            // sorted so the surface is deterministic. An eligible Node
+            // still shows its advertised version before it registers.
+            "nodes": state
+                .storage_nodes
+                .keys()
+                .chain(state.capacity_reports.keys())
+                .chain(configured.iter())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|node| {
+                    let record = state.storage_nodes.get(node);
+                    let report = state.capacity_reports.get(node);
+                    json!({
+                        "node": node,
+                        "registered": record.is_some(),
+                        "endpoint": record.map(|r| r.endpoint.clone()),
+                        "capabilities": record.map(|r| r.capabilities),
+                        "protocol_version": report.map(|r| r.protocol_version),
+                        "build": report.map(|r| r.build.clone()),
+                        "last_reported_at_ns": report.map(|r| r.reported_at_ns),
+                    })
+                })
+                .collect::<Vec<_>>(),
+            "incompatible_reports": state
+                .incompatible_reports
+                .iter()
+                .map(|(node, row)| json!({
+                    "node": node,
+                    "protocol_version": row.protocol_version,
+                    "build": row.build,
+                    "refused_at_ns": row.refused_at_ns,
+                }))
+                .collect::<Vec<_>>(),
+        }),
         ShowKind::Domains | ShowKind::Spaces => json!(state
             .spaces
             .values()
@@ -10052,6 +10220,7 @@ fn show_name(kind: &ShowKind) -> &'static str {
         ShowKind::LegalHolds => "Legal Holds",
         ShowKind::Schemas => "Schemas",
         ShowKind::AuditEvents => "Audit Events",
+        ShowKind::Compatibility => "Compatibility",
     }
 }
 
@@ -14179,6 +14348,257 @@ mod tests {
             .unwrap();
         assert_eq!(entry["eligible"], true);
         assert_eq!(entry["exclusions"], json!([]));
+    }
+
+    fn versioned_capacity_report(node: &str, protocol_version: u32, build: &str) -> Command {
+        Command::ReportStorageNodeCapacity {
+            node: StorageNodeId::try_new(node).unwrap(),
+            capacity: NodeCapacity {
+                disk_free_bytes: 9_999,
+                ..Default::default()
+            },
+            protocol_version,
+            build: build.to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn versioned_and_unversioned_capacity_reports_pass_the_protocol_gate() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        // A Node at this binary's level and a legacy Node that predates
+        // version advertisement (level 0) are both inside the window.
+        controller
+            .execute_commands(vec![versioned_capacity_report(
+                "storage-1",
+                crate::node::NODE_PROTOCOL_VERSION,
+                "9.9.9",
+            )])
+            .await
+            .unwrap();
+        controller
+            .execute_commands(vec![versioned_capacity_report("storage-2", 0, "")])
+            .await
+            .unwrap();
+        let shown = controller.execute("SHOW COMPATIBILITY;").await.unwrap();
+        let data = &shown.results[0].data;
+        assert_eq!(data["catalog_schema_version"], CATALOG_SCHEMA_VERSION);
+        assert_eq!(
+            data["supported_catalog_schema_version"],
+            CATALOG_SCHEMA_VERSION
+        );
+        assert_eq!(
+            data["node_protocol_version"],
+            crate::node::NODE_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            data["min_node_protocol_version"],
+            crate::node::MIN_NODE_PROTOCOL_VERSION
+        );
+        assert_eq!(data["build"], crate::node::BUILD_VERSION);
+        let nodes = data["nodes"].as_array().unwrap();
+        let one = nodes.iter().find(|row| row["node"] == "storage-1").unwrap();
+        assert_eq!(one["protocol_version"], crate::node::NODE_PROTOCOL_VERSION);
+        assert_eq!(one["build"], "9.9.9");
+        assert!(data["incompatible_reports"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn incompatible_capacity_reports_are_refused_and_committed() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        // A Node claiming a protocol newer than this binary serves is
+        // refused — and the refusal is committed gate evidence an
+        // operator can query, not a dropped log line.
+        let refusal = controller
+            .execute_commands(vec![versioned_capacity_report(
+                "storage-1",
+                crate::node::NODE_PROTOCOL_VERSION + 1,
+                "99.0.0",
+            )])
+            .await;
+        assert!(refusal.is_err());
+        let shown = controller.execute("SHOW COMPATIBILITY;").await.unwrap();
+        let data = &shown.results[0].data;
+        let rows = data["incompatible_reports"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["node"], "storage-1");
+        assert_eq!(
+            rows[0]["protocol_version"],
+            crate::node::NODE_PROTOCOL_VERSION + 1
+        );
+        assert_eq!(rows[0]["build"], "99.0.0");
+        // The refused report leaves no accepted capacity evidence behind.
+        let one = data["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["node"] == "storage-1")
+            .unwrap();
+        assert!(one["protocol_version"].is_null());
+        assert!(one["build"].is_null());
+        // A repeat refusal from the same identity updates its row rather
+        // than growing the map.
+        controller
+            .execute_commands(vec![versioned_capacity_report(
+                "storage-1",
+                crate::node::NODE_PROTOCOL_VERSION + 2,
+                "99.1.0",
+            )])
+            .await
+            .ok();
+        let shown = controller.execute("SHOW COMPATIBILITY;").await.unwrap();
+        let rows = shown.results[0].data["incompatible_reports"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0]["protocol_version"],
+            crate::node::NODE_PROTOCOL_VERSION + 2
+        );
+    }
+
+    #[tokio::test]
+    async fn incompatible_reports_evict_oldest_beyond_the_bound() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        // Fill the ring, then push one more — the oldest evidence drops
+        // first so the map stays bounded under a churning fleet.
+        for index in 0..MAX_INCOMPATIBLE_REPORTS {
+            controller
+                .execute_commands(vec![versioned_capacity_report(
+                    &format!("ghost-{index:04}"),
+                    crate::node::NODE_PROTOCOL_VERSION + 1,
+                    "x",
+                )])
+                .await
+                .ok();
+        }
+        controller
+            .execute_commands(vec![versioned_capacity_report(
+                "ghost-9999",
+                crate::node::NODE_PROTOCOL_VERSION + 1,
+                "x",
+            )])
+            .await
+            .ok();
+        let shown = controller.execute("SHOW COMPATIBILITY;").await.unwrap();
+        let rows = shown.results[0].data["incompatible_reports"]
+            .as_array()
+            .unwrap();
+        assert_eq!(rows.len(), MAX_INCOMPATIBLE_REPORTS);
+        assert!(!rows.iter().any(|row| row["node"] == "ghost-0000"));
+        assert!(rows.iter().any(|row| row["node"] == "ghost-9999"));
+    }
+
+    #[tokio::test]
+    async fn incompatible_reports_replay_identically_across_replicas() {
+        let directory_a = TempDir::new().unwrap();
+        let directory_b = TempDir::new().unwrap();
+        let replica_a = new_controller(&directory_a);
+        let replica_b = new_controller(&directory_b);
+        // One committed command applied at two replicas must land
+        // identical evidence — `refused_at_ns` is the command's committed
+        // issued_at, never local wall time.
+        let prepared = replica_a
+            .prepare_replicated(
+                AuditActor::System,
+                Uuid::new_v4(),
+                4_242,
+                versioned_capacity_report(
+                    "ghost-9",
+                    crate::node::NODE_PROTOCOL_VERSION + 1,
+                    "99.0.0",
+                ),
+            )
+            .await
+            .unwrap();
+        replica_a.apply_replicated(prepared.clone()).await;
+        replica_b.apply_replicated(prepared).await;
+        assert_eq!(
+            replica_a.snapshot_bytes().await.unwrap(),
+            replica_b.snapshot_bytes().await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn catalog_open_and_snapshot_install_refuse_a_newer_schema() {
+        // Open: persisted state written by a newer binary is a rollback
+        // across an irreversible catalog migration — refuse to boot
+        // rather than misread it.
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("catalog.json");
+        let mut catalog = serde_json::to_value(CatalogState::default()).unwrap();
+        catalog["schema_version"] = json!(CATALOG_SCHEMA_VERSION + 1);
+        std::fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        let error = ControlController::open_with_storage_nodes(path, store, vec![])
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("irreversible"));
+
+        // Install: the same boundary applies to a snapshot arriving over
+        // replication — a lagging replica must not ingest newer state.
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&controller.snapshot_bytes().await.unwrap()).unwrap();
+        snapshot["schema_version"] = json!(CATALOG_SCHEMA_VERSION + 1);
+        let error = controller
+            .install_snapshot_bytes(&serde_json::to_vec(&snapshot).unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("irreversible"));
+        // A same-version snapshot still installs.
+        snapshot["schema_version"] = json!(CATALOG_SCHEMA_VERSION);
+        controller
+            .install_snapshot_bytes(&serde_json::to_vec(&snapshot).unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn legacy_state_and_commands_without_version_fields_decode() {
+        // A pre-upgrade catalog — no `incompatible_reports` key and no
+        // version fields inside capacity reports — still opens.
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("catalog.json");
+        let mut catalog = serde_json::to_value(CatalogState::default()).unwrap();
+        catalog
+            .as_object_mut()
+            .unwrap()
+            .remove("incompatible_reports");
+        std::fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let store: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
+        ControlController::open_with_storage_nodes(path, store, vec![]).unwrap();
+
+        // A pre-upgrade replicated command — no protocol_version/build —
+        // decodes as an unversioned level-0 report and passes the gate.
+        let legacy = serde_json::json!({
+            "command": "report_storage_node_capacity",
+            "node": "storage-1",
+            "capacity": {
+                "cpu_cores": 1,
+                "memory_bytes": 1,
+                "disk_total_bytes": 1,
+                "disk_free_bytes": 1,
+            },
+        });
+        let command: Command = serde_json::from_value(legacy).unwrap();
+        match command {
+            Command::ReportStorageNodeCapacity {
+                protocol_version,
+                build,
+                ..
+            } => {
+                assert_eq!(protocol_version, 0);
+                assert_eq!(build, "");
+            }
+            _ => panic!("expected ReportStorageNodeCapacity"),
+        }
     }
 
     #[tokio::test]

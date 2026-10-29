@@ -435,6 +435,8 @@ async fn main() -> Result<()> {
                 capacity: config.capacity,
                 capabilities: config.node_capabilities,
                 resources: NodeCapacity::sample(&capacity_dir, capacity_domain.clone()),
+                protocol_version: whitewater::node::NODE_PROTOCOL_VERSION,
+                build: whitewater::node::BUILD_VERSION.to_owned(),
             },
             config.seeds.clone(),
             config.heartbeat_interval,

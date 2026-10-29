@@ -9,6 +9,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::active_range::StorageNodeId;
 
+/// The internal data-plane protocol level this binary speaks. It is
+/// deliberately separate from the package version: bump it only when a
+/// change makes Nodes unable to serve each other safely. The Control
+/// Plane refuses self-reports claiming a *higher* level, so a too-new
+/// Node cannot silently join a too-old Riverbed mid rolling upgrade;
+/// reports carrying no version decode as `0` and stay accepted because
+/// pre-version Nodes must keep working through the roll.
+pub const NODE_PROTOCOL_VERSION: u32 = 1;
+
+/// The oldest protocol level this binary will accept self-reports from.
+/// A Node below it rolled forward too far behind the fleet; its reports
+/// refuse the same way a too-new one does.
+pub const MIN_NODE_PROTOCOL_VERSION: u32 = 1;
+
+/// The running binary's package version, stamped into self-reports and
+/// membership announcements for mixed-version visibility.
+pub const BUILD_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// The data-plane roles one Node declares. The Control Plane voter role
 /// is deliberately absent: voter membership derives from the configured
 /// Control topology and joint consensus, never from a capability label a

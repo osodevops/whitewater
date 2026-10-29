@@ -2272,6 +2272,7 @@ fn show_label(kind: &ShowKind) -> &'static str {
         ShowKind::LegalHolds => "LEGAL HOLDS",
         ShowKind::Schemas => "SCHEMAS",
         ShowKind::AuditEvents => "AUDIT EVENTS",
+        ShowKind::Compatibility => "COMPATIBILITY",
     }
 }
 
