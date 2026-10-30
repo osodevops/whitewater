@@ -100,6 +100,10 @@ pub struct DiagnosticsReport {
     pub authority: String,
     /// True when any stage is `Limited`.
     pub limited: bool,
+    /// Caller-supplied or generated question id — echoes through every
+    /// surface so an investigation correlates question→evidence→answer.
+    #[serde(default)]
+    pub correlation_id: String,
     pub stages: Vec<DiagnosticStage>,
 }
 
@@ -261,6 +265,7 @@ pub fn explain(input: &DiagnosticsInput) -> DiagnosticsReport {
             "local_prototype".to_string()
         },
         limited,
+        correlation_id: String::new(),
         stages,
     }
 }
@@ -689,6 +694,8 @@ pub struct RecommendationsView {
     pub observed_at_ns: i64,
     pub authority: String,
     pub limited: bool,
+    #[serde(default)]
+    pub correlation_id: String,
     pub recommendations: Vec<Recommendation>,
 }
 
@@ -700,6 +707,7 @@ pub fn recommendations_view(report: &DiagnosticsReport) -> RecommendationsView {
         observed_at_ns: report.observed_at_ns,
         authority: report.authority.clone(),
         limited: report.limited,
+        correlation_id: report.correlation_id.clone(),
         recommendations: recommend(report),
     }
 }
@@ -797,6 +805,167 @@ fn advice_shape(stage: &str) -> (String, String, String, String) {
             "revert the change through the same surface it was applied".to_string(),
         ),
     }
+}
+
+// --- Bounded scoped signal retrieval -----------------------------------
+
+/// Scope for [`collect_signals`]: an operator asks "what evidence do you
+/// have about this Domain/Feed/Node in this window?" — the answer is a
+/// bounded set of already-redacted evidence records, never raw payloads.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct SignalsRequest {
+    pub domain: Option<String>,
+    pub feed: Option<String>,
+    pub node: Option<String>,
+    /// Look-back horizon in nanoseconds; bounded to 24h. Findings older
+    /// than the window are excluded; undated findings are kept because
+    /// unknown age is itself evidence.
+    pub window_ns: Option<u64>,
+}
+
+/// One bounded, redacted evidence record — text only, never payloads,
+/// Cursor strings, credentials, or unbounded blobs.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SignalRecord {
+    /// `finding`, `demand`, or `hot_key` — where the evidence came from.
+    pub kind: String,
+    /// The scoped thing the record describes (`stage/resource`).
+    pub target: String,
+    /// When the underlying evidence was observed, if the source timed it.
+    pub observed_at_ns: Option<i64>,
+    /// Bounded description — the finding's cause or the metric summary.
+    pub detail: String,
+    pub severity: StageStatus,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct SignalsResponse {
+    pub schema_version: u32,
+    /// Echoes the caller's request id (or a generated one) so a question
+    /// and its evidence travel together through logs and tickets.
+    pub correlation_id: String,
+    pub observed_at_ns: i64,
+    /// The effective scope after normalization — what was actually
+    /// filtered on, so callers can audit the question that was answered.
+    pub scope: SignalsRequest,
+    pub records: Vec<SignalRecord>,
+    /// Dropped records past the cap — never silent.
+    pub truncated: u32,
+}
+
+const MAX_SIGNAL_RECORDS: usize = 128;
+const MAX_SIGNAL_DETAIL: usize = 512;
+const MAX_SIGNAL_WINDOW_NS: u64 = 24 * 60 * 60 * 1_000_000_000;
+
+fn bounded_detail(text: &str) -> String {
+    if text.len() <= MAX_SIGNAL_DETAIL {
+        return text.to_string();
+    }
+    let mut out = text[..MAX_SIGNAL_DETAIL].to_string();
+    out.push('…');
+    out
+}
+
+/// True when `resource` names something inside the requested scope:
+/// exact name or `scope.` prefix for Domain/Feed, equality for Node.
+fn in_scope(resource: &str, scope: &SignalsRequest) -> bool {
+    if let Some(feed) = &scope.feed {
+        if resource == feed || resource.starts_with(&format!("{feed}.")) {
+            return true;
+        }
+        // A finding inside the Feed's Domain is still in Feed scope only
+        // when it names the Feed — otherwise it is Domain-scope noise.
+        return false;
+    }
+    if let Some(domain) = &scope.domain {
+        return resource == domain || resource.starts_with(&format!("{domain}."));
+    }
+    if let Some(node) = &scope.node {
+        return resource == node || resource.contains(node);
+    }
+    true
+}
+
+/// Flatten the report (plus optional Node demand counters) into bounded
+/// scoped evidence records. Read-only and total — nothing here mutates
+/// or invents evidence; missing pieces simply contribute no records.
+pub fn collect_signals(
+    report: &DiagnosticsReport,
+    demand: Option<DemandEvidence>,
+    request: SignalsRequest,
+) -> SignalsResponse {
+    let mut request = request;
+    if let Some(window) = request.window_ns {
+        request.window_ns = Some(window.min(MAX_SIGNAL_WINDOW_NS));
+    }
+    let floor = request
+        .window_ns
+        .map(|window| report.observed_at_ns.saturating_sub(window as i64));
+    let mut records: Vec<SignalRecord> = Vec::new();
+    for stage in &report.stages {
+        for finding in &stage.findings {
+            if !in_scope(&finding.resource, &request) {
+                continue;
+            }
+            if let (Some(floor), Some(at)) = (floor, finding.evidence_at_ns) {
+                if at < floor {
+                    continue;
+                }
+            }
+            records.push(SignalRecord {
+                kind: "finding".to_string(),
+                target: format!("{}/{}", stage.stage, finding.resource),
+                observed_at_ns: finding.evidence_at_ns,
+                detail: bounded_detail(&format!(
+                    "{} | next: {}",
+                    finding.cause, finding.next_safe_step
+                )),
+                severity: finding.severity,
+            });
+        }
+    }
+    let node_scoped = request.node.is_none() || request.node.as_deref() == Some(&*report.node);
+    if let Some(demand) = demand {
+        if node_scoped {
+            records.push(SignalRecord {
+                kind: "demand".to_string(),
+                target: format!("nodes/{}", report.node),
+                observed_at_ns: Some(report.observed_at_ns),
+                detail: bounded_detail(&format!(
+                    "requests {} in-flight {} appends {} append-bytes {} reads {} records-read {}",
+                    demand.requests_total,
+                    demand.requests_in_flight,
+                    demand.appends_total,
+                    demand.append_bytes_total,
+                    demand.reads_total,
+                    demand.records_read_total
+                )),
+                severity: StageStatus::Healthy,
+            });
+        }
+    }
+    let truncated = records.len().saturating_sub(MAX_SIGNAL_RECORDS) as u32;
+    records.truncate(MAX_SIGNAL_RECORDS);
+    SignalsResponse {
+        schema_version: report.schema_version,
+        correlation_id: String::new(), // filled by the serving surface
+        observed_at_ns: report.observed_at_ns,
+        scope: request,
+        records,
+        truncated,
+    }
+}
+
+/// Node-aggregate demand counters decoupled from `DemandMetrics` so the
+/// evaluator stays pure and test-friendly.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct DemandEvidence {
+    pub requests_total: u64,
+    pub requests_in_flight: u64,
+    pub appends_total: u64,
+    pub append_bytes_total: u64,
+    pub reads_total: u64,
+    pub records_read_total: u64,
 }
 
 #[cfg(test)]
@@ -1093,6 +1262,109 @@ mod tests {
     #[test]
     fn healthy_report_offers_no_recommendations() {
         assert!(recommend(&explain(&base_input())).is_empty());
+    }
+
+    #[test]
+    fn signals_filter_by_scope_window_and_stay_bounded() {
+        let mut input = base_input();
+        input.observed_at_ns = 1_000_000_000_000_000;
+        input.distributaries = vec![
+            DistributaryEvidence {
+                name: "orders.mirror".into(),
+                run_state: "stalled".into(),
+                last_error: Some("x".repeat(900)),
+                lag_records: None,
+                report_age_ms: 1,
+                reported_at_ns: Some(999_999_000_000_000),
+            },
+            DistributaryEvidence {
+                name: "other.mirror".into(),
+                run_state: "stalled".into(),
+                last_error: Some("y".into()),
+                lag_records: None,
+                report_age_ms: 1,
+                reported_at_ns: Some(1), // ancient — outside any window
+            },
+        ];
+        let report = explain(&input);
+        let demand = DemandEvidence {
+            requests_total: 5,
+            requests_in_flight: 1,
+            appends_total: 3,
+            append_bytes_total: 300,
+            reads_total: 2,
+            records_read_total: 40,
+        };
+        // Domain scope only sees the matching mirror; detail is bounded.
+        let scoped = collect_signals(
+            &report,
+            Some(demand.clone()),
+            SignalsRequest {
+                domain: Some("orders".into()),
+                feed: None,
+                node: None,
+                window_ns: None,
+            },
+        );
+        assert!(scoped
+            .records
+            .iter()
+            .any(|record| record.target.contains("orders.mirror")));
+        assert!(!scoped
+            .records
+            .iter()
+            .any(|record| record.target.contains("other.mirror")));
+        assert!(scoped
+            .records
+            .iter()
+            .all(|record| record.detail.len() <= 512 + 3));
+        assert!(scoped.records.iter().any(|record| record.kind == "demand"));
+        // Node scope excludes demand for another Node.
+        let other_node = collect_signals(
+            &report,
+            Some(demand),
+            SignalsRequest {
+                domain: None,
+                feed: None,
+                node: Some("nowhere".into()),
+                window_ns: None,
+            },
+        );
+        assert!(!other_node
+            .records
+            .iter()
+            .any(|record| record.kind == "demand"));
+        // A 1h window keeps the recent finding, drops the ancient one.
+        let windowed = collect_signals(
+            &report,
+            None,
+            SignalsRequest {
+                domain: None,
+                feed: None,
+                node: None,
+                window_ns: Some(3_600_000_000_000),
+            },
+        );
+        assert!(windowed
+            .records
+            .iter()
+            .any(|record| record.target.contains("orders.mirror")));
+        assert!(!windowed
+            .records
+            .iter()
+            .any(|record| record.target.contains("other.mirror")));
+        // Oversized windows clamp to the 24h bound.
+        let clamped = collect_signals(
+            &report,
+            None,
+            SignalsRequest {
+                domain: None,
+                feed: None,
+                node: None,
+                window_ns: Some(u64::MAX),
+            },
+        );
+        assert_eq!(clamped.scope.window_ns, Some(24 * 60 * 60 * 1_000_000_000));
     }
 
     #[test]

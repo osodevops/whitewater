@@ -124,6 +124,21 @@ fn tools() -> Vec<ToolSpec> {
             admin: false,
         },
         ToolSpec {
+            name: "whitewater.diagnostics.signals",
+            description: "Bounded, redacted, scoped evidence retrieval: pass an optional                 scope object with domain/feed/node/window_ns fields and receive finding                 and demand records only — never payloads, Cursors, or credentials.                 Window is capped at 24h; records are capped at 128 with a truncated count.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "domain": { "type": "string" },
+                    "feed": { "type": "string" },
+                    "node": { "type": "string" },
+                    "window_ns": { "type": "integer", "minimum": 0 }
+                },
+                "additionalProperties": false
+            }),
+            admin: false,
+        },
+        ToolSpec {
             name: "whitewater.feed.describe",
             description: "Describe one Feed's definition: Domain, lifecycle, schema and \
                 history-policy bindings, and declared bounds. The caller needs read scope \
@@ -262,8 +277,9 @@ async fn call_tool(
             api::authorize_namespace(state, headers, "*", PermissionAction::Read)
                 .map_err(map_api_error)?;
             let input = api::diagnostics_input(state).await;
-            serde_json::to_value(crate::diagnostics::explain(&input))
-                .map_err(|error| ToolError::Internal(error.to_string()))
+            let mut report = crate::diagnostics::explain(&input);
+            report.correlation_id = api::diagnostics_correlation_id(headers);
+            serde_json::to_value(report).map_err(|error| ToolError::Internal(error.to_string()))
         }
         "whitewater.riverbed.explain_pressure" => {
             api::authorize_namespace(state, headers, "*", PermissionAction::Read)
@@ -277,6 +293,7 @@ async fn call_tool(
                 .transpose()?;
             let input = api::diagnostics_input(state).await;
             let mut report = crate::diagnostics::explain(&input);
+            report.correlation_id = api::diagnostics_correlation_id(headers);
             if let Some(wanted) = wanted {
                 report.stages.retain(|stage| wanted.contains(&stage.stage));
                 report.limited = report
@@ -290,9 +307,32 @@ async fn call_tool(
             api::authorize_namespace(state, headers, "*", PermissionAction::Read)
                 .map_err(map_api_error)?;
             let input = api::diagnostics_input(state).await;
-            let report = crate::diagnostics::explain(&input);
+            let mut report = crate::diagnostics::explain(&input);
+            report.correlation_id = api::diagnostics_correlation_id(headers);
             serde_json::to_value(crate::diagnostics::recommendations_view(&report))
                 .map_err(|error| ToolError::Internal(error.to_string()))
+        }
+        "whitewater.diagnostics.signals" => {
+            api::authorize_namespace(state, headers, "*", PermissionAction::Read)
+                .map_err(map_api_error)?;
+            let request: crate::diagnostics::SignalsRequest =
+                serde_json::from_value(arguments.clone())
+                    .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+            let input = api::diagnostics_input(state).await;
+            let mut report = crate::diagnostics::explain(&input);
+            report.correlation_id = api::diagnostics_correlation_id(headers);
+            let snapshot = state.demand.snapshot();
+            let demand = crate::diagnostics::DemandEvidence {
+                requests_total: snapshot.requests_total,
+                requests_in_flight: snapshot.requests_in_flight,
+                appends_total: snapshot.appends_total,
+                append_bytes_total: snapshot.append_bytes_total,
+                reads_total: snapshot.reads_total,
+                records_read_total: snapshot.records_read_total,
+            };
+            let mut response = crate::diagnostics::collect_signals(&report, Some(demand), request);
+            response.correlation_id = report.correlation_id;
+            serde_json::to_value(response).map_err(|error| ToolError::Internal(error.to_string()))
         }
         "whitewater.feed.describe" => {
             let feed = arguments

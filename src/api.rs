@@ -746,6 +746,7 @@ pub fn router(state: AppState) -> Router {
             "/v1/admin/diagnostics/recommend",
             post(diagnostics_recommend),
         )
+        .route("/v1/admin/diagnostics/signals", post(diagnostics_signals))
         .route("/v1/mcp", post(mcp_rpc))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
@@ -1062,7 +1063,9 @@ async fn diagnostics_explain(
     authorize_namespace(&state, &headers, "*", PermissionAction::Read)?;
     let _request = state.demand.begin_request();
     let input = diagnostics_input(&state).await;
-    Ok(Json(crate::diagnostics::explain(&input)))
+    let mut report = crate::diagnostics::explain(&input);
+    report.correlation_id = diagnostics_correlation_id(&headers);
+    Ok(Json(report))
 }
 
 /// `POST /v1/admin/diagnostics/recommend`
@@ -1076,8 +1079,49 @@ async fn diagnostics_recommend(
     authorize_namespace(&state, &headers, "*", PermissionAction::Read)?;
     let _request = state.demand.begin_request();
     let input = diagnostics_input(&state).await;
-    let report = crate::diagnostics::explain(&input);
+    let mut report = crate::diagnostics::explain(&input);
+    report.correlation_id = diagnostics_correlation_id(&headers);
     Ok(Json(crate::diagnostics::recommendations_view(&report)))
+}
+
+/// One question→evidence id across every diagnostics surface: the
+/// caller's `x-request-id` when supplied (echoed verbatim so their logs
+/// join up), else a generated one. Bounded — trimmed at 128 bytes.
+pub(crate) fn diagnostics_correlation_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.chars().take(128).collect::<String>())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+/// `POST /v1/admin/diagnostics/signals`
+/// Bounded, redacted, scoped evidence retrieval — the Foundation's
+/// scoped-query surface. `read` on `*`; asks "what do you know about
+/// this Domain/Feed/Node in this window?" and returns finding/demand
+/// records only — never payloads, Cursors, or credentials.
+async fn diagnostics_signals(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<crate::diagnostics::SignalsRequest>,
+) -> Result<Json<crate::diagnostics::SignalsResponse>, ApiError> {
+    authorize_namespace(&state, &headers, "*", PermissionAction::Read)?;
+    let _request = state.demand.begin_request();
+    let input = diagnostics_input(&state).await;
+    let report = crate::diagnostics::explain(&input);
+    let snapshot = state.demand.snapshot();
+    let demand = crate::diagnostics::DemandEvidence {
+        requests_total: snapshot.requests_total,
+        requests_in_flight: snapshot.requests_in_flight,
+        appends_total: snapshot.appends_total,
+        append_bytes_total: snapshot.append_bytes_total,
+        reads_total: snapshot.reads_total,
+        records_read_total: snapshot.records_read_total,
+    };
+    let mut response = crate::diagnostics::collect_signals(&report, Some(demand), request);
+    response.correlation_id = diagnostics_correlation_id(&headers);
+    Ok(Json(response))
 }
 
 async fn execute_admin_wcl(
