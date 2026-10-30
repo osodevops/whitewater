@@ -704,6 +704,38 @@ Missing evidence is reported, not smoothed over: a Node without a Control Plane 
 }
 ```
 
+### Rank recommendations
+
+```http
+POST /v1/admin/diagnostics/recommend
+Authorization: Bearer <key>
+```
+
+Ranked, evidence-linked advice derived from the same diagnostics report — the answer to "what should I look at first?" Same `read` on `*` scope, same read-only guarantee, answerable on any Node. Recommendations sort by finding severity (`unhealthy` first) and are capped at 16; a healthy Riverbed returns an empty list. Every entry carries `target` (`stage/resource`), `action` (the finding's next safe step), `evidence` (its cause), `expected_impact`, `durability_risk`, `verification`, and `rollback` — the advice stays inspectable against the finding that produced it and never performs the action it suggests.
+
+```json
+{
+  "schema_version": 1,
+  "node": "control-1",
+  "observed_at_ns": "1793335077437729808",
+  "authority": "control_plane",
+  "limited": false,
+  "recommendations": [
+    {
+      "rank": 1,
+      "target": "subscriptions/ops.cover",
+      "action": "confirm the owner is down or partitioned before forcing reassignment — do not force it while the owner may still be alive",
+      "evidence": "progress owner control-3 does not answer its health endpoint",
+      "expected_impact": "unblocks member joins and shared progress serving",
+      "durability_risk": "forcing reassignment on a live-but-unreachable owner splits authority",
+      "verification": "the Subscription gains a live progress owner and members join",
+      "rollback": "the previous owner's epoch is already fenced; no manual rewind",
+      "severity": "degraded"
+    }
+  ]
+}
+```
+
 ### MCP adapter
 
 ```http
@@ -720,6 +752,7 @@ Every tool call re-authorizes the credential at use time with the same scope che
 | --- | --- | --- |
 | `whitewater.riverbed.health` | `read` on `*` | The full diagnostics explain report |
 | `whitewater.riverbed.explain_pressure` | `read` on `*` | The report filtered to `{"stages": [...]}` |
+| `whitewater.scale.recommend` | `read` on `*` | Ranked recommendations with evidence/impact/risk/verify/rollback |
 | `whitewater.feed.describe` | `read` on the Feed's namespace | `DESCRIBE FEED` results |
 | `whitewater.support.collect_redacted` | admin (`manage` on `*`) | The bounded redacted support bundle |
 

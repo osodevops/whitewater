@@ -742,6 +742,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/backup", post(admin_backup))
         .route("/v1/admin/support-bundle", get(admin_support_bundle))
         .route("/v1/admin/diagnostics/explain", post(diagnostics_explain))
+        .route(
+            "/v1/admin/diagnostics/recommend",
+            post(diagnostics_recommend),
+        )
         .route("/v1/mcp", post(mcp_rpc))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
@@ -1059,6 +1063,21 @@ async fn diagnostics_explain(
     let _request = state.demand.begin_request();
     let input = diagnostics_input(&state).await;
     Ok(Json(crate::diagnostics::explain(&input)))
+}
+
+/// `POST /v1/admin/diagnostics/recommend`
+/// Ranked, evidence-linked advice derived from the same report —
+/// every recommendation carries impact, durability risk, verification,
+/// and rollback. Read-only: Whitewater advises, never acts.
+async fn diagnostics_recommend(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::diagnostics::RecommendationsView>, ApiError> {
+    authorize_namespace(&state, &headers, "*", PermissionAction::Read)?;
+    let _request = state.demand.begin_request();
+    let input = diagnostics_input(&state).await;
+    let report = crate::diagnostics::explain(&input);
+    Ok(Json(crate::diagnostics::recommendations_view(&report)))
 }
 
 async fn execute_admin_wcl(

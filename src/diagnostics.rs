@@ -655,6 +655,150 @@ fn indexes_stage(input: &DiagnosticsInput) -> DiagnosticStage {
     stage("indexes", findings)
 }
 
+/// One ordered, evidence-linked action the Advisor would put in front
+/// of a human. Read-only advice only — Whitewater never performs it;
+/// `rollback` names how a person undoes the step if it was wrong.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Recommendation {
+    /// Ordered priority: 1 is the first thing to check.
+    pub rank: u32,
+    /// The stage/resource the evidence came from.
+    pub target: String,
+    /// What to do — the finding's next safe step.
+    pub action: String,
+    /// Why: the finding's cause, linked so the advice stays inspectable.
+    pub evidence: String,
+    /// What the action is expected to change.
+    pub expected_impact: String,
+    /// What the action could make worse if misapplied.
+    pub durability_risk: String,
+    /// How to know it worked.
+    pub verification: String,
+    /// How to undo it if it did not.
+    pub rollback: String,
+    /// Severity of the driving finding.
+    pub severity: StageStatus,
+}
+
+/// Versioned answer to "what should I look at first?" — the same
+/// report context as [`DiagnosticsReport`] plus ranked advice.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RecommendationsView {
+    pub schema_version: u32,
+    pub node: String,
+    pub observed_at_ns: i64,
+    pub authority: String,
+    pub limited: bool,
+    pub recommendations: Vec<Recommendation>,
+}
+
+/// Build the public view from an already-computed report.
+pub fn recommendations_view(report: &DiagnosticsReport) -> RecommendationsView {
+    RecommendationsView {
+        schema_version: report.schema_version,
+        node: report.node.clone(),
+        observed_at_ns: report.observed_at_ns,
+        authority: report.authority.clone(),
+        limited: report.limited,
+        recommendations: recommend(report),
+    }
+}
+
+/// Recommendations are a bounded, ranked read-model.
+const MAX_RECOMMENDATIONS: usize = 16;
+
+/// Ordered advice derived strictly from report findings — no new
+/// evidence is invented; every recommendation links back to the
+/// finding that produced it. Healthy stages produce no advice.
+pub fn recommend(report: &DiagnosticsReport) -> Vec<Recommendation> {
+    let mut recommendations: Vec<Recommendation> = Vec::new();
+    for stage in &report.stages {
+        for finding in &stage.findings {
+            let (expected_impact, durability_risk, verification, rollback) =
+                advice_shape(&stage.stage);
+            recommendations.push(Recommendation {
+                rank: 0,
+                target: format!("{}/{}", stage.stage, finding.resource),
+                action: finding.next_safe_step.clone(),
+                evidence: finding.cause.clone(),
+                expected_impact,
+                durability_risk,
+                verification,
+                rollback,
+                severity: finding.severity,
+            });
+        }
+    }
+    recommendations.sort_by(|left, right| right.severity.cmp(&left.severity));
+    recommendations.truncate(MAX_RECOMMENDATIONS);
+    for (index, recommendation) in recommendations.iter_mut().enumerate() {
+        recommendation.rank = index as u32 + 1;
+    }
+    recommendations
+}
+
+/// Per-stage (impact, risk, verify, rollback) text — deterministic
+/// advice shape keyed on the finding's stage, keeping the
+/// recommendation honest about what acting on it can and cannot do.
+fn advice_shape(stage: &str) -> (String, String, String, String) {
+    match stage {
+        "control_plane" => (
+            "restores catalog writes, declarations, and placement changes".to_string(),
+            "a wrong restart can split a fragile electorate — verify reachability first".to_string(),
+            "the report's control_plane stage returns to healthy with a leader".to_string(),
+            "revert the restart/change; a restored voter rejoins without operator repair".to_string(),
+        ),
+        "nodes" => (
+            "confirms whether failover can complete or a replica is merely partitioned".to_string(),
+            "forcing reassignment on a partitioned-but-alive Node risks a split owner".to_string(),
+            "the member returns to the live set or ownership moves converge".to_string(),
+            "bring the Node back; epoch fencing prevents a stale owner from writing".to_string(),
+        ),
+        "storage" => (
+            "restores placement capacity or confirms a drain is progressing".to_string(),
+            "removing a Node before drain completion strands replicas".to_string(),
+            "the storage stage shows the Node eligible again, or the drain plan reports ready-to-retire".to_string(),
+            "re-register or un-drain the Node; placements re-evaluate on the next decision".to_string(),
+        ),
+        "writers" => (
+            "relieves a dominant Key's ordered lane or documents an accepted skew".to_string(),
+            "a range split is a committed-boundary operation — never a metadata shortcut".to_string(),
+            "the hot-Key flag clears on a later window or the split activates".to_string(),
+            "revert the workload's re-keying; a completed split has no rollback — verify first".to_string(),
+        ),
+        "readers" => (
+            "distinguishes server-side credit exhaustion from application latency".to_string(),
+            "none — the step only reads pressure signals; delivery is untouched".to_string(),
+            "the Reader's next deliveries carry retry_after_ms of zero".to_string(),
+            "nothing to roll back — no mutation is advised".to_string(),
+        ),
+        "subscriptions" => (
+            "unblocks member joins and shared progress serving".to_string(),
+            "forcing reassignment on a live-but-unreachable owner splits authority".to_string(),
+            "the Subscription gains a live progress owner and members join".to_string(),
+            "the previous owner's epoch is already fenced; no manual rewind".to_string(),
+        ),
+        "pipes" => (
+            "resumes the Pipe's deliveries or restores a dead compute owner".to_string(),
+            "none — resume is cooperative; a dead-owner lease move is epoch-fenced".to_string(),
+            "the Pipe drives again and input progress advances".to_string(),
+            "pause again; effects are durable across the gap".to_string(),
+        ),
+        "distributaries" => (
+            "restores the cross-Riverbed copy from its durable frontier".to_string(),
+            "none — the frontier is durable; a resumed copy replays idempotently".to_string(),
+            "the status report returns to copying/caught_up and lag_records falls".to_string(),
+            "nothing to roll back — the source of truth is upstream".to_string(),
+        ),
+        _ => (
+            "clears the flagged evidence".to_string(),
+            "verify before acting on advice derived from any single signal".to_string(),
+            "the stage returns to healthy on the next report".to_string(),
+            "revert the change through the same surface it was applied".to_string(),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,6 +1052,47 @@ mod tests {
         let stage = stage_of(&report, "storage");
         assert_eq!(stage.findings.len(), MAX_FINDINGS_PER_STAGE);
         assert!(stage.truncated > 0);
+    }
+
+    #[test]
+    fn recommendations_rank_by_severity_and_link_evidence() {
+        let mut input = base_input();
+        input.control_plane = Some(ControlPlaneEvidence {
+            leader: None,
+            term: 12,
+            voters: 3,
+        });
+        input.distributaries = vec![DistributaryEvidence {
+            name: "mirror.orders".into(),
+            run_state: "stalled".into(),
+            last_error: Some("401".into()),
+            lag_records: None,
+            report_age_ms: 5_000,
+            reported_at_ns: Some(1),
+        }];
+        input.hot_keys = vec![HotKeyEvidence {
+            feed: Some("orders.events".into()),
+            range: "r-7".into(),
+            token: "tk".into(),
+            share_bps: 9_000,
+        }];
+        let report = explain(&input);
+        let recommendations = recommend(&report);
+        assert_eq!(recommendations[0].severity, StageStatus::Unhealthy);
+        assert_eq!(recommendations[0].rank, 1);
+        assert!(recommendations[0].target.starts_with("control_plane/"));
+        let last = recommendations.last().unwrap();
+        assert_eq!(last.severity, StageStatus::Advisory);
+        assert!(recommendations.iter().all(|recommendation| {
+            !recommendation.rollback.is_empty()
+                && !recommendation.verification.is_empty()
+                && recommendation.evidence.len() > 3
+        }));
+    }
+
+    #[test]
+    fn healthy_report_offers_no_recommendations() {
+        assert!(recommend(&explain(&base_input())).is_empty());
     }
 
     #[test]

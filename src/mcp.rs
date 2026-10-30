@@ -118,6 +118,12 @@ fn tools() -> Vec<ToolSpec> {
             admin: false,
         },
         ToolSpec {
+            name: "whitewater.scale.recommend",
+            description: "Ranked, evidence-linked operational advice derived from the same                 health report: every recommendation names its evidence, expected impact,                 durability risk, how to verify it worked, and how to roll it back.                 Read-only advice — Whitewater never performs the action.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            admin: false,
+        },
+        ToolSpec {
             name: "whitewater.feed.describe",
             description: "Describe one Feed's definition: Domain, lifecycle, schema and \
                 history-policy bindings, and declared bounds. The caller needs read scope \
@@ -279,6 +285,14 @@ async fn call_tool(
                     .any(|stage| stage.status == crate::diagnostics::StageStatus::Limited);
             }
             serde_json::to_value(report).map_err(|error| ToolError::Internal(error.to_string()))
+        }
+        "whitewater.scale.recommend" => {
+            api::authorize_namespace(state, headers, "*", PermissionAction::Read)
+                .map_err(map_api_error)?;
+            let input = api::diagnostics_input(state).await;
+            let report = crate::diagnostics::explain(&input);
+            serde_json::to_value(crate::diagnostics::recommendations_view(&report))
+                .map_err(|error| ToolError::Internal(error.to_string()))
         }
         "whitewater.feed.describe" => {
             let feed = arguments
