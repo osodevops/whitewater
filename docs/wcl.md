@@ -483,6 +483,19 @@ frontier. `SHOW DISTRIBUTARIES` reports `lease_owner` and `lease_epoch`;
 `MOVE DISTRIBUTARY LEASE` fails the copy over to another storage-eligible
 Node, and `DRAIN STORAGE NODE` plans the move automatically:
 
+The lease owner also publishes a drive report on every state transition
+(and once a minute while quiet), so `SHOW DISTRIBUTARIES` answers "is
+the copy flowing and if not, why" without Node logs: `run_state`
+(`starting`/`copying`/`caught_up`/`stalled`), `copied_records` under
+the current lease epoch, `last_copied_at_ns`, the bounded `last_error`
+with `last_error_at_ns`, and `reported_at_ns`/`status_stale` so an old
+owner's report reads as history, not live evidence, after a move.
+`caught_up` is the honest lag signal — the last remote fetch drained
+the tail; a numeric frontier gap needs a remote API that does not yet
+exist. The report commits through the same epoch fence as the lease:
+only the committed owner at the committed epoch may publish, so a raced
+move can never let a previous owner overwrite live status.
+
 ```wcl
 SHOW DISTRIBUTARIES;
 MOVE DISTRIBUTARY LEASE mirror.orders TO NODE storage-2;

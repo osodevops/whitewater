@@ -316,11 +316,69 @@ pub async fn drive_distributary_once(
     Ok(appended)
 }
 
+/// How often an unchanged status republishes so `reported_at_ns`
+/// distinguishes a quiet-but-alive driver from a dead one.
+pub const DISTRIBUTARY_STATUS_HEARTBEAT_NS: i64 = 60_000_000_000;
+
+/// Whether `next` should be committed over `last`: run-state or error
+/// transitions always publish; steady state republishes only once per
+/// heartbeat window so a sustained `copying` run does not churn the
+/// catalog every tick.
+pub fn distributary_report_due(
+    last: Option<&crate::control::DistributaryStatus>,
+    next: &crate::control::DistributaryStatus,
+    now_ns: i64,
+) -> bool {
+    let Some(last) = last else {
+        return true;
+    };
+    if last.lease_epoch != next.lease_epoch
+        || last.run_state != next.run_state
+        || last.last_error != next.last_error
+    {
+        return true;
+    }
+    now_ns.saturating_sub(last.reported_at_ns) >= DISTRIBUTARY_STATUS_HEARTBEAT_NS
+}
+
 /// The Distributary a node currently drives; the supervisor reconciles
-/// this set against committed leases every tick.
+/// this set against committed leases every tick. The status fields are
+/// operator-facing accumulators scoped to the lease epoch — an epoch
+/// bump evicts the driver and restarts the count on the new owner.
 pub struct DistributaryDriver {
     pub state: DistributaryDriveState,
     pub remote: RemotePool,
+    /// Records this owner observed appended under `state.lease_epoch`.
+    pub copied_records: u64,
+    /// When the last cycle appended records.
+    pub last_copied_at_ns: Option<i64>,
+    /// Most recent failed cycle's refusal (bounded text).
+    pub last_error: Option<String>,
+    pub last_error_at_ns: Option<i64>,
+    /// The last status snapshot committed to the catalog.
+    pub reported: Option<crate::control::DistributaryStatus>,
+}
+
+impl DistributaryDriver {
+    /// The operator-facing snapshot this driver would publish for
+    /// `run_state` right now.
+    pub fn status_snapshot(
+        &self,
+        run_state: crate::control::DistributaryRunState,
+        reported_by: &crate::active_range::StorageNodeId,
+        now_ns: i64,
+    ) -> crate::control::DistributaryStatus {
+        crate::control::DistributaryStatus {
+            lease_epoch: self.state.lease_epoch,
+            reported_by: reported_by.clone(),
+            run_state,
+            copied_records: self.copied_records,
+            last_copied_at_ns: self.last_copied_at_ns,
+            last_error: self.last_error.clone(),
+            last_error_at_ns: self.last_error_at_ns,
+            reported_at_ns: now_ns,
+        }
+    }
 }
 
 /// What one supervisor tick observed for a locally-owned Distributary.
@@ -390,6 +448,49 @@ mod tests {
         // Key material stays in the process environment — the catalog
         // row carries only the variable name.
         assert!(!serde_json::to_string(&link).unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn report_due_only_on_transitions_or_heartbeat() {
+        use crate::control::{DistributaryRunState, DistributaryStatus};
+        let owner = crate::active_range::StorageNodeId::try_new("storage-1").unwrap();
+        let base = DistributaryStatus {
+            lease_epoch: 2,
+            reported_by: owner.clone(),
+            run_state: DistributaryRunState::Copying,
+            copied_records: 10,
+            last_copied_at_ns: Some(100),
+            last_error: None,
+            last_error_at_ns: None,
+            reported_at_ns: 1_000,
+        };
+        // No prior report always publishes; an unchanged row inside the
+        // heartbeat does not — that is the tick-noise throttle.
+        assert!(distributary_report_due(None, &base, 2_000));
+        assert!(!distributary_report_due(Some(&base), &base, 2_000));
+        // A counter advance alone is not a transition: sustained copying
+        // waits for the heartbeat instead of committing every tick.
+        let mut next = base.clone();
+        next.copied_records = 74;
+        assert!(!distributary_report_due(Some(&base), &next, 2_000));
+        // Run-state, error, and epoch transitions always publish.
+        next.run_state = DistributaryRunState::CaughtUp;
+        assert!(distributary_report_due(Some(&base), &next, 2_000));
+        let mut next = base.clone();
+        next.run_state = DistributaryRunState::Stalled;
+        next.last_error = Some("remote refused (503): unavailable".to_owned());
+        next.last_error_at_ns = Some(2_000);
+        assert!(distributary_report_due(Some(&base), &next, 2_000));
+        let mut next = base.clone();
+        next.lease_epoch = 3;
+        assert!(distributary_report_due(Some(&base), &next, 2_000));
+        // The heartbeat republishes an unchanged row so a stale
+        // reported_at means a dead driver, not a quiet one.
+        assert!(distributary_report_due(
+            Some(&base),
+            &base,
+            1_000 + DISTRIBUTARY_STATUS_HEARTBEAT_NS
+        ));
     }
 
     #[test]

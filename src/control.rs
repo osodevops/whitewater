@@ -714,6 +714,48 @@ pub struct DistributaryLease {
     pub epoch: u64,
 }
 
+/// Driver-reported runtime state for one Distributary, published by the
+/// lease owner through `ReportDistributaryStatus` on a state transition
+/// or heartbeat and fenced to the committed lease — a previous owner's
+/// stale report cannot masquerade as live evidence after a move.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DistributaryStatus {
+    /// Lease epoch the reporting owner was driving under.
+    pub lease_epoch: u64,
+    /// Storage Node that observed the cycle.
+    pub reported_by: StorageNodeId,
+    /// Lifecycle the last completed cycle observed.
+    pub run_state: DistributaryRunState,
+    /// Records this owner observed appended under `lease_epoch`.
+    pub copied_records: u64,
+    /// When the last cycle appended records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_copied_at_ns: Option<i64>,
+    /// Most recent failed cycle's refusal when the run is stalled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_at_ns: Option<i64>,
+    /// When the owner published this report.
+    pub reported_at_ns: i64,
+}
+
+/// What one drive cycle observed; `caught_up` means the last remote
+/// fetch drained the tail — the honest lag signal until the remote can
+/// report a numeric frontier gap.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DistributaryRunState {
+    /// Lease owner resolved but no drive cycle has completed.
+    Starting,
+    /// The last cycle appended records.
+    Copying,
+    /// The last fetch returned no waiting remote records.
+    CaughtUp,
+    /// The last cycle failed; `last_error` carries the refusal.
+    Stalled,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WriterDefinition {
     pub writer_id: Uuid,
@@ -1373,6 +1415,11 @@ struct CatalogState {
     distributaries: BTreeMap<Uuid, DistributaryDefinition>,
     #[serde(default)]
     distributary_leases: BTreeMap<Uuid, DistributaryLease>,
+    /// Lease-owner drive reports keyed by Distributary — operator-facing
+    /// runtime state, fenced to the committed lease on write and marked
+    /// stale on read once the lease moves.
+    #[serde(default)]
+    distributary_status: BTreeMap<Uuid, DistributaryStatus>,
     #[serde(default)]
     subscription_feed_memberships: BTreeMap<Uuid, BTreeMap<Uuid, SubscriptionFeedMembership>>,
     #[serde(default)]
@@ -1509,6 +1556,7 @@ impl Default for CatalogState {
             riverbed_links: BTreeMap::new(),
             distributaries: BTreeMap::new(),
             distributary_leases: BTreeMap::new(),
+            distributary_status: BTreeMap::new(),
             subscription_feed_memberships: BTreeMap::new(),
             state_store_assignments: BTreeMap::new(),
             reader_frontiers: BTreeMap::new(),
@@ -1705,6 +1753,14 @@ pub enum Command {
         new_owner: StorageNodeId,
         #[serde(default)]
         expected_epoch: Option<u64>,
+    },
+    /// Lease-owner drive report: publishes observed runtime state into
+    /// the catalog so `SHOW DISTRIBUTARIES` explains progress and stalls
+    /// without tracing Node logs. Fenced to the committed lease — only
+    /// the current owner at the current epoch may publish.
+    ReportDistributaryStatus {
+        distributary_id: Uuid,
+        status: DistributaryStatus,
     },
     CreateWriter {
         name: String,
@@ -3587,6 +3643,18 @@ impl ControlController {
             .lock()
             .await
             .distributary_leases
+            .get(&distributary_id)
+            .cloned()
+    }
+
+    /// The committed driver report for this Distributary — the drive
+    /// loop dedupes unchanged stalls against it instead of publishing
+    /// an identical row every tick.
+    pub async fn distributary_status(&self, distributary_id: Uuid) -> Option<DistributaryStatus> {
+        self.state
+            .lock()
+            .await
+            .distributary_status
             .get(&distributary_id)
             .cloned()
     }
@@ -5881,6 +5949,44 @@ impl ControlController {
                     json!(next),
                 ))
             }
+            Command::ReportDistributaryStatus {
+                distributary_id,
+                status,
+            } => {
+                let definition = state
+                    .distributaries
+                    .get(&distributary_id)
+                    .filter(|item| item.status == ResourceStatus::Active)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!("Distributary {distributary_id}"))
+                    })?;
+                let lease = state
+                    .distributary_leases
+                    .get(&distributary_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "Distributary lease for {distributary_id}"
+                        ))
+                    })?;
+                // The committed lease is the fence: a report from a
+                // previous owner or an older epoch must not overwrite
+                // the live row after a raced move.
+                if lease.epoch != status.lease_epoch || lease.owner != status.reported_by {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "Distributary status report for {} does not match the committed lease",
+                        definition.name
+                    )));
+                }
+                state
+                    .distributary_status
+                    .insert(distributary_id, status.clone());
+                Ok((
+                    format!("recorded status for Distributary {}", definition.name),
+                    json!(status),
+                ))
+            }
             Command::RegisterStorageNode {
                 node,
                 endpoint,
@@ -7333,6 +7439,7 @@ impl ControlController {
                 if outcome.is_ok() {
                     if let Some(item) = state.distributaries.values().find(|d| d.name == name) {
                         state.distributary_leases.remove(&item.distributary_id);
+                        state.distributary_status.remove(&item.distributary_id);
                     }
                 }
                 outcome
@@ -9957,6 +10064,25 @@ fn show_resources(
                     row["lease_owner"] = json!(lease.owner.as_str());
                     row["lease_epoch"] = json!(lease.epoch);
                 }
+                if let Some(status) = state.distributary_status.get(&item.distributary_id) {
+                    row["run_state"] = json!(status.run_state);
+                    row["copied_records"] = json!(status.copied_records);
+                    if let Some(ts) = status.last_copied_at_ns {
+                        row["last_copied_at_ns"] = json!(ts);
+                    }
+                    if let Some(error) = &status.last_error {
+                        row["last_error"] = json!(error);
+                        row["last_error_at_ns"] = json!(status.last_error_at_ns);
+                    }
+                    row["reported_at_ns"] = json!(status.reported_at_ns);
+                    // A report predating the committed lease is history,
+                    // not live evidence — mark it rather than hide it.
+                    row["status_stale"] = json!(state
+                        .distributary_leases
+                        .get(&item.distributary_id)
+                        .is_none_or(|lease| lease.epoch != status.lease_epoch
+                            || lease.owner != status.reported_by));
+                }
                 row
             })
             .collect::<Vec<_>>()),
@@ -10148,6 +10274,14 @@ fn describe_resource(
             }
             if let Some(lease) = state.distributary_leases.get(&item.distributary_id) {
                 row["lease"] = json!(lease);
+            }
+            if let Some(status) = state.distributary_status.get(&item.distributary_id) {
+                row["status"] = json!(status);
+                row["status_stale"] = json!(state
+                    .distributary_leases
+                    .get(&item.distributary_id)
+                    .is_none_or(|lease| lease.epoch != status.lease_epoch
+                        || lease.owner != status.reported_by));
             }
             Ok(row)
         }
@@ -10661,6 +10795,7 @@ fn command_label(command: &Command) -> String {
         Command::DefineRiverbedLink { .. } => "DEFINE RIVERBED LINK",
         Command::DefineDistributary { .. } => "DEFINE DISTRIBUTARY",
         Command::MoveDistributaryLease { .. } => "MOVE DISTRIBUTARY LEASE",
+        Command::ReportDistributaryStatus { .. } => "REPORT DISTRIBUTARY STATUS",
         Command::RegisterStorageNode { .. } => "REGISTER STORAGE NODE",
         Command::RetireStorageNode { .. } => "RETIRE STORAGE NODE",
         Command::DrainStorageNode { .. } => "DRAIN STORAGE NODE",
@@ -14834,6 +14969,135 @@ mod tests {
             .execute("DROP FEED accounts.mirrored;")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn distributary_status_reports_fence_to_the_committed_lease() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute("CREATE DOMAIN accounts; CREATE FEED accounts.mirrored;")
+            .await
+            .unwrap();
+        controller
+            .execute("CREATE RIVERBED LINK dr AT 'https://dr:9392' WITH KEY ENV WHITEWATER_DR_KEY;")
+            .await
+            .unwrap();
+        controller
+            .execute(
+                "CREATE DISTRIBUTARY accounts.mirror FROM LINK dr                  FEED orders.events INTO accounts.mirrored;",
+            )
+            .await
+            .unwrap();
+        let distributary_id = controller.active_distributaries().await[0].distributary_id;
+        let lease = controller
+            .distributary_lease(distributary_id)
+            .await
+            .unwrap();
+        let report = |run_state, epoch, owner: StorageNodeId, error: Option<&str>| {
+            Command::ReportDistributaryStatus {
+                distributary_id,
+                status: DistributaryStatus {
+                    lease_epoch: epoch,
+                    reported_by: owner,
+                    run_state,
+                    copied_records: 7,
+                    last_copied_at_ns: Some(11),
+                    last_error: error.map(|message| message.to_owned()),
+                    last_error_at_ns: error.map(|_| 12),
+                    reported_at_ns: 13,
+                },
+            }
+        };
+        // The committed owner at the committed epoch publishes.
+        controller
+            .execute_commands(vec![report(
+                DistributaryRunState::Copying,
+                1,
+                lease.owner.clone(),
+                None,
+            )])
+            .await
+            .unwrap();
+        let shown = controller.execute("SHOW DISTRIBUTARIES;").await.unwrap();
+        let row = &shown.results[0].data[0];
+        assert_eq!(row["run_state"], "copying");
+        assert_eq!(row["copied_records"], 7);
+        assert_eq!(row["status_stale"], false);
+        // A stale epoch or a non-owner report is refused and the
+        // committed row is unchanged.
+        for command in [
+            report(
+                DistributaryRunState::Stalled,
+                0,
+                lease.owner.clone(),
+                Some("old epoch"),
+            ),
+            report(
+                DistributaryRunState::Stalled,
+                1,
+                StorageNodeId::try_new("storage-9").unwrap(),
+                Some("not the owner"),
+            ),
+        ] {
+            assert!(controller.execute_commands(vec![command]).await.is_err());
+        }
+        let unchanged = controller
+            .distributary_status(distributary_id)
+            .await
+            .unwrap();
+        assert_eq!(unchanged.run_state, DistributaryRunState::Copying);
+        // A stalled cycle surfaces the refusal for operators.
+        controller
+            .execute_commands(vec![report(
+                DistributaryRunState::Stalled,
+                1,
+                lease.owner.clone(),
+                Some("remote refused (503): unavailable"),
+            )])
+            .await
+            .unwrap();
+        let shown = controller.execute("SHOW DISTRIBUTARIES;").await.unwrap();
+        let row = &shown.results[0].data[0];
+        assert_eq!(row["run_state"], "stalled");
+        assert_eq!(row["last_error"], "remote refused (503): unavailable");
+        // After the lease moves the old report reads stale, and the new
+        // owner's first report at the new epoch replaces it.
+        let target = ["storage-1", "storage-2", "storage-3"]
+            .into_iter()
+            .map(|node| StorageNodeId::try_new(node).unwrap())
+            .find(|node| *node != lease.owner)
+            .unwrap();
+        controller
+            .execute(&format!(
+                "MOVE DISTRIBUTARY LEASE accounts.mirror TO NODE {target};"
+            ))
+            .await
+            .unwrap();
+        let shown = controller.execute("SHOW DISTRIBUTARIES;").await.unwrap();
+        assert_eq!(shown.results[0].data[0]["status_stale"], true);
+        controller
+            .execute_commands(vec![report(
+                DistributaryRunState::Starting,
+                2,
+                target.clone(),
+                None,
+            )])
+            .await
+            .unwrap();
+        let shown = controller.execute("SHOW DISTRIBUTARIES;").await.unwrap();
+        let row = &shown.results[0].data[0];
+        assert_eq!(row["run_state"], "starting");
+        assert_eq!(row["status_stale"], false);
+        // Dropping the Distributary clears its status row with the lease.
+        controller
+            .execute("DROP DISTRIBUTARY accounts.mirror;")
+            .await
+            .unwrap();
+        assert!(controller
+            .distributary_status(distributary_id)
+            .await
+            .is_none());
     }
 
     #[test]

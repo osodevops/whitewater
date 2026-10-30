@@ -5887,6 +5887,64 @@ pub async fn drive_local_pipes(state: &AppState, limit: usize) -> Vec<PipeDriveO
     outcomes
 }
 
+/// Commit one drive report unless the committed catalog row already
+/// carries it: unchanged rows inside the heartbeat window are skipped
+/// so a quiet or repeatedly stalling Distributary does not churn the
+/// catalog every tick. Returns true when the row is current.
+async fn publish_distributary_status(
+    state: &AppState,
+    distributary_id: Uuid,
+    status: crate::control::DistributaryStatus,
+) -> bool {
+    if let Some(existing) = state.control.distributary_status(distributary_id).await {
+        let unchanged = existing.lease_epoch == status.lease_epoch
+            && existing.reported_by == status.reported_by
+            && existing.run_state == status.run_state
+            && existing.last_error == status.last_error
+            && existing.copied_records == status.copied_records;
+        let fresh = status
+            .reported_at_ns
+            .saturating_sub(existing.reported_at_ns)
+            < crate::distributary::DISTRIBUTARY_STATUS_HEARTBEAT_NS;
+        if unchanged && fresh {
+            return true;
+        }
+    }
+    state
+        .progress_authority
+        .execute_placement_commands(vec![crate::control::Command::ReportDistributaryStatus {
+            distributary_id,
+            status,
+        }])
+        .await
+        .is_ok()
+}
+
+/// A driver could not even be constructed (missing Link, target Feed,
+/// or credentials) — still an operator-visible stall, so publish it
+/// under the committed lease. `copied_records` reads 0 because nothing
+/// this owner attempted ever appended.
+async fn publish_distributary_stall(
+    state: &AppState,
+    distributary_id: Uuid,
+    lease_epoch: u64,
+    local_node: &crate::active_range::StorageNodeId,
+    message: &str,
+) {
+    let now_ns = crate::control::unix_ns();
+    let status = crate::control::DistributaryStatus {
+        lease_epoch,
+        reported_by: local_node.clone(),
+        run_state: crate::control::DistributaryRunState::Stalled,
+        copied_records: 0,
+        last_copied_at_ns: None,
+        last_error: Some(message.chars().take(512).collect()),
+        last_error_at_ns: Some(now_ns),
+        reported_at_ns: now_ns,
+    };
+    let _ = publish_distributary_status(state, distributary_id, status).await;
+}
+
 /// One supervisor tick: drive every active Distributary whose lease
 /// owner is this Node. The driver set is owned by the calling task and
 /// reconciled here — a Distributary whose lease moved or was dropped is
@@ -5945,6 +6003,14 @@ pub async fn drive_local_distributaries(
                 distributary_id: definition.distributary_id,
                 message: "target Feed is unavailable".to_owned(),
             });
+            publish_distributary_stall(
+                state,
+                definition.distributary_id,
+                lease.epoch,
+                &local_node,
+                "target Feed is unavailable",
+            )
+            .await;
             continue;
         };
         // A lease epoch bump discards session state even when ownership
@@ -5964,11 +6030,34 @@ pub async fn drive_local_distributaries(
                     distributary_id: definition.distributary_id,
                     message: "Riverbed Link is unavailable".to_owned(),
                 });
+                publish_distributary_stall(
+                    state,
+                    definition.distributary_id,
+                    lease.epoch,
+                    &local_node,
+                    "Riverbed Link is unavailable",
+                )
+                .await;
                 continue;
             };
             match crate::distributary::RemotePool::new(&link) {
                 Ok(remote) => {
+                    // Seed accumulators from the committed row when the
+                    // same owner+epoch restarts — the counter describes
+                    // the epoch, not this process.
+                    let seed = state
+                        .control
+                        .distributary_status(definition.distributary_id)
+                        .await
+                        .filter(|row| {
+                            row.lease_epoch == lease.epoch && row.reported_by == local_node
+                        });
                     entry.insert(crate::distributary::DistributaryDriver {
+                        copied_records: seed.as_ref().map_or(0, |row| row.copied_records),
+                        last_copied_at_ns: seed.as_ref().and_then(|row| row.last_copied_at_ns),
+                        last_error: seed.as_ref().and_then(|row| row.last_error.clone()),
+                        last_error_at_ns: seed.as_ref().and_then(|row| row.last_error_at_ns),
+                        reported: seed,
                         state: DistributaryDriveState {
                             lease_epoch: lease.epoch,
                             ..Default::default()
@@ -5979,8 +6068,16 @@ pub async fn drive_local_distributaries(
                 Err(message) => {
                     outcomes.push(DistributaryDriveOutcome::Failed {
                         distributary_id: definition.distributary_id,
-                        message,
+                        message: message.clone(),
                     });
+                    publish_distributary_stall(
+                        state,
+                        definition.distributary_id,
+                        lease.epoch,
+                        &local_node,
+                        &message,
+                    )
+                    .await;
                     continue;
                 }
             }
@@ -5988,7 +6085,8 @@ pub async fn drive_local_distributaries(
         let driver = drivers
             .get_mut(&definition.distributary_id)
             .expect("driver inserted above");
-        match crate::distributary::drive_distributary_once(
+        let now_ns = crate::control::unix_ns();
+        let result = crate::distributary::drive_distributary_once(
             local,
             &mut driver.remote,
             &definition,
@@ -5996,8 +6094,32 @@ pub async fn drive_local_distributaries(
             &mut driver.state,
             limit,
         )
-        .await
+        .await;
+        let run_state = match &result {
+            Ok(0) => crate::control::DistributaryRunState::CaughtUp,
+            Ok(_) => crate::control::DistributaryRunState::Copying,
+            Err(_) => crate::control::DistributaryRunState::Stalled,
+        };
+        match &result {
+            Ok(count) if *count > 0 => {
+                driver.copied_records = driver.copied_records.saturating_add(*count as u64);
+                driver.last_copied_at_ns = Some(now_ns);
+                driver.last_error = None;
+                driver.last_error_at_ns = None;
+            }
+            Err(message) => {
+                driver.last_error = Some(message.chars().take(512).collect());
+                driver.last_error_at_ns = Some(now_ns);
+            }
+            _ => {}
+        }
+        let status = driver.status_snapshot(run_state, &local_node, now_ns);
+        if crate::distributary::distributary_report_due(driver.reported.as_ref(), &status, now_ns)
+            && publish_distributary_status(state, definition.distributary_id, status.clone()).await
         {
+            driver.reported = Some(status);
+        }
+        match result {
             Ok(0) => outcomes.push(DistributaryDriveOutcome::Idle),
             Ok(count) => outcomes.push(DistributaryDriveOutcome::Copied {
                 distributary_id: definition.distributary_id,
