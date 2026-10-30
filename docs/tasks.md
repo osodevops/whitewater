@@ -1666,7 +1666,7 @@ Design: [Whitewater Operations Advisor](operations-advisor.md). The read-only di
 
 - [ ] Add bounded, redacted, authorized metrics/log/trace retrieval by Riverbed, Domain, Feed, Node, and time window; treat returned content as untrusted.
 
-- [ ] Expose read-only Whitewater health/explanation/recommendation tools via MCP, backed by the authenticated Admin API rather than a separate catalog.
+- [x] Expose read-only Whitewater health/explanation/recommendation tools via MCP, backed by the authenticated Admin API rather than a separate catalog. `POST /v1/mcp` serves JSON-RPC 2.0 `initialize`/`tools/list`/`tools/call` on any Node with the same Bearer authentication; `whitewater.riverbed.health` and `whitewater.riverbed.explain_pressure` wrap the diagnostics report under `read`-on-`*`, `whitewater.feed.describe` runs `DESCRIBE FEED` through `ControlController` under Feed-namespace read scope, and `whitewater.support.collect_redacted` reuses the shared bundle collector under admin scope — every call re-authorizes per tool, denied scopes return JSON-RPC errors, and no mutating tool exists. `api::tests::mcp_adapter_serves_scoped_read_only_tools` covers handshake, catalog, dispatch, and fencing. Recommendation tools beyond the explain report remain future work.
 
 - [ ] Correlate scoped Kubernetes and network evidence through a least-privilege external integration without mounting infrastructure credentials in data Nodes.
 

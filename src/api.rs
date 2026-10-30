@@ -742,6 +742,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/backup", post(admin_backup))
         .route("/v1/admin/support-bundle", get(admin_support_bundle))
         .route("/v1/admin/diagnostics/explain", post(diagnostics_explain))
+        .route("/v1/mcp", post(mcp_rpc))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
@@ -809,6 +810,19 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
+/// `POST /v1/mcp` — single JSON-RPC 2.0 request/response, the
+/// read-only MCP adapter. Authentication is the same Bearer check as
+/// every Admin endpoint; each tool re-authorizes scope per call.
+async fn mcp_rpc(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<crate::mcp::JsonRpcRequest>,
+) -> Result<Json<crate::mcp::JsonRpcResponse>, ApiError> {
+    authenticate_credential(&state, &headers)?;
+    let _request = state.demand.begin_request();
+    Ok(Json(crate::mcp::handle(&state, &headers, request).await?))
+}
+
 /// Resolve a Feed's public name for diagnostic evidence — falls back
 /// to the immutable id when the definition is gone, so a finding can
 /// still name its scope.
@@ -821,18 +835,10 @@ async fn feed_name_for(state: &AppState, feed_id: Uuid) -> String {
         .unwrap_or_else(|| feed_id.to_string())
 }
 
-/// `POST /v1/admin/diagnostics/explain`
-/// Correlated, versioned health explanation — the Operations Advisor
-/// foundation. Read-only, `read`-on-`*`-scoped, and safe to ask of any
-/// Node: each stage explains cause, risk, the automatic action already
-/// running, and the next safe step rather than raw metrics. Missing
-/// evidence reports `limited`, never fabricated certainty.
-async fn diagnostics_explain(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<crate::diagnostics::DiagnosticsReport>, ApiError> {
-    authorize_namespace(&state, &headers, "*", PermissionAction::Read)?;
-    let _request = state.demand.begin_request();
+/// Assemble the scoped evidence views the diagnostics rules evaluate —
+/// shared by the explain endpoint and the MCP adapter so both describe
+/// identical state. Bounded and read-only throughout.
+pub(crate) async fn diagnostics_input(state: &AppState) -> crate::diagnostics::DiagnosticsInput {
     let now_ns = unix_ns();
     let now_ms = now_ns.max(0) as u64 / 1_000_000;
 
@@ -884,7 +890,7 @@ async fn diagnostics_explain(
     for reader in state.control.active_readers().await {
         readers.push(crate::diagnostics::ReaderEvidence {
             name: reader.name,
-            feed: feed_name_for(&state, reader.feed_id).await,
+            feed: feed_name_for(state, reader.feed_id).await,
             session_active: reader.session_active,
             last_retry_after_ms: reader
                 .last_delivery
@@ -996,7 +1002,7 @@ async fn diagnostics_explain(
         };
         indexes.push(crate::diagnostics::IndexEvidence {
             name: index.name,
-            feed: feed_name_for(&state, index.feed_id).await,
+            feed: feed_name_for(state, index.feed_id).await,
             stage: stage_label.to_string(),
         });
     }
@@ -1022,7 +1028,7 @@ async fn diagnostics_explain(
         })
         .collect();
 
-    let input = crate::diagnostics::DiagnosticsInput {
+    crate::diagnostics::DiagnosticsInput {
         node: state.membership.local().node_id.clone(),
         observed_at_ns: now_ns,
         control_plane,
@@ -1036,7 +1042,22 @@ async fn diagnostics_explain(
         indexes,
         hot_keys,
         owner_liveness,
-    };
+    }
+}
+
+/// `POST /v1/admin/diagnostics/explain`
+/// Correlated, versioned health explanation — the Operations Advisor
+/// foundation. Read-only, `read`-on-`*`-scoped, and safe to ask of any
+/// Node: each stage explains cause, risk, the automatic action already
+/// running, and the next safe step rather than raw metrics. Missing
+/// evidence reports `limited`, never fabricated certainty.
+async fn diagnostics_explain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::diagnostics::DiagnosticsReport>, ApiError> {
+    authorize_namespace(&state, &headers, "*", PermissionAction::Read)?;
+    let _request = state.demand.begin_request();
+    let input = diagnostics_input(&state).await;
     Ok(Json(crate::diagnostics::explain(&input)))
 }
 
@@ -1109,7 +1130,7 @@ async fn execute_admin_commands(
     }))
 }
 
-fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+pub(crate) fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
     let authorization = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
@@ -1130,7 +1151,7 @@ fn authorize_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError
 /// whose namespace pattern covers `feed` for `action` (`manage`
 /// implies read and write). Endpoints that resolve Writer, Reader,
 /// Subscription, StateStore, or Index names still require admin scope.
-fn authorize_namespace(
+pub(crate) fn authorize_namespace(
     state: &AppState,
     headers: &HeaderMap,
     namespace: &str,
@@ -1153,7 +1174,10 @@ fn authorize_namespace(
 /// resolved — an invalid credential receives `401` rather than a
 /// not-found response that would leak resource existence. The
 /// resource's owning Feed check runs afterward via `authorize_namespace`.
-fn authenticate_credential(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+pub(crate) fn authenticate_credential(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), ApiError> {
     let authorization = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
@@ -1168,7 +1192,7 @@ fn authenticate_credential(state: &AppState, headers: &HeaderMap) -> Result<(), 
 /// bootstrap credential, `Some` an issued key's declared name. Callers
 /// authenticate first, so an `Err` here is defensive — `Unknown`
 /// records the anomaly rather than dropping the mutation.
-fn request_actor(state: &AppState, headers: &HeaderMap) -> crate::control::AuditActor {
+pub(crate) fn request_actor(state: &AppState, headers: &HeaderMap) -> crate::control::AuditActor {
     let authorization = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
@@ -12260,13 +12284,20 @@ async fn admin_support_bundle(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize_admin(&state, &headers)?;
+    Ok(Json(support_bundle(&state).await))
+}
+
+/// The redacted single-call diagnostic snapshot, shared by
+/// `GET /v1/admin/support-bundle` and the MCP
+/// `whitewater.support.collect_redacted` tool so the two cannot drift.
+pub(crate) async fn support_bundle(state: &AppState) -> serde_json::Value {
     let generated_at_ns = unix_ns();
     let local = state.membership.local().clone();
     let control_plane = match &state.control_plane {
         Some(control_plane) => serde_json::to_value(control_plane.status().await).ok(),
         None => None,
     };
-    Ok(Json(json!({
+    json!({
         "format_version": 1,
         "generated_at_ns": generated_at_ns,
         "node": {
@@ -12279,7 +12310,7 @@ async fn admin_support_bundle(
         "control_plane": control_plane,
         "members": state.membership.members().await,
         "catalog": state.control.support_bundle_catalog(generated_at_ns).await,
-    })))
+    })
 }
 
 /// `POST /v1/admin/backup` — crash-consistent per-Node archive. Copies
@@ -17754,7 +17785,7 @@ fn unix_ns() -> i64 {
 }
 
 #[derive(Debug)]
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
     code: Option<&'static str>,
@@ -23338,6 +23369,148 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("voters"));
+    }
+
+    #[tokio::test]
+    async fn mcp_adapter_serves_scoped_read_only_tools() {
+        let directory = TempDir::new().unwrap();
+        let app = admin_test_router(&directory);
+        let rpc = |method: &str, params: serde_json::Value, key: Option<&str>| {
+            let mut request = Request::builder().method("POST").uri("/v1/mcp");
+            if let Some(key) = key {
+                request = request.header("authorization", format!("Bearer {key}"));
+            }
+            request
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": method,
+                        "params": params,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+
+        // Transport auth matches the rest of the Admin API.
+        let missing = app
+            .clone()
+            .oneshot(rpc("ping", json!({}), None))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        let key = Some("this-is-a-long-development-api-key");
+        let init = app
+            .clone()
+            .oneshot(rpc("initialize", json!({}), key))
+            .await
+            .unwrap();
+        assert_eq!(init.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(init.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let init: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(init["result"]["serverInfo"]["name"], "whitewater");
+        assert!(init["result"]["protocolVersion"].is_string());
+
+        let list = app
+            .clone()
+            .oneshot(rpc("tools/list", json!({}), key))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(list.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let list: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        for expected in [
+            "whitewater.riverbed.health",
+            "whitewater.riverbed.explain_pressure",
+            "whitewater.feed.describe",
+            "whitewater.support.collect_redacted",
+        ] {
+            assert!(names.contains(&expected), "missing tool {expected}");
+        }
+
+        // Seed a Feed for the describe tool.
+        let seed = serde_json::to_value(CommandBatchRequest {
+            request_id: Some(Uuid::new_v4()),
+            commands: vec![
+                Command::CreateSpace {
+                    name: "orders".to_owned(),
+                },
+                Command::CreateFeed {
+                    name: "orders.events".to_owned(),
+                    encrypted: false,
+                },
+            ],
+        })
+        .unwrap();
+        let created = app
+            .clone()
+            .oneshot(admin_request("/v1/admin/commands", seed, key))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let describe = app
+            .clone()
+            .oneshot(rpc(
+                "tools/call",
+                json!({
+                    "name": "whitewater.feed.describe",
+                    "arguments": { "feed": "orders.events" },
+                }),
+                key,
+            ))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(describe.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let describe: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(describe["result"]["isError"], false);
+        let structured = &describe["result"]["structuredContent"];
+        assert!(structured["results"].is_array());
+
+        let health = app
+            .clone()
+            .oneshot(rpc(
+                "tools/call",
+                json!({ "name": "whitewater.riverbed.health", "arguments": {} }),
+                key,
+            ))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(health.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(health["result"]["structuredContent"]["schema_version"], 1);
+
+        // Unknown tool names answer a JSON-RPC method error, not a panic.
+        let unknown = app
+            .clone()
+            .oneshot(rpc(
+                "tools/call",
+                json!({ "name": "whitewater.dangerous.mutate", "arguments": {} }),
+                key,
+            ))
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(unknown.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let unknown: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(unknown["error"]["code"], -32601);
     }
 
     #[tokio::test]

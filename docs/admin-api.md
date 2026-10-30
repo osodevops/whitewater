@@ -704,6 +704,32 @@ Missing evidence is reported, not smoothed over: a Node without a Control Plane 
 }
 ```
 
+### MCP adapter
+
+```http
+POST /v1/mcp
+Authorization: Bearer <key>
+Content-Type: application/json
+```
+
+A read-only MCP (Model Context Protocol) adapter for engineers and assistants — a frontend to this API's semantics, not a second catalog or an unbounded shell. Single JSON-RPC 2.0 request/response per POST; reachable through any Node with the same Bearer authentication as every Admin endpoint. `initialize`, `ping`, `notifications/*`, `tools/list`, and `tools/call` are served; mutating tools do not exist.
+
+Every tool call re-authorizes the credential at use time with the same scope checks as the HTTP surface it wraps — a narrower credential returns a JSON-RPC error, never wider data:
+
+| Tool | Scope | Returns |
+| --- | --- | --- |
+| `whitewater.riverbed.health` | `read` on `*` | The full diagnostics explain report |
+| `whitewater.riverbed.explain_pressure` | `read` on `*` | The report filtered to `{"stages": [...]}` |
+| `whitewater.feed.describe` | `read` on the Feed's namespace | `DESCRIBE FEED` results |
+| `whitewater.support.collect_redacted` | admin (`manage` on `*`) | The bounded redacted support bundle |
+
+```json
+{ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+  "params": { "name": "whitewater.riverbed.health", "arguments": {} } }
+```
+
+Tool results carry MCP `content` text plus `structuredContent` JSON; denied scopes, unknown tools, and invalid arguments answer JSON-RPC errors (`-32001`, `-32601`, `-32602`), never partial data.
+
 ### Grant
 
 ```json

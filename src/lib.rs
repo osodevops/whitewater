@@ -17,6 +17,7 @@ pub mod effect;
 pub mod index;
 pub mod index_build;
 pub mod internal_plane;
+pub mod mcp;
 pub mod membership;
 pub mod node;
 pub mod pipe;
