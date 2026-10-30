@@ -51,6 +51,9 @@ WRITERS = int(os.environ.get("BENCH_WRITERS", "4"))
 BATCH = int(os.environ.get("BENCH_BATCH", "50"))
 MODE = os.environ.get("BENCH_MODE", "all")
 BATCH_ATTEMPTS = int(os.environ.get("BENCH_BATCH_ATTEMPTS", "8"))
+# Internal range fan-out for the run — the honest parallel-pipelines knob
+# (Kafka's partition count equivalent). 1 = one pipeline.
+RANGES = int(os.environ.get("BENCH_RANGES", "1"))
 
 
 def compose(*args):
@@ -284,6 +287,24 @@ class WriteDriver:
         return time.monotonic() - started
 
 
+def pre_split(feed, ranges):
+    """Pre-provision `ranges` Active Ranges at even KeyToken boundaries —
+    the internal equivalent of creating a Feed with N pipelines before the
+    load starts (Kafka's partition count). Splits run on an empty Feed, so
+    each cutover only stages assignment metadata."""
+    for index in range(1, ranges):
+        # Boundary i/N of the 128-bit token space as a 32-char hex string.
+        token = (index * (1 << 128) // ranges).to_bytes(16, "big").hex()
+        status, body = post(
+            ENDPOINTS[0],
+            "/v1/admin/ranges/split",
+            {"request_id": str(uuid.uuid4()), "feed": feed, "split_at": token},
+            timeout=120,
+        )
+        assert status == 200, f"pre-split {index}/{ranges} refused: {body}"
+        assert body.get("status") == "activated", body
+
+
 def run_write(feed, writers):
     driver = WriteDriver(writers, RECORDS, BYTES, BATCH)
     seconds = driver.run()
@@ -348,6 +369,8 @@ def main():
             (name, setup["results"][2 + 2 * i + 1]["data"]["session_epoch"])
             for i, name in enumerate(writer_names)
         ]
+        if RANGES > 1:
+            pre_split(feed, RANGES)
 
         results = []
         if MODE in ("write", "all"):

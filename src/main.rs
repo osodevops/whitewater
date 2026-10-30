@@ -214,6 +214,7 @@ async fn main() -> Result<()> {
                 control.clone(),
                 whitewater::active_range::store::FileActiveRangeStoreOptions {
                     max_segment_bytes: config.max_segment_bytes,
+                    sync_interval: config.range_sync_interval,
                     tier: tier_source.clone().map(|source| {
                         source
                             as std::sync::Arc<

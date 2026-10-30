@@ -39,9 +39,11 @@ use crate::{
         KeyToken, MajorityAppendCoordinator, MajorityAppendError, MergeStagingResult,
         OwnerMoveEvidence, RangeId, RangePosition, ReadReplicaEvidence, RepairExportRequest,
         RepairExportResponse, RepairFrame, ReplicaAppendRequest, ReplicaAppendResponse,
-        ReplicaAppendService, ReplicaCommitRequest, ReplicaCommitResponse, ReplicaProgressRequest,
+        ReplicaAppendService, ReplicaBatchAppendRequest, ReplicaBatchAppendResponse,
+        ReplicaCommitRequest, ReplicaCommitResponse, ReplicaProgressRequest,
         ReplicaProgressResponse, ReplicaReconcileRequest, ReplicaReconcileResponse, StorageNodeId,
-        StoredRangeFrame, MAX_COMMITTED_READ_BYTES, MAX_REPLICA_FRAME_BASE64_BYTES,
+        StoredRangeFrame, MAX_COMMITTED_READ_BYTES, MAX_REPLICA_BATCH_BASE64_BYTES,
+        MAX_REPLICA_BATCH_FRAMES, MAX_REPLICA_FRAME_BASE64_BYTES,
     },
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
@@ -306,6 +308,14 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             state.clone(),
             authorize_replica_append,
         ));
+    let replica_batch_append_route = post(replica_append_batch)
+        .layer(DefaultBodyLimit::max(
+            MAX_REPLICA_BATCH_BASE64_BYTES + 1024 * 1024,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
     let replica_commit_route = post(replica_commit).layer(middleware::from_fn_with_state(
         state.clone(),
         authorize_replica_append,
@@ -344,6 +354,14 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
         state.clone(),
         authorize_replica_append,
     ));
+    let owner_append_batch_route = post(owner_append_batch)
+        .layer(DefaultBodyLimit::max(
+            MAX_REPLICA_BATCH_BASE64_BYTES + 1024 * 1024,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
     let owner_release_pending_route = post(owner_release_pending).layer(
         middleware::from_fn_with_state(state.clone(), authorize_replica_append),
     );
@@ -479,6 +497,10 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             replica_append_route,
         )
         .route(
+            "/internal/active-range/replica/append-batch",
+            replica_batch_append_route,
+        )
+        .route(
             "/internal/active-range/replica/commit",
             replica_commit_route,
         )
@@ -487,6 +509,10 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             replica_discard_pending_route,
         )
         .route("/internal/active-range/owner/append", owner_append_route)
+        .route(
+            "/internal/active-range/owner/append-batch",
+            owner_append_batch_route,
+        )
         .route(
             "/internal/active-range/owner/release-pending",
             owner_release_pending_route,
@@ -1787,6 +1813,37 @@ async fn replica_append(
         }
         Err(error) => ReplicaAppendResponse {
             result: None,
+            error: Some(error),
+        },
+    }))
+}
+
+/// Replica fan-out for one ordered contiguous batch — the
+/// `import_committed` replay contract amortized over the whole run: one
+/// gate, one assignment validation, one file sync. Per-frame position,
+/// digest, Cursor, and dedup checks are unchanged.
+async fn replica_append_batch(
+    State(state): State<AppState>,
+    Json(request): Json<ReplicaBatchAppendRequest>,
+) -> Result<Json<ReplicaBatchAppendResponse>, ApiError> {
+    let service = state.replica_append.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "Active Range replica storage is not configured on this Node".to_owned(),
+
+        code: None,
+    })?;
+    let range_id = request.range_id;
+    let wire_bytes: usize = request.frames.iter().map(|f| f.frame_base64.len()).sum();
+    Ok(Json(match service.import_committed_batch(request).await {
+        Ok(results) => {
+            state.demand.record_range_replication(range_id, wire_bytes);
+            ReplicaBatchAppendResponse {
+                results: Some(results),
+                error: None,
+            }
+        }
+        Err(error) => ReplicaBatchAppendResponse {
+            results: None,
             error: Some(error),
         },
     }))
@@ -11966,7 +12023,14 @@ async fn admin_split_range(
             plan.plan_id, request.feed
         )));
     }
-    let source_assignment = match state.control.active_range_assignment(plan.feed_id).await {
+    // The plan names the range that actually contains split_at — the
+    // singular per-feed lookup only coincides on a one-range feed, so a
+    // second split would freeze and lineage-check the wrong range.
+    let source_assignment = match state
+        .control
+        .active_range_assignment_by_id(plan.source_range_id)
+        .await
+    {
         Some(assignment) => assignment,
         None => return Err(ApiError::unavailable("source assignment is unavailable")),
     };
@@ -14554,6 +14618,21 @@ struct InternalOwnerAppendResponse {
     pending_effect: Option<crate::active_range::PendingEffect>,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InternalOwnerBatchAppendRequest {
+    requests: Vec<ClientAppendRequest>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InternalOwnerBatchAppendResponse {
+    results: Option<Vec<WriterAppendResponse>>,
+    error: Option<String>,
+    retryable: bool,
+    /// Machine-readable refusal code forwarded from the owner's ApiError.
+    #[serde(default)]
+    code: Option<String>,
+}
+
 /// `GET /v1/admin/demand/hot-keys`
 ///
 /// Node-local view of Keys flagged for sustained dominant append demand
@@ -15038,6 +15117,88 @@ fn hot_key_entry(
     })
 }
 
+/// Resolve one session record into a minted owner request plus its target
+/// Range — the same Writer/session fences `writer_session_append` applies,
+/// hoisted so the batch pays them once per record up front instead of
+/// inside the serial quorum loop.
+async fn writer_batch_prepare(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: &WriterSessionAppendRequest,
+) -> Result<(ClientAppendRequest, crate::active_range::RangeId), ApiError> {
+    let writer = writer_when_applied(&state.control, &request.writer, state.control_plane.is_some())
+        .await
+        .ok_or_else(|| {
+        if state.control_plane.is_some() {
+            ApiError::unavailable(format!(
+                "Writer {} is not available on this ingress Node; verify it exists or retry with the same request ID",
+                request.writer
+            ))
+        } else {
+            ApiError::bad_request(format!("Writer does not exist: {}", request.writer))
+        }
+    })?;
+    let feed = state
+        .control
+        .active_feed_by_id(writer.feed_id)
+        .await
+        .ok_or_else(|| ApiError::bad_request("Writer Feed does not exist"))?;
+    authorize_namespace(state, headers, &feed.name, PermissionAction::Write)?;
+    let routing_key = decode_base64("key_base64", &request.key_base64)?;
+    if routing_key.is_empty() {
+        return Err(ApiError::bad_request(
+            "key_base64 must contain a non-empty key",
+        ));
+    }
+    let (route, _) = state
+        .control
+        .active_range_for_key(feed.feed_id, &routing_key)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
+    let mut definition = writer.clone();
+    for _ in 0..20 {
+        if definition.session_epoch >= request.session_epoch {
+            break;
+        }
+        // The client's session may have opened on another ingress and not
+        // applied here yet — wait briefly rather than fencing it stale.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        match state.control.active_writer_by_name(&request.writer).await {
+            Some(fresh) => definition = fresh,
+            None => break,
+        }
+    }
+    if !definition.session_active {
+        return Err(ApiError::bad_request(format!(
+            "Writer {} has no active session",
+            request.writer
+        )));
+    }
+    if definition.session_epoch != request.session_epoch {
+        return Err(ApiError::bad_request(format!(
+            "stale Writer session epoch: current={}, supplied={}",
+            definition.session_epoch, request.session_epoch
+        )));
+    }
+    Ok((
+        ClientAppendRequest {
+            request_id: request.request_id,
+            feed: feed.name.clone(),
+            writer_session_id: writer.writer_id,
+            writer_epoch: request.session_epoch,
+            sequence: 0,
+            event_time_ns: request.event_time_ns.clone(),
+            key_base64: request.key_base64.clone(),
+            payload_base64: request.payload_base64.clone(),
+            metadata_base64: request.metadata_base64.clone(),
+            use_compression: request.use_compression,
+            pending_effect: None,
+            mint_sequence: true,
+        },
+        route.range_id,
+    ))
+}
+
 async fn writer_batch_append(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -15066,14 +15227,82 @@ async fn writer_batch_append(
             "Writer batch encoded payload exceeds the maximum frame budget",
         ));
     }
-    let mut results = Vec::with_capacity(request.records.len());
-    for record in request.records {
-        results.push(
-            writer_session_append(State(state.clone()), headers.clone(), Json(record))
-                .await?
-                .0,
-        );
+    let originals = request.records;
+    // Fast path: resolve each record to a minted owner request, group the
+    // run by the Range its key routes to, and commit each group as one
+    // quorum round. Any group-level refusal falls back to the per-record
+    // session path, which carries the sequence-healing retry contract.
+    let mut prepared = Vec::with_capacity(originals.len());
+    for record in &originals {
+        prepared.push(writer_batch_prepare(&state, &headers, record).await?);
     }
+    let mut group_order: Vec<crate::active_range::RangeId> = Vec::new();
+    let mut groups: BTreeMap<crate::active_range::RangeId, (Vec<usize>, Vec<ClientAppendRequest>)> =
+        BTreeMap::new();
+    for (index, (request, range_id)) in prepared.into_iter().enumerate() {
+        if !groups.contains_key(&range_id) {
+            group_order.push(range_id);
+        }
+        let entry = groups.entry(range_id).or_default();
+        entry.0.push(index);
+        entry.1.push(request);
+    }
+    let mut results: Vec<Option<WriterAppendResponse>> = Vec::new();
+    results.resize_with(originals.len(), || None);
+    let originals = std::sync::Arc::new(originals);
+    // Ranges are independent pipelines: drive their groups concurrently.
+    // Chunks inside one group stay sequential — Writer sequences mint in
+    // submission order under the range lock, so overlapping chunks of the
+    // same run could invert them.
+    let mut group_runs = Vec::with_capacity(group_order.len());
+    for range_id in group_order {
+        let (indices, requests) = groups.remove(&range_id).expect("queued range group");
+        let state = state.clone();
+        let headers = headers.clone();
+        let originals = originals.clone();
+        group_runs.push(async move {
+            let mut landed: Vec<(usize, WriterAppendResponse)> = Vec::new();
+            let mut offset = 0;
+            while offset < requests.len() {
+                // One quorum round per chunk: the internal plane bounds a
+                // replica batch at MAX_REPLICA_BATCH_FRAMES.
+                let end = (offset + MAX_REPLICA_BATCH_FRAMES).min(requests.len());
+                let chunk: Vec<ClientAppendRequest> = requests[offset..end].to_vec();
+                match route_append_batch_to_owner(&state, range_id, chunk).await {
+                    Ok(chunk_results) => {
+                        for (index, result) in indices[offset..end].iter().zip(chunk_results) {
+                            landed.push((*index, result));
+                        }
+                    }
+                    Err(_) => {
+                        for index in &indices[offset..end] {
+                            landed.push((
+                                *index,
+                                writer_session_append(
+                                    State(state.clone()),
+                                    headers.clone(),
+                                    Json(originals[*index].clone()),
+                                )
+                                .await?
+                                .0,
+                            ));
+                        }
+                    }
+                }
+                offset = end;
+            }
+            Ok::<_, ApiError>(landed)
+        });
+    }
+    for group_result in futures_util::future::join_all(group_runs).await {
+        for (index, result) in group_result? {
+            results[index] = Some(result);
+        }
+    }
+    let results: Vec<WriterAppendResponse> = results
+        .into_iter()
+        .map(|result| result.expect("every range group produced results"))
+        .collect();
     let hot_key = results.iter().any(|result| result.feedback.hot_key);
     Ok(Json(WriterBatchAppendResponse {
         results,
@@ -15943,53 +16172,10 @@ async fn owner_append_local(
     }
     .map_err(|error| {
         let occupant = error.pending_effect.clone();
-        // A refused append leaves its allocated Writer sequence
-        // unconsumed; once later appends advance the stream, the
-        // deduped allocation can never fill the hole. Tag it so the
-        // session append path can re-allocate and heal the retry.
-        let api = if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
-            && error.message.contains("is stale; latest accepted sequence")
-        {
-            ApiError {
-                status: StatusCode::CONFLICT,
-                message: error.message,
-                code: Some("writer.stale_sequence"),
-            }
-        } else if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
-            && error.message.contains("has a gap; expected")
-        {
-            ApiError {
-                status: StatusCode::CONFLICT,
-                message: error.message,
-                code: Some("writer.sequence_gap"),
-            }
-        } else if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
-            && error.message.contains("different record bytes")
-        {
-            ApiError {
-                status: StatusCode::CONFLICT,
-                message: error.message,
-                code: Some("writer.sequence_conflict"),
-            }
-        } else if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
-            && error
-                .message
-                .contains("Cursor already belongs to another position")
-        {
-            // A request_id reuse whose bytes differ from the committed
-            // record is request poison, not persistence sickness: the
-            // Cursor binds the original request identity, so refuse the
-            // mismatched retry as a client conflict rather than a
-            // retryable storage failure.
-            ApiError {
-                status: StatusCode::CONFLICT,
-                message: error.message,
-                code: None,
-            }
-        } else {
-            majority_api_error(error)
-        };
-        OwnerAppendError { api, occupant }
+        OwnerAppendError {
+            api: majority_append_owner_api_error(error),
+            occupant,
+        }
     })?;
     state
         .demand
@@ -16008,6 +16194,322 @@ async fn owner_append_local(
     })
 }
 
+/// Internal endpoint: one minted Writer batch for a single Active Range.
+/// The whole run lands (or refuses) under one quorum round; a refusal
+/// fails the batch atomically and the caller's per-request identities
+/// dedupe the retried prefix.
+async fn owner_append_batch(
+    State(state): State<AppState>,
+    Json(request): Json<InternalOwnerBatchAppendRequest>,
+) -> Json<InternalOwnerBatchAppendResponse> {
+    Json(
+        match owner_append_batch_local(&state, request.requests).await {
+            Ok(results) => InternalOwnerBatchAppendResponse {
+                results: Some(results),
+                error: None,
+                retryable: false,
+                code: None,
+            },
+            Err(error) => InternalOwnerBatchAppendResponse {
+                results: None,
+                retryable: error.api.status == StatusCode::SERVICE_UNAVAILABLE,
+                error: Some(error.api.message),
+                code: error.api.code.map(str::to_owned),
+            },
+        },
+    )
+}
+
+/// Owner-side batch append: every record resolves to one Active Range,
+/// decodes into its own StoredRecord/encoder pair, and lands through one
+/// `append_minted_batch` quorum round. Per-record identity, dedup, and
+/// fencing are identical to `owner_append_local`; only the shared costs
+/// are amortized.
+async fn owner_append_batch_local(
+    state: &AppState,
+    requests: Vec<ClientAppendRequest>,
+) -> Result<Vec<WriterAppendResponse>, OwnerAppendError> {
+    if requests.is_empty() || requests.len() > MAX_REPLICA_BATCH_FRAMES {
+        return Err(ApiError::bad_request(format!(
+            "owner batch must carry 1..={MAX_REPLICA_BATCH_FRAMES} records"
+        ))
+        .into());
+    }
+    if requests.iter().any(|request| !request.mint_sequence) {
+        return Err(ApiError::bad_request(
+            "owner batches mint Writer sequences; explicit-sequence records use the single append path",
+        )
+        .into());
+    }
+    if requests
+        .iter()
+        .any(|request| request.pending_effect.is_some())
+    {
+        return Err(ApiError::bad_request(
+            "pending_effect is reserved for effect-journal appends; public Writer batches commit on success",
+        )
+        .into());
+    }
+    let local = state.storage_node_id.as_ref().ok_or_else(|| {
+        ApiError::unavailable("this Node is not configured for Active Range routing")
+    })?;
+    let mut feed: Option<crate::control::FeedDefinition> = None;
+    let mut assignment: Option<crate::active_range::ActiveRangeAssignment> = None;
+    let mut replica_requests = Vec::with_capacity(requests.len());
+    let mut encoders = Vec::with_capacity(requests.len());
+    let mut pressure = Vec::with_capacity(requests.len());
+    for request in requests {
+        let feed_r = feed_when_applied(&state.control, &request.feed, state.control_plane.is_some())
+            .await
+            .ok_or_else(|| {
+                if state.control_plane.is_some() {
+                    ApiError::unavailable(format!(
+                        "Feed {} is not available on this Append Owner; verify it exists or retry with the same request ID",
+                        request.feed
+                    ))
+                } else {
+                    ApiError::bad_request(format!("Feed does not exist: {}", request.feed))
+                }
+            })?;
+        let routing_key = decode_base64("key_base64", &request.key_base64)?;
+        if routing_key.is_empty() {
+            return Err(ApiError::bad_request("key_base64 must contain a non-empty key").into());
+        }
+        let (_, assignment_r) = state
+            .control
+            .active_range_for_key(feed_r.feed_id, &routing_key)
+            .await
+            .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
+        match (&feed, &assignment) {
+            (None, None) => {
+                feed = Some(feed_r.clone());
+                assignment = Some(assignment_r.clone());
+            }
+            (Some(f), Some(a))
+                if f.feed_id == feed_r.feed_id && a.range_id == assignment_r.range_id => {}
+            _ => {
+                return Err(ApiError::bad_request(
+                    "owner batch records must resolve to one Active Range",
+                )
+                .into())
+            }
+        }
+        if &assignment_r.owner != local {
+            return Err(ApiError::unavailable(format!(
+                "Node is not current Append Owner {}; refresh assignment and retry",
+                assignment_r.owner
+            ))
+            .into());
+        }
+        let key = routing_key;
+        let payload = decode_base64("payload_base64", &request.payload_base64)?;
+        pressure.push((key.clone(), key.len().saturating_add(payload.len())));
+        let metadata = request
+            .metadata_base64
+            .into_iter()
+            .map(|(name, value)| {
+                decode_base64("metadata_base64", &value).map(|value| (name, value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let ingest_time_ns = unix_ns();
+        let event_time_ns = request
+            .event_time_ns
+            .as_deref()
+            .map(str::parse::<i64>)
+            .transpose()
+            .map_err(|_| {
+                ApiError::bad_request("event_time_ns must be a signed 64-bit decimal string")
+            })?
+            .unwrap_or(ingest_time_ns);
+        let message_id = deterministic_uuid(request.request_id, "message");
+        let cursor = feed_cursor(feed_r.feed_id, request.request_id);
+        let record = StoredRecord {
+            message_id,
+            producer_id: request.writer_session_id,
+            producer_sequence: request.sequence,
+            event_time_ns,
+            ingest_time_ns,
+            key,
+            payload,
+            metadata,
+        };
+        let use_compression = request.use_compression;
+        encoders.push(move |sequence: u64| {
+            let mut record = record.clone();
+            record.producer_sequence = sequence;
+            crate::codec::encode_record_with_compression(&record, use_compression)
+                .map(|frame| STANDARD.encode(frame))
+        });
+        replica_requests.push(ReplicaAppendRequest {
+            feed_id: feed_r.feed_id,
+            range_id: assignment_r.range_id,
+            generation: assignment_r.generation,
+            ownership_epoch: assignment_r.ownership_epoch,
+            append_owner: assignment_r.owner.clone(),
+            expected_position: RangePosition::new(0),
+            identity: AppendIdentity {
+                writer_session_id: request.writer_session_id,
+                writer_epoch: request.writer_epoch,
+                sequence: request.sequence,
+            },
+            cursor,
+            frame_base64: String::new(),
+            pending_effect: None,
+        });
+    }
+    let assignment = assignment.expect("non-empty batch resolved an assignment");
+    let coordinator = state
+        .majority_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("majority append coordinator is unavailable"))?;
+    let results = coordinator
+        .append_minted_batch(replica_requests, encoders)
+        .await
+        .map_err(|error| {
+            let occupant = error.pending_effect.clone();
+            OwnerAppendError {
+                api: majority_append_owner_api_error(error),
+                occupant,
+            }
+        })?;
+    let mut responses = Vec::with_capacity(results.len());
+    for ((key, bytes), result) in pressure.into_iter().zip(results) {
+        state
+            .demand
+            .record_range_append(assignment.range_id, &key, bytes);
+        let hot_key = state.demand.is_hot_key(assignment.range_id, &key);
+        responses.push(WriterAppendResponse {
+            message_id: result.message_id,
+            cursor: result.cursor,
+            deduplicated: result.deduplicated,
+            durability: "majority_committed".to_owned(),
+            feedback: writer_feedback(&state.demand, hot_key),
+        });
+    }
+    Ok(responses)
+}
+
+/// Resolve the Active Range's current Append Owner and forward the whole
+/// batch to it — locally, or over one internal round-trip. Responses stay
+/// request-ordered; a batch-level refusal maps to the same retry classes
+/// the single-append forwarder returns.
+async fn route_append_batch_to_owner(
+    state: &AppState,
+    range_id: crate::active_range::RangeId,
+    requests: Vec<ClientAppendRequest>,
+) -> Result<Vec<WriterAppendResponse>, ApiError> {
+    let assignment = state
+        .control
+        .active_range_assignment_by_id(range_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Active Range assignment is unavailable"))?;
+    let local = state.storage_node_id.as_ref().ok_or_else(|| {
+        ApiError::unavailable("this Node is not configured for Active Range routing")
+    })?;
+    if &assignment.owner == local {
+        return owner_append_batch_local(state, requests)
+            .await
+            .map_err(|error| error.api);
+    }
+    let endpoint = state
+        .control_endpoints
+        .resolve(&assignment.owner)
+        .await
+        .ok_or_else(|| {
+            ApiError::unavailable(format!(
+                "current Append Owner {} has no endpoint",
+                assignment.owner
+            ))
+        })?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("internal forwarding credential is unavailable"))?;
+    let response = state
+        .internal_http
+        .post(format!(
+            "{}/internal/active-range/owner/append-batch",
+            endpoint.trim_end_matches('/')
+        ))
+        .header("x-whitewater-control-key", key)
+        .json(&InternalOwnerBatchAppendRequest { requests })
+        .send()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(ApiError::unavailable(format!(
+            "Append Owner returned HTTP {}",
+            response.status()
+        )));
+    }
+    let response: InternalOwnerBatchAppendResponse = response
+        .json()
+        .await
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    response.results.ok_or_else(|| ApiError {
+        status: if response.retryable {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::CONFLICT
+        },
+        message: response
+            .error
+            .unwrap_or_else(|| "Append Owner returned no result".to_owned()),
+        code: match response.code.as_deref() {
+            Some("writer.stale_sequence") => Some("writer.stale_sequence"),
+            Some("writer.sequence_gap") => Some("writer.sequence_gap"),
+            Some("writer.sequence_conflict") => Some("writer.sequence_conflict"),
+            _ => None,
+        },
+    })
+}
+
+/// Map a refused majority append to the ApiError the session path heals
+/// on — sequence stale/gap/conflict stay client-visible conflicts, cursor
+/// poison refuses loudly, everything else delegates to the shared mapper.
+fn majority_append_owner_api_error(error: crate::active_range::MajorityAppendError) -> ApiError {
+    if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
+        && error.message.contains("is stale; latest accepted sequence")
+    {
+        ApiError {
+            status: StatusCode::CONFLICT,
+            message: error.message,
+            code: Some("writer.stale_sequence"),
+        }
+    } else if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
+        && error.message.contains("has a gap; expected")
+    {
+        ApiError {
+            status: StatusCode::CONFLICT,
+            message: error.message,
+            code: Some("writer.sequence_gap"),
+        }
+    } else if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
+        && error.message.contains("different record bytes")
+    {
+        ApiError {
+            status: StatusCode::CONFLICT,
+            message: error.message,
+            code: Some("writer.sequence_conflict"),
+        }
+    } else if error.code == crate::active_range::MajorityAppendErrorCode::LocalStorageFailure
+        && error
+            .message
+            .contains("Cursor already belongs to another position")
+    {
+        // A request_id reuse whose bytes differ from the committed record
+        // is request poison: the Cursor binds the original request
+        // identity, so refuse the mismatched retry as a client conflict
+        // rather than a retryable storage failure.
+        ApiError {
+            status: StatusCode::CONFLICT,
+            message: error.message,
+            code: None,
+        }
+    } else {
+        majority_api_error(error)
+    }
+}
 /// The sequence the range can accept next, parsed out of a Writer
 /// sequence refusal: `has a gap; expected N` reports N directly while
 /// `is stale; latest accepted sequence is N` bounds at N+1. `None` for
@@ -27192,6 +27694,20 @@ mod tests {
                 .map_err(crate::active_range::ReplicaTransportError::replica)
         }
 
+        async fn append_batch(
+            &self,
+            replica: &crate::active_range::StorageNodeId,
+            request: crate::active_range::ReplicaBatchAppendRequest,
+        ) -> Result<
+            Vec<crate::active_range::ReplicaAppendAccepted>,
+            crate::active_range::ReplicaTransportError,
+        > {
+            self.services[replica]
+                .import_committed_batch(request)
+                .await
+                .map_err(crate::active_range::ReplicaTransportError::replica)
+        }
+
         async fn commit(
             &self,
             replica: &crate::active_range::StorageNodeId,
@@ -27661,6 +28177,333 @@ mod tests {
             .unwrap();
         let message = String::from_utf8_lossy(&body);
         assert!(!message.contains("stale Writer session epoch"), "{message}");
+    }
+
+    #[tokio::test]
+    async fn owner_append_batch_lands_the_run_in_one_commit() {
+        let directory = TempDir::new().unwrap();
+        let (mut state, plane, control, _replica) = internal_replica_test_state(&directory).await;
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        let assignment = control.active_range_assignment(feed.feed_id).await.unwrap();
+        let services: BTreeMap<_, _> = assignment
+            .replicas
+            .iter()
+            .map(|node| {
+                (
+                    node.clone(),
+                    Arc::new(crate::active_range::ReplicaAppendService::new(
+                        directory.path().join("owner-ranges").join(node.as_str()),
+                        node.clone(),
+                        control.clone(),
+                    )),
+                )
+            })
+            .collect();
+        let owner = assignment.owner.clone();
+        let services = Arc::new(services);
+        state.storage_node_id = Some(owner.clone());
+        state.replica_append = Some(services[&owner].clone());
+        state.majority_append = Some(Arc::new(
+            crate::active_range::MajorityAppendCoordinator::new(
+                services[&owner].clone(),
+                control.clone(),
+                Arc::new(LoopbackReplicaTransport {
+                    services: services.clone(),
+                }),
+            ),
+        ));
+        let app = router(state);
+        let writer = Uuid::from_u128(777);
+        let batch_body = |first_id: u128| {
+            serde_json::json!({
+                "requests": (0..3).map(|index| serde_json::json!({
+                    "request_id": Uuid::from_u128(first_id + index),
+                    "feed": "orders.events",
+                    "writer_session_id": writer,
+                    "writer_epoch": 1,
+                    "sequence": 0,
+                    "mint_sequence": true,
+                    // A retried batch must be byte-identical — the Cursor
+                    // binds request_id to its original record bytes.
+                    "event_time_ns": "1700000000000000000",
+                    "key_base64": base64::engine::general_purpose::STANDARD.encode(
+                        format!("customer-{index}"),
+                    ),
+                    "payload_base64": base64::engine::general_purpose::STANDARD.encode(
+                        format!("payload-{index}"),
+                    ),
+                })).collect::<Vec<_>>(),
+            })
+        };
+        let post_batch = |body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/internal/active-range/owner/append-batch")
+                .header("content-type", "application/json")
+                .header(
+                    "x-whitewater-control-key",
+                    "this-is-a-long-control-plane-key",
+                )
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(post_batch(batch_body(800)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: InternalOwnerBatchAppendResponse = serde_json::from_slice(&bytes).unwrap();
+        let results = reply.results.expect("batch landed");
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|result| !result.deduplicated));
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.durability.as_str())
+                .collect::<Vec<_>>(),
+            vec!["majority_committed"; 3],
+        );
+        // One commit marker released the whole prefix on every replica.
+        for node in assignment.replicas.iter() {
+            let committed = services[node]
+                .read_staged_committed(&assignment, None, 10)
+                .await
+                .unwrap();
+            assert_eq!(committed.len(), 3, "replica {node} must hold the run");
+            assert_eq!(
+                committed
+                    .iter()
+                    .map(|frame| frame.position.value())
+                    .collect::<Vec<_>>(),
+                vec![1, 2, 3],
+            );
+        }
+        // A retried batch dedupes to the same positions — the deduped
+        // prefix flushes identically instead of restaging.
+        let response = app
+            .clone()
+            .oneshot(post_batch(batch_body(800)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: InternalOwnerBatchAppendResponse = serde_json::from_slice(&bytes).unwrap();
+        let retried = reply
+            .results
+            .unwrap_or_else(|| panic!("retried batch refused: {:?}", reply.error));
+        assert_eq!(retried.len(), 3);
+        assert!(retried.iter().all(|result| result.deduplicated));
+        assert_eq!(
+            retried
+                .iter()
+                .map(|result| result.cursor.clone())
+                .collect::<Vec<_>>(),
+            results
+                .iter()
+                .map(|result| result.cursor.clone())
+                .collect::<Vec<_>>(),
+        );
+        for node in assignment.replicas.iter() {
+            assert_eq!(
+                services[node]
+                    .read_staged_committed(&assignment, None, 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                3,
+            );
+        }
+        plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn replica_append_batch_endpoint_validates_the_envelope() {
+        let directory = TempDir::new().unwrap();
+        let (app, plane, control, _replica) = internal_replica_test_router(&directory).await;
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        let assignment = control.active_range_assignment(feed.feed_id).await.unwrap();
+        let post = |body: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/internal/active-range/replica/append-batch")
+                .header("content-type", "application/json")
+                .header(
+                    "x-whitewater-control-key",
+                    "this-is-a-long-control-plane-key",
+                )
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let empty = app
+            .clone()
+            .oneshot(post(serde_json::json!({
+                "feed_id": feed.feed_id,
+                "range_id": assignment.range_id,
+                "generation": assignment.generation,
+                "ownership_epoch": assignment.ownership_epoch,
+                "append_owner": assignment.owner,
+                "frames": [],
+            })))
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(empty.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: ReplicaBatchAppendResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(reply.results.is_none());
+        assert!(reply.error.is_some());
+        // A frame claiming a foreign owner is fenced before storage.
+        let foreign = app
+            .clone()
+            .oneshot(post(serde_json::json!({
+                "feed_id": feed.feed_id,
+                "range_id": assignment.range_id,
+                "generation": assignment.generation,
+                "ownership_epoch": assignment.ownership_epoch,
+                "append_owner": "control-9",
+                "frames": [{
+                    "expected_position": 1,
+                    "identity": {
+                        "writer_session_id": Uuid::from_u128(1),
+                        "writer_epoch": 1,
+                        "sequence": 1,
+                    },
+                    "cursor": "opaque",
+                    "frame_base64": "",
+                }],
+            })))
+            .await
+            .unwrap();
+        assert_eq!(foreign.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(foreign.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: ReplicaBatchAppendResponse = serde_json::from_slice(&bytes).unwrap();
+        assert!(reply.results.is_none());
+        assert!(reply.error.is_some());
+        plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_batch_endpoint_commits_the_grouped_run() {
+        let directory = TempDir::new().unwrap();
+        let (mut state, plane, control, _replica) = internal_replica_test_state(&directory).await;
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        let assignment = control.active_range_assignment(feed.feed_id).await.unwrap();
+        let services: BTreeMap<_, _> = assignment
+            .replicas
+            .iter()
+            .map(|node| {
+                (
+                    node.clone(),
+                    Arc::new(crate::active_range::ReplicaAppendService::new(
+                        directory.path().join("owner-ranges").join(node.as_str()),
+                        node.clone(),
+                        control.clone(),
+                    )),
+                )
+            })
+            .collect();
+        let owner = assignment.owner.clone();
+        let services = Arc::new(services);
+        state.storage_node_id = Some(owner.clone());
+        state.replica_append = Some(services[&owner].clone());
+        state.majority_append = Some(Arc::new(
+            crate::active_range::MajorityAppendCoordinator::new(
+                services[&owner].clone(),
+                control.clone(),
+                Arc::new(LoopbackReplicaTransport {
+                    services: services.clone(),
+                }),
+            ),
+        ));
+        control
+            .execute(
+                "CREATE WRITER orders.writer TO orders.events;                  OPEN WRITER SESSION orders.writer;",
+            )
+            .await
+            .unwrap();
+        let app = router(state);
+        let records: Vec<serde_json::Value> = (0..4)
+            .map(|index| {
+                serde_json::json!({
+                    "request_id": Uuid::from_u128(900 + index),
+                    "writer": "orders.writer",
+                    "session_epoch": 1,
+                    "event_time_ns": "1700000000000000000",
+                    "key_base64": base64::engine::general_purpose::STANDARD.encode(
+                        format!("customer-{index}"),
+                    ),
+                    "payload_base64": base64::engine::general_purpose::STANDARD.encode(
+                        format!("payload-{index}"),
+                    ),
+                })
+            })
+            .collect();
+        let post = |records: Vec<serde_json::Value>| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/writers/append-batch")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer this-is-a-long-development-api-key")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "records": records })).unwrap(),
+                ))
+                .unwrap()
+        };
+        let response = app.clone().oneshot(post(records.clone())).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: WriterBatchAppendResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reply.results.len(), 4);
+        assert!(reply.results.iter().all(|result| !result.deduplicated));
+        let cursors: std::collections::BTreeSet<_> = reply
+            .results
+            .iter()
+            .map(|result| result.cursor.clone())
+            .collect();
+        assert_eq!(cursors.len(), 4);
+        // The run committed on the replica quorum, not just the owner.
+        for node in assignment.replicas.iter() {
+            assert_eq!(
+                services[node]
+                    .read_staged_committed(&assignment, None, 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                4,
+                "replica {node} must hold the committed run",
+            );
+        }
+        // The same request identities dedupe on retry.
+        let response = app.clone().oneshot(post(records)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let reply: WriterBatchAppendResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(reply.results.len(), 4);
+        assert!(reply.results.iter().all(|result| result.deduplicated));
+        for node in assignment.replicas.iter() {
+            assert_eq!(
+                services[node]
+                    .read_staged_committed(&assignment, None, 10)
+                    .await
+                    .unwrap()
+                    .len(),
+                4,
+            );
+        }
+        plane.raft().shutdown().await.unwrap();
     }
 
     #[test]

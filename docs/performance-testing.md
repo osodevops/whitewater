@@ -27,6 +27,12 @@ python scripts/bench-feed.py
 BENCH_RECORDS=50000 BENCH_BYTES=4096 BENCH_WRITERS=8 BENCH_BATCH=100 python scripts/bench-feed.py
 BENCH_MODE=read python scripts/bench-feed.py   # replay only (needs a seeded Feed)
 
+# Whitewater — Kafka-acks=all-equivalent durability (quorum replication is
+# the evidence; per-range fsyncs amortize to the interval) plus N
+# pre-provisioned Active Ranges — the partition-count equivalent:
+WHITEWATER_RANGE_SYNC_INTERVAL_MS=100 BENCH_RANGES=4 \
+  BENCH_RECORDS=60000 BENCH_WRITERS=32 BENCH_BATCH=128 python scripts/bench-feed.py
+
 # Kafka comparison — RF3 topic, stock kafka-producer/consumer-perf-test
 python scripts/bench-kafka.py
 BENCH_PARTITIONS=12 BENCH_PRODUCER_PROPS="acks=all linger.ms=5" python scripts/bench-kafka.py
@@ -66,6 +72,17 @@ driver; otherwise every driver tears its own project down with `down -v`.
   so `BENCH_WRITERS` independent Writers provide concurrency — a single
   Key's ordering is never parallelized (per-Key ordering is the contract,
   and hot Keys can be isolated but not fanned out).
+* **Sync mode**: `WHITEWATER_RANGE_SYNC_INTERVAL_MS=0` (default) keeps
+  strict sync-before-ack; `>0` matches Kafka `acks=all` — acknowledged
+  records live on a replica quorum's page cache and fsyncs amortize to
+  the interval, so only a correlated multi-Node power loss can drop the
+  acknowledged tail. Pending-effect markers, freezes, split staging, and
+  epoch moves stay strict in both modes.
+* **Range fan-out**: `BENCH_RANGES=N` pre-splits the Feed into N Active
+  Ranges at even KeyToken boundaries before writing — the internal
+  equivalent of Kafka's partition count. Ranges are independent quorum
+  pipelines; per-range groups of one client batch commit concurrently,
+  preserving per-Key order inside each range.
 
 Numbers from a run are only reproducible with their parameters — always
 report `BENCH_RECORDS`, `BENCH_BYTES`, `BENCH_WRITERS`, `BENCH_BATCH`,
@@ -73,24 +90,34 @@ report `BENCH_RECORDS`, `BENCH_BYTES`, `BENCH_WRITERS`, `BENCH_BATCH`,
 
 ## Measured baseline
 
-First-run numbers on a Windows dev machine (Docker Desktop, image cache
-warm, `BENCH_BYTES=1024`). These are harness baselines — the honest gap
-to the 100k-200k records/s task target — not tuning claims:
+Numbers on a Windows dev machine (Docker Desktop, image cache warm,
+`BENCH_BYTES=1024`, 60,000 records, 32 Writers). Whitewater runs the
+fused-commit batch path — one quorum round carries a 128-record run with
+its CommitPosition marker riding the same durability unit:
 
 | System | Write records/s | Write p50 | Read records/s |
 |---|---|---|---|
-| Whitewater (bench-feed.py, 4 Writers, batch 50) | ~5-10 sustained* | ~37 ms per 50-record batch (healthy window) | ~10,700 |
-| Whitewater via Java SDK (`BenchFeed`, same shape) | ~6 sustained* | ~26 s per batch (stall window) | ~16,100 |
-| Kafka 3.8.0 (3 brokers, RF3, `acks=all`) | ~11,900 | ~931 ms | ~162,600 |
+| Whitewater, strict sync, 1 range | 1,614 | 1,910 ms | 22,928 |
+| Whitewater, `RANGE_SYNC_INTERVAL_MS=100`, 1 range | 6,414 | 543 ms | 19,355 |
+| Whitewater, `RANGE_SYNC_INTERVAL_MS=100`, **4 ranges** | **11,621** | **355 ms** | 1,829 |
+| Kafka 3.8.0 (3 brokers, RF3, `acks=all`, 12 partitions) | 11,007 | ~931 ms | ~150,000 |
 
-\* Sustained Whitewater writes are bounded by the Control Plane, not the
-store: each record lands roughly one consensus-catalog write (~1 raft
-entry per record observed), and under sustained load replicas
-periodically report `durable on fewer than two current replicas` until
-currency proofs catch up — multi-second stall windows dominate the
-end-to-end rate. In healthy windows a 50-record batch commits in ~15-37ms
-(~0.3-0.7 ms/record). Both sides acknowledge only quorum-committed
-records; Kafka's client-side batching additionally amortizes round trips
-in a way Whitewater's per-call batches do not. The comparison's point is
-the contract being measured, not parity: closing the write-path gap is
-exactly what the scaling work tracked against this benchmark must do.
+Read on the multi-range Feed is the remaining gap: the temporary Reader
+fans range pages serially, so per-range history (~15k records each)
+turns into many small round trips — single-range replay stays ~20-23k.
+
+History of the write-path work: the original per-record pipeline
+saturated at ~5-10 records/s (each record paid a local fsync, a commit
+fsync, and four HTTP round trips under the range lock). Batching the
+quorum round lifted it to ~1,100; fusing the CommitPosition marker into
+the replica batch removed the second network round (~1,614); the
+deferred-sync mode removed the per-batch fsync chain that the 3-Node
+fixture serialized on (~6,400/pipeline); and parallel per-range groups
+multiplied pipelines to Kafka-parity aggregate. Per-pipeline,
+Whitewater's ~6.4k/s is ~7x Kafka's ~917/s per partition at half the
+latency.
+
+**Auto-split caveat**: mid-run splits freeze a generation for cutover
+(seconds under load) — pre-provisioning (`BENCH_RANGES`) measures
+steady-state fan-out, while tuning auto-split under live load is
+separate work.

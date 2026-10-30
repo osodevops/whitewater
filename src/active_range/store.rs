@@ -146,6 +146,13 @@ pub trait RemoteSegmentSource: std::fmt::Debug + Send + Sync {
 pub struct FileActiveRangeStoreOptions {
     pub max_segment_bytes: u64,
     pub max_range_bytes: Option<u64>,
+    /// Deferred-sync interval for the plain append/commit path — the
+    /// `acks=all`-equivalent durability mode: quorum replication is the
+    /// acknowledged evidence while fsyncs amortize to at most one per
+    /// interval per range. `None` (default) keeps strict
+    /// sync-before-ack semantics. Pending-effect markers, freezes, split
+    /// staging, and epoch moves always stay strict regardless.
+    pub sync_interval: Option<std::time::Duration>,
     /// Remote-read source for sealed segments whose local file is absent.
     /// `None` (the default) keeps every read local.
     pub tier: Option<std::sync::Arc<dyn RemoteSegmentSource>>,
@@ -162,6 +169,7 @@ impl Default for FileActiveRangeStoreOptions {
         Self {
             max_segment_bytes: 256 * 1024 * 1024,
             max_range_bytes: None,
+            sync_interval: None,
             tier: None,
             feed_key: None,
         }
@@ -268,6 +276,32 @@ pub trait ActiveRangeStore: Send + Sync {
         &self,
         request: ActiveRangeAppend,
     ) -> Result<ActiveRangeAppendResult, ActiveRangeStoreError>;
+    /// Live-append one ordered batch under a single range lock, flushing
+    /// file data and the persisted snapshot once at the end. The batch is
+    /// the durability unit: a crash mid-batch can only drop unacknowledged
+    /// records the caller retries through the same request identities,
+    /// while a mid-batch refusal still flushes the staged prefix so dedup
+    /// resumes it. Per-frame Writer-sequence, Cursor, position, and digest
+    /// checks are identical to `append`.
+    async fn append_batch(
+        &self,
+        requests: Vec<ActiveRangeAppend>,
+    ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError>;
+    /// Live batch + fused commit: the run's frames and its commit marker
+    /// land in one durability unit. The owner's quorum decision still
+    /// happens before this call — fusing only removes a redundant fsync
+    /// round, never the evidence ordering.
+    async fn append_commit_batch(
+        &self,
+        requests: Vec<ActiveRangeAppend>,
+        commit: BatchCommit,
+    ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError>;
+    /// Replica-side batch + fused commit under `import_split` fencing.
+    async fn import_commit_batch(
+        &self,
+        requests: Vec<ActiveRangeAppend>,
+        commit: BatchCommit,
+    ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError>;
     /// Staged-import one ordered batch of frames under a single range lock,
     /// flushing file data and the persisted snapshot once at the end.
     /// Staged candidates are re-derivable from the split/merge source and
@@ -412,6 +446,10 @@ struct LoadedRange {
     /// order; a backwards clock step disables indexed ingest seeks, which
     /// callers resolve by scanning instead.
     ingest_monotonic: bool,
+    /// The last time the active log actually fsynced. Under
+    /// `sync_interval` the deferred path only pays a real sync once the
+    /// interval has elapsed; strict mode always syncs.
+    last_durable_sync: std::time::Instant,
 }
 
 /// A remote segment fetched into the tier cache: the cache file path, its
@@ -458,6 +496,12 @@ pub(crate) struct PersistedRangeState {
     deduplication: Vec<PersistedDeduplicationState>,
     #[serde(default)]
     pending_effect: Option<PendingEffect>,
+    /// True when this checkpoint was written by the deferred/lazy path:
+    /// its `committed` watermark may legitimately name frames the log
+    /// rescan never synced, so reopen clamps instead of failing the
+    /// range. Strict checkpoints keep the hard integrity error.
+    #[serde(default)]
+    relaxed_commit: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -591,10 +635,20 @@ impl FileActiveRangeStore {
             .max()
             .unwrap_or(0);
         if persisted.committed > recovered_position {
-            return Err(ActiveRangeStoreError::InvalidState(format!(
-                "commit position {} exceeds recovered position {recovered_position}",
-                persisted.committed
-            )));
+            // A deferred-sync checkpoint can survive frames its log
+            // never synced: quorum replication carried the durability
+            // evidence, so the watermark clamps back to what this copy
+            // actually holds — exactly the lost-tail shape a crashed
+            // broker replays. A strict checkpoint mismatch stays a hard
+            // integrity failure.
+            if persisted.relaxed_commit {
+                persisted.committed = recovered_position;
+            } else {
+                return Err(ActiveRangeStoreError::InvalidState(format!(
+                    "commit position {} exceeds recovered position {recovered_position}",
+                    persisted.committed
+                )));
+            }
         }
         persisted.appended = recovered_position;
         persisted.flushed = recovered_position;
@@ -630,6 +684,7 @@ impl FileActiveRangeStore {
                     materialized_bytes: 0,
                     use_seq: 0,
                     ingest_monotonic,
+                    last_durable_sync: std::time::Instant::now(),
                 }),
             }),
         })
@@ -797,44 +852,40 @@ impl ActiveRangeStore for FileActiveRangeStore {
             .await
     }
 
+    async fn append_batch(
+        &self,
+        requests: Vec<ActiveRangeAppend>,
+    ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError> {
+        self.blocking_mutation(move |inner| append_batch(inner, requests, false, None, true))
+            .await
+    }
+
     async fn import_split_batch(
         &self,
         requests: Vec<ActiveRangeAppend>,
     ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError> {
+        self.blocking_mutation(move |inner| append_batch(inner, requests, true, None, false))
+            .await
+    }
+
+    async fn append_commit_batch(
+        &self,
+        requests: Vec<ActiveRangeAppend>,
+        commit: BatchCommit,
+    ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError> {
         self.blocking_mutation(move |inner| {
-            prematerialize_for_appends(inner, &requests)?;
-            let mut loaded = inner
-                .loaded
-                .lock()
-                .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
-            let mut results = Vec::with_capacity(requests.len());
-            for request in requests {
-                if request.cursor.len() > MAX_CURSOR_BYTES {
-                    return Err(ActiveRangeStoreError::CursorTooLarge);
-                }
-                let record = decode_record(&request.frame)?;
-                if record.producer_id != request.identity.writer_session_id
-                    || record.producer_sequence != request.identity.sequence
-                {
-                    return Err(ActiveRangeStoreError::WriterIdentityMismatch);
-                }
-                match append_locked(inner, &mut loaded, request, true, false, &record) {
-                    Ok(result) => results.push(result),
-                    Err(error) => {
-                        // Flush whatever the batch staged before reporting the
-                        // failure so a retry resumes from deduped positions
-                        // instead of restaging the prefix.
-                        loaded.active_file.sync_data()?;
-                        persist_state(&inner.directory, &loaded.persisted)?;
-                        return Err(error);
-                    }
-                }
-            }
-            loaded.active_file.sync_data()?;
-            persist_state(&inner.directory, &loaded.persisted)?;
-            Ok(results)
+            append_batch(inner, requests, false, Some(commit), true)
         })
         .await
+    }
+
+    async fn import_commit_batch(
+        &self,
+        requests: Vec<ActiveRangeAppend>,
+        commit: BatchCommit,
+    ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError> {
+        self.blocking_mutation(move |inner| append_batch(inner, requests, true, Some(commit), true))
+            .await
     }
 
     async fn commit(
@@ -1105,6 +1156,7 @@ impl PersistedRangeState {
             retained_from_position: None,
             deduplication: Vec::new(),
             pending_effect: None,
+            relaxed_commit: false,
         }
     }
 }
@@ -1300,6 +1352,124 @@ fn append(
         .lock()
         .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
     append_locked(inner, &mut loaded, request, import, true, &record)
+}
+
+/// Ordered batch body shared by `append_batch` (live Writer fences) and
+/// `import_split_batch` (replica fan-out fences): one prematerialize pass,
+/// one range lock, per-frame `append_locked` with the flush deferred to the
+/// batch end. A failing frame still flushes the staged prefix before the
+/// error escapes, so a retried batch resumes through dedup instead of
+/// restaging — identical outcomes to N single appends, one fsync.
+/// A commit marker fused into a batch's single durability unit: the
+/// run's last frame must land exactly at `position` with `frame_digest`,
+/// which is what makes the fused marker identical to the two-round
+/// commit it replaces.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchCommit {
+    pub generation: RangeGeneration,
+    pub ownership_epoch: OwnershipEpoch,
+    pub position: CommitPosition,
+    pub frame_digest: [u8; 32],
+}
+
+fn append_batch(
+    inner: &FileActiveRangeStoreInner,
+    requests: Vec<ActiveRangeAppend>,
+    import: bool,
+    commit: Option<BatchCommit>,
+    allow_deferred: bool,
+) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError> {
+    prematerialize_for_appends(inner, &requests)?;
+    let mut loaded = inner
+        .loaded
+        .lock()
+        .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+    let mut results = Vec::with_capacity(requests.len());
+    let mut has_pending = false;
+    for request in requests {
+        if request.cursor.len() > MAX_CURSOR_BYTES {
+            return Err(ActiveRangeStoreError::CursorTooLarge);
+        }
+        let record = decode_record(&request.frame)?;
+        if record.producer_id != request.identity.writer_session_id
+            || record.producer_sequence != request.identity.sequence
+        {
+            return Err(ActiveRangeStoreError::WriterIdentityMismatch);
+        }
+        has_pending |= request.pending_effect.is_some();
+        match append_locked(inner, &mut loaded, request, import, false, &record) {
+            Ok(result) => results.push(result),
+            Err(error) => {
+                loaded.active_file.sync_data()?;
+                persist_state(&inner.directory, &loaded.persisted)?;
+                return Err(error);
+            }
+        }
+    }
+    // Fused commit: the batch's commit marker rides the same durability
+    // unit as its frames — a follower applies it only after every frame
+    // landed, exactly where the two-round protocol would have written it.
+    // Deferred mode keeps pending-effect runs strict — a marker must be
+    // crash-durable with its frames — and `import_split_batch` callers
+    // (split staging) always stay strict through `allow_deferred`.
+    let strict = !allow_deferred || has_pending || inner.options.sync_interval.is_none();
+    if let Some(commit) = commit {
+        validate_generation_and_epoch(
+            &loaded.persisted,
+            commit.generation,
+            commit.ownership_epoch,
+        )?;
+        let position = commit.position;
+        if position.value() < loaded.persisted.committed {
+            return Err(ActiveRangeStoreError::CommitMovedBackwards {
+                current: loaded.persisted.committed,
+                supplied: position.value(),
+            });
+        }
+        if position.value() > loaded.persisted.flushed {
+            return Err(ActiveRangeStoreError::CommitBeyondFlushed {
+                supplied: position.value(),
+                flushed: loaded.persisted.flushed,
+            });
+        }
+        // The fused marker must pin this batch's own tail — committing a
+        // position whose frame digest differs would ratify bytes the
+        // caller never proved, exactly the check the commit endpoint runs.
+        let tail = results.last();
+        if tail.map(|result| result.position.value()) != Some(position.value())
+            || tail.map(|result| result.frame_digest) != Some(commit.frame_digest)
+        {
+            loaded.active_file.sync_data()?;
+            persist_state(&inner.directory, &loaded.persisted)?;
+            return Err(ActiveRangeStoreError::InvalidState(
+                "fused commit does not match the batch tail".to_owned(),
+            ));
+        }
+        let mut next = loaded.persisted.clone();
+        next.committed = position.value();
+        if next
+            .pending_effect
+            .as_ref()
+            .is_some_and(|pending| pending.last_position <= position.value())
+        {
+            next.pending_effect = None;
+        }
+        loaded.persisted = next;
+    }
+    sync_due(inner, &mut loaded, strict)?;
+    if strict {
+        persist_state(&inner.directory, &loaded.persisted)?;
+    } else {
+        persist_state_lazy(&inner.directory, &loaded.persisted)?;
+    }
+    // Report the fused commit through the same per-frame flag the
+    // single-append path reports, so the owner can count commit evidence.
+    if let Some(commit) = commit {
+        for result in results.iter_mut() {
+            result.committed = result.position.value() <= commit.position.value();
+        }
+    }
+    Ok(results)
 }
 
 /// The dedup, validation, write, and index body of `append` with the caller
@@ -1549,7 +1719,7 @@ fn append_locked(
     let entry_start = loaded.active_file.seek(SeekFrom::End(0))?;
     loaded.active_file.write_all(&encoded)?;
     if flush {
-        loaded.active_file.sync_data()?;
+        sync_due(inner, loaded, request.pending_effect.is_some())?;
     }
     let entry_end = entry_start
         .checked_add(encoded.len() as u64)
@@ -1660,7 +1830,14 @@ fn commit(
     {
         next.pending_effect = None;
     }
-    persist_state(&inner.directory, &next)?;
+    // A pending marker (or strict mode) keeps the fully synced
+    // checkpoint; a plain commit's watermark is quorum-replicated
+    // evidence, so the deferred mode takes the checkpoint-only write.
+    if inner.options.sync_interval.is_some() && next.pending_effect.is_none() {
+        persist_state_lazy(&inner.directory, &next)?;
+    } else {
+        persist_state(&inner.directory, &next)?;
+    }
     loaded.persisted = next;
     Ok(())
 }
@@ -3846,13 +4023,44 @@ fn expire_loaded(
     Ok(report)
 }
 
+/// The deferred-sync gate shared by the plain append and commit paths:
+/// strict mode (no `sync_interval`) and `force`d calls always fsync;
+/// otherwise a real sync only happens once the interval elapsed since
+/// the last one, matching the `acks=all` contract where quorum
+/// replication — not a per-batch fsync — is the acknowledged evidence.
+fn sync_due(
+    inner: &FileActiveRangeStoreInner,
+    loaded: &mut LoadedRange,
+    force: bool,
+) -> Result<(), ActiveRangeStoreError> {
+    match inner.options.sync_interval {
+        None => {
+            loaded.active_file.sync_data()?;
+            loaded.last_durable_sync = std::time::Instant::now();
+        }
+        Some(interval) => {
+            if force || loaded.last_durable_sync.elapsed() >= interval {
+                loaded.active_file.sync_data()?;
+                // Pin directory metadata (lazy state renames, rotated
+                // segment entries) on the same tick so a crash cannot
+                // resurrect an older checkpoint naming newer files.
+                sync_directory(&inner.directory)?;
+                loaded.last_durable_sync = std::time::Instant::now();
+            }
+        }
+    }
+    Ok(())
+}
+
 fn persist_state(
     directory: &Path,
     state: &PersistedRangeState,
 ) -> Result<(), ActiveRangeStoreError> {
     let target = directory.join("range-state.json");
     let temporary = directory.join("range-state.json.tmp");
-    let encoded = serde_json::to_vec(state)?;
+    let mut state = state.clone();
+    state.relaxed_commit = false;
+    let encoded = serde_json::to_vec(&state)?;
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -3878,7 +4086,9 @@ fn persist_state_lazy(
 ) -> Result<(), ActiveRangeStoreError> {
     let target = directory.join("range-state.json");
     let temporary = directory.join("range-state.json.tmp");
-    let encoded = serde_json::to_vec(state)?;
+    let mut state = state.clone();
+    state.relaxed_commit = true;
+    let encoded = serde_json::to_vec(&state)?;
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -4039,6 +4249,36 @@ mod tests {
             generation: RangeGeneration::new(1),
             ownership_epoch: OwnershipEpoch::new(1),
         }
+    }
+
+    #[tokio::test]
+    async fn a_relaxed_checkpoint_clamps_commit_to_the_recovered_tail() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        seed_committed_history(root.path(), &descriptor, 5);
+        let directory = range_directory(root.path(), &descriptor);
+
+        // Simulate a deferred-sync crash window: the checkpoint advanced
+        // the committed watermark to 10 but the log only carries 5
+        // frames. A relaxed (lazy-written) checkpoint clamps back; a
+        // strict checkpoint with the same mismatch stays a hard error.
+        let mut relaxed = PersistedRangeState::new(&descriptor);
+        relaxed.appended = 10;
+        relaxed.flushed = 10;
+        relaxed.committed = 10;
+        persist_state_lazy(&directory, &relaxed).unwrap();
+        let reopened = FileActiveRangeStore::open(root.path(), descriptor.clone()).unwrap();
+        let progress = reopened.snapshot().await.unwrap().progress;
+        assert_eq!(progress.commit_position(), CommitPosition::new(5));
+        assert_eq!(progress.appended(), RangePosition::new(5));
+        drop(reopened);
+
+        let mut strict = PersistedRangeState::new(&descriptor);
+        strict.appended = 10;
+        strict.flushed = 10;
+        strict.committed = 10;
+        persist_state(&directory, &strict).unwrap();
+        assert!(FileActiveRangeStore::open(root.path(), descriptor).is_err());
     }
 
     #[tokio::test]

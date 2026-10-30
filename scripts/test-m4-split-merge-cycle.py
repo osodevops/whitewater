@@ -143,6 +143,21 @@ def main():
         for index in range(8):
             append(f"c{cycle}s", ENDPOINTS[index % 3])
         reader_drain()
+        # A second split against the *right* child — a multi-range Feed's
+        # next split must stage the range containing the token, not the
+        # feed's first range (the bug this regression pins).
+        right_boundary = hex(int(boundary, 16) + ((1 << 128) - int(boundary, 16)) // 2)[2:].zfill(32)
+        status, split2 = retried_post(ENDPOINTS[1], "/v1/admin/ranges/split", {"request_id": str(uuid.uuid4()), "feed": feed, "split_at": right_boundary, "batch_size": 4})
+        if status != 200 or split2.get("status") != "activated": raise AssertionError(f"cycle {cycle} right-child split: {split2}")
+        if len(placement_routes()) != 3: raise AssertionError(f"cycle {cycle} did not leave three Active Ranges")
+        reader_drain()
+        member_drain()
+        routes = placement_routes()
+        status, merged2 = retried_post(ENDPOINTS[2], "/v1/admin/ranges/merge", {"request_id": str(uuid.uuid4()), "feed": feed, "left_range_id": routes[1]["range_id"], "right_range_id": routes[2]["range_id"]})
+        if status != 200 or merged2.get("status") != "activated": raise AssertionError(f"cycle {cycle} right merge: {merged2}")
+        if len(placement_routes()) != 2: raise AssertionError(f"cycle {cycle} did not collapse back to two Active Ranges")
+        reader_drain()
+        member_drain()
         routes = placement_routes()
         status, merged = retried_post(ENDPOINTS[2], "/v1/admin/ranges/merge", {"request_id": str(uuid.uuid4()), "feed": feed, "left_range_id": routes[0]["range_id"], "right_range_id": routes[1]["range_id"]})
         if status != 200 or merged.get("status") != "activated": raise AssertionError(f"cycle {cycle} merge: {merged}")

@@ -20,6 +20,9 @@ x-node: &node
     WHITEWATER_AUTO_SPLIT_SUSTAINED_SAMPLES: ${WHITEWATER_AUTO_SPLIT_SUSTAINED_SAMPLES:-3}
     WHITEWATER_AUTO_SPLIT_COOLDOWN_SAMPLES: ${WHITEWATER_AUTO_SPLIT_COOLDOWN_SAMPLES:-30}
     WHITEWATER_AUTO_MERGE_APPEND_RATE: ${WHITEWATER_AUTO_MERGE_APPEND_RATE:-10}
+    # 0 = strict sync-before-ack; >0 amortizes plain append/commit fsyncs
+    # to the interval (the acks=all durability mode for benchmarks).
+    WHITEWATER_RANGE_SYNC_INTERVAL_MS: ${WHITEWATER_RANGE_SYNC_INTERVAL_MS:-0}
     # The balancer's cold-merge fuse must outlast every acceptance script's
     # quiet window: transition tests split explicitly and then hold the Feed
     # append-quiet through multi-minute Reader drains, which a short fuse

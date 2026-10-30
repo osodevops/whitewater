@@ -143,6 +143,67 @@ impl fmt::Display for ReplicaAppendError {
 
 impl std::error::Error for ReplicaAppendError {}
 
+/// Bounded batch variant of [`ReplicaAppendRequest`]: the owner ships one
+/// ordered run of contiguous frames under a single fencing validation so
+/// a WriterSession batch costs one quorum round-trip per replica instead
+/// of one per record. Position, digest, epoch, and dedup checks apply
+/// per frame exactly as the single-append contract.
+pub const MAX_REPLICA_BATCH_FRAMES: usize = 128;
+/// Total base64 budget for one batch body — keeps the wire bound in the
+/// same order as the single-frame limit.
+pub const MAX_REPLICA_BATCH_BASE64_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaBatchFrame {
+    /// Position the Append Owner landed this frame at. `Some` on the
+    /// follower path — the replica must land it exactly there or dedupe
+    /// to identical bytes, exactly like the single-append contract;
+    /// `None` on the owner path, where frames are unconditional tail
+    /// appends whose landed positions become canonical.
+    #[serde(default)]
+    pub expected_position: Option<RangePosition>,
+    pub identity: AppendIdentity,
+    pub cursor: String,
+    pub frame_base64: String,
+    #[serde(default)]
+    pub pending_effect: Option<super::store::PendingEffectRef>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaBatchAppendRequest {
+    pub feed_id: Uuid,
+    pub range_id: RangeId,
+    pub generation: RangeGeneration,
+    pub ownership_epoch: OwnershipEpoch,
+    pub append_owner: StorageNodeId,
+    pub frames: Vec<ReplicaBatchFrame>,
+    /// Commit marker fused into the batch's durability unit. The owner
+    /// sets it only for runs without pending effects; the replica
+    /// applies it iff every frame landed and the run tail matches —
+    /// one write + one sync + one persisted-state update instead of a
+    /// separate commit round, with the same generation/epoch/monotonic/
+    /// digest fences `commit` enforces.
+    #[serde(default)]
+    pub commit_at: Option<ReplicaBatchCommit>,
+}
+
+/// The owner-authoritative commit evidence a fused batch marker carries:
+/// exactly the `commit` endpoint's position + tail-digest pair.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaBatchCommit {
+    pub position: CommitPosition,
+    pub frame_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReplicaBatchAppendResponse {
+    pub results: Option<Vec<ReplicaAppendAccepted>>,
+    pub error: Option<ReplicaAppendError>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicaAppendResponse {
     pub result: Option<ReplicaAppendAccepted>,
@@ -1393,6 +1454,147 @@ impl ReplicaAppendService {
         })
     }
 
+    /// Replica fan-out for one ordered contiguous batch under the same
+    /// fencing as `import_committed`: one gate acquisition, one
+    /// assignment validation, one file flush + persisted-state write for
+    /// the whole run instead of one per frame. Per-frame position,
+    /// digest, Cursor, and dedup checks are unchanged — a mid-batch
+    /// refusal flushes the staged prefix so the retry resumes from
+    /// deduped positions exactly like a retried single append.
+    /// Owner-live batch: the same per-frame Writer-sequence, dedup,
+    /// position, digest, and pending-effect fences as `append`, with the
+    /// gate, store lock, file sync, and persisted-state write paid once
+    /// for the whole run.
+    pub async fn append_batch(
+        &self,
+        request: ReplicaBatchAppendRequest,
+    ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaAppendError> {
+        self.append_batch_inner(request, false).await
+    }
+
+    /// Replica fan-out batch under `import_committed` fencing — the
+    /// owner-authoritative replay, so live Writer ordering does not apply.
+    pub async fn import_committed_batch(
+        &self,
+        request: ReplicaBatchAppendRequest,
+    ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaAppendError> {
+        self.append_batch_inner(request, true).await
+    }
+
+    async fn append_batch_inner(
+        &self,
+        request: ReplicaBatchAppendRequest,
+        import: bool,
+    ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaAppendError> {
+        let _gate = self.append_gate(request.range_id).await.lock_owned().await;
+        if self
+            .generation_is_frozen(request.range_id, request.generation)
+            .await
+        {
+            return Err(ReplicaAppendError::temporary(
+                ReplicaAppendErrorCode::RangeFrozen,
+                "Active Range generation is frozen for split cutover; retry safely",
+            ));
+        }
+        if request.frames.is_empty() || request.frames.len() > MAX_REPLICA_BATCH_FRAMES {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::InvalidFrame,
+                format!("replica batch must carry 1..={MAX_REPLICA_BATCH_FRAMES} frames"),
+            ));
+        }
+        let wire_bytes: usize = request.frames.iter().map(|f| f.frame_base64.len()).sum();
+        if wire_bytes > MAX_REPLICA_BATCH_BASE64_BYTES {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::FrameTooLarge,
+                format!(
+                    "replica batch exceeds the {} byte limit",
+                    MAX_REPLICA_BATCH_BASE64_BYTES
+                ),
+            ));
+        }
+        let assignment = match self
+            .control
+            .active_range_assignment_by_id(request.range_id)
+            .await
+        {
+            Some(assignment) if assignment.feed_id == request.feed_id => assignment,
+            _ => {
+                return Err(ReplicaAppendError::temporary(
+                    ReplicaAppendErrorCode::AssignmentNotFound,
+                    format!(
+                        "no committed Active Range assignment exists for Feed {}",
+                        request.feed_id
+                    ),
+                ))
+            }
+        };
+        self.validate_assignment_fields(
+            &assignment,
+            request.range_id,
+            request.generation,
+            request.ownership_epoch,
+            &request.append_owner,
+        )?;
+        let store = self.store_for(&assignment).await?;
+        let mut appends = Vec::with_capacity(request.frames.len());
+        for (index, frame_request) in request.frames.iter().enumerate() {
+            if frame_request.frame_base64.len() > MAX_REPLICA_FRAME_BASE64_BYTES {
+                return Err(ReplicaAppendError::rejected(
+                    ReplicaAppendErrorCode::FrameTooLarge,
+                    format!("batch frame {index} exceeds the single-frame byte limit"),
+                ));
+            }
+            let frame = STANDARD
+                .decode(&frame_request.frame_base64)
+                .map_err(|error| {
+                    ReplicaAppendError::rejected(
+                        ReplicaAppendErrorCode::InvalidFrameEncoding,
+                        format!("batch frame {index} is not valid base64: {error}"),
+                    )
+                })?;
+            if frame.len() > MAX_FRAME_BYTES {
+                return Err(ReplicaAppendError::rejected(
+                    ReplicaAppendErrorCode::FrameTooLarge,
+                    format!("batch frame {index} exceeds the {MAX_FRAME_BYTES} byte limit"),
+                ));
+            }
+            appends.push(ActiveRangeAppend {
+                generation: request.generation,
+                ownership_epoch: request.ownership_epoch,
+                expected_position: frame_request.expected_position,
+                identity: frame_request.identity.clone(),
+                cursor: frame_request.cursor.clone(),
+                frame,
+                pending_effect: frame_request.pending_effect,
+            });
+        }
+        let commit = request.commit_at.map(|hint| super::store::BatchCommit {
+            generation: request.generation,
+            ownership_epoch: request.ownership_epoch,
+            position: hint.position,
+            frame_digest: hint.frame_digest,
+        });
+        let results = match (import, commit) {
+            (true, Some(commit)) => store.import_commit_batch(appends, commit).await,
+            (false, Some(commit)) => store.append_commit_batch(appends, commit).await,
+            (true, None) => store.import_split_batch(appends).await,
+            (false, None) => store.append_batch(appends).await,
+        }
+        .map_err(map_store_error)?;
+        Ok(results
+            .into_iter()
+            .map(|result| ReplicaAppendAccepted {
+                position: result.position,
+                message_id: result.message_id,
+                cursor: result.cursor,
+                frame_digest: result.frame_digest,
+                deduplicated: result.deduplicated,
+                committed: result.committed,
+                durable: true,
+            })
+            .collect())
+    }
+
     pub async fn commit(
         &self,
         request: ReplicaCommitRequest,
@@ -1505,21 +1707,38 @@ impl ReplicaAppendService {
         assignment: &ActiveRangeAssignment,
         request: &ReplicaAppendRequest,
     ) -> Result<(), ReplicaAppendError> {
-        if assignment.range_id != request.range_id {
+        self.validate_assignment_fields(
+            assignment,
+            request.range_id,
+            request.generation,
+            request.ownership_epoch,
+            &request.append_owner,
+        )
+    }
+
+    /// Shared fencing for single and batch appends: RangeId, generation,
+    /// ownership epoch, claimed owner, and replica membership all check
+    /// identically — a batch is a run of single appends, not a weaker
+    /// contract.
+    fn validate_assignment_fields(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        range_id: RangeId,
+        generation: RangeGeneration,
+        ownership_epoch: OwnershipEpoch,
+        append_owner: &StorageNodeId,
+    ) -> Result<(), ReplicaAppendError> {
+        if assignment.range_id != range_id {
             return Err(ReplicaAppendError::rejected(
                 ReplicaAppendErrorCode::WrongRange,
                 format!(
-                    "request RangeId {} does not match committed RangeId {}",
-                    request.range_id, assignment.range_id
+                    "request RangeId {range_id} does not match committed RangeId {}",
+                    assignment.range_id
                 ),
             ));
         }
         assignment
-            .validate_request(
-                request.generation,
-                request.ownership_epoch,
-                &request.append_owner,
-            )
+            .validate_request(generation, ownership_epoch, append_owner)
             .map_err(map_assignment_error)?;
         if !assignment.replicas.contains(&self.local_node) {
             return Err(ReplicaAppendError::rejected(

@@ -52,6 +52,17 @@ impl ReplicaTransport for UnusedTransport {
         ))
     }
 
+    async fn append_batch(
+        &self,
+        _replica: &StorageNodeId,
+        _request: whitewater::active_range::ReplicaBatchAppendRequest,
+    ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaTransportError> {
+        Err(ReplicaTransportError::transport(
+            "transport is not used during drain",
+            false,
+        ))
+    }
+
     async fn commit(
         &self,
         _replica: &StorageNodeId,

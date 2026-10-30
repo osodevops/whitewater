@@ -58,6 +58,24 @@ impl ReplicaTransport for DirectTransport {
         Ok(accepted)
     }
 
+    async fn append_batch(
+        &self,
+        replica: &StorageNodeId,
+        request: whitewater::active_range::ReplicaBatchAppendRequest,
+    ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaTransportError> {
+        if self.append_down.contains(replica) {
+            return Err(ReplicaTransportError::transport("append unavailable", true));
+        }
+        let mut accepted = self.services[replica]
+            .import_committed_batch(request)
+            .await
+            .map_err(ReplicaTransportError::replica)?;
+        if self.corrupt_digest.as_ref() == Some(replica) {
+            accepted[0].frame_digest[0] ^= 0xff;
+        }
+        Ok(accepted)
+    }
+
     async fn commit(
         &self,
         replica: &StorageNodeId,

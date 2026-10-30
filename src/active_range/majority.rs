@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -107,6 +107,13 @@ pub trait ReplicaTransport: Send + Sync {
         replica: &StorageNodeId,
         request: ReplicaAppendRequest,
     ) -> Result<ReplicaAppendAccepted, ReplicaTransportError>;
+
+    /// Fan out one ordered contiguous batch in a single round-trip.
+    async fn append_batch(
+        &self,
+        replica: &StorageNodeId,
+        request: crate::active_range::replication::ReplicaBatchAppendRequest,
+    ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaTransportError>;
 
     async fn commit(
         &self,
@@ -672,6 +679,546 @@ impl MajorityAppendCoordinator {
         })
     }
 
+    /// Ordered contiguous Writer batch under one range lock: the local
+    /// batch lands in a single store transaction (one file sync), one
+    /// fan-out round ships it to each follower (one remote sync), and
+    /// one commit marker releases the whole contiguous prefix — N
+    /// records cost one quorum round instead of N serialized rounds.
+    /// Per-frame identity, dedup, position, digest, and fencing checks
+    /// are identical to `append_inner`: replicas are offered the exact
+    /// owner-landed positions, so a retried batch replays through the
+    /// same request-derived Cursors and deduped frames never fork.
+    pub async fn append_batch(
+        &self,
+        requests: Vec<ReplicaAppendRequest>,
+    ) -> Result<Vec<MajorityAppendResult>, MajorityAppendError> {
+        self.append_batch_inner(
+            requests,
+            None::<Vec<fn(u64) -> Result<String, crate::codec::CodecError>>>,
+        )
+        .await
+    }
+
+    /// Owner-minted batch: sequences are derived per record from the
+    /// replica's landed dedup stream under the same lock the batch
+    /// appends under, so minted numbers stay contiguous with committed
+    /// history exactly like `append_minted`.
+    pub async fn append_minted_batch<E>(
+        &self,
+        requests: Vec<ReplicaAppendRequest>,
+        encoders: Vec<E>,
+    ) -> Result<Vec<MajorityAppendResult>, MajorityAppendError>
+    where
+        E: FnOnce(u64) -> Result<String, crate::codec::CodecError> + Send,
+    {
+        self.append_batch_inner(requests, Some(encoders)).await
+    }
+
+    async fn append_batch_inner<E>(
+        &self,
+        mut requests: Vec<ReplicaAppendRequest>,
+        mut encoders: Option<Vec<E>>,
+    ) -> Result<Vec<MajorityAppendResult>, MajorityAppendError>
+    where
+        E: FnOnce(u64) -> Result<String, crate::codec::CodecError> + Send,
+    {
+        if requests.is_empty() {
+            return Ok(vec![]);
+        }
+        if let Some(encoders) = &encoders {
+            if encoders.len() != requests.len() {
+                return Err(self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    "minted batch encoders must pair one-to-one with requests",
+                    false,
+                    vec![],
+                    vec![],
+                ));
+            }
+        }
+        let range_id = requests[0].range_id;
+        if requests.iter().any(|request| request.range_id != range_id) {
+            return Err(self.error(
+                MajorityAppendErrorCode::LocalStorageFailure,
+                "batch requests must target one Active Range",
+                false,
+                vec![],
+                vec![],
+            ));
+        }
+        let feed_id = requests[0].feed_id;
+        if requests.iter().any(|request| request.feed_id != feed_id) {
+            return Err(self.error(
+                MajorityAppendErrorCode::LocalStorageFailure,
+                "batch requests must target one Feed",
+                false,
+                vec![],
+                vec![],
+            ));
+        }
+        let _append_guard = self.append_lock(range_id).await.lock_owned().await;
+        let assignment = self
+            .control
+            .active_range_assignment_by_id(range_id)
+            .await
+            .ok_or_else(|| {
+                self.error(
+                    MajorityAppendErrorCode::AssignmentNotFound,
+                    "Active Range assignment is not available",
+                    true,
+                    vec![],
+                    vec![],
+                )
+            })?;
+        if assignment.owner != *self.local.local_node()
+            || requests.iter().any(|r| r.append_owner != assignment.owner)
+        {
+            return Err(self.error(
+                MajorityAppendErrorCode::NotCurrentOwner,
+                format!(
+                    "Node {} is not the current Append Owner",
+                    self.local.local_node()
+                ),
+                true,
+                vec![],
+                vec![],
+            ));
+        }
+        if let Some(encoders) = encoders.take() {
+            // Mint the whole sequence run up front: the dedup watermark
+            // only advances when frames land, so a batch mints each
+            // Writer's base once and assigns the run contiguously.
+            let mut minted: BTreeMap<(Uuid, u64), u64> = BTreeMap::new();
+            for (request, encode_with_sequence) in requests.iter_mut().zip(encoders) {
+                request.ownership_epoch = assignment.ownership_epoch;
+                let writer_key = (
+                    request.identity.writer_session_id,
+                    request.identity.writer_epoch,
+                );
+                request.identity.sequence = match minted.get(&writer_key) {
+                    Some(allocated) => *allocated,
+                    None => {
+                        let next = self
+                            .local
+                            .next_writer_sequence(
+                                &assignment,
+                                request.identity.writer_session_id,
+                                request.identity.writer_epoch,
+                            )
+                            .await
+                            .map_err(|error| {
+                                self.error(
+                                    MajorityAppendErrorCode::LocalStorageFailure,
+                                    format!("owner could not mint the Writer sequence: {error}"),
+                                    true,
+                                    vec![],
+                                    vec![],
+                                )
+                            })?;
+                        minted.insert(writer_key, next);
+                        next
+                    }
+                };
+                minted.insert(writer_key, request.identity.sequence + 1);
+                request.frame_base64 =
+                    encode_with_sequence(request.identity.sequence).map_err(|error| {
+                        self.error(
+                            MajorityAppendErrorCode::LocalStorageFailure,
+                            format!("owner could not encode the minted record: {error}"),
+                            false,
+                            vec![],
+                            vec![],
+                        )
+                    })?;
+            }
+        } else {
+            for request in requests.iter_mut() {
+                request.ownership_epoch = assignment.ownership_epoch;
+            }
+        }
+        // One local batch under one store lock + one file sync. The
+        // frames land as unconditional tail appends — a retried prefix
+        // dedupes to its stored positions — and the returned positions
+        // are the canonical owner positions replicas must match.
+        let envelope =
+            |frames: Vec<crate::active_range::replication::ReplicaBatchFrame>,
+             commit_at: Option<crate::active_range::replication::ReplicaBatchCommit>| {
+                crate::active_range::replication::ReplicaBatchAppendRequest {
+                    feed_id: requests[0].feed_id,
+                    range_id,
+                    generation: requests[0].generation,
+                    ownership_epoch: requests[0].ownership_epoch,
+                    append_owner: requests[0].append_owner.clone(),
+                    frames,
+                    commit_at,
+                }
+            };
+        let local_frames = requests
+            .iter()
+            .map(
+                |request| crate::active_range::replication::ReplicaBatchFrame {
+                    expected_position: None,
+                    identity: request.identity.clone(),
+                    cursor: request.cursor.clone(),
+                    frame_base64: request.frame_base64.clone(),
+                    pending_effect: request.pending_effect,
+                },
+            )
+            .collect();
+        let local_results = self
+            .local
+            .append_batch(envelope(local_frames, None))
+            .await
+            .map_err(|error| {
+                if error.code == ReplicaAppendErrorCode::PendingEffectOccupied {
+                    return self.occupied_error(error.pending_effect.map(|boxed| *boxed));
+                }
+                self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    error.to_string(),
+                    error.retryable,
+                    vec![],
+                    vec![],
+                )
+            })?;
+        if local_results.len() != requests.len() {
+            return Err(self.error(
+                MajorityAppendErrorCode::LocalStorageFailure,
+                "local batch append returned a truncated result set",
+                false,
+                vec![],
+                vec![],
+            ));
+        }
+        // Replicas are offered the owner-landed positions, mirroring N
+        // single appends. A Cursor-deduped frame whose stored bytes
+        // differ from the request's (a re-sequenced retry) must be
+        // offered as the stored occupant — replicas would otherwise
+        // refuse a forked frame at that position.
+        let mut follower_frames: Vec<crate::active_range::replication::ReplicaBatchFrame> =
+            requests
+                .iter()
+                .zip(local_results.iter())
+                .map(
+                    |(request, result)| crate::active_range::replication::ReplicaBatchFrame {
+                        expected_position: Some(result.position),
+                        identity: request.identity.clone(),
+                        cursor: request.cursor.clone(),
+                        frame_base64: request.frame_base64.clone(),
+                        pending_effect: request.pending_effect,
+                    },
+                )
+                .collect();
+        for (index, result) in local_results.iter().enumerate() {
+            if !result.deduplicated {
+                continue;
+            }
+            let request_digest = STANDARD
+                .decode(&follower_frames[index].frame_base64)
+                .map(|frame| *blake3::hash(&frame).as_bytes())
+                .unwrap_or_default();
+            if request_digest == result.frame_digest {
+                continue;
+            }
+            let after = result
+                .position
+                .value()
+                .checked_sub(1)
+                .map(RangePosition::new);
+            let frames = self
+                .local
+                .read_assignment_uncommitted(&assignment, after, 1)
+                .await
+                .map_err(|error| {
+                    self.error(
+                        MajorityAppendErrorCode::LocalStorageFailure,
+                        format!("owner could not reload the deduplicated frame: {error}"),
+                        true,
+                        vec![],
+                        vec![],
+                    )
+                })?;
+            if let Some(frame) = frames.into_iter().next() {
+                if frame.position == result.position {
+                    follower_frames[index].frame_base64 = STANDARD.encode(&frame.frame);
+                    follower_frames[index].identity = frame.identity;
+                    follower_frames[index].cursor = frame.cursor;
+                }
+            }
+        }
+        let followers = assignment
+            .replicas
+            .iter()
+            .filter(|node| *node != self.local.local_node())
+            .cloned()
+            .collect::<Vec<_>>();
+        // Fused commit: plain batches pin the commit marker to the run's
+        // tail so each replica lands frames + watermark in one durability
+        // unit — the same CommitPosition the two-round protocol writes,
+        // one network round earlier. Pending-effect runs stay fenced
+        // behind their effect journal and keep the deferred path.
+        let has_pending = follower_frames
+            .iter()
+            .any(|frame| frame.pending_effect.is_some());
+        let commit_hint = if has_pending {
+            None
+        } else {
+            let tail = &local_results[local_results.len() - 1];
+            Some(crate::active_range::replication::ReplicaBatchCommit {
+                position: CommitPosition::new(tail.position.value()),
+                frame_digest: tail.frame_digest,
+            })
+        };
+        let mut durable = vec![self.local.local_node().clone()];
+        let first_push = self.transport.append_batch(
+            &followers[0],
+            envelope(follower_frames.clone(), commit_hint),
+        );
+        let second_push = self.transport.append_batch(
+            &followers[1],
+            envelope(follower_frames.clone(), commit_hint),
+        );
+        let (first_result, second_result) = tokio::join!(first_push, second_push);
+        let last_position = local_results[local_results.len() - 1].position;
+        let mut follower_results = Vec::with_capacity(2);
+        for (node, result) in [
+            (followers[0].clone(), first_result),
+            (followers[1].clone(), second_result),
+        ] {
+            // A replica that missed earlier positions refuses the run's
+            // tail as a gap: re-drive the owner's stored prefix then
+            // retry the batch, same as the single-append repair.
+            let result = match result {
+                Err(error) if error.code == Some(ReplicaAppendErrorCode::PositionGap) => match self
+                    .fill_replica_gap(
+                        &assignment,
+                        &requests[0],
+                        &node,
+                        error.expected_position,
+                        last_position,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.transport
+                            .append_batch(&node, envelope(follower_frames.clone(), commit_hint))
+                            .await
+                    }
+                    Err(fill_error) => Err(fill_error),
+                },
+                other => other,
+            };
+            follower_results.push((node, result));
+        }
+        let mut durable_followers = Vec::new();
+        let mut fused_commit: Vec<StorageNodeId> = Vec::new();
+        let mut divergent: Vec<StorageNodeId> = Vec::new();
+        for (node, result) in follower_results {
+            let accepted = match result {
+                Ok(accepted) => accepted,
+                Err(error) => {
+                    if error.code == Some(ReplicaAppendErrorCode::CommittedPositionConflict) {
+                        divergent.push(node.clone());
+                    }
+                    tracing::warn!(
+                        replica = %node,
+                        feed_id = %requests[0].feed_id,
+                        range_id = %range_id,
+                        retryable = error.retryable,
+                        error = %error.message,
+                        "Active Range replica batch append refused by follower"
+                    );
+                    continue;
+                }
+            };
+            if accepted.len() != local_results.len() {
+                return Err(self.error(
+                    MajorityAppendErrorCode::FrameConflict,
+                    format!("replica {node} acknowledged a truncated batch"),
+                    false,
+                    durable,
+                    vec![],
+                ));
+            }
+            // Committed-divergent evidence vetoes the batch exactly like
+            // the single-append fork proof; a bare position/digest
+            // mismatch stays a fatal contradiction.
+            let mut mismatch = false;
+            for (accepted_frame, local_frame) in accepted.iter().zip(local_results.iter()) {
+                if accepted_frame.position != local_frame.position && accepted_frame.committed {
+                    divergent.push(node.clone());
+                    mismatch = true;
+                    break;
+                }
+                if accepted_frame.position != local_frame.position
+                    || accepted_frame.frame_digest != local_frame.frame_digest
+                {
+                    return Err(self.error(
+                        MajorityAppendErrorCode::FrameConflict,
+                        format!("replica {node} acknowledged different bytes or position"),
+                        false,
+                        durable,
+                        vec![],
+                    ));
+                }
+            }
+            if mismatch {
+                continue;
+            }
+            durable.push(node.clone());
+            if accepted.last().is_some_and(|frame| frame.committed) {
+                // The fused marker landed with the frames — this replica
+                // already holds CommitPosition evidence and needs no
+                // commit round.
+                fused_commit.push(node.clone());
+            }
+            durable_followers.push(node);
+        }
+        if !divergent.is_empty() {
+            self.local
+                .note_owner_diverged(range_id, requests[0].ownership_epoch)
+                .await;
+            return Err(self.error(
+                MajorityAppendErrorCode::NoDurableMajority,
+                format!(
+                    "replica(s) {} hold divergent committed evidence; ownership resolving",
+                    divergent
+                        .iter()
+                        .map(|node| node.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                true,
+                durable,
+                vec![],
+            ));
+        }
+        if durable.len() < ACTIVE_RANGE_COMMIT_QUORUM {
+            self.local.note_owner_quorum_blocked(range_id).await;
+            return Err(self.error(
+                MajorityAppendErrorCode::NoDurableMajority,
+                "batch append is durable on fewer than two current replicas",
+                true,
+                durable,
+                vec![],
+            ));
+        }
+        self.local.note_owner_quorum_restored(range_id).await;
+        if has_pending {
+            // Deferred commit: pending-effect frames stay fenced behind
+            // their effect marker exactly like the single-append path —
+            // the effect journal's terminal marker releases the tail.
+            durable.sort();
+            return Ok(local_results
+                .into_iter()
+                .map(|local| MajorityAppendResult {
+                    message_id: local.message_id,
+                    cursor: local.cursor,
+                    position: local.position,
+                    frame_digest: local.frame_digest,
+                    durable_replicas: durable.clone(),
+                    commit_evidence: vec![],
+                    deduplicated: local.deduplicated,
+                })
+                .collect());
+        }
+        let commit_request = ReplicaCommitRequest {
+            feed_id: requests[0].feed_id,
+            range_id,
+            generation: requests[0].generation,
+            ownership_epoch: requests[0].ownership_epoch,
+            append_owner: requests[0].append_owner.clone(),
+            commit_position: CommitPosition::new(last_position.value()),
+            frame_digest: local_results[local_results.len() - 1].frame_digest,
+        };
+        // Replicas that fused the commit already hold evidence; only a
+        // durable follower that landed frames without the marker gets a
+        // commit round (e.g. a gap-repaired tail).
+        let mut evidence: Vec<StorageNodeId> = fused_commit;
+        let mut last_commit_error = String::new();
+        let unfused: Vec<StorageNodeId> = durable_followers
+            .iter()
+            .filter(|node| !evidence.contains(node))
+            .cloned()
+            .collect();
+        if unfused.len() == 1 {
+            match self
+                .transport
+                .commit(&unfused[0], commit_request.clone())
+                .await
+            {
+                Ok(_) => evidence.push(unfused[0].clone()),
+                Err(error) => {
+                    last_commit_error =
+                        format!("; replica {} refused: {}", unfused[0], error.message)
+                }
+            }
+        } else if unfused.len() == 2 {
+            let first_commit = self.transport.commit(&unfused[0], commit_request.clone());
+            let second_commit = self.transport.commit(&unfused[1], commit_request.clone());
+            let (first_result, second_result) = tokio::join!(first_commit, second_commit);
+            match first_result {
+                Ok(_) => evidence.push(unfused[0].clone()),
+                Err(error) => {
+                    last_commit_error =
+                        format!("; replica {} refused: {}", unfused[0], error.message)
+                }
+            }
+            match second_result {
+                Ok(_) => evidence.push(unfused[1].clone()),
+                Err(error) => {
+                    last_commit_error =
+                        format!("; replica {} refused: {}", unfused[1], error.message)
+                }
+            }
+        }
+        if evidence.is_empty() {
+            return Err(self.error(
+                MajorityAppendErrorCode::NoCommitMajority,
+                format!(
+                    "batch majority exists but no follower persisted CommitPosition evidence; retry with the same append identities{last_commit_error}"
+                ),
+                true,
+                durable,
+                evidence,
+            ));
+        }
+        self.local.commit(commit_request).await.map_err(|error| {
+            self.error(
+                MajorityAppendErrorCode::LocalStorageFailure,
+                error.to_string(),
+                // A PositionGap here means the local tail was truncated by
+                // a landing ownership move; the frames deduplicate safely
+                // on the client's retry wherever they committed.
+                error.retryable || error.code == ReplicaAppendErrorCode::PositionGap,
+                durable.clone(),
+                evidence.clone(),
+            )
+        })?;
+        evidence.push(self.local.local_node().clone());
+        durable.sort();
+        evidence.sort();
+        self.report_commit_proof(
+            requests[0].feed_id,
+            range_id,
+            CommitPosition::new(last_position.value()),
+            local_results[local_results.len() - 1].frame_digest,
+            evidence.clone(),
+        );
+        Ok(local_results
+            .into_iter()
+            .map(|local| MajorityAppendResult {
+                message_id: local.message_id,
+                cursor: local.cursor,
+                position: local.position,
+                frame_digest: local.frame_digest,
+                durable_replicas: durable.clone(),
+                commit_evidence: evidence.clone(),
+                deduplicated: local.deduplicated,
+            })
+            .collect())
+    }
+
     /// Re-drive the positions a lagging replica never stored so the caller
     /// can retry the current frame. A replica that missed an earlier push
     /// refuses every later position as a gap; replaying the owner's
@@ -1142,6 +1689,28 @@ impl ReplicaTransport for HttpReplicaTransport {
             (None, Some(error)) => Err(ReplicaTransportError::replica(error)),
             (None, None) => Err(ReplicaTransportError::transport(
                 "replica returned no append result",
+                true,
+            )),
+        }
+    }
+
+    async fn append_batch(
+        &self,
+        replica: &StorageNodeId,
+        request: crate::active_range::replication::ReplicaBatchAppendRequest,
+    ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaTransportError> {
+        let response: crate::active_range::replication::ReplicaBatchAppendResponse = self
+            .post(
+                replica,
+                "/internal/active-range/replica/append-batch",
+                &request,
+            )
+            .await?;
+        match (response.results, response.error) {
+            (Some(results), _) => Ok(results),
+            (None, Some(error)) => Err(ReplicaTransportError::replica(error)),
+            (None, None) => Err(ReplicaTransportError::transport(
+                "replica returned no batch append results",
                 true,
             )),
         }

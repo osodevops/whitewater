@@ -1257,6 +1257,226 @@ async fn import_split_batch_flushes_once_and_resumes_through_dedup() {
     }
 }
 
+#[tokio::test]
+async fn import_commit_batch_lands_frames_and_watermark_in_one_unit() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let staged = |position: u64| {
+        let mut request = append(position, format!("fused-{position}").as_bytes());
+        request.expected_position = Some(RangePosition::new(position));
+        request
+    };
+    let batch: Vec<_> = (1..=4).map(staged).collect();
+    // The owner would derive the hint from its own landed tail; a test
+    // computes it from the same frame bytes the wire carries.
+    let tail_digest = *blake3::hash(&batch[3].frame).as_bytes();
+    let results = store
+        .import_commit_batch(
+            batch,
+            whitewater::active_range::BatchCommit {
+                generation: RangeGeneration::new(1),
+                ownership_epoch: OwnershipEpoch::new(1),
+                position: CommitPosition::new(4),
+                frame_digest: tail_digest,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(results.len(), 4);
+    assert!(results.iter().all(|result| result.committed));
+    assert_eq!(
+        store.read_committed(None, 10).await.unwrap().len(),
+        4,
+        "fused commit makes the whole run readable in one durability unit"
+    );
+
+    // The marker survives a restart like a separately committed one.
+    drop(store);
+    let reopened = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    assert_eq!(
+        reopened
+            .snapshot()
+            .await
+            .unwrap()
+            .progress
+            .commit_position(),
+        CommitPosition::new(4)
+    );
+    assert_eq!(reopened.read_committed(None, 10).await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn import_commit_batch_refuses_a_marker_that_does_not_pin_the_tail() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let staged = |position: u64| {
+        let mut request = append(position, format!("fused-{position}").as_bytes());
+        request.expected_position = Some(RangePosition::new(position));
+        request
+    };
+
+    // A digest that does not match the landed tail refuses; the staged
+    // prefix still flushes so the retry dedupes instead of re-appending.
+    let batch: Vec<_> = (1..=3).map(staged).collect();
+    let error = store
+        .import_commit_batch(
+            batch,
+            whitewater::active_range::BatchCommit {
+                generation: RangeGeneration::new(1),
+                ownership_epoch: OwnershipEpoch::new(1),
+                position: CommitPosition::new(3),
+                frame_digest: [0xAA; 32],
+            },
+        )
+        .await;
+    assert!(error.is_err());
+    assert_eq!(
+        store.read_committed(None, 10).await.unwrap().len(),
+        0,
+        "a refused fused marker commits nothing"
+    );
+    let retry: Vec<_> = (1..=3).map(staged).collect();
+    let tail_digest = *blake3::hash(&retry[2].frame).as_bytes();
+    let results = store
+        .import_commit_batch(
+            retry,
+            whitewater::active_range::BatchCommit {
+                generation: RangeGeneration::new(1),
+                ownership_epoch: OwnershipEpoch::new(1),
+                position: CommitPosition::new(3),
+                frame_digest: tail_digest,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(results.iter().all(|result| result.deduplicated));
+    assert_eq!(store.read_committed(None, 10).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn import_commit_batch_fences_epoch_and_backwards_commits() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let staged = |position: u64| {
+        let mut request = append(position, format!("fused-{position}").as_bytes());
+        request.expected_position = Some(RangePosition::new(position));
+        request
+    };
+    let batch: Vec<_> = (1..=2).map(staged).collect();
+    let tail_digest = *blake3::hash(&batch[1].frame).as_bytes();
+
+    // A stale ownership epoch refuses before anything commits.
+    let error = store
+        .import_commit_batch(
+            batch.clone(),
+            whitewater::active_range::BatchCommit {
+                generation: RangeGeneration::new(1),
+                ownership_epoch: OwnershipEpoch::new(0),
+                position: CommitPosition::new(2),
+                frame_digest: tail_digest,
+            },
+        )
+        .await;
+    assert!(error.is_err());
+    assert_eq!(store.read_committed(None, 10).await.unwrap().len(), 0);
+
+    // Committing the run, then replaying it with a backwards marker,
+    // refuses the same way the commit endpoint does.
+    store
+        .import_commit_batch(
+            batch.clone(),
+            whitewater::active_range::BatchCommit {
+                generation: RangeGeneration::new(1),
+                ownership_epoch: OwnershipEpoch::new(1),
+                position: CommitPosition::new(2),
+                frame_digest: tail_digest,
+            },
+        )
+        .await
+        .unwrap();
+    let error = store
+        .import_commit_batch(
+            batch,
+            whitewater::active_range::BatchCommit {
+                generation: RangeGeneration::new(1),
+                ownership_epoch: OwnershipEpoch::new(1),
+                position: CommitPosition::new(2),
+                frame_digest: tail_digest,
+            },
+        )
+        .await;
+    // Replaying the same marker is an idempotent no-op, not a backwards
+    // move: the deduped tail revalidates and the committed watermark holds.
+    assert!(error.is_ok());
+    assert_eq!(store.read_committed(None, 10).await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn deferred_sync_mode_commits_reads_and_reopens_cleanly() {
+    let directory = TempDir::new().unwrap();
+    let options = FileActiveRangeStoreOptions {
+        sync_interval: Some(std::time::Duration::from_secs(3600)),
+        ..FileActiveRangeStoreOptions::default()
+    };
+    let store =
+        FileActiveRangeStore::open_with_options(directory.path(), descriptor(), options.clone())
+            .unwrap();
+    store.append(append(1, b"first")).await.unwrap();
+    store.append(append(2, b"second")).await.unwrap();
+    store
+        .commit(
+            RangeGeneration::new(1),
+            OwnershipEpoch::new(1),
+            CommitPosition::new(2),
+        )
+        .await
+        .unwrap();
+    assert_eq!(store.read_committed(None, 10).await.unwrap().len(), 2);
+    drop(store);
+
+    // A clean close leaves every lazy checkpoint file written — reopen
+    // sees the full watermark and committed history.
+    let reopened =
+        FileActiveRangeStore::open_with_options(directory.path(), descriptor(), options).unwrap();
+    assert_eq!(reopened.read_committed(None, 10).await.unwrap().len(), 2);
+    assert_eq!(
+        reopened
+            .snapshot()
+            .await
+            .unwrap()
+            .progress
+            .commit_position(),
+        CommitPosition::new(2)
+    );
+}
+
+#[tokio::test]
+async fn deferred_sync_mode_keeps_pending_effects_strict() {
+    let directory = TempDir::new().unwrap();
+    let options = FileActiveRangeStoreOptions {
+        sync_interval: Some(std::time::Duration::from_secs(3600)),
+        ..FileActiveRangeStoreOptions::default()
+    };
+    let store =
+        FileActiveRangeStore::open_with_options(directory.path(), descriptor(), options.clone())
+            .unwrap();
+    let effect = Uuid::from_u128(70);
+    let mut request = append(1, b"held");
+    request.pending_effect = Some(whitewater::active_range::PendingEffectRef {
+        effect_id: effect,
+        subscription_id: Uuid::from_u128(71),
+    });
+    store.append(request).await.unwrap();
+    drop(store);
+
+    // Pending-effect appends take the strict persist path even under a
+    // deferred interval — the marker fences exactly as in strict mode.
+    let reopened =
+        FileActiveRangeStore::open_with_options(directory.path(), descriptor(), options).unwrap();
+    assert!(reopened.pending_effect().await.unwrap().is_some());
+    assert_eq!(reopened.read_committed(None, 10).await.unwrap().len(), 0);
+}
+
 use std::io::{Read as _, Seek as _, SeekFrom};
 
 fn checkpoint_file(root: &Path, segment: u64) -> PathBuf {

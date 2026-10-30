@@ -102,6 +102,13 @@ pub struct NodeConfig {
     /// zero disables materialization entirely, which fails historical
     /// reads on demoted ranges rather than caching unbounded.
     pub remote_cache_bytes: u64,
+    /// Deferred-sync interval for plain appends/commits
+    /// (`WHITEWATER_RANGE_SYNC_INTERVAL_MS`, default 0 = strict
+    /// sync-before-ack). When set, quorum replication carries the
+    /// acknowledged evidence and per-range fsyncs amortize to at most one
+    /// per interval — the `acks=all` durability mode. Pending-effect
+    // markers, freezes, split staging, and epoch moves stay strict.
+    pub range_sync_interval: Option<Duration>,
 }
 
 impl NodeConfig {
@@ -191,6 +198,10 @@ impl NodeConfig {
             anyhow::bail!("WHITEWATER_TIER_SCAN_MS must be greater than zero");
         }
         let remote_cache_bytes = parse_env("WHITEWATER_REMOTE_CACHE_BYTES", 1024 * 1024 * 1024)?;
+        let range_sync_interval = {
+            let ms = parse_env("WHITEWATER_RANGE_SYNC_INTERVAL_MS", 0)?;
+            (ms > 0).then(|| Duration::from_millis(ms))
+        };
         let tls = [
             env::var("WHITEWATER_SUBSCRIPTION_MTLS_BIND").ok(),
             env::var("WHITEWATER_SUBSCRIPTION_MTLS_CERT").ok(),
@@ -269,6 +280,7 @@ impl NodeConfig {
             tier_scan_interval,
             max_segment_bytes,
             remote_cache_bytes,
+            range_sync_interval,
         })
     }
 }

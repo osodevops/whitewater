@@ -48,9 +48,10 @@ pub use repair::{
 pub use replication::{
     RangeReadSpec, ReadReplicaEvidence, ReplicaAppendAccepted, ReplicaAppendError,
     ReplicaAppendErrorCode, ReplicaAppendRequest, ReplicaAppendResponse, ReplicaAppendService,
+    ReplicaBatchAppendRequest, ReplicaBatchAppendResponse, ReplicaBatchCommit, ReplicaBatchFrame,
     ReplicaCommitAccepted, ReplicaCommitRequest, ReplicaCommitResponse, ReplicaDiscardOutcome,
     ReplicaDiscardPendingRequest, ReplicaDiscardPendingResponse, MAX_COMMITTED_READ_BYTES,
-    MAX_REPLICA_FRAME_BASE64_BYTES,
+    MAX_REPLICA_BATCH_BASE64_BYTES, MAX_REPLICA_BATCH_FRAMES, MAX_REPLICA_FRAME_BASE64_BYTES,
 };
 pub use routing::{KeyRange, KeyToken, RangeMap, RangeMapError, RangeRoute};
 pub use split::{
@@ -62,6 +63,7 @@ pub use split::{
 };
 pub use store::{
     ActiveRangeAppend, ActiveRangeAppendResult, ActiveRangeDescriptor, ActiveRangeSnapshot,
-    ActiveRangeStore, ActiveRangeStoreError, FileActiveRangeStore, FileActiveRangeStoreOptions,
-    IngestBoundary, PendingDiscardOutcome, PendingEffect, PendingEffectRef, StoredRangeFrame,
+    ActiveRangeStore, ActiveRangeStoreError, BatchCommit, FileActiveRangeStore,
+    FileActiveRangeStoreOptions, IngestBoundary, PendingDiscardOutcome, PendingEffect,
+    PendingEffectRef, StoredRangeFrame,
 };
