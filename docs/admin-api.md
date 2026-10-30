@@ -663,6 +663,47 @@ Because the catalog is replicated, one Node's bundle reports cluster-wide contro
 
 `AdminClient::support_bundle` is the typed counterpart.
 
+### Explain health
+
+```http
+POST /v1/admin/diagnostics/explain
+Authorization: Bearer <key>
+```
+
+Returns the correlated, versioned (`schema_version: 1`) health explanation that backs the Operations Advisor foundation. Authorization requires `read` on the root `*` namespace — the same scope `SHOW` needs — so any credential able to observe the catalog can ask "why?" without admin mutation rights. The endpoint is read-only and may be asked of any Node; the report describes cluster state, not just the contacted process.
+
+Each of nine pipeline stages — `control_plane`, `nodes`, `storage`, `writers`, `readers`, `subscriptions`, `pipes`, `distributaries`, `indexes` — reports `healthy`, `advisory`, `degraded`, `unhealthy`, or `limited`, plus bounded findings (64 per stage; `truncated` counts overflow). Every finding carries `resource`, `severity`, `cause`, `risk`, `automatic_action` (what Whitewater is already doing), `next_safe_step`, `confidence`, and `evidence_at_ns` freshness where the source has a timestamp.
+
+Missing evidence is reported, not smoothed over: a Node without a Control Plane reports the stage `limited` (and sets top-level `limited`) rather than fabricating quorum health, and member-liveness findings carry `medium` confidence because gossip staleness is evidence of a problem, not proof of death. Nothing in the report mutates state or triggers recovery — deterministic Control Plane reconciliation remains the only actor.
+
+```json
+{
+  "schema_version": 1,
+  "node": "control-1",
+  "observed_at_ns": "1793335077437729808",
+  "authority": "control_plane",
+  "limited": false,
+  "stages": [
+    {
+      "stage": "distributaries",
+      "status": "degraded",
+      "findings": [
+        {
+          "resource": "ops.mirror",
+          "severity": "degraded",
+          "cause": "copy cycle stalled: remote reader fetch refused: 401",
+          "risk": "the destination stops receiving records; source history remains durable upstream",
+          "automatic_action": "the lease owner keeps retrying the cycle and republishes status each attempt",
+          "next_safe_step": "read the last_error first — it names the refused hop",
+          "confidence": "high",
+          "evidence_at_ns": "1793335070000000000"
+        }
+      ]
+    }
+  ]
+}
+```
+
 ### Grant
 
 ```json

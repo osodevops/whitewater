@@ -2721,6 +2721,19 @@ impl ControlController {
         Ok(storage_drain_plan(&state, self, node))
     }
 
+    /// Placement eligibility for every storage identity the catalog
+    /// knows about, evaluated at read time — the same view `SHOW
+    /// STORAGE NODES` serves, for diagnostics and Advisor tooling.
+    pub async fn storage_pool_report(&self) -> Vec<NodeStorageEligibility> {
+        let state = self.state.lock().await;
+        storage_eligibility_report(
+            &state,
+            &self.eligible_storage_nodes,
+            &self.capacity_policy,
+            unix_ns(),
+        )
+    }
+
     pub async fn draining_storage_nodes(&self) -> BTreeSet<StorageNodeId> {
         self.state.lock().await.draining_storage_nodes.clone()
     }

@@ -166,6 +166,12 @@ impl MembershipService {
         }
     }
 
+    /// The liveness bound applied to heartbeat age — diagnostics need
+    /// it to distinguish a stale member from a live one.
+    pub fn member_timeout(&self) -> Duration {
+        self.member_timeout
+    }
+
     pub async fn members(&self) -> Vec<MemberView> {
         let members = self.members.read().await;
         let mut result: Vec<_> = members

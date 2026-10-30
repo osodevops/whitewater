@@ -741,6 +741,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/control-plane", get(control_plane_status))
         .route("/v1/admin/backup", post(admin_backup))
         .route("/v1/admin/support-bundle", get(admin_support_bundle))
+        .route("/v1/admin/diagnostics/explain", post(diagnostics_explain))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
@@ -806,6 +807,237 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
             subscription_member_max_lease_ticks: SUBSCRIPTION_MEMBER_MAX_LEASE_TICKS,
         },
     })
+}
+
+/// Resolve a Feed's public name for diagnostic evidence — falls back
+/// to the immutable id when the definition is gone, so a finding can
+/// still name its scope.
+async fn feed_name_for(state: &AppState, feed_id: Uuid) -> String {
+    state
+        .control
+        .feed_definition_by_id(feed_id)
+        .await
+        .map(|feed| feed.name)
+        .unwrap_or_else(|| feed_id.to_string())
+}
+
+/// `POST /v1/admin/diagnostics/explain`
+/// Correlated, versioned health explanation — the Operations Advisor
+/// foundation. Read-only, `read`-on-`*`-scoped, and safe to ask of any
+/// Node: each stage explains cause, risk, the automatic action already
+/// running, and the next safe step rather than raw metrics. Missing
+/// evidence reports `limited`, never fabricated certainty.
+async fn diagnostics_explain(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<crate::diagnostics::DiagnosticsReport>, ApiError> {
+    authorize_namespace(&state, &headers, "*", PermissionAction::Read)?;
+    let _request = state.demand.begin_request();
+    let now_ns = unix_ns();
+    let now_ms = now_ns.max(0) as u64 / 1_000_000;
+
+    let control_plane = match &state.control_plane {
+        Some(plane) => {
+            let status = plane.status().await;
+            Some(crate::diagnostics::ControlPlaneEvidence {
+                leader: status.leader_id.map(|id| id.to_string()),
+                term: status.current_term,
+                voters: status.membership.len(),
+            })
+        }
+        None => None,
+    };
+
+    let members: Vec<crate::diagnostics::MemberEvidence> = state
+        .membership
+        .members()
+        .await
+        .into_iter()
+        .map(|member| crate::diagnostics::MemberEvidence {
+            node: member.node_id,
+            local: member.local,
+            last_seen_age_ms: now_ms.saturating_sub(member.last_seen_ms),
+        })
+        .collect();
+
+    let storage_nodes: Vec<crate::diagnostics::StorageEvidence> = state
+        .control
+        .storage_pool_report()
+        .await
+        .into_iter()
+        .map(|entry| crate::diagnostics::StorageEvidence {
+            node: entry.node.as_str().to_string(),
+            eligible: entry.eligible,
+            exclusions: entry
+                .exclusions
+                .iter()
+                .filter_map(|exclusion| {
+                    serde_json::to_value(exclusion)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_string))
+                })
+                .collect(),
+        })
+        .collect();
+
+    let mut readers = Vec::new();
+    for reader in state.control.active_readers().await {
+        readers.push(crate::diagnostics::ReaderEvidence {
+            name: reader.name,
+            feed: feed_name_for(&state, reader.feed_id).await,
+            session_active: reader.session_active,
+            last_retry_after_ms: reader
+                .last_delivery
+                .map(|delivery| delivery.retry_after_ms)
+                .unwrap_or(0),
+        });
+    }
+
+    let progress_owners: BTreeMap<Uuid, String> = state
+        .control
+        .active_subscription_progress_assignments()
+        .await
+        .into_iter()
+        .map(|assignment| {
+            (
+                assignment.subscription_id,
+                assignment.owner.as_str().to_string(),
+            )
+        })
+        .collect();
+    let subscriptions: Vec<crate::diagnostics::SubscriptionEvidence> = state
+        .control
+        .active_subscriptions()
+        .await
+        .into_iter()
+        .map(|subscription| crate::diagnostics::SubscriptionEvidence {
+            name: subscription.name,
+            progress_owner: progress_owners.get(&subscription.subscription_id).cloned(),
+        })
+        .collect();
+
+    let mut distributaries = Vec::new();
+    for definition in state.control.active_distributaries().await {
+        if let Some(status) = state
+            .control
+            .distributary_status(definition.distributary_id)
+            .await
+        {
+            let run_state = serde_json::to_value(status.run_state)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string());
+            distributaries.push(crate::diagnostics::DistributaryEvidence {
+                name: definition.name,
+                run_state,
+                last_error: status.last_error,
+                lag_records: status.lag_records,
+                report_age_ms: (now_ns - status.reported_at_ns).max(0) as u64 / 1_000_000,
+                reported_at_ns: Some(status.reported_at_ns),
+            });
+        }
+    }
+
+    let compute_leases: BTreeMap<Uuid, String> = state
+        .control
+        .pipe_compute_leases()
+        .await
+        .into_iter()
+        .map(|lease| (lease.pipe_id, lease.owner.as_str().to_string()))
+        .collect();
+    let pipes: Vec<crate::diagnostics::PipeEvidence> = state
+        .control
+        .active_pipes()
+        .await
+        .into_iter()
+        .map(|pipe| crate::diagnostics::PipeEvidence {
+            name: pipe.name,
+            stage: serde_json::to_value(pipe.stage)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+                .unwrap_or_else(|| "unknown".to_string()),
+            compute_owner: compute_leases.get(&pipe.pipe_id).cloned(),
+        })
+        .collect();
+
+    // Owner liveness is proven by a bounded health probe on each
+    // referenced storage endpoint — the same evidence the lease
+    // supervisor acts on. Owner storage identities and member node_ids
+    // are different spaces, so gossip cannot answer this.
+    let mut owners = BTreeSet::new();
+    owners.extend(progress_owners.values().cloned());
+    owners.extend(compute_leases.values().cloned());
+    let probe_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(750))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let mut owner_liveness = BTreeMap::new();
+    for owner in owners {
+        let Ok(storage_owner) = crate::active_range::StorageNodeId::try_new(owner.clone()) else {
+            owner_liveness.insert(owner, crate::diagnostics::OwnerState::Unverifiable);
+            continue;
+        };
+        let state_value = match state.control_endpoints.resolve(&storage_owner).await {
+            None => crate::diagnostics::OwnerState::Unverifiable,
+            Some(endpoint) => match probe_client.get(format!("{endpoint}/health")).send().await {
+                Ok(_) => crate::diagnostics::OwnerState::Live,
+                Err(_) => crate::diagnostics::OwnerState::Dead,
+            },
+        };
+        owner_liveness.insert(owner, state_value);
+    }
+
+    let mut indexes = Vec::new();
+    for index in state.control.index_definitions().await {
+        let stage_label = match index.stage {
+            crate::control::IndexBuildStage::Declared => "declared",
+            crate::control::IndexBuildStage::Building { .. } => "building",
+            crate::control::IndexBuildStage::Active { .. } => "active",
+        };
+        indexes.push(crate::diagnostics::IndexEvidence {
+            name: index.name,
+            feed: feed_name_for(&state, index.feed_id).await,
+            stage: stage_label.to_string(),
+        });
+    }
+
+    let maps = state.control.active_feed_range_maps().await;
+    let hot_keys: Vec<crate::diagnostics::HotKeyEvidence> = state
+        .demand
+        .hot_keys()
+        .into_iter()
+        .map(|hot| {
+            let feed = maps.iter().find_map(|(feed, map)| {
+                map.routes()
+                    .iter()
+                    .any(|route| route.range_id == hot.range_id)
+                    .then(|| feed.clone())
+            });
+            crate::diagnostics::HotKeyEvidence {
+                feed,
+                range: hot.range_id.to_string(),
+                token: hot.token.to_string(),
+                share_bps: hot.share_bps,
+            }
+        })
+        .collect();
+
+    let input = crate::diagnostics::DiagnosticsInput {
+        node: state.membership.local().node_id.clone(),
+        observed_at_ns: now_ns,
+        control_plane,
+        member_timeout_ms: state.membership.member_timeout().as_millis() as u64,
+        members,
+        storage_nodes,
+        readers,
+        subscriptions,
+        distributaries,
+        pipes,
+        indexes,
+        hot_keys,
+        owner_liveness,
+    };
+    Ok(Json(crate::diagnostics::explain(&input)))
 }
 
 async fn execute_admin_wcl(
@@ -23009,6 +23241,103 @@ mod tests {
         let serialized = String::from_utf8(body.to_vec()).unwrap();
         assert!(!serialized.contains(&digest));
         assert!(!serialized.contains("verifier"));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_explain_scopes_and_reports() {
+        let directory = TempDir::new().unwrap();
+        let app = admin_test_router(&directory);
+        let explain_request = |key: Option<&str>| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/v1/admin/diagnostics/explain");
+            if let Some(key) = key {
+                request = request.header("authorization", format!("Bearer {key}"));
+            }
+            request.body(Body::empty()).unwrap()
+        };
+
+        let missing = app.clone().oneshot(explain_request(None)).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        // A key scoped to `orders.*` cannot read a Riverbed-wide report.
+        let digest = "c".repeat(64);
+        let seed = serde_json::to_value(CommandBatchRequest {
+            request_id: Some(Uuid::new_v4()),
+            commands: vec![
+                Command::CreateRole {
+                    name: "scoped".to_owned(),
+                },
+                Command::IssueApiKey {
+                    name: "narrow".to_owned(),
+                    digest: digest.clone(),
+                    role: "scoped".to_owned(),
+                    expires_at_ns: None,
+                },
+            ],
+        })
+        .unwrap();
+        let created = app
+            .clone()
+            .oneshot(admin_request(
+                "/v1/admin/commands",
+                seed,
+                Some("this-is-a-long-development-api-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let narrow = app
+            .clone()
+            .oneshot(explain_request(Some(&digest)))
+            .await
+            .unwrap();
+        assert_eq!(narrow.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .oneshot(explain_request(Some("this-is-a-long-development-api-key")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(report["schema_version"], 1);
+        assert_eq!(report["authority"], "local_prototype");
+        // The fixture genuinely lacks a Control Plane — the report must
+        // say so rather than fabricate a healthy quorum.
+        assert_eq!(report["limited"], true);
+        let stages: Vec<&str> = report["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|stage| stage["stage"].as_str().unwrap())
+            .collect();
+        for expected in [
+            "control_plane",
+            "nodes",
+            "storage",
+            "writers",
+            "readers",
+            "subscriptions",
+            "pipes",
+            "distributaries",
+            "indexes",
+        ] {
+            assert!(stages.contains(&expected), "missing stage {expected}");
+        }
+        let control_plane = report["stages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|stage| stage["stage"] == "control_plane")
+            .unwrap();
+        assert_eq!(control_plane["status"], "limited");
+        assert!(control_plane["findings"][0]["next_safe_step"]
+            .as_str()
+            .unwrap()
+            .contains("voters"));
     }
 
     #[tokio::test]

@@ -1656,13 +1656,13 @@ Definition of Done:
 
 
 
-Design: [Whitewater Operations Advisor](operations-advisor.md). This is **not implemented**. It follows the structured health explanations, scoped identity/audit controls, and safe drain/movement gates in earlier milestones; it does not replace deterministic Control Plane recovery or block the current M4 focus.
+Design: [Whitewater Operations Advisor](operations-advisor.md). The read-only diagnostic foundation is implemented (`POST /v1/admin/diagnostics/explain`); Advisor reasoning, MCP exposure, and policy-gated actions remain **not implemented**. It follows the structured health explanations, scoped identity/audit controls, and safe drain/movement gates in earlier milestones; it does not replace deterministic Control Plane recovery or block the current M4 focus.
 
 
 
-- [ ] Define versioned, correlated diagnostic schemas for Nodes, Control Plane, storage, Writers, Readers, and later Subscriptions/Indexes/Pipes, including cause, risk, automatic action, and next safe step.
+- [x] Define versioned, correlated diagnostic schemas for Nodes, Control Plane, storage, Writers, Readers, and later Subscriptions/Indexes/Pipes, including cause, risk, automatic action, and next safe step. `src/diagnostics.rs` defines `DiagnosticsReport` (`schema_version: 1`) with per-stage `healthy`/`advisory`/`degraded`/`unhealthy`/`limited` status and findings carrying resource, cause, risk, automatic action, next safe step, confidence, and evidence freshness; `diagnostics::tests` covers every stage's rules, bounded findings, and schema round-trip.
 
-- [ ] Define a correlated health-explanation API spanning Writer, quorum, storage, Index, Subscription, and Reader stages.
+- [x] Define a correlated health-explanation API spanning Writer, quorum, storage, Index, Subscription, and Reader stages. `POST /v1/admin/diagnostics/explain` composes nine stages — Control Plane quorum, member Nodes, storage eligibility, Writer hot-Key pressure, Reader pacing, Subscription progress placement, Pipe compute leases, Distributary copy health, and Index builds — assembled from catalog, membership, and demand evidence under `read`-on-`*` scope on any Node; `api::tests::diagnostics_explain_scopes_and_reports` fences missing and narrow-scoped credentials and pins the report shape.
 
 - [ ] Add bounded, redacted, authorized metrics/log/trace retrieval by Riverbed, Domain, Feed, Node, and time window; treat returned content as untrusted.
 

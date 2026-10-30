@@ -1,6 +1,6 @@
 # Whitewater Operations Advisor
 
-> Proposed agentic analysis and **policy-gated** assistance for operating a Riverbed. This is a design and roadmap item, **not an implemented service or MCP server**.
+> Proposed agentic analysis and **policy-gated** assistance for operating a Riverbed. The diagnostic foundation this document depends on is implemented: `POST /v1/admin/diagnostics/explain` serves the versioned, correlated health explanation below. The Advisor reasoning, MCP adapter, and policy-gated actions described here remain design and roadmap items, **not implemented services**.
 
 ## Why it exists
 
