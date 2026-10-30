@@ -518,6 +518,18 @@ def summarize(results: dict[str, str]) -> int:
     failures = {script: outcome for script, outcome in results.items() if outcome != "ok"}
     for script in sorted(results):
         print(f"{results[script]:>24}  {script}")
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if summary_path:
+        lane = os.environ.get("WHITEWATER_ACCEPTANCE_LANE", "default")
+        try:
+            with open(summary_path, "a", encoding="utf-8") as summary:
+                summary.write(f"### live-acceptance `{lane}`\n\n")
+                summary.write("| script | result |\n|---|---|\n")
+                for script in sorted(results):
+                    summary.write(f"| `{script}` | {results[script]} |\n")
+                summary.write("\n")
+        except OSError:
+            pass
     if failures:
         print(f"acceptance suite failed: {failures}", file=sys.stderr)
         return 1
