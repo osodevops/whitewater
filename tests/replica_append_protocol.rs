@@ -252,7 +252,10 @@ async fn replica_rejects_position_gaps_and_conflicting_bytes() {
         .append(fixture.request(1, 2, b"different"))
         .await
         .unwrap_err();
-    assert_eq!(conflict.code, ReplicaAppendErrorCode::PositionConflict);
+    assert_eq!(
+        conflict.code,
+        ReplicaAppendErrorCode::CommittedPositionConflict
+    );
 }
 
 #[tokio::test]

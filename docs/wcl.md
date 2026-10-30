@@ -495,9 +495,12 @@ default 1000ms, minimum 100ms) and acts only on locally-held leases; it
 needs `WHITEWATER_ADMIN_API_KEY` for local appends, matching the drain
 supervisor's credential. A Link cannot drop while Distributaries use it,
 and a target Feed cannot drop or erase under an active Distributary.
-Automatic lease recovery on owner loss is not yet implemented — until
-then a dead owner stalls its Distributaries until an operator `MOVE`
-lands; failover is safe, just manual.
+On owner loss the Control Plane leader's lease recovery supervisor
+(`ComputeLeaseRecoverySupervisor`, shared with Pipe compute leases)
+probes the owner through `/health`; after a sustained failure streak it
+CASes the lease — epoch bump included — onto the first storage-eligible
+survivor, so the copy resumes without an operator `MOVE`. `MOVE` remains
+available for deliberate failover and drain planning.
 
 
 ### Role

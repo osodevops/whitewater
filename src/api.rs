@@ -2709,7 +2709,11 @@ fn subscription_placement_diverged(
 /// /health endpoint and CASes dead ones onto a surviving storage Node —
 /// a threshold of consecutive failures means a slow Node that still
 /// answers is never moved unnecessarily.
-pub struct PipeComputeLeaseRecoverySupervisor {
+/// Leader-driven backstop for compute leases: probes each lease owner
+/// over /health and CASes dead ones onto a surviving storage Node.
+/// Covers Pipe compute leases and Distributary leases — both are pure
+/// catalog metadata, so recovery is a single epoch-bumping CAS.
+pub struct ComputeLeaseRecoverySupervisor {
     threshold: u32,
     client: reqwest::Client,
     /// mTLS-capable probe client, built once from the shared material:
@@ -2720,7 +2724,7 @@ pub struct PipeComputeLeaseRecoverySupervisor {
     failures: std::sync::Mutex<BTreeMap<Uuid, (crate::active_range::StorageNodeId, u32)>>,
 }
 
-impl PipeComputeLeaseRecoverySupervisor {
+impl ComputeLeaseRecoverySupervisor {
     pub fn new(threshold: u32) -> Self {
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(1))
@@ -2764,6 +2768,40 @@ impl PipeComputeLeaseRecoverySupervisor {
             .is_ok()
     }
 
+    /// Sustained-failure bookkeeping: a lease only earns a recovery
+    /// attempt after `threshold` consecutive dead-owner probes, and the
+    /// count resets when the owner answers or the lease moves on its own.
+    /// Keyed by resource id — Pipe and Distributary ids are distinct
+    /// Uuid namespaces sharing this map.
+    fn should_recover(
+        &self,
+        key: Uuid,
+        owner: &crate::active_range::StorageNodeId,
+        alive: bool,
+    ) -> bool {
+        let mut failures = self
+            .failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if alive {
+            failures.remove(&key);
+            return false;
+        }
+        let entry = failures.entry(key).or_insert_with(|| (owner.clone(), 0));
+        if entry.0 != *owner {
+            *entry = (owner.clone(), 0);
+        }
+        entry.1 = entry.1.saturating_add(1);
+        entry.1 >= self.threshold
+    }
+
+    fn clear_failure(&self, key: Uuid) {
+        self.failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&key);
+    }
+
     pub async fn tick(&self, state: &AppState) {
         let Some(plane) = &state.control_plane else {
             return;
@@ -2780,41 +2818,16 @@ impl PipeComputeLeaseRecoverySupervisor {
                 .await
                 .is_none()
             {
-                self.failures
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&lease.pipe_id);
+                self.clear_failure(lease.pipe_id);
                 continue;
             }
             let alive = self.node_alive(state, &lease.owner).await;
-            let should_recover = {
-                let mut failures = self
-                    .failures
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                if alive {
-                    failures.remove(&lease.pipe_id);
-                    false
-                } else {
-                    let entry = failures
-                        .entry(lease.pipe_id)
-                        .or_insert_with(|| (lease.owner.clone(), 0));
-                    if entry.0 != lease.owner {
-                        *entry = (lease.owner.clone(), 0);
-                    }
-                    entry.1 = entry.1.saturating_add(1);
-                    entry.1 >= self.threshold
-                }
-            };
-            if !should_recover {
+            if !self.should_recover(lease.pipe_id, &lease.owner, alive) {
                 continue;
             }
             match self.recover(state, &lease).await {
                 Ok(new_owner) => {
-                    self.failures
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&lease.pipe_id);
+                    self.clear_failure(lease.pipe_id);
                     tracing::info!(
                         pipe_id = %lease.pipe_id,
                         owner = %new_owner,
@@ -2828,6 +2841,45 @@ impl PipeComputeLeaseRecoverySupervisor {
                         owner = %lease.owner,
                         compute_epoch = lease.compute_epoch,
                         "background Pipe compute lease recovery attempt failed"
+                    );
+                }
+            }
+        }
+        let active: std::collections::HashSet<Uuid> = state
+            .control
+            .active_distributaries()
+            .await
+            .into_iter()
+            .map(|definition| definition.distributary_id)
+            .collect();
+        for lease in state.control.distributary_leases().await {
+            // A lease row without an active definition is dead weight —
+            // DROP removes both, but a partially applied older state is
+            // never worth churning recovery attempts over.
+            if !active.contains(&lease.distributary_id) {
+                self.clear_failure(lease.distributary_id);
+                continue;
+            }
+            let alive = self.node_alive(state, &lease.owner).await;
+            if !self.should_recover(lease.distributary_id, &lease.owner, alive) {
+                continue;
+            }
+            match self.recover_distributary(state, &lease).await {
+                Ok(new_owner) => {
+                    self.clear_failure(lease.distributary_id);
+                    tracing::info!(
+                        distributary_id = %lease.distributary_id,
+                        owner = %new_owner,
+                        "Distributary lease owner recovered"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        distributary_id = %lease.distributary_id,
+                        owner = %lease.owner,
+                        epoch = lease.epoch,
+                        "background Distributary lease recovery attempt failed"
                     );
                 }
             }
@@ -2876,6 +2928,58 @@ impl PipeComputeLeaseRecoverySupervisor {
         }
         Err(crate::reader::SubscriptionProgressError::Unavailable)
     }
+
+    /// Distributary leases carry no data either — the durable progress
+    /// is the remote Reader frontier — so recovery is the same pattern:
+    /// hand the lease to the first surviving storage Node via an
+    /// epoch-guarded CAS that fails closed against racing movers.
+    async fn recover_distributary(
+        &self,
+        state: &AppState,
+        lease: &crate::control::DistributaryLease,
+    ) -> Result<crate::active_range::StorageNodeId, crate::reader::SubscriptionProgressError> {
+        let current = state
+            .control
+            .distributary_lease(lease.distributary_id)
+            .await
+            .unwrap_or_else(|| lease.clone());
+        if current.owner != lease.owner {
+            return Ok(current.owner);
+        }
+        let name = active_distributary_name(state, lease.distributary_id)
+            .await
+            .ok_or(crate::reader::SubscriptionProgressError::Unavailable)?;
+        for candidate in state.control.storage_pool_nodes().await {
+            if candidate == current.owner {
+                continue;
+            }
+            if !self.node_alive(state, &candidate).await {
+                continue;
+            }
+            state
+                .progress_authority
+                .execute_placement_commands(vec![crate::control::Command::MoveDistributaryLease {
+                    distributary: name.clone(),
+                    new_owner: candidate.clone(),
+                    expected_epoch: Some(current.epoch),
+                }])
+                .await?;
+            return Ok(candidate);
+        }
+        Err(crate::reader::SubscriptionProgressError::Unavailable)
+    }
+}
+
+/// The lease table is keyed by id but `MoveDistributaryLease` addresses
+/// the resource by name — resolve through the active definition set.
+async fn active_distributary_name(state: &AppState, distributary_id: Uuid) -> Option<String> {
+    state
+        .control
+        .active_distributaries()
+        .await
+        .into_iter()
+        .find(|definition| definition.distributary_id == distributary_id)
+        .map(|definition| definition.name)
 }
 
 /// Whether the live placement's owner already answers evidence probes: a
@@ -9194,7 +9298,11 @@ async fn recovery_reconcile(
 ) -> Json<ReplicaReconcileResponse> {
     let response = match &state.replica_append {
         Some(service) => match service
-            .reconcile_recovery(request.feed_id, request.committed_prefix)
+            .reconcile_recovery(
+                request.feed_id,
+                request.committed_prefix,
+                request.authoritative,
+            )
             .await
         {
             Ok(removed_records) => ReplicaReconcileResponse {
@@ -11024,6 +11132,7 @@ async fn admin_split_range(
                     &ReplicaReconcileRequest {
                         feed_id: plan.feed_id,
                         committed_prefix: source_commit,
+                        authoritative: node == &plan.right_assignment.owner,
                     },
                 )
                 .await
@@ -26356,11 +26465,83 @@ mod tests {
             .unwrap();
         let before = control.pipe_compute_lease(pipe.pipe_id).await.unwrap();
         assert_eq!(before.owner, target);
-        let supervisor = PipeComputeLeaseRecoverySupervisor::new(2);
+        let supervisor = ComputeLeaseRecoverySupervisor::new(2);
         supervisor.tick(&state).await;
         let after = control.pipe_compute_lease(pipe.pipe_id).await.unwrap();
         assert_eq!(after.owner, before.owner);
         assert_eq!(after.compute_epoch, before.compute_epoch);
+    }
+
+    #[test]
+    fn lease_supervisor_recovery_requires_sustained_failures() {
+        // The failure counter is the hysteresis: one missed probe must
+        // never move a lease (a slow Node is not a dead Node), an
+        // answering owner resets the count, and an owner change mid-
+        // streak restarts it so a racing mover's new owner gets a fresh
+        // threshold rather than inheriting the old owner's debt.
+        let supervisor = ComputeLeaseRecoverySupervisor::new(2);
+        let id = Uuid::from_u128(4242);
+        let owner = crate::active_range::StorageNodeId::try_new("control-1").unwrap();
+        let other = crate::active_range::StorageNodeId::try_new("control-2").unwrap();
+
+        // One failure is below threshold; the second consecutive one
+        // earns a recovery attempt.
+        assert!(!supervisor.should_recover(id, &owner, false));
+        assert!(supervisor.should_recover(id, &owner, false));
+
+        // An answering owner clears the streak — the next failure is a
+        // fresh count, not a continuation.
+        assert!(!supervisor.should_recover(id, &owner, true));
+        assert!(!supervisor.should_recover(id, &owner, false));
+        assert!(supervisor.should_recover(id, &owner, false));
+
+        // A moved lease restarts the count for the new owner.
+        supervisor.clear_failure(id);
+        assert!(!supervisor.should_recover(id, &owner, false));
+        assert!(!supervisor.should_recover(id, &other, false));
+        assert!(supervisor.should_recover(id, &other, false));
+
+        // Pipe and Distributary ids share the map but never collide —
+        // they are different Uuids.
+        let other_resource = Uuid::from_u128(7777);
+        assert!(!supervisor.should_recover(other_resource, &owner, false));
+        assert!(supervisor.should_recover(other_resource, &owner, false));
+    }
+
+    #[tokio::test]
+    async fn distributary_lease_supervisor_stays_idle_until_this_node_leads() {
+        // Same gate as Pipe compute leases: only the leader may CAS a
+        // Distributary lease, so a partitioned follower seeing a dead
+        // owner never churns the epoch.
+        let directory = TempDir::new().unwrap();
+        let (state, _plane, control, _replica) = internal_replica_test_state(&directory).await;
+        control
+            .execute(
+                "CREATE FEED orders.mirrored; \
+                 CREATE RIVERBED LINK upstream AT 'http://src1:7070' WITH KEY ENV WW_KEY; \
+                 CREATE DISTRIBUTARY orders.mirror FROM LINK upstream FEED orders.events INTO orders.mirrored;",
+            )
+            .await
+            .unwrap();
+        let distributary = control
+            .active_distributaries()
+            .await
+            .into_iter()
+            .find(|item| item.name == "orders.mirror")
+            .unwrap();
+        let before = control
+            .distributary_lease(distributary.distributary_id)
+            .await
+            .unwrap();
+        let supervisor = ComputeLeaseRecoverySupervisor::new(1);
+        supervisor.tick(&state).await;
+        supervisor.tick(&state).await;
+        let after = control
+            .distributary_lease(distributary.distributary_id)
+            .await
+            .unwrap();
+        assert_eq!(after.owner, before.owner);
+        assert_eq!(after.epoch, before.epoch);
     }
 
     /// In-memory CutoverPrefix over a contiguous committed prefix so the

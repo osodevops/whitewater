@@ -293,6 +293,110 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn stale_epoch_stamp_on_the_current_owner_is_re_stamped_not_fatal() {
+    let fixture = Fixture::new().await;
+    let followers = fixture.non_owner_nodes();
+    // Ownership CASes epoch 1 -> 2 onto a different replica; every store
+    // adopts the newer epoch on its next fencing check.
+    fixture
+        .control
+        .execute_commands(vec![Command::RecoverActiveRangeOwnership {
+            feed: "orders.events".to_owned(),
+            expected_owner: fixture.owner.clone(),
+            expected_epoch: fixture.request.ownership_epoch,
+            new_owner: followers[0].clone(),
+        }])
+        .await
+        .unwrap();
+
+    let transport = DirectTransport {
+        services: Arc::new(fixture.services.clone()),
+        append_down: Arc::new(BTreeSet::new()),
+        commit_down: Arc::new(BTreeSet::new()),
+        corrupt_digest: None,
+        commit_pause: None,
+    };
+    let coordinator = MajorityAppendCoordinator::new(
+        fixture.services[&followers[0]].clone(),
+        fixture.control.clone(),
+        Arc::new(transport),
+    );
+
+    // The caller routed to the right (new) owner but still carries the
+    // pre-cutover epoch — catalog propagation lag or a stamp pinned at
+    // Writer-session open. Refusing fatally would wedge the session on
+    // routing residue; the current owner must re-stamp the authoritative
+    // epoch and land the frame.
+    let mut request = fixture.request.clone();
+    request.append_owner = followers[0].clone();
+    assert_eq!(request.ownership_epoch, OwnershipEpoch::new(1));
+    let result = coordinator.append(request).await.unwrap();
+    assert_eq!(result.position, RangePosition::new(1));
+}
+
+#[tokio::test]
+async fn divergent_committed_replica_vetoes_instead_of_forging_divergence() {
+    let fixture = Fixture::new().await;
+    let followers = fixture.non_owner_nodes();
+
+    // Stage a divergent committed occupant at position 1 on one follower:
+    // same Writer identity, different record bytes — the history a
+    // superseded owner could have committed before losing ownership.
+    let mut divergent = fixture.request.clone();
+    divergent.cursor = "cursor-divergent".to_owned();
+    let mut divergent_record =
+        decode_record(&STANDARD.decode(&fixture.request.frame_base64).unwrap()).unwrap();
+    divergent_record.message_id = Uuid::from_u128(702);
+    divergent_record.payload = b"diverged".to_vec();
+    divergent.frame_base64 = STANDARD.encode(encode_record(&divergent_record).unwrap());
+    let landed = fixture.services[&followers[0]]
+        .append(divergent)
+        .await
+        .unwrap();
+    fixture.services[&followers[0]]
+        .commit(ReplicaCommitRequest {
+            feed_id: fixture.request.feed_id,
+            range_id: fixture.request.range_id,
+            generation: fixture.request.generation,
+            ownership_epoch: fixture.request.ownership_epoch,
+            append_owner: fixture.owner.clone(),
+            commit_position: CommitPosition::new(1),
+            frame_digest: landed.frame_digest,
+        })
+        .await
+        .unwrap();
+
+    // The owner's durable pair used to out-vote the divergent replica and
+    // commit a second frame at position 1 — forging committed divergence no
+    // recovery can reconcile. The fork evidence must veto the append as a
+    // retryable refusal so the Writer rides out the ownership cutover.
+    let error = fixture
+        .coordinator(&[], &[], None)
+        .append(fixture.request.clone())
+        .await
+        .unwrap_err();
+    assert!(error.retryable);
+    assert_eq!(error.code, MajorityAppendErrorCode::NoDurableMajority);
+
+    // The diverged latch keeps the owner unhealthy under this epoch so
+    // recovery moves ownership onto the evidence holder instead of a clean
+    // quorum append elsewhere clearing the mark while the fork persists.
+    let status = fixture.services[&fixture.owner]
+        .recovery_status(fixture.request.feed_id)
+        .await
+        .unwrap();
+    assert!(!status.healthy);
+
+    // The evidence replica's committed frame is untouched.
+    let divergent_status = fixture.services[&followers[0]]
+        .recovery_status(fixture.request.feed_id)
+        .await
+        .unwrap();
+    assert_eq!(divergent_status.committed, CommitPosition::new(1));
+    assert_eq!(divergent_status.appended, RangePosition::new(1));
+}
+
+#[tokio::test]
 async fn three_healthy_replicas_commit_with_three_matching_evidence_records() {
     let fixture = Fixture::new().await;
     let result = fixture

@@ -51,6 +51,11 @@ pub struct ReplicaAppendAccepted {
     pub cursor: String,
     pub frame_digest: [u8; 32],
     pub deduplicated: bool,
+    /// The matching frame sits inside this replica's committed prefix —
+    /// divergent committed history is committed-fork evidence the owner
+    /// must veto, not out-vote.
+    #[serde(default)]
+    pub committed: bool,
     pub durable: bool,
 }
 
@@ -68,6 +73,7 @@ pub enum ReplicaAppendErrorCode {
     InvalidFrame,
     PositionGap,
     PositionConflict,
+    CommittedPositionConflict,
     WriterSequenceConflict,
     RangeFrozen,
     PendingEffectOccupied,
@@ -268,6 +274,12 @@ pub struct ReplicaAppendService {
     /// `frozen_generations`; `recovery_status` reports such an owner as
     /// unhealthy so ownership moves instead of writes stalling forever.
     quorum_blocked_ranges: Arc<RwLock<HashSet<RangeId>>>,
+    /// Ranges where a replica proved a committed-divergent occupant —
+    /// its committed history holds different bytes than the owner's tail.
+    /// Unlike `quorum_blocked_ranges` this latches until the epoch moves:
+    /// a clean quorum append elsewhere does not resolve the fork, only an
+    /// ownership cutover onto the divergent evidence holder can.
+    diverged_ranges: Arc<RwLock<HashSet<(RangeId, OwnershipEpoch)>>>,
     // Serialized per range: appends and generation freezes for one range
     // must not interleave, but unrelated ranges pipeline on this Node.
     append_gates: Arc<Mutex<std::collections::BTreeMap<RangeId, Arc<Mutex<()>>>>>,
@@ -307,6 +319,7 @@ impl ReplicaAppendService {
             store_open_gate: Arc::new(Mutex::new(())),
             frozen_generations: Arc::new(RwLock::new(HashSet::new())),
             quorum_blocked_ranges: Arc::new(RwLock::new(HashSet::new())),
+            diverged_ranges: Arc::new(RwLock::new(HashSet::new())),
             append_gates: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             index_apply: Arc::new(std::sync::RwLock::new(None)),
             store_options,
@@ -482,6 +495,13 @@ impl ReplicaAppendService {
     }
 
     /// Clears the quorum-blocked mark after a successful quorum append.
+    /// A replica reported a divergent committed occupant for this range:
+    /// latch the owner as unhealthy until the epoch moves — the fork can
+    /// only resolve through ownership cutover onto the evidence holder.
+    pub async fn note_owner_diverged(&self, range_id: RangeId, epoch: OwnershipEpoch) {
+        self.diverged_ranges.write().await.insert((range_id, epoch));
+    }
+
     pub async fn note_owner_quorum_restored(&self, range_id: RangeId) {
         self.quorum_blocked_ranges.write().await.remove(&range_id);
     }
@@ -646,9 +666,16 @@ impl ReplicaAppendService {
     ) -> Result<super::ReplicaRecoveryStatus, ReplicaAppendError> {
         let store = self.store_for(assignment).await?;
         let snapshot = store.snapshot().await.map_err(map_store_error)?;
+        let diverged = assignment.owner == self.local_node
+            && self
+                .diverged_ranges
+                .read()
+                .await
+                .contains(&(assignment.range_id, assignment.ownership_epoch));
         Ok(super::ReplicaRecoveryStatus {
             node: self.local_node.clone(),
-            healthy: !store.persistence_failure(),
+            healthy: !store.persistence_failure() && !diverged,
+            diverged,
             appended: snapshot.progress.appended(),
             committed: snapshot.progress.commit_position(),
         })
@@ -756,9 +783,16 @@ impl ReplicaAppendService {
                 .read()
                 .await
                 .contains(&assignment.range_id);
+        let diverged = assignment.owner == self.local_node
+            && self
+                .diverged_ranges
+                .read()
+                .await
+                .contains(&(assignment.range_id, assignment.ownership_epoch));
         Ok(super::ReplicaRecoveryStatus {
             node: self.local_node.clone(),
-            healthy: !store.persistence_failure() && !quorum_blocked,
+            healthy: !store.persistence_failure() && !quorum_blocked && !diverged,
+            diverged,
             appended: snapshot.progress.appended(),
             committed: snapshot.progress.commit_position(),
         })
@@ -768,6 +802,7 @@ impl ReplicaAppendService {
         &self,
         feed_id: Uuid,
         committed_prefix: CommitPosition,
+        authoritative: bool,
     ) -> Result<u64, ReplicaAppendError> {
         let assignment = self
             .control
@@ -798,7 +833,12 @@ impl ReplicaAppendService {
                 .value()
                 .min(snapshot.progress.appended().value()),
         );
-        if snapshot.progress.commit_position() < promotable {
+        // Only the evidence-holding new owner may commit its local frames
+        // forward: any other replica's pending tail could hold divergent
+        // bytes pushed by a superseded owner, and committing them would
+        // forge committed divergence. Non-authoritative replicas truncate
+        // the tail and converge through verified committed import.
+        if authoritative && snapshot.progress.commit_position() < promotable {
             store
                 .commit(
                     assignment.generation,
@@ -1348,6 +1388,7 @@ impl ReplicaAppendService {
             cursor: result.cursor,
             frame_digest: result.frame_digest,
             deduplicated: result.deduplicated,
+            committed: result.committed,
             durable: true,
         })
     }
@@ -1622,6 +1663,10 @@ fn map_store_error(error: ActiveRangeStoreError) -> ReplicaAppendError {
             ReplicaAppendErrorCode::PositionConflict,
             error.to_string(),
         ),
+        ActiveRangeStoreError::CommittedPositionConflict(_) => ReplicaAppendError::rejected(
+            ReplicaAppendErrorCode::CommittedPositionConflict,
+            error.to_string(),
+        ),
         ActiveRangeStoreError::WriterSequenceConflict { .. }
         | ActiveRangeStoreError::StaleWriterSequence { .. }
         | ActiveRangeStoreError::WriterSequenceGap { .. } => ReplicaAppendError::rejected(
@@ -1654,6 +1699,7 @@ mod tests {
     use crate::{
         active_range::ReplicaSet,
         control::Command,
+        domain::StoredRecord,
         storage::{FileLogStore, LogStore},
     };
 
@@ -1721,6 +1767,166 @@ mod tests {
 
         owner.note_owner_quorum_restored(assignment.range_id).await;
         assert!(owner.recovery_status(feed_id).await.unwrap().healthy);
+    }
+
+    #[tokio::test]
+    async fn non_authoritative_reconcile_truncates_without_promoting_the_tail() {
+        let root = tempfile::TempDir::new().unwrap();
+        let nodes = ["storage-1", "storage-2", "storage-3"]
+            .map(|node| StorageNodeId::try_new(node).unwrap());
+        let legacy: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(root.path().join("legacy")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                root.path().join("catalog.json"),
+                legacy,
+                nodes.to_vec(),
+            )
+            .unwrap(),
+        );
+        let created = control
+            .execute_commands(vec![
+                Command::CreateSpace {
+                    name: "orders".to_owned(),
+                },
+                Command::CreateFeed {
+                    name: "orders.events".to_owned(),
+                    encrypted: false,
+                },
+            ])
+            .await
+            .unwrap();
+        let feed_id: Uuid =
+            serde_json::from_value(created.results[1].data["feed_id"].clone()).unwrap();
+        let assignment = control.active_range_assignment(feed_id).await.unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        let replica_root = root.path().join("replica");
+        crate::active_range::store::seed_committed_history(&replica_root, &descriptor, 7);
+        let replica_id = assignment
+            .replicas
+            .iter()
+            .find(|node| **node != assignment.owner)
+            .unwrap()
+            .clone();
+        let replica = ReplicaAppendService::new(&replica_root, replica_id, control.clone());
+
+        // A pending frame above the committed prefix — the divergent tail a
+        // superseded owner could have pushed before losing ownership.
+        let writer = Uuid::from_u128(9);
+        let record = StoredRecord {
+            message_id: Uuid::from_u128(910),
+            producer_id: writer,
+            producer_sequence: 1,
+            event_time_ns: 1,
+            ingest_time_ns: 2,
+            key: b"key".to_vec(),
+            payload: b"diverged-tail".to_vec(),
+            metadata: std::collections::BTreeMap::new(),
+        };
+        let frame = crate::codec::encode_record(&record).unwrap();
+        let request = ReplicaAppendRequest {
+            feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+            append_owner: assignment.owner.clone(),
+            expected_position: RangePosition::new(8),
+            identity: AppendIdentity {
+                writer_session_id: writer,
+                writer_epoch: 1,
+                sequence: 1,
+            },
+            cursor: "cursor-tail".to_owned(),
+            frame_base64: base64::engine::general_purpose::STANDARD.encode(&frame),
+            pending_effect: None,
+        };
+        replica.append(request.clone()).await.unwrap();
+
+        // Non-authoritative reconcile must not promote the unverifiable
+        // tail into committed history — it truncates so verified committed
+        // import can restore the prefix.
+        let removed = replica
+            .reconcile_recovery(feed_id, CommitPosition::new(9), false)
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+        let status = replica.recovery_status(feed_id).await.unwrap();
+        assert_eq!(status.appended, RangePosition::new(7));
+        assert_eq!(status.committed, CommitPosition::new(7));
+
+        // The authoritative evidence holder still commits forward under the
+        // same request — the only replica permitted to promote local bytes.
+        replica.append(request).await.unwrap();
+        replica
+            .reconcile_recovery(feed_id, CommitPosition::new(9), true)
+            .await
+            .unwrap();
+        let status = replica.recovery_status(feed_id).await.unwrap();
+        assert_eq!(status.committed, CommitPosition::new(8));
+    }
+
+    #[tokio::test]
+    async fn owner_divergence_latch_marks_recovery_status_unhealthy_for_the_epoch() {
+        let root = tempfile::TempDir::new().unwrap();
+        let nodes = ["storage-1", "storage-2", "storage-3"]
+            .map(|node| StorageNodeId::try_new(node).unwrap());
+        let legacy: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(root.path().join("legacy")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                root.path().join("catalog.json"),
+                legacy,
+                nodes.to_vec(),
+            )
+            .unwrap(),
+        );
+        let created = control
+            .execute_commands(vec![
+                Command::CreateSpace {
+                    name: "orders".to_owned(),
+                },
+                Command::CreateFeed {
+                    name: "orders.events".to_owned(),
+                    encrypted: false,
+                },
+            ])
+            .await
+            .unwrap();
+        let feed_id: Uuid =
+            serde_json::from_value(created.results[1].data["feed_id"].clone()).unwrap();
+        let assignment = control.active_range_assignment(feed_id).await.unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        let owner_root = root.path().join("owner");
+        crate::active_range::store::seed_committed_history(&owner_root, &descriptor, 7);
+        let owner =
+            ReplicaAppendService::new(&owner_root, assignment.owner.clone(), control.clone());
+
+        assert!(owner.recovery_status(feed_id).await.unwrap().healthy);
+
+        // A latch stamped under another epoch is stale fencing — it must
+        // not degrade the current owner.
+        owner
+            .note_owner_diverged(assignment.range_id, OwnershipEpoch::new(99))
+            .await;
+        assert!(owner.recovery_status(feed_id).await.unwrap().healthy);
+
+        // The current-epoch latch keeps the owner unhealthy until the epoch
+        // moves — unlike quorum_blocked, quorum appends must not clear it.
+        owner
+            .note_owner_diverged(assignment.range_id, assignment.ownership_epoch)
+            .await;
+        owner.note_owner_quorum_restored(assignment.range_id).await;
+        assert!(!owner.recovery_status(feed_id).await.unwrap().healthy);
     }
 
     #[test]
@@ -1931,7 +2137,7 @@ mod tests {
             .expect_err("different bytes at a committed position must conflict");
         assert_eq!(
             tampered_error.code,
-            ReplicaAppendErrorCode::PositionConflict
+            ReplicaAppendErrorCode::CommittedPositionConflict
         );
     }
 

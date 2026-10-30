@@ -340,6 +340,13 @@ impl MajorityAppendCoordinator {
                 vec![],
             ));
         }
+        // The caller stamps the epoch from its own catalog view, which can
+        // lag a committed cutover; surfacing that lag as a fatal refusal
+        // would wedge Writers on routing residue. The owner just proved it
+        // is the current owner, so the catalog epoch it read is the
+        // authoritative fencing stamp for the frame this append produces —
+        // replicas and the local store fence on it identically.
+        request.ownership_epoch = assignment.ownership_epoch;
         if let Some(encode_with_sequence) = mint {
             // Owner-minted Writer sequences: the session append path sends no
             // pre-allocated number; the owner derives it from this replica's
@@ -447,6 +454,7 @@ impl MajorityAppendCoordinator {
             (followers[1].clone(), second_result),
         ];
         let mut durable_followers = Vec::new();
+        let mut divergent: Vec<StorageNodeId> = Vec::new();
         for (node, result) in follower_results {
             let result = match result {
                 Err(error) if error.code == Some(ReplicaAppendErrorCode::PositionGap) => match self
@@ -466,7 +474,17 @@ impl MajorityAppendCoordinator {
             };
             match result {
                 Ok(accepted) => {
-                    if accepted.position != local.position
+                    // Committed-divergent evidence: the replica matched this
+                    // frame to a different position inside its committed
+                    // prefix — the store-level proof a forked owner left
+                    // behind. Counting it as a quorum refusal would let the
+                    // durable pair forge committed divergence — veto the
+                    // append and surface the fork instead. A bare digest or
+                    // uncommitted-position mismatch is a response-level
+                    // contradiction, not fork evidence: keep it fatal.
+                    if accepted.position != local.position && accepted.committed {
+                        divergent.push(node);
+                    } else if accepted.position != local.position
                         || accepted.frame_digest != local.frame_digest
                     {
                         return Err(self.error(
@@ -476,11 +494,15 @@ impl MajorityAppendCoordinator {
                             durable,
                             vec![],
                         ));
+                    } else {
+                        durable.push(node.clone());
+                        durable_followers.push(node);
                     }
-                    durable.push(node.clone());
-                    durable_followers.push(node);
                 }
                 Err(error) => {
+                    if error.code == Some(ReplicaAppendErrorCode::CommittedPositionConflict) {
+                        divergent.push(node.clone());
+                    }
                     tracing::warn!(
                         replica = %node,
                         feed_id = %request.feed_id,
@@ -495,6 +517,31 @@ impl MajorityAppendCoordinator {
                     );
                 }
             }
+        }
+        if !divergent.is_empty() {
+            // A surviving replica proved a different committed frame at this
+            // position: committing the durable pair would forge committed
+            // divergence the cluster can never reconcile. Latch the owner
+            // divergent until ownership moves onto the evidence holder, and
+            // tell the client to retry across the cutover instead of
+            // wedging the Writer sequence on a permanent refusal.
+            self.local
+                .note_owner_diverged(request.range_id, request.ownership_epoch)
+                .await;
+            return Err(self.error(
+                MajorityAppendErrorCode::NoDurableMajority,
+                format!(
+                    "replica(s) {} hold divergent committed evidence; ownership resolving",
+                    divergent
+                        .iter()
+                        .map(|node| node.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                true,
+                durable,
+                vec![],
+            ));
         }
         if durable.len() < ACTIVE_RANGE_COMMIT_QUORUM {
             // The owner cannot commit: mark the range so recovery probes
@@ -539,14 +586,20 @@ impl MajorityAppendCoordinator {
             frame_digest: local.frame_digest,
         };
         let mut evidence = Vec::new();
+        let mut last_commit_error = String::new();
         if durable_followers.len() == 1 {
-            if self
+            match self
                 .transport
                 .commit(&durable_followers[0], commit_request.clone())
                 .await
-                .is_ok()
             {
-                evidence.push(durable_followers[0].clone());
+                Ok(_) => evidence.push(durable_followers[0].clone()),
+                Err(error) => {
+                    last_commit_error = format!(
+                        "; replica {} refused: {}",
+                        durable_followers[0], error.message
+                    )
+                }
             }
         } else {
             let first = self
@@ -556,17 +609,31 @@ impl MajorityAppendCoordinator {
                 .transport
                 .commit(&durable_followers[1], commit_request.clone());
             let (first_result, second_result) = tokio::join!(first, second);
-            if first_result.is_ok() {
-                evidence.push(durable_followers[0].clone());
+            match first_result {
+                Ok(_) => evidence.push(durable_followers[0].clone()),
+                Err(error) => {
+                    last_commit_error = format!(
+                        "; replica {} refused: {}",
+                        durable_followers[0], error.message
+                    )
+                }
             }
-            if second_result.is_ok() {
-                evidence.push(durable_followers[1].clone());
+            match second_result {
+                Ok(_) => evidence.push(durable_followers[1].clone()),
+                Err(error) => {
+                    last_commit_error = format!(
+                        "; replica {} refused: {}",
+                        durable_followers[1], error.message
+                    )
+                }
             }
         }
         if evidence.is_empty() {
             return Err(self.error(
                 MajorityAppendErrorCode::NoCommitMajority,
-                "frame majority exists but no follower persisted CommitPosition evidence; retry with the same append identity",
+                format!(
+                    "frame majority exists but no follower persisted CommitPosition evidence; retry with the same append identity{last_commit_error}"
+                ),
                 true,
                 durable,
                 evidence,

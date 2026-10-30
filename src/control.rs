@@ -3580,6 +3580,17 @@ impl ControlController {
             .collect()
     }
 
+    /// The current lease row for one Distributary — the recovery path
+    /// re-reads it so a racing mover's CAS fails closed on the epoch.
+    pub async fn distributary_lease(&self, distributary_id: Uuid) -> Option<DistributaryLease> {
+        self.state
+            .lock()
+            .await
+            .distributary_leases
+            .get(&distributary_id)
+            .cloned()
+    }
+
     pub async fn active_distributaries(&self) -> Vec<DistributaryDefinition> {
         self.state
             .lock()

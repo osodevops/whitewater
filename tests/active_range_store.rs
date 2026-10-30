@@ -678,7 +678,7 @@ async fn a_validated_frame_overwrites_an_uncommitted_tail_but_never_committed() 
     .unwrap();
     assert!(matches!(
         store.append(forged).await,
-        Err(ActiveRangeStoreError::PositionConflict(position)) if position.value() == 1
+        Err(ActiveRangeStoreError::CommittedPositionConflict(position)) if position.value() == 1
     ));
     // Different bytes from the placement-validated owner at an uncommitted
     // position truncate the orphan and land instead of wedging.

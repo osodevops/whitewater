@@ -1133,10 +1133,11 @@ async fn main() -> Result<()> {
     // request path recovers a dead owner — so a lease can sit on a stopped
     // Node and silently stall forwards and window expiry until an
     // operator drains it. This leader-driven backstop probes lease owners
-    // through /health and CASes dead ones onto a surviving storage Node.
+    // through /health and CASes dead ones onto a surviving storage Node;
+    // Distributary leases recover the same way.
     let pipe_lease_recovery_task = if app_state.control_plane.is_some() {
         let state = app_state.clone();
-        let supervisor = whitewater::api::PipeComputeLeaseRecoverySupervisor::new(3);
+        let supervisor = whitewater::api::ComputeLeaseRecoverySupervisor::new(3);
         let mut shutdown = shutdown_tx.subscribe();
         Some(tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(2));

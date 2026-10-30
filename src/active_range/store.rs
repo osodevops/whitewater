@@ -209,6 +209,8 @@ pub enum ActiveRangeStoreError {
     },
     #[error("different bytes or append identity already occupy RangePosition {0}")]
     PositionConflict(RangePosition),
+    #[error("a different committed frame already occupies RangePosition {0}")]
+    CommittedPositionConflict(RangePosition),
     #[error("commit position {supplied} exceeds flushed position {flushed}")]
     CommitBeyondFlushed { supplied: u64, flushed: u64 },
     #[error("commit position cannot move backwards: current={current}, supplied={supplied}")]
@@ -1359,6 +1361,16 @@ fn append_locked(
             let existing = entry_at(loaded, supplied)
                 .ok_or(ActiveRangeStoreError::PositionConflict(supplied))?;
             if existing.identity != request.identity || existing.frame_digest != frame_digest {
+                // A divergent occupant at or below the committed boundary is
+                // committed-fork evidence: some surviving replica committed a
+                // different frame at this position under a prior owner. The
+                // distinct error lets the Append Owner veto the commit
+                // instead of forging divergence over it. Divergent pending
+                // occupants were truncated above, so anything reaching this
+                // branch at a committed position can only be a fork.
+                if supplied.value() <= loaded.persisted.committed {
+                    return Err(ActiveRangeStoreError::CommittedPositionConflict(supplied));
+                }
                 tracing::warn!(
                     position = supplied.value(),
                     committed = loaded.persisted.committed,

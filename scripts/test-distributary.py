@@ -1,5 +1,6 @@
 import base64
 import json
+import pathlib
 import subprocess
 import time
 import urllib.error
@@ -202,10 +203,12 @@ def main():
             "continuous copy",
         )
 
-        # Lease failover: stop the owner Node, move the lease to a live
-        # Node, and prove the copy resumes with no duplicated records.
-        # Reads and the MOVE itself route to a surviving destination
-        # Node — the stopped owner cannot serve them.
+        # Lease failover: stop the owner Node. The leader's lease
+        # recovery supervisor must notice the dead owner and CAS the
+        # lease onto a survivor on its own — no operator MOVE — and the
+        # copy must then resume with no duplicated records. Reads route
+        # to a surviving destination Node — the stopped owner cannot
+        # serve them.
         owner, epoch_before = lease_owner(DST[0])
         victim_index = owner_index(owner)
         survivor = live_dst(victim_index)
@@ -213,8 +216,14 @@ def main():
             ["docker", "stop", f"whitewater-distributary-dst{victim_index + 1}-1"],
             check=True,
         )
-        replacement = f"control-{next(i for i in range(3) if i != victim_index) + 1}"
-        wcl(survivor, f"MOVE DISTRIBUTARY LEASE dstdom.mirror TO NODE {replacement};")
+
+        def lease_recovered():
+            new_owner, new_epoch = lease_owner(survivor)
+            if new_owner == owner or new_epoch <= epoch_before:
+                return False
+            return new_owner, new_epoch
+
+        recovered_owner, _ = wait_for(lease_recovered, "automatic lease recovery")
         for record_id in range(31, 41):
             append(SRC[record_id % 3], "srcwriter", epoch, record_id)
 
@@ -231,9 +240,62 @@ def main():
                 raise AssertionError("duplicate records after lease move")
             return rows
 
-        wait_for(resumed_without_dupes, "lease-move resume")
+        # The recovery chain — lease CAS, range owner recovery, reconcile,
+        # then ~2s/record appends — needs a wider window than the happy
+        # path; a genuine wedge still fails, just not the honest delay.
+        wait_for(resumed_without_dupes, "lease-move resume", timeout=240)
         _, epoch_after = lease_owner(survivor)
         assert epoch_after > epoch_before
+
+        # Range-owner failover: bring the victim back so quorum holds at
+        # two live Nodes, then stop the Node that currently owns the
+        # mirrored Feed's Active Range. The owner recovery supervisor —
+        # dead-owner planning plus the live-owner committed-frontier
+        # backstop — must heal the range while the drive keeps copying.
+        subprocess.run(
+            ["docker", "start", f"whitewater-distributary-dst{victim_index + 1}-1"],
+            check=True,
+        )
+
+        def victim_back():
+            try:
+                with urllib.request.urlopen(
+                    f"http://localhost:{8180 + victim_index + 1}/health", timeout=5
+                ) as response:
+                    return response.status == 200
+            except (OSError, urllib.error.HTTPError):
+                return False
+
+        wait_for(victim_back, "victim rejoin", timeout=60)
+
+        def range_owner_index(endpoint):
+            result = wcl(endpoint, "INSPECT PLACEMENT FOR FEED dstdom.mirrored;")
+            assignments = result["results"][0]["data"]["range_assignments"]
+            return owner_index(assignments[0]["owner"])
+
+        range_victim = range_owner_index(survivor)
+        subprocess.run(
+            ["docker", "stop", f"whitewater-distributary-dst{range_victim + 1}-1"],
+            check=True,
+        )
+        range_survivor = live_dst(range_victim)
+        for record_id in range(41, 51):
+            append(SRC[record_id % 3], "srcwriter", epoch, record_id)
+
+        def resumed_after_range_owner_loss():
+            rows = records(range_survivor, "dstdom.mirrored")
+            if len(rows) != 50:
+                return False
+            payloads = [
+                base64.b64decode(row["payload_base64"]).decode() for row in rows
+            ]
+            if len(set(payloads)) != 50:
+                raise AssertionError("duplicate records after range owner loss")
+            return rows
+
+        wait_for(resumed_after_range_owner_loss, "range-owner resume", timeout=240)
+        range_owner_after = range_owner_index(range_survivor)
+        assert range_owner_after != range_victim
 
         print(
             json.dumps(
@@ -241,18 +303,39 @@ def main():
                     "initial_copy": 20,
                     "continuous_copy": 10,
                     "post_failover_copy": 10,
-                    "destination_records": 40,
+                    "post_range_owner_loss_copy": 10,
+                    "destination_records": 50,
                     "duplicates": 0,
                     "lease_owner_before": owner,
+                    "lease_owner_after": recovered_owner,
                     "lease_epoch_before": epoch_before,
                     "lease_epoch_after": epoch_after,
+                    "range_owner_lost": f"control-{range_victim + 1}",
+                    "range_owner_after": f"control-{range_owner_after + 1}",
                     "note": "destination-owned pull copied the source Feed; "
                     "Key/event-time/Metadata preserved under new Cursors; "
-                    "owner loss + operator lease move resumed with zero duplicates",
+                    "lease-owner loss + automatic lease recovery and "
+                    "range-owner loss + owner recovery resumed with "
+                    "zero duplicates",
                 }
             )
         )
     finally:
+        # Capture diagnostics before teardown — CI uploads acceptance-logs/.
+        try:
+            logs_dir = pathlib.Path(__file__).resolve().parent.parent / "acceptance-logs"
+            logs_dir.mkdir(exist_ok=True)
+            captured = subprocess.run(
+                [*COMPOSE, "logs", "--no-color", "--tail", "400"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            (logs_dir / "distributary-containers.log").write_text(
+                captured.stdout + captured.stderr, encoding="utf-8"
+            )
+        except OSError:
+            pass
         subprocess.run(["docker", "start", "whitewater-distributary-dst1-1"], check=False)
         subprocess.run(["docker", "start", "whitewater-distributary-dst2-1"], check=False)
         subprocess.run(["docker", "start", "whitewater-distributary-dst3-1"], check=False)

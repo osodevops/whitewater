@@ -136,6 +136,16 @@ pub struct DistributaryDriveState {
     pub lease_epoch: u64,
 }
 
+impl DistributaryDriveState {
+    /// Abandon an in-flight remote page: reopening the Reader session
+    /// rewinds the remote delivered frontier back to acknowledged
+    /// progress, so records the page delivered but this driver never
+    /// appended are fetched again instead of skipped.
+    fn abandon_page(&mut self) {
+        self.reader_epoch = None;
+    }
+}
+
 /// One bounded drive cycle for a locally-owned Distributary: declare
 /// the remote Reader and local Writer if missing, open sessions as
 /// needed, copy up to `limit` records, then acknowledge the remote
@@ -259,7 +269,11 @@ pub async fn drive_distributary_once(
             {
                 // A fenced or refused append must not be retried past
                 // this cycle: surface it before acknowledging anything.
+                // The reader session also resets — the page's delivered
+                // frontier has already passed this Cursor, and only a
+                // reopen rewinds it to acknowledged progress.
                 state.writer_epoch = None;
+                state.abandon_page();
                 return Err(format!(
                     "local append refused for remote Cursor {} ({status}): {message}",
                     record.cursor
@@ -267,6 +281,7 @@ pub async fn drive_distributary_once(
             }
             Err(error) => {
                 state.writer_epoch = None;
+                state.abandon_page();
                 return Err(format!(
                     "local append failed for remote Cursor {}: {error}",
                     record.cursor
@@ -275,10 +290,10 @@ pub async fn drive_distributary_once(
         }
     }
 
-    let delivered = page
-        .delivered_cursor
-        .clone()
-        .ok_or_else(|| "remote fetch returned records without a delivered cursor".to_owned())?;
+    let Some(delivered) = page.delivered_cursor.clone() else {
+        state.abandon_page();
+        return Err("remote fetch returned records without a delivered cursor".to_owned());
+    };
     {
         let name = reader.clone();
         remote
@@ -375,5 +390,23 @@ mod tests {
         // Key material stays in the process environment — the catalog
         // row carries only the variable name.
         assert!(!serde_json::to_string(&link).unwrap().contains("secret"));
+    }
+
+    #[test]
+    fn abandon_page_forces_reader_reopen() {
+        // A mid-page local append failure must rewind the remote
+        // delivered frontier: reopening resets it to acknowledged
+        // progress so delivered-but-unappended records are refetched
+        // rather than skipped past.
+        let mut state = DistributaryDriveState {
+            reader_epoch: Some(7),
+            writer_epoch: Some(3),
+            declared: true,
+            lease_epoch: 2,
+        };
+        state.abandon_page();
+        assert_eq!(state.reader_epoch, None);
+        assert_eq!(state.writer_epoch, Some(3));
+        assert!(state.declared);
     }
 }

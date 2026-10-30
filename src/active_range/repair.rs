@@ -637,7 +637,7 @@ pub async fn repair_replica(
         return Err(ReplicaRepairError::TargetAhead);
     }
     target
-        .reconcile_recovery(assignment.feed_id, target_status.committed)
+        .reconcile_recovery(assignment.feed_id, target_status.committed, false)
         .await
         .map_err(|error| ReplicaRepairError::Target(error.to_string()))?;
     target_status = target

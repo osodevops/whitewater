@@ -59,18 +59,21 @@ async fn failed_owner_recovery_selects_a_caught_up_replica_and_higher_epoch() {
             ReplicaRecoveryStatus {
                 node: owner.clone(),
                 healthy: false,
+                diverged: false,
                 appended: RangePosition::new(5),
                 committed: CommitPosition::new(4),
             },
             ReplicaRecoveryStatus {
                 node: caught_up.clone(),
                 healthy: true,
+                diverged: false,
                 appended: RangePosition::new(5),
                 committed: CommitPosition::new(4),
             },
             ReplicaRecoveryStatus {
                 node: lagging,
                 healthy: true,
+                diverged: false,
                 appended: RangePosition::new(4),
                 committed: CommitPosition::new(4),
             },
@@ -92,6 +95,7 @@ async fn recovery_refuses_a_healthy_owner_or_loss_of_replica_majority() {
     let healthy_owner = ReplicaRecoveryStatus {
         node: assignment.owner.clone(),
         healthy: true,
+        diverged: false,
         appended: RangePosition::new(1),
         committed: CommitPosition::new(1),
     };
@@ -116,6 +120,7 @@ async fn recovery_refuses_a_healthy_owner_or_loss_of_replica_majority() {
                         .unwrap()
                         .clone(),
                     healthy: true,
+                    diverged: false,
                     appended: RangePosition::new(1),
                     committed: CommitPosition::new(1),
                 },
@@ -146,18 +151,21 @@ async fn recovery_boundary_follows_the_highest_verified_commit_marker() {
             ReplicaRecoveryStatus {
                 node: owner.clone(),
                 healthy: false,
+                diverged: false,
                 appended: RangePosition::new(6),
                 committed: CommitPosition::new(6),
             },
             ReplicaRecoveryStatus {
                 node: marker_holder.clone(),
                 healthy: true,
+                diverged: false,
                 appended: RangePosition::new(6),
                 committed: CommitPosition::new(6),
             },
             ReplicaRecoveryStatus {
                 node: followers[1].clone(),
                 healthy: true,
+                diverged: false,
                 appended: RangePosition::new(4),
                 committed: CommitPosition::new(4),
             },
@@ -299,17 +307,21 @@ async fn recovered_replicas_advance_epoch_preserve_commit_and_truncate_tail() {
         }])
         .await
         .unwrap();
-    for service in [
-        services[&followers[0]].clone(),
-        services[&followers[1]].clone(),
+    for (node, service) in [
+        (&followers[0], services[&followers[0]].clone()),
+        (&followers[1], services[&followers[1]].clone()),
     ] {
         // The replicas adopted the newer committed epoch when the command
         // landed, but adoption only stamps the epoch: the reconcile promote
-        // commits position 1 and the truncate drops the superseded epoch's
-        // uncommitted tail frame.
+        // commits position 1 on the authoritative new owner and the truncate
+        // drops the superseded epoch's uncommitted tail frame everywhere.
         assert_eq!(
             service
-                .reconcile_recovery(assignment.feed_id, CommitPosition::new(1))
+                .reconcile_recovery(
+                    assignment.feed_id,
+                    CommitPosition::new(1),
+                    *node == followers[0],
+                )
                 .await
                 .unwrap(),
             1
