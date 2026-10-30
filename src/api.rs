@@ -672,6 +672,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/readers/open", post(reader_open))
         .route("/v1/readers/fetch", post(reader_fetch))
         .route("/v1/readers/ack", post(reader_ack))
+        .route("/v1/readers/frontier", post(reader_frontier_report))
         .route("/v1/readers/close", post(reader_close))
         .route("/v1/readers/temporary/fetch", post(temporary_reader_fetch))
         .route(
@@ -5903,10 +5904,16 @@ async fn publish_distributary_status(
     status: crate::control::DistributaryStatus,
 ) -> bool {
     if let Some(existing) = state.control.distributary_status(distributary_id).await {
+        // lag_records participates in the dedup comparison: the probe
+        // still runs only on report-due ticks (so lag alone never
+        // churns the catalog), but a publish that happens anyway must
+        // carry the current figure rather than being swallowed as
+        // "unchanged" for up to a heartbeat while SHOW reads stale lag.
         let unchanged = existing.lease_epoch == status.lease_epoch
             && existing.reported_by == status.reported_by
             && existing.run_state == status.run_state
             && existing.last_error == status.last_error
+            && existing.lag_records == status.lag_records
             && existing.copied_records == status.copied_records;
         let fresh = status
             .reported_at_ns
@@ -5947,6 +5954,7 @@ async fn publish_distributary_stall(
         last_error: Some(message.chars().take(512).collect()),
         last_error_at_ns: Some(now_ns),
         reported_at_ns: now_ns,
+        lag_records: None,
     };
     let _ = publish_distributary_status(state, distributary_id, status).await;
 }
@@ -6073,6 +6081,7 @@ pub async fn drive_local_distributaries(
                         });
                     entry.insert(crate::distributary::DistributaryDriver {
                         copied_records: seed.as_ref().map_or(0, |row| row.copied_records),
+                        lag_records: seed.as_ref().and_then(|row| row.lag_records),
                         last_copied_at_ns: seed.as_ref().and_then(|row| row.last_copied_at_ns),
                         last_error: seed.as_ref().and_then(|row| row.last_error.clone()),
                         last_error_at_ns: seed.as_ref().and_then(|row| row.last_error_at_ns),
@@ -6128,26 +6137,38 @@ pub async fn drive_local_distributaries(
                 )
                 .await
                 {
-                    Ok((count, Some(seq))) => {
-                        // The page committed locally — advance the
-                        // durable frontier under the lease. A fenced
-                        // advance means a raced move; retrying the page
-                        // dedups through the derived mutation ids.
-                        state
-                            .progress_authority
-                            .execute_placement_commands(vec![
-                                crate::control::Command::AdvanceDistributaryStoreFrontier {
-                                    distributary_id: definition.distributary_id,
-                                    reported_by: local_node.clone(),
-                                    lease_epoch: lease.epoch,
-                                    shipped_seq: seq,
-                                },
-                            ])
-                            .await
-                            .map(|_| count)
-                            .map_err(|error| format!("journal frontier advance failed: {error}"))
+                    Ok((count, frontier, remote_committed)) => {
+                        // Numeric lag is the source's committed journal
+                        // head minus what the destination confirmed —
+                        // after a successful advance that is the fresh
+                        // frontier, otherwise the stale one.
+                        let shipped = frontier.unwrap_or(definition.shipped_seq);
+                        driver.lag_records = Some(remote_committed.saturating_sub(shipped));
+                        match frontier {
+                            Some(seq) => {
+                                // The page committed locally — advance the
+                                // durable frontier under the lease. A fenced
+                                // advance means a raced move; retrying the page
+                                // dedups through the derived mutation ids.
+                                state
+                                    .progress_authority
+                                    .execute_placement_commands(vec![
+                                        crate::control::Command::AdvanceDistributaryStoreFrontier {
+                                            distributary_id: definition.distributary_id,
+                                            reported_by: local_node.clone(),
+                                            lease_epoch: lease.epoch,
+                                            shipped_seq: seq,
+                                        },
+                                    ])
+                                    .await
+                                    .map(|_| count)
+                                    .map_err(|error| {
+                                        format!("journal frontier advance failed: {error}")
+                                    })
+                            }
+                            None => Ok(count),
+                        }
                     }
-                    Ok((count, None)) => Ok(count),
                     Err(message) => Err(message),
                 }
             }
@@ -6170,11 +6191,36 @@ pub async fn drive_local_distributaries(
             }
             _ => {}
         }
+        // A report tick is the only time a remote frontier probe runs:
+        // transitions and the heartbeat carry the current figure, while
+        // a lag change alone never churns the catalog. The probe is
+        // remote but bounded (one bounded page per range); a failed
+        // probe keeps the last figure rather than faking zero.
         let status = driver.status_snapshot(run_state, &local_node, now_ns);
-        if crate::distributary::distributary_report_due(driver.reported.as_ref(), &status, now_ns)
-            && publish_distributary_status(state, definition.distributary_id, status.clone()).await
-        {
-            driver.reported = Some(status);
+        if crate::distributary::distributary_report_due(driver.reported.as_ref(), &status, now_ns) {
+            // Probe while stalled too: a stall is exactly when the gap
+            // grows — the remote is reachable unless the stall cause
+            // is itself remote, in which case the probe fails and the
+            // last figure honestly persists.
+            if matches!(target, DriveTarget::Feed(_)) {
+                let reader =
+                    crate::distributary::distributary_reader_name(definition.distributary_id);
+                if let Ok(report) = driver
+                    .remote
+                    .run(|client| {
+                        let reader = reader.clone();
+                        async move { client.reader_frontier(&reader).await }
+                    })
+                    .await
+                {
+                    driver.lag_records = Some(report.unacknowledged);
+                }
+            }
+            let status = driver.status_snapshot(run_state, &local_node, now_ns);
+            if publish_distributary_status(state, definition.distributary_id, status.clone()).await
+            {
+                driver.reported = Some(status);
+            }
         }
         match result {
             Ok(0) => outcomes.push(DistributaryDriveOutcome::Idle),
@@ -10368,6 +10414,122 @@ async fn reader_fetch(
         acknowledged_cursor: reader.acknowledged_cursor,
         recommended_capacity: pacing.max_records,
         retry_after_ms: pacing.retry_after.as_millis().min(u64::MAX as u128) as u64,
+    }))
+}
+
+/// `POST /v1/readers/frontier` — the named Reader's durable progress
+/// against the Feed's committed frontier: per-range committed and
+/// acknowledged positions plus the summed `unacknowledged` figure.
+/// This is the numeric lag a Distributary driver probes on the source
+/// Riverbed, and the generic "how far behind is this consumer" answer
+/// for any named Reader. Acknowledged Cursors resolve through each
+/// range owner's committed index; an unresolvable Cursor fails closed
+/// rather than estimating a position.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReaderFrontierReportRequest {
+    reader: String,
+}
+
+#[derive(Serialize)]
+struct ReaderFrontierRangeReport {
+    range_id: crate::active_range::RangeId,
+    committed: u64,
+    acknowledged: u64,
+}
+
+#[derive(Serialize)]
+struct ReaderFrontierReportResponse {
+    reader: String,
+    feed: String,
+    ranges: Vec<ReaderFrontierRangeReport>,
+    committed: u64,
+    unacknowledged: u64,
+}
+
+async fn reader_frontier_report(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ReaderFrontierReportRequest>,
+) -> Result<Json<ReaderFrontierReportResponse>, ApiError> {
+    authenticate_credential(&state, &headers)?;
+    let reader = reader_when_applied(
+        &state.control,
+        &request.reader,
+        state.control_plane.is_some(),
+    )
+    .await
+    .ok_or_else(|| ApiError::bad_request("Reader does not exist"))?;
+    let feed = state
+        .control
+        .active_feed_by_id(reader.feed_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("Reader Feed is not applied on this Node"))?;
+    authorize_namespace(&state, &headers, &feed.name, PermissionAction::Read)?;
+    let assignments = read_placement(&state, reader.feed_id, &feed.name).await?;
+    let frontier = state.control.active_reader_frontier(reader.reader_id).await;
+    let mut ranges = Vec::with_capacity(assignments.len());
+    let mut committed_total = 0_u64;
+    let mut unacknowledged = 0_u64;
+    for assignment in &assignments {
+        // Per-range acknowledged Cursors exist only once the
+        // persisted-frontier fetch path has run (multi-range Beginning
+        // Readers). Single-range Readers stay on the legacy delivered/
+        // acknowledged record-Cursor contract — their acknowledged
+        // Cursor resolves through the same owner index.
+        let cursor = frontier
+            .as_ref()
+            .and_then(|value| value.acknowledged.get(&assignment.range_id))
+            .filter(|cursor| !cursor.is_empty())
+            .cloned()
+            .or_else(|| {
+                reader
+                    .acknowledged_cursor
+                    .as_ref()
+                    .filter(|cursor| !cursor.is_empty() && !cursor.starts_with("rf1_"))
+                    .cloned()
+            });
+        let page = fetch_range_page(
+            &state,
+            ReadRangePageRequest {
+                assignment: assignment.clone(),
+                after: None,
+                expected_commit: None,
+                after_cursor: cursor.clone(),
+                tail_count: None,
+                ingest_threshold: None,
+                cursors: None,
+                single_range: true,
+                page_limit: Some(1),
+            },
+        )
+        .await?;
+        let acknowledged = if cursor.is_some() {
+            page.resolved_after
+                .ok_or_else(|| {
+                    ApiError::unavailable(
+                        "Reader acknowledged Cursor is unresolvable on the current range owner",
+                    )
+                })?
+                .value()
+        } else {
+            0
+        };
+        committed_total = committed_total.saturating_add(page.committed.value());
+        unacknowledged =
+            unacknowledged.saturating_add(page.committed.value().saturating_sub(acknowledged));
+        ranges.push(ReaderFrontierRangeReport {
+            range_id: assignment.range_id,
+            committed: page.committed.value(),
+            acknowledged,
+        });
+    }
+    Ok(Json(ReaderFrontierReportResponse {
+        reader: reader.name,
+        feed: feed.name,
+        ranges,
+        committed: committed_total,
+        unacknowledged,
     }))
 }
 
@@ -17923,6 +18085,190 @@ mod tests {
         )
         .unwrap_err();
         assert!(!error.message.contains("permanently lost"));
+    }
+
+    #[tokio::test]
+    async fn reader_frontier_reports_numeric_lag_and_requires_auth() {
+        let directory = TempDir::new().unwrap();
+        let (mut state, _plane, control, _replica) = internal_replica_test_state(&directory).await;
+        control
+            .execute("CREATE READER audit FROM orders.events START AT BEGINNING;")
+            .await
+            .unwrap();
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        let assignment = control.active_range_assignment(feed.feed_id).await.unwrap();
+        // local_prototype authority: this fixture's Control Plane can
+        // never elect a leader (its peers are unreachable), so placement
+        // reads and committed-prefix corroboration would fail closed.
+        // Dropping the plane exercises the same endpoint surface through
+        // the direct-catalog path; the Control Plane quorum path is
+        // covered by the live three-Node acceptance fixture.
+        state.control_plane = None;
+        let owner = assignment.owner.clone();
+        // Committed appends require the majority coordinator; the
+        // loopback transport commits each frame on all three replica
+        // services in-process, matching RF3 durability semantics.
+        let services: BTreeMap<_, _> = assignment
+            .replicas
+            .iter()
+            .map(|node| {
+                (
+                    node.clone(),
+                    Arc::new(crate::active_range::ReplicaAppendService::new(
+                        directory.path().join("ranges").join(node.as_str()),
+                        node.clone(),
+                        control.clone(),
+                    )),
+                )
+            })
+            .collect();
+        let services = Arc::new(services);
+        state.storage_node_id = Some(owner.clone());
+        state.replica_append = Some(services[&owner].clone());
+        state.majority_append = Some(Arc::new(
+            crate::active_range::MajorityAppendCoordinator::new(
+                services[&owner].clone(),
+                control.clone(),
+                Arc::new(LoopbackReplicaTransport {
+                    services: services.clone(),
+                }),
+            ),
+        ));
+        let probe_state = state.clone();
+        let app = router(state);
+
+        control
+            .execute_commands(vec![Command::OpenReaderSession {
+                reader: "audit".to_owned(),
+                capacity: 10,
+            }])
+            .await
+            .unwrap();
+
+        // Commit three records through the internal owner path.
+        let append = |sequence: u64| {
+            serde_json::json!({
+                "request_id": Uuid::from_u128(9_000 + sequence as u128),
+                "feed": "orders.events",
+                "writer_session_id": Uuid::from_u128(42),
+                "writer_epoch": 1,
+                "sequence": sequence,
+                "key_base64": base64::engine::general_purpose::STANDARD.encode(b"k"),
+                "payload_base64": base64::engine::general_purpose::STANDARD.encode(b"v"),
+            })
+        };
+        for sequence in 1..=3_u64 {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/internal/active-range/owner/append")
+                        .header("content-type", "application/json")
+                        .header(
+                            "x-whitewater-control-key",
+                            "this-is-a-long-control-plane-key",
+                        )
+                        .body(Body::from(serde_json::to_vec(&append(sequence)).unwrap()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(status, StatusCode::OK, "append {sequence}: {body}");
+            assert!(body["error"].is_null(), "append {sequence}: {body}");
+        }
+
+        // The frame at position 2's opaque Cursor is the acknowledged
+        // point — delivered then acknowledged like a real fetch page.
+        let page = fetch_range_page(
+            &probe_state,
+            ReadRangePageRequest {
+                assignment: assignment.clone(),
+                after: None,
+                expected_commit: None,
+                after_cursor: None,
+                tail_count: None,
+                ingest_threshold: None,
+                cursors: None,
+                single_range: true,
+                page_limit: Some(3),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.committed.value(), 3);
+        let cursor_two = page.frames[1].cursor.clone();
+        control
+            .execute_commands(vec![
+                Command::RecordReaderFrontier {
+                    reader: "audit".to_owned(),
+                    session_epoch: 1,
+                    cursor: "page-1".to_owned(),
+                    positions: BTreeMap::from([(assignment.range_id, cursor_two.clone())]),
+                    expected_cursor: None,
+                    fence_delivery: false,
+                    fetch_request_id: None,
+                    fetch_limit: None,
+                    fetch_retry_after_ms: None,
+                },
+                Command::AcknowledgeReader {
+                    reader: "audit".to_owned(),
+                    session_epoch: 1,
+                    cursor: "page-1".to_owned(),
+                },
+            ])
+            .await
+            .unwrap();
+
+        let post = |headers: Vec<(&str, &str)>| {
+            let mut builder = Request::builder()
+                .method("POST")
+                .uri("/v1/readers/frontier")
+                .header("content-type", "application/json");
+            for (name, value) in headers {
+                builder = builder.header(name, value);
+            }
+            builder
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "reader": "audit" })).unwrap(),
+                ))
+                .unwrap()
+        };
+        // Auth fence first: no credential, then wrong credential.
+        let response = app.clone().oneshot(post(vec![])).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let response = app
+            .clone()
+            .oneshot(post(vec![("authorization", "Bearer wrong")]))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app
+            .clone()
+            .oneshot(post(vec![(
+                "authorization",
+                "Bearer this-is-a-long-development-api-key",
+            )]))
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, StatusCode::OK, "body={body}");
+        assert_eq!(body["committed"], 3);
+        assert_eq!(body["unacknowledged"], 1);
+        assert_eq!(body["ranges"][0]["acknowledged"], 2);
+        assert_eq!(body["ranges"][0]["committed"], 3);
     }
 
     #[test]

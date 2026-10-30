@@ -765,11 +765,17 @@ pub struct DistributaryStatus {
     pub last_error_at_ns: Option<i64>,
     /// When the owner published this report.
     pub reported_at_ns: i64,
+    /// Numeric lag the last probe observed: committed source units the
+    /// destination has not yet confirmed — unacknowledged Feed records
+    /// on the remote named Reader, or unshipped journal sequences for a
+    /// StateStore copy. `None` until the first successful probe; a
+    /// failed probe keeps the last figure rather than guessing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag_records: Option<u64>,
 }
 
 /// What one drive cycle observed; `caught_up` means the last remote
-/// fetch drained the tail — the honest lag signal until the remote can
-/// report a numeric frontier gap.
+/// fetch drained the tail — `lag_records` carries the numeric gap.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DistributaryRunState {
@@ -3794,6 +3800,7 @@ impl ControlController {
                     "lease_owner": lease.map(|l| l.owner.as_str()),
                     "lease_epoch": lease.map(|l| l.epoch),
                     "status": status,
+                    "lag_records": status.and_then(|s| s.lag_records),
                     "status_stale": status.is_some_and(|s| {
                         lease.is_none_or(|l| {
                             l.epoch != s.lease_epoch || l.owner != s.reported_by
@@ -10498,6 +10505,7 @@ fn show_resources(
                 if let Some(status) = state.distributary_status.get(&item.distributary_id) {
                     row["run_state"] = json!(status.run_state);
                     row["copied_records"] = json!(status.copied_records);
+                    row["lag_records"] = json!(status.lag_records);
                     if let Some(ts) = status.last_copied_at_ns {
                         row["last_copied_at_ns"] = json!(ts);
                     }
@@ -15449,6 +15457,7 @@ mod tests {
                     last_error: error.map(|message| message.to_owned()),
                     last_error_at_ns: error.map(|_| 12),
                     reported_at_ns: 13,
+                    lag_records: Some(4),
                 },
             }
         };
@@ -15466,6 +15475,7 @@ mod tests {
         let row = &shown.results[0].data[0];
         assert_eq!(row["run_state"], "copying");
         assert_eq!(row["copied_records"], 7);
+        assert_eq!(row["lag_records"], 4);
         assert_eq!(row["status_stale"], false);
         // A stale epoch or a non-owner report is refused and the
         // committed row is unchanged.
@@ -15490,6 +15500,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(unchanged.run_state, DistributaryRunState::Copying);
+        assert_eq!(unchanged.lag_records, Some(4));
         // A stalled cycle surfaces the refusal for operators.
         controller
             .execute_commands(vec![report(

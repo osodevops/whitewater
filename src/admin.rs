@@ -287,6 +287,26 @@ pub struct StateStoreJournalEntriesResponse {
     pub committed_seq: u64,
 }
 
+/// The named Reader's per-range progress against the committed Feed
+/// frontier — `unacknowledged` is the numeric consumer lag.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ReaderFrontierReportResponse {
+    pub reader: String,
+    pub feed: String,
+    pub ranges: Vec<ReaderFrontierRangeReport>,
+    pub committed: u64,
+    pub unacknowledged: u64,
+}
+
+/// One range's committed frontier and the Reader's acknowledged
+/// position inside it.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ReaderFrontierRangeReport {
+    pub range_id: crate::active_range::RangeId,
+    pub committed: u64,
+    pub acknowledged: u64,
+}
+
 /// The acknowledged outcome of a replayed mutation — mirrors the
 /// mutate response so dedup is observable to the driver.
 #[derive(Clone, Debug, Deserialize)]
@@ -859,6 +879,20 @@ impl AdminClient {
                 "mutation_id": mutation_id,
                 "op": op,
             }),
+        )
+        .await
+    }
+
+    /// Report the named Reader's durable progress against its Feed's
+    /// committed frontier — per-range committed/acknowledged positions
+    /// plus the summed `unacknowledged` numeric lag.
+    pub async fn reader_frontier(
+        &self,
+        reader: &str,
+    ) -> Result<ReaderFrontierReportResponse, AdminClientError> {
+        self.post(
+            "/v1/readers/frontier",
+            &serde_json::json!({ "reader": reader }),
         )
         .await
     }

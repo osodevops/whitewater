@@ -155,6 +155,12 @@ def lease_owner(endpoint, name=None):
     return rows[0]["lease_owner"], int(rows[0]["lease_epoch"])
 
 
+def show_lag(endpoint, name):
+    result = wcl(endpoint, "SHOW DISTRIBUTARIES;")
+    rows = [row for row in result["results"][0]["data"] if row["name"] == name]
+    return rows[0].get("lag_records")
+
+
 def main():
     subprocess.run([*COMPOSE, "down", "-v"], check=True)
     try:
@@ -285,7 +291,25 @@ def main():
         for record_id in range(41, 51):
             append(SRC[record_id % 3], "srcwriter", epoch, record_id)
 
+        # Numeric lag evidence: while the destination range is down the
+        # driver stalls but its report ticks keep probing the source
+        # frontier — unacknowledged records 41..50 must surface as a
+        # positive lag_records figure before the copy resumes.
+        lag_peak = [0]
+
+        def feed_lag_visible():
+            lag = show_lag(range_survivor, "dstdom.mirror")
+            if lag is None:
+                return False
+            lag_peak[0] = max(lag_peak[0], int(lag))
+            return int(lag) > 0
+
+        wait_for(feed_lag_visible, "feed lag reported", timeout=240)
+
         def resumed_after_range_owner_loss():
+            lag = show_lag(range_survivor, "dstdom.mirror")
+            if lag is not None:
+                lag_peak[0] = max(lag_peak[0], int(lag))
             rows = records(range_survivor, "dstdom.mirrored")
             if len(rows) != 50:
                 return False
@@ -299,6 +323,14 @@ def main():
         wait_for(resumed_after_range_owner_loss, "range-owner resume", timeout=240)
         range_owner_after = range_owner_index(range_survivor)
         assert range_owner_after != range_victim
+
+        # Caught up: the source acknowledged every copied record, so the
+        # numeric frontier gap returns to zero.
+        wait_for(
+            lambda: show_lag(range_survivor, "dstdom.mirror") == 0 or None,
+            "feed lag zero after resume",
+            timeout=120,
+        )
 
         # Restore the range victim before the store phase: a second dead
         # Node would drop the destination below Control Plane quorum, and
@@ -428,6 +460,14 @@ def main():
             return int(described["results"][0]["data"]["shipped_seq"]) >= 6
 
         wait_for(store_resumed, "store ship resume", timeout=240)
+        # The store copy reports its lag as committed_seq minus shipped
+        # frontier — after resume it must read exactly zero.
+        wait_for(
+            lambda: show_lag(store_survivor, "dstdom.storecopy") == 0
+            or None,
+            "store lag zero after resume",
+            timeout=120,
+        )
         # Bring the stopped destination Node back so the fixture tears
         # down cleanly with every Node alive.
         subprocess.run(
@@ -450,6 +490,9 @@ def main():
                     "lease_epoch_after": epoch_after,
                     "store_shipped": True,
                     "store_survived_lease_move": True,
+                    "feed_lag_peak": lag_peak[0],
+                    "feed_lag_zero_after_resume": True,
+                    "store_lag_zero_after_resume": True,
                     "range_owner_lost": f"control-{range_victim + 1}",
                     "range_owner_after": f"control-{range_owner_after + 1}",
                     "note": "destination-owned pull copied the source Feed; "

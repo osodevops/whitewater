@@ -356,7 +356,7 @@ pub async fn drive_distributary_store_once(
     target_store: &str,
     shipped_seq: u64,
     limit: usize,
-) -> Result<(usize, Option<u64>), String> {
+) -> Result<(usize, Option<u64>, u64), String> {
     let Some(source_store) = definition.source_store.clone() else {
         return Err("Distributary is a Feed copy, not a StateStore copy".to_owned());
     };
@@ -372,7 +372,7 @@ pub async fn drive_distributary_store_once(
         .await
         .map_err(|error| format!("remote journal fetch failed: {error}"))?;
     if page.entries.is_empty() {
-        return Ok((0, None));
+        return Ok((0, None, page.committed_seq));
     }
     let mut shipped = 0usize;
     let mut last_seq = None;
@@ -390,7 +390,7 @@ pub async fn drive_distributary_store_once(
         shipped += 1;
         last_seq = Some(entry.sequence);
     }
-    Ok((shipped, last_seq))
+    Ok((shipped, last_seq, page.committed_seq))
 }
 
 /// How often an unchanged status republishes so `reported_at_ns`
@@ -434,6 +434,11 @@ pub struct DistributaryDriver {
     pub last_error_at_ns: Option<i64>,
     /// The last status snapshot committed to the catalog.
     pub reported: Option<crate::control::DistributaryStatus>,
+    /// Numeric source lag from the last successful probe — remote
+    /// unacknowledged records for a Feed copy, unshipped journal
+    /// sequences for a StateStore copy. Probes run on report ticks so a
+    /// lag change never churns the catalog by itself.
+    pub lag_records: Option<u64>,
 }
 
 impl DistributaryDriver {
@@ -454,6 +459,7 @@ impl DistributaryDriver {
             last_error: self.last_error.clone(),
             last_error_at_ns: self.last_error_at_ns,
             reported_at_ns: now_ns,
+            lag_records: self.lag_records,
         }
     }
 }
@@ -551,6 +557,7 @@ mod tests {
             reported_by: owner.clone(),
             run_state: DistributaryRunState::Copying,
             copied_records: 10,
+            lag_records: None,
             last_copied_at_ns: Some(100),
             last_error: None,
             last_error_at_ns: None,

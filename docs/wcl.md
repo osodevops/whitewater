@@ -517,11 +517,15 @@ the copy flowing and if not, why" without Node logs: `run_state`
 the current lease epoch, `last_copied_at_ns`, the bounded `last_error`
 with `last_error_at_ns`, and `reported_at_ns`/`status_stale` so an old
 owner's report reads as history, not live evidence, after a move.
-`caught_up` is the honest lag signal — the last remote fetch drained
-the tail; a numeric frontier gap needs a remote API that does not yet
-exist. The report commits through the same epoch fence as the lease:
-only the committed owner at the committed epoch may publish, so a raced
-move can never let a previous owner overwrite live status.
+`lag_records` is the numeric gap: committed source units the
+destination has not yet confirmed — unacknowledged Feed records on the
+remote named Reader (resolved through `POST /v1/readers/frontier` on
+the source) or unshipped journal sequences for a StateStore copy.
+Probes run on report ticks only, so a lag change never churns the
+catalog by itself; a failed probe keeps the last figure rather than
+guessing zero. The report commits through the same epoch fence as the
+lease: only the committed owner at the committed epoch may publish, so
+a raced move can never let a previous owner overwrite live status.
 
 ```wcl
 SHOW DISTRIBUTARIES;

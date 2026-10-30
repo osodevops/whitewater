@@ -325,9 +325,14 @@ POST /v1/readers/fetch
 POST /v1/readers/ack
 { "request_id": "...", "reader": "audit", "session_epoch": 1, "cursor": "..." }
 
+POST /v1/readers/frontier
+{ "reader": "audit" }
+
 POST /v1/readers/close
 { "request_id": "...", "reader": "audit", "session_epoch": 1 }
 ```
+
+`POST /v1/readers/frontier` reports a named Reader's durable progress against its Feed's committed frontier: `committed` and `unacknowledged` totals plus a per-range `ranges[]` breakdown (`range_id`, `committed`, `acknowledged`). `unacknowledged` is the numeric consumer lag — acknowledged Cursors resolve through each range owner's committed index and an unresolvable one fails closed rather than estimating. Requires `read` on the Feed's namespace. A Distributary driver probes this on the source Riverbed to publish `lag_records`; any operator or SDK can ask the same question directly.
 
 Delivered and acknowledged Cursors are separate. Fetch advances delivered progress only; acknowledgement is explicit and cumulative. Always acknowledge the fetch response's `delivered_cursor`, not `records[-1].cursor`: on a multi-range named Reader starting at Beginning, the former is a versioned opaque progress token and the latter identifies one record. The underlying bounded per-range frontier is persisted through the Control Plane without exposing range placement in public Reader definitions. Reopening a persistent Reader increments its epoch, fences the old session, resets delivered progress to the acknowledged frontier, and resumes on another Node. A verified bounded split/merge cutover translates the named Reader's acknowledged frontier with the RangeMap and fences the old session; reopen to replay unacknowledged work, which may include conservative duplicates after merge. Incomplete lineage refuses cutover rather than guessing a Cursor, and merges with overlapping post-split Writer sequences remain blocked. Public/temporary and legacy seek paths retain their documented multi-range history bounds. A repeated fetch `request_id` on the frontier path replays the identical page: the committed frontier persists the pre-delivery positions and record bound, so a retry after an ambiguous transport failure re-reads immutable history and serves the same records plus the same deterministic `delivered_cursor` — on any ingress Node — when the derived positions match the committed frontier exactly, and keeps the original reopen instruction when they cannot be proven identical.
 
