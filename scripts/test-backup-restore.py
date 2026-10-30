@@ -228,7 +228,14 @@ def main():
     if ARTIFACTS.exists():
         shutil.rmtree(ARTIFACTS)
     for index in range(1, 4):
-        (ARTIFACTS / f"node{index}").mkdir(parents=True)
+        path = ARTIFACTS / f"node{index}"
+        path.mkdir(parents=True)
+        # The Node runs as uid 10001; Docker Desktop masks host
+        # permissions, but on a Linux runner the bind-mounted
+        # directory must be writable by that uid or /backups
+        # refuses every file with EACCES.
+        if os.name == "posix":
+            path.chmod(0o777)
     subprocess.run([*COMPOSE, "down", "-v"], check=True)
     subprocess.run([*COMPOSE, "up", "-d", "--build"], check=True)
     try:
