@@ -139,6 +139,12 @@ fn tools() -> Vec<ToolSpec> {
             admin: false,
         },
         ToolSpec {
+            name: "whitewater.diagnostics.baseline",
+            description: "Schedule baseline for this Node's demand: typical/busy/quiet                 classification against the bounded sample ring (minute samples, a week                 deep at most) with depth-driven confidence and flip-streak hysteresis.                 Shallow history honestly reports learning rather than guessing.",
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+            admin: false,
+        },
+        ToolSpec {
             name: "whitewater.feed.describe",
             description: "Describe one Feed's definition: Domain, lifecycle, schema and \
                 history-policy bindings, and declared bounds. The caller needs read scope \
@@ -333,6 +339,23 @@ async fn call_tool(
             let mut response = crate::diagnostics::collect_signals(&report, Some(demand), request);
             response.correlation_id = report.correlation_id;
             serde_json::to_value(response).map_err(|error| ToolError::Internal(error.to_string()))
+        }
+        "whitewater.diagnostics.baseline" => {
+            api::authorize_namespace(state, headers, "*", PermissionAction::Read)
+                .map_err(map_api_error)?;
+            let samples = state
+                .demand
+                .baseline_samples()
+                .iter()
+                .map(|sample| crate::diagnostics::BaselineEvidence {
+                    taken_at_ns: sample.taken_at_ns,
+                    requests_total: sample.requests_total,
+                    appends_total: sample.appends_total,
+                    reads_total: sample.reads_total,
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_value(crate::diagnostics::classify_baseline(&samples))
+                .map_err(|error| ToolError::Internal(error.to_string()))
         }
         "whitewater.feed.describe" => {
             let feed = arguments

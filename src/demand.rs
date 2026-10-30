@@ -26,6 +26,7 @@ struct DemandCounters {
     range_appends: Mutex<BTreeMap<RangeId, RangeAppendWindow>>,
     range_totals: Mutex<BTreeMap<RangeId, RangeAppendWindow>>,
     hot_keys: Mutex<BTreeMap<RangeId, (HotKeyEvidence, std::time::Instant)>>,
+    baseline: Mutex<std::collections::VecDeque<BaselineSample>>,
     pipe_drives: Mutex<BTreeMap<uuid::Uuid, PipeDriveTelemetry>>,
     subscription_traffic: Mutex<BTreeMap<uuid::Uuid, SubscriptionTrafficTelemetry>>,
     reader_traffic: Mutex<BTreeMap<uuid::Uuid, ReaderTrafficTelemetry>>,
@@ -79,6 +80,22 @@ pub struct KeyPressureShare {
     pub records: u64,
     pub bytes: u64,
 }
+
+/// One periodic demand observation — totals only; rates derive from
+/// consecutive samples so counters never need resetting.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct BaselineSample {
+    pub taken_at_ns: i64,
+    pub requests_total: u64,
+    pub appends_total: u64,
+    pub append_bytes_total: u64,
+    pub reads_total: u64,
+    pub records_read_total: u64,
+}
+
+/// One week of one-minute samples — the deepest history the busy/quiet
+/// classifier can honestly claim.
+pub const MAX_BASELINE_SAMPLES: usize = 10_080;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct DemandSnapshot {
@@ -510,6 +527,34 @@ impl DemandMetrics {
         self.inner
             .records_read_total
             .fetch_add(records as u64, Ordering::Relaxed);
+    }
+
+    /// Push one periodic observation; callers drive the cadence (the
+    /// main-loop sampler), this only bounds retention.
+    pub fn note_baseline_sample(&self, taken_at_ns: i64) {
+        let snapshot = self.snapshot();
+        if let Ok(mut baseline) = self.inner.baseline.lock() {
+            baseline.push_back(BaselineSample {
+                taken_at_ns,
+                requests_total: snapshot.requests_total,
+                appends_total: snapshot.appends_total,
+                append_bytes_total: snapshot.append_bytes_total,
+                reads_total: snapshot.reads_total,
+                records_read_total: snapshot.records_read_total,
+            });
+            while baseline.len() > MAX_BASELINE_SAMPLES {
+                baseline.pop_front();
+            }
+        }
+    }
+
+    /// Oldest-first copy of the bounded observation ring.
+    pub fn baseline_samples(&self) -> Vec<BaselineSample> {
+        self.inner
+            .baseline
+            .lock()
+            .map(|baseline| baseline.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub fn snapshot(&self) -> DemandSnapshot {

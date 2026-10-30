@@ -681,6 +681,15 @@ pub struct Recommendation {
     pub verification: String,
     /// How to undo it if it did not.
     pub rollback: String,
+    /// Other options the same evidence supports — the operator keeps
+    /// the choice; the Advisor does not silently pick one path.
+    pub alternatives: Vec<String>,
+    /// Rough cost/disruption class: `none`, `brief`, `planned`, or
+    /// `disruptive` — honest classing, not invented numbers.
+    pub cost_class: String,
+    /// Which SLO surface the action touches (availability, latency,
+    /// durability) — so approval weight lands where the risk lives.
+    pub slo_impact: String,
     /// Severity of the driving finding.
     pub severity: StageStatus,
 }
@@ -722,8 +731,15 @@ pub fn recommend(report: &DiagnosticsReport) -> Vec<Recommendation> {
     let mut recommendations: Vec<Recommendation> = Vec::new();
     for stage in &report.stages {
         for finding in &stage.findings {
-            let (expected_impact, durability_risk, verification, rollback) =
-                advice_shape(&stage.stage);
+            let (
+                expected_impact,
+                durability_risk,
+                verification,
+                rollback,
+                alternatives,
+                cost_class,
+                slo_impact,
+            ) = advice_shape(&stage.stage);
             recommendations.push(Recommendation {
                 rank: 0,
                 target: format!("{}/{}", stage.stage, finding.resource),
@@ -733,6 +749,9 @@ pub fn recommend(report: &DiagnosticsReport) -> Vec<Recommendation> {
                 durability_risk,
                 verification,
                 rollback,
+                alternatives,
+                cost_class,
+                slo_impact,
                 severity: finding.severity,
             });
         }
@@ -748,61 +767,90 @@ pub fn recommend(report: &DiagnosticsReport) -> Vec<Recommendation> {
 /// Per-stage (impact, risk, verify, rollback) text — deterministic
 /// advice shape keyed on the finding's stage, keeping the
 /// recommendation honest about what acting on it can and cannot do.
-fn advice_shape(stage: &str) -> (String, String, String, String) {
+type AdviceShape = (String, String, String, String, Vec<String>, String, String);
+
+fn advice_shape(stage: &str) -> AdviceShape {
     match stage {
         "control_plane" => (
             "restores catalog writes, declarations, and placement changes".to_string(),
             "a wrong restart can split a fragile electorate — verify reachability first".to_string(),
             "the report's control_plane stage returns to healthy with a leader".to_string(),
             "revert the restart/change; a restored voter rejoins without operator repair".to_string(),
+vec!["defer placement changes until quorum returns — read-only work still functions".to_string()],
+            "brief".to_string(),
+            "availability".to_string(),
         ),
         "nodes" => (
             "confirms whether failover can complete or a replica is merely partitioned".to_string(),
             "forcing reassignment on a partitioned-but-alive Node risks a split owner".to_string(),
             "the member returns to the live set or ownership moves converge".to_string(),
             "bring the Node back; epoch fencing prevents a stale owner from writing".to_string(),
+vec!["if the Node is gone permanently, drain it through the storage-drain path instead of forcing".to_string()],
+            "planned".to_string(),
+            "availability".to_string(),
         ),
         "storage" => (
             "restores placement capacity or confirms a drain is progressing".to_string(),
             "removing a Node before drain completion strands replicas".to_string(),
             "the storage stage shows the Node eligible again, or the drain plan reports ready-to-retire".to_string(),
             "re-register or un-drain the Node; placements re-evaluate on the next decision".to_string(),
+vec!["accept reduced capacity temporarily if demand is low — drain still completes".to_string()],
+            "planned".to_string(),
+            "durability".to_string(),
         ),
         "writers" => (
             "relieves a dominant Key's ordered lane or documents an accepted skew".to_string(),
             "a range split is a committed-boundary operation — never a metadata shortcut".to_string(),
             "the hot-Key flag clears on a later window or the split activates".to_string(),
             "revert the workload's re-keying; a completed split has no rollback — verify first".to_string(),
+vec!["re-key hot tenants in the writer layer — zero cluster disruption".to_string()],
+            "planned".to_string(),
+            "latency".to_string(),
         ),
         "readers" => (
             "distinguishes server-side credit exhaustion from application latency".to_string(),
             "none — the step only reads pressure signals; delivery is untouched".to_string(),
             "the Reader's next deliveries carry retry_after_ms of zero".to_string(),
             "nothing to roll back — no mutation is advised".to_string(),
+vec!["check the application's own processing latency before touching the server".to_string()],
+            "none".to_string(),
+            "latency".to_string(),
         ),
         "subscriptions" => (
             "unblocks member joins and shared progress serving".to_string(),
             "forcing reassignment on a live-but-unreachable owner splits authority".to_string(),
             "the Subscription gains a live progress owner and members join".to_string(),
             "the previous owner's epoch is already fenced; no manual rewind".to_string(),
+vec!["restart the dead owner — fencing makes rejoin safe without a forced move".to_string()],
+            "brief".to_string(),
+            "availability".to_string(),
         ),
         "pipes" => (
             "resumes the Pipe's deliveries or restores a dead compute owner".to_string(),
             "none — resume is cooperative; a dead-owner lease move is epoch-fenced".to_string(),
             "the Pipe drives again and input progress advances".to_string(),
             "pause again; effects are durable across the gap".to_string(),
+vec!["scale compute — a fourth Node may take Pipe leases without reshaping storage".to_string()],
+            "none".to_string(),
+            "latency".to_string(),
         ),
         "distributaries" => (
             "restores the cross-Riverbed copy from its durable frontier".to_string(),
             "none — the frontier is durable; a resumed copy replays idempotently".to_string(),
             "the status report returns to copying/caught_up and lag_records falls".to_string(),
             "nothing to roll back — the source of truth is upstream".to_string(),
+vec!["fix the named hop (credentials/network) and let the frontier resume itself".to_string()],
+            "none".to_string(),
+            "durability".to_string(),
         ),
         _ => (
             "clears the flagged evidence".to_string(),
             "verify before acting on advice derived from any single signal".to_string(),
             "the stage returns to healthy on the next report".to_string(),
             "revert the change through the same surface it was applied".to_string(),
+vec!["gather more evidence before acting — a single signal is never proof".to_string()],
+            "none".to_string(),
+            "availability".to_string(),
         ),
     }
 }
@@ -851,6 +899,10 @@ pub struct SignalsResponse {
     pub records: Vec<SignalRecord>,
     /// Dropped records past the cap — never silent.
     pub truncated: u32,
+    /// Schedule-baseline verdict when the scope includes this Node —
+    /// `None` for Node-scoped queries about other Nodes.
+    #[serde(default)]
+    pub baseline: Option<BaselineReport>,
 }
 
 const MAX_SIGNAL_RECORDS: usize = 128;
@@ -953,6 +1005,7 @@ pub fn collect_signals(
         scope: request,
         records,
         truncated,
+        baseline: None,
     }
 }
 
@@ -966,6 +1019,181 @@ pub struct DemandEvidence {
     pub append_bytes_total: u64,
     pub reads_total: u64,
     pub records_read_total: u64,
+}
+
+// --- Schedule baselines --------------------------------------------------
+
+/// Bounded demand evidence for [`classify_baseline`] — mirrored from
+/// `demand::BaselineSample` so the classifier stays pure.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BaselineEvidence {
+    pub taken_at_ns: i64,
+    pub requests_total: u64,
+    pub appends_total: u64,
+    pub reads_total: u64,
+}
+
+/// What the bounded history says about *now* — never stronger than the
+/// evidence: shallow history always reports `learning`.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BaselineClass {
+    /// Too little history to call anything — the honest answer.
+    Learning,
+    /// Current rate sits inside the observed envelope.
+    Typical,
+    /// Sustained above the envelope — a busy period or an incident's
+    /// leading edge; the report cannot tell which and says so.
+    Busy,
+    /// Sustained below the envelope — quiet window or an upstream
+    /// stall; again the classifier names the shape, not the cause.
+    Quiet,
+}
+
+/// One baseline verdict with the evidence that produced it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct BaselineReport {
+    pub classification: BaselineClass,
+    /// 0..=100 — depth-driven: hours of history score low, days score
+    /// higher; a `learning` verdict is always 0.
+    pub confidence: u32,
+    /// Observed request-rate envelope (per minute) the verdict compares
+    /// against — min/median/max over all known windows.
+    pub envelope_min_rpm: f64,
+    pub envelope_median_rpm: f64,
+    pub envelope_max_rpm: f64,
+    /// Current trailing rate (per minute) measured from the newest pair
+    /// of samples.
+    pub current_rpm: f64,
+    /// How many samples informed this verdict — callers can audit depth.
+    pub samples: u32,
+    /// Sustained-anomaly counter: consecutive out-of-envelope samples
+    /// required before the verdict flips — hysteresis, not one spike.
+    pub streak: u32,
+    /// Plain-English evidence — carries the "cannot tell which" caveat.
+    pub explanation: String,
+}
+
+/// Minimum history before any verdict: one hour of minute samples.
+const BASELINE_MIN_SAMPLES: usize = 60;
+/// Consecutive out-of-envelope samples required to flip — hysteresis
+/// per the sustained-threshold rule.
+const BASELINE_FLIP_STREAK: u32 = 3;
+/// Envelope margin: a rate outside median±50% or beyond observed
+/// extremes counts as out-of-envelope.
+const BASELINE_MARGIN_NUM: f64 = 3.0;
+const BASELINE_MARGIN_DEN: f64 = 2.0;
+
+/// Classify the trailing request rate against the bounded history.
+/// Pure over the evidence: no clock reads, no side effects, and honest
+/// about depth — `learning` until at least an hour of samples exists.
+pub fn classify_baseline(samples: &[BaselineEvidence]) -> BaselineReport {
+    let empty = |classification, samples: &[BaselineEvidence]| BaselineReport {
+        classification,
+        confidence: 0,
+        envelope_min_rpm: 0.0,
+        envelope_median_rpm: 0.0,
+        envelope_max_rpm: 0.0,
+        current_rpm: 0.0,
+        samples: samples.len() as u32,
+        streak: 0,
+        explanation: "insufficient history — baseline reports `learning` until at \
+            least an hour of demand samples exists"
+            .to_string(),
+    };
+    if samples.len() < BASELINE_MIN_SAMPLES {
+        return empty(BaselineClass::Learning, samples);
+    }
+    // Rates per minute between consecutive samples; a non-positive gap
+    // or a counter reset contributes nothing rather than a bogus rate.
+    let mut rates: Vec<f64> = Vec::new();
+    for window in samples.windows(2) {
+        let (earlier, later) = (&window[0], &window[1]);
+        let elapsed = later.taken_at_ns.saturating_sub(earlier.taken_at_ns);
+        if elapsed <= 0 {
+            continue;
+        }
+        let requests = later.requests_total.saturating_sub(earlier.requests_total);
+        rates.push(requests as f64 * 60_000_000_000.0 / elapsed as f64);
+    }
+    if rates.len() < BASELINE_MIN_SAMPLES {
+        return empty(BaselineClass::Learning, samples);
+    }
+    let current_rpm = *rates.last().unwrap_or(&0.0);
+    let history = &rates[..rates.len() - 1];
+    let mut sorted = history.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let min = *sorted.first().unwrap_or(&0.0);
+    let max = *sorted.last().unwrap_or(&0.0);
+    let median = sorted[sorted.len() / 2];
+    // Out-of-envelope: beyond observed extremes by a margin, or beyond
+    // median±50% when the median is nonzero.
+    let out_of_envelope = |rate: f64| {
+        if rate > max * BASELINE_MARGIN_NUM / BASELINE_MARGIN_DEN
+            || (median > 0.0 && rate > median * BASELINE_MARGIN_NUM / BASELINE_MARGIN_DEN)
+        {
+            return true;
+        }
+        if median > 0.0 && rate < median * BASELINE_MARGIN_DEN / BASELINE_MARGIN_NUM {
+            return true;
+        }
+        false
+    };
+    let mut streak = 0u32;
+    for rate in rates.iter().rev() {
+        if out_of_envelope(*rate) {
+            streak += 1;
+        } else {
+            break;
+        }
+    }
+    // Streak counts tail samples; the verdict only flips after
+    // BASELINE_FLIP_STREAK consecutive anomalies (hysteresis), but the
+    // first anomaly already tells us which side it sits on.
+    let out_now = out_of_envelope(current_rpm);
+    // Below the flip streak an anomaly is evidence, not a verdict —
+    // the classification stays typical while the streak accrues.
+    let classification = if !out_now || streak < BASELINE_FLIP_STREAK {
+        BaselineClass::Typical
+    } else if current_rpm >= median {
+        BaselineClass::Busy
+    } else {
+        BaselineClass::Quiet
+    };
+    let hours = samples.len() as f64 / 60.0;
+    let confidence = if classification == BaselineClass::Learning {
+        0
+    } else {
+        ((hours / 24.0) * 100.0).min(100.0) as u32
+    };
+    let explanation = match classification {
+        BaselineClass::Learning => empty(BaselineClass::Learning, samples).explanation,
+        BaselineClass::Typical => format!(
+            "request rate {current_rpm:.0}/min sits inside the observed envelope \
+             ({min:.0}–{max:.0}/min, median {median:.0})"
+        ),
+        BaselineClass::Busy => format!(
+            "request rate {current_rpm:.0}/min sustained above the envelope \
+             ({min:.0}–{max:.0}/min) for {streak} samples — a busy period or an \
+             incident's leading edge; the baseline names the shape, not the cause"
+        ),
+        BaselineClass::Quiet => format!(
+            "request rate {current_rpm:.0}/min sustained below the envelope \
+             ({min:.0}–{max:.0}/min) for {streak} samples — a quiet window or an \
+             upstream stall; the baseline names the shape, not the cause"
+        ),
+    };
+    BaselineReport {
+        classification,
+        confidence,
+        envelope_min_rpm: min,
+        envelope_median_rpm: median,
+        envelope_max_rpm: max,
+        current_rpm,
+        samples: samples.len() as u32,
+        streak,
+        explanation,
+    }
 }
 
 #[cfg(test)]
@@ -1365,6 +1593,37 @@ mod tests {
             },
         );
         assert_eq!(clamped.scope.window_ns, Some(24 * 60 * 60 * 1_000_000_000));
+    }
+
+    #[test]
+    fn baseline_learns_then_classifies_sustained_shapes() {
+        let sample = |index: u64, requests: u64| BaselineEvidence {
+            taken_at_ns: (index * 60_000_000_000) as i64,
+            requests_total: requests,
+            appends_total: requests / 2,
+            reads_total: requests,
+        };
+        let shallow: Vec<_> = (0..30).map(|i| sample(i, i * 100)).collect();
+        let report = classify_baseline(&shallow);
+        assert_eq!(report.classification, BaselineClass::Learning);
+        assert_eq!(report.confidence, 0);
+        let steady: Vec<_> = (0..90).map(|i| sample(i, i * 600)).collect();
+        let report = classify_baseline(&steady);
+        assert_eq!(report.classification, BaselineClass::Typical);
+        assert!(report.confidence < 10);
+        assert_eq!(report.current_rpm, 600.0);
+        let mut spiking = steady.clone();
+        spiking.push(sample(90, 600 * 90 + 100_000));
+        let report = classify_baseline(&spiking);
+        assert_eq!(report.classification, BaselineClass::Typical);
+        for i in 1..=4u64 {
+            spiking.push(sample(90 + i, 600 * (90 + i) + 100_000 * (i + 1)));
+        }
+        let report = classify_baseline(&spiking);
+        assert_eq!(report.classification, BaselineClass::Busy);
+        assert!(report
+            .explanation
+            .contains("names the shape, not the cause"));
     }
 
     #[test]

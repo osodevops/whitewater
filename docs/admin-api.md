@@ -743,7 +743,7 @@ POST /v1/admin/diagnostics/signals
 Authorization: Bearer <key>
 ```
 
-Bounded, redacted, scoped evidence retrieval — `{"domain"?, "feed"?, "node"?, "window_ns"?}` narrows the answer to matching finding and per-Node demand records (≤128, `truncated` counts overflow; `window_ns` clamps to 24h and excludes findings older than the look-back). Every record is text-only evidence — never payloads, Cursor strings, or credentials — and should be treated as untrusted input downstream. All diagnostics responses (`explain`, `recommend`, `signals`, and their MCP counterparts) carry `correlation_id`: the caller's `x-request-id` echoed, else a generated id, so a question and its evidence travel together.
+Bounded, redacted, scoped evidence retrieval — `{"domain"?, "feed"?, "node"?, "window_ns"?}` narrows the answer to matching finding and per-Node demand records (≤128, `truncated` counts overflow; `window_ns` clamps to 24h and excludes findings older than the look-back). When the scope includes the answering Node the response also carries `baseline`: a `learning`/`typical`/`busy`/`quiet` verdict over the bounded one-minute demand-sample ring (week-deep cap, `WHITEWATER_BASELINE_SAMPLE_MS`, 3-sample flip hysteresis, depth-scored confidence — shallow history reports `learning`, never a guess). Every record is text-only evidence — never payloads, Cursor strings, or credentials — and should be treated as untrusted input downstream. All diagnostics responses (`explain`, `recommend`, `signals`, and their MCP counterparts) carry `correlation_id`: the caller's `x-request-id` echoed, else a generated id, so a question and its evidence travel together.
 
 ### MCP adapter
 
@@ -763,6 +763,7 @@ Every tool call re-authorizes the credential at use time with the same scope che
 | `whitewater.riverbed.explain_pressure` | `read` on `*` | The report filtered to `{"stages": [...]}` |
 | `whitewater.scale.recommend` | `read` on `*` | Ranked recommendations with evidence/impact/risk/verify/rollback |
 | `whitewater.diagnostics.signals` | `read` on `*` | Scoped bounded evidence records (`domain`/`feed`/`node`/`window_ns`) |
+| `whitewater.diagnostics.baseline` | `read` on `*` | Demand baseline: typical/busy/quiet vs the bounded sample ring |
 | `whitewater.feed.describe` | `read` on the Feed's namespace | `DESCRIBE FEED` results |
 | `whitewater.support.collect_redacted` | admin (`manage` on `*`) | The bounded redacted support bundle |
 

@@ -1120,6 +1120,22 @@ async fn diagnostics_signals(
         records_read_total: snapshot.records_read_total,
     };
     let mut response = crate::diagnostics::collect_signals(&report, Some(demand), request);
+    let node_scoped = response.scope.node.is_none()
+        || response.scope.node.as_deref() == Some(report.node.as_str());
+    if node_scoped {
+        let samples = state
+            .demand
+            .baseline_samples()
+            .iter()
+            .map(|sample| crate::diagnostics::BaselineEvidence {
+                taken_at_ns: sample.taken_at_ns,
+                requests_total: sample.requests_total,
+                appends_total: sample.appends_total,
+                reads_total: sample.reads_total,
+            })
+            .collect::<Vec<_>>();
+        response.baseline = Some(crate::diagnostics::classify_baseline(&samples));
+    }
     response.correlation_id = diagnostics_correlation_id(&headers);
     Ok(Json(response))
 }

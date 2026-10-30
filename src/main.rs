@@ -1153,6 +1153,35 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    // Bounded demand observations for the Advisor's schedule baseline:
+    // one sample per minute, capped at a week of history — shallow
+    // history honestly reports `learning` rather than guessing.
+    {
+        let demand = app_state.demand.clone();
+        let mut shutdown = shutdown_tx.subscribe();
+        let sample_ms = std::env::var("WHITEWATER_BASELINE_SAMPLE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|ms| *ms >= 1_000)
+            .unwrap_or(60_000);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(sample_ms));
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let ns = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as i64)
+                            .unwrap_or_default();
+                        demand.note_baseline_sample(ns);
+                    }
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() { break; }
+                    }
+                }
+            }
+        });
+    }
     let app = router(app_state).layer(TraceLayer::new_for_http());
     let listener = TcpListener::bind(config.bind_addr).await?;
     let tls_task = match (subscription_tls, tls_router, &config.subscription_mtls) {
