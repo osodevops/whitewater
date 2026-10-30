@@ -792,6 +792,48 @@ impl AdminClient {
         self.execute_commands(vec![command]).await
     }
 
+    /// Fetch the redacted support bundle from this Node — a single
+    /// diagnostic snapshot covering Control Plane status, member
+    /// liveness, and the bounded catalog-derived state. Credentials,
+    /// verifier digests, record payloads, and Cursor strings are
+    /// excluded by construction rather than scrubbed.
+    pub async fn support_bundle(&self) -> Result<serde_json::Value, AdminClientError> {
+        self.get("/v1/admin/support-bundle").await
+    }
+
+    async fn get<R>(&self, path: &str) -> Result<R, AdminClientError>
+    where
+        R: DeserializeOwned,
+    {
+        let response = self
+            .http
+            .get(format!("{}{}", self.endpoint, path))
+            .bearer_auth(&self.api_key)
+            .send()
+            .await?;
+        let status = response.status();
+        let bytes = response.bytes().await?;
+        if status.is_success() {
+            Ok(
+                serde_json::from_slice(&bytes).map_err(|error| AdminClientError::Api {
+                    status,
+                    message: format!("invalid success response: {error}"),
+                })?,
+            )
+        } else {
+            let message = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(|error| error.as_str())
+                        .map(ToOwned::to_owned)
+                })
+                .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
+            Err(AdminClientError::Api { status, message })
+        }
+    }
+
     async fn post<T, R>(&self, path: &str, request: &T) -> Result<R, AdminClientError>
     where
         T: Serialize + ?Sized,

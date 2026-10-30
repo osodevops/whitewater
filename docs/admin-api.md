@@ -623,6 +623,38 @@ Returns the Node-local set of Keys flagged for sustained dominant append demand 
 While a Key is flagged, appends for it return `feedback.hot_key: true` with tightened batch guidance and `retry_after_ms`; unrelated Keys in the same range keep normal guidance, and sustained range pressure splits at the Key's edge rather than the weighted median so unrelated Keys migrate away.
 
 
+### Fetch a support bundle
+
+```http
+GET /v1/admin/support-bundle
+Authorization: Bearer <admin-key>
+```
+
+Returns a single-call diagnostic snapshot for support and operations: the responding Node's identity (`node_id`, `api_url`, `storage_node_id`, `build`, `protocol_version`), the Control Plane status (leader, term, applied index, catalog revision), member liveness as this Node sees it, and the bounded catalog-derived state — resource counts, storage-Node registration/capacity/eligibility rows, Active Range assignments with ownership epochs, Subscription progress placements, Pipe compute leases, Index and StateStore summaries, Riverbed Link routes, Distributary lease plus drive status, issued API-key identities (name, role, lifecycle only), incompatible-protocol reports, and the newest 128 audit events.
+
+Redaction is by construction rather than after-the-fact scrubbing: credential material, verifier digests, record payloads, and Cursor strings are never collected into the bundle, so there is nothing sensitive left to leak. Per-list rows are bounded (256) and flagged with `*_truncated` when the cap trims output, so the response stays small enough to attach to an incident report.
+
+Because the catalog is replicated, one Node's bundle reports cluster-wide control state; collect per-Node bundles when Node-local detail (build, protocol, member view) differs across the fleet.
+
+```json
+{
+  "format_version": 1,
+  "generated_at_ns": "1793335077437729808",
+  "node": { "node_id": "control-1", "build": "...", "protocol_version": 1 },
+  "control_plane": { "leader_id": 1, "state": "leader", "catalog_revision": 42 },
+  "members": [ { "node_id": "control-1", "local": true, "last_seen_ms": 0 } ],
+  "catalog": {
+    "counts": { "domains": 3, "feeds": 12, "distributaries": 1 },
+    "storage_nodes": [ { "node": "dst1", "eligible": true, "draining": false } ],
+    "active_ranges": [ { "feed": "orders.events", "owner": "dst1", "ownership_epoch": 2 } ],
+    "distributaries": [ { "name": "ops.mirror", "lease_owner": "control-1", "status": { "run_state": "copying" } } ],
+    "audit_events": [ { "seq": 42, "action": "CREATE DISTRIBUTARY", "outcome": "committed" } ]
+  }
+}
+```
+
+`AdminClient::support_bundle` is the typed counterpart.
+
 ### Grant
 
 ```json

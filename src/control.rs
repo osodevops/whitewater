@@ -3659,6 +3659,222 @@ impl ControlController {
             .cloned()
     }
 
+    /// The catalog-derived half of a support bundle: resource counts,
+    /// bounded rows, storage-Node status, and the recent audit trail.
+    /// Credentials, verifier digests, record payloads, and Cursor
+    /// strings are never collected rather than scrubbed after the fact.
+    pub async fn support_bundle_catalog(&self, now_ns: i64) -> serde_json::Value {
+        const MAX_ROWS: usize = 256;
+        const MAX_AUDIT: usize = 128;
+        let state = self.state.lock().await;
+        let feed_name = |feed_id: &Uuid| state.feeds.get(feed_id).map(|feed| feed.name.clone());
+        let nodes = state
+            .storage_nodes
+            .keys()
+            .chain(state.capacity_reports.keys())
+            .chain(self.eligible_storage_nodes.iter())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(|node| {
+                let record = state.storage_nodes.get(node);
+                let report = state.capacity_reports.get(node);
+                json!({
+                    "node": node,
+                    "registered": record.is_some(),
+                    "endpoint": record.map(|r| r.endpoint.clone()),
+                    "capabilities": record.map(|r| r.capabilities),
+                    "draining": state.draining_storage_nodes.contains(node),
+                    "retired": state.retired_storage_nodes.contains(node),
+                    "eligible": self.storage_eligible(&state, node, now_ns),
+                    "capacity": report.map(|r| r.capacity.clone()),
+                    "protocol_version": report.map(|r| r.protocol_version),
+                    "build": report.map(|r| r.build.clone()),
+                    "last_reported_at_ns": report.map(|r| r.reported_at_ns),
+                })
+            })
+            .collect::<Vec<_>>();
+        let ranges = state
+            .range_assignments
+            .iter()
+            .take(MAX_ROWS)
+            .map(|(range_id, assignment)| {
+                json!({
+                    "feed": feed_name(&assignment.feed_id),
+                    "range_id": range_id,
+                    "generation": assignment.generation,
+                    "owner": assignment.owner,
+                    "replicas": assignment.replicas,
+                    "ownership_epoch": assignment.ownership_epoch,
+                })
+            })
+            .collect::<Vec<_>>();
+        let distributaries = state
+            .distributaries
+            .values()
+            .filter(|item| item.status == ResourceStatus::Active)
+            .take(MAX_ROWS)
+            .map(|item| {
+                let lease = state.distributary_leases.get(&item.distributary_id);
+                let status = state.distributary_status.get(&item.distributary_id);
+                json!({
+                    "name": item.name,
+                    "link": state.riverbed_links.get(&item.link_id).map(|l| l.name.clone()),
+                    "source_feed": item.source_feed,
+                    "target_feed": feed_name(&item.target_feed_id),
+                    "lease_owner": lease.map(|l| l.owner.as_str()),
+                    "lease_epoch": lease.map(|l| l.epoch),
+                    "status": status,
+                    "status_stale": status.is_some_and(|s| {
+                        lease.is_none_or(|l| {
+                            l.epoch != s.lease_epoch || l.owner != s.reported_by
+                        })
+                    }),
+                })
+            })
+            .collect::<Vec<_>>();
+        let subscriptions = state
+            .subscriptions
+            .values()
+            .filter(|item| item.status == ResourceStatus::Active)
+            .take(MAX_ROWS)
+            .map(|item| {
+                let placement = state
+                    .subscription_progress_assignments
+                    .get(&item.subscription_id);
+                json!({
+                    "name": item.name,
+                    "stage": item.stage,
+                    "progress_owner": placement.map(|p| p.owner.as_str()),
+                    "ownership_epoch": placement.map(|p| p.ownership_epoch),
+                    "replicas": placement.map(|p| p.replicas.clone()),
+                })
+            })
+            .collect::<Vec<_>>();
+        let pipes = state
+            .pipes
+            .values()
+            .filter(|item| item.status == ResourceStatus::Active)
+            .take(MAX_ROWS)
+            .map(|item| {
+                let lease = effective_pipe_compute_lease(&state, item.pipe_id);
+                json!({
+                    "name": item.name,
+                    "stage": item.stage,
+                    "compute_owner": lease.as_ref().map(|l| l.owner.as_str()),
+                    "compute_epoch": lease.map(|l| l.compute_epoch),
+                })
+            })
+            .collect::<Vec<_>>();
+        let indexes = state
+            .indexes
+            .values()
+            .take(MAX_ROWS)
+            .map(|item| {
+                json!({
+                    "name": item.name,
+                    "feed": feed_name(&item.feed_id),
+                    "unique": item.unique,
+                })
+            })
+            .collect::<Vec<_>>();
+        let state_stores = state
+            .state_stores
+            .values()
+            .filter(|item| item.stage != StateStoreStage::Dropped)
+            .take(MAX_ROWS)
+            .map(|item| {
+                json!({
+                    "name": item.name,
+                    "stage": item.stage,
+                })
+            })
+            .collect::<Vec<_>>();
+        let links = state
+            .riverbed_links
+            .values()
+            .filter(|item| item.status == ResourceStatus::Active)
+            .map(|item| {
+                // key_env is a variable *name*, never the credential —
+                // that distinction is exactly what makes it bundle-safe.
+                json!({
+                    "name": item.name,
+                    "endpoints": item.endpoints,
+                    "key_env": item.key_env,
+                })
+            })
+            .collect::<Vec<_>>();
+        let api_keys = state
+            .api_keys
+            .values()
+            .map(|identity| {
+                // The verifier digest never leaves the catalog: the
+                // bundle carries identity and lifecycle only.
+                json!({
+                    "name": identity.name,
+                    "role": state
+                        .roles
+                        .get(&identity.role_id)
+                        .map(|role| role.name.clone()),
+                    "status": identity.status,
+                    "created_at_ns": identity.created_at_ns,
+                    "expires_at_ns": identity.expires_at_ns,
+                    "revoked_at_ns": identity.revoked_at_ns,
+                })
+            })
+            .collect::<Vec<_>>();
+        let audit_events = state
+            .audit_events
+            .iter()
+            .rev()
+            .take(MAX_AUDIT)
+            .collect::<Vec<_>>();
+        let counts = json!({
+            "domains": state.spaces.values().filter(|s| s.status == ResourceStatus::Active).count(),
+            "feeds": state.feeds.values().filter(|f| f.status == ResourceStatus::Active).count(),
+            "writers": state.writers.values().filter(|w| w.status == ResourceStatus::Active).count(),
+            "readers": state.readers.values().filter(|r| r.status == ResourceStatus::Active).count(),
+            "subscriptions": subscriptions.len(),
+            "pipes": pipes.len(),
+            "indexes": state.indexes.len(),
+            "state_stores": state_stores.len(),
+            "riverbed_links": links.len(),
+            "distributaries": distributaries.len(),
+            "api_keys": api_keys.len(),
+            "active_ranges": state.range_assignments.len(),
+            "pending_split_plans": state.range_split_plans.len(),
+            "pending_merge_plans": state.range_merge_plans.len(),
+            "legal_holds": state.legal_holds.len(),
+        });
+        json!({
+            "revision": state.revision,
+            "schema_version": state.schema_version,
+            "supported_schema_version": CATALOG_SCHEMA_VERSION,
+            "counts": counts,
+            "storage_nodes": nodes,
+            "active_ranges": ranges,
+            "active_ranges_truncated": state.range_assignments.len() > MAX_ROWS,
+            "subscriptions": subscriptions,
+            "pipes": pipes,
+            "indexes": indexes,
+            "state_stores": state_stores,
+            "riverbed_links": links,
+            "distributaries": distributaries,
+            "api_keys": api_keys,
+            "incompatible_reports": state
+                .incompatible_reports
+                .iter()
+                .map(|(node, row)| json!({
+                    "node": node,
+                    "protocol_version": row.protocol_version,
+                    "build": row.build,
+                    "refused_at_ns": row.refused_at_ns,
+                }))
+                .collect::<Vec<_>>(),
+            "audit_events": audit_events,
+            "audit_truncated": state.audit_events.len() > MAX_AUDIT,
+        })
+    }
+
     pub async fn active_distributaries(&self) -> Vec<DistributaryDefinition> {
         self.state
             .lock()

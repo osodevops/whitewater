@@ -734,6 +734,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/admin/demand/feeds", get(admin_feed_demand))
         .route("/v1/admin/control-plane", get(control_plane_status))
         .route("/v1/admin/backup", post(admin_backup))
+        .route("/v1/admin/support-bundle", get(admin_support_bundle))
         .route("/v1/control/execute", post(execute_admin_wcl))
         .route("/v1/node/metrics", get(node_metrics))
         .route("/v1/cluster/members", get(cluster_members))
@@ -11578,6 +11579,40 @@ pub struct AdminBackupRequest {
     pub destination: String,
 }
 
+/// `GET /v1/admin/support-bundle` — a single-call diagnostic snapshot
+/// for support and operations: Node/build/protocol identity, Control
+/// Plane status, member liveness as seen by this Node, and the bounded
+/// catalog-derived state (counts, ranges, leases, Distributary status,
+/// recent audit events). Redaction is by construction: credentials,
+/// verifier digests, record payloads, and Cursor strings are never
+/// collected, so nothing sensitive can leak through a scrub pass.
+async fn admin_support_bundle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    authorize_admin(&state, &headers)?;
+    let generated_at_ns = unix_ns();
+    let local = state.membership.local().clone();
+    let control_plane = match &state.control_plane {
+        Some(control_plane) => serde_json::to_value(control_plane.status().await).ok(),
+        None => None,
+    };
+    Ok(Json(json!({
+        "format_version": 1,
+        "generated_at_ns": generated_at_ns,
+        "node": {
+            "node_id": local.node_id,
+            "api_url": local.api_url,
+            "storage_node_id": state.storage_node_id.as_ref().map(ToString::to_string),
+            "build": crate::node::BUILD_VERSION,
+            "protocol_version": crate::node::NODE_PROTOCOL_VERSION,
+        },
+        "control_plane": control_plane,
+        "members": state.membership.members().await,
+        "catalog": state.control.support_bundle_catalog(generated_at_ns).await,
+    })))
+}
+
 /// `POST /v1/admin/backup` — crash-consistent per-Node archive. Copies
 /// the data directory (range segments, journals, raft log, identity)
 /// plus the committed catalog snapshot, then writes `manifest.json` as
@@ -22104,6 +22139,81 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(valid.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn support_bundle_requires_admin_and_redacts_credentials() {
+        let directory = TempDir::new().unwrap();
+        let app = admin_test_router(&directory);
+        let bundle_request = |key: Option<&str>| {
+            let mut request = Request::builder()
+                .method("GET")
+                .uri("/v1/admin/support-bundle");
+            if let Some(key) = key {
+                request = request.header("authorization", format!("Bearer {key}"));
+            }
+            request.body(Body::empty()).unwrap()
+        };
+
+        let missing = app.clone().oneshot(bundle_request(None)).await.unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+
+        // Seed a Domain, Feed, Role, and issued key so the bundle has
+        // rows to report — including the credential that must redact.
+        let digest = "b".repeat(64);
+        let seed = serde_json::to_value(CommandBatchRequest {
+            request_id: Some(Uuid::new_v4()),
+            commands: vec![
+                Command::CreateSpace {
+                    name: "orders".to_owned(),
+                },
+                Command::CreateFeed {
+                    name: "orders.created".to_owned(),
+                    encrypted: false,
+                },
+                Command::CreateRole {
+                    name: "auditor".to_owned(),
+                },
+                Command::IssueApiKey {
+                    name: "support.reader".to_owned(),
+                    digest: digest.clone(),
+                    role: "auditor".to_owned(),
+                    expires_at_ns: None,
+                },
+            ],
+        })
+        .unwrap();
+        let created = app
+            .clone()
+            .oneshot(admin_request(
+                "/v1/admin/commands",
+                seed,
+                Some("this-is-a-long-development-api-key"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+
+        let response = app
+            .oneshot(bundle_request(Some("this-is-a-long-development-api-key")))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let bundle: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(bundle["format_version"], 1);
+        assert_eq!(bundle["node"]["node_id"], "test-node");
+        assert_eq!(bundle["catalog"]["counts"]["domains"], 1);
+        assert_eq!(bundle["catalog"]["counts"]["feeds"], 1);
+        assert_eq!(bundle["catalog"]["counts"]["api_keys"], 1);
+        assert_eq!(bundle["catalog"]["api_keys"][0]["name"], "support.reader");
+        // Redaction by construction: nothing in the serialized bundle
+        // may carry the verifier digest or its field name.
+        let serialized = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!serialized.contains(&digest));
+        assert!(!serialized.contains("verifier"));
     }
 
     #[tokio::test]
