@@ -57,6 +57,26 @@ pub fn record_request_id(distributary_id: Uuid, source_cursor: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+/// The destination mutation id for one shipped journal entry. Deriving
+/// from `(distributary_id, source sequence)` makes every reship — after
+/// a crash, a fenced frontier advance, or a lease move — replay the
+/// identical mutation identity, so the destination journal's
+/// idempotency dedup returns the original outcome instead of double
+/// applying.
+pub fn store_mutation_id(distributary_id: Uuid, source_seq: u64) -> Uuid {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"whitewater-distributary-store-mutation-v1");
+    hasher.update(distributary_id.as_bytes());
+    hasher.update(&source_seq.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut bytes: [u8; 16] = digest.as_bytes()[..16]
+        .try_into()
+        .expect("UUID digest length");
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
 /// A remote Riverbed reached through a `RiverbedLink`: one
 /// `AdminClient` per endpoint with transport-only failover. An API
 /// refusal is authoritative — retrying it on another Node would refuse
@@ -174,7 +194,9 @@ pub async fn drive_distributary_once(
             })
             .await;
         if described.is_err() {
-            let source_feed = definition.source_feed.clone();
+            let Some(source_feed) = definition.source_feed.clone() else {
+                return Err("Distributary is a StateStore copy, not a Feed copy".to_owned());
+            };
             let name = reader.clone();
             remote
                 .run(|client| {
@@ -316,6 +338,61 @@ pub async fn drive_distributary_once(
     Ok(appended)
 }
 
+/// One bounded drive cycle for a StateStore-copy Distributary: fetch a
+/// committed journal page from the remote Riverbed and replay each
+/// mutation on the local target store in sequence order. The
+/// destination mutation id derives from `(distributary_id, source
+/// sequence)`, so a mid-page crash or a fenced frontier advance makes
+/// the reship dedup rather than double-apply — the same effectively-
+/// once discipline as `record_request_id` gives Feed copies. Unlike
+/// the Feed path there is no remote session to rewind: progress lives
+/// in the destination catalog (`shipped_seq`), advanced by the caller
+/// only after every mutation in the returned page committed. Returns
+/// the mutations shipped and the last source sequence applied.
+pub async fn drive_distributary_store_once(
+    local: &AdminClient,
+    remote: &mut RemotePool,
+    definition: &DistributaryDefinition,
+    target_store: &str,
+    shipped_seq: u64,
+    limit: usize,
+) -> Result<(usize, Option<u64>), String> {
+    let Some(source_store) = definition.source_store.clone() else {
+        return Err("Distributary is a Feed copy, not a StateStore copy".to_owned());
+    };
+    let page = remote
+        .run(|client| {
+            let store = source_store.clone();
+            async move {
+                client
+                    .state_store_journal_entries(&store, shipped_seq, limit)
+                    .await
+            }
+        })
+        .await
+        .map_err(|error| format!("remote journal fetch failed: {error}"))?;
+    if page.entries.is_empty() {
+        return Ok((0, None));
+    }
+    let mut shipped = 0usize;
+    let mut last_seq = None;
+    for entry in &page.entries {
+        let mutation_id = store_mutation_id(definition.distributary_id, entry.sequence);
+        local
+            .replay_state_store_mutation(target_store, mutation_id, entry.op.clone())
+            .await
+            .map_err(|error| {
+                format!(
+                    "local journal replay failed at source sequence {}: {error}",
+                    entry.sequence
+                )
+            })?;
+        shipped += 1;
+        last_seq = Some(entry.sequence);
+    }
+    Ok((shipped, last_seq))
+}
+
 /// How often an unchanged status republishes so `reported_at_ns`
 /// distinguishes a quiet-but-alive driver from a dead one.
 pub const DISTRIBUTARY_STATUS_HEARTBEAT_NS: i64 = 60_000_000_000;
@@ -401,6 +478,21 @@ pub enum DistributaryDriveOutcome {
 mod tests {
     use super::*;
     use crate::control::ResourceStatus;
+
+    #[test]
+    fn store_mutation_id_is_deterministic_and_scoped() {
+        let id = Uuid::new_v4();
+        let one = store_mutation_id(id, 7);
+        assert_eq!(one, store_mutation_id(id, 7));
+        // A different source sequence or Distributary must derive a
+        // different mutation identity, or reship dedup would alias
+        // mutations across pages or copies.
+        assert_ne!(one, store_mutation_id(id, 8));
+        assert_ne!(one, store_mutation_id(Uuid::new_v4(), 7));
+        // And it never collides with the feed-copy append identity for
+        // the same ordinal position.
+        assert_ne!(one, record_request_id(id, "7"));
+    }
 
     #[test]
     fn record_request_id_is_deterministic_and_scoped() {

@@ -268,6 +268,36 @@ fn constant_time_equal(left: &[u8; 32], right: &[u8; 32]) -> bool {
         == 0
 }
 
+/// One committed journal entry served by `state_store_journal_entries`
+/// — the replayable subset of the source mutation (the destination
+/// derives its own mutation id and sequence allocation).
+#[derive(Clone, Debug, Deserialize)]
+pub struct StateStoreJournalEntry {
+    pub sequence: u64,
+    pub op: crate::state_store::StateStoreMutationOp,
+    /// Decimal string: nanosecond timestamps exceed f53 precision.
+    pub issued_at_ns: String,
+}
+
+/// A bounded committed-journal page for Distributary shipping.
+#[derive(Clone, Debug, Deserialize)]
+pub struct StateStoreJournalEntriesResponse {
+    pub store_id: Uuid,
+    pub entries: Vec<StateStoreJournalEntry>,
+    pub committed_seq: u64,
+}
+
+/// The acknowledged outcome of a replayed mutation — mirrors the
+/// mutate response so dedup is observable to the driver.
+#[derive(Clone, Debug, Deserialize)]
+pub struct StateStoreReplayResponse {
+    pub store_id: Uuid,
+    pub mutation_id: Uuid,
+    pub sequence: u64,
+    #[serde(default)]
+    pub deduplicated: bool,
+}
+
 #[derive(Clone)]
 pub struct AdminClient {
     endpoint: String,
@@ -790,6 +820,47 @@ impl AdminClient {
 
     async fn execute_one(&self, command: Command) -> Result<ControlExecution, AdminClientError> {
         self.execute_commands(vec![command]).await
+    }
+
+    /// Fetch one bounded page of committed journal entries from a
+    /// manual StateStore — the read a Distributary driver makes on the
+    /// source Riverbed when shipping a store's mutation history.
+    pub async fn state_store_journal_entries(
+        &self,
+        store: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<StateStoreJournalEntriesResponse, AdminClientError> {
+        self.post(
+            "/v1/state-stores/journal-entries",
+            &serde_json::json!({
+                "store": store,
+                "after_seq": after_seq,
+                "limit": limit,
+            }),
+        )
+        .await
+    }
+
+    /// Replay one committed journal mutation verbatim into a manual
+    /// StateStore — the write a Distributary driver makes on the
+    /// destination. `mutation_id` carries the derived ship identity so
+    /// reships deduplicate like client retries.
+    pub async fn replay_state_store_mutation(
+        &self,
+        store: &str,
+        mutation_id: Uuid,
+        op: crate::state_store::StateStoreMutationOp,
+    ) -> Result<StateStoreReplayResponse, AdminClientError> {
+        self.post(
+            "/v1/state-stores/replay",
+            &serde_json::json!({
+                "store": store,
+                "mutation_id": mutation_id,
+                "op": op,
+            }),
+        )
+        .await
     }
 
     /// Fetch the redacted support bundle from this Node — a single

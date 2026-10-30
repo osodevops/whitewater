@@ -473,8 +473,35 @@ makes the remote redeliver; each record's append rides a request id
 derived from `(distributary_id, source_cursor)`, so the destination
 dedups the replay — copy semantics are effectively-once, never
 at-most-once. Feed-derived StateStores on the destination simply
-re-derive from the copied Feed; manual StateStore journal shipping is
-not yet implemented.
+re-derive from the copied Feed.
+
+A Distributary can also ship a *manual* StateStore — the store
+whose only history is its replicated mutation journal, with no
+Feed to re-derive from:
+
+```wcl
+CREATE DISTRIBUTARY mirror.profiles FROM LINK upstream
+  STATE-STORE profiles.prod INTO mirror.profiles_copy;
+```
+
+The local target must be a manual StateStore the operator
+declared first (Feed-derived targets refuse — they already
+re-derive). The driver pages the source's committed journal via
+`POST /v1/state-stores/journal-entries` (read scope on the remote
+credential), then replays each mutation in sequence order through
+`POST /v1/state-stores/replay` — `put_row`, `delete_row`,
+`clear_all`, and the Pipe-internal `accumulate_rows` all ship
+verbatim, since the journaled op is self-describing. The
+destination mutation id derives from `(distributary_id, source
+sequence)`, so a crash mid-page reships into the journal's normal
+idempotency dedup — the same effectively-once discipline as the
+Feed path. Durable progress is `shipped_seq` on the Distributary
+row itself, advanced by the lease owner through a lease-fenced
+catalog command after the page commits; it survives moves and
+owner crashes as authoritative resume progress, the counterpart
+of the remote named-Reader frontier a Feed copy leaves on the
+source. `SHOW DISTRIBUTARIES` reports `kind`, `target_store`, and
+`shipped_seq` for store copies.
 
 Each Distributary carries an epoch-fenced lease like a Pipe compute
 lease. The lease owner drives; a remote Reader session open fences the
@@ -507,7 +534,8 @@ The drive loop runs on every Node (`WHITEWATER_DISTRIBUTARY_DRIVE_INTERVAL_MS`,
 default 1000ms, minimum 100ms) and acts only on locally-held leases; it
 needs `WHITEWATER_ADMIN_API_KEY` for local appends, matching the drain
 supervisor's credential. A Link cannot drop while Distributaries use it,
-and a target Feed cannot drop or erase under an active Distributary.
+and a target Feed or StateStore cannot drop or erase under an active
+Distributary.
 On owner loss the Control Plane leader's lease recovery supervisor
 (`ComputeLeaseRecoverySupervisor`, shared with Pipe compute leases)
 probes the owner through `/health`; after a sustained failure streak it

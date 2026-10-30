@@ -137,9 +137,21 @@ def live_dst(exclude_index):
     return DST[next(i for i in range(3) if i != exclude_index)]
 
 
-def lease_owner(endpoint):
+def victim_back_at(index):
+    try:
+        with urllib.request.urlopen(
+            f"http://localhost:{8180 + index + 1}/health", timeout=5
+        ) as response:
+            return response.status == 200
+    except (OSError, urllib.error.HTTPError):
+        return False
+
+
+def lease_owner(endpoint, name=None):
     result = wcl(endpoint, "SHOW DISTRIBUTARIES;")
     rows = result["results"][0]["data"]
+    if name is not None:
+        rows = [row for row in rows if row["name"] == name]
     return rows[0]["lease_owner"], int(rows[0]["lease_epoch"])
 
 
@@ -257,16 +269,7 @@ def main():
             check=True,
         )
 
-        def victim_back():
-            try:
-                with urllib.request.urlopen(
-                    f"http://localhost:{8180 + victim_index + 1}/health", timeout=5
-                ) as response:
-                    return response.status == 200
-            except (OSError, urllib.error.HTTPError):
-                return False
-
-        wait_for(victim_back, "victim rejoin", timeout=60)
+        wait_for(lambda: victim_back_at(victim_index), "victim rejoin", timeout=60)
 
         def range_owner_index(endpoint):
             result = wcl(endpoint, "INSPECT PLACEMENT FOR FEED dstdom.mirrored;")
@@ -297,6 +300,141 @@ def main():
         range_owner_after = range_owner_index(range_survivor)
         assert range_owner_after != range_victim
 
+        # Restore the range victim before the store phase: a second dead
+        # Node would drop the destination below Control Plane quorum, and
+        # the store lease kill needs a surviving majority to CAS onto.
+        subprocess.run(
+            ["docker", "start", f"whitewater-distributary-dst{range_victim + 1}-1"],
+            check=True,
+        )
+        wait_for(
+            lambda: victim_back_at(range_victim),
+            "range victim rejoin",
+            timeout=60,
+        )
+
+        # Manual StateStore journal shipping: a store whose only history
+        # is its mutation journal mirrors cross-Riverbed through the
+        # same lease-fenced drive. Seed the source store (puts + a
+        # delete), declare the destination copy, and the ship catches up.
+        wcl(
+            SRC[0],
+            "DEFINE STATESTORE srcdom.profiles KEYS dept;",
+        )
+
+        def mutate(node, key, payload, delete=False, mutation=None):
+            op = (
+                {"kind": "delete_row", "key_base64": b64(key)}
+                if delete
+                else {
+                    "kind": "put_row",
+                    "key_base64": b64(key),
+                    "payload_base64": b64(payload),
+                    "named": [
+                        {
+                            "name": "dept",
+                            "values": [{"kind": "text", "value": "eng"}],
+                        }
+                    ],
+                }
+            )
+            status, result = post(
+                node,
+                "/v1/state-stores/mutate",
+                {
+                    "store": "srcdom.profiles",
+                    "mutation_id": mutation or str(uuid.uuid4()),
+                    "op": op,
+                },
+            )
+            assert status == 200 and result["sequence"] > 0, (status, result)
+
+        mutate(SRC[0], "u1", "payload-u1")
+        mutate(SRC[0], "u2", "payload-u2")
+        mutate(SRC[0], "u3", "payload-u3")
+        mutate(SRC[0], "u3", "", delete=True)
+
+        wcl(
+            DST[0],
+            "DEFINE STATESTORE dstdom.shadow KEYS dept; "
+            "CREATE DISTRIBUTARY dstdom.storecopy FROM LINK upstream "
+            "STATE-STORE srcdom.profiles INTO dstdom.shadow;",
+        )
+
+        def lookup(node, store, key):
+            status, response = post(
+                node,
+                "/v1/state-stores/lookup",
+                {"store": store, "key_base64": b64(key)},
+            )
+            assert status == 200, (status, response)
+            if not response["found"]:
+                return None
+            return base64.b64decode(response["payload_base64"]).decode()
+
+        def store_shipped():
+            if lookup(DST[0], "dstdom.shadow", "u1") != "payload-u1":
+                return False
+            if lookup(DST[0], "dstdom.shadow", "u2") != "payload-u2":
+                return False
+            # The delete shipped too — u3 must stay absent.
+            if lookup(DST[0], "dstdom.shadow", "u3") is not None:
+                return False
+            described = wcl(DST[0], "DESCRIBE DISTRIBUTARY dstdom.storecopy;")
+            data = described["results"][0]["data"]
+            if data["kind"] != "state_store" or int(data["shipped_seq"]) < 4:
+                return False
+            return True
+
+        wait_for(store_shipped, "store journal ship", timeout=120)
+
+        # Continuous ship: later mutations flow without redefinition.
+        mutate(SRC[0], "u4", "payload-u4")
+        mutate(SRC[0], "u5", "payload-u5")
+        wait_for(
+            lambda: lookup(DST[0], "dstdom.shadow", "u5") == "payload-u5"
+            or None,
+            "store continuous ship",
+            timeout=120,
+        )
+
+        # Lease kill on the store copy: the shipped_seq frontier lives on
+        # the catalog row, so the recovered owner resumes from committed
+        # progress rather than reshipping — a reship would still dedup
+        # through the derived mutation ids.
+        store_owner, store_epoch_before = lease_owner(DST[0], "dstdom.storecopy")
+        store_victim = owner_index(store_owner)
+        store_survivor = live_dst(store_victim)
+        subprocess.run(
+            ["docker", "stop", f"whitewater-distributary-dst{store_victim + 1}-1"],
+            check=True,
+        )
+
+        def store_lease_recovered():
+            new_owner, new_epoch = lease_owner(
+                store_survivor, "dstdom.storecopy"
+            )
+            if new_owner == store_owner or new_epoch <= store_epoch_before:
+                return False
+            return new_owner, new_epoch
+
+        wait_for(store_lease_recovered, "store lease recovery")
+        mutate(SRC[0], "u6", "payload-u6")
+
+        def store_resumed():
+            if lookup(store_survivor, "dstdom.shadow", "u6") != "payload-u6":
+                return False
+            described = wcl(store_survivor, "DESCRIBE DISTRIBUTARY dstdom.storecopy;")
+            return int(described["results"][0]["data"]["shipped_seq"]) >= 6
+
+        wait_for(store_resumed, "store ship resume", timeout=240)
+        # Bring the stopped destination Node back so the fixture tears
+        # down cleanly with every Node alive.
+        subprocess.run(
+            ["docker", "start", f"whitewater-distributary-dst{store_victim + 1}-1"],
+            check=True,
+        )
+
         print(
             json.dumps(
                 {
@@ -310,6 +448,8 @@ def main():
                     "lease_owner_after": recovered_owner,
                     "lease_epoch_before": epoch_before,
                     "lease_epoch_after": epoch_after,
+                    "store_shipped": True,
+                    "store_survived_lease_move": True,
                     "range_owner_lost": f"control-{range_victim + 1}",
                     "range_owner_after": f"control-{range_owner_after + 1}",
                     "note": "destination-owned pull copied the source Feed; "

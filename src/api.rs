@@ -661,6 +661,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/state-stores/get-by", post(state_store_get_by))
         .route("/v1/state-stores/iterate", post(state_store_iterate))
         .route("/v1/state-stores/clear", post(state_store_clear))
+        .route(
+            "/v1/state-stores/journal-entries",
+            post(state_store_journal_entries),
+        )
+        .route("/v1/state-stores/replay", post(state_store_replay))
         .route("/v1/indexes/query", post(index_query))
         .route("/v1/writers/append", post(writer_session_append))
         .route("/v1/writers/append-batch", post(writer_batch_append))
@@ -5994,22 +5999,35 @@ pub async fn drive_local_distributaries(
             outcomes.push(DistributaryDriveOutcome::NotOwner);
             continue;
         }
-        let Some(target_feed) = state
-            .control
-            .active_feed_by_id(definition.target_feed_id)
-            .await
-            .map(|feed| feed.name)
-        else {
+        enum DriveTarget {
+            Feed(String),
+            Store(String),
+        }
+        let (target, target_missing): (Option<DriveTarget>, &'static str) =
+            if let Some(feed_id) = definition.target_feed_id {
+                match state.control.active_feed_by_id(feed_id).await {
+                    Some(feed) => (Some(DriveTarget::Feed(feed.name)), ""),
+                    None => (None, "target Feed is unavailable"),
+                }
+            } else if let Some(store_id) = definition.target_store_id {
+                match state.control.state_store_definition_by_id(store_id).await {
+                    Some(store) => (Some(DriveTarget::Store(store.name)), ""),
+                    None => (None, "target StateStore is unavailable"),
+                }
+            } else {
+                (None, "Distributary declares no copy target")
+            };
+        let Some(target) = target else {
             outcomes.push(DistributaryDriveOutcome::Failed {
                 distributary_id: definition.distributary_id,
-                message: "target Feed is unavailable".to_owned(),
+                message: target_missing.to_owned(),
             });
             publish_distributary_stall(
                 state,
                 definition.distributary_id,
                 lease.epoch,
                 &local_node,
-                "target Feed is unavailable",
+                target_missing,
             )
             .await;
             continue;
@@ -6087,15 +6105,53 @@ pub async fn drive_local_distributaries(
             .get_mut(&definition.distributary_id)
             .expect("driver inserted above");
         let now_ns = crate::control::unix_ns();
-        let result = crate::distributary::drive_distributary_once(
-            local,
-            &mut driver.remote,
-            &definition,
-            &target_feed,
-            &mut driver.state,
-            limit,
-        )
-        .await;
+        let result = match &target {
+            DriveTarget::Feed(feed_name) => {
+                crate::distributary::drive_distributary_once(
+                    local,
+                    &mut driver.remote,
+                    &definition,
+                    feed_name,
+                    &mut driver.state,
+                    limit,
+                )
+                .await
+            }
+            DriveTarget::Store(store_name) => {
+                match crate::distributary::drive_distributary_store_once(
+                    local,
+                    &mut driver.remote,
+                    &definition,
+                    store_name,
+                    definition.shipped_seq,
+                    limit,
+                )
+                .await
+                {
+                    Ok((count, Some(seq))) => {
+                        // The page committed locally — advance the
+                        // durable frontier under the lease. A fenced
+                        // advance means a raced move; retrying the page
+                        // dedups through the derived mutation ids.
+                        state
+                            .progress_authority
+                            .execute_placement_commands(vec![
+                                crate::control::Command::AdvanceDistributaryStoreFrontier {
+                                    distributary_id: definition.distributary_id,
+                                    reported_by: local_node.clone(),
+                                    lease_epoch: lease.epoch,
+                                    shipped_seq: seq,
+                                },
+                            ])
+                            .await
+                            .map(|_| count)
+                            .map_err(|error| format!("journal frontier advance failed: {error}"))
+                    }
+                    Ok((count, None)) => Ok(count),
+                    Err(message) => Err(message),
+                }
+            }
+        };
         let run_state = match &result {
             Ok(0) => crate::control::DistributaryRunState::CaughtUp,
             Ok(_) => crate::control::DistributaryRunState::Copying,
@@ -7620,6 +7676,225 @@ async fn state_store_iterate(
 struct StateStoreClearRequest {
     store: String,
     mutation_id: Uuid,
+}
+
+/// `POST /v1/state-stores/journal-entries` — one bounded page of
+/// committed mutation-journal entries from a manual StateStore, in
+/// sequence order. This is the read a Distributary driver makes on the
+/// source Riverbed: the wire carries only the replayable subset
+/// (sequence, op, `issued_at_ns`), so the destination derives its own
+/// mutation identity and sequence allocation. Feed-derived stores have
+/// no journal of their own — they replay from their source Feed — and
+/// are refused rather than serving an empty page that would look
+/// caught-up.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateStoreJournalEntriesRequest {
+    store: String,
+    #[serde(default)]
+    after_seq: u64,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Serialize)]
+struct StateStoreJournalEntryWire {
+    sequence: u64,
+    op: crate::state_store::StateStoreMutationOp,
+    /// Decimal string — nanosecond timestamps exceed f53 precision.
+    issued_at_ns: String,
+}
+
+#[derive(Serialize)]
+struct StateStoreJournalEntriesResponse {
+    store_id: Uuid,
+    entries: Vec<StateStoreJournalEntryWire>,
+    committed_seq: u64,
+}
+
+async fn state_store_journal_entries(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<StateStoreJournalEntriesRequest>,
+) -> Result<Json<StateStoreJournalEntriesResponse>, ApiError> {
+    authenticate_credential(&state, &headers)?;
+    let store = state_store_when_applied(
+        &state.control,
+        &request.store,
+        state.control_plane.is_some(),
+    )
+    .await
+    .ok_or_else(|| {
+        ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
+    })?;
+    authorize_namespace(&state, &headers, &store.name, PermissionAction::Read)?;
+    if !matches!(store.source, crate::control::StateStoreSource::Manual) {
+        return Err(ApiError::bad_request(
+            "journal entries exist only for manual StateStores; Feed-derived stores replay from their source Feed",
+        ));
+    }
+    let assignment = state
+        .control
+        .active_state_store_assignment_by_id(store.store_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("StateStore has no mutation-journal placement"))?;
+    let limit = request
+        .limit
+        .unwrap_or(crate::state_store::MAX_CATCHUP_PAGE_ENTRIES)
+        .clamp(1, crate::state_store::MAX_CATCHUP_PAGE_ENTRIES);
+    // Freshness order identical to serve_state_store_read: the local
+    // replica first, then the owner, then the remaining replicas.
+    let mut candidates: Vec<StorageNodeId> = Vec::new();
+    if let Some(local) = &state.storage_node_id {
+        if assignment.replicas.contains(local) {
+            candidates.push(local.clone());
+        }
+    }
+    candidates.push(assignment.owner.clone());
+    for replica in assignment.replicas.iter() {
+        if !candidates.contains(replica) {
+            candidates.push(replica.clone());
+        }
+    }
+    let mut last_error: Option<ApiError> = None;
+    for replica in &candidates {
+        let entries_request = crate::state_store::StateStoreEntriesRequest {
+            owner: assignment.owner.clone(),
+            receiver: replica.clone(),
+            store_id: store.store_id,
+            ownership_epoch: assignment.ownership_epoch,
+            after_seq: request.after_seq,
+            limit,
+        };
+        let outcome = if Some(replica) == state.storage_node_id.as_ref()
+            && state.state_store_journal.is_some()
+        {
+            state
+                .state_store_journal
+                .as_ref()
+                .unwrap()
+                .entries(entries_request)
+                .await
+                .map_err(state_store_api_error)
+        } else {
+            match state_store_transport_for(&state, &assignment) {
+                Ok(transport) => transport
+                    .entries(replica, entries_request)
+                    .await
+                    .map_err(state_store_api_error),
+                Err(error) => Err(error),
+            }
+        };
+        match outcome {
+            Ok(reply) => {
+                return Ok(Json(StateStoreJournalEntriesResponse {
+                    store_id: store.store_id,
+                    entries: reply
+                        .result
+                        .entries
+                        .into_iter()
+                        .map(|entry| StateStoreJournalEntryWire {
+                            sequence: entry.mutation.sequence,
+                            op: entry.mutation.op,
+                            issued_at_ns: entry.mutation.issued_at_ns.to_string(),
+                        })
+                        .collect(),
+                    committed_seq: reply.result.committed_seq,
+                }));
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        ApiError::unavailable("no StateStore journal replica could serve the page")
+    }))
+}
+
+/// `POST /v1/state-stores/replay` — apply one committed journal
+/// mutation verbatim into a manual StateStore. This is the write a
+/// Distributary driver makes on the destination: the journaled op is
+/// self-describing (`named` values carry their source-stamped `unique`
+/// flags), and the caller-owned `mutation_id` — derived from
+/// `(distributary_id, source sequence)` — makes reships deduplicate
+/// through the journal's normal idempotency. Named-key references must
+/// be declared on the destination store so a schema mismatch stalls
+/// the ship loudly instead of writing postings the store never asked
+/// for.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StateStoreReplayRequest {
+    store: String,
+    mutation_id: Uuid,
+    op: crate::state_store::StateStoreMutationOp,
+}
+
+async fn state_store_replay(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<StateStoreReplayRequest>,
+) -> Result<Json<StateStoreMutateResponse>, ApiError> {
+    authenticate_credential(&state, &headers)?;
+    let store = state_store_when_applied(
+        &state.control,
+        &request.store,
+        state.control_plane.is_some(),
+    )
+    .await
+    .ok_or_else(|| {
+        ApiError::bad_request(format!("StateStore does not exist: {}", request.store))
+    })?;
+    authorize_namespace(&state, &headers, &store.name, PermissionAction::Write)?;
+    if !matches!(store.source, crate::control::StateStoreSource::Manual) {
+        return Err(ApiError::bad_request(
+            "replay applies only to manual StateStores; Feed-derived stores replay from their source",
+        ));
+    }
+    // Every named key the op carries must be declared on the
+    // destination — a schema mismatch is a loud ship stall, not
+    // silently dropped postings.
+    let declared = |name: &str| store.named_keys.iter().any(|key| key.name == name);
+    let named_names: Vec<&str> = match &request.op {
+        crate::state_store::StateStoreMutationOp::PutRow { named, .. } => {
+            named.iter().map(|entry| entry.name.as_str()).collect()
+        }
+        crate::state_store::StateStoreMutationOp::AccumulateRows { entries } => entries
+            .iter()
+            .flat_map(|entry| entry.named.iter().map(|named| named.name.as_str()))
+            .collect(),
+        _ => Vec::new(),
+    };
+    if let Some(undeclared) = named_names.iter().find(|name| !declared(name)) {
+        return Err(ApiError::bad_request(format!(
+            "StateStore {} does not declare named key {}",
+            store.name, undeclared
+        )));
+    }
+    let assignment = state
+        .control
+        .active_state_store_assignment_by_id(store.store_id)
+        .await
+        .ok_or_else(|| ApiError::unavailable("StateStore has no mutation-journal placement"))?;
+    let mutation = crate::state_store::StateStoreMutation {
+        store_id: store.store_id,
+        mutation_id: request.mutation_id,
+        request_id: Uuid::new_v4(),
+        ownership_epoch: assignment.ownership_epoch,
+        sequence: 0,
+        op: request.op,
+        issued_at_ns: unix_ns(),
+        source: None,
+    };
+    let coordinator = state_store_coordinator_for(&state, assignment)?;
+    let result = coordinator
+        .mutate(mutation)
+        .await
+        .map_err(state_store_api_error)?;
+    Ok(Json(StateStoreMutateResponse {
+        store_id: result.store_id,
+        mutation_id: result.mutation_id,
+        sequence: result.sequence,
+        deduplicated: result.deduplicated,
+    }))
 }
 
 async fn state_store_clear(
@@ -17958,6 +18233,180 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(refused.status(), StatusCode::UNAUTHORIZED);
+
+        // The shipping read serves committed entries in sequence order —
+        // the Distributary driver's source fetch.
+        let entries = client
+            .post(format!(
+                "{}/v1/state-stores/journal-entries",
+                endpoints[&nodes[0]]
+            ))
+            .bearer_auth("this-is-a-long-development-api-key")
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+                "after_seq": 0,
+                "limit": 8,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(entries.status(), StatusCode::OK);
+        let page: Value = entries.json().await.unwrap();
+        assert_eq!(page["committed_seq"], 1);
+        let entry = &page["entries"][0];
+        assert_eq!(entry["sequence"], 1);
+        assert_eq!(entry["op"]["kind"], "put_row");
+        // Entries after the committed frontier page empty rather than
+        // fabricating progress.
+        let tail = client
+            .post(format!(
+                "{}/v1/state-stores/journal-entries",
+                endpoints[&nodes[0]]
+            ))
+            .bearer_auth("this-is-a-long-development-api-key")
+            .json(&serde_json::json!({
+                "store": "accounts.profiles",
+                "after_seq": 1,
+                "limit": 8,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(tail.status(), StatusCode::OK);
+        assert_eq!(
+            tail.json::<Value>().await.unwrap()["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        // Replaying the shipped op into a second manual store applies the
+        // row and dedups the derived mutation identity like a retry.
+        control
+            .execute_commands(vec![Command::DefineStateStore {
+                name: "accounts.shadow".to_owned(),
+                source: crate::control::StateStoreSourceRequest::Manual,
+                named_keys: vec![],
+            }])
+            .await
+            .unwrap();
+        let shadow = control
+            .declared_state_store_by_name("accounts.shadow")
+            .await
+            .unwrap();
+        let replay_id = Uuid::new_v4();
+        let replay = |mutation_id: Uuid, op: Value| {
+            let client = client.clone();
+            let url = format!("{}/v1/state-stores/replay", endpoints[&nodes[0]]);
+            async move {
+                let response = client
+                    .post(url)
+                    .bearer_auth("this-is-a-long-development-api-key")
+                    .json(&serde_json::json!({
+                        "store": "accounts.shadow",
+                        "mutation_id": mutation_id,
+                        "op": op,
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                (response.status(), response.json::<Value>().await.unwrap())
+            }
+        };
+        let (status, body) = replay(replay_id, entry["op"].clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sequence"], 1);
+        assert_eq!(body["deduplicated"], false);
+        let (status, body) = replay(replay_id, entry["op"].clone()).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["deduplicated"], true);
+        for index in &indexes {
+            let row = index
+                .get(&crate::index::PrimaryRef {
+                    feed_id: shadow.store_id,
+                    application_key: b"user-1".to_vec(),
+                })
+                .unwrap()
+                .expect("replay applied the row on every replica");
+            assert_eq!(row.payload, b"{\"plan\": \"pro\"}");
+        }
+
+        // A named key the destination never declared refuses loudly —
+        // the schema-mismatch stall the driver surfaces as last_error.
+        let named_refusal = client
+            .post(format!("{}/v1/state-stores/replay", endpoints[&nodes[0]]))
+            .bearer_auth("this-is-a-long-development-api-key")
+            .json(&serde_json::json!({
+                "store": "accounts.shadow",
+                "mutation_id": Uuid::new_v4(),
+                "op": {
+                    "kind": "put_row",
+                    "key": [117],
+                    "payload": [118],
+                    "named": [{ "name": "ghost", "values": [{ "Text": "x" }], "unique": false }],
+                }
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(named_refusal.status(), StatusCode::BAD_REQUEST);
+
+        // Both shipping endpoints authenticate; feed-derived stores have
+        // no journal of their own to ship.
+        for (path, body) in [
+            (
+                "journal-entries",
+                serde_json::json!({"store": "accounts.profiles"}),
+            ),
+            (
+                "replay",
+                serde_json::json!({
+                    "store": "accounts.profiles",
+                    "mutation_id": Uuid::new_v4(),
+                    "op": {"kind": "clear_all"},
+                }),
+            ),
+        ] {
+            let refused = client
+                .post(format!("{}/v1/state-stores/{path}", endpoints[&nodes[0]]))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(refused.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+        control
+            .execute_commands(vec![
+                Command::CreateFeed {
+                    name: "accounts.events".to_owned(),
+                    encrypted: false,
+                },
+                Command::DefineStateStore {
+                    name: "accounts.derived".to_owned(),
+                    source: crate::control::StateStoreSourceRequest::Feed {
+                        feed: "accounts.events".to_owned(),
+                    },
+                    named_keys: vec![],
+                },
+            ])
+            .await
+            .unwrap();
+        let derived = client
+            .post(format!(
+                "{}/v1/state-stores/journal-entries",
+                endpoints[&nodes[0]]
+            ))
+            .bearer_auth("this-is-a-long-development-api-key")
+            .json(&serde_json::json!({
+                "store": "accounts.derived",
+                "after_seq": 0,
+                "limit": 8,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(derived.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

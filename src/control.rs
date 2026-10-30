@@ -692,14 +692,41 @@ pub struct RiverbedLink {
 pub struct DistributaryDefinition {
     pub distributary_id: Uuid,
     pub name: String,
-    /// Local Domain the target Feed lives in.
+    /// Local Domain the target lives in.
     pub space_id: Uuid,
     pub link_id: Uuid,
-    /// Feed name on the remote Riverbed.
-    pub source_feed: String,
-    pub target_feed_id: Uuid,
+    /// Feed name on the remote Riverbed — `None` for StateStore copies.
+    #[serde(default)]
+    pub source_feed: Option<String>,
+    /// Local target Feed — `None` for StateStore copies.
+    #[serde(default)]
+    pub target_feed_id: Option<Uuid>,
+    /// StateStore name on the remote Riverbed — `None` for Feed copies.
+    /// Only manual stores ship; Feed-derived stores re-derive from the
+    /// copied Feed and have no journal of their own to mirror.
+    #[serde(default)]
+    pub source_store: Option<String>,
+    /// Local target StateStore — `None` for Feed copies.
+    #[serde(default)]
+    pub target_store_id: Option<Uuid>,
+    /// Durable shipped frontier for StateStore copies: the last source
+    /// journal sequence confirmed committed on the destination. Only a
+    /// lease-fenced `AdvanceDistributaryStoreFrontier` moves it, so it
+    /// survives lease moves and owner crashes as authoritative resume
+    /// progress — the counterpart of the remote named-Reader frontier
+    /// a Feed copy leaves on the source Riverbed.
+    #[serde(default)]
+    pub shipped_seq: u64,
     pub status: ResourceStatus,
     pub created_at_ns: i64,
+}
+
+impl DistributaryDefinition {
+    /// Whether this Distributary ships a manual StateStore journal
+    /// rather than a Feed — exactly one source pair is ever set.
+    pub fn is_store_copy(&self) -> bool {
+        self.source_store.is_some()
+    }
 }
 
 /// Which storage-eligible Node may drive a Distributary right now. The
@@ -1739,14 +1766,22 @@ pub enum Command {
         endpoints: Vec<String>,
         key_env: String,
     },
-    /// Declare a Distributary: managed copy of the remote `source_feed`
-    /// reachable through `link` into local `target_feed`. Drops flow
-    /// through the generic `Command::Drop` resource path.
+    /// Declare a Distributary: managed copy reachable through `link`.
+    /// Exactly one source pair is set — (`source_feed`, `target_feed`)
+    /// for a Feed copy, (`source_store`, `target_store`) for a manual
+    /// StateStore journal ship. Drops flow through the generic
+    /// `Command::Drop` resource path.
     DefineDistributary {
         name: String,
         link: String,
-        source_feed: String,
-        target_feed: String,
+        #[serde(default)]
+        source_feed: Option<String>,
+        #[serde(default)]
+        target_feed: Option<String>,
+        #[serde(default)]
+        source_store: Option<String>,
+        #[serde(default)]
+        target_store: Option<String>,
     },
     MoveDistributaryLease {
         distributary: String,
@@ -1761,6 +1796,20 @@ pub enum Command {
     ReportDistributaryStatus {
         distributary_id: Uuid,
         status: DistributaryStatus,
+    },
+    /// Lease-owner advance of a StateStore-copy shipped frontier after a
+    /// page of journaled mutations committed on the destination. Fenced
+    /// to the committed lease owner and epoch like
+    /// `ReportDistributaryStatus`; monotonic — a replayed or stale
+    /// sequence never regresses the frontier.
+    AdvanceDistributaryStoreFrontier {
+        distributary_id: Uuid,
+        /// Node claiming the advance — must equal the committed lease
+        /// owner, fencing a stale driver after a move.
+        reported_by: StorageNodeId,
+        /// Lease epoch the advance was produced under.
+        lease_epoch: u64,
+        shipped_seq: u64,
     },
     CreateWriter {
         name: String,
@@ -3511,6 +3560,19 @@ impl ControlController {
             .cloned()
     }
 
+    pub async fn state_store_definition_by_id(
+        &self,
+        store_id: Uuid,
+    ) -> Option<StateStoreDefinition> {
+        self.state
+            .lock()
+            .await
+            .state_stores
+            .get(&store_id)
+            .filter(|item| item.stage != StateStoreStage::Dropped)
+            .cloned()
+    }
+
     pub async fn declared_state_store_by_name(&self, name: &str) -> Option<StateStoreDefinition> {
         self.state
             .lock()
@@ -3719,8 +3781,16 @@ impl ControlController {
                 json!({
                     "name": item.name,
                     "link": state.riverbed_links.get(&item.link_id).map(|l| l.name.clone()),
+                    "kind": if item.is_store_copy() { "state_store" } else { "feed" },
                     "source_feed": item.source_feed,
-                    "target_feed": feed_name(&item.target_feed_id),
+                    "target_feed": item
+                        .target_feed_id
+                        .and_then(|id| feed_name(&id)),
+                    "source_store": item.source_store,
+                    "target_store": item
+                        .target_store_id
+                        .and_then(|id| state.state_stores.get(&id).map(|s| s.name.clone())),
+                    "shipped_seq": item.shipped_seq,
                     "lease_owner": lease.map(|l| l.owner.as_str()),
                     "lease_epoch": lease.map(|l| l.epoch),
                     "status": status,
@@ -5371,7 +5441,7 @@ impl ControlController {
                     })
                     || state.distributaries.values().any(|item| {
                         item.status == ResourceStatus::Active
-                            && item.target_feed_id == feed_id
+                            && item.target_feed_id == Some(feed_id)
                     })
                 {
                     return Err(ControlError::InvalidOperation(
@@ -6050,6 +6120,8 @@ impl ControlController {
                 link,
                 source_feed,
                 target_feed,
+                source_store,
+                target_store,
             } => {
                 validate_dotted_name(&name)?;
                 ensure_name_available(
@@ -6065,7 +6137,56 @@ impl ControlController {
                     .find(|item| item.name == *link && item.status == ResourceStatus::Active)
                     .cloned()
                     .ok_or_else(|| ControlError::NotFound(format!("Riverbed Link {link}")))?;
-                let feed = active_feed(state, &target_feed)?;
+                // Exactly one source pair: a Feed copy or a manual
+                // StateStore journal ship — never both, never neither.
+                let (source_feed, target_feed_id, source_store, target_store_id, space_id) =
+                    match (&source_feed, &target_feed, &source_store, &target_store) {
+                        (Some(remote_feed), Some(local_feed), None, None) => {
+                            validate_dotted_name(remote_feed)?;
+                            let feed = active_feed(state, local_feed)?;
+                            (
+                                Some(remote_feed.clone()),
+                                Some(feed.feed_id),
+                                None,
+                                None,
+                                feed.space_id,
+                            )
+                        }
+                        (None, None, Some(remote_store), Some(local_store)) => {
+                            validate_dotted_name(remote_store)?;
+                            let store = state
+                                .state_stores
+                                .values()
+                                .find(|item| {
+                                    item.name == *local_store
+                                        && item.stage != StateStoreStage::Dropped
+                                })
+                                .cloned()
+                                .ok_or_else(|| {
+                                    ControlError::NotFound(format!(
+                                        "StateStore {local_store}"
+                                    ))
+                                })?;
+                            if !matches!(store.source, StateStoreSource::Manual) {
+                                return Err(ControlError::InvalidOperation(
+                                    "a Distributary target StateStore must be manual;                                      Feed-derived stores re-derive from the copied Feed"
+                                        .to_owned(),
+                                ));
+                            }
+                            (
+                                None,
+                                None,
+                                Some(remote_store.clone()),
+                                Some(store.store_id),
+                                store.space_id,
+                            )
+                        }
+                        _ => {
+                            return Err(ControlError::InvalidOperation(
+                                "a Distributary names exactly one source pair: FEED ... INTO                                  Feed or STATE-STORE ... INTO StateStore".to_owned(),
+                            ))
+                        }
+                    };
                 let owner = self
                     .storage_pool(state, issued_at_ns)
                     .into_iter()
@@ -6078,10 +6199,13 @@ impl ControlController {
                 let definition = DistributaryDefinition {
                     distributary_id: derived_resource_id(request_id, "distributary"),
                     name: name.clone(),
-                    space_id: feed.space_id,
+                    space_id,
                     link_id: link_record.link_id,
-                    source_feed: source_feed.clone(),
-                    target_feed_id: feed.feed_id,
+                    source_feed,
+                    target_feed_id,
+                    source_store,
+                    target_store_id,
+                    shipped_seq: 0,
                     status: ResourceStatus::Active,
                     created_at_ns: issued_at_ns,
                 };
@@ -6201,6 +6325,54 @@ impl ControlController {
                 Ok((
                     format!("recorded status for Distributary {}", definition.name),
                     json!(status),
+                ))
+            }
+            Command::AdvanceDistributaryStoreFrontier {
+                distributary_id,
+                reported_by,
+                lease_epoch,
+                shipped_seq,
+            } => {
+                let definition = state
+                    .distributaries
+                    .get_mut(&distributary_id)
+                    .filter(|item| item.status == ResourceStatus::Active)
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!("Distributary {distributary_id}"))
+                    })?;
+                let name = definition.name.clone();
+                if !definition.is_store_copy() {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "Distributary {name} is a Feed copy without a journal frontier"
+                    )));
+                }
+                let lease = state
+                    .distributary_leases
+                    .get(&distributary_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControlError::NotFound(format!(
+                            "Distributary lease for {distributary_id}"
+                        ))
+                    })?;
+                // The committed lease is the fence, identical in
+                // discipline to status reports: a driver surviving a
+                // raced move cannot regress the frontier.
+                if lease.epoch != lease_epoch || lease.owner != reported_by {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "Distributary frontier advance for {name} does not match the committed lease"
+                    )));
+                }
+                if shipped_seq < definition.shipped_seq {
+                    return Err(ControlError::InvalidOperation(format!(
+                        "Distributary frontier for {name} cannot regress from {} to {shipped_seq}",
+                        definition.shipped_seq
+                    )));
+                }
+                definition.shipped_seq = shipped_seq;
+                Ok((
+                    format!("advanced Distributary {name} journal frontier to {shipped_seq}"),
+                    json!({ "shipped_seq": shipped_seq }),
                 ))
             }
             Command::RegisterStorageNode {
@@ -7551,7 +7723,8 @@ impl ControlController {
                             && item.output_feed_id == Some(feed_id)
                     })
                     || state.distributaries.values().any(|item| {
-                        item.status == ResourceStatus::Active && item.target_feed_id == feed_id
+                        item.status == ResourceStatus::Active
+                            && item.target_feed_id == Some(feed_id)
                     })
                 {
                     return Err(ControlError::InvalidOperation(
@@ -7687,6 +7860,14 @@ impl ControlController {
                     .find(|item| item.name == name && item.stage != StateStoreStage::Dropped)
                     .map(|item| item.store_id)
                     .ok_or_else(|| ControlError::NotFound(format!("StateStore {name}")))?;
+                if state.distributaries.values().any(|item| {
+                    item.status == ResourceStatus::Active && item.target_store_id == Some(store_id)
+                }) {
+                    return Err(ControlError::InvalidOperation(
+                        "drop attached Distributaries before dropping their target StateStore"
+                            .to_owned(),
+                    ));
+                }
                 let item = state
                     .state_stores
                     .get_mut(&store_id)
@@ -7852,16 +8033,39 @@ fn parse_statement(statement: &str) -> Result<Command, ControlError> {
             Some("DISTRIBUTARY") => {
                 // CREATE DISTRIBUTARY <name> FROM LINK <link>
                 //   FEED <remote_feed> INTO <local_feed>
+                // or the manual-StateStore journal ship:
+                //   CREATE DISTRIBUTARY <name> FROM LINK <link>
+                //     STATE-STORE <remote_store> INTO <local_store>
                 expect_keyword(&tokens, 3, "FROM")?;
                 expect_keyword(&tokens, 4, "LINK")?;
-                expect_keyword(&tokens, 6, "FEED")?;
-                expect_keyword(&tokens, 8, "INTO")?;
-                Ok(Command::DefineDistributary {
-                    name: token(&tokens, 2)?.to_owned(),
-                    link: token(&tokens, 5)?.to_owned(),
-                    source_feed: token(&tokens, 7)?.to_owned(),
-                    target_feed: token(&tokens, 9)?.to_owned(),
-                })
+                match keyword(6).as_deref() {
+                    Some("FEED") => {
+                        expect_keyword(&tokens, 8, "INTO")?;
+                        Ok(Command::DefineDistributary {
+                            name: token(&tokens, 2)?.to_owned(),
+                            link: token(&tokens, 5)?.to_owned(),
+                            source_feed: Some(token(&tokens, 7)?.to_owned()),
+                            target_feed: Some(token(&tokens, 9)?.to_owned()),
+                            source_store: None,
+                            target_store: None,
+                        })
+                    }
+                    Some("STATE-STORE") | Some("STATESTORE") => {
+                        expect_keyword(&tokens, 8, "INTO")?;
+                        Ok(Command::DefineDistributary {
+                            name: token(&tokens, 2)?.to_owned(),
+                            link: token(&tokens, 5)?.to_owned(),
+                            source_feed: None,
+                            target_feed: None,
+                            source_store: Some(token(&tokens, 7)?.to_owned()),
+                            target_store: Some(token(&tokens, 9)?.to_owned()),
+                        })
+                    }
+                    other => Err(ControlError::Syntax(format!(
+                        "CREATE DISTRIBUTARY expects FEED or STATE-STORE after LINK, not {}",
+                        other.unwrap_or("end of statement")
+                    ))),
+                }
             }
             Some("PIPE") => {
                 // CREATE PIPE <name> FROM SUBSCRIPTION <sub> TO FEED <feed>
@@ -10273,8 +10477,19 @@ fn show_resources(
                 if let Some(link) = state.riverbed_links.get(&item.link_id) {
                     row["link"] = json!(link.name.clone());
                 }
-                if let Some(feed) = state.feeds.get(&item.target_feed_id) {
+                row["kind"] = json!(if item.is_store_copy() {
+                    "state_store"
+                } else {
+                    "feed"
+                });
+                if let Some(feed) = item.target_feed_id.and_then(|id| state.feeds.get(&id)) {
                     row["target_feed"] = json!(feed.name.clone());
+                }
+                if let Some(store) = item
+                    .target_store_id
+                    .and_then(|id| state.state_stores.get(&id))
+                {
+                    row["target_store"] = json!(store.name.clone());
                 }
                 if let Some(lease) = state.distributary_leases.get(&item.distributary_id) {
                     row["lease_owner"] = json!(lease.owner.as_str());
@@ -10485,8 +10700,19 @@ fn describe_resource(
             if let Some(link) = state.riverbed_links.get(&item.link_id) {
                 row["link"] = json!(link.name.clone());
             }
-            if let Some(feed) = state.feeds.get(&item.target_feed_id) {
+            row["kind"] = json!(if item.is_store_copy() {
+                "state_store"
+            } else {
+                "feed"
+            });
+            if let Some(feed) = item.target_feed_id.and_then(|id| state.feeds.get(&id)) {
                 row["target_feed"] = json!(feed.name.clone());
+            }
+            if let Some(store) = item
+                .target_store_id
+                .and_then(|id| state.state_stores.get(&id))
+            {
+                row["target_store"] = json!(store.name.clone());
             }
             if let Some(lease) = state.distributary_leases.get(&item.distributary_id) {
                 row["lease"] = json!(lease);
@@ -11012,6 +11238,7 @@ fn command_label(command: &Command) -> String {
         Command::DefineDistributary { .. } => "DEFINE DISTRIBUTARY",
         Command::MoveDistributaryLease { .. } => "MOVE DISTRIBUTARY LEASE",
         Command::ReportDistributaryStatus { .. } => "REPORT DISTRIBUTARY STATUS",
+        Command::AdvanceDistributaryStoreFrontier { .. } => "ADVANCE DISTRIBUTARY STORE FRONTIER",
         Command::RegisterStorageNode { .. } => "REGISTER STORAGE NODE",
         Command::RetireStorageNode { .. } => "RETIRE STORAGE NODE",
         Command::DrainStorageNode { .. } => "DRAIN STORAGE NODE",
@@ -15316,11 +15543,175 @@ mod tests {
             .is_none());
     }
 
+    #[tokio::test]
+    async fn distributary_store_copy_frontier_fences_and_persists() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute(
+                "CREATE DOMAIN accounts; CREATE FEED accounts.events;                  DEFINE STATESTORE accounts.shadow KEYS dept;                  DEFINE STATESTORE accounts.derived FROM FEED accounts.events;",
+            )
+            .await
+            .unwrap();
+        controller
+            .execute(
+                "CREATE RIVERBED LINK dr AT 'https://dr-1:9392'                  WITH KEY ENV WHITEWATER_DR_KEY;",
+            )
+            .await
+            .unwrap();
+        // The STATE-STORE form binds a remote manual store's journal to
+        // a local manual target and seeds the lease at epoch 1.
+        let defined = controller
+            .execute(
+                "CREATE DISTRIBUTARY accounts.storecopy FROM LINK dr                  STATE-STORE ops.shadow INTO accounts.shadow;",
+            )
+            .await
+            .unwrap();
+        assert_eq!(defined.results[0].data["source_store"], "ops.shadow");
+        let distributary_id = defined.results[0].data["distributary_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let leases = controller.distributary_leases().await;
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[0].epoch, 1);
+        // A Feed-derived target, an unknown link, an unknown store, and
+        // a duplicate name refuse.
+        for script in [
+            "CREATE DISTRIBUTARY accounts.a FROM LINK dr STATE-STORE ops.s INTO accounts.derived;",
+            "CREATE DISTRIBUTARY accounts.b FROM LINK missing STATE-STORE ops.s INTO accounts.shadow;",
+            "CREATE DISTRIBUTARY accounts.c FROM LINK dr STATE-STORE ops.s INTO accounts.missing;",
+            "CREATE DISTRIBUTARY accounts.storecopy FROM LINK dr STATE-STORE ops.s INTO accounts.shadow;",
+        ] {
+            assert!(controller.execute(script).await.is_err(), "{script}");
+        }
+        // Exactly one source pair is enforced in apply — typed commands
+        // carrying both or neither refuse the same way.
+        for (sf, tf, ss, ts) in [
+            (
+                Some("remote.f"),
+                Some("accounts.mirrored"),
+                Some("remote.s"),
+                Some("accounts.shadow"),
+            ),
+            (None, None, None, None),
+        ] {
+            let refused = controller
+                .execute_commands(vec![Command::DefineDistributary {
+                    name: format!("accounts.badpair{}", sf.is_some() as u8),
+                    link: "dr".to_owned(),
+                    source_feed: sf.map(str::to_owned),
+                    target_feed: tf.map(str::to_owned),
+                    source_store: ss.map(str::to_owned),
+                    target_store: ts.map(str::to_owned),
+                }])
+                .await;
+            assert!(refused.is_err());
+        }
+        // The durable frontier advances only under the committed lease:
+        // wrong owner, wrong epoch, and regression all refuse.
+        let id = Uuid::parse_str(&distributary_id).unwrap();
+        let owner = leases[0].owner.clone();
+        let other = ["storage-1", "storage-2", "storage-3"]
+            .into_iter()
+            .map(|node| StorageNodeId::try_new(node).unwrap())
+            .find(|node| *node != owner)
+            .unwrap();
+        for (by, epoch, seq) in [(other.clone(), 1, 7), (owner.clone(), 9, 7)] {
+            assert!(controller
+                .execute_commands(vec![Command::AdvanceDistributaryStoreFrontier {
+                    distributary_id: id,
+                    reported_by: by,
+                    lease_epoch: epoch,
+                    shipped_seq: seq,
+                }])
+                .await
+                .is_err());
+        }
+        controller
+            .execute_commands(vec![Command::AdvanceDistributaryStoreFrontier {
+                distributary_id: id,
+                reported_by: owner.clone(),
+                lease_epoch: 1,
+                shipped_seq: 7,
+            }])
+            .await
+            .unwrap();
+        // Idempotent at the same sequence, refused below it.
+        controller
+            .execute_commands(vec![Command::AdvanceDistributaryStoreFrontier {
+                distributary_id: id,
+                reported_by: owner.clone(),
+                lease_epoch: 1,
+                shipped_seq: 7,
+            }])
+            .await
+            .unwrap();
+        assert!(controller
+            .execute_commands(vec![Command::AdvanceDistributaryStoreFrontier {
+                distributary_id: id,
+                reported_by: owner.clone(),
+                lease_epoch: 1,
+                shipped_seq: 5,
+            }])
+            .await
+            .is_err());
+        // SHOW and DESCRIBE surface the kind, target store, and frontier.
+        let shown = controller.execute("SHOW DISTRIBUTARIES;").await.unwrap();
+        let row = &shown.results[0].data[0];
+        assert_eq!(row["kind"], "state_store");
+        assert_eq!(row["target_store"], "accounts.shadow");
+        assert_eq!(row["shipped_seq"], 7);
+        let described = controller
+            .execute("DESCRIBE DISTRIBUTARY accounts.storecopy;")
+            .await
+            .unwrap();
+        assert_eq!(described.results[0].data["kind"], "state_store");
+        // The target store cannot drop while a Distributary ships into
+        // it; a Feed copy cannot take a journal frontier.
+        assert!(controller
+            .execute("DROP STATESTORE accounts.shadow;")
+            .await
+            .is_err());
+        let feed_defined = controller
+            .execute(
+                "CREATE FEED accounts.mirrored;                  CREATE DISTRIBUTARY accounts.feedcopy FROM LINK dr                  FEED orders.events INTO accounts.mirrored;",
+            )
+            .await
+            .unwrap();
+        let feed_id = feed_defined.results[1].data["distributary_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(controller
+            .execute_commands(vec![Command::AdvanceDistributaryStoreFrontier {
+                distributary_id: Uuid::parse_str(&feed_id).unwrap(),
+                reported_by: owner.clone(),
+                lease_epoch: 1,
+                shipped_seq: 3,
+            }])
+            .await
+            .is_err());
+        // The shipped frontier survives a catalog snapshot/reopen.
+        drop(controller);
+        let reopened = new_controller(&directory);
+        let shown = reopened.execute("SHOW DISTRIBUTARIES;").await.unwrap();
+        let store_row = shown.results[0]
+            .data
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "state_store")
+            .expect("store copy row");
+        assert_eq!(store_row["shipped_seq"], 7);
+    }
+
     #[test]
     fn distributary_wcl_parses() {
         let commands = parse_wcl(
             "CREATE RIVERBED LINK dr AT 'https://a:1,https://b:2' WITH KEY ENV DR_KEY; \
              CREATE DISTRIBUTARY accounts.m FROM LINK dr FEED orders.e INTO accounts.m2; \
+             CREATE DISTRIBUTARY accounts.s FROM LINK dr STATE-STORE ops.shadow INTO accounts.s2; \
              MOVE DISTRIBUTARY LEASE accounts.m TO NODE storage-2; \
              DROP DISTRIBUTARY accounts.m; DROP LINK dr; SHOW LINKS; SHOW DISTRIBUTARIES;",
         )
@@ -15333,35 +15724,42 @@ mod tests {
         assert!(matches!(
             &commands[1],
             Command::DefineDistributary { source_feed, target_feed, .. }
-                if source_feed == "orders.e" && target_feed == "accounts.m2"
+                if source_feed.as_deref() == Some("orders.e")
+                    && target_feed.as_deref() == Some("accounts.m2")
         ));
         assert!(matches!(
             &commands[2],
-            Command::MoveDistributaryLease { .. }
+            Command::DefineDistributary { source_store, target_store, .. }
+                if source_store.as_deref() == Some("ops.shadow")
+                    && target_store.as_deref() == Some("accounts.s2")
         ));
         assert!(matches!(
             &commands[3],
+            Command::MoveDistributaryLease { .. }
+        ));
+        assert!(matches!(
+            &commands[4],
             Command::Drop {
                 kind: ResourceKind::Distributary,
                 ..
             }
         ));
         assert!(matches!(
-            &commands[4],
+            &commands[5],
             Command::Drop {
                 kind: ResourceKind::RiverbedLink,
                 ..
             }
         ));
         assert!(matches!(
-            &commands[5],
+            &commands[6],
             Command::Show {
                 kind: ShowKind::RiverbedLinks,
                 ..
             }
         ));
         assert!(matches!(
-            &commands[6],
+            &commands[7],
             Command::Show {
                 kind: ShowKind::Distributaries,
                 ..
