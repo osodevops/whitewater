@@ -523,7 +523,8 @@ remote named Reader (resolved through `POST /v1/readers/frontier` on
 the source) or unshipped journal sequences for a StateStore copy.
 Probes run on report ticks only, so a lag change never churns the
 catalog by itself; a failed probe keeps the last figure rather than
-guessing zero. The report commits through the same epoch fence as the
+guessing zero and reports `lag_probe_error` with the refusal, so a
+stalled read stays diagnosable instead of masquerading as zero lag. The report commits through the same epoch fence as the
 lease: only the committed owner at the committed epoch may publish, so
 a raced move can never let a previous owner overwrite live status.
 

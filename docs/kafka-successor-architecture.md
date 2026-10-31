@@ -521,6 +521,8 @@ Consensus is kept small and focused on:
 
 The normal data path should not require global consensus for each message. Acknowledgement policy can determine when an append is considered durable, for example after replication to a quorum of active-range replicas.
 
+Because every replica holds the committed prefix, a committed read does not have to travel to the Append Owner. Any current replica may serve its own committed boundary once another replica corroborates the same position and frame digest; a lagging follower simply reports a lower corroborated boundary, and the caller falls back to the owner when local evidence is unavailable. A replica transiently ahead of the owner is normal convergence under fused commit markers, not divergence — the digest match is the check, never owner primacy. This keeps reads local to whichever Node the client chose without weakening the committed-only contract.
+
 ## 13. A deliberately small wire protocol
 
 The essential protocol should remain small enough to understand and implement correctly. An initial operation set might be:
@@ -552,7 +554,7 @@ Additional capabilities should generally be expressed through these primitives, 
 
 The current JSON-over-HTTP surface is the development substrate, not the final form. The evolution path, in order:
 
-1. **Inter-Node binary protocol first.** Replication and WAL shipping are homogeneous Rust-to-Rust traffic — a versioned binary frame format belongs there before any client-visible change, because it carries the highest per-byte cost at zero SDK parity risk.
+1. **Inter-Node binary protocol first.** Replication and WAL shipping are homogeneous Rust-to-Rust traffic — a versioned binary frame format belongs there before any client-visible change, because it carries the highest per-byte cost at zero SDK parity risk. **Shipped:** replica append transport and results run binary end-to-end, and `POST /v1/readers/temporary/fetch` negotiates `application/vnd.whitewater.frames` — a streamed body of raw stored frames with cursor framing that skips the base64/JSON round trip per page while the JSON response remains the default compatibility path.
 2. **Control Plane stays HTTPS permanently.** WCL, `/admin/commands`, `/health`, and conformance are operational surfaces; curl-ability, proxy awareness, and readable fixtures are features, not limitations.
 3. **Client data plane over QUIC rather than bespoke TCP.** QUIC (RFC 9000) bundles transport, TLS 1.3, and independent streams into one userspace handshake over UDP: one round trip (zero on resume), no head-of-line blocking between streams, and connection migration that survives client IP changes — which pairs naturally with session-epoch fencing since fewer reconnects mean fewer epochs to re-establish. A custom binary protocol over QUIC streams gets reliability, ordering, and mandatory encryption as primitives; over raw TCP all four must be reimplemented. HTTP/3 — the existing REST surface over QUIC — is the cheap intermediate experiment since it preserves every route verbatim.
 4. **One semantic contract, two serializations.** `sdk/spec/` remains the contract of record: identical ops, error codes, and opaque Cursor semantics regardless of whether bytes arrive as JSON/HTTP or binary/QUIC. The shared conformance corpus is what keeps parity claims honest and must eventually execute over both transports.
