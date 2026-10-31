@@ -46,10 +46,12 @@ pub use repair::{
     ReplicaRepairProgress,
 };
 pub use replication::{
+    decode_batch_body, decode_batch_result_body, encode_batch_body, encode_batch_result_body,
     RangeReadSpec, ReadReplicaEvidence, ReplicaAppendAccepted, ReplicaAppendError,
     ReplicaAppendErrorCode, ReplicaAppendRequest, ReplicaAppendResponse, ReplicaAppendService,
-    ReplicaBatchAppendRequest, ReplicaBatchAppendResponse, ReplicaBatchCommit, ReplicaBatchFrame,
-    ReplicaCommitAccepted, ReplicaCommitRequest, ReplicaCommitResponse, ReplicaDiscardOutcome,
+    ReplicaBatchAppendHeader, ReplicaBatchAppendRequest, ReplicaBatchAppendResponse,
+    ReplicaBatchCommit, ReplicaBatchFrame, ReplicaBatchFrameMeta, ReplicaCommitAccepted,
+    ReplicaCommitRequest, ReplicaCommitResponse, ReplicaDiscardOutcome,
     ReplicaDiscardPendingRequest, ReplicaDiscardPendingResponse, MAX_COMMITTED_READ_BYTES,
     MAX_REPLICA_BATCH_BASE64_BYTES, MAX_REPLICA_BATCH_FRAMES, MAX_REPLICA_FRAME_BASE64_BYTES,
 };

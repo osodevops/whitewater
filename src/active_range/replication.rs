@@ -148,7 +148,7 @@ impl std::error::Error for ReplicaAppendError {}
 /// a WriterSession batch costs one quorum round-trip per replica instead
 /// of one per record. Position, digest, epoch, and dedup checks apply
 /// per frame exactly as the single-append contract.
-pub const MAX_REPLICA_BATCH_FRAMES: usize = 128;
+pub const MAX_REPLICA_BATCH_FRAMES: usize = 512;
 /// Total base64 budget for one batch body — keeps the wire bound in the
 /// same order as the single-frame limit.
 pub const MAX_REPLICA_BATCH_BASE64_BYTES: usize = 16 * 1024 * 1024;
@@ -198,10 +198,253 @@ pub struct ReplicaBatchCommit {
     pub frame_digest: [u8; 32],
 }
 
+/// Header of the binary batch wire body: every field of
+/// `ReplicaBatchAppendRequest` except the frame payloads, which travel as
+/// raw length-prefixed bytes after this JSON header. Dropping JSON+base64
+/// off the hot replication leg removes ~33% wire inflation and a ~1MB
+/// JSON document per quorum round.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaBatchAppendHeader {
+    pub feed_id: Uuid,
+    pub range_id: RangeId,
+    pub generation: RangeGeneration,
+    pub ownership_epoch: OwnershipEpoch,
+    pub append_owner: StorageNodeId,
+    pub frames: Vec<ReplicaBatchFrameMeta>,
+    #[serde(default)]
+    pub commit_at: Option<ReplicaBatchCommit>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaBatchFrameMeta {
+    #[serde(default)]
+    pub expected_position: Option<RangePosition>,
+    pub identity: AppendIdentity,
+    pub cursor: String,
+    #[serde(default)]
+    pub pending_effect: Option<super::store::PendingEffectRef>,
+}
+
+/// Binary batch body: `[u32 header_len][header_json][u32 len + frame bytes]*`.
+/// The header's `frames` metadata list is the same length as the blob
+/// count — blobs pair with their metadata positionally.
+pub fn encode_batch_body(
+    header: &ReplicaBatchAppendHeader,
+    frames: &[Vec<u8>],
+) -> Result<Vec<u8>, ReplicaAppendError> {
+    if header.frames.len() != frames.len() {
+        return Err(ReplicaAppendError::rejected(
+            ReplicaAppendErrorCode::InvalidFrame,
+            "binary batch header/frame count mismatch",
+        ));
+    }
+    let header_json = serde_json::to_vec(header).map_err(|error| {
+        ReplicaAppendError::rejected(
+            ReplicaAppendErrorCode::InvalidFrameEncoding,
+            format!("binary batch header does not encode: {error}"),
+        )
+    })?;
+    let mut body = Vec::with_capacity(
+        4 + header_json.len() + 4 + 4 * frames.len() + frames.iter().map(Vec::len).sum::<usize>(),
+    );
+    body.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+    body.extend_from_slice(&header_json);
+    body.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+    for frame in frames {
+        body.extend_from_slice(&(frame.len() as u32).to_le_bytes());
+        body.extend_from_slice(frame);
+    }
+    Ok(body)
+}
+
+/// Parse the binary batch body produced by `encode_batch_body`.
+pub fn decode_batch_body(
+    body: &[u8],
+) -> Result<(ReplicaBatchAppendHeader, Vec<Vec<u8>>), ReplicaAppendError> {
+    let take = |offset: &mut usize, len: usize| -> Result<&[u8], ReplicaAppendError> {
+        let end = offset
+            .checked_add(len)
+            .filter(|end| *end <= body.len())
+            .ok_or_else(|| {
+                ReplicaAppendError::rejected(
+                    ReplicaAppendErrorCode::InvalidFrameEncoding,
+                    "binary batch body is truncated",
+                )
+            })?;
+        let slice = &body[*offset..end];
+        *offset = end;
+        Ok(slice)
+    };
+    let mut offset = 0_usize;
+    let header_len = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap()) as usize;
+    let header: ReplicaBatchAppendHeader = serde_json::from_slice(take(&mut offset, header_len)?)
+        .map_err(|error| {
+        ReplicaAppendError::rejected(
+            ReplicaAppendErrorCode::InvalidFrameEncoding,
+            format!("binary batch header does not parse: {error}"),
+        )
+    })?;
+    let count = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap()) as usize;
+    if count != header.frames.len() {
+        return Err(ReplicaAppendError::rejected(
+            ReplicaAppendErrorCode::InvalidFrameEncoding,
+            "binary batch header/frame count mismatch",
+        ));
+    }
+    let mut frames = Vec::with_capacity(count);
+    for _ in 0..count {
+        let len = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap()) as usize;
+        frames.push(take(&mut offset, len)?.to_vec());
+    }
+    if offset != body.len() {
+        return Err(ReplicaAppendError::rejected(
+            ReplicaAppendErrorCode::InvalidFrameEncoding,
+            "binary batch body carries trailing bytes",
+        ));
+    }
+    Ok((header, frames))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplicaBatchAppendResponse {
     pub results: Option<Vec<ReplicaAppendAccepted>>,
     pub error: Option<ReplicaAppendError>,
+}
+
+/// Binary batch response body: `[u32 header_len][header_json]` followed
+/// by one row per accepted frame — `[u64 position][u16 cursor_len]
+/// [cursor][u8 flags][u8;16 message_id][u8;32 frame_digest]` where flags
+/// bit0=deduplicated, bit1=committed, bit2=durable. The JSON response
+/// shape costs ~200 bytes and a serde pass per frame — several ms per
+/// quorum round at batch sizes — while rows encode in microseconds.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplicaBatchAppendResultHeader {
+    pub error: Option<ReplicaAppendError>,
+}
+
+pub fn encode_batch_result_body(
+    results: &Result<Vec<ReplicaAppendAccepted>, ReplicaAppendError>,
+) -> Vec<u8> {
+    let header = ReplicaBatchAppendResultHeader {
+        error: results.as_ref().err().cloned(),
+    };
+    let header_json = serde_json::to_vec(&header).unwrap_or_else(|_| b"{}".to_vec());
+    let rows: &[ReplicaAppendAccepted] = results.as_ref().map(Vec::as_slice).unwrap_or(&[]);
+    let mut body = Vec::with_capacity(4 + header_json.len() + 4 + rows.len() * 64);
+    body.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
+    body.extend_from_slice(&header_json);
+    body.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+    for result in rows {
+        body.extend_from_slice(&result.position.value().to_le_bytes());
+        let cursor = result.cursor.as_bytes();
+        body.extend_from_slice(&(cursor.len() as u16).to_le_bytes());
+        body.extend_from_slice(cursor);
+        let mut flags = 0_u8;
+        if result.deduplicated {
+            flags |= 1;
+        }
+        if result.committed {
+            flags |= 2;
+        }
+        if result.durable {
+            flags |= 4;
+        }
+        body.push(flags);
+        body.extend_from_slice(result.message_id.as_bytes());
+        body.extend_from_slice(&result.frame_digest);
+    }
+    body
+}
+
+/// Parse the binary batch response produced by `encode_batch_result_body`.
+pub fn decode_batch_result_body(
+    body: &[u8],
+) -> Result<ReplicaBatchAppendResponse, ReplicaAppendError> {
+    let truncated = || {
+        ReplicaAppendError::rejected(
+            ReplicaAppendErrorCode::InvalidFrameEncoding,
+            "binary batch response is truncated",
+        )
+    };
+    if body.len() < 4 {
+        return Err(truncated());
+    }
+    let mut offset = 4_usize;
+    let header_len = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
+    let header_end = offset.checked_add(header_len).filter(|e| *e <= body.len());
+    let header_json = match header_end {
+        Some(end) => {
+            let slice = &body[offset..end];
+            offset = end;
+            slice
+        }
+        None => return Err(truncated()),
+    };
+    let header: ReplicaBatchAppendResultHeader =
+        serde_json::from_slice(header_json).map_err(|error| {
+            ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::InvalidFrameEncoding,
+                format!("binary batch response header does not parse: {error}"),
+            )
+        })?;
+    if let Some(error) = header.error {
+        return Ok(ReplicaBatchAppendResponse {
+            results: None,
+            error: Some(error),
+        });
+    }
+    if body.len() < offset + 4 {
+        return Err(truncated());
+    }
+    let count = u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap()) as usize;
+    offset += 4;
+    let mut results = Vec::with_capacity(count);
+    for _ in 0..count {
+        if body.len() < offset + 8 + 2 {
+            return Err(truncated());
+        }
+        let position = u64::from_le_bytes(body[offset..offset + 8].try_into().unwrap());
+        offset += 8;
+        let cursor_len = u16::from_le_bytes(body[offset..offset + 2].try_into().unwrap()) as usize;
+        offset += 2;
+        let end = offset + cursor_len + 1 + 16 + 32;
+        if body.len() < end {
+            return Err(truncated());
+        }
+        let cursor =
+            String::from_utf8(body[offset..offset + cursor_len].to_vec()).map_err(|_| {
+                ReplicaAppendError::rejected(
+                    ReplicaAppendErrorCode::InvalidFrameEncoding,
+                    "binary batch response cursor is not UTF-8",
+                )
+            })?;
+        offset += cursor_len;
+        let flags = body[offset];
+        offset += 1;
+        let message_id = Uuid::from_bytes(body[offset..offset + 16].try_into().unwrap());
+        offset += 16;
+        let frame_digest: [u8; 32] = body[offset..offset + 32].try_into().unwrap();
+        offset += 32;
+        results.push(ReplicaAppendAccepted {
+            position: RangePosition::new(position),
+            message_id,
+            cursor,
+            frame_digest,
+            deduplicated: flags & 1 != 0,
+            committed: flags & 2 != 0,
+            durable: flags & 4 != 0,
+        });
+    }
+    if offset != body.len() {
+        return Err(truncated());
+    }
+    Ok(ReplicaBatchAppendResponse {
+        results: Some(results),
+        error: None,
+    })
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1118,7 +1361,7 @@ impl ReplicaAppendService {
         }
         let boundary = expected_commit.unwrap_or(committed);
         let frames = store
-            .read_committed_bounded(after, page_limit.clamp(1, 128), MAX_COMMITTED_READ_BYTES)
+            .read_committed_bounded(after, page_limit.clamp(1, 512), MAX_COMMITTED_READ_BYTES)
             .await
             .map_err(map_store_error)?
             .into_iter()
@@ -1280,7 +1523,7 @@ impl ReplicaAppendService {
             frames
         } else {
             store
-                .read_committed_bounded(start, page_limit.clamp(1, 32), MAX_COMMITTED_READ_BYTES)
+                .read_committed_bounded(start, page_limit.clamp(1, 512), MAX_COMMITTED_READ_BYTES)
                 .await
                 .map_err(map_store_error)?
                 .into_iter()
@@ -1503,16 +1746,6 @@ impl ReplicaAppendService {
         request: ReplicaBatchAppendRequest,
         import: bool,
     ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaAppendError> {
-        let _gate = self.append_gate(request.range_id).await.lock_owned().await;
-        if self
-            .generation_is_frozen(request.range_id, request.generation)
-            .await
-        {
-            return Err(ReplicaAppendError::temporary(
-                ReplicaAppendErrorCode::RangeFrozen,
-                "Active Range generation is frozen for split cutover; retry safely",
-            ));
-        }
         if request.frames.is_empty() || request.frames.len() > MAX_REPLICA_BATCH_FRAMES {
             return Err(ReplicaAppendError::rejected(
                 ReplicaAppendErrorCode::InvalidFrame,
@@ -1529,30 +1762,6 @@ impl ReplicaAppendService {
                 ),
             ));
         }
-        let assignment = match self
-            .control
-            .active_range_assignment_by_id(request.range_id)
-            .await
-        {
-            Some(assignment) if assignment.feed_id == request.feed_id => assignment,
-            _ => {
-                return Err(ReplicaAppendError::temporary(
-                    ReplicaAppendErrorCode::AssignmentNotFound,
-                    format!(
-                        "no committed Active Range assignment exists for Feed {}",
-                        request.feed_id
-                    ),
-                ))
-            }
-        };
-        self.validate_assignment_fields(
-            &assignment,
-            request.range_id,
-            request.generation,
-            request.ownership_epoch,
-            &request.append_owner,
-        )?;
-        let store = self.store_for(&assignment).await?;
         let mut appends = Vec::with_capacity(request.frames.len());
         for (index, frame_request) in request.frames.iter().enumerate() {
             if frame_request.frame_base64.len() > MAX_REPLICA_FRAME_BASE64_BYTES {
@@ -1585,9 +1794,128 @@ impl ReplicaAppendService {
                 pending_effect: frame_request.pending_effect,
             });
         }
-        let commit = request.commit_at.map(|hint| super::store::BatchCommit {
-            generation: request.generation,
-            ownership_epoch: request.ownership_epoch,
+        self.append_frames_inner(
+            request.feed_id,
+            request.range_id,
+            request.generation,
+            request.ownership_epoch,
+            &request.append_owner,
+            appends,
+            request.commit_at,
+            import,
+        )
+        .await
+    }
+
+    /// Binary-wire batch append: the frame payloads arrive already
+    /// decoded, so the hot replication leg skips the ~1MB JSON document
+    /// and base64 pass the JSON path pays per round.
+    pub async fn append_batch_decoded(
+        &self,
+        header: ReplicaBatchAppendHeader,
+        frames: Vec<Vec<u8>>,
+    ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaAppendError> {
+        if header.frames.is_empty() || header.frames.len() > MAX_REPLICA_BATCH_FRAMES {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::InvalidFrame,
+                format!("replica batch must carry 1..={MAX_REPLICA_BATCH_FRAMES} frames"),
+            ));
+        }
+        if header.frames.len() != frames.len() {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::InvalidFrame,
+                "binary batch header/frame count mismatch",
+            ));
+        }
+        let wire_bytes: usize = frames.iter().map(Vec::len).sum();
+        if wire_bytes > MAX_REPLICA_BATCH_BASE64_BYTES {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::FrameTooLarge,
+                format!(
+                    "replica batch exceeds the {} byte limit",
+                    MAX_REPLICA_BATCH_BASE64_BYTES
+                ),
+            ));
+        }
+        let mut appends = Vec::with_capacity(frames.len());
+        for (index, (meta, frame)) in header.frames.iter().zip(frames).enumerate() {
+            if frame.len() > MAX_FRAME_BYTES {
+                return Err(ReplicaAppendError::rejected(
+                    ReplicaAppendErrorCode::FrameTooLarge,
+                    format!("batch frame {index} exceeds the {MAX_FRAME_BYTES} byte limit"),
+                ));
+            }
+            appends.push(ActiveRangeAppend {
+                generation: header.generation,
+                ownership_epoch: header.ownership_epoch,
+                expected_position: meta.expected_position,
+                identity: meta.identity.clone(),
+                cursor: meta.cursor.clone(),
+                frame,
+                pending_effect: meta.pending_effect,
+            });
+        }
+        self.append_frames_inner(
+            header.feed_id,
+            header.range_id,
+            header.generation,
+            header.ownership_epoch,
+            &header.append_owner,
+            appends,
+            header.commit_at,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_frames_inner(
+        &self,
+        feed_id: Uuid,
+        range_id: RangeId,
+        generation: RangeGeneration,
+        ownership_epoch: OwnershipEpoch,
+        append_owner: &StorageNodeId,
+        appends: Vec<ActiveRangeAppend>,
+        commit_at: Option<ReplicaBatchCommit>,
+        import: bool,
+    ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaAppendError> {
+        let diag_t = std::time::Instant::now();
+        let _gate = self.append_gate(range_id).await.lock_owned().await;
+        let gate_ms = diag_t.elapsed();
+        if self.generation_is_frozen(range_id, generation).await {
+            return Err(ReplicaAppendError::temporary(
+                ReplicaAppendErrorCode::RangeFrozen,
+                "Active Range generation is frozen for split cutover; retry safely",
+            ));
+        }
+        let lookup_t = std::time::Instant::now();
+        let assignment = match self.control.active_range_assignment_by_id(range_id).await {
+            Some(assignment) if assignment.feed_id == feed_id => assignment,
+            _ => {
+                return Err(ReplicaAppendError::temporary(
+                    ReplicaAppendErrorCode::AssignmentNotFound,
+                    format!(
+                        "no committed Active Range assignment exists for Feed {}",
+                        feed_id
+                    ),
+                ))
+            }
+        };
+        self.validate_assignment_fields(
+            &assignment,
+            range_id,
+            generation,
+            ownership_epoch,
+            append_owner,
+        )?;
+        let store = self.store_for(&assignment).await?;
+        let lookup_ms = lookup_t.elapsed();
+        let appends_len = appends.len();
+        let store_t = std::time::Instant::now();
+        let commit = commit_at.map(|hint| super::store::BatchCommit {
+            generation,
+            ownership_epoch,
             position: hint.position,
             frame_digest: hint.frame_digest,
         });
@@ -1598,6 +1926,14 @@ impl ReplicaAppendService {
             (false, None) => store.append_batch(appends).await,
         }
         .map_err(map_store_error)?;
+        let store_ms = store_t.elapsed();
+        tracing::debug!(
+            frames = appends_len,
+            gate_ms = gate_ms.as_secs_f64() * 1000.0,
+            lookup_ms = lookup_ms.as_secs_f64() * 1000.0,
+            store_ms = store_ms.as_secs_f64() * 1000.0,
+            "replica append inner timing"
+        );
         Ok(results
             .into_iter()
             .map(|result| ReplicaAppendAccepted {

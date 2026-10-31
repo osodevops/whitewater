@@ -1505,18 +1505,28 @@ fn append_locked(
     // occupants at or below the committed boundary still refuse through
     // PositionConflict.
     if let Some(supplied) = request.expected_position {
-        if supplied.value() > loaded.persisted.committed
-            && loaded.entries.iter().any(|entry| {
-                entry.position == supplied
-                    && (entry.identity != request.identity || entry.frame_digest != frame_digest)
-            })
-        {
-            truncate_uncommitted_locked(
-                inner,
-                loaded,
-                request.generation,
-                request.ownership_epoch,
-            )?;
+        if supplied.value() > loaded.persisted.committed {
+            // `entries` is dense and position-ordered for the active
+            // segment — a binary search finds the supplied position's
+            // occupant directly instead of scanning the whole tail per
+            // frame (O(range entries) per frame degraded fused batches
+            // quadratically as the range grew).
+            let superseded = loaded
+                .entries
+                .binary_search_by_key(&supplied.value(), |entry| entry.position.value())
+                .ok()
+                .is_some_and(|index| {
+                    let entry = &loaded.entries[index];
+                    entry.identity != request.identity || entry.frame_digest != frame_digest
+                });
+            if superseded {
+                truncate_uncommitted_locked(
+                    inner,
+                    loaded,
+                    request.generation,
+                    request.ownership_epoch,
+                )?;
+            }
         }
     }
     let next_position = RangePosition::new(

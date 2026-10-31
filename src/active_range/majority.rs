@@ -1,9 +1,17 @@
-use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    fmt,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex, Semaphore};
 use uuid::Uuid;
 
 use crate::control::{unix_ns, ControlController, RangeCommitProof};
@@ -130,15 +138,96 @@ pub trait ReplicaTransport: Send + Sync {
     ) -> Result<ReplicaDiscardPendingResponse, ReplicaTransportError>;
 }
 
+/// Rounds a follower or the local commit may process concurrently per
+/// range. Tickets still issue in mint order, so the window bounds
+/// uncommitted exposure without letting later rounds overtake earlier
+/// ones on any single replica.
+const MAX_INFLIGHT_ROUNDS: usize = 16;
+
+/// FIFO-ordered turn queue: tickets mint inside the range's serialized
+/// mint/append section, and each holder waits for its ticket before
+/// running its critical section (one follower send, or the local commit).
+/// This keeps every replica's append order and the local commit order
+/// identical to mint order while rounds pipeline across the network.
+type SendTurns =
+    Arc<Mutex<std::collections::BTreeMap<(super::RangeId, StorageNodeId), Arc<OrderedTurn>>>>;
+type RangeTurns = Arc<Mutex<std::collections::BTreeMap<super::RangeId, Arc<OrderedTurn>>>>;
+type InFlightPermits = Arc<Mutex<std::collections::BTreeMap<super::RangeId, Arc<Semaphore>>>>;
+
+struct OrderedTurn {
+    next_issue: AtomicU64,
+    ready: watch::Sender<u64>,
+    ready_rx: watch::Receiver<u64>,
+}
+
+/// A minted place in an `OrderedTurn`. Dropping it advances the queue —
+/// even when the holder's round failed — so a cancelled or refused round
+/// can never wedge the pipeline behind it.
+struct TurnPermit {
+    turn: Arc<OrderedTurn>,
+    ticket: u64,
+}
+
+impl OrderedTurn {
+    fn new() -> Self {
+        let (ready, ready_rx) = watch::channel(0_u64);
+        Self {
+            next_issue: AtomicU64::new(0),
+            ready,
+            ready_rx,
+        }
+    }
+
+    /// Mint a place in line; call inside the serialized section so ticket
+    /// order matches mint order.
+    fn hold(self: &Arc<Self>) -> TurnPermit {
+        TurnPermit {
+            turn: Arc::clone(self),
+            ticket: self.next_issue.fetch_add(1, Ordering::SeqCst),
+        }
+    }
+
+    async fn wait_turn(&self, ticket: u64) {
+        let mut rx = self.ready_rx.clone();
+        // `>=`: a dropped predecessor already advanced the queue.
+        let _ = rx.wait_for(|next| *next >= ticket).await;
+    }
+}
+
+impl TurnPermit {
+    async fn wait(&self) {
+        self.turn.wait_turn(self.ticket).await;
+    }
+}
+
+impl Drop for TurnPermit {
+    fn drop(&mut self) {
+        self.turn.ready.send_modify(|next| *next += 1);
+    }
+}
+
 #[derive(Clone)]
 pub struct MajorityAppendCoordinator {
     local: Arc<ReplicaAppendService>,
     control: Arc<ControlController>,
     transport: Arc<dyn ReplicaTransport>,
-    // Serialized per range: position allocation, local append, and follower
-    // fan-out for one range must not interleave, while unrelated ranges on
-    // this Node pipeline independently.
+    // Serialized per range: position allocation and the local tail append
+    // must not interleave, while unrelated ranges on this Node pipeline
+    // independently. Follower sends and the local commit leave this
+    // section early — their order is preserved by OrderedTurn queues —
+    // so the network round-trip of one quorum round overlaps the mint +
+    // local append of the next.
     append_locks: Arc<Mutex<std::collections::BTreeMap<super::RangeId, Arc<Mutex<()>>>>>,
+    // Per (range, follower) send order — replicas demand contiguous
+    // positions, so concurrent in-flight rounds must still reach each
+    // follower in mint order.
+    send_turns: SendTurns,
+    // Per range local commit order — the committed watermark only advances
+    // over contiguous quorum evidence in mint order.
+    commit_turns: RangeTurns,
+    // Per range bound on concurrent rounds; cutover freezes drain it by
+    // acquiring every permit so the frozen boundary is quorum-stable.
+    in_flight: InFlightPermits,
 
     proofs: Option<Arc<CommitProofReporter>>,
 }
@@ -154,8 +243,42 @@ impl MajorityAppendCoordinator {
             control,
             transport,
             append_locks: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            send_turns: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            commit_turns: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            in_flight: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             proofs: None,
         }
+    }
+
+    async fn send_turn(
+        &self,
+        range_id: super::RangeId,
+        follower: &StorageNodeId,
+    ) -> Arc<OrderedTurn> {
+        self.send_turns
+            .lock()
+            .await
+            .entry((range_id, follower.clone()))
+            .or_insert_with(|| Arc::new(OrderedTurn::new()))
+            .clone()
+    }
+
+    async fn commit_turn(&self, range_id: super::RangeId) -> Arc<OrderedTurn> {
+        self.commit_turns
+            .lock()
+            .await
+            .entry(range_id)
+            .or_insert_with(|| Arc::new(OrderedTurn::new()))
+            .clone()
+    }
+
+    async fn in_flight_window(&self, range_id: super::RangeId) -> Arc<Semaphore> {
+        self.in_flight
+            .lock()
+            .await
+            .entry(range_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(MAX_INFLIGHT_ROUNDS)))
+            .clone()
     }
 
     /// Report a durable committed-frontier proof through `reporter` after
@@ -235,6 +358,25 @@ impl MajorityAppendCoordinator {
         &self,
         source: &super::ActiveRangeAssignment,
     ) -> Result<CommitPosition, MajorityAppendError> {
+        // Drain the in-flight window first: every round that already
+        // minted must reach its commit turn so the frozen boundary
+        // reflects every quorum that can still complete. New rounds block
+        // on the exhausted window and then hit the frozen-generation
+        // refusal at their local append.
+        let _drain = self
+            .in_flight_window(source.range_id)
+            .await
+            .acquire_many_owned(MAX_INFLIGHT_ROUNDS as u32)
+            .await
+            .map_err(|_| {
+                self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    "Active Range append window is closed",
+                    true,
+                    vec![],
+                    vec![],
+                )
+            })?;
         let _append_guard = self.append_lock(source.range_id).await.lock_owned().await;
         let current = self
             .control
@@ -756,7 +898,26 @@ impl MajorityAppendCoordinator {
                 vec![],
             ));
         }
+        // In-flight window: bounds concurrent rounds per range and gives
+        // cutover freezes a drain point — a freeze acquires every permit
+        // so its committed boundary is quorum-stable before staging.
+        let _phase_timer = std::time::Instant::now();
+        let _in_flight_permit = self
+            .in_flight_window(range_id)
+            .await
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    "Active Range append window is closed",
+                    true,
+                    vec![],
+                    vec![],
+                )
+            })?;
         let _append_guard = self.append_lock(range_id).await.lock_owned().await;
+        let _locked_at = _phase_timer.elapsed();
         let assignment = self
             .control
             .active_range_assignment_by_id(range_id)
@@ -969,31 +1130,42 @@ impl MajorityAppendCoordinator {
                 frame_digest: tail.frame_digest,
             })
         };
-        let mut durable = vec![self.local.local_node().clone()];
-        let first_push = self.transport.append_batch(
-            &followers[0],
-            envelope(follower_frames.clone(), commit_hint),
-        );
-        let second_push = self.transport.append_batch(
-            &followers[1],
-            envelope(follower_frames.clone(), commit_hint),
-        );
-        let (first_result, second_result) = tokio::join!(first_push, second_push);
+        // Pipeline point: mint order is fixed — sequences, owner
+        // positions, and the fused commit hint are all decided. Sends to
+        // each follower and the local commit run through ordered turn
+        // queues minted here, so releasing the append lock lets the next
+        // round's local work overlap this round's network flight without
+        // ever letting a later batch reach a replica first.
+        let send_turn_a = self.send_turn(range_id, &followers[0]).await;
+        let send_turn_b = self.send_turn(range_id, &followers[1]).await;
+        let send_permit_a = send_turn_a.hold();
+        let send_permit_b = send_turn_b.hold();
+        let commit_permit = self.commit_turn(range_id).await.hold();
         let last_position = local_results[local_results.len() - 1].position;
-        let mut follower_results = Vec::with_capacity(2);
-        for (node, result) in [
-            (followers[0].clone(), first_result),
-            (followers[1].clone(), second_result),
-        ] {
-            // A replica that missed earlier positions refuses the run's
-            // tail as a gap: re-drive the owner's stored prefix then
-            // retry the batch, same as the single-append repair.
-            let result = match result {
+        let _local_ms = _phase_timer.elapsed() - _locked_at;
+        drop(_append_guard);
+        // Timing accumulators: [send_wait_ms, send_ms] max per follower.
+        let timing = std::sync::Mutex::new((0.0_f64, 0.0_f64));
+        let mut durable = vec![self.local.local_node().clone()];
+        // Each send holds its follower's turn across the send AND any
+        // gap-repair retry, so a lagging repair still cannot reorder two
+        // rounds on that replica.
+        let send_a = async {
+            let t = std::time::Instant::now();
+            send_permit_a.wait().await;
+            let waited = t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
+            let node = &followers[0];
+            let result = match self
+                .transport
+                .append_batch(node, envelope(follower_frames.clone(), commit_hint))
+                .await
+            {
                 Err(error) if error.code == Some(ReplicaAppendErrorCode::PositionGap) => match self
                     .fill_replica_gap(
                         &assignment,
                         &requests[0],
-                        &node,
+                        node,
                         error.expected_position,
                         last_position,
                     )
@@ -1001,15 +1173,62 @@ impl MajorityAppendCoordinator {
                 {
                     Ok(()) => {
                         self.transport
-                            .append_batch(&node, envelope(follower_frames.clone(), commit_hint))
+                            .append_batch(node, envelope(follower_frames.clone(), commit_hint))
                             .await
                     }
                     Err(fill_error) => Err(fill_error),
                 },
                 other => other,
             };
-            follower_results.push((node, result));
-        }
+            let sent = t.elapsed().as_secs_f64() * 1000.0;
+            let mut guard = timing.lock().unwrap();
+            guard.0 = guard.0.max(waited);
+            guard.1 = guard.1.max(sent);
+            result
+            // send_permit_a drops here — this follower's next round may send.
+        };
+        let send_b = async {
+            let t = std::time::Instant::now();
+            send_permit_b.wait().await;
+            let waited = t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
+            let node = &followers[1];
+            let result = match self
+                .transport
+                .append_batch(node, envelope(follower_frames.clone(), commit_hint))
+                .await
+            {
+                Err(error) if error.code == Some(ReplicaAppendErrorCode::PositionGap) => match self
+                    .fill_replica_gap(
+                        &assignment,
+                        &requests[0],
+                        node,
+                        error.expected_position,
+                        last_position,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.transport
+                            .append_batch(node, envelope(follower_frames.clone(), commit_hint))
+                            .await
+                    }
+                    Err(fill_error) => Err(fill_error),
+                },
+                other => other,
+            };
+            let sent = t.elapsed().as_secs_f64() * 1000.0;
+            let mut guard = timing.lock().unwrap();
+            guard.0 = guard.0.max(waited);
+            guard.1 = guard.1.max(sent);
+            result
+        };
+        let (first_result, second_result) = tokio::join!(send_a, send_b);
+        let _sends_done = _phase_timer.elapsed();
+        let follower_results = [
+            (followers[0].clone(), first_result),
+            (followers[1].clone(), second_result),
+        ];
         let mut durable_followers = Vec::new();
         let mut fused_commit: Vec<StorageNodeId> = Vec::new();
         let mut divergent: Vec<StorageNodeId> = Vec::new();
@@ -1122,6 +1341,13 @@ impl MajorityAppendCoordinator {
                 })
                 .collect());
         }
+        // Commit phase runs in mint order: the quorum is established, so
+        // the watermark may advance — but only after every earlier round's
+        // commit turn, keeping the local watermark and per-follower commit
+        // order contiguous.
+        let _commit_wait_at = _phase_timer.elapsed();
+        commit_permit.wait().await;
+        let _commit_waited = _phase_timer.elapsed() - _commit_wait_at;
         let commit_request = ReplicaCommitRequest {
             feed_id: requests[0].feed_id,
             range_id,
@@ -1195,6 +1421,22 @@ impl MajorityAppendCoordinator {
                 evidence.clone(),
             )
         })?;
+        {
+            let total = _phase_timer.elapsed();
+            let (wait_ms, send_ms) = *timing.lock().unwrap();
+            tracing::debug!(
+                frames = requests.len(),
+                lock_wait_ms = _locked_at.as_secs_f64() * 1000.0,
+                mint_local_ms = _local_ms.as_secs_f64() * 1000.0,
+                send_wait_ms = wait_ms,
+                send_ms = send_ms,
+                sends_total_ms = (_sends_done - _locked_at - _local_ms).as_secs_f64() * 1000.0,
+                commit_wait_ms = _commit_waited.as_secs_f64() * 1000.0,
+                commit_ms = (total - _sends_done - _commit_waited).as_secs_f64() * 1000.0,
+                total_ms = total.as_secs_f64() * 1000.0,
+                "append batch phase timing"
+            );
+        }
         evidence.push(self.local.local_node().clone());
         durable.sort();
         evidence.sort();
@@ -1672,6 +1914,76 @@ impl HttpReplicaTransport {
             .await
             .map_err(|error| ReplicaTransportError::transport(error.to_string(), true))
     }
+
+    async fn post_batch_bytes(
+        &self,
+        replica: &StorageNodeId,
+        request: crate::active_range::replication::ReplicaBatchAppendRequest,
+    ) -> Result<crate::active_range::replication::ReplicaBatchAppendResponse, ReplicaTransportError>
+    {
+        use crate::active_range::replication::{
+            encode_batch_body, ReplicaBatchAppendHeader, ReplicaBatchFrameMeta,
+        };
+        let mut frames = Vec::with_capacity(request.frames.len());
+        for frame in &request.frames {
+            frames.push(STANDARD.decode(&frame.frame_base64).map_err(|error| {
+                ReplicaTransportError::transport(
+                    format!("batch frame is not valid base64: {error}"),
+                    false,
+                )
+            })?);
+        }
+        let header = ReplicaBatchAppendHeader {
+            feed_id: request.feed_id,
+            range_id: request.range_id,
+            generation: request.generation,
+            ownership_epoch: request.ownership_epoch,
+            append_owner: request.append_owner,
+            frames: request
+                .frames
+                .iter()
+                .map(|frame| ReplicaBatchFrameMeta {
+                    expected_position: frame.expected_position,
+                    identity: frame.identity.clone(),
+                    cursor: frame.cursor.clone(),
+                    pending_effect: frame.pending_effect,
+                })
+                .collect(),
+            commit_at: request.commit_at,
+        };
+        let body = encode_batch_body(&header, &frames)
+            .map_err(|error| ReplicaTransportError::transport(error.to_string(), false))?;
+        let endpoint = self.endpoints.resolve(replica).await.ok_or_else(|| {
+            ReplicaTransportError::transport(
+                format!("replica {replica} has no configured endpoint"),
+                false,
+            )
+        })?;
+        let response = self
+            .http
+            .post(format!(
+                "{}/internal/active-range/replica/append-batch-bin",
+                endpoint.trim_end_matches('/')
+            ))
+            .header("x-whitewater-control-key", &self.key)
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .send()
+            .await
+            .map_err(|error| ReplicaTransportError::transport(error.to_string(), true))?;
+        if !response.status().is_success() {
+            return Err(ReplicaTransportError::transport(
+                format!("replica {replica} returned HTTP {}", response.status()),
+                response.status().is_server_error(),
+            ));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| ReplicaTransportError::transport(error.to_string(), true))?;
+        crate::active_range::replication::decode_batch_result_body(&body)
+            .map_err(ReplicaTransportError::replica)
+    }
 }
 
 #[async_trait]
@@ -1699,13 +2011,8 @@ impl ReplicaTransport for HttpReplicaTransport {
         replica: &StorageNodeId,
         request: crate::active_range::replication::ReplicaBatchAppendRequest,
     ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaTransportError> {
-        let response: crate::active_range::replication::ReplicaBatchAppendResponse = self
-            .post(
-                replica,
-                "/internal/active-range/replica/append-batch",
-                &request,
-            )
-            .await?;
+        let response: crate::active_range::replication::ReplicaBatchAppendResponse =
+            self.post_batch_bytes(replica, request).await?;
         match (response.results, response.error) {
             (Some(results), _) => Ok(results),
             (None, Some(error)) => Err(ReplicaTransportError::replica(error)),

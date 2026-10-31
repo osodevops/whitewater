@@ -6,7 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Query, State},
     http::{header::AUTHORIZATION, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
@@ -33,18 +33,19 @@ use uuid::Uuid;
 
 use crate::{
     active_range::{
-        stage_candidate_ranges_local, stage_merged_range_local, ActiveRangeAssignment,
-        AppendIdentity, CandidateSplitStagingResult, CommitPosition, CommitProofSink,
-        ControlPlaneFollowerMove, DrainMoveDriver, FollowerMoveControl, FollowerMoveCopyResult,
-        KeyToken, MajorityAppendCoordinator, MajorityAppendError, MergeStagingResult,
-        OwnerMoveEvidence, RangeId, RangePosition, ReadReplicaEvidence, RepairExportRequest,
-        RepairExportResponse, RepairFrame, ReplicaAppendError, ReplicaAppendErrorCode,
-        ReplicaAppendRequest, ReplicaAppendResponse, ReplicaAppendService,
-        ReplicaBatchAppendRequest, ReplicaBatchAppendResponse, ReplicaCommitRequest,
-        ReplicaCommitResponse, ReplicaProgressRequest, ReplicaProgressResponse,
-        ReplicaReconcileRequest, ReplicaReconcileResponse, ReplicaRecoveryStatus, StorageNodeId,
-        StoredRangeFrame, MAX_COMMITTED_READ_BYTES, MAX_REPLICA_BATCH_BASE64_BYTES,
-        MAX_REPLICA_BATCH_FRAMES, MAX_REPLICA_FRAME_BASE64_BYTES,
+        decode_batch_body as decode_replica_batch_body, stage_candidate_ranges_local,
+        stage_merged_range_local, ActiveRangeAssignment, AppendIdentity,
+        CandidateSplitStagingResult, CommitPosition, CommitProofSink, ControlPlaneFollowerMove,
+        DrainMoveDriver, FollowerMoveControl, FollowerMoveCopyResult, KeyToken,
+        MajorityAppendCoordinator, MajorityAppendError, MergeStagingResult, OwnerMoveEvidence,
+        RangeId, RangePosition, ReadReplicaEvidence, RepairExportRequest, RepairExportResponse,
+        RepairFrame, ReplicaAppendError, ReplicaAppendErrorCode, ReplicaAppendRequest,
+        ReplicaAppendResponse, ReplicaAppendService, ReplicaBatchAppendRequest,
+        ReplicaBatchAppendResponse, ReplicaCommitRequest, ReplicaCommitResponse,
+        ReplicaProgressRequest, ReplicaProgressResponse, ReplicaReconcileRequest,
+        ReplicaReconcileResponse, ReplicaRecoveryStatus, StorageNodeId, StoredRangeFrame,
+        MAX_COMMITTED_READ_BYTES, MAX_REPLICA_BATCH_BASE64_BYTES, MAX_REPLICA_BATCH_FRAMES,
+        MAX_REPLICA_FRAME_BASE64_BYTES,
     },
     admin::{AdminAuthError, AdminAuthenticator, CommandBatchRequest, WclRequest},
     autoscale::{AutoscaleController, AutoscalePolicy, ScaleDecision},
@@ -317,6 +318,14 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             state.clone(),
             authorize_replica_append,
         ));
+    let replica_batch_append_bin_route = post(replica_append_batch_bin)
+        .layer(DefaultBodyLimit::max(
+            MAX_REPLICA_BATCH_BASE64_BYTES + 1024 * 1024,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
     let replica_commit_route = post(replica_commit).layer(middleware::from_fn_with_state(
         state.clone(),
         authorize_replica_append,
@@ -500,6 +509,10 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
         .route(
             "/internal/active-range/replica/append-batch",
             replica_batch_append_route,
+        )
+        .route(
+            "/internal/active-range/replica/append-batch-bin",
+            replica_batch_append_bin_route,
         )
         .route(
             "/internal/active-range/replica/commit",
@@ -1848,6 +1861,49 @@ async fn replica_append_batch(
             error: Some(error),
         },
     }))
+}
+
+/// Binary-wire replica fan-out: same contract as the JSON batch route
+/// but the frame payloads arrive as raw length-prefixed bytes after a
+/// small JSON header — the hot quorum leg skips a ~1MB JSON document and
+/// the base64 pass per round.
+async fn replica_append_batch_bin(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Result<impl IntoResponse, ApiError> {
+    let service = state.replica_append.as_ref().ok_or_else(|| ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        message: "Active Range replica storage is not configured on this Node".to_owned(),
+
+        code: None,
+    })?;
+    let t0 = std::time::Instant::now();
+    let (header, frames) =
+        decode_replica_batch_body(&body).map_err(|error| ApiError::bad_request(error.message))?;
+    let range_id = header.range_id;
+    let frame_count = frames.len();
+    let wire_bytes: usize = frames.iter().map(Vec::len).sum();
+    let decode_ms = t0.elapsed();
+    let svc_t = std::time::Instant::now();
+    let response = service.append_batch_decoded(header, frames).await;
+    tracing::debug!(
+        frames = frame_count,
+        body_bytes = body.len(),
+        decode_ms = decode_ms.as_secs_f64() * 1000.0,
+        service_ms = svc_t.elapsed().as_secs_f64() * 1000.0,
+        "replica batch handler timing"
+    );
+    let encoded = match &response {
+        Ok(results) => {
+            state.demand.record_range_replication(range_id, wire_bytes);
+            crate::active_range::encode_batch_result_body(&Ok(results.clone()))
+        }
+        Err(error) => crate::active_range::encode_batch_result_body(&Err(error.clone())),
+    };
+    Ok((
+        [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+        encoded,
+    ))
 }
 
 async fn replica_commit(
@@ -5072,17 +5128,29 @@ async fn resolve_cursor_positions(
         .map(|assignment| (assignment.range_id, String::new()))
         .collect();
     loop {
-        for index in 0..streams.len() {
-            if heads[index].is_none() {
-                heads[index] = match streams[index].next_frame().await? {
-                    Some(frame) => {
-                        let record = decode_record(&frame.frame)
-                            .map_err(|error| ApiError::unavailable(error.to_string()))?;
-                        Some(((record.ingest_time_ns, record.message_id), frame))
-                    }
-                    None => None,
-                };
-            }
+        // Refill every drained head concurrently — each stream owns an
+        // independent remote page fetch, so serial awaits paid one owner
+        // round trip per range per buffer instead of per merge wave.
+        let refills: Vec<usize> = (0..streams.len())
+            .filter(|index| heads[*index].is_none())
+            .collect();
+        let refilled = join_all(
+            streams
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, _)| refills.contains(index))
+                .map(|(_, stream)| stream.next_frame()),
+        )
+        .await;
+        for (index, next) in refills.into_iter().zip(refilled) {
+            heads[index] = match next? {
+                Some(frame) => {
+                    let record = decode_record(&frame.frame)
+                        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                    Some(((record.ingest_time_ns, record.message_id), frame))
+                }
+                None => None,
+            };
         }
         let Some(index) = heads
             .iter()
@@ -5514,17 +5582,29 @@ async fn fetch_frontier_page(
     let mut positions = frontier.positions.clone();
     let mut bytes = 0_usize;
     loop {
-        for index in 0..streams.len() {
-            if heads[index].is_none() {
-                heads[index] = match streams[index].1.next_frame().await? {
-                    Some(frame) => {
-                        let record = decode_record(&frame.frame)
-                            .map_err(|error| ApiError::unavailable(error.to_string()))?;
-                        Some(((record.ingest_time_ns, record.message_id), frame))
-                    }
-                    None => None,
-                };
-            }
+        // Refill every drained head concurrently — each stream owns an
+        // independent remote page fetch, so serial awaits paid one owner
+        // round trip per range per buffer instead of per merge wave.
+        let refills: Vec<usize> = (0..streams.len())
+            .filter(|index| heads[*index].is_none())
+            .collect();
+        let refilled = join_all(
+            streams
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, _)| refills.contains(index))
+                .map(|(_, stream)| stream.1.next_frame()),
+        )
+        .await;
+        for (index, next) in refills.into_iter().zip(refilled) {
+            heads[index] = match next? {
+                Some(frame) => {
+                    let record = decode_record(&frame.frame)
+                        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                    Some(((record.ingest_time_ns, record.message_id), frame))
+                }
+                None => None,
+            };
         }
         let Some(index) = earliest_eligible_head(&heads, eligible_ingest_ns) else {
             break;
@@ -15233,28 +15313,64 @@ fn hot_key_entry(
 /// Range — the same Writer/session fences `writer_session_append` applies,
 /// hoisted so the batch pays them once per record up front instead of
 /// inside the serial quorum loop.
+/// Per-call resolution cache for the batch append hot path: one Writer,
+/// Feed, and RangeMap read each per client batch instead of per record —
+/// ~3 global catalog lock acquisitions per batch rather than ~3 per
+/// record. Staleness inside one call is safe: the owner-side assignment
+/// fence re-validates generation/epoch on every quorum round.
+#[derive(Default)]
+struct AppendLookupCache {
+    writers: std::collections::HashMap<String, crate::control::WriterDefinition>,
+    feeds: std::collections::HashMap<Uuid, crate::control::FeedDefinition>,
+    feeds_by_name: std::collections::HashMap<String, crate::control::FeedDefinition>,
+    range_maps: std::collections::HashMap<Uuid, crate::active_range::RangeMap>,
+    assignments: std::collections::HashMap<
+        crate::active_range::RangeId,
+        crate::active_range::ActiveRangeAssignment,
+    >,
+}
+
 async fn writer_batch_prepare(
     state: &AppState,
     headers: &HeaderMap,
     request: &WriterSessionAppendRequest,
+    cache: &mut AppendLookupCache,
 ) -> Result<(ClientAppendRequest, crate::active_range::RangeId), ApiError> {
-    let writer = writer_when_applied(&state.control, &request.writer, state.control_plane.is_some())
-        .await
-        .ok_or_else(|| {
-        if state.control_plane.is_some() {
-            ApiError::unavailable(format!(
-                "Writer {} is not available on this ingress Node; verify it exists or retry with the same request ID",
-                request.writer
-            ))
-        } else {
-            ApiError::bad_request(format!("Writer does not exist: {}", request.writer))
+    let writer = match cache.writers.get(&request.writer) {
+        Some(writer) => writer.clone(),
+        None => {
+            let writer = writer_when_applied(
+                &state.control,
+                &request.writer,
+                state.control_plane.is_some(),
+            )
+            .await
+            .ok_or_else(|| {
+                if state.control_plane.is_some() {
+                    ApiError::unavailable(format!(
+                        "Writer {} is not available on this ingress Node; verify it exists or retry with the same request ID",
+                        request.writer
+                    ))
+                } else {
+                    ApiError::bad_request(format!("Writer does not exist: {}", request.writer))
+                }
+            })?;
+            cache.writers.insert(request.writer.clone(), writer.clone());
+            writer
         }
-    })?;
-    let feed = state
-        .control
-        .active_feed_by_id(writer.feed_id)
-        .await
-        .ok_or_else(|| ApiError::bad_request("Writer Feed does not exist"))?;
+    };
+    let feed = match cache.feeds.get(&writer.feed_id) {
+        Some(feed) => feed.clone(),
+        None => {
+            let feed = state
+                .control
+                .active_feed_by_id(writer.feed_id)
+                .await
+                .ok_or_else(|| ApiError::bad_request("Writer Feed does not exist"))?;
+            cache.feeds.insert(writer.feed_id, feed.clone());
+            feed
+        }
+    };
     authorize_namespace(state, headers, &feed.name, PermissionAction::Write)?;
     let routing_key = decode_base64("key_base64", &request.key_base64)?;
     if routing_key.is_empty() {
@@ -15262,11 +15378,18 @@ async fn writer_batch_prepare(
             "key_base64 must contain a non-empty key",
         ));
     }
-    let (route, _) = state
-        .control
-        .active_range_for_key(feed.feed_id, &routing_key)
-        .await
-        .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
+    let range_map = match cache.range_maps.get(&feed.feed_id) {
+        Some(map) => map,
+        None => {
+            let map = state
+                .control
+                .active_range_map(feed.feed_id)
+                .await
+                .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
+            cache.range_maps.entry(feed.feed_id).or_insert(map)
+        }
+    };
+    let route = range_map.route_key(&routing_key).clone();
     let mut definition = writer.clone();
     for _ in 0..20 {
         if definition.session_epoch >= request.session_epoch {
@@ -15345,8 +15468,9 @@ async fn writer_batch_append(
     // quorum round. Any group-level refusal falls back to the per-record
     // session path, which carries the sequence-healing retry contract.
     let mut prepared = Vec::with_capacity(originals.len());
+    let mut cache = AppendLookupCache::default();
     for record in &originals {
-        prepared.push(writer_batch_prepare(&state, &headers, record).await?);
+        prepared.push(writer_batch_prepare(&state, &headers, record, &mut cache).await?);
     }
     let mut group_order: Vec<crate::active_range::RangeId> = Vec::new();
     let mut groups: BTreeMap<crate::active_range::RangeId, (Vec<usize>, Vec<ClientAppendRequest>)> =
@@ -16370,28 +16494,62 @@ async fn owner_append_batch_local(
     let mut replica_requests = Vec::with_capacity(requests.len());
     let mut encoders = Vec::with_capacity(requests.len());
     let mut pressure = Vec::with_capacity(requests.len());
+    let mut cache = AppendLookupCache::default();
     for request in requests {
-        let feed_r = feed_when_applied(&state.control, &request.feed, state.control_plane.is_some())
-            .await
-            .ok_or_else(|| {
-                if state.control_plane.is_some() {
-                    ApiError::unavailable(format!(
-                        "Feed {} is not available on this Append Owner; verify it exists or retry with the same request ID",
-                        request.feed
-                    ))
-                } else {
-                    ApiError::bad_request(format!("Feed does not exist: {}", request.feed))
-                }
-            })?;
+        let feed_r = match cache.feeds_by_name.get(&request.feed) {
+            Some(feed) => feed.clone(),
+            None => {
+                let feed = feed_when_applied(
+                    &state.control,
+                    &request.feed,
+                    state.control_plane.is_some(),
+                )
+                .await
+                .ok_or_else(|| {
+                    if state.control_plane.is_some() {
+                        ApiError::unavailable(format!(
+                            "Feed {} is not available on this Append Owner; verify it exists or retry with the same request ID",
+                            request.feed
+                        ))
+                    } else {
+                        ApiError::bad_request(format!("Feed does not exist: {}", request.feed))
+                    }
+                })?;
+                cache
+                    .feeds_by_name
+                    .insert(request.feed.clone(), feed.clone());
+                feed
+            }
+        };
         let routing_key = decode_base64("key_base64", &request.key_base64)?;
         if routing_key.is_empty() {
             return Err(ApiError::bad_request("key_base64 must contain a non-empty key").into());
         }
-        let (_, assignment_r) = state
-            .control
-            .active_range_for_key(feed_r.feed_id, &routing_key)
-            .await
-            .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
+        let route = match cache.range_maps.get(&feed_r.feed_id) {
+            Some(map) => map.route_key(&routing_key).clone(),
+            None => {
+                let map = state
+                    .control
+                    .active_range_map(feed_r.feed_id)
+                    .await
+                    .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
+                let route = map.route_key(&routing_key).clone();
+                cache.range_maps.insert(feed_r.feed_id, map);
+                route
+            }
+        };
+        let assignment_r = match cache.assignments.get(&route.range_id) {
+            Some(assignment) => assignment.clone(),
+            None => {
+                let assignment = state
+                    .control
+                    .active_range_assignment_by_id(route.range_id)
+                    .await
+                    .ok_or_else(|| ApiError::unavailable("Active Range route is unavailable"))?;
+                cache.assignments.insert(route.range_id, assignment.clone());
+                assignment
+            }
+        };
         match (&feed, &assignment) {
             (None, None) => {
                 feed = Some(feed_r.clone());
@@ -17344,79 +17502,6 @@ async fn read_single_range(
     Ok(frames)
 }
 
-struct ReaderRangeHead {
-    assignment: ActiveRangeAssignment,
-    committed: CommitPosition,
-    next: Option<(StoredRangeFrame, (i64, Uuid))>,
-}
-
-async fn reader_range_head(
-    state: &AppState,
-    assignment: &ActiveRangeAssignment,
-    after_cursor: Option<&str>,
-    after: Option<RangePosition>,
-    boundary: Option<CommitPosition>,
-) -> Result<(CommitPosition, Option<(StoredRangeFrame, (i64, Uuid))>), ApiError> {
-    let page = fetch_range_page(
-        state,
-        ReadRangePageRequest {
-            assignment: assignment.clone(),
-            after,
-            expected_commit: boundary,
-            after_cursor: after_cursor.map(str::to_owned),
-            tail_count: None,
-            ingest_threshold: None,
-            cursors: None,
-            single_range: true,
-            page_limit: Some(1),
-        },
-    )
-    .await?;
-    if boundary.is_some_and(|expected| expected != page.committed) {
-        return Err(ApiError::unavailable(
-            "range read boundary changed; retry with the same Reader session",
-        ));
-    }
-    let start = page.resolved_after.map_or(0, RangePosition::value);
-    if start > page.committed.value() {
-        return Err(ApiError::unavailable(
-            "Reader frontier is beyond the committed range",
-        ));
-    }
-    let Some(frame) = page.frames.into_iter().next() else {
-        if start == page.committed.value() {
-            return Ok((page.committed, None));
-        }
-        return Err(ApiError::unavailable(
-            "current owner omitted a committed Reader frame",
-        ));
-    };
-    if frame.position.value() != start.saturating_add(1)
-        || frame.position.value() > page.committed.value()
-    {
-        return Err(ApiError::unavailable(
-            "current owner returned a gapped Reader frame",
-        ));
-    }
-    let decoded = STANDARD
-        .decode(frame.frame_base64.as_bytes())
-        .map_err(|_| ApiError::unavailable("invalid committed Reader frame encoding"))?;
-    let record =
-        decode_record(&decoded).map_err(|error| ApiError::unavailable(error.to_string()))?;
-    Ok((
-        page.committed,
-        Some((
-            StoredRangeFrame {
-                position: frame.position,
-                identity: frame.identity,
-                cursor: frame.cursor,
-                frame: decoded,
-            },
-            (record.ingest_time_ns, record.message_id),
-        )),
-    ))
-}
-
 async fn read_reader_frontier(
     state: &AppState,
     feed_id: Uuid,
@@ -17447,80 +17532,73 @@ async fn read_reader_frontier(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let mut heads = Vec::with_capacity(assignments.len());
-    let mut bytes = 0_usize;
+    // Buffered per-range streams: each `next_frame` refills a 128-frame
+    // page through `fetch_range_page`, so the merge below pays one owner
+    // round trip per page rather than per record (the previous
+    // `page_limit: 1` head walk serialized a remote read — with
+    // corroboration — behind every emitted record).
+    let mut streams: Vec<RangeFrameStream> = Vec::with_capacity(assignments.len());
     for assignment in &assignments {
-        let cursor = progress
+        let mut stream = RangeFrameStream::new(state, assignment);
+        if let Some(cursor) = progress
             .get(&assignment.range_id)
-            .filter(|value| !value.is_empty());
-        let (committed, next) =
-            reader_range_head(state, assignment, cursor.map(String::as_str), None, None)
-                .await
-                .map_err(|error| ApiError {
-                    status: error.status,
-                    message: format!(
-                        "range {} head (cursor {:?}): {}",
-                        assignment.range_id, cursor, error.message
-                    ),
-                    code: error.code,
-                })?;
-        if let Some((frame, _)) = &next {
-            bytes = bytes.saturating_add(
-                logical_frame_bytes(&frame.frame)?.saturating_add(frame.cursor.len()),
-            );
-            if bytes > MAX_LOGICAL_READ_BYTES {
-                return Err(ApiError::unavailable(
-                    "Reader range heads exceed the bounded read byte budget",
-                ));
-            }
+            .filter(|value| !value.is_empty())
+        {
+            stream.after_cursor = Some(cursor.clone());
         }
-        heads.push(ReaderRangeHead {
-            assignment: assignment.clone(),
-            committed,
-            next,
-        });
+        streams.push(stream);
     }
+    let mut heads: Vec<Option<((i64, Uuid), StoredRangeFrame)>> =
+        streams.iter().map(|_| None).collect();
     let mut records = Vec::new();
+    let mut bytes = 0_usize;
     while records.len() < limit.min(MAX_LOGICAL_READ_FRAMES) {
+        // Refill every drained head concurrently — each stream owns an
+        // independent remote page fetch, so serial awaits paid one owner
+        // round trip per range per buffer instead of per merge wave.
+        let refills: Vec<usize> = (0..streams.len())
+            .filter(|index| heads[*index].is_none())
+            .collect();
+        let refilled = join_all(
+            streams
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, _)| refills.contains(index))
+                .map(|(_, stream)| stream.next_frame()),
+        )
+        .await;
+        for (index, next) in refills.into_iter().zip(refilled) {
+            heads[index] = match next? {
+                Some(frame) => {
+                    let record = decode_record(&frame.frame)
+                        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                    Some(((record.ingest_time_ns, record.message_id), frame))
+                }
+                None => None,
+            };
+        }
         let Some(index) = heads
             .iter()
             .enumerate()
-            .filter_map(|(index, head)| head.next.as_ref().map(|(_, key)| (index, *key)))
+            .filter_map(|(index, head)| head.as_ref().map(|(key, _)| (index, *key)))
             .min_by_key(|(index, key)| (*key, *index))
             .map(|(index, _)| index)
         else {
             break;
         };
-        let head = &mut heads[index];
-        let (record, _) = head
-            .next
-            .take()
-            .ok_or_else(|| ApiError::unavailable("Reader head disappeared"))?;
-        progress.insert(head.assignment.range_id, record.cursor.clone());
-        let after = record.position;
+        let Some((_, record)) = heads[index].take() else {
+            continue;
+        };
+        bytes = bytes.saturating_add(
+            logical_frame_bytes(&record.frame)?.saturating_add(record.cursor.len()),
+        );
+        if bytes > MAX_LOGICAL_READ_BYTES {
+            return Err(ApiError::unavailable(
+                "Reader page exceeds the bounded read byte budget",
+            ));
+        }
+        progress.insert(assignments[index].range_id, record.cursor.clone());
         records.push(record);
-        if records.len() == limit.min(MAX_LOGICAL_READ_FRAMES) {
-            break;
-        }
-        let (_, next) = reader_range_head(
-            state,
-            &head.assignment,
-            None,
-            Some(after),
-            Some(head.committed),
-        )
-        .await?;
-        if let Some((frame, _)) = &next {
-            bytes = bytes.saturating_add(
-                logical_frame_bytes(&frame.frame)?.saturating_add(frame.cursor.len()),
-            );
-            if bytes > MAX_LOGICAL_READ_BYTES {
-                return Err(ApiError::unavailable(
-                    "Reader page exceeds the bounded read byte budget",
-                ));
-            }
-        }
-        head.next = next;
     }
     if read_placement(state, feed_id, feed_name).await? != assignments {
         return Err(ApiError::unavailable(
@@ -17573,7 +17651,7 @@ impl RangeFrameStream<'_> {
                     tail_count: None,
                     ingest_threshold: None,
                     cursors: None,
-                    page_limit: Some(128),
+                    page_limit: Some(512),
                 },
             )
             .await?;
@@ -17664,17 +17742,29 @@ async fn read_paginated_feed(
     let mut bytes = 0_usize;
     let mut found_after = after.is_none();
     loop {
-        for index in 0..streams.len() {
-            if heads[index].is_none() {
-                heads[index] = match streams[index].next_frame().await? {
-                    Some(frame) => {
-                        let record = decode_record(&frame.frame)
-                            .map_err(|error| ApiError::unavailable(error.to_string()))?;
-                        Some(((record.ingest_time_ns, record.message_id), frame))
-                    }
-                    None => None,
-                };
-            }
+        // Refill every drained head concurrently — each stream owns an
+        // independent remote page fetch, so serial awaits paid one owner
+        // round trip per range per buffer instead of per merge wave.
+        let refills: Vec<usize> = (0..streams.len())
+            .filter(|index| heads[*index].is_none())
+            .collect();
+        let refilled = join_all(
+            streams
+                .iter_mut()
+                .enumerate()
+                .filter(|(index, _)| refills.contains(index))
+                .map(|(_, stream)| stream.next_frame()),
+        )
+        .await;
+        for (index, next) in refills.into_iter().zip(refilled) {
+            heads[index] = match next? {
+                Some(frame) => {
+                    let record = decode_record(&frame.frame)
+                        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                    Some(((record.ingest_time_ns, record.message_id), frame))
+                }
+                None => None,
+            };
         }
         let Some(index) = heads
             .iter()
@@ -17765,7 +17855,7 @@ async fn read_complete_feed(
                 ingest_threshold: None,
                 cursors: None,
                 single_range: false,
-                page_limit: Some(128),
+                page_limit: Some(512),
             };
             let page = fetch_range_page(state, request).await?;
             if boundary.is_some_and(|expected| expected != page.committed)

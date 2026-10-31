@@ -144,6 +144,71 @@ host move ±50% between runs (earlier same-shape runs measured Kafka
 across sessions; the per-pipeline and latency relationships held across
 every run.
 
+### Write-path optimization round (post-baseline)
+
+A phase-timed pass over the append path found the previous numbers were
+not measuring the quorum engine at all. Fix-by-fix:
+
+1. **Benchmark client connection churn.** `bench-feed.py` opened a new
+   TCP connection per call through the Docker Desktop port proxy while
+   Kafka's perf tool ran inside the broker network. Persistent HTTP
+   connections: 9,800 -> 11,936 rec/s (+22%).
+2. **Round payload cap.** `MAX_REPLICA_BATCH_FRAMES` 128 -> 512 (wire
+   budget was already 16 MiB): ~19,000 rec/s best single run.
+3. **Pipelined quorum rounds.** `append_lock` previously covered mint +
+   local append + follower fan-out + commit for the whole range.
+   The lock now covers sequence mint and local tail append only;
+   per-(range,follower) `OrderedTurn` tickets keep replica delivery
+   ordered (the store is strict tail-append), a per-range commit turn
+   keeps the local watermark mint-ordered, and a bounded in-flight
+   `Semaphore` (8/range) both bounds concurrency and lets
+   `freeze_for_cutover` drain all permits before reading a boundary.
+4. **Binary internal transport.** The replica batch route used ~1 MB of
+   JSON + base64 per direction per round, including `frame_digest`
+   serializing as a ~100-char array per result.
+   `/internal/active-range/replica/append-batch-bin` carries a small
+   JSON header + length-prefixed raw frames + packed binary result
+   rows; same auth, same limits, ~35% fewer bytes and no serde pass.
+5. **Batch-scoped catalog lookups.** Writer prepare and the owner append
+   resolved Feed/Range metadata per record; now cached per batch.
+6. **O(N) orphan scan removed.** `append_locked` checked a supplied
+   position against `entries` with a linear scan per frame; the index
+   is position-ordered, so it now binary-searches.
+7. **The decisive fix: strict vs deferred fsync.** The benchmark was
+   accidentally running `WHITEWATER_RANGE_SYNC_INTERVAL_MS=0` — strict
+   mode, `fsync` inside every store call, ~30 ms on Docker Desktop's
+   virtualized disk, serialized inside each send. Deferred mode (100 ms)
+   amortizes fsyncs per interval **and is the honest `acks=all`
+   equivalent**: Kafka's `acks=all` waits for ISR replication, not
+   fsync either. Follower store time dropped 30 ms -> 1.3 ms per batch.
+
+Same fixture and workload (3 Nodes, RF3, deferred sync, 4 ranges,
+32 Writers x batch 512), final image:
+
+| Metric | Whitewater | Kafka best (12 partitions) |
+|---|---|---|
+| Write records/s, 60k run | **23,429-26,974** | 22,099 |
+| Write records/s, 200k run | **26,546** | — |
+| Write p50 | **527-630 ms** | 905 ms |
+| Write p99 | 713-906 ms | 1,225 ms |
+| Read records/s | **11,356** | 84,388-192,926 |
+
+**Whitewater now writes faster than Kafka's best measured fan-out on
+this host, at ~30-40% lower p50.** Node utilization is now real work —
+23-57% CPU per Node vs 0.2-3.5% when the fsync stall dominated; Kafka
+used 251-288% per broker.
+
+**Read-path round (same pass)**: the multi-range Reader merge refetched
+one frame per record through a remote corroborated page call
+(`page_limit: 1`) — ~60-70ms per record. The merge now buffers
+128→512-frame `RangeFrameStream` pages (the service clamp rose from
+32/128 to 512, still bounded by the 16 MiB read budget) and refills
+drained heads concurrently via `join_all`; the bench replay page rose
+to the 10,000-frame cap. Multi-range read went **1,844 -> 11,356
+rec/s** (6x). Kafka still reads 7-17x faster — page-cache sendfile plus
+no per-range corroboration; a binary internal read transport and
+boundary-evidence caching are the remaining levers, tracked separately.
+
 ### Write-path history
 
 The original per-record pipeline saturated at ~5-10 records/s (each

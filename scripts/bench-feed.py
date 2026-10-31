@@ -23,6 +23,7 @@ BENCH_WRITERS, BENCH_BATCH, BENCH_MODE, BENCH_BASE_PORT, WW_KEEP_UP.
 """
 
 import base64
+import http.client
 import json
 import os
 import statistics
@@ -209,6 +210,54 @@ def b64(raw):
     return base64.b64encode(raw).decode()
 
 
+class Session:
+    """Keep-alive POST channel — urllib opens a fresh TCP connection per
+    request, which measures the Docker port proxy more than the server.
+    One persistent connection per Writer matches a real SDK client's
+    socket reuse."""
+
+    def __init__(self, endpoint):
+        self.hostport = endpoint.split("://", 1)[1]
+        self.conn = http.client.HTTPConnection(self.hostport, timeout=60)
+
+    def post(self, path, body):
+        payload = json.dumps(body)
+        for _ in range(2):
+            try:
+                self.conn.request(
+                    "POST",
+                    path,
+                    payload,
+                    {
+                        "authorization": f"Bearer {KEY}",
+                        "content-type": "application/json",
+                    },
+                )
+                response = self.conn.getresponse()
+                data = response.read()
+                return response.status, json.loads(data or b"{}")
+            except (http.client.HTTPException, OSError) as error:
+                self.conn.close()
+                self.conn = http.client.HTTPConnection(self.hostport, timeout=60)
+                last_error = error
+        return 0, {"error": str(last_error)}
+
+    def get(self, path):
+        for _ in range(2):
+            try:
+                self.conn.request(
+                    "GET", path, headers={"authorization": f"Bearer {KEY}"}
+                )
+                response = self.conn.getresponse()
+                data = response.read()
+                return response.status, json.loads(data or b"{}")
+            except (http.client.HTTPException, OSError) as error:
+                self.conn.close()
+                self.conn = http.client.HTTPConnection(self.hostport, timeout=60)
+                last_error = error
+        return 0, {"error": str(last_error)}
+
+
 class WriteDriver:
     """One thread per Writer — a Writer's record sequence is ordered, so
     concurrent producers must not share a sequence stream. Each worker owns
@@ -243,7 +292,7 @@ class WriteDriver:
 
     def _run(self, worker):
         writer, epoch = self.writers[worker]
-        endpoint = ENDPOINTS[worker % len(ENDPOINTS)]
+        session = Session(ENDPOINTS[worker % len(ENDPOINTS)])
         sent = 0
         index = worker * sum(self.shares)
         while sent < self.shares[worker]:
@@ -256,8 +305,7 @@ class WriteDriver:
             sent += take
             for _ in range(BATCH_ATTEMPTS):
                 started = time.monotonic()
-                status, body = post(
-                    endpoint,
+                status, body = session.post(
                     "/v1/writers/append-batch" if take > 1 else "/v1/writers/append",
                     {"records": records} if take > 1 else records[0],
                 )
@@ -322,16 +370,15 @@ def run_write(feed, writers):
 def run_read(feed):
     """Replay the whole Feed through temporary fetch pages until a short or
     empty page marks the tail."""
-    endpoint = ENDPOINTS[0]
+    session = Session(ENDPOINTS[0])
     cursor = ""
     records = 0
     payload_bytes = 0
     started = time.monotonic()
     while True:
-        status, page = post(
-            endpoint,
+        status, page = session.post(
             "/v1/readers/temporary/fetch",
-            {"feed": feed, "after": cursor or None, "limit": 1000, "wait_ms": 0},
+            {"feed": feed, "after": cursor or None, "limit": 10000, "wait_ms": 0},
         )
         assert status == 200, page
         page_records = page.get("records", [])
