@@ -283,6 +283,27 @@ def main():
             return owner_index(assignments[0]["owner"])
 
         range_victim = range_owner_index(survivor)
+        # The lease owner and range owner can coincide — both seed on
+        # early storage-eligible Nodes. Killing that Node would leave no
+        # driver at all until lease recovery, so the lag-observation
+        # window collapses into a race between two recovery paths. Move
+        # the lease to a survivor first: the driver stays alive through
+        # the range kill and reports the gap deterministically.
+        current_lease, _ = lease_owner(survivor, "dstdom.mirror")
+        if owner_index(current_lease) == range_victim:
+            target_index = (range_victim + 1) % 3
+            wcl(
+                survivor,
+                "MOVE DISTRIBUTARY LEASE dstdom.mirror TO NODE "
+                f"control-{target_index + 1};",
+            )
+            wait_for(
+                lambda: owner_index(
+                    lease_owner(survivor, "dstdom.mirror")[0]
+                ) == target_index,
+                "lease moved off range victim",
+                timeout=60,
+            )
         subprocess.run(
             ["docker", "stop", f"whitewater-distributary-dst{range_victim + 1}-1"],
             check=True,
@@ -292,17 +313,31 @@ def main():
             append(SRC[record_id % 3], "srcwriter", epoch, record_id)
 
         # Numeric lag evidence: while the destination range is down the
-        # driver stalls but its report ticks keep probing the source
-        # frontier — unacknowledged records 41..50 must surface as a
-        # positive lag_records figure before the copy resumes.
+        # driver stalls holding an un-acked page — a strict lower bound
+        # the stalled report publishes immediately — while report ticks
+        # keep probing the exact source frontier. Unacknowledged records
+        # 41..50 must surface as a positive lag_records figure before the
+        # copy resumes. The diagnostic dict keeps a timeout honest about
+        # what SHOW was actually reporting.
         lag_peak = [0]
 
         def feed_lag_visible():
-            lag = show_lag(range_survivor, "dstdom.mirror")
-            if lag is None:
-                return False
-            lag_peak[0] = max(lag_peak[0], int(lag))
-            return int(lag) > 0
+            result = wcl(range_survivor, "SHOW DISTRIBUTARIES;")
+            rows = [
+                row for row in result["results"][0]["data"]
+                if row["name"] == "dstdom.mirror"
+            ]
+            row = rows[0]
+            lag = row.get("lag_records")
+            if lag is not None and int(lag) > 0:
+                lag_peak[0] = max(lag_peak[0], int(lag))
+                return int(lag)
+            raise AssertionError({
+                "lag_records": lag,
+                "run_state": row.get("run_state"),
+                "last_error": row.get("last_error"),
+                "lag_probe_error": row.get("lag_probe_error"),
+            })
 
         wait_for(feed_lag_visible, "feed lag reported", timeout=240)
 

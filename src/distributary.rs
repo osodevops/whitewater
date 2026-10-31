@@ -154,6 +154,12 @@ pub struct DistributaryDriveState {
     /// The lease epoch this driver state was built under — a bump
     /// discards session state even if ownership stayed local.
     pub lease_epoch: u64,
+    /// Records the in-flight page delivered that this driver never
+    /// appended — direct lag evidence while a stall holds the page:
+    /// each is committed on the source and unacknowledged, so it is a
+    /// strict lower bound of the remote frontier gap. Cleared when a
+    /// cycle completes; the source probe remains the exact figure.
+    pub pending_unacked: usize,
 }
 
 impl DistributaryDriveState {
@@ -269,8 +275,10 @@ pub async fn drive_distributary_once(
             })?
     };
     if page.records.is_empty() {
+        state.pending_unacked = 0;
         return Ok(0);
     }
+    state.pending_unacked = page.records.len();
 
     let mut appended = 0usize;
     for record in &page.records {
@@ -285,7 +293,10 @@ pub async fn drive_distributary_once(
             use_compression: false,
         };
         match local.append_writer(&request).await {
-            Ok(_) => appended += 1,
+            Ok(_) => {
+                appended += 1;
+                state.pending_unacked = page.records.len() - appended;
+            }
             Err(AdminClientError::Api { status, message })
                 if status.as_u16() == 409 || status.is_client_error() =>
             {
@@ -416,6 +427,17 @@ pub fn distributary_report_due(
         return true;
     }
     now_ns.saturating_sub(last.reported_at_ns) >= DISTRIBUTARY_STATUS_HEARTBEAT_NS
+}
+
+/// The lag figure a stall may publish before the next source probe:
+/// `pending_unacked` delivered-but-unappended records floor the remote
+/// frontier gap — never below the last probed figure, never below the
+/// held-page evidence, and `None` stays `None` when no page is held.
+pub fn stalled_lag_floor(current: Option<u64>, pending_unacked: usize) -> Option<u64> {
+    if pending_unacked == 0 {
+        return current;
+    }
+    Some(current.unwrap_or(0).max(pending_unacked as u64))
 }
 
 /// The Distributary a node currently drives; the supervisor reconciles
@@ -599,6 +621,20 @@ mod tests {
     }
 
     #[test]
+    fn stalled_lag_floor_only_raises_from_held_page_evidence() {
+        // No held page: the floor never invents or erases a figure.
+        assert_eq!(stalled_lag_floor(None, 0), None);
+        assert_eq!(stalled_lag_floor(Some(7), 0), Some(7));
+        // A held page floors the gap at its un-appended count — the
+        // evidence is committed-on-source records that never reached the
+        // destination.
+        assert_eq!(stalled_lag_floor(None, 10), Some(10));
+        assert_eq!(stalled_lag_floor(Some(3), 10), Some(10));
+        // A later exact probe figure is never dragged backwards.
+        assert_eq!(stalled_lag_floor(Some(42), 10), Some(42));
+    }
+
+    #[test]
     fn abandon_page_forces_reader_reopen() {
         // A mid-page local append failure must rewind the remote
         // delivered frontier: reopening resets it to acknowledged
@@ -609,6 +645,7 @@ mod tests {
             writer_epoch: Some(3),
             declared: true,
             lease_epoch: 2,
+            pending_unacked: 0,
         };
         state.abandon_page();
         assert_eq!(state.reader_epoch, None);

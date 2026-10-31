@@ -6653,6 +6653,15 @@ pub async fn drive_local_distributaries(
             Err(message) => {
                 driver.last_error = Some(message.chars().take(512).collect());
                 driver.last_error_at_ns = Some(now_ns);
+                // A stalled page is direct lag evidence: its un-appended
+                // records are committed on the source and unacknowledged,
+                // so the figure floors the frontier gap even before the
+                // next probe. Without it a stall whose recovery beats the
+                // report cadence would report lag=0 forever.
+                driver.lag_records = crate::distributary::stalled_lag_floor(
+                    driver.lag_records,
+                    driver.state.pending_unacked,
+                );
             }
             _ => {}
         }
