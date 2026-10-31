@@ -90,32 +90,69 @@ report `BENCH_RECORDS`, `BENCH_BYTES`, `BENCH_WRITERS`, `BENCH_BATCH`,
 
 ## Measured baseline
 
-Numbers on a Windows dev machine (Docker Desktop, image cache warm,
-`BENCH_BYTES=1024`, 60,000 records, 32 Writers). Whitewater runs the
-fused-commit batch path — one quorum round carries a 128-record run with
-its CommitPosition marker riding the same durability unit:
+### Matched-config comparison (isolated runs)
 
-| System | Write records/s | Write p50 | Read records/s |
-|---|---|---|---|
-| Whitewater, strict sync, 1 range | 1,614 | 1,910 ms | 22,928 |
-| Whitewater, `RANGE_SYNC_INTERVAL_MS=100`, 1 range | 6,414 | 543 ms | 19,355 |
-| Whitewater, `RANGE_SYNC_INTERVAL_MS=100`, **4 ranges** | **11,621** | **355 ms** | 1,829 |
-| Kafka 3.8.0 (3 brokers, RF3, `acks=all`, 12 partitions) | 11,007 | ~931 ms | ~150,000 |
+Kafka ran **alone** in Docker, was removed with `down -v`, then
+Whitewater ran **alone** — only one system ever occupied the Docker
+host. Same workload both sides: 60,000 records × 1,024 bytes, 3
+brokers/3 Nodes, RF3, matched fan-out, matched producer semantics.
 
-Read on the multi-range Feed is the remaining gap: the temporary Reader
-fans range pages serially, so per-range history (~15k records each)
-turns into many small round trips — single-range replay stays ~20-23k.
+| Config knob | Kafka 3.8.0 | Whitewater |
+|---|---|---|
+| Acknowledged durability | `acks=all` (ISR quorum, no per-record fsync) | `WHITEWATER_RANGE_SYNC_INTERVAL_MS=100` (quorum replication is the evidence; fsyncs amortize per interval) |
+| Idempotent writes | `enable.idempotence=true` (per-partition sequence dedup) | Always-on request_id + per-Key Writer-sequence + frame-digest fences |
+| Producer batching | `linger.ms=5` + `batch.size` client-side | `BENCH_BATCH=128` per `/v1/writers/append-batch` call |
+| Producer concurrency | perf tool's async sender | `BENCH_WRITERS=32` independent Writers |
+| Fan-out | `--partitions N` (4 / 12) | `BENCH_RANGES=N` (4 / 12) — internal, invisible to the app |
+| Replication | RF3 per partition (12/36 replicas) | RF3 per range (12/36 replicas) — same physical replica footprint |
 
-History of the write-path work: the original per-record pipeline
-saturated at ~5-10 records/s (each record paid a local fsync, a commit
-fsync, and four HTTP round trips under the range lock). Batching the
-quorum round lifted it to ~1,100; fusing the CommitPosition marker into
-the replica batch removed the second network round (~1,614); the
-deferred-sync mode removed the per-batch fsync chain that the 3-Node
-fixture serialized on (~6,400/pipeline); and parallel per-range groups
-multiplied pipelines to Kafka-parity aggregate. Per-pipeline,
-Whitewater's ~6.4k/s is ~7x Kafka's ~917/s per partition at half the
-latency.
+| System | Pipelines | Write records/s | Write p50 | Write p99 | Read records/s |
+|---|---|---|---|---|---|
+| Kafka 3.8.0, `acks=all` + `enable.idempotence` | 4 partitions | 12,589 | 1,798 ms | 2,341 ms | 192,926 |
+| Kafka 3.8.0, `acks=all` + `enable.idempotence` | 12 partitions | 22,099 | 905 ms | 1,225 ms | 84,388 |
+| Whitewater, deferred sync | 4 ranges | 9,800 | 410 ms | 527 ms | 1,883 |
+| Whitewater, deferred sync | 12 ranges | 6,554 | 605 ms | 792 ms | 1,690 |
+| Whitewater, **strict sync** (per-batch fsync) | 1 range | 1,614 | 1,910 ms | — | 22,928 |
+| Whitewater, deferred sync | 1 range | 6,414 | 543 ms | — | 19,355 |
+
+**Write throughput**: Kafka's 12-partition aggregate (22.1k) leads
+Whitewater's best measured fan-out on this host (9.8k @ 4 ranges) —
+Kafka's async producer keeps far more batches in flight per broker.
+**Per-pipeline Whitewater is faster**: 2,450 rec/s/range vs
+1,842 rec/s/partition at the matched 4-vs-12 comparison, and **latency
+is 2–4× lower** at every configuration (410–605 ms p50 vs 905–1,798 ms).
+
+**Per-node utilization** (`docker stats`, sustained write phase):
+Kafka brokers ran 251–288% CPU each with balanced block writes
+(~2.9 GB/broker); Whitewater Nodes ran 0.2–3.5% CPU each with balanced
+block writes (253–268 MB/Node). Every broker/Node carried replicas —
+the difference is that Whitewater's bottleneck is quorum round-trip
+serialization, not compute: it does its measured write work at ~1/100th
+the CPU per node.
+
+**Read**: Kafka's consumer-perf replays from broker page cache via
+sendfile (84–193k rec/s). Whitewater's temporary Reader corroborates
+committed pages against replica owners; multi-range Feeds fan those
+pages **serially** today — 1.7–1.9k rec/s vs ~20–23k on a single-range
+Feed. Multi-range read fan-out is the tracked gap, not a
+Kafka-equivalent ceiling: the read path has no sendfile shortcut, it
+pays a quorum-corroboration round per page.
+
+**Run-to-run variance**: absolute numbers on a shared Docker Desktop
+host move ±50% between runs (earlier same-shape runs measured Kafka
+11,007 and Whitewater 11,621 at 12-vs-4). Compare within a row set, not
+across sessions; the per-pipeline and latency relationships held across
+every run.
+
+### Write-path history
+
+The original per-record pipeline saturated at ~5-10 records/s (each
+record paid a local fsync, a commit fsync, and four HTTP round trips
+under the range lock). Batching the quorum round lifted it to ~1,100;
+fusing the CommitPosition marker into the replica batch removed the
+second network round (~1,614); the deferred-sync mode removed the
+per-batch fsync chain that the 3-Node fixture serialized on
+(~6,400/pipeline); and parallel per-range groups multiplied pipelines.
 
 **Auto-split caveat**: mid-run splits freeze a generation for cutover
 (seconds under load) — pre-provisioning (`BENCH_RANGES`) measures
