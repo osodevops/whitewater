@@ -12,7 +12,7 @@ use crate::{
 };
 
 use super::{
-    ActiveRangeAssignment, CommitPosition, MajorityAppendCoordinator, RangePosition,
+    ActiveRangeAssignment, CommitPosition, MajorityAppendCoordinator, RangeId, RangePosition,
     ReplicaAppendRequest, ReplicaAppendService, ReplicaCommitRequest, ReplicaProgressRequest,
     ReplicaProgressResponse, StorageNodeId,
 };
@@ -31,6 +31,10 @@ pub struct ReplicaRepairProgress {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RepairExportRequest {
     pub feed_id: Uuid,
+    /// Exact Active Range to export; multi-range Feeds must pass this or the
+    /// receiver resolves the Feed's first range instead.
+    #[serde(default)]
+    pub range_id: Option<RangeId>,
     pub after: Option<RangePosition>,
     pub limit: usize,
 }
@@ -615,20 +619,20 @@ pub async fn repair_replica(
     batch_size: usize,
 ) -> Result<ReplicaRepairProgress, ReplicaRepairError> {
     let source_status = source
-        .recovery_status(assignment.feed_id)
+        .recovery_status_for_assignment(assignment)
         .await
         .map_err(|error| ReplicaRepairError::Source(error.to_string()))?;
     let mut quarantined = false;
-    let mut target_status = match target.recovery_status(assignment.feed_id).await {
+    let mut target_status = match target.recovery_status_for_assignment(assignment).await {
         Ok(status) => status,
         Err(_) => {
             target
-                .quarantine_for_repair(assignment.feed_id)
+                .quarantine_assignment_for_repair(assignment)
                 .await
                 .map_err(|error| ReplicaRepairError::Target(error.to_string()))?;
             quarantined = true;
             target
-                .recovery_status(assignment.feed_id)
+                .recovery_status_for_assignment(assignment)
                 .await
                 .map_err(|error| ReplicaRepairError::Target(error.to_string()))?
         }
@@ -637,11 +641,11 @@ pub async fn repair_replica(
         return Err(ReplicaRepairError::TargetAhead);
     }
     target
-        .reconcile_recovery(assignment.feed_id, target_status.committed, false)
+        .reconcile_recovery_for_assignment(assignment, target_status.committed, false)
         .await
         .map_err(|error| ReplicaRepairError::Target(error.to_string()))?;
     target_status = target
-        .recovery_status(assignment.feed_id)
+        .recovery_status_for_assignment(assignment)
         .await
         .map_err(|error| ReplicaRepairError::Target(error.to_string()))?;
     let mut after = (target_status.appended.value() > 0).then_some(target_status.appended);
@@ -649,7 +653,7 @@ pub async fn repair_replica(
     let mut transferred_bytes = 0_u64;
     loop {
         let frames = source
-            .export_committed(assignment.feed_id, after, batch_size.clamp(1, 10_000))
+            .export_assignment_committed(assignment, after, batch_size.clamp(1, 10_000))
             .await
             .map_err(|error| ReplicaRepairError::Source(error.to_string()))?;
         if frames.is_empty() {
@@ -693,7 +697,7 @@ pub async fn repair_replica(
         }
     }
     let repaired = target
-        .recovery_status(assignment.feed_id)
+        .recovery_status_for_assignment(assignment)
         .await
         .map_err(|error| ReplicaRepairError::Target(error.to_string()))?;
     let ready = repaired.committed == source_status.committed
@@ -769,25 +773,26 @@ impl LocalRepairSupervisor {
             {
                 continue;
             }
-            let source = match self
-                .remote_progress(&assignment.owner, assignment.feed_id)
-                .await
-            {
+            let source = match self.remote_progress(&assignment.owner, &assignment).await {
                 Ok(status) => status,
                 Err(_) => continue,
             };
             let mut quarantined = false;
-            let local = match self.local.recovery_status(assignment.feed_id).await {
+            let local = match self.local.recovery_status_for_assignment(&assignment).await {
                 Ok(status) => status,
                 Err(_) => {
-                    match self.local.quarantine_for_repair(assignment.feed_id).await {
+                    match self
+                        .local
+                        .quarantine_assignment_for_repair(&assignment)
+                        .await
+                    {
                         Ok(_) => quarantined = true,
                         Err(error) => {
                             results.push(Err(ReplicaRepairError::Target(error.to_string())));
                             continue;
                         }
                     }
-                    match self.local.recovery_status(assignment.feed_id).await {
+                    match self.local.recovery_status_for_assignment(&assignment).await {
                         Ok(status) => status,
                         Err(error) => {
                             results.push(Err(ReplicaRepairError::Target(error.to_string())));
@@ -810,13 +815,16 @@ impl LocalRepairSupervisor {
     async fn remote_progress(
         &self,
         node: &StorageNodeId,
-        feed_id: Uuid,
+        assignment: &ActiveRangeAssignment,
     ) -> Result<super::ReplicaRecoveryStatus, String> {
         let response: ReplicaProgressResponse = self
             .post(
                 node,
                 "/internal/active-range/recovery/progress",
-                &ReplicaProgressRequest { feed_id },
+                &ReplicaProgressRequest {
+                    feed_id: assignment.feed_id,
+                    range_id: Some(assignment.range_id),
+                },
             )
             .await?;
         response.status.ok_or_else(|| {
@@ -842,6 +850,7 @@ impl LocalRepairSupervisor {
                     "/internal/active-range/repair/export",
                     &RepairExportRequest {
                         feed_id: assignment.feed_id,
+                        range_id: Some(assignment.range_id),
                         after: (after.value() > 0).then_some(after),
                         limit: self.batch_size,
                     },

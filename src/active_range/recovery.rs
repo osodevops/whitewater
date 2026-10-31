@@ -14,7 +14,7 @@ use crate::{
 };
 
 use super::{
-    ActiveRangeAssignment, CommitPosition, OwnershipEpoch, RangePosition, StorageNodeId,
+    ActiveRangeAssignment, CommitPosition, OwnershipEpoch, RangeId, RangePosition, StorageNodeId,
     ACTIVE_RANGE_COMMIT_QUORUM,
 };
 
@@ -172,6 +172,10 @@ pub fn plan_behind_owner_recovery(
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicaProgressRequest {
     pub feed_id: Uuid,
+    /// Exact Active Range to probe; multi-range Feeds must pass this or the
+    /// receiver resolves the Feed's first range instead.
+    #[serde(default)]
+    pub range_id: Option<RangeId>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -183,6 +187,10 @@ pub struct ReplicaProgressResponse {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReplicaReconcileRequest {
     pub feed_id: Uuid,
+    /// Exact Active Range to reconcile; multi-range Feeds must pass this or
+    /// the receiver resolves the Feed's first range instead.
+    #[serde(default)]
+    pub range_id: Option<RangeId>,
     pub committed_prefix: CommitPosition,
     /// Only the evidence-holding new owner may commit local frames to the
     /// prefix; other replicas truncate their uncommitted tail and converge
@@ -215,7 +223,7 @@ pub trait RecoveryTransport: Send + Sync {
     async fn progress(
         &self,
         node: &StorageNodeId,
-        feed_id: Uuid,
+        assignment: &ActiveRangeAssignment,
     ) -> Result<ReplicaRecoveryStatus, String>;
 
     async fn reconcile(
@@ -248,7 +256,6 @@ impl OwnerRecoveryExecutor {
     async fn replica_statuses(
         &self,
         assignment: &ActiveRangeAssignment,
-        feed_id: Uuid,
         presumed_dead: Option<&StorageNodeId>,
     ) -> Vec<ReplicaRecoveryStatus> {
         let mut statuses = Vec::new();
@@ -261,7 +268,7 @@ impl OwnerRecoveryExecutor {
                     appended: RangePosition::new(0),
                     committed: CommitPosition::new(0),
                 });
-            } else if let Ok(status) = self.transport.progress(node, feed_id).await {
+            } else if let Ok(status) = self.transport.progress(node, assignment).await {
                 statuses.push(status);
             }
         }
@@ -272,6 +279,7 @@ impl OwnerRecoveryExecutor {
         &self,
         feed: &crate::control::FeedDefinition,
         feed_name: &str,
+        assignment: &ActiveRangeAssignment,
         plan: &OwnerRecoveryPlan,
         statuses: &[ReplicaRecoveryStatus],
     ) -> Result<(), RecoveryExecutionError> {
@@ -293,6 +301,7 @@ impl OwnerRecoveryExecutor {
         {
             let request = ReplicaReconcileRequest {
                 feed_id: feed.feed_id,
+                range_id: Some(assignment.range_id),
                 committed_prefix: plan.committed_prefix,
                 authoritative: status.node == plan.new_owner,
             };
@@ -307,6 +316,7 @@ impl OwnerRecoveryExecutor {
     pub async fn recover(
         &self,
         feed_name: &str,
+        assignment: &ActiveRangeAssignment,
         failed_owner: &StorageNodeId,
     ) -> Result<OwnerRecoveryPlan, RecoveryExecutionError> {
         let feed = self
@@ -314,21 +324,15 @@ impl OwnerRecoveryExecutor {
             .active_feed_by_name(feed_name)
             .await
             .ok_or(RecoveryExecutionError::AssignmentUnavailable)?;
-        let assignment = self
-            .control
-            .active_range_assignment(feed.feed_id)
-            .await
-            .ok_or(RecoveryExecutionError::AssignmentUnavailable)?;
         if &assignment.owner != failed_owner {
             return Err(RecoveryExecutionError::Control(
                 "owner changed before recovery began".to_owned(),
             ));
         }
-        let statuses = self
-            .replica_statuses(&assignment, feed.feed_id, Some(failed_owner))
-            .await;
-        let plan = plan_owner_recovery(&assignment, &statuses)?;
-        self.apply_plan(&feed, feed_name, &plan, &statuses).await?;
+        let statuses = self.replica_statuses(assignment, Some(failed_owner)).await;
+        let plan = plan_owner_recovery(assignment, &statuses)?;
+        self.apply_plan(&feed, feed_name, assignment, &plan, &statuses)
+            .await?;
         Ok(plan)
     }
 
@@ -339,6 +343,7 @@ impl OwnerRecoveryExecutor {
     pub async fn recover_behind(
         &self,
         feed_name: &str,
+        assignment: &ActiveRangeAssignment,
         current_owner: &StorageNodeId,
     ) -> Result<OwnerRecoveryPlan, RecoveryExecutionError> {
         let feed = self
@@ -346,19 +351,15 @@ impl OwnerRecoveryExecutor {
             .active_feed_by_name(feed_name)
             .await
             .ok_or(RecoveryExecutionError::AssignmentUnavailable)?;
-        let assignment = self
-            .control
-            .active_range_assignment(feed.feed_id)
-            .await
-            .ok_or(RecoveryExecutionError::AssignmentUnavailable)?;
         if &assignment.owner != current_owner {
             return Err(RecoveryExecutionError::Control(
                 "owner changed before recovery began".to_owned(),
             ));
         }
-        let statuses = self.replica_statuses(&assignment, feed.feed_id, None).await;
-        let plan = plan_behind_owner_recovery(&assignment, &statuses)?;
-        self.apply_plan(&feed, feed_name, &plan, &statuses).await?;
+        let statuses = self.replica_statuses(assignment, None).await;
+        let plan = plan_behind_owner_recovery(assignment, &statuses)?;
+        self.apply_plan(&feed, feed_name, assignment, &plan, &statuses)
+            .await?;
         Ok(plan)
     }
 }
@@ -433,7 +434,7 @@ async fn probe_active_owners(
     stream::iter(assignments)
         .map(|(feed_name, assignment)| async move {
             let owner = transport
-                .progress(&assignment.owner, assignment.feed_id)
+                .progress(&assignment.owner, &assignment)
                 .await
                 .ok();
             let mut replicas = Vec::new();
@@ -444,7 +445,7 @@ async fn probe_active_owners(
                     }
                     continue;
                 }
-                if let Ok(status) = transport.progress(node, assignment.feed_id).await {
+                if let Ok(status) = transport.progress(node, &assignment).await {
                     replicas.push(status);
                 }
             }
@@ -540,10 +541,12 @@ impl RecoverySupervisor {
             .map(|(feed_name, assignment, owner_healthy)| async move {
                 let result = if owner_healthy {
                     self.executor
-                        .recover_behind(&feed_name, &assignment.owner)
+                        .recover_behind(&feed_name, &assignment, &assignment.owner)
                         .await
                 } else {
-                    self.executor.recover(&feed_name, &assignment.owner).await
+                    self.executor
+                        .recover(&feed_name, &assignment, &assignment.owner)
+                        .await
                 };
                 self.failures.lock().await.remove(&assignment.feed_id);
                 result
@@ -619,13 +622,16 @@ impl RecoveryTransport for HttpRecoveryTransport {
     async fn progress(
         &self,
         node: &StorageNodeId,
-        feed_id: Uuid,
+        assignment: &ActiveRangeAssignment,
     ) -> Result<ReplicaRecoveryStatus, String> {
         let response: ReplicaProgressResponse = self
             .post(
                 node,
                 "/internal/active-range/recovery/progress",
-                &ReplicaProgressRequest { feed_id },
+                &ReplicaProgressRequest {
+                    feed_id: assignment.feed_id,
+                    range_id: Some(assignment.range_id),
+                },
             )
             .await?;
         response.status.ok_or_else(|| {
@@ -671,9 +677,9 @@ mod tests {
         async fn progress(
             &self,
             _node: &StorageNodeId,
-            feed_id: Uuid,
+            assignment: &ActiveRangeAssignment,
         ) -> Result<ReplicaRecoveryStatus, String> {
-            if feed_id == self.first
+            if assignment.feed_id == self.first
                 && self
                     .first_blocked
                     .swap(false, std::sync::atomic::Ordering::SeqCst)
@@ -685,7 +691,7 @@ mod tests {
                 // release.
                 self.first_seen.notify_one();
                 self.release_first.notified().await;
-            } else if feed_id != self.first {
+            } else if assignment.feed_id != self.first {
                 self.second_seen.notify_one();
             }
             Err("owner unavailable".to_owned())
@@ -757,7 +763,7 @@ mod tests {
         async fn progress(
             &self,
             node: &StorageNodeId,
-            _feed_id: Uuid,
+            _assignment: &ActiveRangeAssignment,
         ) -> Result<ReplicaRecoveryStatus, String> {
             Ok(ReplicaRecoveryStatus {
                 node: node.clone(),

@@ -279,7 +279,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
         .await
         .unwrap();
     let plan: RangeSplitPlan = serde_json::from_value(prepared.results[0].data.clone()).unwrap();
-    let staged = stage_right_range(&plan, source, &services, 1)
+    let staged = stage_right_range(&plan, &source_assignment, source, &services, 1)
         .await
         .unwrap();
     assert_eq!(staged.source_scanned_through, CommitPosition::new(4));
@@ -288,6 +288,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
     assert_eq!(staged.replicas_verified.len(), 3);
     let candidate = stage_candidate_ranges(
         &plan,
+        &source_assignment,
         services[&source_assignment.owner].clone(),
         &services,
         2,

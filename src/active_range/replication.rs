@@ -97,7 +97,7 @@ pub struct ReplicaAppendError {
 }
 
 impl ReplicaAppendError {
-    fn rejected(code: ReplicaAppendErrorCode, message: impl Into<String>) -> Self {
+    pub(crate) fn rejected(code: ReplicaAppendErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -107,7 +107,7 @@ impl ReplicaAppendError {
         }
     }
 
-    fn temporary(code: ReplicaAppendErrorCode, message: impl Into<String>) -> Self {
+    pub(crate) fn temporary(code: ReplicaAppendErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
@@ -875,6 +875,16 @@ impl ReplicaAppendService {
                     format!("no committed Active Range assignment exists for Feed {feed_id}"),
                 )
             })?;
+        self.reconcile_recovery_for_assignment(&assignment, committed_prefix, authoritative)
+            .await
+    }
+
+    pub async fn reconcile_recovery_for_assignment(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        committed_prefix: CommitPosition,
+        authoritative: bool,
+    ) -> Result<u64, ReplicaAppendError> {
         if !assignment.replicas.contains(&self.local_node) {
             return Err(ReplicaAppendError::rejected(
                 ReplicaAppendErrorCode::ReceiverNotReplica,
@@ -884,7 +894,7 @@ impl ReplicaAppendService {
                 ),
             ));
         }
-        let store = self.store_for(&assignment).await?;
+        let store = self.store_for(assignment).await?;
         let snapshot = store.snapshot().await.map_err(map_store_error)?;
         // A replica behind the verified prefix cannot commit frames it does
         // not hold: promote the prefix it has and let committed repair
@@ -995,6 +1005,13 @@ impl ReplicaAppendService {
                     format!("no committed Active Range assignment exists for Feed {feed_id}"),
                 )
             })?;
+        self.quarantine_assignment_for_repair(&assignment).await
+    }
+
+    pub async fn quarantine_assignment_for_repair(
+        &self,
+        assignment: &ActiveRangeAssignment,
+    ) -> Result<Option<PathBuf>, ReplicaAppendError> {
         self.stores
             .write()
             .await

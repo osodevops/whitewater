@@ -145,22 +145,28 @@ pub async fn freeze_and_stage_final_boundary(
     source
         .freeze_generation(source_assignment.range_id, source_assignment.generation)
         .await;
+    // The boundary must come from the range being frozen — the singular
+    // per-feed lookup resolves the feed's first range, so a staged split
+    // of any other Active Range would pin the wrong committed prefix.
     let final_commit = source
-        .recovery_status(plan.feed_id)
+        .recovery_status_for_assignment(source_assignment)
         .await
         .map_err(|error| SplitStagingError::Source(error.to_string()))?
         .committed;
-    let staging = match stage_candidate_ranges(plan, source.clone(), targets, batch_size).await {
-        Ok(staging) => staging,
-        Err(error) => {
-            source
-                .unfreeze_generation(source_assignment.range_id, source_assignment.generation)
-                .await;
-            return Err(error);
-        }
-    };
+    let staging =
+        match stage_candidate_ranges(plan, source_assignment, source.clone(), targets, batch_size)
+            .await
+        {
+            Ok(staging) => staging,
+            Err(error) => {
+                source
+                    .unfreeze_generation(source_assignment.range_id, source_assignment.generation)
+                    .await;
+                return Err(error);
+            }
+        };
     let after = source
-        .recovery_status(plan.feed_id)
+        .recovery_status_for_assignment(source_assignment)
         .await
         .map_err(|error| SplitStagingError::Source(error.to_string()))?
         .committed;
@@ -305,6 +311,7 @@ pub async fn orchestrate_split_cutover(
 
 pub async fn stage_candidate_ranges_local(
     plan: &RangeSplitPlan,
+    source_assignment: &ActiveRangeAssignment,
     source: Arc<ReplicaAppendService>,
     local: Arc<ReplicaAppendService>,
     batch_size: usize,
@@ -317,7 +324,7 @@ pub async fn stage_candidate_ranges_local(
         .as_ref()
         .ok_or(SplitStagingError::MissingLeftAssignment)?;
     let left = stage_route(
-        plan.feed_id,
+        source_assignment,
         left_assignment,
         route_for(plan, left_assignment)?,
         source.clone(),
@@ -328,7 +335,7 @@ pub async fn stage_candidate_ranges_local(
     )
     .await?;
     let right = stage_route(
-        plan.feed_id,
+        source_assignment,
         &plan.right_assignment,
         route_for(plan, &plan.right_assignment)?,
         source,
@@ -347,12 +354,13 @@ pub async fn stage_candidate_ranges_local(
 
 pub async fn stage_candidate_ranges(
     plan: &RangeSplitPlan,
+    source_assignment: &ActiveRangeAssignment,
     source: Arc<ReplicaAppendService>,
     targets: &BTreeMap<StorageNodeId, Arc<ReplicaAppendService>>,
     batch_size: usize,
 ) -> Result<CandidateSplitStagingResult, SplitStagingError> {
     let source_commit = source
-        .recovery_status(plan.feed_id)
+        .recovery_status_for_assignment(source_assignment)
         .await
         .map_err(|error| SplitStagingError::Source(error.to_string()))?
         .committed;
@@ -363,7 +371,7 @@ pub async fn stage_candidate_ranges(
     let left_route = route_for(plan, left_assignment)?;
     let right_route = route_for(plan, &plan.right_assignment)?;
     let left = stage_route(
-        plan.feed_id,
+        source_assignment,
         left_assignment,
         left_route,
         source.clone(),
@@ -374,7 +382,7 @@ pub async fn stage_candidate_ranges(
     )
     .await?;
     let right = stage_route(
-        plan.feed_id,
+        source_assignment,
         &plan.right_assignment,
         right_route,
         source,
@@ -393,17 +401,18 @@ pub async fn stage_candidate_ranges(
 
 pub async fn stage_right_range(
     plan: &RangeSplitPlan,
+    source_assignment: &ActiveRangeAssignment,
     source: Arc<ReplicaAppendService>,
     targets: &BTreeMap<StorageNodeId, Arc<ReplicaAppendService>>,
     batch_size: usize,
 ) -> Result<SplitStagingResult, SplitStagingError> {
     let source_commit = source
-        .recovery_status(plan.feed_id)
+        .recovery_status_for_assignment(source_assignment)
         .await
         .map_err(|error| SplitStagingError::Source(error.to_string()))?
         .committed;
     stage_route(
-        plan.feed_id,
+        source_assignment,
         &plan.right_assignment,
         route_for(plan, &plan.right_assignment)?,
         source,
@@ -428,7 +437,7 @@ fn route_for<'a>(
 
 #[allow(clippy::too_many_arguments)]
 async fn stage_route(
-    feed_id: uuid::Uuid,
+    source_assignment: &ActiveRangeAssignment,
     assignment: &ActiveRangeAssignment,
     route: &RangeRoute,
     source: Arc<ReplicaAppendService>,
@@ -444,7 +453,11 @@ async fn stage_route(
     let mut checksum = blake3::Hasher::new();
     while source_after.map_or(0, RangePosition::value) < source_commit.value() {
         let frames = source
-            .export_committed(feed_id, source_after, batch_size.clamp(1, 10_000))
+            .export_assignment_committed(
+                source_assignment,
+                source_after,
+                batch_size.clamp(1, 10_000),
+            )
             .await
             .map_err(|error| SplitStagingError::Source(error.to_string()))?;
         if frames.is_empty() {

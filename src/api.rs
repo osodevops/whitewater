@@ -38,10 +38,11 @@ use crate::{
         ControlPlaneFollowerMove, DrainMoveDriver, FollowerMoveControl, FollowerMoveCopyResult,
         KeyToken, MajorityAppendCoordinator, MajorityAppendError, MergeStagingResult,
         OwnerMoveEvidence, RangeId, RangePosition, ReadReplicaEvidence, RepairExportRequest,
-        RepairExportResponse, RepairFrame, ReplicaAppendRequest, ReplicaAppendResponse,
-        ReplicaAppendService, ReplicaBatchAppendRequest, ReplicaBatchAppendResponse,
-        ReplicaCommitRequest, ReplicaCommitResponse, ReplicaProgressRequest,
-        ReplicaProgressResponse, ReplicaReconcileRequest, ReplicaReconcileResponse, StorageNodeId,
+        RepairExportResponse, RepairFrame, ReplicaAppendError, ReplicaAppendErrorCode,
+        ReplicaAppendRequest, ReplicaAppendResponse, ReplicaAppendService,
+        ReplicaBatchAppendRequest, ReplicaBatchAppendResponse, ReplicaCommitRequest,
+        ReplicaCommitResponse, ReplicaProgressRequest, ReplicaProgressResponse,
+        ReplicaReconcileRequest, ReplicaReconcileResponse, ReplicaRecoveryStatus, StorageNodeId,
         StoredRangeFrame, MAX_COMMITTED_READ_BYTES, MAX_REPLICA_BATCH_BASE64_BYTES,
         MAX_REPLICA_BATCH_FRAMES, MAX_REPLICA_FRAME_BASE64_BYTES,
     },
@@ -10110,7 +10111,7 @@ async fn recovery_progress(
     Json(request): Json<ReplicaProgressRequest>,
 ) -> Json<ReplicaProgressResponse> {
     let response = match &state.replica_append {
-        Some(service) => match service.recovery_status(request.feed_id).await {
+        Some(service) => match recovery_progress_service(service, &state, &request).await {
             Ok(status) => ReplicaProgressResponse {
                 status: Some(status),
                 error: None,
@@ -10128,28 +10129,89 @@ async fn recovery_progress(
     Json(response)
 }
 
+async fn recovery_progress_service(
+    service: &ReplicaAppendService,
+    state: &AppState,
+    request: &ReplicaProgressRequest,
+) -> Result<ReplicaRecoveryStatus, String> {
+    match request.range_id {
+        Some(range_id) => {
+            let assignment = state
+                .control
+                .active_range_assignment_by_id(range_id)
+                .await
+                .ok_or_else(|| {
+                    format!("no committed Active Range assignment exists for Range {range_id}")
+                })?;
+            if assignment.feed_id != request.feed_id {
+                return Err(format!(
+                    "Active Range {range_id} belongs to Feed {}, not {}",
+                    assignment.feed_id, request.feed_id
+                ));
+            }
+            service
+                .recovery_status_for_assignment(&assignment)
+                .await
+                .map_err(|error| error.to_string())
+        }
+        None => service
+            .recovery_status(request.feed_id)
+            .await
+            .map_err(|error| error.to_string()),
+    }
+}
+
 async fn recovery_reconcile(
     State(state): State<AppState>,
     Json(request): Json<ReplicaReconcileRequest>,
 ) -> Json<ReplicaReconcileResponse> {
     let response = match &state.replica_append {
-        Some(service) => match service
-            .reconcile_recovery(
-                request.feed_id,
-                request.committed_prefix,
-                request.authoritative,
-            )
-            .await
-        {
-            Ok(removed_records) => ReplicaReconcileResponse {
-                removed_records: Some(removed_records),
-                error: None,
-            },
-            Err(error) => ReplicaReconcileResponse {
-                removed_records: None,
-                error: Some(error.to_string()),
-            },
-        },
+        Some(service) => {
+            let result = match request.range_id {
+                Some(range_id) => match state.control.active_range_assignment_by_id(range_id).await
+                {
+                    Some(assignment) if assignment.feed_id == request.feed_id => {
+                        service
+                            .reconcile_recovery_for_assignment(
+                                &assignment,
+                                request.committed_prefix,
+                                request.authoritative,
+                            )
+                            .await
+                    }
+                    Some(assignment) => Err(ReplicaAppendError::rejected(
+                        ReplicaAppendErrorCode::AssignmentNotFound,
+                        format!(
+                            "Active Range {range_id} belongs to Feed {}, not {}",
+                            assignment.feed_id, request.feed_id
+                        ),
+                    )),
+                    None => Err(ReplicaAppendError::temporary(
+                        ReplicaAppendErrorCode::AssignmentNotFound,
+                        format!("no committed Active Range assignment exists for Range {range_id}"),
+                    )),
+                },
+                None => {
+                    service
+                        .reconcile_recovery(
+                            request.feed_id,
+                            request.committed_prefix,
+                            request.authoritative,
+                        )
+                        .await
+                }
+            };
+            match result {
+                Ok(removed_records) => ReplicaReconcileResponse {
+                    removed_records: Some(removed_records),
+                    error: None,
+                },
+                Err(error) => ReplicaReconcileResponse {
+                    removed_records: None,
+                    error: Some(error.to_string()),
+                },
+            }
+        }
         None => ReplicaReconcileResponse {
             removed_records: None,
             error: Some("replica storage is not configured".to_owned()),
@@ -10163,10 +10225,7 @@ async fn repair_export(
     Json(request): Json<RepairExportRequest>,
 ) -> Json<RepairExportResponse> {
     let response = match &state.replica_append {
-        Some(service) => match service
-            .export_committed(request.feed_id, request.after, request.limit)
-            .await
-        {
+        Some(service) => match repair_export_frames(service, &state, &request).await {
             Ok(frames) => RepairExportResponse {
                 frames: frames
                     .into_iter()
@@ -10190,6 +10249,44 @@ async fn repair_export(
         },
     };
     Json(response)
+}
+
+async fn repair_export_frames(
+    service: &ReplicaAppendService,
+    state: &AppState,
+    request: &RepairExportRequest,
+) -> Result<Vec<crate::active_range::StoredRangeFrame>, ReplicaAppendError> {
+    match request.range_id {
+        Some(range_id) => {
+            let assignment = state
+                .control
+                .active_range_assignment_by_id(range_id)
+                .await
+                .ok_or_else(|| {
+                    ReplicaAppendError::temporary(
+                        ReplicaAppendErrorCode::AssignmentNotFound,
+                        format!("no committed Active Range assignment exists for Range {range_id}"),
+                    )
+                })?;
+            if assignment.feed_id != request.feed_id {
+                return Err(ReplicaAppendError::rejected(
+                    ReplicaAppendErrorCode::AssignmentNotFound,
+                    format!(
+                        "Active Range {range_id} belongs to Feed {}, not {}",
+                        assignment.feed_id, request.feed_id
+                    ),
+                ));
+            }
+            service
+                .export_assignment_committed(&assignment, request.after, request.limit)
+                .await
+        }
+        None => {
+            service
+                .export_committed(request.feed_id, request.after, request.limit)
+                .await
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -11169,7 +11266,13 @@ async fn split_stage_local(
             )
             .await;
     }
-    let local_commit = match service.recovery_status(request.plan.feed_id).await {
+    // Same singular-lookup hazard as split_freeze_local: the local
+    // boundary must come from the staged source range, not the feed's
+    // first range, or the check validates the wrong committed prefix.
+    let local_commit = match service
+        .recovery_status_for_assignment(&request.source_assignment)
+        .await
+    {
         Ok(status) => status.committed,
         Err(error) => {
             return Json(LocalSplitStageResponse {
@@ -11189,6 +11292,7 @@ async fn split_stage_local(
     }
     match stage_candidate_ranges_local(
         &request.plan,
+        &request.source_assignment,
         service.clone(),
         service.clone(),
         request.batch_size,
@@ -11251,8 +11355,12 @@ async fn split_freeze_local(
             )
             .await;
     }
+    // The progress must describe the range being frozen — the singular
+    // per-feed lookup resolves the feed's first range, so a split of any
+    // other Active Range would capture the wrong committed boundary and
+    // stage children with a truncated prefix.
     let status = service
-        .recovery_status(request.source_assignment.feed_id)
+        .recovery_status_for_assignment(&request.source_assignment)
         .await
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
     Ok(Json(ReplicaProgressResponse {
@@ -11455,9 +11563,12 @@ trait CutoverPrefix {
     /// silently stranded on a retired range map.
     async fn position_of(&self, cursor: &str) -> Result<u64, ApiError> {
         self.cursor_position(cursor).await?.ok_or_else(|| {
-            ApiError::unavailable(
-                "Reader acknowledged Cursor is missing from the frozen committed source history",
-            )
+            ApiError::unavailable(format!(
+                "Reader acknowledged Cursor is missing from the frozen committed source history (range={} boundary={} cursor={})",
+                self.range_id(),
+                self.boundary(),
+                cursor
+            ))
         })
     }
     /// The KeyToken of each listed committed Cursor resolved by one bounded
@@ -12090,6 +12201,7 @@ async fn admin_split_range(
                     key,
                     &ReplicaReconcileRequest {
                         feed_id: plan.feed_id,
+                        range_id: Some(plan.source_range_id),
                         committed_prefix: source_commit,
                         authoritative: node == &plan.right_assignment.owner,
                     },
@@ -17342,7 +17454,16 @@ async fn read_reader_frontier(
             .get(&assignment.range_id)
             .filter(|value| !value.is_empty());
         let (committed, next) =
-            reader_range_head(state, assignment, cursor.map(String::as_str), None, None).await?;
+            reader_range_head(state, assignment, cursor.map(String::as_str), None, None)
+                .await
+                .map_err(|error| ApiError {
+                    status: error.status,
+                    message: format!(
+                        "range {} head (cursor {:?}): {}",
+                        assignment.range_id, cursor, error.message
+                    ),
+                    code: error.code,
+                })?;
         if let Some((frame, _)) = &next {
             bytes = bytes.saturating_add(
                 logical_frame_bytes(&frame.frame)?.saturating_add(frame.cursor.len()),
@@ -28129,6 +28250,186 @@ mod tests {
         let reply: InternalOwnerAppendResponse = serde_json::from_slice(&bytes).unwrap();
         assert!(reply.result.is_some());
         assert_eq!(reply.position, Some(1));
+        plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn split_freeze_reports_the_frozen_ranges_boundary() {
+        let directory = TempDir::new().unwrap();
+        let (state, plane, control, _replica) = internal_replica_test_state(&directory).await;
+        // Activate a split so the Feed holds two Active Ranges; the
+        // regression froze correctly but reported the feed-first range's
+        // committed boundary through the singular per-feed lookup.
+        let prepared = control
+            .execute_commands(vec![Command::PrepareActiveRangeSplit {
+                feed: "orders.events".to_owned(),
+                split_at: KeyToken::from_bytes([0x80; 16]),
+            }])
+            .await
+            .unwrap();
+        let plan: RangeSplitPlan =
+            serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+        control
+            .execute_commands(vec![Command::RecordActiveRangeSplitCatchUp {
+                feed: "orders.events".to_owned(),
+                plan_id: plan.plan_id,
+                source_commit: CommitPosition::new(0),
+                source_scanned_through: CommitPosition::new(0),
+                right_commit: CommitPosition::new(0),
+                checksum_verified: true,
+            }])
+            .await
+            .unwrap();
+        control
+            .execute_commands(vec![Command::ActivateActiveRangeSplit {
+                feed: "orders.events".to_owned(),
+                plan_id: plan.plan_id,
+                left_writer_sequences: Vec::new(),
+                right_writer_sequences: Vec::new(),
+                reader_translations: Vec::new(),
+                subscription_translations: Vec::new(),
+            }])
+            .await
+            .unwrap();
+        let left = control
+            .active_range_assignment_by_id(plan.left_assignment.unwrap().range_id)
+            .await
+            .unwrap();
+        let right = control
+            .active_range_assignment_by_id(plan.right_assignment.range_id)
+            .await
+            .unwrap();
+        let descriptor = |assignment: &ActiveRangeAssignment| ActiveRangeDescriptor {
+            feed_id: assignment.feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        let root = directory.path().join("active-ranges");
+        seed_committed_history(&root, &descriptor(&left), 3);
+        seed_committed_history(&root, &descriptor(&right), 7);
+        // The fixture's local Node is control-1 with no majority service;
+        // freeze the right child as a follower replica so the status reply
+        // exercises the range-scoped recovery path under test.
+        let mut source = right.clone();
+        if source.owner.as_str() == "control-1" {
+            source.owner = crate::active_range::StorageNodeId::try_new("control-2").unwrap();
+        }
+        let reply = split_freeze_local(
+            State(state.clone()),
+            Json(LocalSplitUnfreezeRequest {
+                source_assignment: source,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.0.status.unwrap().committed, CommitPosition::new(7));
+        plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recovery_progress_reports_the_selected_ranges_status() {
+        let directory = TempDir::new().unwrap();
+        let (state, plane, control, _replica) = internal_replica_test_state(&directory).await;
+        // Two Active Ranges with different committed frontiers; the
+        // regression resolved progress through the singular per-feed
+        // assignment and always reported the first range's status.
+        let prepared = control
+            .execute_commands(vec![Command::PrepareActiveRangeSplit {
+                feed: "orders.events".to_owned(),
+                split_at: KeyToken::from_bytes([0x80; 16]),
+            }])
+            .await
+            .unwrap();
+        let plan: RangeSplitPlan =
+            serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+        control
+            .execute_commands(vec![Command::RecordActiveRangeSplitCatchUp {
+                feed: "orders.events".to_owned(),
+                plan_id: plan.plan_id,
+                source_commit: CommitPosition::new(0),
+                source_scanned_through: CommitPosition::new(0),
+                right_commit: CommitPosition::new(0),
+                checksum_verified: true,
+            }])
+            .await
+            .unwrap();
+        control
+            .execute_commands(vec![Command::ActivateActiveRangeSplit {
+                feed: "orders.events".to_owned(),
+                plan_id: plan.plan_id,
+                left_writer_sequences: Vec::new(),
+                right_writer_sequences: Vec::new(),
+                reader_translations: Vec::new(),
+                subscription_translations: Vec::new(),
+            }])
+            .await
+            .unwrap();
+        let left = control
+            .active_range_assignment_by_id(plan.left_assignment.unwrap().range_id)
+            .await
+            .unwrap();
+        let right = control
+            .active_range_assignment_by_id(plan.right_assignment.range_id)
+            .await
+            .unwrap();
+        let descriptor = |assignment: &ActiveRangeAssignment| ActiveRangeDescriptor {
+            feed_id: assignment.feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        let root = directory.path().join("active-ranges");
+        seed_committed_history(&root, &descriptor(&left), 3);
+        seed_committed_history(&root, &descriptor(&right), 7);
+        let service = state.replica_append.as_ref().unwrap();
+        // The feed-scoped probe keeps its first-range semantics; the
+        // range-scoped probe must report the selected range exactly.
+        let feed_scoped = recovery_progress_service(
+            service,
+            &state,
+            &ReplicaProgressRequest {
+                feed_id: left.feed_id,
+                range_id: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(feed_scoped.committed, CommitPosition::new(3));
+        let right_scoped = recovery_progress_service(
+            service,
+            &state,
+            &ReplicaProgressRequest {
+                feed_id: right.feed_id,
+                range_id: Some(right.range_id),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(right_scoped.committed, CommitPosition::new(7));
+        let left_scoped = recovery_progress_service(
+            service,
+            &state,
+            &ReplicaProgressRequest {
+                feed_id: left.feed_id,
+                range_id: Some(left.range_id),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(left_scoped.committed, CommitPosition::new(3));
+        // A range scoped to a different Feed is refused, never silently
+        // resolved.
+        let mismatched = recovery_progress_service(
+            service,
+            &state,
+            &ReplicaProgressRequest {
+                feed_id: Uuid::new_v4(),
+                range_id: Some(right.range_id),
+            },
+        )
+        .await;
+        assert!(mismatched.is_err());
         plane.raft().shutdown().await.unwrap();
     }
 
