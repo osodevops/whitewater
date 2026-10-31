@@ -95,6 +95,39 @@ Numbers from a run are only reproducible with their parameters — always
 report `BENCH_RECORDS`, `BENCH_BYTES`, `BENCH_WRITERS`, `BENCH_BATCH`,
 `BENCH_PARTITIONS`, and host characteristics alongside results.
 
+## Mixed-workload soak (`bench-soak.py`)
+
+The per-mode benches measure write or read in isolation; production load
+is simultaneous, so `scripts/bench-soak.py` runs writers AND
+tail-following readers concurrently for `BENCH_SOAK_SECONDS` (default
+120) and reports the throughput **curve** — per-`BENCH_SOAK_INTERVAL`
+rates in the `soak` row's `curve` field — not just the average. A system
+that holds its peak for 60s and collapses at minute 3 fails this bench
+where the fixed-size passes miss it entirely.
+
+```bash
+python scripts/bench-soak.py
+BENCH_SOAK_SECONDS=300 BENCH_WRITERS=8 BENCH_READERS=4 python scripts/bench-soak.py
+```
+
+Knobs: `BENCH_SOAK_SECONDS`, `BENCH_SOAK_INTERVAL` (default 5s),
+`BENCH_BYTES`, `BENCH_WRITERS`, `BENCH_BATCH`, `BENCH_READERS`,
+`BENCH_FEEDS`, `BENCH_PAGE_LIMIT`, `BENCH_READ_WAIT_MS` (consumer
+long-poll), `BENCH_BASE_PORT`, `WW_KEEP_UP`. Readers use the binary
+frame transport and poll the tail exactly like attached consumers, so
+read throughput tracks write throughput once the tail is caught — the
+signal is whether the write rate stays flat and errors stay zero as
+replication, segment writes, and read serving contend for the same
+disk and NIC.
+
+Smoke run (30s window, 8 writers × 256-record batches, 4 feeds, 4
+readers, Docker Desktop): **~12.1–12.5k records/s written and read,
+flat across every 5s interval, zero errors** — readers kept exact pace
+with writers (a consumer cannot read faster than the producer). The
+`soak-write`/`soak-read` rows' averages understate the in-window rate
+because their `seconds` includes the post-deadline drain grace; the
+`curve` array is the figure of record.
+
 ## Measured baseline
 
 ### Matched-config comparison (isolated runs)
