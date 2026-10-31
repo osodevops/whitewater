@@ -27,6 +27,13 @@ python scripts/bench-feed.py
 BENCH_RECORDS=50000 BENCH_BYTES=4096 BENCH_WRITERS=8 BENCH_BATCH=100 python scripts/bench-feed.py
 BENCH_MODE=read python scripts/bench-feed.py   # replay only (needs a seeded Feed)
 
+# Parallel read/write shapes — N independent Feeds and N reader threads
+# (the N-partition/N-consumer-thread equivalent; ranges stay internal):
+BENCH_FEEDS=3 BENCH_READ_FORMAT=binary BENCH_PAGE_LIMIT=65536   BENCH_RECORDS=60000 BENCH_WRITERS=32 BENCH_BATCH=512 python scripts/bench-feed.py
+# BENCH_READ_FORMAT=binary selects the raw-frames fetch transport;
+# BENCH_PAGE_LIMIT sizes one streamed page. Kafka's matching knob is
+# BENCH_READ_THREADS for kafka-consumer-perf-test.
+
 # Whitewater — Kafka-acks=all-equivalent durability (quorum replication is
 # the evidence; per-range fsyncs amortize to the interval) plus N
 # pre-provisioned Active Ranges — the partition-count equivalent:
@@ -191,23 +198,64 @@ Same fixture and workload (3 Nodes, RF3, deferred sync, 4 ranges,
 | Write records/s, 200k run | **26,546** | — |
 | Write p50 | **527-630 ms** | 905 ms |
 | Write p99 | 713-906 ms | 1,225 ms |
-| Read records/s | **11,356** | 84,388-192,926 |
+| Read records/s (JSON) | **11,356** | 84,388-192,926 |
+| Read records/s (binary, 1 feed / 3 feeds) | **169,020 / 225,066** | 203,390 / 219,780 |
 
 **Whitewater now writes faster than Kafka's best measured fan-out on
 this host, at ~30-40% lower p50.** Node utilization is now real work —
 23-57% CPU per Node vs 0.2-3.5% when the fsync stall dominated; Kafka
 used 251-288% per broker.
 
-**Read-path round (same pass)**: the multi-range Reader merge refetched
-one frame per record through a remote corroborated page call
-(`page_limit: 1`) — ~60-70ms per record. The merge now buffers
-128→512-frame `RangeFrameStream` pages (the service clamp rose from
-32/128 to 512, still bounded by the 16 MiB read budget) and refills
-drained heads concurrently via `join_all`; the bench replay page rose
-to the 10,000-frame cap. Multi-range read went **1,844 -> 11,356
-rec/s** (6x). Kafka still reads 7-17x faster — page-cache sendfile plus
-no per-range corroboration; a binary internal read transport and
-boundary-evidence caching are the remaining levers, tracked separately.
+**Read-path rounds**: five stacked optimizations took the multi-range
+read from 1,844 to **225,066 rec/s** (122x) — now matching or beating
+Kafka's consumer-perf at equivalent pipeline counts.
+
+1. `reader_range_head` paid a corroborated remote page **per record**
+   (`page_limit: 1`) — ~60-70ms per record. The frontier merge now runs
+   on buffered `RangeFrameStream` pages and refills drained heads
+   concurrently via `join_all` (1,844 -> 11,356).
+2. **Local-replica committed reads**: RF3 keeps a full committed copy on
+   every replica, so `fetch_range_page` serves from whichever Node the
+   client chose — the owner uses the owner read contract, a follower
+   corroborates its claimed boundary against another replica's
+   committed/digest evidence and falls back to the owner when its
+   committed prefix lags the read Cursor. Reads stopped paying a remote
+   owner round trip per page; the internal path also dropped the
+   JSON/base64 `RepairFrame` envelope in favour of decoded frames
+   end-to-end (~34k -> ~52k single feed).
+3. **Binary fetch transport**: `Accept: application/vnd.whitewater.frames`
+   returns raw stored frames (u32 count, next-Cursor, per-record
+   cursor+frame lengths) instead of base64-in-JSON, chunked into 4 MiB
+   stream chunks so the send overlaps page assembly (~52k -> ~101k on
+   three feeds).
+4. **Store-side sequential reads**: `read_indexed_frame` opened,
+   statted, seeked and read the segment file **per frame** (~17us/record).
+   Contiguous same-segment runs now read once into a span buffer and
+   slice per frame — one syscall per page — while the per-frame blake3
+   integrity check is retained (~114k -> ~143k).
+5. **Page-size plumbing**: hidden clamps split every read into 32/128-
+   frame store windows (313 sequential store calls per 10k page). The
+   service/page/request clamps now run at 2,048-65,536 frames under a
+   96 MiB committed-read byte budget, so a full Feed drain is one
+   streamed response (~143k -> 225k).
+
+Matched-shape comparison (3 Nodes each, RF3, `acks=all`-equivalent
+deferred quorum sync, 1 KiB records, sequential on the same host):
+
+| Config | System | Write rec/s | Read rec/s |
+|---|---|---|---|
+| 1 partition / 1 feed, 1 consumer thread | Kafka | 8,711 | 203,390 |
+| | Whitewater binary | ~7,000 | **169,020** host / ~202k in-network |
+| 3 partitions / 3 feeds, 3 consumer threads | Kafka | 11,926 | 219,780 |
+| | Whitewater binary | ~15,500 | **225,066** |
+
+Whitewater wins the parallel read (the throughput-relevant shape). The
+single-feed host-side number is bounded by the Docker Desktop port
+proxy at ~165-200 MiB/s per connection — the same drain measured
+in-network (`docker exec` into the fixture, matching how Kafka's
+consumer-perf runs inside its container) reaches ~202k rec/s, i.e.
+parity with Kafka's sendfile consumer. Per-request server assembly is
+~230-330 MiB/s, so a faster client (Rust SDK) would show it directly.
 
 ### Write-path history
 

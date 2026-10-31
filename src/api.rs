@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use axum::{
     body::{Body, Bytes},
     extract::{DefaultBodyLimit, Query, State},
-    http::{header::AUTHORIZATION, HeaderMap, Request, StatusCode},
+    http::{header, header::AUTHORIZATION, HeaderMap, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -4687,15 +4687,8 @@ async fn subscription_member_fetch(
                     )
                     .await?;
                     for frame in page.frames {
-                        let bytes =
-                            STANDARD
-                                .decode(frame.frame_base64.as_bytes())
-                                .map_err(|_| {
-                                    ApiError::unavailable(
-                                        "current owner returned an invalid frame encoding",
-                                    )
-                                })?;
-                        let record = decode_record(&bytes)
+                        let bytes = &frame.frame;
+                        let record = decode_record(bytes)
                             .map_err(|error| ApiError::unavailable(error.to_string()))?;
                         if mine.contains(&crate::reader::subscription_work_window(&record.key)) {
                             picked.push((*range_id, frame.cursor.clone(), record));
@@ -4828,13 +4821,9 @@ async fn resolve_tail_positions(
             frame.map(|frame| frame.cursor.clone()).unwrap_or_default(),
         );
         if let Some(frame) = frame {
-            let decoded = STANDARD
-                .decode(frame.frame_base64.as_bytes())
-                .map_err(|_| {
-                    ApiError::unavailable("current owner returned an invalid frame encoding")
-                })?;
-            let record = decode_record(&decoded)
-                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+            let decoded = &frame.frame;
+            let record =
+                decode_record(decoded).map_err(|error| ApiError::unavailable(error.to_string()))?;
             let key = (record.ingest_time_ns, record.message_id);
             if tail.as_ref().is_none_or(|(current, _)| key > *current) {
                 tail = Some((key, frame.cursor.clone()));
@@ -6387,6 +6376,7 @@ async fn publish_distributary_status(
             && existing.run_state == status.run_state
             && existing.last_error == status.last_error
             && existing.lag_records == status.lag_records
+            && existing.lag_probe_error == status.lag_probe_error
             && existing.copied_records == status.copied_records;
         let fresh = status
             .reported_at_ns
@@ -6428,6 +6418,7 @@ async fn publish_distributary_stall(
         last_error_at_ns: Some(now_ns),
         reported_at_ns: now_ns,
         lag_records: None,
+        lag_probe_error: None,
     };
     let _ = publish_distributary_status(state, distributary_id, status).await;
 }
@@ -6555,6 +6546,7 @@ pub async fn drive_local_distributaries(
                     entry.insert(crate::distributary::DistributaryDriver {
                         copied_records: seed.as_ref().map_or(0, |row| row.copied_records),
                         lag_records: seed.as_ref().and_then(|row| row.lag_records),
+                        lag_probe_error: seed.as_ref().and_then(|row| row.lag_probe_error.clone()),
                         last_copied_at_ns: seed.as_ref().and_then(|row| row.last_copied_at_ns),
                         last_error: seed.as_ref().and_then(|row| row.last_error.clone()),
                         last_error_at_ns: seed.as_ref().and_then(|row| row.last_error_at_ns),
@@ -6678,7 +6670,7 @@ pub async fn drive_local_distributaries(
             if matches!(target, DriveTarget::Feed(_)) {
                 let reader =
                     crate::distributary::distributary_reader_name(definition.distributary_id);
-                if let Ok(report) = driver
+                match driver
                     .remote
                     .run(|client| {
                         let reader = reader.clone();
@@ -6686,7 +6678,17 @@ pub async fn drive_local_distributaries(
                     })
                     .await
                 {
-                    driver.lag_records = Some(report.unacknowledged);
+                    Ok(report) => {
+                        driver.lag_records = Some(report.unacknowledged);
+                        driver.lag_probe_error = None;
+                    }
+                    // A refused probe keeps the last figure AND reports
+                    // why — otherwise a persistently unreachable frontier
+                    // looks identical to a caught-up Distributary.
+                    Err(error) => {
+                        driver.lag_probe_error =
+                            Some(error.to_string().chars().take(512).collect());
+                    }
                 }
             }
             let status = driver.status_snapshot(run_state, &local_node, now_ns);
@@ -11205,11 +11207,72 @@ pub struct TemporaryReaderFetchResponse {
     pub next_cursor: Option<String>,
 }
 
+/// Binary fetch wire format (`Accept: application/vnd.whitewater.frames`):
+/// `u32 count`, `u32 next_cursor_len` + next_cursor bytes, then per record
+/// `u32 cursor_len` + cursor + `u32 frame_len` + stored frame bytes. The
+/// stored frame is the record's canonical codec encoding — the client
+/// decodes it itself, so a bulk read never pays a server-side decode +
+/// base64 + JSON re-encode pass (the JSON representation stays the
+/// default for compatibility).
+const FRAMES_MEDIA_TYPE: &str = "application/vnd.whitewater.frames";
+
+fn wants_frame_binary(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| accept.contains(FRAMES_MEDIA_TYPE))
+}
+
+const FRAME_FETCH_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+
+#[cfg(test)]
+fn encode_frame_fetch(next_cursor: Option<String>, frames: Vec<StoredRangeFrame>) -> Vec<u8> {
+    let mut body = Vec::new();
+    for chunk in encode_frame_fetch_stream(next_cursor, frames) {
+        body.extend_from_slice(&chunk);
+    }
+    body
+}
+
+/// Framed-record byte source: header first, then records accumulated into
+/// ~`FRAME_FETCH_CHUNK_BYTES` chunks. Splitting construction from
+/// transport lets the HTTP layer stream chunks as they are produced
+/// instead of buffering the whole page before the first byte leaves.
+fn encode_frame_fetch_stream(
+    next_cursor: Option<String>,
+    frames: Vec<StoredRangeFrame>,
+) -> impl Iterator<Item = Vec<u8>> {
+    let cursor_bytes = next_cursor.unwrap_or_default().into_bytes();
+    let mut header = Vec::with_capacity(8 + cursor_bytes.len());
+    header.extend_from_slice(&(frames.len() as u32).to_le_bytes());
+    header.extend_from_slice(&(cursor_bytes.len() as u32).to_le_bytes());
+    header.extend_from_slice(&cursor_bytes);
+    let mut chunks = Vec::new();
+    let mut current = Vec::with_capacity(FRAME_FETCH_CHUNK_BYTES);
+    for frame in frames {
+        let entry_bytes = 8 + frame.cursor.len() + frame.frame.len();
+        if current.len() + entry_bytes > FRAME_FETCH_CHUNK_BYTES && !current.is_empty() {
+            chunks.push(std::mem::replace(
+                &mut current,
+                Vec::with_capacity(FRAME_FETCH_CHUNK_BYTES),
+            ));
+        }
+        current.extend_from_slice(&(frame.cursor.len() as u32).to_le_bytes());
+        current.extend_from_slice(frame.cursor.as_bytes());
+        current.extend_from_slice(&(frame.frame.len() as u32).to_le_bytes());
+        current.extend_from_slice(&frame.frame);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    std::iter::once(header).chain(chunks)
+}
+
 async fn temporary_reader_fetch(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<TemporaryReaderFetchRequest>,
-) -> Result<Json<TemporaryReaderFetchResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     authorize_namespace(&state, &headers, &request.feed, PermissionAction::Read)?;
     if request.new_only && request.after.is_some() {
         return Err(ApiError::bad_request(
@@ -11232,14 +11295,15 @@ async fn temporary_reader_fetch(
     let feed = feed_when_applied(&state.control, &request.feed, state.control_plane.is_some())
         .await
         .ok_or_else(|| ApiError::bad_request("Feed does not exist"))?;
-    let limit = request.limit.unwrap_or(100).clamp(1, 10_000);
+    let limit = request.limit.unwrap_or(100).clamp(1, 65_536);
     if request.new_only {
         let existing =
             read_complete_feed(&state, feed.feed_id, &feed.name, None, 1, true, false).await?;
         return Ok(Json(TemporaryReaderFetchResponse {
             next_cursor: existing.last().map(|item| item.cursor.clone()),
             records: Vec::new(),
-        }));
+        })
+        .into_response());
     }
     let deadline = tokio::time::Instant::now()
         + Duration::from_millis(request.wait_ms.unwrap_or(0).min(30_000));
@@ -11270,6 +11334,20 @@ async fn temporary_reader_fetch(
             frames = frames.split_off(frames.len() - limit);
         }
         if !frames.is_empty() || tokio::time::Instant::now() >= deadline {
+            let next_cursor = frames
+                .last()
+                .map(|item| item.cursor.clone())
+                .or(request.after.clone());
+            if wants_frame_binary(&headers) {
+                let stream = futures_util::stream::iter(
+                    encode_frame_fetch_stream(next_cursor, frames)
+                        .map(Ok::<Vec<u8>, std::convert::Infallible>),
+                );
+                return Response::builder()
+                    .header(header::CONTENT_TYPE, FRAMES_MEDIA_TYPE)
+                    .body(Body::from_stream(stream))
+                    .map_err(|error| ApiError::unavailable(error.to_string()));
+            }
             let source = record_source_by_name(&state, &request.feed).await;
             let records = frames
                 .into_iter()
@@ -11293,7 +11371,8 @@ async fn temporary_reader_fetch(
             return Ok(Json(TemporaryReaderFetchResponse {
                 records,
                 next_cursor,
-            }));
+            })
+            .into_response());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -11732,15 +11811,13 @@ impl FrozenLineage<'_> {
                         "Reader transition source has a position gap",
                     ));
                 }
-                let decoded = STANDARD
-                    .decode(&frame.frame_base64)
-                    .map_err(|error| ApiError::unavailable(error.to_string()))?;
-                if logical_frame_bytes(&decoded)? > MAX_LOGICAL_READ_BYTES {
+                let decoded = &frame.frame;
+                if logical_frame_bytes(decoded)? > MAX_LOGICAL_READ_BYTES {
                     return Err(ApiError::unavailable(
                         "record exceeds the bounded Feed read byte budget",
                     ));
                 }
-                let record = decode_record(&decoded)
+                let record = decode_record(decoded)
                     .map_err(|error| ApiError::unavailable(error.to_string()))?;
                 entries.push(ReaderLineageEntry {
                     range_id: self.assignment.range_id,
@@ -16914,7 +16991,7 @@ fn logical_frame_bytes(frame: &[u8]) -> Result<usize, ApiError> {
 }
 
 const MAX_LOGICAL_READ_BYTES: usize = MAX_COMMITTED_READ_BYTES;
-const MAX_LOGICAL_READ_FRAMES: usize = 10_000;
+const MAX_LOGICAL_READ_FRAMES: usize = 65_536;
 const MAX_LOGICAL_READ_RANGES: usize = 128;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -17023,12 +17100,19 @@ fn require_read_quorum(
         if follower.node == owner.node || !assignment.replicas.contains(&follower.node) {
             return Err(fail("read evidence came from a non-replica Node"));
         }
-        if follower.committed > owner.committed {
-            return Err(fail(
-                "Append Owner is behind another committed replica; retry after repair or recovery",
-            ));
-        }
-        if follower.committed >= position && follower.digest == owner.digest {
+        if follower.committed >= position {
+            // A replica ahead of the owner's claimed boundary is normal
+            // convergence under fused commit markers (the marker lands
+            // with the send; the owner commits in mint order behind it),
+            // and with a matching digest at the boundary it is the
+            // strongest possible confirmation. A mismatched digest at a
+            // position the replica already committed is real committed
+            // divergence — the read cannot pick a side.
+            if follower.digest != owner.digest {
+                return Err(fail(
+                    "replica holds divergent committed evidence at the read boundary",
+                ));
+            }
             confirmed = true;
         }
     }
@@ -17093,6 +17177,101 @@ async fn verify_read_quorum(
     .collect::<Vec<_>>();
     let proof = state.control.range_commit_proof(assignment.range_id).await;
     require_read_quorum(assignment, position, &owner, &followers, proof.as_ref())
+}
+
+/// Committed-boundary corroboration for a read served by a non-owner
+/// replica: the local replica's claimed boundary must be confirmed by at
+/// least one other current replica holding the same committed frame
+/// digest at that position. Unlike the owner read contract a corroborating
+/// replica may legitimately show a newer committed frontier (commit
+/// markers lag on followers); that is staleness, not divergence, and the
+/// read still serves only the locally corroborated boundary.
+async fn verify_local_read_quorum(
+    state: &AppState,
+    assignment: &ActiveRangeAssignment,
+    position: CommitPosition,
+) -> Result<(), ApiError> {
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("replica storage is not available"))?;
+    let local = service
+        .read_replica_evidence(assignment, position)
+        .await
+        .map_err(|error| ApiError::unavailable(error.message))?;
+    let key = state
+        .internal_key
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("read evidence credential is unavailable"))?;
+    let others = join_all(
+        assignment
+            .replicas
+            .iter()
+            .filter(|node| **node != local.node)
+            .map(|node| async {
+                let endpoint = state.control_endpoints.resolve(node).await?;
+                let response = state
+                    .internal_http
+                    .post(format!(
+                        "{}/internal/active-range/read/evidence",
+                        endpoint.trim_end_matches('/')
+                    ))
+                    .header("x-whitewater-control-key", key)
+                    .json(&ReadRangeEvidenceRequest {
+                        assignment: assignment.clone(),
+                        position,
+                    })
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                    .ok()?
+                    .error_for_status()
+                    .ok()?
+                    .json::<ReadReplicaEvidence>()
+                    .await
+                    .ok()?;
+                (response.node == *node).then_some(response)
+            }),
+    )
+    .await
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let proof = state.control.range_commit_proof(assignment.range_id).await;
+    let provable = std::iter::once(local.committed)
+        .chain(others.iter().map(|evidence| evidence.committed))
+        .max()
+        .unwrap_or_default();
+    let lost_history = proof
+        .filter(|proof| proof.position > provable)
+        .map(|proof| {
+            format!(
+                "; durable committed-frontier proof records position {} committed on a replica quorum while reachable replicas can show at most {} — committed history may be permanently lost until the replica set is repaired",
+                proof.position.value(),
+                provable.value(),
+            )
+        })
+        .unwrap_or_default();
+    let fail = |message: &str| ApiError::unavailable(format!("{message}{lost_history}"));
+    if local.committed < position
+        || position.value() > 0 && local.digest.is_none()
+        || !assignment.replicas.contains(&local.node)
+    {
+        return Err(fail(
+            "local replica cannot prove its committed read boundary",
+        ));
+    }
+    let confirmed = others.iter().any(|follower| {
+        assignment.replicas.contains(&follower.node)
+            && follower.committed >= position
+            && follower.digest == local.digest
+    });
+    if !confirmed {
+        return Err(fail(
+            "no other replica confirms the committed prefix and digest; retry after catch-up",
+        ));
+    }
+    Ok(())
 }
 
 /// Persists committed-frontier proofs into the replicated catalog so
@@ -17302,17 +17481,255 @@ async fn read_placement(
     Ok(assignments)
 }
 
+/// A committed range page after transport decoding — identical shape
+/// whether it was served locally or fetched over the internal wire, so
+/// local reads never pay a base64 encode/decode round trip.
+struct FetchedRangePage {
+    committed: CommitPosition,
+    resolved_after: Option<RangePosition>,
+    ingest_boundary: Option<IngestBoundaryReply>,
+    frames: Vec<StoredRangeFrame>,
+}
+
+/// Serve a committed range page from the local Node when it hosts a
+/// current replica (owner or follower). RF3 keeps a full committed copy on
+/// every replica, so Reads never have to leave the Node the client chose:
+/// the local replica's claimed boundary is corroborated against another
+/// replica's committed/digest evidence exactly as owner reads are. A
+/// follower's boundary can lag the owner's committed tip — the response
+/// reports the corroborated boundary, and the caller falls back to the
+/// owner when local evidence is unavailable.
+async fn read_local_replica_range_page(
+    state: &AppState,
+    request: &ReadRangePageRequest,
+) -> Result<FetchedRangePage, ApiError> {
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Active Range storage is not available"))?;
+    if !assignment_member(service.local_node(), &request.assignment) {
+        return Err(ApiError::unavailable("local Node does not host this range"));
+    }
+    let expected_commit = if request.expected_commit.is_none() && state.control_plane.is_some() {
+        let local = service
+            .read_replica_evidence(&request.assignment, CommitPosition::new(0))
+            .await
+            .map_err(|error| ApiError::unavailable(error.message))?;
+        verify_local_read_quorum(state, &request.assignment, local.committed).await?;
+        Some(local.committed)
+    } else {
+        request.expected_commit
+    };
+    let (committed, resolved_after, ingest_boundary, frames) = if request.single_range {
+        service
+            .read_replica_range_cursor_page(
+                &request.assignment,
+                crate::active_range::RangeReadSpec {
+                    cursor: request.after_cursor.as_deref(),
+                    after: request.after,
+                    tail_count: request.tail_count,
+                    ingest_threshold: request.ingest_threshold,
+                    cursors: request.cursors.as_deref(),
+                },
+                expected_commit,
+                request.page_limit.unwrap_or(1),
+            )
+            .await
+            .map(|(commit, resolved, probe, frames)| {
+                (
+                    commit,
+                    resolved,
+                    probe.map(|boundary| match boundary {
+                        crate::active_range::IngestBoundary::Ordered { cursor, .. } => {
+                            IngestBoundaryReply {
+                                ordered: true,
+                                cursor,
+                            }
+                        }
+                        crate::active_range::IngestBoundary::Unordered => IngestBoundaryReply {
+                            ordered: false,
+                            cursor: String::new(),
+                        },
+                    }),
+                    frames,
+                )
+            })
+    } else if request.after_cursor.is_some()
+        || request.tail_count.is_some()
+        || request.ingest_threshold.is_some()
+        || request.cursors.is_some()
+    {
+        return Err(ApiError::bad_request(
+            "Cursor, tail, ingest, and point read modes require single-range routing",
+        ));
+    } else {
+        service
+            .read_replica_range_page(
+                &request.assignment,
+                request.after,
+                expected_commit,
+                request.page_limit.unwrap_or(32),
+            )
+            .await
+            .map(|(commit, frames)| (commit, request.after, None, frames))
+    }
+    .map_err(|error| ApiError {
+        status: if error.retryable {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_REQUEST
+        },
+        message: error.message,
+        code: None,
+    })?;
+    for frame in &frames {
+        if logical_frame_bytes(&frame.frame)? > MAX_LOGICAL_READ_BYTES {
+            return Err(ApiError::unavailable(
+                "record exceeds the bounded Feed read byte budget",
+            ));
+        }
+    }
+    state.demand.record_range_read(
+        request.assignment.range_id,
+        frames.len(),
+        frames.iter().map(|frame| frame.frame.len() as u64).sum(),
+    );
+    Ok(FetchedRangePage {
+        committed,
+        resolved_after,
+        ingest_boundary,
+        frames,
+    })
+}
+
+fn assignment_member(node: &StorageNodeId, assignment: &ActiveRangeAssignment) -> bool {
+    assignment.replicas.contains(node)
+}
+
+/// Local decoded page for the owner itself: identical to the replica path
+/// except the boundary is corroborated through the owner read contract
+/// (the owner's claimed frontier must be confirmed by a replica, not just
+/// any member).
+async fn read_local_owner_range_page(
+    state: &AppState,
+    request: &ReadRangePageRequest,
+) -> Result<FetchedRangePage, ApiError> {
+    let service = state
+        .replica_append
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Active Range storage is not available"))?;
+    let expected_commit = if request.expected_commit.is_none() && state.control_plane.is_some() {
+        let owner = service
+            .read_replica_evidence(&request.assignment, CommitPosition::new(0))
+            .await
+            .map_err(|error| ApiError::unavailable(error.message))?;
+        verify_read_quorum(state, &request.assignment, owner.committed).await?;
+        Some(owner.committed)
+    } else {
+        request.expected_commit
+    };
+    let (committed, resolved_after, ingest_boundary, frames) = if request.single_range {
+        service
+            .read_owned_range_cursor_page(
+                &request.assignment,
+                crate::active_range::RangeReadSpec {
+                    cursor: request.after_cursor.as_deref(),
+                    after: request.after,
+                    tail_count: request.tail_count,
+                    ingest_threshold: request.ingest_threshold,
+                    cursors: request.cursors.as_deref(),
+                },
+                expected_commit,
+                request.page_limit.unwrap_or(1),
+            )
+            .await
+            .map(|(commit, resolved, probe, frames)| {
+                (
+                    commit,
+                    resolved,
+                    probe.map(|boundary| match boundary {
+                        crate::active_range::IngestBoundary::Ordered { cursor, .. } => {
+                            IngestBoundaryReply {
+                                ordered: true,
+                                cursor,
+                            }
+                        }
+                        crate::active_range::IngestBoundary::Unordered => IngestBoundaryReply {
+                            ordered: false,
+                            cursor: String::new(),
+                        },
+                    }),
+                    frames,
+                )
+            })
+    } else if request.after_cursor.is_some()
+        || request.tail_count.is_some()
+        || request.ingest_threshold.is_some()
+        || request.cursors.is_some()
+    {
+        return Err(ApiError::bad_request(
+            "Cursor, tail, ingest, and point read modes require single-range routing",
+        ));
+    } else {
+        service
+            .read_owned_range_page(
+                &request.assignment,
+                request.after,
+                expected_commit,
+                request.page_limit.unwrap_or(32),
+            )
+            .await
+            .map(|(commit, frames)| (commit, request.after, None, frames))
+    }
+    .map_err(|error| ApiError {
+        status: if error.retryable {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_REQUEST
+        },
+        message: error.message,
+        code: None,
+    })?;
+    for frame in &frames {
+        if logical_frame_bytes(&frame.frame)? > MAX_LOGICAL_READ_BYTES {
+            return Err(ApiError::unavailable(
+                "record exceeds the bounded Feed read byte budget",
+            ));
+        }
+    }
+    state.demand.record_range_read(
+        request.assignment.range_id,
+        frames.len(),
+        frames.iter().map(|frame| frame.frame.len() as u64).sum(),
+    );
+    Ok(FetchedRangePage {
+        committed,
+        resolved_after,
+        ingest_boundary,
+        frames,
+    })
+}
+
 async fn fetch_range_page(
     state: &AppState,
     request: ReadRangePageRequest,
-) -> Result<ReadRangePageResponse, ApiError> {
+) -> Result<FetchedRangePage, ApiError> {
     let service = state.replica_append.as_ref().ok_or_else(|| {
         ApiError::unavailable("Active Range replica storage is not configured on this Node")
     })?;
+    // RF3 keeps a committed copy on every replica: reads stay local on
+    // whichever Node the client chose, decoded once with no base64 round
+    // trip. The owner uses the owner read contract; a follower uses the
+    // generalized member corroboration, and any local failure falls
+    // through to the authoritative owner, which also covers lagging
+    // followers that have not caught up to the read Cursor.
     if service.local_node() == &request.assignment.owner {
-        return Ok(read_owned_range_page(State(state.clone()), Json(request))
-            .await?
-            .0);
+        return read_local_owner_range_page(state, &request).await;
+    }
+    if assignment_member(service.local_node(), &request.assignment) {
+        if let Ok(page) = read_local_replica_range_page(state, &request).await {
+            return Ok(page);
+        }
     }
     let endpoint = state
         .control_endpoints
@@ -17360,8 +17777,28 @@ async fn fetch_range_page(
         }
         bytes.extend_from_slice(&chunk);
     }
-    serde_json::from_slice::<ReadRangePageResponse>(&bytes)
-        .map_err(|error| ApiError::unavailable(error.to_string()))
+    let page = serde_json::from_slice::<ReadRangePageResponse>(&bytes)
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    let mut frames = Vec::with_capacity(page.frames.len());
+    for frame in page.frames {
+        let decoded = STANDARD
+            .decode(frame.frame_base64.as_bytes())
+            .map_err(|_| {
+                ApiError::unavailable("current owner returned an invalid frame encoding")
+            })?;
+        frames.push(StoredRangeFrame {
+            position: frame.position,
+            identity: frame.identity,
+            cursor: frame.cursor,
+            frame: decoded,
+        });
+    }
+    Ok(FetchedRangePage {
+        committed: page.committed,
+        resolved_after: page.resolved_after,
+        ingest_boundary: page.ingest_boundary,
+        frames,
+    })
 }
 
 fn merge_feed_frames(
@@ -17430,7 +17867,7 @@ async fn read_single_range(
                 ingest_threshold: None,
                 cursors: None,
                 single_range: true,
-                page_limit: Some(limit.saturating_sub(frames.len()).clamp(1, 32)),
+                page_limit: Some(limit.saturating_sub(frames.len()).clamp(1, 2048)),
             },
         )
         .await?;
@@ -17460,27 +17897,18 @@ async fn read_single_range(
                     "current owner returned a gapped committed range",
                 ));
             }
-            let decoded = STANDARD
-                .decode(frame.frame_base64.as_bytes())
-                .map_err(|_| {
-                    ApiError::unavailable("current owner returned an invalid frame encoding")
-                })?;
+            let decoded = &frame.frame;
             bytes = bytes
-                .saturating_add(logical_frame_bytes(&decoded)?.saturating_add(frame.cursor.len()));
-            if logical_frame_bytes(&decoded)? > MAX_LOGICAL_READ_BYTES
+                .saturating_add(logical_frame_bytes(decoded)?.saturating_add(frame.cursor.len()));
+            if logical_frame_bytes(decoded)? > MAX_LOGICAL_READ_BYTES
                 || bytes > MAX_LOGICAL_READ_BYTES
             {
                 return Err(ApiError::unavailable(
                     "Feed page exceeds the bounded read byte budget",
                 ));
             }
-            frames.push(StoredRangeFrame {
-                position: frame.position,
-                identity: frame.identity,
-                cursor: frame.cursor,
-                frame: decoded,
-            });
             after_position = Some(frame.position);
+            frames.push(frame);
             expected = expected.saturating_add(1);
         }
         if frames.len() == before {
@@ -17651,7 +18079,7 @@ impl RangeFrameStream<'_> {
                     tail_count: None,
                     ingest_threshold: None,
                     cursors: None,
-                    page_limit: Some(512),
+                    page_limit: Some(2048),
                 },
             )
             .await?;
@@ -17675,23 +18103,14 @@ impl RangeFrameStream<'_> {
                         "current owner returned a gapped committed range",
                     ));
                 }
-                let decoded = STANDARD
-                    .decode(frame.frame_base64.as_bytes())
-                    .map_err(|_| {
-                        ApiError::unavailable("current owner returned an invalid frame encoding")
-                    })?;
-                if logical_frame_bytes(&decoded)? > MAX_LOGICAL_READ_BYTES {
+                let decoded = &frame.frame;
+                if logical_frame_bytes(decoded)? > MAX_LOGICAL_READ_BYTES {
                     return Err(ApiError::unavailable(
                         "record exceeds the bounded Feed read byte budget",
                     ));
                 }
-                self.pending.push_back(StoredRangeFrame {
-                    position: frame.position,
-                    identity: frame.identity,
-                    cursor: frame.cursor,
-                    frame: decoded,
-                });
                 self.after = Some(frame.position);
+                self.pending.push_back(frame);
                 expected = expected.saturating_add(1);
             }
             if self.after.is_none() {
@@ -17855,7 +18274,7 @@ async fn read_complete_feed(
                 ingest_threshold: None,
                 cursors: None,
                 single_range: false,
-                page_limit: Some(512),
+                page_limit: Some(2048),
             };
             let page = fetch_range_page(state, request).await?;
             if boundary.is_some_and(|expected| expected != page.committed)
@@ -17880,27 +18299,18 @@ async fn read_complete_feed(
                         "current owner returned a gapped committed range",
                     ));
                 }
-                let decoded = STANDARD
-                    .decode(frame.frame_base64.as_bytes())
-                    .map_err(|_| {
-                        ApiError::unavailable("current owner returned an invalid frame encoding")
-                    })?;
+                let decoded = &frame.frame;
                 bytes = bytes.saturating_add(
-                    logical_frame_bytes(&decoded)?.saturating_add(frame.cursor.len()),
+                    logical_frame_bytes(decoded)?.saturating_add(frame.cursor.len()),
                 );
-                if logical_frame_bytes(&decoded)? > MAX_LOGICAL_READ_BYTES
+                if logical_frame_bytes(decoded)? > MAX_LOGICAL_READ_BYTES
                     || bytes > MAX_LOGICAL_READ_BYTES
                     || merged.len() >= MAX_LOGICAL_READ_FRAMES
                 {
                     return Err(ApiError::unavailable("Feed history exceeds the bounded read budget; scalable continuation is not available"));
                 }
-                merged.push(StoredRangeFrame {
-                    position: frame.position,
-                    identity: frame.identity,
-                    cursor: frame.cursor,
-                    frame: decoded,
-                });
                 after_position = Some(frame.position);
+                merged.push(frame);
                 expected = expected.saturating_add(1);
             }
         }
@@ -18163,13 +18573,9 @@ async fn lookup_feed_record(
                 "resolved Cursor position does not hold the requested frame",
             ));
         }
-        let decoded = STANDARD
-            .decode(frame.frame_base64.as_bytes())
-            .map_err(|_| {
-                ApiError::unavailable("current owner returned an invalid frame encoding")
-            })?;
+        let decoded = &frame.frame;
         let record =
-            decode_record(&decoded).map_err(|error| ApiError::unavailable(error.to_string()))?;
+            decode_record(decoded).map_err(|error| ApiError::unavailable(error.to_string()))?;
         return Ok(Json(record_response(
             CursorRecord {
                 cursor: frame.cursor,
@@ -21824,7 +22230,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn single_range_read_continues_beyond_ten_thousand_and_reports_unsupported_full_scan() {
+    async fn single_range_read_continues_beyond_page_bound_and_reports_unsupported_full_scan() {
         let directory = TempDir::new().unwrap();
         let store: Arc<dyn LogStore> =
             Arc::new(FileLogStore::open(directory.path().join("data")).unwrap());
@@ -21862,7 +22268,7 @@ mod tests {
                 generation: assignment.generation,
                 ownership_epoch: assignment.ownership_epoch,
             },
-            10_001,
+            (MAX_LOGICAL_READ_FRAMES + 1) as u64,
         );
         let membership = Arc::new(MembershipService::new(
             MemberAnnouncement {
@@ -21918,7 +22324,7 @@ mod tests {
             &state,
             feed_id,
             "orders.events",
-            Some("cursor-10000"),
+            Some("cursor-65536"),
             100,
             false,
             false,
@@ -21926,7 +22332,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(continued.len(), 1);
-        assert_eq!(continued[0].cursor, "cursor-10001");
+        assert_eq!(continued[0].cursor, "cursor-65537");
         let tail = read_complete_feed(&state, feed_id, "orders.events", None, 2, true, false)
             .await
             .unwrap();
@@ -21934,7 +22340,7 @@ mod tests {
             tail.iter()
                 .map(|frame| frame.cursor.as_str())
                 .collect::<Vec<_>>(),
-            vec!["cursor-10000", "cursor-10001"]
+            vec!["cursor-65536", "cursor-65537"]
         );
         assert_eq!(
             read_complete_feed(
@@ -25891,7 +26297,7 @@ mod tests {
 
         let (status, body) = read_feed("orders.deep", None, 12_000).await;
         assert_eq!(status, StatusCode::OK);
-        let expected: Vec<String> = (1..=10_000_u64)
+        let expected: Vec<String> = (1..=10_005_u64)
             .map(|sequence| format!("cursor-{sequence}"))
             .collect();
         assert_eq!(cursors_of(&body), expected);
@@ -25910,7 +26316,10 @@ mod tests {
 
         let (status, body) = read_feed("orders.blobs", None, 10).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(cursors_of(&body), vec!["cursor-1", "cursor-2"]);
+        assert_eq!(
+            cursors_of(&body),
+            vec!["cursor-1", "cursor-2", "cursor-3", "cursor-4"]
+        );
         let (status, body) = read_feed("orders.blobs", Some("cursor-2"), 10).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(cursors_of(&body), vec!["cursor-3", "cursor-4"]);
@@ -29640,5 +30049,81 @@ mod tests {
         // A Cursor absent from the frozen prefix stays unmapped.
         assert!(!tokens.contains_key("not-in-prefix"));
         assert_eq!(history.sweeps.get(), 1);
+    }
+
+    fn test_frame(position: u64, payload: &[u8]) -> StoredRangeFrame {
+        StoredRangeFrame {
+            position: RangePosition::new(position),
+            identity: AppendIdentity {
+                writer_session_id: Uuid::nil(),
+                writer_epoch: 1,
+                sequence: position,
+            },
+            cursor: format!("cursor-{position}"),
+            frame: crate::codec::encode_record(&crate::domain::StoredRecord {
+                message_id: Uuid::nil(),
+                producer_id: Uuid::nil(),
+                producer_sequence: position,
+                event_time_ns: 1,
+                ingest_time_ns: 1,
+                key: b"k".to_vec(),
+                payload: payload.to_vec(),
+                metadata: BTreeMap::new(),
+            })
+            .expect("record encodes"),
+        }
+    }
+
+    #[test]
+    fn frame_fetch_stream_round_trips_all_records() {
+        let frames = vec![
+            test_frame(1, b"alpha"),
+            test_frame(2, &vec![7u8; 3000]),
+            test_frame(3, b"omega"),
+        ];
+        let body = encode_frame_fetch(Some("next-cursor".to_owned()), frames);
+        assert_eq!(u32::from_le_bytes(body[0..4].try_into().unwrap()), 3);
+        let cursor_len = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+        assert_eq!(&body[8..8 + cursor_len], b"next-cursor");
+        let mut pos = 8 + cursor_len;
+        let mut payloads = Vec::new();
+        for expected in 1..=3_u64 {
+            let c_len = u32::from_le_bytes(body[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let cursor = std::str::from_utf8(&body[pos..pos + c_len])
+                .unwrap()
+                .to_owned();
+            pos += c_len;
+            assert_eq!(cursor, format!("cursor-{expected}"));
+            let f_len = u32::from_le_bytes(body[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let frame = &body[pos..pos + f_len];
+            pos += f_len;
+            let record = crate::codec::decode_record(frame).expect("stored frame parses");
+            assert_eq!(record.producer_sequence, expected);
+            payloads.push(record.payload);
+        }
+        assert_eq!(pos, body.len());
+        assert_eq!(payloads[0], b"alpha");
+        assert_eq!(payloads[1], vec![7u8; 3000]);
+        assert_eq!(payloads[2], b"omega");
+    }
+
+    #[test]
+    fn frame_fetch_stream_splits_large_pages_into_bounded_chunks() {
+        let big = vec![9u8; 900];
+        let frames: Vec<StoredRangeFrame> = (1..=6000)
+            .map(|position| test_frame(position, &big))
+            .collect();
+        let expected = encode_frame_fetch(None, frames.clone());
+        let chunks: Vec<Vec<u8>> = encode_frame_fetch_stream(None, frames).collect();
+        // 6000 * ~1KB records = ~6.6MB, must split past the 4MiB chunk size
+        assert!(chunks.len() > 2, "expected header plus several chunks");
+        assert!(chunks
+            .iter()
+            .skip(1)
+            .all(|chunk| chunk.len() <= FRAME_FETCH_CHUNK_BYTES + 2048));
+        let joined: Vec<u8> = chunks.into_iter().flatten().collect();
+        assert_eq!(joined, expected);
     }
 }

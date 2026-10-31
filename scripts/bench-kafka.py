@@ -34,6 +34,9 @@ BOOTSTRAP = "broker1:29092,broker2:29092,broker3:29092"
 RECORDS = int(os.environ.get("BENCH_RECORDS", "20000"))
 BYTES = int(os.environ.get("BENCH_BYTES", "1024"))
 PARTITIONS = int(os.environ.get("BENCH_PARTITIONS", "6"))
+# Consumer group parallelism — matches Whitewater's parallel reader threads
+# (BENCH_FEEDS): N threads over N partitions.
+READ_THREADS = int(os.environ.get("BENCH_READ_THREADS", "1"))
 MODE = os.environ.get("BENCH_MODE", "all")
 TOPIC = os.environ.get("BENCH_TOPIC", "bench.events")
 PRODUCER_PROPS = os.environ.get(
@@ -181,6 +184,7 @@ def run_read():
             "--bootstrap-server", BOOTSTRAP,
             "--topic", TOPIC,
             "--messages", str(RECORDS),
+            "--threads", str(READ_THREADS),
             "--timeout", "180000",
         ],
         timeout=360,

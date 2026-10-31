@@ -772,6 +772,13 @@ pub struct DistributaryStatus {
     /// failed probe keeps the last figure rather than guessing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lag_records: Option<u64>,
+    /// Most recent lag probe refusal — the remote frontier read failed,
+    /// so `lag_records` still carries the previous figure (or none). A
+    /// stalled Distributary whose lag never appears is otherwise
+    /// indistinguishable from a caught-up one; this keeps the probe's
+    /// refusal operator-visible instead of silently holding the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lag_probe_error: Option<String>,
 }
 
 /// What one drive cycle observed; `caught_up` means the last remote
@@ -15471,6 +15478,7 @@ mod tests {
                     last_error_at_ns: error.map(|_| 12),
                     reported_at_ns: 13,
                     lag_records: Some(4),
+                    lag_probe_error: None,
                 },
             }
         };

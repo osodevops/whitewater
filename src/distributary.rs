@@ -439,6 +439,10 @@ pub struct DistributaryDriver {
     /// sequences for a StateStore copy. Probes run on report ticks so a
     /// lag change never churns the catalog by itself.
     pub lag_records: Option<u64>,
+    /// Why the last lag probe failed — surfaced through the status so a
+    /// persistently refused frontier read is diagnosable instead of
+    /// leaving `lag_records` stuck at `None` with no explanation.
+    pub lag_probe_error: Option<String>,
 }
 
 impl DistributaryDriver {
@@ -460,6 +464,7 @@ impl DistributaryDriver {
             last_error_at_ns: self.last_error_at_ns,
             reported_at_ns: now_ns,
             lag_records: self.lag_records,
+            lag_probe_error: self.lag_probe_error.clone(),
         }
     }
 }
@@ -562,6 +567,7 @@ mod tests {
             last_error: None,
             last_error_at_ns: None,
             reported_at_ns: 1_000,
+            lag_probe_error: None,
         };
         // No prior report always publishes; an unchanged row inside the
         // heartbeat does not — that is the tick-noise throttle.

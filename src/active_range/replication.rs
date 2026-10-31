@@ -23,7 +23,7 @@ use super::{
 };
 
 pub const MAX_REPLICA_FRAME_BASE64_BYTES: usize = MAX_FRAME_BYTES.div_ceil(3) * 4;
-pub const MAX_COMMITTED_READ_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_COMMITTED_READ_BYTES: usize = 96 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -1334,7 +1334,41 @@ impl ReplicaAppendService {
         expected_commit: Option<CommitPosition>,
         page_limit: usize,
     ) -> Result<(CommitPosition, Vec<super::StoredRangeFrame>), ReplicaAppendError> {
-        if self.local_node != assignment.owner
+        self.read_range_page_inner(assignment, after, expected_commit, page_limit, true)
+            .await
+    }
+
+    /// Committed page served by any current replica member (Append Owner or
+    /// follower). The caller must corroborate the returned committed
+    /// boundary against another replica (same evidence contract as owner
+    /// reads) before trusting it; a follower can legitimately lag the
+    /// owner's committed watermark, so callers treat the boundary as the
+    /// readable committed prefix rather than the newest committed tip.
+    pub async fn read_replica_range_page(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        after: Option<RangePosition>,
+        expected_commit: Option<CommitPosition>,
+        page_limit: usize,
+    ) -> Result<(CommitPosition, Vec<super::StoredRangeFrame>), ReplicaAppendError> {
+        self.read_range_page_inner(assignment, after, expected_commit, page_limit, false)
+            .await
+    }
+
+    async fn read_range_page_inner(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        after: Option<RangePosition>,
+        expected_commit: Option<CommitPosition>,
+        page_limit: usize,
+        require_owner: bool,
+    ) -> Result<(CommitPosition, Vec<super::StoredRangeFrame>), ReplicaAppendError> {
+        let member = if require_owner {
+            self.local_node == assignment.owner
+        } else {
+            assignment.replicas.contains(&self.local_node)
+        };
+        if !member
             || self
                 .control
                 .active_range_assignment_by_id(assignment.range_id)
@@ -1361,7 +1395,7 @@ impl ReplicaAppendService {
         }
         let boundary = expected_commit.unwrap_or(committed);
         let frames = store
-            .read_committed_bounded(after, page_limit.clamp(1, 512), MAX_COMMITTED_READ_BYTES)
+            .read_committed_bounded(after, page_limit.clamp(1, 2048), MAX_COMMITTED_READ_BYTES)
             .await
             .map_err(map_store_error)?
             .into_iter()
@@ -1396,7 +1430,54 @@ impl ReplicaAppendService {
         ),
         ReplicaAppendError,
     > {
-        if self.local_node != assignment.owner
+        self.read_range_cursor_page_inner(assignment, spec, expected_commit, page_limit, true)
+            .await
+    }
+
+    /// Cursor/tail/ingest/point committed reads served by any current
+    /// replica member; see `read_replica_range_page` for the corroboration
+    /// contract the caller must uphold.
+    pub async fn read_replica_range_cursor_page(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        spec: RangeReadSpec<'_>,
+        expected_commit: Option<CommitPosition>,
+        page_limit: usize,
+    ) -> Result<
+        (
+            CommitPosition,
+            Option<RangePosition>,
+            Option<super::store::IngestBoundary>,
+            Vec<super::StoredRangeFrame>,
+        ),
+        ReplicaAppendError,
+    > {
+        self.read_range_cursor_page_inner(assignment, spec, expected_commit, page_limit, false)
+            .await
+    }
+
+    async fn read_range_cursor_page_inner(
+        &self,
+        assignment: &ActiveRangeAssignment,
+        spec: RangeReadSpec<'_>,
+        expected_commit: Option<CommitPosition>,
+        page_limit: usize,
+        require_owner: bool,
+    ) -> Result<
+        (
+            CommitPosition,
+            Option<RangePosition>,
+            Option<super::store::IngestBoundary>,
+            Vec<super::StoredRangeFrame>,
+        ),
+        ReplicaAppendError,
+    > {
+        let member = if require_owner {
+            self.local_node == assignment.owner
+        } else {
+            assignment.replicas.contains(&self.local_node)
+        };
+        if !member
             || self
                 .control
                 .active_range_assignment_by_id(assignment.range_id)
@@ -1523,7 +1604,7 @@ impl ReplicaAppendService {
             frames
         } else {
             store
-                .read_committed_bounded(start, page_limit.clamp(1, 512), MAX_COMMITTED_READ_BYTES)
+                .read_committed_bounded(start, page_limit.clamp(1, 2048), MAX_COMMITTED_READ_BYTES)
                 .await
                 .map_err(map_store_error)?
                 .into_iter()

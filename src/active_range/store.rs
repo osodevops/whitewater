@@ -2301,6 +2301,7 @@ fn read_window_inner(
                     // its first entry serves, so the local-span cap only
                     // ever evicts already-served views.
                     let mut materialized_segment = None;
+                    let mut segment_cache = SegmentReadCache::default();
                     let mut served = 0_usize;
                     let mut index = start;
                     while served < remaining {
@@ -2316,24 +2317,49 @@ fn read_window_inner(
                             materialized_segment = Some(segment);
                         }
                         let entry = &loaded.entries[index];
-                        let frame = read_indexed_frame(&inner.directory, &loaded, entry)?;
-                        if let Some(cap) = max_bytes {
-                            let size = crate::codec::logical_frame_size(&frame.frame)?;
-                            let candidate = bytes
-                                .checked_add(size)
-                                .ok_or(ActiveRangeStoreError::ReadBudgetExceeded)?;
-                            if candidate > cap {
-                                if frames.is_empty() {
-                                    return Err(ActiveRangeStoreError::ReadBudgetExceeded);
-                                }
-                                return Ok(frames);
+                        // Sequential scans serve contiguous same-segment
+                        // entries: read the whole run in one syscall and
+                        // slice per entry instead of seek+read per frame.
+                        let span_end = {
+                            let mut end = index.saturating_add(1);
+                            while end < loaded.entries.len()
+                                && end < index.saturating_add(remaining)
+                                && loaded.entries[end].segment == entry.segment
+                                && loaded.entries[end].position.value()
+                                    == loaded.entries[end - 1].position.value() + 1
+                                && loaded.entries[end].position.value() <= bound
+                            {
+                                end += 1;
                             }
-                            bytes = candidate;
+                            end
+                        };
+                        let run = &loaded.entries[index..span_end];
+                        let mut span_frames = read_indexed_frame_run(
+                            &inner.directory,
+                            &mut segment_cache,
+                            &loaded,
+                            run,
+                        )?
+                        .into_iter();
+                        for frame in &mut span_frames {
+                            if let Some(cap) = max_bytes {
+                                let size = crate::codec::logical_frame_size(&frame.frame)?;
+                                let candidate = bytes
+                                    .checked_add(size)
+                                    .ok_or(ActiveRangeStoreError::ReadBudgetExceeded)?;
+                                if candidate > cap {
+                                    if frames.is_empty() {
+                                        return Err(ActiveRangeStoreError::ReadBudgetExceeded);
+                                    }
+                                    return Ok(frames);
+                                }
+                                bytes = candidate;
+                            }
+                            frames.push(frame);
+                            next = next.saturating_add(1);
+                            served += 1;
+                            index += 1;
                         }
-                        frames.push(frame);
-                        next = next.saturating_add(1);
-                        served += 1;
-                        index += 1;
                     }
                     if served == 0 && next <= bound {
                         return Err(ActiveRangeStoreError::InvalidState(format!(
@@ -2375,7 +2401,7 @@ fn read_committed_bounded(
     read_window(
         inner,
         after,
-        limit.clamp(1, 128) as u64,
+        limit.clamp(1, 10_000) as u64,
         true,
         Some(max_bytes),
     )
@@ -3626,6 +3652,81 @@ fn read_indexed_frame(
         cursor: entry.cursor.clone(),
         frame,
     })
+}
+
+/// Per-window open-file cache: sequential scans read thousands of frames
+/// from one segment, and opening + statting the file per frame was the
+/// dominant read cost (~4 syscalls each). The cache keeps the last open
+/// segment handle; entries within a window almost always share it.
+#[derive(Default)]
+struct SegmentReadCache {
+    segment: Option<u64>,
+    file: Option<File>,
+}
+
+fn read_indexed_frame_run(
+    directory: &Path,
+    cache: &mut SegmentReadCache,
+    loaded: &LoadedRange,
+    entries: &[EntryIndex],
+) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
+    debug_assert!(!entries.is_empty());
+    let segment = entries[0].segment;
+    // Encrypted spans serve from the decrypted in-memory view — no file
+    // handle involved.
+    if loaded
+        .materialized
+        .get(&segment)
+        .is_some_and(|materialized| materialized.plaintext.is_some())
+    {
+        return entries
+            .iter()
+            .map(|entry| read_indexed_frame(directory, loaded, entry))
+            .collect();
+    }
+    if cache.segment != Some(segment) {
+        let path = loaded
+            .materialized
+            .get(&segment)
+            .map(|materialized| materialized.path.clone())
+            .unwrap_or_else(|| segment_path(directory, segment));
+        cache.file = Some(File::open(&path)?);
+        cache.segment = Some(segment);
+    }
+    let file = cache.file.as_mut().expect("segment file opened above");
+    let span_start = entries[0].frame_offset;
+    let span_end = entries.iter().try_fold(0_u64, |end, entry| {
+        entry
+            .frame_offset
+            .checked_add(entry.frame_length)
+            .map(|candidate| candidate.max(end))
+            .ok_or(ActiveRangeStoreError::PositionOverflow)
+    })?;
+    let span_length: usize = (span_end - span_start)
+        .try_into()
+        .map_err(|_| CodecError::FrameTooLarge)?;
+    let mut span = vec![0_u8; span_length];
+    file.seek(SeekFrom::Start(span_start))?;
+    file.read_exact(&mut span)?;
+    let mut frames = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let start = (entry.frame_offset - span_start) as usize;
+        let end = start + entry.frame_length as usize;
+        let frame = span[start..end].to_vec();
+        if *blake3::hash(&frame).as_bytes() != entry.frame_digest {
+            return Err(corrupt(
+                &segment_path(directory, entry.segment),
+                "record frame changed after recovery",
+            ));
+        }
+        frames.push(StoredRangeFrame {
+            position: entry.position,
+            identity: entry.identity.clone(),
+            cursor: entry.cursor.clone(),
+            frame,
+        });
+    }
+    Ok(frames)
 }
 
 fn deduplication_from_entries(entries: &[EntryIndex]) -> HashMap<WriterKey, DeduplicationState> {

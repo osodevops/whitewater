@@ -55,6 +55,15 @@ BATCH_ATTEMPTS = int(os.environ.get("BENCH_BATCH_ATTEMPTS", "8"))
 # Internal range fan-out for the run — the honest parallel-pipelines knob
 # (Kafka's partition count equivalent). 1 = one pipeline.
 RANGES = int(os.environ.get("BENCH_RANGES", "1"))
+# Feed count for parallel-consumer comparisons: N feeds each holding
+# ~RECORDS/N records, one reader thread per feed — the honest equivalent
+# of N partitions consumed by N consumer threads.
+FEEDS = int(os.environ.get("BENCH_FEEDS", "1"))
+# Read wire format: "json" (default compatibility) or "binary" — raw
+# stored frames via Accept: application/vnd.whitewater.frames, the
+# sendfile-style path that skips server decode + base64 + JSON.
+PAGE_LIMIT = int(os.environ.get("BENCH_PAGE_LIMIT", "65536"))
+READ_FORMAT = os.environ.get("BENCH_READ_FORMAT", "json")
 
 
 def compose(*args):
@@ -210,31 +219,35 @@ def b64(raw):
     return base64.b64encode(raw).decode()
 
 
+FRAMES_MEDIA = "application/vnd.whitewater.frames"
+
+
 class Session:
     """Keep-alive POST channel — urllib opens a fresh TCP connection per
     request, which measures the Docker port proxy more than the server.
     One persistent connection per Writer matches a real SDK client's
     socket reuse."""
 
-    def __init__(self, endpoint):
+    def __init__(self, endpoint, binary=False):
         self.hostport = endpoint.split("://", 1)[1]
+        self.binary = binary
         self.conn = http.client.HTTPConnection(self.hostport, timeout=60)
 
     def post(self, path, body):
         payload = json.dumps(body)
         for _ in range(2):
             try:
-                self.conn.request(
-                    "POST",
-                    path,
-                    payload,
-                    {
-                        "authorization": f"Bearer {KEY}",
-                        "content-type": "application/json",
-                    },
-                )
+                request_headers = {
+                    "authorization": f"Bearer {KEY}",
+                    "content-type": "application/json",
+                }
+                if self.binary:
+                    request_headers["accept"] = FRAMES_MEDIA
+                self.conn.request("POST", path, payload, request_headers)
                 response = self.conn.getresponse()
                 data = response.read()
+                if self.binary and response.status == 200:
+                    return response.status, data
                 return response.status, json.loads(data or b"{}")
             except (http.client.HTTPException, OSError) as error:
                 self.conn.close()
@@ -291,7 +304,7 @@ class WriteDriver:
         }
 
     def _run(self, worker):
-        writer, epoch = self.writers[worker]
+        writer, epoch, feed = self.writers[worker]
         session = Session(ENDPOINTS[worker % len(ENDPOINTS)])
         sent = 0
         index = worker * sum(self.shares)
@@ -353,7 +366,7 @@ def pre_split(feed, ranges):
         assert body.get("status") == "activated", body
 
 
-def run_write(feed, writers):
+def run_write(writers):
     driver = WriteDriver(writers, RECORDS, BYTES, BATCH)
     seconds = driver.run()
     result = bench_result(
@@ -367,33 +380,75 @@ def run_write(feed, writers):
     return [result]
 
 
-def run_read(feed):
-    """Replay the whole Feed through temporary fetch pages until a short or
-    empty page marks the tail."""
-    session = Session(ENDPOINTS[0])
+def parse_frame_fetch(data):
+    """Binary fetch page: u32 count, u32 next_cursor_len + cursor, then per
+    record u32 cursor_len + cursor + u32 frame_len + stored frame bytes.
+    The stored frame carries [u32be body_len][FSR2 body][u32be crc]; the
+    V2 body lays payload_len as a big-endian u32 at body offset 64."""
+    pos = 0
+    count = int.from_bytes(data[pos:pos + 4], "little"); pos += 4
+    nc_len = int.from_bytes(data[pos:pos + 4], "little"); pos += 4
+    next_cursor = data[pos:pos + nc_len].decode(); pos += nc_len
+    payload_bytes = 0
+    for _ in range(count):
+        c_len = int.from_bytes(data[pos:pos + 4], "little"); pos += 4 + c_len
+        f_len = int.from_bytes(data[pos:pos + 4], "little"); pos += 4
+        payload_bytes += int.from_bytes(data[pos + 68:pos + 72], "big")
+        pos += f_len
+    return count, payload_bytes, next_cursor
+
+
+def drain_feed(feed, index, totals):
+    """One reader thread: replay the whole Feed through temporary fetch
+    pages until a short or empty page marks the tail."""
+    session = Session(ENDPOINTS[index % len(ENDPOINTS)], binary=READ_FORMAT == "binary")
     cursor = ""
     records = 0
     payload_bytes = 0
-    started = time.monotonic()
     while True:
         status, page = session.post(
             "/v1/readers/temporary/fetch",
-            {"feed": feed, "after": cursor or None, "limit": 10000, "wait_ms": 0},
+            {"feed": feed, "after": cursor or None, "limit": PAGE_LIMIT, "wait_ms": 0},
         )
         assert status == 200, page
-        page_records = page.get("records", [])
-        if not page_records:
-            break
-        records += len(page_records)
-        for record in page_records:
-            payload_bytes += len(base64.b64decode(record.get("payload_base64", "")))
-        next_cursor = page.get("next_cursor")
+        if READ_FORMAT == "binary":
+            count, page_payload, next_cursor = parse_frame_fetch(page)
+            if count == 0:
+                break
+            records += count
+            payload_bytes += page_payload
+        else:
+            page_records = page.get("records", [])
+            if not page_records:
+                break
+            records += len(page_records)
+            for record in page_records:
+                payload_bytes += len(base64.b64decode(record.get("payload_base64", "")))
+            next_cursor = page.get("next_cursor")
         # A short page can be a byte-budget cut rather than the tail; the
         # read only ends on an empty page or a cursor that stops advancing.
         if not next_cursor or next_cursor == cursor:
             break
         cursor = next_cursor
+    totals[index] = (records, payload_bytes)
+
+
+def run_read(feeds):
+    """N parallel reader threads — one per Feed — the honest equivalent of
+    N consumer threads draining N partitions."""
+    totals = [(0, 0)] * len(feeds)
+    threads = [
+        threading.Thread(target=drain_feed, args=(feed, index, totals), daemon=True)
+        for index, feed in enumerate(feeds)
+    ]
+    started = time.monotonic()
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
     seconds = time.monotonic() - started
+    records = sum(total[0] for total in totals)
+    payload_bytes = sum(total[1] for total in totals)
     per_record = payload_bytes // records if records else BYTES
     return bench_result("whitewater", "read", records, per_record, seconds, [], {})
 
@@ -405,26 +460,41 @@ def main():
         wait_ready()
         suffix = f"{int(time.time())}{uuid.uuid4().hex[:4]}"
         domain = f"bench{suffix}"
-        feed = f"{domain}.events"
-        statements = [f"CREATE DOMAIN {domain}", f"CREATE FEED {feed}"]
+        feeds = (
+            [f"{domain}.events"]
+            if FEEDS == 1
+            else [f"{domain}.events{i}" for i in range(FEEDS)]
+        )
+        statements = [f"CREATE DOMAIN {domain}"]
+        for feed in feeds:
+            statements.append(f"CREATE FEED {feed}")
         writer_names = [f"benchw{suffix}w{i}" for i in range(WRITERS)]
-        for name in writer_names:
+        writer_feeds = []
+        for i, name in enumerate(writer_names):
+            feed = feeds[i % len(feeds)]
+            writer_feeds.append(feed)
             statements.append(f"CREATE WRITER {name} TO {feed}")
             statements.append(f"OPEN WRITER SESSION {name}")
         setup = wcl("; ".join(statements) + ";")
+        first_writer_result = 1 + len(feeds)
         writers = [
-            (name, setup["results"][2 + 2 * i + 1]["data"]["session_epoch"])
+            (
+                name,
+                setup["results"][first_writer_result + 2 * i + 1]["data"]["session_epoch"],
+                writer_feeds[i],
+            )
             for i, name in enumerate(writer_names)
         ]
         if RANGES > 1:
-            pre_split(feed, RANGES)
+            for feed in feeds:
+                pre_split(feed, RANGES)
 
         results = []
         if MODE in ("write", "all"):
-            results.extend(run_write(feed, writers))
+            results.extend(run_write(writers))
             report(results[-1])
         if MODE in ("read", "all"):
-            results.append(run_read(feed))
+            results.append(run_read(feeds))
             report(results[-1])
         assert all(
             result["mode"] != "write" or result.get("errors", 0) == 0
