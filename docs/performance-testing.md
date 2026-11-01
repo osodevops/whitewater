@@ -472,6 +472,45 @@ records, JSON tops out around batch 128 (~1.36 MB on the wire) while
 binary fits ~190 — the frames path reaches roughly 25% deeper into the
 same request budget.
 
+
+### Bytes-to-bytes matrix — 8 KB records, native transports both sides
+
+Same fixture and methodology as the SDK-vs-SDK run, payloads raised to
+8 KB with binary transports end-to-end on both sides: Kafka
+`kafka-clients` (native binary protocol, `batch.size` raised to 1 MiB so
+it coalesces comparably to Whitewater's 128-record frame batch) versus
+Whitewater `FSA1` writes + `application/vnd.whitewater.frames` reads.
+20k records, 8 writers, RF3 quorum both sides:
+
+| Pipelines | Metric | Kafka native client | Whitewater (binary both ways) | Winner |
+|---|---|---|---|---|
+| 1 partition / 1 feed | write rec/s (MiB/s) | 7,427 (58.0) | 5,545 (43.3) | Kafka ~1.3x |
+| | write p50 | 924 ms | 158 ms | **Whitewater ~6x lower** |
+| | read rec/s (MiB/s) | 29,591 (231) | 21,271 (166) | Kafka ~1.4x |
+| 3 partitions / 3 feeds | write rec/s (MiB/s) | 9,348 (73.0) | 4,275-4,590 (33-36) | Kafka ~2x |
+| | write p50 | 750 ms | 172-210 ms | **Whitewater ~4x lower** |
+| | read rec/s (MiB/s) | 24,057 (188) | 49,474 (387) | **Whitewater ~2x** |
+
+Honest reads at 8 KB:
+
+* **Reads: Whitewater scales past Kafka decisively** — 2x at 3
+  pipelines (387 vs 188 MiB/s), the same scaling shape the 1 KB runs
+  showed. Kafka's per-partition fetch responses cap out around
+  190-230 MiB/s on this fixture regardless of partition count.
+* **Writes: Kafka's coalescing scales with bytes too** — 1 MiB in
+  flight per partition amortizes its ~750 ms commit over ~128 records;
+  Whitewater's per-range serialized quorum rounds carry the same bytes
+  but the round cadence does not amortize (4.3-4.6k at 3 feeds vs 5.5k
+  at 1 — more pipelines did not help because the round, not the
+  transport, is the bound). This is the concrete engine work item:
+  pipelined quorum rounds per range, not more transport work.
+* **Latency stays decisively Whitewater's**: write p50 158-210 ms vs
+  Kafka's 750-924 ms at identical durability — the linger/coalesce tax
+  is ~4-6x at this payload.
+
+(The earlier same-shape 3-feed binary run measured 6,797 rec/s on a
+better host day — Docker Desktop variance; compare within a run set.)
+
 ### Write-path history
 
 The original per-record pipeline saturated at ~5-10 records/s (each
