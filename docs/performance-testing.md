@@ -372,6 +372,65 @@ docker run --rm --network whitewater-bench_default     -v /path/to/whitewater-ru
     WHITEWATER_ENDPOINTS=http://node1:7070,http://node2:7070,http://node3:7070     BENCH_RECORDS=60000 BENCH_WRITERS=8 BENCH_BATCH=512 BENCH_FEEDS=3     ./target-linux/release/examples/bench_feed'
 ```
 
+
+### Adaptive write batching (`Writer::autotuned`, `Writer::batched`)
+
+The Rust SDK now offers two ways to close Kafka's `linger.ms` gap:
+
+* `writer.batched(Batching)` — the explicit equivalent: records wait up
+  to `linger` for the batch to fill to `max_batch`, with
+  `max_in_flight` concurrent `append-batch` rounds.
+* `writer.autotuned(AutoTune)` — self-adjusting Nagle semantics: an
+  **idle** Writer sends immediately (a trickle pays zero added
+  latency); a **busy** Writer accumulates roughly one measured round
+  trip — the EWMA of observed response time *is* the linger.
+
+Adaptation is split deliberately: latency never shrinks the batch
+window (under load, RTT mostly reflects the tuner's own queue, so
+reacting to it is a negative feedback loop that collapses throughput —
+measured: 32-record rounds shrank to 16 and the run fell to 5k rec/s).
+Instead, server feedback sheds **concurrency**: a high-pressure
+`recommended_batch_count` (16, or 8 on a hot Key) halves outstanding
+rounds down to one; `retry_after_ms` serializes outright and floors
+the accumulation window. Fast, unpressured rounds recover slots toward
+`max_in_flight`. The batch cap itself is a ceiling you fill, not a
+target — the server's normal advisory (`100`) is populated on every
+outcome, so following it literally would pin every pipelined client to
+100-record rounds; explicit clients ignore it and win.
+
+Measured (60k x 1 KB, 8 writers, 3 feeds, same fixture as above):
+
+| Write mode | records/s | p50 | p99 |
+|---|---|---|---|
+| explicit `append_batch(512)` — tuned | 22,554 | 145 ms | 262 ms |
+| `autotuned` (cap 512, 4 in-flight) | 19,550 | 1,148 ms | 1,815 ms |
+| `autotuned` (cap 512, 8 in-flight) | 19,892 | 1,105 ms | 1,760 ms |
+| `autotuned` (cap 512, 1 in-flight) | 11,552 | 1,311 ms | 3,608 ms |
+
+The tuned pump lands ~88% of explicit sizing with **zero** tuning
+input — records queue while their batch forms, which is the honest
+latency cost of batch coalescing (still below Kafka's p50 515-605 ms
+at the upper envelope). The residual gap is pump plumbing overhead
+(channel, spawn, queue drain) under flood, not a semantic difference.
+For trickle traffic autotune is strictly better than either: a single
+record sends on the next loop iteration with no linger at all.
+
+`BENCH_AUTOTUNE=1` (+ `BENCH_MAX_BATCH`, `BENCH_IN_FLIGHT`) exercises
+this path in `examples/bench_feed.rs`.
+
+Two related fixes shipped with it:
+
+* **Sticky session endpoints** — `Reader`/`Writer`/`Member` calls now
+  pin to the Node that opened them and hop only on transport failure
+  (re-pinning to the survivor). The previous per-request round-robin
+  stranded Node-local pacing state: a `fetch` on one Node and its
+  `ack` on another left the `ReaderPacingTable` accumulating
+  unacknowledged bytes, halving page limits toward 8 and injecting
+  `retry_after_ms` throttles.
+* `reader.autotuned()` — adaptive page limit: full pages double the
+  next `limit` toward the transport bound; empty pages relax the tail.
+  Session fetch remains server-paced via `retry_after_ms`.
+
 ### Write-path history
 
 The original per-record pipeline saturated at ~5-10 records/s (each
