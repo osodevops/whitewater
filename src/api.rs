@@ -15523,7 +15523,50 @@ async fn writer_batch_prepare(
 async fn writer_batch_append(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<WriterBatchAppendRequest>,
+    body: Bytes,
+) -> Result<Json<WriterBatchAppendResponse>, ApiError> {
+    // Content-Type selects the wire contract: the JSON request stays
+    // the default, while `application/vnd.whitewater.frames` carries
+    // FSA1 append frames — same records, no base64 or JSON-serde pass.
+    let request = match headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(content_type) if content_type.starts_with(crate::codec::APPEND_FRAME_MEDIA_TYPE) => {
+            WriterBatchAppendRequest {
+                records: crate::codec::decode_append_frame_page(&body)
+                    .map_err(|error| {
+                        ApiError::bad_request(format!("invalid append frame batch: {error}"))
+                    })?
+                    .into_iter()
+                    .map(|record| WriterSessionAppendRequest {
+                        request_id: record.request_id,
+                        writer: record.writer,
+                        session_epoch: record.session_epoch,
+                        event_time_ns: record.event_time_ns.map(|value| value.to_string()),
+                        key_base64: STANDARD.encode(&record.key),
+                        payload_base64: STANDARD.encode(&record.payload),
+                        metadata_base64: record
+                            .metadata
+                            .iter()
+                            .map(|(name, value)| (name.clone(), STANDARD.encode(value)))
+                            .collect(),
+                        use_compression: record.use_compression,
+                    })
+                    .collect(),
+            }
+        }
+        _ => serde_json::from_slice::<WriterBatchAppendRequest>(&body).map_err(|error| {
+            ApiError::bad_request(format!("invalid append batch body: {error}"))
+        })?,
+    };
+    writer_batch_append_inner(state, headers, request).await
+}
+
+async fn writer_batch_append_inner(
+    state: AppState,
+    headers: HeaderMap,
+    request: WriterBatchAppendRequest,
 ) -> Result<Json<WriterBatchAppendResponse>, ApiError> {
     authenticate_credential(&state, &headers)?;
     if request.records.is_empty() || request.records.len() > 1_000 {

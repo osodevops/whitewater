@@ -11,6 +11,10 @@ const MAGIC_LZ4: &[u8; 4] = b"FSR3";
 const MIN_COMPRESSION_BYTES: usize = 1024;
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
+/// Wire media type for `FSA1` append frames — the same
+/// `application/vnd.whitewater.frames` contract reads negotiate.
+pub const APPEND_FRAME_MEDIA_TYPE: &str = "application/vnd.whitewater.frames";
+
 #[derive(Debug, Error)]
 pub enum CodecError {
     #[error("record frame is too large")]
@@ -254,6 +258,101 @@ impl<'a> Reader<'a> {
     }
 }
 
+const MAGIC_APPEND: &[u8; 4] = b"FSA1";
+
+/// One client append record decoded from an `FSA1` frame — the binary
+/// equivalent of `WriterSessionAppendRequest`. Message identity,
+/// Writer sequence, and ingest time are minted downstream; the client
+/// supplies exactly these fields.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AppendFrameRecord {
+    pub writer: String,
+    pub request_id: Uuid,
+    pub session_epoch: u64,
+    pub event_time_ns: Option<i64>,
+    pub use_compression: bool,
+    pub key: Vec<u8>,
+    pub payload: Vec<u8>,
+    pub metadata: BTreeMap<String, Vec<u8>>,
+}
+
+/// Decode a `application/vnd.whitewater.frames` append body:
+/// `u32 count` then `u32 body_len | body | u32 crc32(body)` frames,
+/// each body `FSA1`-prefixed. Mirrors the stored-frame envelope so
+/// every corruption mode fails closed with a typed error.
+pub fn decode_append_frame_page(body: &[u8]) -> Result<Vec<AppendFrameRecord>, CodecError> {
+    let mut reader = Reader::new(body);
+    let count = reader.u32()? as usize;
+    if count > 1_000 {
+        return Err(CodecError::FieldTooLarge);
+    }
+    let mut records = Vec::with_capacity(count.min(1_000));
+    for _ in 0..count {
+        let frame_len = reader.u32()? as usize;
+        if frame_len > MAX_FRAME_BYTES {
+            return Err(CodecError::FrameTooLarge);
+        }
+        // frame_len is the body length; the 4-byte length prefix was
+        // already consumed, leaving body + 4-byte CRC32 trailer.
+        let frame_body = reader.take(frame_len)?;
+        let checksum = reader.u32()?;
+        if crc32fast::hash(frame_body) != checksum {
+            return Err(CodecError::InvalidChecksum);
+        }
+        records.push(decode_append_frame(frame_body)?);
+    }
+    if !reader.is_empty() {
+        return Err(CodecError::Truncated);
+    }
+    Ok(records)
+}
+
+fn decode_append_frame(body: &[u8]) -> Result<AppendFrameRecord, CodecError> {
+    let mut reader = Reader::new(body);
+    if reader.take(4)? != MAGIC_APPEND {
+        return Err(CodecError::InvalidMagic);
+    }
+    let writer_len = reader.u16()? as usize;
+    let writer = std::str::from_utf8(reader.take(writer_len)?)
+        .map_err(|_| CodecError::InvalidMetadataKey)?
+        .to_owned();
+    let request_id = Uuid::from_slice(reader.take(16)?).map_err(|_| CodecError::InvalidUuid)?;
+    let session_epoch = reader.u64()?;
+    let flags = reader.take(1)?[0];
+    let event_time_ns = if flags & 0x01 != 0 {
+        Some(reader.i64()?)
+    } else {
+        None
+    };
+    let key_len = reader.u32()? as usize;
+    let key = reader.take(key_len)?.to_vec();
+    let payload_len = reader.u32()? as usize;
+    let payload = reader.take(payload_len)?.to_vec();
+    let metadata_count = reader.u16()?;
+    let mut metadata = BTreeMap::new();
+    for _ in 0..metadata_count {
+        let name_len = reader.u16()? as usize;
+        let value_len = reader.u32()? as usize;
+        let name = std::str::from_utf8(reader.take(name_len)?)
+            .map_err(|_| CodecError::InvalidMetadataKey)?
+            .to_owned();
+        metadata.insert(name, reader.take(value_len)?.to_vec());
+    }
+    if !reader.is_empty() {
+        return Err(CodecError::Truncated);
+    }
+    Ok(AppendFrameRecord {
+        writer,
+        request_id,
+        session_epoch,
+        event_time_ns,
+        use_compression: flags & 0x02 != 0,
+        key,
+        payload,
+        metadata,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +532,69 @@ mod tests {
         assert!(matches!(
             decode_record(&frame),
             Err(CodecError::InvalidChecksum)
+        ));
+    }
+
+    #[test]
+    fn append_frame_page_round_trips_and_fails_closed() {
+        // FSA1 keeps the stored-frame envelope: len + body + crc32.
+        let record = AppendFrameRecord {
+            writer: "w.alpha".to_owned(),
+            request_id: Uuid::new_v4(),
+            session_epoch: 7,
+            event_time_ns: Some(1_700_000_000_000_000_001),
+            use_compression: true,
+            key: b"key".to_vec(),
+            payload: vec![0xAB; 64],
+            metadata: BTreeMap::from([("origin".to_owned(), b"bench".to_vec())]),
+        };
+        let mut body = Vec::new();
+        body.extend_from_slice(MAGIC_APPEND);
+        body.extend_from_slice(&(record.writer.len() as u16).to_be_bytes());
+        body.extend_from_slice(record.writer.as_bytes());
+        body.extend_from_slice(record.request_id.as_bytes());
+        body.extend_from_slice(&record.session_epoch.to_be_bytes());
+        body.push(0x03);
+        body.extend_from_slice(&record.event_time_ns.unwrap().to_be_bytes());
+        body.extend_from_slice(&(record.key.len() as u32).to_be_bytes());
+        body.extend_from_slice(&record.key);
+        body.extend_from_slice(&(record.payload.len() as u32).to_be_bytes());
+        body.extend_from_slice(&record.payload);
+        body.extend_from_slice(&1u16.to_be_bytes());
+        body.extend_from_slice(&6u16.to_be_bytes());
+        body.extend_from_slice(&5u32.to_be_bytes());
+        body.extend_from_slice(b"origin");
+        body.extend_from_slice(b"bench");
+        let mut page = Vec::new();
+        page.extend_from_slice(&1u32.to_be_bytes());
+        page.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        page.extend_from_slice(&body);
+        page.extend_from_slice(&crc32fast::hash(&body).to_be_bytes());
+
+        let decoded = decode_append_frame_page(&page).expect("decode");
+        assert_eq!(decoded, vec![record]);
+
+        // Corruption fails closed, never partial.
+        let mut torn = page.clone();
+        *torn.last_mut().expect("byte") ^= 0xFF;
+        assert!(matches!(
+            decode_append_frame_page(&torn),
+            Err(CodecError::InvalidChecksum)
+        ));
+        assert!(matches!(
+            decode_append_frame_page(&page[..page.len() - 3]),
+            Err(CodecError::Truncated)
+        ));
+        let mut wrong = page.clone();
+        wrong[8..12].copy_from_slice(b"XXXX");
+        // Repair the trailer so the magic check (not the checksum
+        // guard) is the path under test.
+        let body_len = u32::from_be_bytes(page[4..8].try_into().expect("len")) as usize;
+        let crc = crc32fast::hash(&wrong[8..8 + body_len]);
+        wrong[8 + body_len..8 + body_len + 4].copy_from_slice(&crc.to_be_bytes());
+        assert!(matches!(
+            decode_append_frame_page(&wrong),
+            Err(CodecError::InvalidMagic)
         ));
     }
 }
