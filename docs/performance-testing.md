@@ -231,7 +231,7 @@ Same fixture and workload (3 Nodes, RF3, deferred sync, 4 ranges,
 | Write records/s, 200k run | **26,546** | — |
 | Write p50 | **527-630 ms** | 905 ms |
 | Write p99 | 713-906 ms | 1,225 ms |
-| Read records/s (JSON) | **11,356** | 84,388-192,926 |
+| Read records/s (JSON) | **74,601** (3 feeds; was 11,356 before the read-path rounds) | 84,388-192,926 |
 | Read records/s (binary, 1 feed / 3 feeds) | **169,020 / 225,066** | 203,390 / 219,780 |
 
 **Whitewater now writes faster than Kafka's best measured fan-out on
