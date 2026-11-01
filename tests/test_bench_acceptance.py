@@ -17,6 +17,7 @@ def load(name):
 
 bench_feed = load("bench-feed.py")
 bench_kafka = load("bench-kafka.py")
+bench_kafka_sdk = load("bench-kafka-sdk.py")
 disk_full = load("test-disk-full.py")
 runner = load("run-acceptance.py")
 
@@ -110,6 +111,26 @@ class KafkaParserTests(unittest.TestCase):
     def test_consumer_without_rows_raises(self):
         with self.assertRaises(AssertionError):
             bench_kafka.parse_consumer_output("empty")
+
+
+class KafkaSdkDriverTests(unittest.TestCase):
+    def test_command_passes_bench_knobs_and_internal_bootstrap(self):
+        command = bench_kafka_sdk.java_bench_command(
+            {"BENCH_RECORDS": "60000", "BENCH_TOPIC": "t", "PATH": "x"}
+        )
+        rendered = " ".join(command)
+        self.assertIn("BOOTSTRAP_SERVERS=broker1:29092", rendered)
+        self.assertIn("BENCH_RECORDS=60000", rendered)
+        self.assertIn("BENCH_TOPIC=bench.events", rendered)
+        self.assertIn("--network whitewater-kafka-bench_default", rendered)
+        self.assertIn("kafka-sdk-m2:/root/.m2", rendered)
+        self.assertNotIn("PATH", rendered)
+
+    def test_module_loads_with_internal_endpoints(self):
+        self.assertEqual(
+            bench_kafka_sdk.BOOTSTRAP, "broker1:29092,broker2:29092,broker3:29092"
+        )
+        self.assertEqual(bench_kafka_sdk.PROJECT, "whitewater-kafka-bench")
 
 
 class DiskFullLaneTests(unittest.TestCase):

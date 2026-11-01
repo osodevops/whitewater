@@ -11,8 +11,10 @@ the same workload.
 | Driver | System under test | Fixture | Default ports |
 |---|---|---|---|
 | `scripts/bench-feed.py` | Whitewater (Python/HTTP protocol path) | `compose.verify.yml` as project `whitewater-bench` | 7771-7773 |
-| `scripts/bench-kafka.py` | Kafka 3.8.0 (3 combined KRaft brokers) | `compose.kafka.yml` as project `whitewater-kafka-bench` | 19092-19094 |
+| `scripts/bench-kafka.py` | Kafka 3.8.0 (3 combined KRaft brokers, perf tools) | `compose.kafka.yml` as project `whitewater-kafka-bench` | 19092-19094 |
+| `scripts/bench-kafka-sdk.py` | Kafka 3.8.0 through the Java SDK (`benchmarks/kafka-sdk`, plain `kafka-clients` — Spring delegates to it) | same `whitewater-kafka-bench` project; client runs in its own container on the bench network | 19092-19094 |
 | `whitewater-java/examples/BenchFeed.java` | Whitewater through the Java SDK | attaches to a live Riverbed | `WHITEWATER_ENDPOINTS` |
+| `whitewater-rust/examples/bench_feed.rs` | Whitewater through the Rust SDK (JSON writes; `application/vnd.whitewater.frames` binary reads) | attaches to a live Riverbed | `WHITEWATER_ENDPOINTS` |
 
 Every driver prints `BENCH_RESULT {json}` lines under one metric
 contract: `system`, `mode` (`write`/`read`), `records`,
@@ -296,6 +298,79 @@ in-network (`docker exec` into the fixture, matching how Kafka's
 consumer-perf runs inside its container) reaches ~202k rec/s, i.e.
 parity with Kafka's sendfile consumer. Per-request server assembly is
 ~230-330 MiB/s, so a faster client (Rust SDK) would show it directly.
+
+### SDK-vs-SDK comparison (Java `kafka-clients` vs Rust SDK)
+
+Same isolation as the matched-config runs: Kafka alone, `down -v`,
+then Whitewater alone. Both clients ran in **dedicated containers on
+the bench compose network** — neither rides localhost, so the veth hop
+is symmetric. 60,000 x 1,024-byte records, 8 producer/Writer threads,
+RF3, acknowledged-at-quorum both sides.
+
+| Config knob | Kafka Java SDK | Whitewater Rust SDK |
+|---|---|---|
+| Client | `org.apache.kafka:kafka-clients` 3.8.0 (`benchmarks/kafka-sdk`; Spring Kafka delegates to this client) | `whitewater-rust` (`Client`, `Writer`, binary `temporary_fetch_frames`) |
+| Durability | `acks=all`, RF3 topic, `min.insync.replicas=2` | RF3 quorum commit, `WHITEWATER_RANGE_SYNC_INTERVAL_MS=100` (acks=all-equivalent) |
+| Idempotence | `enable.idempotence=true` | Always-on per-record `request_id` dedup |
+| Batching | `linger.ms=5`, `batch.size=128 KiB` client-side | `append_batch` 512/call (server bound: 1,000 records/request) |
+| Read | `consumer.assign()` — no group join (stateless, matching WW temporary fetch); ~8 MiB `max.partition.fetch.bytes` measured optimum | `temporary_fetch_frames` pages of 65,536 records, `application/vnd.whitewater.frames` |
+
+Measured (60k x 1 KB, 8 writers):
+
+| Pipelines | Metric | Kafka Java SDK | Whitewater Rust SDK | Winner |
+|---|---|---|---|---|
+| 1 partition / 1 feed | write records/s | 32,500-34,400 | 16,500-17,100 | Kafka ~2x |
+| | write p50 | 521-605 ms | 215-223 ms | **Whitewater ~3x lower** |
+| | read records/s | 84,000-88,000 | 106,000-133,000 | **Whitewater ~1.3-1.5x** |
+| 3 partitions / 3 feeds | write records/s | 34,700 | 20,600-23,500 | Kafka ~1.6x |
+| | write p50 | 515 ms | 149-170 ms | **Whitewater ~3x lower** |
+| | read records/s | 86,200 | 227,000-299,000 | **Whitewater ~3x** |
+
+**Reads: Whitewater leads at both shapes and scales with pipelines**
+(106-133k single feed -> 227-299k three feeds). Three things stack in
+its favor: no group join or partition-assignment phase (temporary fetch
+is stateless), 65,536-record pages vs Kafka's ~1-8 MiB per-partition
+fetch responses, and the binary frame transport — the SDK decodes
+`FSR2`/`FSR3` frames client-side, so reads ship stored bytes verbatim.
+Kafka's Java read stayed ~86k regardless of partition count on this
+fixture — poll cadence per consumer bounds it, not partition fan-out.
+(For reference the stock `kafka-consumer-perf-test` reported
+168k `fetch.nMsg.sec` on the same data — it runs inside the broker on
+localhost, skipping the client-network hop both SDK benches pay.)
+
+**Writes: Kafka's producer batching still wins on rate (~1.6-2x)** —
+its producers coalesce sequential sends into per-partition batches
+asynchronously, keeping more records in flight per broker round trip.
+Whitewater serializes quorum rounds per range: batch 512 and batch
+1,000 landed identical rates (20.6k vs 20.8k) — the bound is round
+cadence, not request size. Whitewater's write latency is ~3x *lower*
+(p50 149-223 ms vs 515-605 ms): `linger.ms` buys Kafka's throughput
+with added delay, and a single-range quorum round is already
+sub-batch-sized at this shape.
+
+**Two honest caveats.** Whitewater's appends still ride JSON+base64 on
+the wire (a binary append endpoint does not exist yet; reads went
+binary first because bulk replay pays the most) — the write path's
+~33% base64 inflation and serde pass are real SDK-visible costs this
+comparison includes. Second, the Kafka write rate is *methodology
+sensitive*: the perf tool measured 8,711-22,099 under its own sender,
+while a straightforward 8-thread `kafka-clients` producer measures
+~32-35k — batch coalescing rewards naive parallelism.
+
+Reproduce:
+
+```bash
+# Kafka (alone): 1 then 3 pipelines
+python scripts/bench-kafka-sdk.py                    # BENCH_PARTITIONS=1
+BENCH_PARTITIONS=3 BENCH_READ_THREADS=3 BENCH_TOPIC=bench3.events     python scripts/bench-kafka-sdk.py
+docker compose -f compose.kafka.yml -p whitewater-kafka-bench down -v
+
+# Whitewater (alone): fixture on 7771-7773, deferred sync
+WHITEWATER_RANGE_SYNC_INTERVAL_MS=100 COMPOSE_PROJECT_NAME=whitewater-bench     WHITEWATER_VERIFY_PORT_1=7771 WHITEWATER_VERIFY_PORT_2=7772     WHITEWATER_VERIFY_PORT_3=7773 WHITEWATER_VERIFY_SUBNET=10.250.245.0/24     docker compose -f compose.verify.yml up -d
+# in the whitewater-rust checkout, release-built once:
+docker run --rm --network whitewater-bench_default     -v /path/to/whitewater-rust:/src -w /src rust:1.90-bookworm     bash -c 'cargo build --release --example bench_feed &&
+    WHITEWATER_ENDPOINTS=http://node1:7070,http://node2:7070,http://node3:7070     BENCH_RECORDS=60000 BENCH_WRITERS=8 BENCH_BATCH=512 BENCH_FEEDS=3     ./target-linux/release/examples/bench_feed'
+```
 
 ### Write-path history
 
