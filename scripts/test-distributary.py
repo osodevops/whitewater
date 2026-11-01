@@ -342,18 +342,54 @@ def main():
         wait_for(feed_lag_visible, "feed lag reported", timeout=240)
 
         def resumed_after_range_owner_loss():
-            lag = show_lag(range_survivor, "dstdom.mirror")
+            result = wcl(range_survivor, "SHOW DISTRIBUTARIES;")
+            mirror = [
+                row for row in result["results"][0]["data"]
+                if row["name"] == "dstdom.mirror"
+            ][0]
+            lag = mirror.get("lag_records")
             if lag is not None:
                 lag_peak[0] = max(lag_peak[0], int(lag))
-            rows = records(range_survivor, "dstdom.mirrored")
-            if len(rows) != 50:
-                return False
-            payloads = [
-                base64.b64decode(row["payload_base64"]).decode() for row in rows
-            ]
-            if len(set(payloads)) != 50:
-                raise AssertionError("duplicate records after range owner loss")
-            return rows
+            try:
+                rows = records(range_survivor, "dstdom.mirrored")
+                row_count = len(rows)
+                read_error = None
+            except Exception as error:
+                rows, row_count, read_error = [], -1, str(error)
+            if row_count == 50:
+                payloads = [
+                    base64.b64decode(row["payload_base64"]).decode()
+                    for row in rows
+                ]
+                if len(set(payloads)) != 50:
+                    raise AssertionError(
+                        "duplicate records after range owner loss"
+                    )
+                return rows
+            # Timeout evidence: which recovery leg is the copy waiting
+            # on — the range owner, the driver, or the append itself.
+            raise AssertionError({
+                "copied_rows": row_count,
+                "read_error": read_error,
+                "run_state": mirror.get("run_state"),
+                "last_error": mirror.get("last_error"),
+                "lag_records": lag,
+                "lag_probe_error": mirror.get("lag_probe_error"),
+                "lease_owner": mirror.get("lease_owner"),
+                "range_owner": current_range_owner(),
+            })
+
+        def current_range_owner():
+            try:
+                result = wcl(
+                    range_survivor,
+                    "INSPECT PLACEMENT FOR FEED dstdom.mirrored;",
+                )
+                return result["results"][0]["data"]["range_assignments"][0][
+                    "owner"
+                ]
+            except Exception as error:
+                return f"inspect failed: {error}"
 
         wait_for(resumed_after_range_owner_loss, "range-owner resume", timeout=240)
         range_owner_after = range_owner_index(range_survivor)
