@@ -431,6 +431,47 @@ Two related fixes shipped with it:
   next `limit` toward the transport bound; empty pages relax the tail.
   Session fetch remains server-paced via `retry_after_ms`.
 
+
+### Binary append transport (`FSA1`, opt-in `Writer::binary_appends`)
+
+`/v1/writers/append-batch` now selects the wire contract on
+`Content-Type`: the JSON request stays the default, and
+`application/vnd.whitewater.frames` bodies carry `FSA1` append frames —
+`u32 count` then `u32 body_len | body | u32 crc32` frames holding the
+client-owned fields (writer, request_id, session_epoch, event_time_ns,
+compression flag, key, payload, metadata). Message identity, Writer
+sequence, and ingest time are still minted downstream, so idempotency
+and retry semantics are identical. The Rust SDK opts in per Writer via
+`Writer::binary_appends()` (`BENCH_WRITE_FORMAT=binary`).
+
+Measured (same fixture, 8 writers, 3 feeds):
+
+| Shape | Transport | records/s | MiB/s | p50 |
+|---|---|---|---|---|
+| 60k x 1 KB, batch 512 | JSON | 24,054 | 23.5 | 143 ms |
+| | binary | 23,741 | 23.2 | 134 ms |
+| 20k x 8 KB, batch 128 | JSON | 4,143 | 32.4 | 210 ms |
+| | binary | **6,797** | **53.1** | **112 ms** |
+
+Two findings, both worth recording:
+
+* **At 1 KB the transports are statistically identical** — the
+  per-range quorum round (~50 ms serialized send per round, ~20
+  rounds/s/range) is the bound, not the wire codec. The write gap vs
+  Kafka at small payloads is *not* serialization; it is quorum round
+  cadence, and closing it is engine work (deeper round pipelining),
+  not more transport.
+* **At 8 KB the codec pass dominates** — base64+JSON was adding ~100 ms
+  per batch; binary nearly doubles the byte ceiling (+64% rec/s, +64%
+  MiB/s, p50 halved). Bigger payloads are where the transport earns
+  its keep, so binary is the raw-throughput conduit while JSON stays
+  the curl-friendly default.
+
+The 2 MiB default body limit applies to both contracts: at 8 KB
+records, JSON tops out around batch 128 (~1.36 MB on the wire) while
+binary fits ~190 — the frames path reaches roughly 25% deeper into the
+same request budget.
+
 ### Write-path history
 
 The original per-record pipeline saturated at ~5-10 records/s (each
