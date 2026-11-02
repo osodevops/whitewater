@@ -256,6 +256,31 @@ fn group_compatible(
         && b.pending_effect.is_none()
 }
 
+/// One detached group round handed to a range's executor thread: the
+/// closure captures every Send input (submissions, guards, permits) and
+/// materializes the round's future inside the executor's own runtime.
+// The future is intentionally NOT Send-bound: it is constructed and
+// run on the range's executor thread via spawn_local, so non-Send
+// sections never cross a boundary. Only the CLOSURE (Send captures)
+// crosses the channel.
+type RoundJob = Box<
+    dyn FnOnce() -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                    Output = Result<Vec<MajorityAppendResult>, MajorityAppendError>,
+                >,
+            >,
+        > + Send,
+>;
+
+type RoundReply =
+    tokio::sync::oneshot::Sender<Result<Vec<MajorityAppendResult>, MajorityAppendError>>;
+
+/// Fixed shared pool of round-executor lanes — never grows, never
+/// leaks a thread per range.
+type RoundExecutorLanes =
+    Arc<Mutex<Option<Vec<tokio::sync::mpsc::UnboundedSender<(RoundJob, RoundReply)>>>>>;
+
 #[derive(Clone)]
 pub struct MajorityAppendCoordinator {
     local: Arc<ReplicaAppendService>,
@@ -297,6 +322,12 @@ pub struct MajorityAppendCoordinator {
     >,
     /// Per-range bound on queued-but-undrained submissions.
     group_queue_windows: Arc<Mutex<std::collections::BTreeMap<super::RangeId, Arc<Semaphore>>>>,
+    /// Per-range round executor: a dedicated OS thread with its own
+    /// current-thread runtime runs group rounds detached — cancelling
+    /// the driving HTTP request can never abort a quorum round. The
+    /// round future is CONSTRUCTED on the executor thread so non-Send
+    /// sections never cross a thread boundary.
+    round_executors: RoundExecutorLanes,
 
     proofs: Option<Arc<CommitProofReporter>>,
 }
@@ -319,6 +350,7 @@ impl MajorityAppendCoordinator {
             repair_locks: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             group_queues: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             group_queue_windows: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            round_executors: Arc::new(Mutex::new(None)),
             proofs: None,
         }
     }
@@ -343,6 +375,47 @@ impl MajorityAppendCoordinator {
             .entry(range_id)
             .or_insert_with(|| Arc::new(OrderedTurn::new()))
             .clone()
+    }
+
+    /// Shared executor lanes: `min(available_parallelism, 8)` threads,
+    /// each with its own current-thread runtime + LocalSet; a range
+    /// hashes to one lane so rounds run detached without a thread per
+    /// range.
+    async fn round_executor(
+        &self,
+        range_id: super::RangeId,
+    ) -> tokio::sync::mpsc::UnboundedSender<(RoundJob, RoundReply)> {
+        let mut lanes = self.round_executors.lock().await;
+        let lanes = lanes.get_or_insert_with(|| {
+            (0..std::thread::available_parallelism()
+                .map(|count| count.get().min(8))
+                .unwrap_or(1))
+                .map(|lane| {
+                    let (tx, mut rx) =
+                        tokio::sync::mpsc::unbounded_channel::<(RoundJob, RoundReply)>();
+                    std::thread::Builder::new()
+                        .name(format!("ww-group-round-{lane}"))
+                        .spawn(move || {
+                            let runtime = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                                .expect("group round runtime");
+                            let local = tokio::task::LocalSet::new();
+                            local.block_on(&runtime, async move {
+                                while let Some((job, reply)) = rx.recv().await {
+                                    tokio::task::spawn_local(async move {
+                                        let outcome = job().await;
+                                        let _ = reply.send(outcome);
+                                    });
+                                }
+                            });
+                        })
+                        .expect("group round thread");
+                    tx
+                })
+                .collect()
+        });
+        lanes[(range_id.as_uuid().as_u128() as usize) % lanes.len()].clone()
     }
 
     async fn group_queue_window(&self, range_id: super::RangeId) -> Arc<Semaphore> {
@@ -1145,28 +1218,37 @@ impl MajorityAppendCoordinator {
                 )),
             };
         }
-        let merged_submissions = subs.len() > 1;
-        // Reassemble the round in queue order; per-request `None` keeps
-        // explicit-sequence submissions unpatched.
-        let mut merged_requests = Vec::new();
-        let mut merged_frames: Vec<Option<Vec<u8>>> = Vec::new();
-        // Capture per-submission frame counts before the vecs drain —
-        // the split below slices results by them.
-        let counts: Vec<usize> = subs.iter().map(|sub| sub.frames.len()).collect();
-        for sub in &mut subs {
-            merged_requests.append(&mut sub.requests);
-            merged_frames.append(&mut sub.frames);
-        }
-        let mut requests = merged_requests;
+        // The round runs detached: if the driver's HTTP request is
+        // cancelled mid-round, the quorum round must still complete and
+        // reply to every merged submission — the caller only awaits its
+        // own slice. Guards/permits move into the spawned task with the
+        // exact lifetimes they had here.
+        let this = self.clone();
+        let executor = this.round_executor(range_id).await;
+        let job: RoundJob = Box::new(move || {
+            Box::pin(async move {
+                let merged_submissions = subs.len() > 1;
+                // Reassemble the round in queue order; per-request `None` keeps
+                // explicit-sequence submissions unpatched.
+                let mut merged_requests = Vec::new();
+                let mut merged_frames: Vec<Option<Vec<u8>>> = Vec::new();
+                // Capture per-submission frame counts before the vecs drain —
+                // the split below slices results by them.
+                let counts: Vec<usize> = subs.iter().map(|sub| sub.frames.len()).collect();
+                for sub in &mut subs {
+                    merged_requests.append(&mut sub.requests);
+                    merged_frames.append(&mut sub.frames);
+                }
+                let mut requests = merged_requests;
+                let _locked_at = _phase_timer.elapsed();
+                let round_result: Result<Vec<MajorityAppendResult>, MajorityAppendError> = async {
         let _locked_at = _phase_timer.elapsed();
-        let round_result: Result<Vec<MajorityAppendResult>, MajorityAppendError> = async {
-        let _locked_at = _phase_timer.elapsed();
-        let assignment = self
+        let assignment = this
             .control
             .active_range_assignment_by_id(range_id)
             .await
             .ok_or_else(|| {
-                self.error(
+                this.error(
                     MajorityAppendErrorCode::AssignmentNotFound,
                     "Active Range assignment is not available",
                     true,
@@ -1175,14 +1257,14 @@ impl MajorityAppendCoordinator {
                 )
             })?;
         let _assign_ms = _phase_timer.elapsed() - _locked_at;
-        if assignment.owner != *self.local.local_node()
+        if assignment.owner != *this.local.local_node()
             || requests.iter().any(|r| r.append_owner != assignment.owner)
         {
-            return Err(self.error(
+            return Err(this.error(
                 MajorityAppendErrorCode::NotCurrentOwner,
                 format!(
                     "Node {} is not the current Append Owner",
-                    self.local.local_node()
+                    this.local.local_node()
                 ),
                 true,
                 vec![],
@@ -1208,7 +1290,7 @@ impl MajorityAppendCoordinator {
                 request.identity.sequence = match minted.get(&writer_key) {
                     Some(allocated) => *allocated,
                     None => {
-                        let next = self
+                        let next = this
                             .local
                             .next_writer_sequence(
                                 &assignment,
@@ -1217,7 +1299,7 @@ impl MajorityAppendCoordinator {
                             )
                             .await
                             .map_err(|error| {
-                                self.error(
+                                this.error(
                                     MajorityAppendErrorCode::LocalStorageFailure,
                                     format!("owner could not mint the Writer sequence: {error}"),
                                     true,
@@ -1235,7 +1317,7 @@ impl MajorityAppendCoordinator {
                     request.identity.sequence,
                 )
                 .map_err(|error| {
-                    self.error(
+                    this.error(
                         MajorityAppendErrorCode::LocalStorageFailure,
                         format!("owner could not encode the minted record: {error}"),
                         false,
@@ -1281,15 +1363,15 @@ impl MajorityAppendCoordinator {
             .collect();
         let _encode_ms = _phase_timer.elapsed() - _locked_at - _assign_ms;
         let _store_mark = _phase_timer.elapsed();
-        let local_results = self
+        let local_results = this
             .local
             .append_batch(envelope(local_frames, None))
             .await
             .map_err(|error| {
                 if error.code == ReplicaAppendErrorCode::PendingEffectOccupied {
-                    return self.occupied_error(error.pending_effect.map(|boxed| *boxed));
+                    return this.occupied_error(error.pending_effect.map(|boxed| *boxed));
                 }
-                self.error(
+                this.error(
                     MajorityAppendErrorCode::LocalStorageFailure,
                     error.to_string(),
                     error.retryable,
@@ -1298,7 +1380,7 @@ impl MajorityAppendCoordinator {
                 )
             })?;
         if local_results.len() != requests.len() {
-            return Err(self.error(
+            return Err(this.error(
                 MajorityAppendErrorCode::LocalStorageFailure,
                 "local batch append returned a truncated result set",
                 false,
@@ -1338,12 +1420,12 @@ impl MajorityAppendCoordinator {
                 .value()
                 .checked_sub(1)
                 .map(RangePosition::new);
-            let frames = self
+            let frames = this
                 .local
                 .read_assignment_uncommitted(&assignment, after, 1)
                 .await
                 .map_err(|error| {
-                    self.error(
+                    this.error(
                         MajorityAppendErrorCode::LocalStorageFailure,
                         format!("owner could not reload the deduplicated frame: {error}"),
                         true,
@@ -1362,7 +1444,7 @@ impl MajorityAppendCoordinator {
         let followers = assignment
             .replicas
             .iter()
-            .filter(|node| *node != self.local.local_node())
+            .filter(|node| *node != this.local.local_node())
             .cloned()
             .collect::<Vec<_>>();
         // Fused commit: plain batches pin the commit marker to the run's
@@ -1388,18 +1470,18 @@ impl MajorityAppendCoordinator {
         // queues minted here, so releasing the append lock lets the next
         // round's local work overlap this round's network flight without
         // ever letting a later batch reach a replica first.
-        let send_turn_a = self.send_turn(range_id, &followers[0]).await;
-        let send_turn_b = self.send_turn(range_id, &followers[1]).await;
+        let send_turn_a = this.send_turn(range_id, &followers[0]).await;
+        let send_turn_b = this.send_turn(range_id, &followers[1]).await;
         let send_permit_a = send_turn_a.hold();
         let send_permit_b = send_turn_b.hold();
-        let commit_permit = self.commit_turn(range_id).await.hold();
+        let commit_permit = this.commit_turn(range_id).await.hold();
         let last_position = local_results[local_results.len() - 1].position;
         let _store_ms = _phase_timer.elapsed() - _store_mark;
         let _local_ms = _phase_timer.elapsed() - _locked_at;
         drop(_append_guard);
         // Timing accumulators: [send_wait_ms, send_ms] max per follower.
         let timing = std::sync::Mutex::new((0.0_f64, 0.0_f64));
-        let mut durable = vec![self.local.local_node().clone()];
+        let mut durable = vec![this.local.local_node().clone()];
         // Windowed sends: the OrderedTurn still mints and admits sends
         // strictly in order, but a ticket is released as soon as its
         // request is on the wire — up to MAX_INFLIGHT_SENDS_PER_FOLLOWER
@@ -1407,10 +1489,11 @@ impl MajorityAppendCoordinator {
         // ordered admission lands them in position order. The lane
         // permit is held across the response AND any gap repair, so a
         // lane never exceeds the window even mid-repair.
-        let lane_a = self.send_lane(range_id, &followers[0]).await;
-        let lane_b = self.send_lane(range_id, &followers[1]).await;
-        let repair_a = self.repair_lock(range_id, &followers[0]).await;
-        let repair_b = self.repair_lock(range_id, &followers[1]).await;
+        let lane_a = this.send_lane(range_id, &followers[0]).await;
+        let lane_b = this.send_lane(range_id, &followers[1]).await;
+        let repair_a = this.repair_lock(range_id, &followers[0]).await;
+        let repair_b = this.repair_lock(range_id, &followers[1]).await;
+        let send_transport = this.transport.clone();
         let send_to =
             |node: StorageNodeId,
              turn_permit: TurnPermit,
@@ -1420,6 +1503,8 @@ impl MajorityAppendCoordinator {
                 let timing = &timing;
                 let requests = &requests;
                 let assignment = &assignment;
+                let send_transport = &send_transport;
+                let this = &this;
                 async move {
                     let t = std::time::Instant::now();
                     turn_permit.wait().await;
@@ -1444,7 +1529,7 @@ impl MajorityAppendCoordinator {
                     let waited = t.elapsed().as_secs_f64() * 1000.0;
                     let t = std::time::Instant::now();
                     let send = tokio::spawn({
-                        let transport = self.transport.clone();
+                        let transport = send_transport.clone();
                         let node = node.clone();
                         let request = request.clone();
                         async move { transport.append_batch(&node, request).await }
@@ -1466,7 +1551,7 @@ impl MajorityAppendCoordinator {
                             // serialize on the lane's repair lock; re-driven
                             // frames dedup idempotently on the replica.
                             let _repair = repair.lock().await;
-                            match self
+                            match this
                                 .fill_replica_gap(
                                     assignment,
                                     &requests[0],
@@ -1476,7 +1561,7 @@ impl MajorityAppendCoordinator {
                                 )
                                 .await
                             {
-                                Ok(()) => self.transport.append_batch(&node, request).await,
+                                Ok(()) => send_transport.append_batch(&node, request).await,
                                 Err(fill_error) => Err(fill_error),
                             }
                         }
@@ -1531,7 +1616,7 @@ impl MajorityAppendCoordinator {
                 }
             };
             if accepted.len() != local_results.len() {
-                return Err(self.error(
+                return Err(this.error(
                     MajorityAppendErrorCode::FrameConflict,
                     format!("replica {node} acknowledged a truncated batch"),
                     false,
@@ -1552,7 +1637,7 @@ impl MajorityAppendCoordinator {
                 if accepted_frame.position != local_frame.position
                     || accepted_frame.frame_digest != local_frame.frame_digest
                 {
-                    return Err(self.error(
+                    return Err(this.error(
                         MajorityAppendErrorCode::FrameConflict,
                         format!("replica {node} acknowledged different bytes or position"),
                         false,
@@ -1574,10 +1659,10 @@ impl MajorityAppendCoordinator {
             durable_followers.push(node);
         }
         if !divergent.is_empty() {
-            self.local
+            this.local
                 .note_owner_diverged(range_id, requests[0].ownership_epoch)
                 .await;
-            return Err(self.error(
+            return Err(this.error(
                 MajorityAppendErrorCode::NoDurableMajority,
                 format!(
                     "replica(s) {} hold divergent committed evidence; ownership resolving",
@@ -1593,8 +1678,8 @@ impl MajorityAppendCoordinator {
             ));
         }
         if durable.len() < ACTIVE_RANGE_COMMIT_QUORUM {
-            self.local.note_owner_quorum_blocked(range_id).await;
-            return Err(self.error(
+            this.local.note_owner_quorum_blocked(range_id).await;
+            return Err(this.error(
                 MajorityAppendErrorCode::NoDurableMajority,
                 "batch append is durable on fewer than two current replicas",
                 true,
@@ -1602,7 +1687,7 @@ impl MajorityAppendCoordinator {
                 vec![],
             ));
         }
-        self.local.note_owner_quorum_restored(range_id).await;
+        this.local.note_owner_quorum_restored(range_id).await;
         if has_pending {
             // Deferred commit: pending-effect frames stay fenced behind
             // their effect marker exactly like the single-append path —
@@ -1648,7 +1733,7 @@ impl MajorityAppendCoordinator {
             .cloned()
             .collect();
         if unfused.len() == 1 {
-            match self
+            match this
                 .transport
                 .commit(&unfused[0], commit_request.clone())
                 .await
@@ -1660,8 +1745,8 @@ impl MajorityAppendCoordinator {
                 }
             }
         } else if unfused.len() == 2 {
-            let first_commit = self.transport.commit(&unfused[0], commit_request.clone());
-            let second_commit = self.transport.commit(&unfused[1], commit_request.clone());
+            let first_commit = this.transport.commit(&unfused[0], commit_request.clone());
+            let second_commit = this.transport.commit(&unfused[1], commit_request.clone());
             let (first_result, second_result) = tokio::join!(first_commit, second_commit);
             match first_result {
                 Ok(_) => evidence.push(unfused[0].clone()),
@@ -1679,7 +1764,7 @@ impl MajorityAppendCoordinator {
             }
         }
         if evidence.is_empty() {
-            return Err(self.error(
+            return Err(this.error(
                 MajorityAppendErrorCode::NoCommitMajority,
                 format!(
                     "batch majority exists but no follower persisted CommitPosition evidence; retry with the same append identities{last_commit_error}"
@@ -1689,8 +1774,8 @@ impl MajorityAppendCoordinator {
                 evidence,
             ));
         }
-        self.local.commit(commit_request).await.map_err(|error| {
-            self.error(
+        this.local.commit(commit_request).await.map_err(|error| {
+            this.error(
                 MajorityAppendErrorCode::LocalStorageFailure,
                 error.to_string(),
                 // A PositionGap here means the local tail was truncated by
@@ -1720,10 +1805,10 @@ impl MajorityAppendCoordinator {
                 "append batch phase timing"
             );
         }
-        evidence.push(self.local.local_node().clone());
+        evidence.push(this.local.local_node().clone());
         durable.sort();
         evidence.sort();
-        self.report_commit_proof(
+        this.report_commit_proof(
             requests[0].feed_id,
             range_id,
             CommitPosition::new(last_position.value()),
@@ -1744,60 +1829,89 @@ impl MajorityAppendCoordinator {
             .collect())
         }
         .await;
-        // Split the merged round back per submission in queue order.
-        let groups = subs.len();
-        let mine_index = mine;
-        match round_result {
-            Ok(results) => {
-                let mut offset = 0_usize;
-                let mut mine = None;
-                for (index, sub) in subs.into_iter().enumerate() {
-                    let end = offset + counts[index];
-                    let slice = results[offset..end].to_vec();
-                    offset = end;
-                    if index == mine_index {
-                        mine = Some(slice);
-                    } else {
-                        let _ = sub.reply.send(Ok(slice));
+                // Split the merged round back per submission in queue order.
+                let groups = subs.len();
+                let mine_index = mine;
+                match round_result {
+                    Ok(results) => {
+                        let mut offset = 0_usize;
+                        let mut mine = None;
+                        for (index, sub) in subs.into_iter().enumerate() {
+                            let end = offset + counts[index];
+                            let slice = results[offset..end].to_vec();
+                            offset = end;
+                            if index == mine_index {
+                                mine = Some(slice);
+                            } else {
+                                let _ = sub.reply.send(Ok(slice));
+                            }
+                        }
+                        tracing::debug!(groups, "append batch group round");
+                        Ok(mine.expect("own slice"))
                     }
-                }
-                tracing::debug!(groups, "append batch group round");
-                Ok(mine.expect("own slice"))
-            }
-            Err(error) => {
-                // Poison isolation: a merged round's per-frame refusal
-                // may not apply to every submission — re-run each solo
-                // so one bad batch cannot take innocent ones down.
-                // Non-retryable refusals may be per-frame: solo re-runs
-                // isolate the bad submission from the innocent ones.
-                let poisonous = !error.retryable;
-                if merged_submissions && poisonous {
-                    let mut mine = None;
-                    for (index, sub) in subs.into_iter().enumerate() {
-                        let frames = if sub.frames.iter().all(Option::is_none) {
-                            None
+                    Err(error) => {
+                        // Poison isolation: a merged round's per-frame refusal
+                        // may not apply to every submission — re-run each solo
+                        // so one bad batch cannot take innocent ones down.
+                        // Non-retryable refusals may be per-frame: solo re-runs
+                        // isolate the bad submission from the innocent ones.
+                        let poisonous = !error.retryable;
+                        if merged_submissions && poisonous {
+                            let mut mine = None;
+                            for (index, sub) in subs.into_iter().enumerate() {
+                                // Solo re-run lands the pre-encoded frames as
+                                // explicit requests — sequences were already
+                                // minted into request.identity by the failed
+                                // round, and dedup replays any landed prefix.
+                                let mut sub = sub;
+                                for (request, frame) in
+                                    sub.requests.iter_mut().zip(sub.frames.iter_mut())
+                                {
+                                    if let Some(frame) = frame.take() {
+                                        request.frame = frame.into();
+                                    }
+                                }
+                                let outcome = this.append_batch(sub.requests).await;
+                                if index == mine_index {
+                                    mine = Some(outcome);
+                                } else {
+                                    let _ = sub.reply.send(outcome);
+                                }
+                            }
+                            mine.expect("own outcome")
                         } else {
-                            Some(sub.frames)
-                        };
-                        let outcome = Box::pin(self.append_batch_inner(sub.requests, frames)).await;
-                        if index == mine_index {
-                            mine = Some(outcome);
-                        } else {
-                            let _ = sub.reply.send(outcome);
+                            for (index, sub) in subs.into_iter().enumerate() {
+                                let cloned = error.clone();
+                                if index == mine_index {
+                                    continue;
+                                }
+                                let _ = sub.reply.send(Err(cloned));
+                            }
+                            Err(error)
                         }
                     }
-                    mine.expect("own outcome")
-                } else {
-                    for (index, sub) in subs.into_iter().enumerate() {
-                        let cloned = error.clone();
-                        if index == mine_index {
-                            continue;
-                        }
-                        let _ = sub.reply.send(Err(cloned));
-                    }
-                    Err(error)
                 }
-            }
+            })
+        });
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        if executor.send((job, done_tx)).is_err() {
+            return Err(self.error(
+                MajorityAppendErrorCode::LocalStorageFailure,
+                "group-commit executor is closed",
+                true,
+                vec![],
+                vec![],
+            ));
+        }
+        match done_rx.await {
+            Ok(outcome) => outcome,
+            Err(_) => Err(self.error(
+                MajorityAppendErrorCode::LocalStorageFailure,
+                "group-commit round task failed",
+                true,
+                vec![],
+                vec![],
+            )),
         }
     }
 
@@ -1838,29 +1952,84 @@ impl MajorityAppendCoordinator {
                     true,
                 )
             })?;
-        for frame in frames {
-            if frame.position.value() >= upto.value() {
-                break;
+        let frames: Vec<_> = frames
+            .into_iter()
+            .take_while(|frame| frame.position.value() < upto.value())
+            .collect();
+        // Re-drive the gap with batch sends chunked by the same bounds a
+        // merged round obeys — one HTTP call per ~4096 frames instead of
+        // one per frame. No commit_at on repair chunks, mirroring the
+        // per-frame path which carries no commit evidence.
+        let mut chunk = Vec::new();
+        let mut chunk_bytes = 0_usize;
+        for frame in &frames {
+            let bytes = frame.frame.len() + 64;
+            if !chunk.is_empty()
+                && (chunk.len() >= super::replication::MAX_REPLICA_BATCH_FRAMES
+                    || chunk_bytes + bytes > MAX_GROUP_ROUND_BYTES)
+            {
+                self.fill_replica_chunk(assignment, request, replica, std::mem::take(&mut chunk))
+                    .await?;
+                chunk_bytes = 0;
             }
-            let accepted = self
-                .transport
-                .append(
-                    replica,
-                    ReplicaAppendRequest {
-                        feed_id: request.feed_id,
-                        range_id: request.range_id,
-                        generation: request.generation,
-                        ownership_epoch: request.ownership_epoch,
-                        append_owner: request.append_owner.clone(),
-                        expected_position: frame.position,
-                        identity: frame.identity,
-                        cursor: frame.cursor.clone(),
-                        frame: frame.frame.clone(),
-                        pending_effect: None,
-                    },
-                )
+            chunk_bytes += bytes;
+            chunk.push(frame.clone());
+        }
+        if !chunk.is_empty() {
+            self.fill_replica_chunk(assignment, request, replica, chunk)
                 .await?;
-            if accepted.position != frame.position {
+        }
+        Ok(())
+    }
+
+    /// Send one repair chunk as a single `append_batch` round-trip and
+    /// verify every accepted position lands where the owner stored it.
+    async fn fill_replica_chunk(
+        &self,
+        _assignment: &super::ActiveRangeAssignment,
+        request: &ReplicaAppendRequest,
+        replica: &StorageNodeId,
+        chunk: Vec<super::store::StoredRangeFrame>,
+    ) -> Result<(), ReplicaTransportError> {
+        let expected: Vec<RangePosition> = chunk.iter().map(|f| f.position).collect();
+        let accepted = self
+            .transport
+            .append_batch(
+                replica,
+                crate::active_range::replication::ReplicaBatchAppendRequest {
+                    feed_id: request.feed_id,
+                    range_id: request.range_id,
+                    generation: request.generation,
+                    ownership_epoch: request.ownership_epoch,
+                    append_owner: request.append_owner.clone(),
+                    frames: chunk
+                        .iter()
+                        .map(
+                            |frame| crate::active_range::replication::ReplicaBatchFrame {
+                                expected_position: Some(frame.position),
+                                identity: frame.identity.clone(),
+                                cursor: frame.cursor.clone(),
+                                frame: frame.frame.clone(),
+                                pending_effect: None,
+                            },
+                        )
+                        .collect(),
+                    commit_at: None,
+                },
+            )
+            .await?;
+        if accepted.len() != expected.len() {
+            return Err(ReplicaTransportError::transport(
+                format!(
+                    "replica {replica} accepted {} re-driven frames for {} supplied",
+                    accepted.len(),
+                    expected.len(),
+                ),
+                true,
+            ));
+        }
+        for (accepted, expected) in accepted.iter().zip(expected.iter()) {
+            if accepted.position != *expected {
                 return Err(ReplicaTransportError::transport(
                     format!(
                         "replica {replica} landed re-driven frame at RangePosition {}",

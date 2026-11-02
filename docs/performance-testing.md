@@ -84,6 +84,9 @@ driver; otherwise every driver tears its own project down with `down -v`.
 * **Sync mode**: `WHITEWATER_RANGE_SYNC_INTERVAL_MS=0` (default) keeps
   strict sync-before-ack; `>0` matches Kafka `acks=all` — acknowledged
   records live on a replica quorum's page cache and fsyncs amortize to
+  the interval (`WHITEWATER_RANGE_SYNC_INTERVAL_MS=never` disables
+  periodic fsync entirely — RF3 quorum + OS writeback, matching
+  Kafka's acks=all default) while strict/forced syncs still run;
   the interval, so only a correlated multi-Node power loss can drop the
   acknowledged tail. Pending-effect markers, freezes, split staging, and
   epoch moves stay strict in both modes.

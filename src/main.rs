@@ -394,7 +394,9 @@ async fn main() -> Result<()> {
             let transport = Arc::new(HttpReplicaTransport::with_client(
                 control_endpoints.clone(),
                 key,
-                build_internal_client(Duration::from_secs(2))?,
+                // Merged/windowed rounds + ordered admission need room
+                // beyond a transient disk stall; keep recovery at 2 s.
+                build_internal_client(Duration::from_secs(10))?,
             )?);
             let proofs = CommitProofReporter::new(Arc::new(CatalogCommitProofSink::new(
                 control.clone(),

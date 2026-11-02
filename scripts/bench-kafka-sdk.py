@@ -20,6 +20,11 @@ Environment knobs: BENCH_RECORDS, BENCH_BYTES, BENCH_PARTITIONS,
 BENCH_WRITERS, BENCH_READ_THREADS, BENCH_MODE, BENCH_TOPIC,
 BENCH_PRODUCER_ACKS, BENCH_PRODUCER_LINGER_MS, BENCH_PRODUCER_BATCH_SIZE,
 BENCH_CONSUMER_*, WW_KEEP_UP.
+
+KAFKA_LOG_FLUSH_INTERVAL_MS=100 + KAFKA_LOG_FLUSH_SCHEDULER_INTERVAL_MS=100
+enable Kafka fsync-every-100ms for the durability comparison — the
+scheduler interval ALSO defaults to Long.MAX, so the first knob alone
+does nothing (both default = never fsync).
 """
 
 import os

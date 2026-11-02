@@ -436,6 +436,10 @@ struct FileActiveRangeStoreInner {
     test_lock_free_pause: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     test_lock_free_reads: std::sync::atomic::AtomicUsize,
+    /// Test hook: milliseconds the background segment-seal thread sleeps
+    /// before doing its work — scoped to this store.
+    #[cfg(test)]
+    test_slow_seal_ms: std::sync::atomic::AtomicU64,
 }
 
 struct LoadedRange {
@@ -478,6 +482,11 @@ struct LoadedRange {
     /// `metadata()` syscall and gives staged batch writes their entry
     /// offsets before the bytes land.
     active_length: u64,
+    /// Segments whose rotation switched the active file but whose
+    /// seal work (sync_all + index checkpoint + manifest) is still
+    /// running on a background thread — deferred/never modes only.
+    /// Consumers must treat these as not yet sealed.
+    sealing: std::collections::BTreeSet<u64>,
 }
 
 /// A remote segment fetched into the tier cache: the cache file path, its
@@ -717,6 +726,7 @@ impl FileActiveRangeStore {
                 sync_in_flight: false,
                 sync_error: None,
                 active_length,
+                sealing: std::collections::BTreeSet::new(),
             }),
             self_weak: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -725,6 +735,8 @@ impl FileActiveRangeStore {
             test_lock_free_pause: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             test_lock_free_reads: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            test_slow_seal_ms: std::sync::atomic::AtomicU64::new(0),
         });
         inner
             .self_weak
@@ -819,15 +831,24 @@ impl FileActiveRangeStore {
         &self,
     ) -> Result<Vec<SegmentManifest>, ActiveRangeStoreError> {
         self.blocking(|inner| {
-            let (persisted, remote) = {
+            let (persisted, remote, sealing) = {
                 let loaded = inner
                     .loaded
                     .lock()
                     .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
-                (loaded.persisted.clone(), loaded.remote.clone())
+                (
+                    loaded.persisted.clone(),
+                    loaded.remote.clone(),
+                    loaded.sealing.clone(),
+                )
             };
             let mut manifests = Vec::new();
             for segment in 0..persisted.active_segment {
+                if sealing.contains(&segment) {
+                    // Seal artifacts are still being written; not yet
+                    // sealed — the uploader re-checks on a later pass.
+                    continue;
+                }
                 // A demoted segment has no local bytes to rehash; its
                 // stored manifest is the provenance record the uploader
                 // already verified, so report it rather than failing the
@@ -2801,6 +2822,101 @@ fn rotate_if_needed(
         || current_length.saturating_add(next_entry_bytes) <= inner.options.max_segment_bytes
         || loaded.persisted.appended != loaded.persisted.committed
     {
+        return Ok(());
+    }
+    // Deferred/never modes: the expensive seal runs off the append lock
+    // so an in-flight round never stalls on a ~256 MB segment fsync.
+    // Encrypted feeds keep the inline path — encrypt-on-seal rewrites
+    // the file in place and needs the lock.
+    if inner.options.sync_interval.is_some()
+        && !matches!(
+            inner.options.feed_key,
+            Some(crate::control::FeedKeyState::Active(_))
+        )
+    {
+        let old_file = loaded.active_file.try_clone()?;
+        let old_segment = loaded.persisted.active_segment;
+        let next_segment = old_segment
+            .checked_add(1)
+            .ok_or(ActiveRangeStoreError::PositionOverflow)?;
+        let next_file = open_segment(&inner.directory, next_segment)?;
+        next_file.sync_all()?;
+        let mut next = loaded.persisted.clone();
+        next.active_segment = next_segment;
+        persist_state(&inner.directory, &mut next)?;
+        let sealed_entries: Vec<EntryIndex> = loaded
+            .entries
+            .iter()
+            .filter(|entry| entry.segment == old_segment)
+            .cloned()
+            .collect();
+        let snapshot = next.clone();
+        loaded.sealing.insert(old_segment);
+        loaded.persisted = next;
+        loaded.active_file = next_file;
+        loaded.active_length = loaded.active_file.metadata()?.len();
+        if let Some(strong) = inner.self_weak.get().and_then(std::sync::Weak::upgrade) {
+            let directory = inner.directory.clone();
+            std::thread::Builder::new()
+                .name(format!("ww-seal-{old_segment}"))
+                .spawn(move || {
+                    #[cfg(test)]
+                    if strong
+                        .test_slow_seal_ms
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                        > 0
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(
+                            strong
+                                .test_slow_seal_ms
+                                .load(std::sync::atomic::Ordering::SeqCst),
+                        ));
+                    }
+                    let outcome = old_file
+                        .sync_all()
+                        .map_err(ActiveRangeStoreError::from)
+                        .and_then(|_| {
+                            write_segment_checkpoint(
+                                &directory,
+                                old_segment,
+                                &snapshot,
+                                &sealed_entries,
+                            )
+                        })
+                        .and_then(|_| {
+                            write_segment_manifest(
+                                &directory,
+                                old_segment,
+                                &snapshot,
+                                &sealed_entries,
+                            )
+                        });
+                    if let Ok(mut loaded) = strong.loaded.lock() {
+                        match outcome {
+                            Ok(_) => {
+                                loaded.sealing.remove(&old_segment);
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    range_dir = %directory.display(),
+                                    %error,
+                                    "async segment seal failed; store fails closed until reopen"
+                                );
+                                loaded.sync_error = Some(error.to_string());
+                            }
+                        }
+                    }
+                })
+                .expect("seal thread");
+            return Ok(());
+        }
+        // Executor is gone (store closing): finish the seal inline so
+        // the artifacts exist before the file moves on.
+        loaded.active_file.sync_all()?;
+        loaded.sealing.remove(&old_segment);
+        let sealed_entries: Vec<EntryIndex> = sealed_entries;
+        write_segment_checkpoint(&inner.directory, old_segment, &snapshot, &sealed_entries)?;
+        write_segment_manifest(&inner.directory, old_segment, &snapshot, &sealed_entries)?;
         return Ok(());
     }
     loaded.active_file.sync_all()?;
@@ -5554,6 +5670,89 @@ mod tests {
             "64 committed entries never sealed segment 0"
         );
         store
+    }
+
+    #[tokio::test]
+    async fn deferred_rotation_seals_in_the_background() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor.clone(),
+            FileActiveRangeStoreOptions {
+                max_segment_bytes: 2_048,
+                sync_interval: Some(std::time::Duration::from_millis(1)),
+                ..FileActiveRangeStoreOptions::default()
+            },
+        )
+        .unwrap();
+        // Hold the background seal so the second append lands while
+        // segment 0 is still sealing.
+        store
+            .inner
+            .test_slow_seal_ms
+            .store(500, std::sync::atomic::Ordering::SeqCst);
+        let directory = range_directory(root.path(), &descriptor);
+        let mut appended = 0_u64;
+        while appended < 64 && loaded_segment_switch(&store, 0) {
+            append_committed_records(&store, &descriptor, appended + 1, 1, 512).await;
+            appended += 1;
+        }
+        assert!(!loaded_segment_switch(&store, 0), "segment 0 never rotated");
+        // The manifest is not there yet — the seal sleeps — but the
+        // active segment already moved and appends/reads keep working.
+        let start = std::time::Instant::now();
+        append_committed_records(&store, &descriptor, appended + 1, 1, 512).await;
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(100),
+            "append stalled on the sealing segment"
+        );
+        let read = store.read_committed(None, 8).await.unwrap();
+        assert!(!read.is_empty(), "read across sealing segment");
+        // Let the seal finish: manifest + index checkpoint appear and
+        // the sealed segment verifies.
+        store
+            .inner
+            .test_slow_seal_ms
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..50 {
+            if manifest_path(&directory, 0).exists() && checkpoint_path(&directory, 0).exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(manifest_path(&directory, 0).exists());
+        assert!(checkpoint_path(&directory, 0).exists());
+        assert!(store.verify_sealed_segments().await.unwrap().len() == 1);
+    }
+
+    #[tokio::test]
+    async fn never_mode_skips_periodic_sync_entirely() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = FileActiveRangeStore::open_with_options(
+            root.path(),
+            descriptor.clone(),
+            FileActiveRangeStoreOptions {
+                sync_interval: Some(std::time::Duration::MAX),
+                ..FileActiveRangeStoreOptions::default()
+            },
+        )
+        .unwrap();
+        append_committed_records(&store, &descriptor, 1, 4, 512).await;
+        // Duration::MAX interval: elapsed >= interval is never true, so
+        // no background deferred sync ever starts.
+        let loaded = store.inner.loaded.lock().unwrap();
+        assert!(!loaded.sync_in_flight, "never mode fired a periodic sync");
+    }
+
+    fn loaded_segment_switch(store: &FileActiveRangeStore, expected: u64) -> bool {
+        store
+            .inner
+            .loaded
+            .lock()
+            .map(|loaded| loaded.persisted.active_segment == expected)
+            .unwrap_or(false)
     }
 
     #[tokio::test]

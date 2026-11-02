@@ -2474,6 +2474,194 @@ async fn submissions_over_the_byte_budget_split_rounds() {
     }
 }
 
+/// Drops one designated batch send to one follower, then records every
+/// repair `append_batch` call so the test can count them.
+struct DropOnceTransport {
+    services: Arc<BTreeMap<StorageNodeId, Arc<ReplicaAppendService>>>,
+    dropped: Arc<std::sync::Mutex<std::collections::HashSet<u64>>>,
+    repair_batches: Arc<std::sync::Mutex<Vec<usize>>>,
+    single_appends: Arc<std::sync::Mutex<usize>>,
+    drop_at: u64,
+    victim: StorageNodeId,
+}
+
+impl DropOnceTransport {
+    fn new(fixture: &Fixture, victim: StorageNodeId, drop_at: u64) -> Self {
+        Self {
+            services: Arc::new(fixture.services.clone()),
+            dropped: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            repair_batches: Arc::new(std::sync::Mutex::new(Vec::new())),
+            single_appends: Arc::new(std::sync::Mutex::new(0)),
+            drop_at,
+            victim,
+        }
+    }
+}
+
+#[async_trait]
+impl ReplicaTransport for DropOnceTransport {
+    async fn append(
+        &self,
+        replica: &StorageNodeId,
+        request: ReplicaAppendRequest,
+    ) -> Result<ReplicaAppendAccepted, ReplicaTransportError> {
+        *self.single_appends.lock().unwrap() += 1;
+        self.services[replica]
+            .append(request)
+            .await
+            .map_err(ReplicaTransportError::replica)
+    }
+
+    async fn append_batch(
+        &self,
+        replica: &StorageNodeId,
+        request: whitewater::active_range::ReplicaBatchAppendRequest,
+    ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaTransportError> {
+        let first = request
+            .frames
+            .first()
+            .and_then(|frame| frame.expected_position)
+            .map(|p| p.value())
+            .unwrap_or(0);
+        if replica == &self.victim
+            && first == self.drop_at
+            && self.dropped.lock().unwrap().insert(first)
+        {
+            // Pretend the send landed; the follower never saw it.
+            return Ok(request
+                .frames
+                .iter()
+                .map(|frame| ReplicaAppendAccepted {
+                    position: frame.expected_position.unwrap(),
+                    message_id: uuid::Uuid::new_v4(),
+                    cursor: frame.cursor.clone(),
+                    frame_digest: [0; 32],
+                    deduplicated: false,
+                    committed: false,
+                    durable: true,
+                })
+                .collect());
+        }
+        if replica == &self.victim {
+            self.repair_batches
+                .lock()
+                .unwrap()
+                .push(request.frames.len());
+        }
+        self.services[replica]
+            .import_committed_batch(request)
+            .await
+            .map_err(ReplicaTransportError::replica)
+    }
+
+    async fn commit(
+        &self,
+        replica: &StorageNodeId,
+        request: ReplicaCommitRequest,
+    ) -> Result<ReplicaCommitAccepted, ReplicaTransportError> {
+        self.services[replica]
+            .commit(request)
+            .await
+            .map_err(ReplicaTransportError::replica)
+    }
+
+    async fn discard_pending(
+        &self,
+        replica: &StorageNodeId,
+        request: ReplicaDiscardPendingRequest,
+    ) -> Result<ReplicaDiscardPendingResponse, ReplicaTransportError> {
+        self.services[replica]
+            .discard_pending(request)
+            .await
+            .map_err(ReplicaTransportError::replica)
+    }
+}
+
+#[tokio::test]
+async fn dropped_round_is_repaired_with_batch_sends_not_single_appends() {
+    let fixture = Fixture::new().await;
+    let victim = fixture.non_owner_nodes()[0].clone();
+    // Round 1 lands positions 1..2 for the victim; pretend round 2's
+    // send (position 2) was dropped so round 3 hits a PositionGap and
+    // fill_replica_gap re-drives it.
+    let transport = DropOnceTransport::new(&fixture, victim.clone(), 2);
+    let repair_batches = transport.repair_batches.clone();
+    let single_appends = transport.single_appends.clone();
+    let coordinator = MajorityAppendCoordinator::new(
+        fixture.services[&fixture.owner].clone(),
+        fixture.control.clone(),
+        Arc::new(transport),
+    );
+    coordinator
+        .append_batch(vec![
+            windowed_request(&fixture, 1),
+            windowed_request(&fixture, 2),
+            windowed_request(&fixture, 3),
+        ])
+        .await
+        .expect("round with the dropped send still commits");
+    coordinator
+        .append_batch(vec![windowed_request(&fixture, 4)])
+        .await
+        .expect("the next round repairs the gap and commits");
+    let batches = repair_batches.lock().unwrap().clone();
+    assert_eq!(
+        *single_appends.lock().unwrap(),
+        0,
+        "gap repair must not fall back to per-frame appends"
+    );
+    // batches[0] is the merged round (3 frames); the repair is the
+    // single follow-up batch carrying only the dropped position.
+    assert_eq!(
+        batches.as_slice(),
+        &[3, 1],
+        "the dropped round is repaired with ONE batch send, got {batches:?}"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_driver_still_completes_the_group_round() {
+    // Cancelling the driving submission's caller mid-round must not
+    // abort the quorum round: every other merged submission still gets
+    // its reply and lands contiguous positions.
+    let fixture = Fixture::new().await;
+    let transport = WindowedTransport::new(&fixture, std::time::Duration::from_millis(60));
+    let coordinator = MajorityAppendCoordinator::new(
+        fixture.services[&fixture.owner].clone(),
+        fixture.control.clone(),
+        Arc::new(transport.clone()),
+    );
+    // Driver: cancelled once the send delay has it inside the round.
+    let driver_request = windowed_request(&fixture, 1);
+    let driver = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.append_batch(vec![driver_request]).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    // Passengers queue behind the append lock and merge into the round.
+    let passenger_requests: Vec<_> = (2..=4_u64)
+        .map(|index| windowed_request(&fixture, index))
+        .collect();
+    let mut passengers = Vec::new();
+    for request in passenger_requests {
+        let coordinator = coordinator.clone();
+        passengers.push(tokio::spawn(async move {
+            coordinator.append_batch(vec![request]).await
+        }));
+    }
+    driver.abort();
+    let mut positions = Vec::new();
+    for handle in passengers {
+        let results = handle.await.unwrap().unwrap();
+        positions.push(results[0].position.value());
+    }
+    positions.sort_unstable();
+    assert!(positions.len() >= 3);
+    for pair in positions.windows(2) {
+        assert_eq!(pair[1], pair[0] + 1, "merged positions stay contiguous");
+    }
+}
+
 #[tokio::test]
 async fn pending_effect_submissions_never_merge() {
     // A pending-effect submission always runs alone: merging it into a

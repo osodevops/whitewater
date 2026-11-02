@@ -198,10 +198,11 @@ impl NodeConfig {
             anyhow::bail!("WHITEWATER_TIER_SCAN_MS must be greater than zero");
         }
         let remote_cache_bytes = parse_env("WHITEWATER_REMOTE_CACHE_BYTES", 1024 * 1024 * 1024)?;
-        let range_sync_interval = {
-            let ms = parse_env("WHITEWATER_RANGE_SYNC_INTERVAL_MS", 0)?;
-            (ms > 0).then(|| Duration::from_millis(ms))
-        };
+        let range_sync_interval = parse_range_sync_interval(
+            env::var("WHITEWATER_RANGE_SYNC_INTERVAL_MS")
+                .ok()
+                .as_deref(),
+        )?;
         let tls = [
             env::var("WHITEWATER_SUBSCRIPTION_MTLS_BIND").ok(),
             env::var("WHITEWATER_SUBSCRIPTION_MTLS_CERT").ok(),
@@ -493,6 +494,24 @@ fn parse_control_nodes(value: &str) -> Result<Vec<(u64, String)>> {
         .collect()
 }
 
+/// `never` = deferred durability with no periodic fsync at all
+/// (Kafka's acks=all default): durability comes from RF3 quorum + OS
+/// writeback; strict/forced syncs still run. Interval arithmetic only
+/// ever compares `elapsed() >= interval`, so Duration::MAX is safe —
+/// no Instant + it.
+fn parse_range_sync_interval(raw: Option<&str>) -> anyhow::Result<Option<Duration>> {
+    match raw {
+        Some("never") => Ok(Some(Duration::MAX)),
+        _ => {
+            let ms = raw
+                .unwrap_or("0")
+                .parse::<u64>()
+                .map_err(|error| anyhow::anyhow!("WHITEWATER_RANGE_SYNC_INTERVAL_MS: {error}"))?;
+            Ok((ms > 0).then(|| Duration::from_millis(ms)))
+        }
+    }
+}
+
 fn parse_env<T>(name: &str, default: T) -> Result<T>
 where
     T: std::str::FromStr,
@@ -686,6 +705,19 @@ mod tests {
         assert!(validate_internal_transport(InternalTransport::Mtls, Some(&bundle)).is_ok());
         assert!(validate_internal_transport(InternalTransport::Insecure, Some(&bundle)).is_err());
     }
+    #[test]
+    fn range_sync_interval_never_means_deferred_without_periodic_sync() {
+        assert_eq!(
+            super::parse_range_sync_interval(Some("never")).unwrap(),
+            Some(std::time::Duration::MAX)
+        );
+        assert_eq!(super::parse_range_sync_interval(Some("0")).unwrap(), None);
+        assert_eq!(
+            super::parse_range_sync_interval(Some("100")).unwrap(),
+            Some(std::time::Duration::from_millis(100))
+        );
+    }
+
     #[test]
     fn subscription_peer_endpoints_reject_duplicates_and_missing_values() {
         let endpoints = parse_peer_endpoints(

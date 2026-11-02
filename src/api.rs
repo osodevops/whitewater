@@ -15890,6 +15890,14 @@ async fn writer_batch_append_inner(
                         }
                     }
                     Err(error) => {
+                        // Per-record session replay exists to heal
+                        // Writer-sequence disagreements only — transport
+                        // errors, timeouts, and refusals return as
+                        // retryable 503: the client retries identical
+                        // request_ids and dedup covers ambiguity.
+                        if !owner_batch_error_heals(error.code) {
+                            return Err(ApiError::unavailable(error.message));
+                        }
                         tracing::warn!(
                             range_id = %range_id,
                             chunk = end - offset,
@@ -17152,6 +17160,10 @@ async fn route_append_batch_to_owner(
     let response = state
         .internal_http
         .post(format!("{owner_base}/append-batch-bin"))
+        // Below the SDK's 30 s request timeout so the ingress answers
+        // first; a stalled follower can hold a round well past the
+        // shared 5 s client default.
+        .timeout(Duration::from_secs(25))
         .header("x-whitewater-control-key", key)
         .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
         .body(bin_body)
@@ -17179,6 +17191,7 @@ async fn route_append_batch_to_owner(
         state
             .internal_http
             .post(format!("{owner_base}/append-batch"))
+            .timeout(Duration::from_secs(25))
             .header("x-whitewater-control-key", key)
             .json(&InternalOwnerBatchAppendRequest { requests })
             .send()
@@ -17332,6 +17345,19 @@ async fn execute_writer_command(
         }
     };
     Ok(())
+}
+
+/// Only Writer-sequence disagreements heal through per-record session
+/// replay; transport errors, timeouts, and refusals return to the
+/// client as retryable 503 — the client retries identical request_ids
+/// and dedup covers ambiguity.
+fn owner_batch_error_heals(code: Option<&str>) -> bool {
+    matches!(
+        code,
+        Some("writer.stale_sequence")
+            | Some("writer.sequence_gap")
+            | Some("writer.sequence_conflict")
+    )
 }
 
 fn writer_feedback(demand: &DemandMetrics, hot_key: bool) -> WriterServerFeedback {
@@ -30875,6 +30901,26 @@ mod tests {
         assert_eq!(payloads[0], b"alpha");
         assert_eq!(payloads[1], vec![7u8; 3000]);
         assert_eq!(payloads[2], b"omega");
+    }
+
+    #[test]
+    fn owner_batch_error_heals_only_on_sequence_codes() {
+        for code in [
+            "writer.stale_sequence",
+            "writer.sequence_gap",
+            "writer.sequence_conflict",
+        ] {
+            assert!(super::owner_batch_error_heals(Some(code)), "{code}");
+        }
+        for code in [
+            None,
+            Some("transport.timeout"),
+            Some("service_unavailable"),
+            Some("writer.dedup_conflict"),
+            Some("group_commit_reply_dropped"),
+        ] {
+            assert!(!super::owner_batch_error_heals(code), "{code:?}");
+        }
     }
 
     #[test]
