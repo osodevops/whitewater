@@ -168,7 +168,7 @@ pub struct FileActiveRangeStoreOptions {
 impl Default for FileActiveRangeStoreOptions {
     fn default() -> Self {
         Self {
-            max_segment_bytes: 256 * 1024 * 1024,
+            max_segment_bytes: 1024 * 1024 * 1024,
             max_range_bytes: None,
             sync_interval: None,
             tier: None,

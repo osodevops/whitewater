@@ -691,6 +691,35 @@ it is serialized per range and costs ~10–14 ms per 1k-frame round. Node
 CPU stays below ~1.4 of 16 cores, so the remaining gap is serialization,
 not compute.
 
+#### Round 3 — 1 GiB default segments (Kafka's `log.segment.bytes`)
+
+At 256 MiB, a 300k-record run rotates the active segment partway
+through. Sealing the old segment (a ~256 MB `sync_all`, a ~38 MB index
+checkpoint, and a full-segment manifest hash) flooded Docker Desktop's
+shared virtual disk. Writes then capped at ~48k rec/s with p95 of
+1.1–1.7 s, even with sealing moved off the append path. Kafka never
+rolls a segment at this size.
+
+`WHITEWATER_MAX_SEGMENT_BYTES` now defaults to 1 GiB. During a rolling
+upgrade, pin the old 256 MiB value explicitly until every Node runs the
+new default: a divergent bound diverges segment boundaries and manifest
+digests.
+
+Shape: 300k × 1 KiB, 16 writers, `BENCH_BATCHED=1`, binary writes, same
+host. The Kafka figures are from the same day.
+
+| Durability | Shape | Kafka Java SDK | Whitewater (1 GiB default) |
+|---|---|---|---|
+| no fsync (Kafka default / `never`) | 1 partition / 1 range | 75,180 / 97,358 rec/s, p50 984–1,433 ms | 75,465 / 76,398 rec/s, p50 86–87 ms |
+| | 3 partitions / 3 ranges | 99,342 / 121,445 rec/s, p50 470–827 ms | 77,366 / 74,648 rec/s, p50 82–83 ms |
+| fsync every 100 ms (`log.flush.*=100` / `100`) | 1 partition / 1 range | 79,367 / 73,235 rec/s, p50 1,431–1,448 ms | 56,475 / 56,356 rec/s, p50 88–90 ms |
+| | 3 partitions / 3 ranges | 100,010 / 112,927 rec/s, p50 596–811 ms | 59,509 / 59,260 rec/s, p50 100–102 ms |
+
+For the fsync-every-100 ms comparison, Kafka needs both
+`KAFKA_LOG_FLUSH_INTERVAL_MS=100` and
+`KAFKA_LOG_FLUSH_SCHEDULER_INTERVAL_MS=100`. The scheduler also
+defaults to Long.MAX, so setting only the first knob does nothing.
+
 ### Write-path history
 
 The original per-record pipeline saturated at ~5-10 records/s (each

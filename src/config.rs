@@ -92,9 +92,11 @@ pub struct NodeConfig {
     /// (`WHITEWATER_TIER_SCAN_MS`, default 5m).
     pub tier_scan_interval: Duration,
     /// Committed-segment rotation bound (`WHITEWATER_MAX_SEGMENT_BYTES`,
-    /// default 256 MiB). Identical semantics on every replica; a divergent
-    /// bound diverges segment boundaries and therefore manifest digests,
-    /// so it must be configured uniformly.
+    /// default 1 GiB, matching Kafka's `log.segment.bytes`). Identical
+    /// semantics on every replica; a divergent bound diverges segment
+    /// boundaries and therefore manifest digests, so it must be configured
+    /// uniformly — pin the old 256 MiB value explicitly while a rolling
+    /// upgrade mixes Node versions.
     pub max_segment_bytes: u64,
     /// Per-range ceiling on cached remote sealed-segment bytes
     /// (`WHITEWATER_REMOTE_CACHE_BYTES`, default 1 GiB). Materialized
@@ -190,7 +192,7 @@ impl NodeConfig {
             .map(PathBuf::from);
         let tier_scan_interval =
             Duration::from_millis(parse_env("WHITEWATER_TIER_SCAN_MS", 300_000)?);
-        let max_segment_bytes = parse_env("WHITEWATER_MAX_SEGMENT_BYTES", 256 * 1024 * 1024)?;
+        let max_segment_bytes = parse_env("WHITEWATER_MAX_SEGMENT_BYTES", 1024 * 1024 * 1024)?;
         if max_segment_bytes == 0 {
             anyhow::bail!("WHITEWATER_MAX_SEGMENT_BYTES must be greater than zero");
         }
