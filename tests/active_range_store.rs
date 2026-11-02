@@ -48,7 +48,7 @@ fn append(sequence: u64, payload: &[u8]) -> ActiveRangeAppend {
             sequence,
         },
         cursor: format!("cursor-{sequence}"),
-        frame: encode_record(&record).unwrap(),
+        frame: encode_record(&record).unwrap().into(),
         pending_effect: None,
     }
 }
@@ -68,7 +68,9 @@ async fn compression_can_be_enabled_and_disabled_on_existing_history_and_after_r
         let sequence = index as u64 + 1;
         let mut request = append(sequence, &payload);
         let record = decode_record(&request.frame).unwrap();
-        request.frame = encode_record_with_compression(&record, compressed).unwrap();
+        request.frame = encode_record_with_compression(&record, compressed)
+            .unwrap()
+            .into();
         assert_eq!(
             &request.frame[4..8],
             if compressed { b"FSR3" } else { b"FSR2" }
@@ -102,7 +104,8 @@ async fn compression_can_be_enabled_and_disabled_on_existing_history_and_after_r
         let mut request = append(sequence, &payload);
         request.frame =
             encode_record_with_compression(&decode_record(&request.frame).unwrap(), compressed)
-                .unwrap();
+                .unwrap()
+                .into();
         reopened.append(request).await.unwrap();
         reopened
             .commit(
@@ -141,7 +144,7 @@ async fn a_resequenced_retry_with_the_same_cursor_returns_the_original_position(
     let mut retry_record = decode_record(&retry.frame).unwrap();
     retry_record.message_id = first_record.message_id;
     retry_record.event_time_ns = first_record.event_time_ns;
-    retry.frame = encode_record(&retry_record).unwrap();
+    retry.frame = encode_record(&retry_record).unwrap().into();
     retry.cursor = first.cursor.clone();
     let deduplicated = store.append(retry.clone()).await.unwrap();
     assert!(deduplicated.deduplicated);
@@ -156,7 +159,7 @@ async fn a_resequenced_retry_with_the_same_cursor_returns_the_original_position(
     let mut forged_record = decode_record(&forged.frame).unwrap();
     forged_record.message_id = first_record.message_id;
     forged_record.event_time_ns = first_record.event_time_ns;
-    forged.frame = encode_record(&forged_record).unwrap();
+    forged.frame = encode_record(&forged_record).unwrap().into();
     forged.cursor = first.cursor.clone();
     assert!(matches!(
         store.append(forged).await,
@@ -169,7 +172,7 @@ async fn a_resequenced_retry_with_the_same_cursor_returns_the_original_position(
     let mut forged_next_record = decode_record(&forged_next.frame).unwrap();
     forged_next_record.message_id = first_record.message_id;
     forged_next_record.event_time_ns = first_record.event_time_ns;
-    forged_next.frame = encode_record(&forged_next_record).unwrap();
+    forged_next.frame = encode_record(&forged_next_record).unwrap().into();
     forged_next.cursor = first.cursor.clone();
     assert!(matches!(
         store.append(forged_next).await,
@@ -205,7 +208,9 @@ async fn compressed_pages_enforce_logical_byte_budgets_and_resume_without_skippi
     for sequence in 1..=2 {
         let mut request = append(sequence, &payload);
         request.frame =
-            encode_record_with_compression(&decode_record(&request.frame).unwrap(), true).unwrap();
+            encode_record_with_compression(&decode_record(&request.frame).unwrap(), true)
+                .unwrap()
+                .into();
         assert!(request.frame.len() < 1000);
         store.append(request).await.unwrap();
         store
@@ -675,7 +680,8 @@ async fn a_validated_frame_overwrites_an_uncommitted_tail_but_never_committed() 
         payload: b"forged".to_vec(),
         metadata: BTreeMap::new(),
     })
-    .unwrap();
+    .unwrap()
+    .into();
     assert!(matches!(
         store.append(forged).await,
         Err(ActiveRangeStoreError::CommittedPositionConflict(position)) if position.value() == 1
@@ -755,7 +761,7 @@ fn staged(sequence: u64, payload: &[u8], cursor: &str, position: u64) -> ActiveR
             sequence,
         },
         cursor: cursor.to_owned(),
-        frame: encode_record(&record).unwrap(),
+        frame: encode_record(&record).unwrap().into(),
         pending_effect: None,
     }
 }
@@ -1191,7 +1197,7 @@ async fn cursor_dedup_returns_the_original_position_for_resequenced_retries() {
     let mut record = decode_record(&resequenced.frame).unwrap();
     record.message_id = Uuid::from_u128(101);
     record.event_time_ns = 1;
-    resequenced.frame = encode_record(&record).unwrap();
+    resequenced.frame = encode_record(&record).unwrap().into();
     resequenced.cursor = "cursor-1".to_owned();
     let landed = store.append(resequenced).await.unwrap();
     assert!(landed.deduplicated);
@@ -1693,4 +1699,80 @@ async fn next_writer_sequence_tracks_the_landed_stream_across_reopen() {
     assert_eq!(reopened.next_writer_sequence(writer, 1).await.unwrap(), 3);
     // A different epoch mints its own stream from scratch.
     assert_eq!(reopened.next_writer_sequence(writer, 7).await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn import_commit_batch_replays_a_late_duplicate_below_committed() {
+    let directory = TempDir::new().unwrap();
+    let store = FileActiveRangeStore::open(directory.path(), descriptor()).unwrap();
+    let staged = |sequence: u64| {
+        let mut request = append(sequence, format!("fused-{sequence}").as_bytes());
+        request.expected_position = Some(RangePosition::new(sequence));
+        request
+    };
+    let tail_digest =
+        |batch: &[ActiveRangeAppend]| *blake3::hash(&batch.last().unwrap().frame).as_bytes();
+    let commit = |position: u64, frame_digest: [u8; 32]| whitewater::active_range::BatchCommit {
+        generation: RangeGeneration::new(1),
+        ownership_epoch: OwnershipEpoch::new(1),
+        position: CommitPosition::new(position),
+        frame_digest,
+    };
+
+    // The first run commits the watermark at its tail as usual.
+    let batch: Vec<_> = (1..=4).map(staged).collect();
+    store
+        .import_commit_batch(batch.clone(), commit(4, tail_digest(&batch)))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.snapshot().await.unwrap().progress.commit_position(),
+        CommitPosition::new(4)
+    );
+
+    // Windowed replica sends can deliver a duplicate batch after a
+    // later fused commit already moved past it: every frame deduped
+    // and the marker still pins the same tail bytes, so the commit is
+    // already satisfied — the watermark must not rewind.
+    let late: Vec<_> = (1..=2).map(staged).collect();
+    let results = store
+        .import_commit_batch(late.clone(), commit(2, tail_digest(&late)))
+        .await
+        .unwrap();
+    assert!(results
+        .iter()
+        .all(|result| result.deduplicated && result.committed));
+    assert_eq!(
+        store.snapshot().await.unwrap().progress.commit_position(),
+        CommitPosition::new(4),
+        "a satisfied replay never moves the committed watermark back"
+    );
+
+    // The same late replay carrying a forged marker digest stays a
+    // fail-closed backwards move.
+    let error = store
+        .import_commit_batch(late.clone(), commit(2, [0xAA; 32]))
+        .await;
+    assert!(matches!(
+        error,
+        Err(ActiveRangeStoreError::CommitMovedBackwards { .. })
+    ));
+
+    // A batch that lands a NEW frame is not a satisfied replay even
+    // when its own tail digest matches the marker — the commit refuses.
+    let fresh = staged(5);
+    let error = store
+        .import_commit_batch(
+            vec![fresh.clone()],
+            commit(2, *blake3::hash(&fresh.frame).as_bytes()),
+        )
+        .await;
+    assert!(matches!(
+        error,
+        Err(ActiveRangeStoreError::CommitMovedBackwards { .. })
+    ));
+    assert_eq!(
+        store.snapshot().await.unwrap().progress.commit_position(),
+        CommitPosition::new(4)
+    );
 }

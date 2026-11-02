@@ -4,7 +4,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use bytes::Bytes;
 use tempfile::TempDir;
 use uuid::Uuid;
 use whitewater::{
@@ -241,7 +241,7 @@ impl Fixture {
                 sequence: 1,
             },
             cursor: "cursor-1".to_owned(),
-            frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            frame: encode_record(&record).unwrap().into(),
             pending_effect: None,
         };
         Self {
@@ -362,11 +362,10 @@ async fn divergent_committed_replica_vetoes_instead_of_forging_divergence() {
     // superseded owner could have committed before losing ownership.
     let mut divergent = fixture.request.clone();
     divergent.cursor = "cursor-divergent".to_owned();
-    let mut divergent_record =
-        decode_record(&STANDARD.decode(&fixture.request.frame_base64).unwrap()).unwrap();
+    let mut divergent_record = decode_record(&fixture.request.frame).unwrap();
     divergent_record.message_id = Uuid::from_u128(702);
     divergent_record.payload = b"diverged".to_vec();
-    divergent.frame_base64 = STANDARD.encode(encode_record(&divergent_record).unwrap());
+    divergent.frame = encode_record(&divergent_record).unwrap().into();
     let landed = fixture.services[&followers[0]]
         .append(divergent)
         .await
@@ -728,7 +727,7 @@ async fn owner_move_fences_old_owner_only_after_verified_catch_up() {
     request.expected_position = RangePosition::new(2);
     request.identity.sequence = 2;
     request.cursor = "cursor-2".to_owned();
-    request.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+    request.frame = encode_record(&record).unwrap().into();
     let transport = DirectTransport {
         services: Arc::new(fixture.services.clone()),
         append_down: Arc::new(BTreeSet::new()),
@@ -783,7 +782,7 @@ async fn owner_move_rejects_a_caught_up_follower_with_different_bytes() {
         payload: b"different".to_vec(),
         metadata: BTreeMap::new(),
     };
-    conflicting.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+    conflicting.frame = encode_record(&record).unwrap().into();
     let accepted = target.append(conflicting).await.unwrap();
     target
         .commit(ReplicaCommitRequest {
@@ -859,7 +858,7 @@ fn paged_request(fixture: &Fixture, sequence: u64) -> ReplicaAppendRequest {
     request.expected_position = RangePosition::new(sequence);
     request.identity.sequence = sequence;
     request.cursor = format!("cursor-{sequence}");
-    request.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+    request.frame = encode_record(&record).unwrap().into();
     request
 }
 
@@ -1059,19 +1058,18 @@ async fn cursor_pages_continue_after_a_bounded_batch_without_rescanning_the_pref
         request.expected_position = RangePosition::new(sequence);
         request.identity.sequence = sequence;
         request.cursor = format!("cursor-{sequence}");
-        request.frame_base64 = STANDARD.encode(
-            encode_record(&StoredRecord {
-                message_id: Uuid::from_u128(700 + sequence as u128),
-                producer_id: fixture.request.identity.writer_session_id,
-                producer_sequence: sequence,
-                event_time_ns: sequence as i64,
-                ingest_time_ns: sequence as i64,
-                key: b"customer-1".to_vec(),
-                payload: Vec::new(),
-                metadata: BTreeMap::new(),
-            })
-            .unwrap(),
-        );
+        request.frame = encode_record(&StoredRecord {
+            message_id: Uuid::from_u128(700 + sequence as u128),
+            producer_id: fixture.request.identity.writer_session_id,
+            producer_sequence: sequence,
+            event_time_ns: sequence as i64,
+            ingest_time_ns: sequence as i64,
+            key: b"customer-1".to_vec(),
+            payload: Vec::new(),
+            metadata: BTreeMap::new(),
+        })
+        .unwrap()
+        .into();
         coordinator.append(request).await.unwrap();
     }
     let (commit, position, _, page) = owner
@@ -1317,7 +1315,7 @@ fn resequence(request: &mut ReplicaAppendRequest, sequence: u64, position: u64) 
     request.identity.sequence = sequence;
     request.expected_position = RangePosition::new(position);
     request.cursor = format!("cursor-{sequence}");
-    request.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+    request.frame = encode_record(&record).unwrap().into();
 }
 
 #[tokio::test]
@@ -1765,19 +1763,18 @@ async fn position_gap_repushes_the_missing_owner_frames_before_the_current_one()
     let mut second = fixture.request.clone();
     second.identity.sequence = 2;
     second.cursor = "cursor-2".to_owned();
-    second.frame_base64 = STANDARD.encode(
-        encode_record(&StoredRecord {
-            message_id: Uuid::from_u128(702),
-            producer_id: second.identity.writer_session_id,
-            producer_sequence: 2,
-            event_time_ns: 3,
-            ingest_time_ns: 4,
-            key: b"customer-2".to_vec(),
-            payload: b"shipped".to_vec(),
-            metadata: BTreeMap::new(),
-        })
-        .unwrap(),
-    );
+    second.frame = encode_record(&StoredRecord {
+        message_id: Uuid::from_u128(702),
+        producer_id: second.identity.writer_session_id,
+        producer_sequence: 2,
+        event_time_ns: 3,
+        ingest_time_ns: 4,
+        key: b"customer-2".to_vec(),
+        payload: b"shipped".to_vec(),
+        metadata: BTreeMap::new(),
+    })
+    .unwrap()
+    .into();
     let coordinator = fixture.coordinator(&[], &[], None);
     let result = coordinator.append(second).await.unwrap();
     assert_eq!(result.position.value(), 2);
@@ -1805,19 +1802,18 @@ async fn validated_owner_frame_truncates_the_superseded_uncommitted_tail() {
     orphan.identity.sequence = 2;
     orphan.expected_position = RangePosition::new(2);
     orphan.cursor = "cursor-2".to_owned();
-    orphan.frame_base64 = STANDARD.encode(
-        encode_record(&StoredRecord {
-            message_id: Uuid::from_u128(703),
-            producer_id: orphan.identity.writer_session_id,
-            producer_sequence: 2,
-            event_time_ns: 5,
-            ingest_time_ns: 6,
-            key: b"customer-3".to_vec(),
-            payload: b"orphaned".to_vec(),
-            metadata: BTreeMap::new(),
-        })
-        .unwrap(),
-    );
+    orphan.frame = encode_record(&StoredRecord {
+        message_id: Uuid::from_u128(703),
+        producer_id: orphan.identity.writer_session_id,
+        producer_sequence: 2,
+        event_time_ns: 5,
+        ingest_time_ns: 6,
+        key: b"customer-3".to_vec(),
+        payload: b"orphaned".to_vec(),
+        metadata: BTreeMap::new(),
+    })
+    .unwrap()
+    .into();
     fixture.services[&replica].append(orphan).await.unwrap();
     // Ownership moves to the replica under a newer epoch.
     fixture
@@ -1840,19 +1836,18 @@ async fn validated_owner_frame_truncates_the_superseded_uncommitted_tail() {
     successor.identity.writer_session_id = Uuid::from_u128(704);
     successor.expected_position = RangePosition::new(2);
     successor.cursor = "cursor-successor".to_owned();
-    successor.frame_base64 = STANDARD.encode(
-        encode_record(&StoredRecord {
-            message_id: Uuid::from_u128(705),
-            producer_id: successor.identity.writer_session_id,
-            producer_sequence: 1,
-            event_time_ns: 7,
-            ingest_time_ns: 8,
-            key: b"customer-4".to_vec(),
-            payload: b"adopted".to_vec(),
-            metadata: BTreeMap::new(),
-        })
-        .unwrap(),
-    );
+    successor.frame = encode_record(&StoredRecord {
+        message_id: Uuid::from_u128(705),
+        producer_id: successor.identity.writer_session_id,
+        producer_sequence: 1,
+        event_time_ns: 7,
+        ingest_time_ns: 8,
+        key: b"customer-4".to_vec(),
+        payload: b"adopted".to_vec(),
+        metadata: BTreeMap::new(),
+    })
+    .unwrap()
+    .into();
     let accepted = fixture.services[&replica].append(successor).await.unwrap();
     assert_eq!(accepted.position.value(), 2);
     assert!(!accepted.deduplicated);
@@ -1880,11 +1875,10 @@ async fn resequenced_retry_dedup_pushes_the_stored_frame_to_replicas() {
         let mut request = fixture.request.clone();
         request.cursor = format!("cursor-{sequence}");
         request.identity.sequence = sequence;
-        let mut record =
-            decode_record(&STANDARD.decode(&fixture.request.frame_base64).unwrap()).unwrap();
+        let mut record = decode_record(&fixture.request.frame).unwrap();
         record.message_id = Uuid::from_u128(700 + sequence as u128);
         record.producer_sequence = sequence;
-        request.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+        request.frame = encode_record(&record).unwrap().into();
         records.push(request);
     }
     for request in &records {
@@ -1893,9 +1887,9 @@ async fn resequenced_retry_dedup_pushes_the_stored_frame_to_replicas() {
 
     let mut retry = records[0].clone();
     retry.identity.sequence = 9;
-    let mut record = decode_record(&STANDARD.decode(&retry.frame_base64).unwrap()).unwrap();
+    let mut record = decode_record(&retry.frame).unwrap();
     record.producer_sequence = 9;
-    retry.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+    retry.frame = encode_record(&record).unwrap().into();
     let result = coordinator.append(retry).await.unwrap();
     assert!(result.deduplicated);
     assert_eq!(result.position.value(), 1);
@@ -2011,7 +2005,7 @@ async fn owner_minted_sequences_stay_contiguous_and_retries_deduplicate() {
     let coordinator = fixture.coordinator(&[], &[], None);
     let writer = Uuid::from_u128(700);
     let encode = |sequence: u64, marker: u128, payload: &'static [u8]| {
-        Ok(STANDARD.encode(
+        Ok(Bytes::from(
             encode_record(&StoredRecord {
                 message_id: Uuid::from_u128(marker),
                 producer_id: writer,
@@ -2030,7 +2024,7 @@ async fn owner_minted_sequences_stay_contiguous_and_retries_deduplicate() {
     let mut first = fixture.request.clone();
     first.cursor = "mint-1".to_owned();
     first.identity.sequence = 0;
-    first.frame_base64 = String::new();
+    first.frame = bytes::Bytes::new();
     let first = coordinator
         .append_minted(first, |sequence| encode(sequence, 701, b"one"))
         .await
@@ -2040,7 +2034,7 @@ async fn owner_minted_sequences_stay_contiguous_and_retries_deduplicate() {
     let mut second = fixture.request.clone();
     second.cursor = "mint-2".to_owned();
     second.identity.sequence = 0;
-    second.frame_base64 = String::new();
+    second.frame = bytes::Bytes::new();
     let second = coordinator
         .append_minted(second, |sequence| encode(sequence, 702, b"two"))
         .await
@@ -2070,7 +2064,7 @@ async fn owner_minted_sequences_stay_contiguous_and_retries_deduplicate() {
     let mut retry = fixture.request.clone();
     retry.cursor = "mint-1".to_owned();
     retry.identity.sequence = 0;
-    retry.frame_base64 = String::new();
+    retry.frame = bytes::Bytes::new();
     let retried = coordinator
         .append_minted(retry, |sequence| encode(sequence, 701, b"one"))
         .await
@@ -2117,7 +2111,7 @@ async fn minted_sequences_parallelize_across_ranges_on_one_node() {
 
     let encode_for = |writer: Uuid, marker: u128, payload: &'static [u8]| {
         move |sequence: u64| {
-            Ok(STANDARD.encode(
+            Ok(Bytes::from(
                 encode_record(&StoredRecord {
                     message_id: Uuid::from_u128(marker),
                     producer_id: writer,
@@ -2148,7 +2142,7 @@ async fn minted_sequences_parallelize_across_ranges_on_one_node() {
     let mut a = fixture.request.clone();
     a.cursor = "mint-a".to_owned();
     a.identity.sequence = 0;
-    a.frame_base64 = String::new();
+    a.frame = bytes::Bytes::new();
     let mut b = a.clone();
     b.feed_id = second_feed_id;
     b.range_id = second_assignment.range_id;
@@ -2162,4 +2156,400 @@ async fn minted_sequences_parallelize_across_ranges_on_one_node() {
     );
     assert_eq!(ra.unwrap().position.value(), 1);
     assert_eq!(rb.unwrap().position.value(), 1);
+}
+
+/// DirectTransport variant that measures per-follower in-flight
+/// `append_batch` concurrency and records the position order each
+/// follower observes — the evidence windowed sends provide.
+#[derive(Clone)]
+struct WindowedTransport {
+    services: Arc<BTreeMap<StorageNodeId, Arc<ReplicaAppendService>>>,
+    delay: std::time::Duration,
+    // (current in flight, high-water mark) per follower.
+    in_flight: Arc<std::sync::Mutex<BTreeMap<StorageNodeId, (usize, usize)>>>,
+    // First-frame positions in the order each follower received them.
+    received: Arc<std::sync::Mutex<BTreeMap<StorageNodeId, Vec<u64>>>>,
+    // Pause one designated send inside the transport to hold the lane.
+    pause_position: Option<u64>,
+    pause_entered: Arc<tokio::sync::Notify>,
+    pause_release: Arc<tokio::sync::Notify>,
+}
+
+impl WindowedTransport {
+    fn new(fixture: &Fixture, delay: std::time::Duration) -> Self {
+        Self {
+            services: Arc::new(fixture.services.clone()),
+            delay,
+            in_flight: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            received: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            pause_position: None,
+            pause_entered: Arc::new(tokio::sync::Notify::new()),
+            pause_release: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn max_in_flight(&self, node: &StorageNodeId) -> usize {
+        self.in_flight
+            .lock()
+            .unwrap()
+            .get(node)
+            .map(|entry| entry.1)
+            .unwrap_or(0)
+    }
+
+    fn received(&self, node: &StorageNodeId) -> Vec<u64> {
+        self.received
+            .lock()
+            .unwrap()
+            .get(node)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+#[async_trait]
+impl ReplicaTransport for WindowedTransport {
+    async fn append(
+        &self,
+        replica: &StorageNodeId,
+        request: ReplicaAppendRequest,
+    ) -> Result<ReplicaAppendAccepted, ReplicaTransportError> {
+        self.services[replica]
+            .append(request)
+            .await
+            .map_err(ReplicaTransportError::replica)
+    }
+
+    async fn append_batch(
+        &self,
+        replica: &StorageNodeId,
+        request: whitewater::active_range::ReplicaBatchAppendRequest,
+    ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaTransportError> {
+        {
+            let mut in_flight = self.in_flight.lock().unwrap();
+            let entry = in_flight.entry(replica.clone()).or_default();
+            entry.0 += 1;
+            entry.1 = entry.1.max(entry.0);
+        }
+        if let Some(position) = request
+            .frames
+            .first()
+            .and_then(|frame| frame.expected_position)
+        {
+            self.received
+                .lock()
+                .unwrap()
+                .entry(replica.clone())
+                .or_default()
+                .push(position.value());
+        }
+        if self.pause_position.is_some()
+            && request
+                .frames
+                .iter()
+                .any(|frame| frame.expected_position.map(|p| p.value()) == self.pause_position)
+        {
+            self.pause_entered.notify_one();
+            self.pause_release.notified().await;
+        }
+        tokio::time::sleep(self.delay).await;
+        let result = self.services[replica]
+            .import_committed_batch(request)
+            .await
+            .map_err(ReplicaTransportError::replica);
+        self.in_flight.lock().unwrap().get_mut(replica).unwrap().0 -= 1;
+        result
+    }
+
+    async fn commit(
+        &self,
+        replica: &StorageNodeId,
+        request: ReplicaCommitRequest,
+    ) -> Result<ReplicaCommitAccepted, ReplicaTransportError> {
+        self.services[replica]
+            .commit(request)
+            .await
+            .map_err(ReplicaTransportError::replica)
+    }
+
+    async fn discard_pending(
+        &self,
+        replica: &StorageNodeId,
+        request: ReplicaDiscardPendingRequest,
+    ) -> Result<ReplicaDiscardPendingResponse, ReplicaTransportError> {
+        self.services[replica]
+            .discard_pending(request)
+            .await
+            .map_err(ReplicaTransportError::replica)
+    }
+}
+
+/// One-frame batch request for a distinct writer, so concurrent rounds
+/// never wedge on per-writer sequence order.
+fn windowed_request(fixture: &Fixture, index: u64) -> ReplicaAppendRequest {
+    let mut request = fixture.request.clone();
+    let writer = Uuid::from_u128(10_000 + index as u128);
+    let record = StoredRecord {
+        message_id: Uuid::from_u128(20_000 + index as u128),
+        producer_id: writer,
+        producer_sequence: 1,
+        event_time_ns: index as i64,
+        ingest_time_ns: index as i64 + 1,
+        key: b"customer-1".to_vec(),
+        payload: format!("payload-{index}").into_bytes(),
+        metadata: BTreeMap::new(),
+    };
+    request.identity = AppendIdentity {
+        writer_session_id: writer,
+        writer_epoch: 1,
+        sequence: 1,
+    };
+    request.cursor = format!("window-{index}");
+    request.frame = encode_record(&record).unwrap().into();
+    request
+}
+
+#[tokio::test]
+async fn concurrent_submissions_merge_into_fewer_rounds() {
+    // Several client batches queued on one Range's append lock fold
+    // into fewer quorum rounds, each caller receiving exactly its own
+    // result slice in request order.
+    let fixture = Fixture::new().await;
+    let transport = WindowedTransport::new(&fixture, std::time::Duration::from_millis(40));
+    let coordinator = MajorityAppendCoordinator::new(
+        fixture.services[&fixture.owner].clone(),
+        fixture.control.clone(),
+        Arc::new(transport.clone()),
+    );
+    const SUBMISSIONS: u64 = 64;
+    let mut handles = Vec::new();
+    for submission in 0..SUBMISSIONS {
+        let coordinator = coordinator.clone();
+        let request = windowed_request(&fixture, submission + 1);
+        handles.push(tokio::spawn(async move {
+            coordinator.append_batch(vec![request]).await
+        }));
+    }
+    let mut positions = Vec::new();
+    for handle in handles {
+        let results = handle.await.unwrap().unwrap();
+        assert_eq!(results.len(), 1, "each submission got its own slice");
+        positions.push(results[0].position.value());
+    }
+    // Every submission landed a distinct contiguous position; the
+    // follower saw fewer round heads than submissions.
+    positions.sort_unstable();
+    assert_eq!(positions, (1..=SUBMISSIONS).collect::<Vec<u64>>());
+    for follower in fixture.non_owner_nodes() {
+        // 64 submissions queue ahead of the 16-round in-flight window;
+        // drivers merge them into far fewer quorum rounds.
+        assert!(
+            transport.received(&follower).len() < SUBMISSIONS as usize / 4,
+            "submissions should merge into far fewer quorum rounds"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replica_sends_pipeline_up_to_the_per_follower_window() {
+    let fixture = Fixture::new().await;
+    let transport = WindowedTransport::new(&fixture, std::time::Duration::from_millis(30));
+    let coordinator = MajorityAppendCoordinator::new(
+        fixture.services[&fixture.owner].clone(),
+        fixture.control.clone(),
+        Arc::new(transport.clone()),
+    );
+    let mut handles = Vec::new();
+    for index in 0..8_u64 {
+        let coordinator = coordinator.clone();
+        let request = windowed_request(&fixture, index);
+        handles.push(tokio::spawn(async move {
+            coordinator.append_batch(vec![request]).await
+        }));
+    }
+    for handle in handles {
+        handle.await.unwrap().unwrap();
+    }
+    for follower in fixture.non_owner_nodes() {
+        let max = transport.max_in_flight(&follower);
+        assert!(max > 1, "lane {follower} never overlapped sends");
+        assert!(max <= 4, "lane {follower} exceeded the send window: {max}");
+        let received = transport.received(&follower);
+        // Group commit merges queued submissions into fewer rounds, so
+        // the follower may see fewer than 8 round heads — what must hold
+        // is that heads start at 1 and arrive strictly in mint order.
+        assert!(!received.is_empty());
+        assert_eq!(received[0], 1);
+        for pair in received.windows(2) {
+            assert!(
+                pair[1] > pair[0],
+                "follower {follower} observed positions out of mint order: {received:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn poisoned_submission_is_isolated_on_solo_rerun() {
+    // A merged round that fails on a non-retryable, per-frame refusal
+    // re-runs each submission alone: the bad one keeps failing while
+    // the innocent ones land.
+    let fixture = Fixture::new().await;
+    let transport = WindowedTransport::new(&fixture, std::time::Duration::from_millis(40));
+    let coordinator = MajorityAppendCoordinator::new(
+        fixture.services[&fixture.owner].clone(),
+        fixture.control.clone(),
+        Arc::new(transport.clone()),
+    );
+    // Land writer W sequence 1 normally, then a conflicting submission
+    // replays the same writer+sequence with different frame bytes.
+    let mut poison = windowed_request(&fixture, 1);
+    let writer = poison.identity.writer_session_id;
+    let landed = coordinator
+        .append_batch(vec![poison.clone()])
+        .await
+        .unwrap();
+    assert_eq!(landed.len(), 1);
+    let record = StoredRecord {
+        message_id: Uuid::from_u128(999_999),
+        producer_id: writer,
+        producer_sequence: 1,
+        event_time_ns: 1,
+        ingest_time_ns: 2,
+        key: b"customer-1".to_vec(),
+        payload: b"forged".to_vec(),
+        metadata: BTreeMap::new(),
+    };
+    poison.frame = encode_record(&record).unwrap().into();
+    poison.cursor = "forged-cursor".to_owned();
+    let innocent = windowed_request(&fixture, 2);
+    let (poisoned, clean) = tokio::join!(
+        coordinator.append_batch(vec![poison]),
+        coordinator.append_batch(vec![innocent]),
+    );
+    assert!(poisoned.is_err(), "the conflicting submission must fail");
+    let results = clean.unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].position.value(), 2);
+}
+
+#[tokio::test]
+async fn submissions_over_the_byte_budget_split_rounds() {
+    // Submissions that together exceed MAX_GROUP_ROUND_BYTES (16 MiB)
+    // must not merge into one quorum round.
+    let fixture = Fixture::new().await;
+    let transport = WindowedTransport::new(&fixture, std::time::Duration::from_millis(40));
+    let coordinator = MajorityAppendCoordinator::new(
+        fixture.services[&fixture.owner].clone(),
+        fixture.control.clone(),
+        Arc::new(transport.clone()),
+    );
+    let big = |index: u64| {
+        let mut request = windowed_request(&fixture, index);
+        let record = StoredRecord {
+            message_id: Uuid::from_u128(3_000 + index as u128),
+            producer_id: request.identity.writer_session_id,
+            producer_sequence: 1,
+            event_time_ns: index as i64,
+            ingest_time_ns: index as i64 + 1,
+            key: b"customer-1".to_vec(),
+            payload: vec![b'x'; 9 * 1024 * 1024],
+            metadata: BTreeMap::new(),
+        };
+        request.frame = encode_record(&record).unwrap().into();
+        request
+    };
+    let (first, second) = tokio::join!(
+        coordinator.append_batch(vec![big(1)]),
+        coordinator.append_batch(vec![big(2)]),
+    );
+    first.unwrap();
+    second.unwrap();
+    for follower in fixture.non_owner_nodes() {
+        assert_eq!(
+            transport.received(&follower).len(),
+            2,
+            "submissions over the 16 MiB byte budget must run separately"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pending_effect_submissions_never_merge() {
+    // A pending-effect submission always runs alone: merging it into a
+    // group round would let an unrelated batch ride the effect fence.
+    let fixture = Fixture::new().await;
+    let transport = WindowedTransport::new(&fixture, std::time::Duration::from_millis(40));
+    let coordinator = MajorityAppendCoordinator::new(
+        fixture.services[&fixture.owner].clone(),
+        fixture.control.clone(),
+        Arc::new(transport.clone()),
+    );
+    let mut effect = windowed_request(&fixture, 1);
+    pending_request(&mut effect, Uuid::from_u128(700), Uuid::from_u128(701));
+    let plain = windowed_request(&fixture, 2);
+    let (effect_results, plain_results) = tokio::join!(
+        coordinator.append_batch(vec![effect]),
+        coordinator.append_batch(vec![plain]),
+    );
+    effect_results.unwrap();
+    // The effect holds the tail, so the plain submission is refused
+    // retryable — proof it never merged around the effect's fence.
+    let error = plain_results.unwrap_err();
+    assert_eq!(error.code, MajorityAppendErrorCode::PendingEffectOccupied);
+    assert!(error.retryable);
+    for follower in fixture.non_owner_nodes() {
+        assert_eq!(
+            transport.received(&follower).len(),
+            1,
+            "only the pending-effect submission should land a round"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pending_effect_send_fences_the_whole_follower_lane() {
+    let fixture = Fixture::new().await;
+    let mut transport = WindowedTransport::new(&fixture, std::time::Duration::from_millis(5));
+    transport.pause_position = Some(1);
+    let pause_entered = transport.pause_entered.clone();
+    let pause_release = transport.pause_release.clone();
+    let coordinator = MajorityAppendCoordinator::new(
+        fixture.services[&fixture.owner].clone(),
+        fixture.control.clone(),
+        Arc::new(transport.clone()),
+    );
+
+    // First round carries the pending-effect tail hold; its send pauses
+    // inside the transport while holding every lane permit.
+    let mut pending = windowed_request(&fixture, 1);
+    pending_request(&mut pending, Uuid::from_u128(900), Uuid::from_u128(901));
+    let pending_send = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.append_batch(vec![pending]).await })
+    };
+    pause_entered.notified().await;
+
+    // A second round on the same effect may append locally, but its send
+    // must queue behind the fenced lane — never overlap the pending one.
+    let mut second = windowed_request(&fixture, 2);
+    pending_request(&mut second, Uuid::from_u128(900), Uuid::from_u128(901));
+    let second_send = {
+        let coordinator = coordinator.clone();
+        tokio::spawn(async move { coordinator.append_batch(vec![second]).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    for follower in fixture.non_owner_nodes() {
+        assert_eq!(
+            transport.received(&follower).len(),
+            1,
+            "a second send overlapped the fenced pending-effect lane"
+        );
+    }
+    pause_release.notify_waiters();
+    pending_send.await.unwrap().unwrap();
+    second_send.await.unwrap().unwrap();
+    for follower in fixture.non_owner_nodes() {
+        assert_eq!(transport.received(&follower).len(), 2);
+    }
 }

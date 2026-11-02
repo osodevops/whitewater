@@ -1072,22 +1072,11 @@ impl WriterSessionClient {
                 session_epoch: self.session_epoch,
                 use_compression: self.use_compression,
                 event_time_ns: event_time_ns.map(|value| value.to_string()),
-                key_base64: base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key),
-                payload_base64: base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    payload,
-                ),
-                metadata_base64: metadata
+                key: key.to_vec().into(),
+                payload: payload.to_vec().into(),
+                metadata: metadata
                     .iter()
-                    .map(|(name, value)| {
-                        (
-                            name.clone(),
-                            base64::Engine::encode(
-                                &base64::engine::general_purpose::STANDARD,
-                                value,
-                            ),
-                        )
-                    })
+                    .map(|(name, value)| (name.clone(), value.clone().into()))
                     .collect(),
             })
             .await
@@ -1105,26 +1094,12 @@ impl WriterSessionClient {
                 session_epoch: self.session_epoch,
                 use_compression: self.use_compression,
                 event_time_ns: record.event_time_ns.map(|value| value.to_string()),
-                key_base64: base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    record.key,
-                ),
-                payload_base64: base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    record.payload,
-                ),
-                metadata_base64: record
+                key: record.key.into(),
+                payload: record.payload.into(),
+                metadata: record
                     .metadata
                     .into_iter()
-                    .map(|(name, value)| {
-                        (
-                            name,
-                            base64::Engine::encode(
-                                &base64::engine::general_purpose::STANDARD,
-                                value,
-                            ),
-                        )
-                    })
+                    .map(|(name, value)| (name, value.into()))
                     .collect(),
             })
             .collect();

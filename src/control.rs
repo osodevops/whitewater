@@ -2831,10 +2831,22 @@ impl ControlController {
                 ))
             },
         )?;
-        Ok(FixedActiveRangePlacement {
-            owner: replicas[0].clone(),
-            replicas,
-        })
+        // Owner balance: the replica set stays hash-ranked, but the
+        // Append Owner is the replica currently owning the fewest
+        // ranges — deterministic given `state`, so replicas preparing
+        // the same command agree; ties keep the hash rank order.
+        let owner = replicas
+            .iter()
+            .min_by_key(|node| {
+                state
+                    .range_assignments
+                    .values()
+                    .filter(|assignment| &assignment.owner == *node)
+                    .count()
+            })
+            .expect("non-empty replica set")
+            .clone();
+        Ok(FixedActiveRangePlacement { owner, replicas })
     }
 
     fn select_fixed_subscription_progress(
@@ -11342,6 +11354,36 @@ mod tests {
                 .collect(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn feed_creation_balances_active_range_owners_across_storage_nodes() {
+        let directory = TempDir::new().unwrap();
+        let controller = new_controller(&directory);
+        controller
+            .execute(
+                "CREATE DOMAIN orders; CREATE FEED orders.alpha;                  CREATE FEED orders.beta; CREATE FEED orders.gamma;",
+            )
+            .await
+            .unwrap();
+        let state = controller.state.lock().await;
+        let owners: BTreeSet<StorageNodeId> = state
+            .range_assignments
+            .values()
+            .map(|assignment| assignment.owner.clone())
+            .collect();
+        assert_eq!(
+            owners.len(),
+            3,
+            "three Feeds on three storage Nodes must spread owners: {owners:?}"
+        );
+        // The replica sets still cover every eligible Node.
+        for assignment in state.range_assignments.values() {
+            assert_eq!(
+                assignment.replicas.as_array().len(),
+                ACTIVE_RANGE_REPLICA_COUNT
+            );
+        }
     }
 
     #[test]

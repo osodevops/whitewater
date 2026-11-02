@@ -1,6 +1,5 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tempfile::TempDir;
 use whitewater::{
     active_range::{
@@ -265,7 +264,7 @@ async fn recovered_replicas_advance_epoch_preserve_commit_and_truncate_tail() {
                 sequence,
             },
             cursor: format!("cursor-{sequence}"),
-            frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            frame: encode_record(&record).unwrap().into(),
             pending_effect: None,
         }
     };

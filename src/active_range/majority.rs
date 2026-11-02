@@ -9,7 +9,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{watch, Mutex, Semaphore};
 use uuid::Uuid;
@@ -144,6 +143,13 @@ pub trait ReplicaTransport: Send + Sync {
 /// ones on any single replica.
 const MAX_INFLIGHT_ROUNDS: usize = 16;
 
+/// Concurrent sends one (range, follower) lane may hold in flight. The
+/// `OrderedTurn` still admits sends strictly in mint order, so a replica
+/// observes the identical position sequence — the window only overlaps
+/// the network round-trips, matching Kafka's multiple in-flight
+/// producer requests per partition.
+const MAX_INFLIGHT_SENDS_PER_FOLLOWER: usize = 4;
+
 /// FIFO-ordered turn queue: tickets mint inside the range's serialized
 /// mint/append section, and each holder waits for its ticket before
 /// running its critical section (one follower send, or the local commit).
@@ -153,6 +159,10 @@ type SendTurns =
     Arc<Mutex<std::collections::BTreeMap<(super::RangeId, StorageNodeId), Arc<OrderedTurn>>>>;
 type RangeTurns = Arc<Mutex<std::collections::BTreeMap<super::RangeId, Arc<OrderedTurn>>>>;
 type InFlightPermits = Arc<Mutex<std::collections::BTreeMap<super::RangeId, Arc<Semaphore>>>>;
+type SendLanes =
+    Arc<Mutex<std::collections::BTreeMap<(super::RangeId, StorageNodeId), Arc<Semaphore>>>>;
+type RepairLocks =
+    Arc<Mutex<std::collections::BTreeMap<(super::RangeId, StorageNodeId), Arc<Mutex<()>>>>>;
 
 struct OrderedTurn {
     next_issue: AtomicU64,
@@ -206,6 +216,46 @@ impl Drop for TurnPermit {
     }
 }
 
+/// Frames one group round may carry: keeps merged quorum rounds inside
+/// the follower replica-batch bounds (`MAX_REPLICA_BATCH_FRAMES` on
+/// current followers; older Nodes still enforce 512 and would refuse a
+/// merged round — mixed-version clusters merge less).
+const MAX_GROUP_ROUND_FRAMES: usize = 4_096;
+/// Raw byte cap per merged round (frame + prefix overhead included).
+const MAX_GROUP_ROUND_BYTES: usize = 16 * 1024 * 1024;
+/// Per-range bound on submissions parked behind the append lock.
+const MAX_GROUP_QUEUE: usize = 4_096;
+
+static NEXT_GROUP_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// One client batch parked on a Range's group-commit queue. The driver
+/// that drains it runs the quorum round and reports the tail slice back.
+struct GroupSubmission {
+    id: u64,
+    /// Held until this submission is drained — the queue-depth bound.
+    _queue_permit: tokio::sync::OwnedSemaphorePermit,
+    requests: Vec<super::replication::ReplicaAppendRequest>,
+    /// Sequence-0 frames for minted submissions (`None` per request for
+    /// explicit-sequence submissions).
+    frames: Vec<Option<Vec<u8>>>,
+    reply: tokio::sync::oneshot::Sender<Result<Vec<MajorityAppendResult>, MajorityAppendError>>,
+}
+
+/// True when two submissions may merge into one quorum round: same
+/// Feed/Range/generation/epoch, owner-local minting, and no pending
+/// effect (effect runs stay fenced solo).
+fn group_compatible(
+    a: &super::replication::ReplicaAppendRequest,
+    b: &super::replication::ReplicaAppendRequest,
+) -> bool {
+    a.feed_id == b.feed_id
+        && a.range_id == b.range_id
+        && a.generation == b.generation
+        && a.ownership_epoch == b.ownership_epoch
+        && a.pending_effect.is_none()
+        && b.pending_effect.is_none()
+}
+
 #[derive(Clone)]
 pub struct MajorityAppendCoordinator {
     local: Arc<ReplicaAppendService>,
@@ -228,6 +278,25 @@ pub struct MajorityAppendCoordinator {
     // Per range bound on concurrent rounds; cutover freezes drain it by
     // acquiring every permit so the frozen boundary is quorum-stable.
     in_flight: InFlightPermits,
+    // Per (range, follower) bound on concurrently in-flight sends; a
+    // round holds one permit from send start through any gap repair.
+    send_lanes: SendLanes,
+    // Per (range, follower) serializer for gap re-drives: overlapping
+    // rounds that each miss positions repair one at a time — re-driven
+    // frames dedup idempotently on the replica.
+    repair_locks: RepairLocks,
+    /// Per-range group-commit queue: submissions waiting on the append
+    /// lock merge into one quorum round, amortizing the fixed cost of a
+    /// round across waiting client batches — the mechanism that lets a
+    /// single Range pipeline like Kafka followers fetching accumulated
+    /// records.
+    group_queues: Arc<
+        Mutex<
+            std::collections::BTreeMap<super::RangeId, std::collections::VecDeque<GroupSubmission>>,
+        >,
+    >,
+    /// Per-range bound on queued-but-undrained submissions.
+    group_queue_windows: Arc<Mutex<std::collections::BTreeMap<super::RangeId, Arc<Semaphore>>>>,
 
     proofs: Option<Arc<CommitProofReporter>>,
 }
@@ -246,6 +315,10 @@ impl MajorityAppendCoordinator {
             send_turns: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             commit_turns: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             in_flight: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            send_lanes: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            repair_locks: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            group_queues: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            group_queue_windows: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             proofs: None,
         }
     }
@@ -272,12 +345,47 @@ impl MajorityAppendCoordinator {
             .clone()
     }
 
+    async fn group_queue_window(&self, range_id: super::RangeId) -> Arc<Semaphore> {
+        self.group_queue_windows
+            .lock()
+            .await
+            .entry(range_id)
+            .or_insert_with(|| Arc::new(Semaphore::new(MAX_GROUP_QUEUE)))
+            .clone()
+    }
+
     async fn in_flight_window(&self, range_id: super::RangeId) -> Arc<Semaphore> {
         self.in_flight
             .lock()
             .await
             .entry(range_id)
             .or_insert_with(|| Arc::new(Semaphore::new(MAX_INFLIGHT_ROUNDS)))
+            .clone()
+    }
+
+    async fn send_lane(
+        &self,
+        range_id: super::RangeId,
+        follower: &StorageNodeId,
+    ) -> Arc<Semaphore> {
+        self.send_lanes
+            .lock()
+            .await
+            .entry((range_id, follower.clone()))
+            .or_insert_with(|| Arc::new(Semaphore::new(MAX_INFLIGHT_SENDS_PER_FOLLOWER)))
+            .clone()
+    }
+
+    async fn repair_lock(
+        &self,
+        range_id: super::RangeId,
+        follower: &StorageNodeId,
+    ) -> Arc<Mutex<()>> {
+        self.repair_locks
+            .lock()
+            .await
+            .entry((range_id, follower.clone()))
+            .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
     }
 
@@ -425,7 +533,7 @@ impl MajorityAppendCoordinator {
     ) -> Result<MajorityAppendResult, MajorityAppendError> {
         self.append_inner(
             request,
-            None::<fn(u64) -> Result<String, crate::codec::CodecError>>,
+            None::<fn(u64) -> Result<bytes::Bytes, crate::codec::CodecError>>,
         )
         .await
     }
@@ -442,7 +550,7 @@ impl MajorityAppendCoordinator {
         encode_with_sequence: F,
     ) -> Result<MajorityAppendResult, MajorityAppendError>
     where
-        F: FnOnce(u64) -> Result<String, crate::codec::CodecError> + Send,
+        F: FnOnce(u64) -> Result<bytes::Bytes, crate::codec::CodecError> + Send,
     {
         self.append_inner(request, Some(encode_with_sequence)).await
     }
@@ -453,7 +561,7 @@ impl MajorityAppendCoordinator {
         mint: Option<F>,
     ) -> Result<MajorityAppendResult, MajorityAppendError>
     where
-        F: FnOnce(u64) -> Result<String, crate::codec::CodecError> + Send,
+        F: FnOnce(u64) -> Result<bytes::Bytes, crate::codec::CodecError> + Send,
     {
         let _append_guard = self.append_lock(request.range_id).await.lock_owned().await;
         request.expected_position = self
@@ -521,16 +629,15 @@ impl MajorityAppendCoordinator {
                         vec![],
                     )
                 })?;
-            request.frame_base64 =
-                encode_with_sequence(request.identity.sequence).map_err(|error| {
-                    self.error(
-                        MajorityAppendErrorCode::LocalStorageFailure,
-                        format!("owner could not encode the minted record: {error}"),
-                        false,
-                        vec![],
-                        vec![],
-                    )
-                })?;
+            request.frame = encode_with_sequence(request.identity.sequence).map_err(|error| {
+                self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    format!("owner could not encode the minted record: {error}"),
+                    false,
+                    vec![],
+                    vec![],
+                )
+            })?;
         }
         let local = self.local.append(request.clone()).await.map_err(|error| {
             if error.code == ReplicaAppendErrorCode::PendingEffectOccupied {
@@ -556,10 +663,7 @@ impl MajorityAppendCoordinator {
             // that position makes every replica refuse a different committed
             // occupant; offer the canonical stored frame so replicas dedup
             // or append it on its own identity.
-            let request_digest = STANDARD
-                .decode(&request.frame_base64)
-                .map(|frame| *blake3::hash(&frame).as_bytes())
-                .unwrap_or_default();
+            let request_digest = *blake3::hash(&request.frame).as_bytes();
             if request_digest != local.frame_digest {
                 let after = local
                     .position
@@ -581,7 +685,7 @@ impl MajorityAppendCoordinator {
                     })?;
                 if let Some(frame) = frames.into_iter().next() {
                     if frame.position == local.position {
-                        request.frame_base64 = STANDARD.encode(&frame.frame);
+                        request.frame = frame.frame.clone();
                         request.identity = frame.identity;
                         request.cursor = frame.cursor;
                     }
@@ -834,11 +938,7 @@ impl MajorityAppendCoordinator {
         &self,
         requests: Vec<ReplicaAppendRequest>,
     ) -> Result<Vec<MajorityAppendResult>, MajorityAppendError> {
-        self.append_batch_inner(
-            requests,
-            None::<Vec<fn(u64) -> Result<String, crate::codec::CodecError>>>,
-        )
-        .await
+        self.append_batch_inner(requests, None).await
     }
 
     /// Owner-minted batch: sequences are derived per record from the
@@ -851,32 +951,48 @@ impl MajorityAppendCoordinator {
         encoders: Vec<E>,
     ) -> Result<Vec<MajorityAppendResult>, MajorityAppendError>
     where
-        E: FnOnce(u64) -> Result<String, crate::codec::CodecError> + Send,
+        E: FnOnce(u64) -> Result<bytes::Bytes, crate::codec::CodecError> + Send,
     {
-        self.append_batch_inner(requests, Some(encoders)).await
+        if encoders.len() != requests.len() {
+            return Err(self.error(
+                MajorityAppendErrorCode::LocalStorageFailure,
+                "minted batch encoders must pair one-to-one with requests",
+                false,
+                vec![],
+                vec![],
+            ));
+        }
+        // Encoders run sequence-0 here, outside the append lock: only
+        // the cheap producer_sequence patch needs the minted number, and
+        // moving the encode (and its CRC pass) out of the critical
+        // section is what lets rounds pipeline.
+        let mut frames = Vec::with_capacity(encoders.len());
+        for encode_with_sequence in encoders {
+            frames.push(
+                encode_with_sequence(0)
+                    .map(|bytes| bytes.to_vec())
+                    .map_err(|error| {
+                        self.error(
+                            MajorityAppendErrorCode::LocalStorageFailure,
+                            format!("owner could not encode the minted record: {error}"),
+                            false,
+                            vec![],
+                            vec![],
+                        )
+                    })?,
+            );
+        }
+        self.append_batch_inner(requests, Some(frames.into_iter().map(Some).collect()))
+            .await
     }
 
-    async fn append_batch_inner<E>(
+    async fn append_batch_inner(
         &self,
-        mut requests: Vec<ReplicaAppendRequest>,
-        mut encoders: Option<Vec<E>>,
-    ) -> Result<Vec<MajorityAppendResult>, MajorityAppendError>
-    where
-        E: FnOnce(u64) -> Result<String, crate::codec::CodecError> + Send,
-    {
+        requests: Vec<ReplicaAppendRequest>,
+        pre_encoded: Option<Vec<Option<Vec<u8>>>>,
+    ) -> Result<Vec<MajorityAppendResult>, MajorityAppendError> {
         if requests.is_empty() {
             return Ok(vec![]);
-        }
-        if let Some(encoders) = &encoders {
-            if encoders.len() != requests.len() {
-                return Err(self.error(
-                    MajorityAppendErrorCode::LocalStorageFailure,
-                    "minted batch encoders must pair one-to-one with requests",
-                    false,
-                    vec![],
-                    vec![],
-                ));
-            }
         }
         let range_id = requests[0].range_id;
         if requests.iter().any(|request| request.range_id != range_id) {
@@ -898,16 +1014,52 @@ impl MajorityAppendCoordinator {
                 vec![],
             ));
         }
-        // In-flight window: bounds concurrent rounds per range and gives
-        // cutover freezes a drain point — a freeze acquires every permit
-        // so its committed boundary is quorum-stable before staging.
+        // Group-commit queue first: submissions WAITING for the window
+        // are visible to drivers and merge, so the 16-permit window
+        // bounds in-flight ROUNDS rather than client batches.
         let _phase_timer = std::time::Instant::now();
-        let _in_flight_permit = self
-            .in_flight_window(range_id)
+        let frames: Vec<Option<Vec<u8>>> = match pre_encoded {
+            Some(frames) => frames,
+            None => requests.iter().map(|_| None).collect(),
+        };
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        let my_id = NEXT_GROUP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Bounded queue: the permit releases when this submission is
+        // drained (dropped inside the driver), so depth is capped at
+        // MAX_GROUP_QUEUE regardless of driver pacing.
+        let _queue_permit = self
+            .group_queue_window(range_id)
             .await
             .acquire_owned()
             .await
             .map_err(|_| {
+                self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    "Active Range group queue is closed",
+                    true,
+                    vec![],
+                    vec![],
+                )
+            })?;
+        {
+            self.group_queues
+                .lock()
+                .await
+                .entry(range_id)
+                .or_default()
+                .push_back(GroupSubmission {
+                    id: my_id,
+                    _queue_permit,
+                    requests,
+                    frames,
+                    reply: reply_tx,
+                });
+        }
+        // Either this submission becomes a driver (permit acquired →
+        // drain + round) or an earlier driver already took it (reply).
+        let window = self.in_flight_window(range_id).await;
+        let _in_flight_permit = tokio::select! {
+            permit = window.acquire_owned() => permit.map_err(|_| {
                 self.error(
                     MajorityAppendErrorCode::LocalStorageFailure,
                     "Active Range append window is closed",
@@ -915,8 +1067,99 @@ impl MajorityAppendCoordinator {
                     vec![],
                     vec![],
                 )
-            })?;
+            })?,
+            reply = &mut reply_rx => {
+                return match reply {
+                    Ok(outcome) => outcome,
+                    Err(_) => Err(self.error(
+                        MajorityAppendErrorCode::LocalStorageFailure,
+                        "group-commit driver dropped the reply",
+                        true,
+                        vec![],
+                        vec![],
+                    )),
+                };
+            }
+        };
         let _append_guard = self.append_lock(range_id).await.lock_owned().await;
+        // Drain compatible submissions FIFO — always including this one.
+        let (mut subs, mine) = {
+            let mut map = self.group_queues.lock().await;
+            let queue = map.get_mut(&range_id).expect("queue entry exists");
+            let my_pos = queue.iter().position(|sub| sub.id == my_id);
+            match my_pos {
+                None => (Vec::new(), usize::MAX),
+                Some(my_pos) => {
+                    let mine_requests: Vec<_> = queue[my_pos].requests.clone();
+                    let mut drained = Vec::new();
+                    let mut frames_total = 0usize;
+                    let mut bytes_total = 0usize;
+                    // Compatible-with-ours in queue order (ours may sit
+                    // mid-queue); an incompatible earlier submission is
+                    // left for its own driver's round.
+                    let mut index = 0_usize;
+                    while index < queue.len() {
+                        let first = &queue[index].requests[0];
+                        let compatible = group_compatible(&mine_requests[0], first);
+                        let fits = compatible
+                            && frames_total + queue[index].requests.len() <= MAX_GROUP_ROUND_FRAMES
+                            && bytes_total
+                                + queue[index]
+                                    .requests
+                                    .iter()
+                                    .map(|r| r.frame.len() + 64)
+                                    .sum::<usize>()
+                                <= MAX_GROUP_ROUND_BYTES;
+                        if queue[index].id == my_id || fits {
+                            frames_total += queue[index].requests.len();
+                            bytes_total += queue[index]
+                                .requests
+                                .iter()
+                                .map(|r| r.frame.len() + 64)
+                                .sum::<usize>();
+                            drained.push(queue.remove(index).expect("queued"));
+                        } else {
+                            index += 1;
+                        }
+                    }
+                    let mine = drained
+                        .iter()
+                        .position(|sub| sub.id == my_id)
+                        .expect("own submission drained");
+                    (drained, mine)
+                }
+            }
+        };
+        if subs.is_empty() {
+            // An earlier driver already took this submission — the round
+            // it lands in reports our slice back over the channel.
+            drop(_append_guard);
+            return match reply_rx.await {
+                Ok(outcome) => outcome,
+                Err(_) => Err(self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    "group-commit driver dropped the reply",
+                    true,
+                    vec![],
+                    vec![],
+                )),
+            };
+        }
+        let merged_submissions = subs.len() > 1;
+        // Reassemble the round in queue order; per-request `None` keeps
+        // explicit-sequence submissions unpatched.
+        let mut merged_requests = Vec::new();
+        let mut merged_frames: Vec<Option<Vec<u8>>> = Vec::new();
+        // Capture per-submission frame counts before the vecs drain —
+        // the split below slices results by them.
+        let counts: Vec<usize> = subs.iter().map(|sub| sub.frames.len()).collect();
+        for sub in &mut subs {
+            merged_requests.append(&mut sub.requests);
+            merged_frames.append(&mut sub.frames);
+        }
+        let mut requests = merged_requests;
+        let _locked_at = _phase_timer.elapsed();
+        let round_result: Result<Vec<MajorityAppendResult>, MajorityAppendError> = async {
         let _locked_at = _phase_timer.elapsed();
         let assignment = self
             .control
@@ -931,6 +1174,7 @@ impl MajorityAppendCoordinator {
                     vec![],
                 )
             })?;
+        let _assign_ms = _phase_timer.elapsed() - _locked_at;
         if assignment.owner != *self.local.local_node()
             || requests.iter().any(|r| r.append_owner != assignment.owner)
         {
@@ -945,13 +1189,18 @@ impl MajorityAppendCoordinator {
                 vec![],
             ));
         }
-        if let Some(encoders) = encoders.take() {
+        if merged_frames.iter().any(Option::is_some) {
             // Mint the whole sequence run up front: the dedup watermark
             // only advances when frames land, so a batch mints each
             // Writer's base once and assigns the run contiguously.
+            // `None` entries (explicit-sequence merged submissions)
+            // keep their supplied identity.sequence.
             let mut minted: BTreeMap<(Uuid, u64), u64> = BTreeMap::new();
-            for (request, encode_with_sequence) in requests.iter_mut().zip(encoders) {
+            for (request, pre_frame) in requests.iter_mut().zip(merged_frames) {
                 request.ownership_epoch = assignment.ownership_epoch;
+                let Some(mut pre_frame) = pre_frame else {
+                    continue;
+                };
                 let writer_key = (
                     request.identity.writer_session_id,
                     request.identity.writer_epoch,
@@ -981,16 +1230,20 @@ impl MajorityAppendCoordinator {
                     }
                 };
                 minted.insert(writer_key, request.identity.sequence + 1);
-                request.frame_base64 =
-                    encode_with_sequence(request.identity.sequence).map_err(|error| {
-                        self.error(
-                            MajorityAppendErrorCode::LocalStorageFailure,
-                            format!("owner could not encode the minted record: {error}"),
-                            false,
-                            vec![],
-                            vec![],
-                        )
-                    })?;
+                crate::codec::patch_producer_sequence_unchecked(
+                    &mut pre_frame,
+                    request.identity.sequence,
+                )
+                .map_err(|error| {
+                    self.error(
+                        MajorityAppendErrorCode::LocalStorageFailure,
+                        format!("owner could not encode the minted record: {error}"),
+                        false,
+                        vec![],
+                        vec![],
+                    )
+                })?;
+                request.frame = pre_frame.into();
             }
         } else {
             for request in requests.iter_mut() {
@@ -1021,11 +1274,13 @@ impl MajorityAppendCoordinator {
                     expected_position: None,
                     identity: request.identity.clone(),
                     cursor: request.cursor.clone(),
-                    frame_base64: request.frame_base64.clone(),
+                    frame: request.frame.clone(),
                     pending_effect: request.pending_effect,
                 },
             )
             .collect();
+        let _encode_ms = _phase_timer.elapsed() - _locked_at - _assign_ms;
+        let _store_mark = _phase_timer.elapsed();
         let local_results = self
             .local
             .append_batch(envelope(local_frames, None))
@@ -1065,7 +1320,7 @@ impl MajorityAppendCoordinator {
                         expected_position: Some(result.position),
                         identity: request.identity.clone(),
                         cursor: request.cursor.clone(),
-                        frame_base64: request.frame_base64.clone(),
+                        frame: request.frame.clone(),
                         pending_effect: request.pending_effect,
                     },
                 )
@@ -1074,10 +1329,7 @@ impl MajorityAppendCoordinator {
             if !result.deduplicated {
                 continue;
             }
-            let request_digest = STANDARD
-                .decode(&follower_frames[index].frame_base64)
-                .map(|frame| *blake3::hash(&frame).as_bytes())
-                .unwrap_or_default();
+            let request_digest = *blake3::hash(&follower_frames[index].frame).as_bytes();
             if request_digest == result.frame_digest {
                 continue;
             }
@@ -1101,7 +1353,7 @@ impl MajorityAppendCoordinator {
                 })?;
             if let Some(frame) = frames.into_iter().next() {
                 if frame.position == result.position {
-                    follower_frames[index].frame_base64 = STANDARD.encode(&frame.frame);
+                    follower_frames[index].frame = frame.frame.clone();
                     follower_frames[index].identity = frame.identity;
                     follower_frames[index].cursor = frame.cursor;
                 }
@@ -1142,87 +1394,115 @@ impl MajorityAppendCoordinator {
         let send_permit_b = send_turn_b.hold();
         let commit_permit = self.commit_turn(range_id).await.hold();
         let last_position = local_results[local_results.len() - 1].position;
+        let _store_ms = _phase_timer.elapsed() - _store_mark;
         let _local_ms = _phase_timer.elapsed() - _locked_at;
         drop(_append_guard);
         // Timing accumulators: [send_wait_ms, send_ms] max per follower.
         let timing = std::sync::Mutex::new((0.0_f64, 0.0_f64));
         let mut durable = vec![self.local.local_node().clone()];
-        // Each send holds its follower's turn across the send AND any
-        // gap-repair retry, so a lagging repair still cannot reorder two
-        // rounds on that replica.
-        let send_a = async {
-            let t = std::time::Instant::now();
-            send_permit_a.wait().await;
-            let waited = t.elapsed().as_secs_f64() * 1000.0;
-            let t = std::time::Instant::now();
-            let node = &followers[0];
-            let result = match self
-                .transport
-                .append_batch(node, envelope(follower_frames.clone(), commit_hint))
-                .await
-            {
-                Err(error) if error.code == Some(ReplicaAppendErrorCode::PositionGap) => match self
-                    .fill_replica_gap(
-                        &assignment,
-                        &requests[0],
-                        node,
-                        error.expected_position,
-                        last_position,
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        self.transport
-                            .append_batch(node, envelope(follower_frames.clone(), commit_hint))
+        // Windowed sends: the OrderedTurn still mints and admits sends
+        // strictly in order, but a ticket is released as soon as its
+        // request is on the wire — up to MAX_INFLIGHT_SENDS_PER_FOLLOWER
+        // sends per lane overlap their round-trips while the replica's
+        // ordered admission lands them in position order. The lane
+        // permit is held across the response AND any gap repair, so a
+        // lane never exceeds the window even mid-repair.
+        let lane_a = self.send_lane(range_id, &followers[0]).await;
+        let lane_b = self.send_lane(range_id, &followers[1]).await;
+        let repair_a = self.repair_lock(range_id, &followers[0]).await;
+        let repair_b = self.repair_lock(range_id, &followers[1]).await;
+        let send_to =
+            |node: StorageNodeId,
+             turn_permit: TurnPermit,
+             lane: Arc<Semaphore>,
+             repair: Arc<Mutex<()>>,
+             request: crate::active_range::replication::ReplicaBatchAppendRequest| {
+                let timing = &timing;
+                let requests = &requests;
+                let assignment = &assignment;
+                async move {
+                    let t = std::time::Instant::now();
+                    turn_permit.wait().await;
+                    // Pending-effect rounds fence the whole lane — they must
+                    // never overlap another send to this replica.
+                    let lane_permit = if has_pending {
+                        lane.clone()
+                            .acquire_many_owned(MAX_INFLIGHT_SENDS_PER_FOLLOWER as u32)
                             .await
-                    }
-                    Err(fill_error) => Err(fill_error),
-                },
-                other => other,
+                    } else {
+                        lane.clone().acquire_owned().await
+                    };
+                    let _lane_permit = match lane_permit {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            return Err(ReplicaTransportError::transport(
+                                "replica send lane is closed",
+                                true,
+                            ))
+                        }
+                    };
+                    let waited = t.elapsed().as_secs_f64() * 1000.0;
+                    let t = std::time::Instant::now();
+                    let send = tokio::spawn({
+                        let transport = self.transport.clone();
+                        let node = node.clone();
+                        let request = request.clone();
+                        async move { transport.append_batch(&node, request).await }
+                    });
+                    // The ticket's only job was ordering send starts; release
+                    // it now this send is on the wire so the next round may
+                    // start its own while this response is in flight.
+                    drop(turn_permit);
+                    let result = match send.await {
+                        Ok(result) => result,
+                        Err(join_error) => Err(ReplicaTransportError::transport(
+                            format!("replica send task failed: {join_error}"),
+                            true,
+                        )),
+                    };
+                    let result = match result {
+                        Err(error) if error.code == Some(ReplicaAppendErrorCode::PositionGap) => {
+                            // Overlapping rounds that each miss positions
+                            // serialize on the lane's repair lock; re-driven
+                            // frames dedup idempotently on the replica.
+                            let _repair = repair.lock().await;
+                            match self
+                                .fill_replica_gap(
+                                    assignment,
+                                    &requests[0],
+                                    &node,
+                                    error.expected_position,
+                                    last_position,
+                                )
+                                .await
+                            {
+                                Ok(()) => self.transport.append_batch(&node, request).await,
+                                Err(fill_error) => Err(fill_error),
+                            }
+                        }
+                        other => other,
+                    };
+                    let sent = t.elapsed().as_secs_f64() * 1000.0;
+                    let mut guard = timing.lock().unwrap();
+                    guard.0 = guard.0.max(waited);
+                    guard.1 = guard.1.max(sent);
+                    result
+                }
             };
-            let sent = t.elapsed().as_secs_f64() * 1000.0;
-            let mut guard = timing.lock().unwrap();
-            guard.0 = guard.0.max(waited);
-            guard.1 = guard.1.max(sent);
-            result
-            // send_permit_a drops here — this follower's next round may send.
-        };
-        let send_b = async {
-            let t = std::time::Instant::now();
-            send_permit_b.wait().await;
-            let waited = t.elapsed().as_secs_f64() * 1000.0;
-            let t = std::time::Instant::now();
-            let node = &followers[1];
-            let result = match self
-                .transport
-                .append_batch(node, envelope(follower_frames.clone(), commit_hint))
-                .await
-            {
-                Err(error) if error.code == Some(ReplicaAppendErrorCode::PositionGap) => match self
-                    .fill_replica_gap(
-                        &assignment,
-                        &requests[0],
-                        node,
-                        error.expected_position,
-                        last_position,
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        self.transport
-                            .append_batch(node, envelope(follower_frames.clone(), commit_hint))
-                            .await
-                    }
-                    Err(fill_error) => Err(fill_error),
-                },
-                other => other,
-            };
-            let sent = t.elapsed().as_secs_f64() * 1000.0;
-            let mut guard = timing.lock().unwrap();
-            guard.0 = guard.0.max(waited);
-            guard.1 = guard.1.max(sent);
-            result
-        };
+        let send_a = send_to(
+            followers[0].clone(),
+            send_permit_a,
+            lane_a,
+            repair_a,
+            envelope(follower_frames.clone(), commit_hint),
+        );
+        let send_b = send_to(
+            followers[1].clone(),
+            send_permit_b,
+            lane_b,
+            repair_b,
+            envelope(follower_frames.clone(), commit_hint),
+        );
         let (first_result, second_result) = tokio::join!(send_a, send_b);
         let _sends_done = _phase_timer.elapsed();
         let follower_results = [
@@ -1428,6 +1708,9 @@ impl MajorityAppendCoordinator {
                 frames = requests.len(),
                 lock_wait_ms = _locked_at.as_secs_f64() * 1000.0,
                 mint_local_ms = _local_ms.as_secs_f64() * 1000.0,
+                mint_assign_ms = _assign_ms.as_secs_f64() * 1000.0,
+                mint_encode_ms = _encode_ms.as_secs_f64() * 1000.0,
+                mint_store_ms = _store_ms.as_secs_f64() * 1000.0,
                 send_wait_ms = wait_ms,
                 send_ms = send_ms,
                 sends_total_ms = (_sends_done - _locked_at - _local_ms).as_secs_f64() * 1000.0,
@@ -1459,6 +1742,63 @@ impl MajorityAppendCoordinator {
                 deduplicated: local.deduplicated,
             })
             .collect())
+        }
+        .await;
+        // Split the merged round back per submission in queue order.
+        let groups = subs.len();
+        let mine_index = mine;
+        match round_result {
+            Ok(results) => {
+                let mut offset = 0_usize;
+                let mut mine = None;
+                for (index, sub) in subs.into_iter().enumerate() {
+                    let end = offset + counts[index];
+                    let slice = results[offset..end].to_vec();
+                    offset = end;
+                    if index == mine_index {
+                        mine = Some(slice);
+                    } else {
+                        let _ = sub.reply.send(Ok(slice));
+                    }
+                }
+                tracing::debug!(groups, "append batch group round");
+                Ok(mine.expect("own slice"))
+            }
+            Err(error) => {
+                // Poison isolation: a merged round's per-frame refusal
+                // may not apply to every submission — re-run each solo
+                // so one bad batch cannot take innocent ones down.
+                // Non-retryable refusals may be per-frame: solo re-runs
+                // isolate the bad submission from the innocent ones.
+                let poisonous = !error.retryable;
+                if merged_submissions && poisonous {
+                    let mut mine = None;
+                    for (index, sub) in subs.into_iter().enumerate() {
+                        let frames = if sub.frames.iter().all(Option::is_none) {
+                            None
+                        } else {
+                            Some(sub.frames)
+                        };
+                        let outcome = Box::pin(self.append_batch_inner(sub.requests, frames)).await;
+                        if index == mine_index {
+                            mine = Some(outcome);
+                        } else {
+                            let _ = sub.reply.send(outcome);
+                        }
+                    }
+                    mine.expect("own outcome")
+                } else {
+                    for (index, sub) in subs.into_iter().enumerate() {
+                        let cloned = error.clone();
+                        if index == mine_index {
+                            continue;
+                        }
+                        let _ = sub.reply.send(Err(cloned));
+                    }
+                    Err(error)
+                }
+            }
+        }
     }
 
     /// Re-drive the positions a lagging replica never stored so the caller
@@ -1515,7 +1855,7 @@ impl MajorityAppendCoordinator {
                         expected_position: frame.position,
                         identity: frame.identity,
                         cursor: frame.cursor.clone(),
-                        frame_base64: STANDARD.encode(&frame.frame),
+                        frame: frame.frame.clone(),
                         pending_effect: None,
                     },
                 )
@@ -1926,12 +2266,7 @@ impl HttpReplicaTransport {
         };
         let mut frames = Vec::with_capacity(request.frames.len());
         for frame in &request.frames {
-            frames.push(STANDARD.decode(&frame.frame_base64).map_err(|error| {
-                ReplicaTransportError::transport(
-                    format!("batch frame is not valid base64: {error}"),
-                    false,
-                )
-            })?);
+            frames.push(frame.frame.to_vec());
         }
         let header = ReplicaBatchAppendHeader {
             feed_id: request.feed_id,

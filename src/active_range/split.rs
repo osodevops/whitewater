@@ -21,7 +21,7 @@ use super::{
 /// paying a durability round-trip per frame.
 #[derive(Default)]
 pub(crate) struct StagedBatch {
-    pub(crate) frames: Vec<(RangePosition, AppendIdentity, String, Vec<u8>)>,
+    pub(crate) frames: Vec<(RangePosition, AppendIdentity, String, bytes::Bytes)>,
     pub(crate) expected: Vec<(RangePosition, [u8; 32])>,
 }
 
@@ -31,7 +31,7 @@ impl StagedBatch {
         position: RangePosition,
         identity: AppendIdentity,
         cursor: String,
-        frame: Vec<u8>,
+        frame: bytes::Bytes,
         digest: [u8; 32],
     ) {
         self.frames.push((position, identity, cursor, frame));

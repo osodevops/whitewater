@@ -630,14 +630,13 @@ pub fn tier_scan_once(
     let mut report = TierScanReport::default();
     let now = unix_ns();
     for generation_dir in generation_directories(root) {
-        let state_path = generation_dir.join("range-state.json");
-        let persisted: PersistedRangeState = match fs::read(&state_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        {
-            Some(state) => state,
-            None => continue,
-        };
+        // Lazy slot files may carry the freshest checkpoint — resolve
+        // them or the scan sees a stale active_segment.
+        let persisted: PersistedRangeState =
+            match crate::active_range::store::read_latest_persisted_state(&generation_dir) {
+                Ok(Some(state)) => state,
+                _ => continue,
+            };
         let hot_local = policy(persisted.feed_id).and_then(|p| p.tier_after_ns);
         for segment in 0..persisted.active_segment {
             if read_tier_marker(&generation_dir, segment).is_some() {

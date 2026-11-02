@@ -7,12 +7,13 @@ use std::{
 };
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use crate::{
-    codec::{decode_record, CodecError, MAX_FRAME_BYTES},
+    codec::{decode_record, peek_record_header, CodecError, RecordHeader, MAX_FRAME_BYTES},
     control::HistoryPolicy,
     domain::StoredRecord,
 };
@@ -43,7 +44,7 @@ pub struct ActiveRangeAppend {
     pub expected_position: Option<RangePosition>,
     pub identity: AppendIdentity,
     pub cursor: String,
-    pub frame: Vec<u8>,
+    pub frame: Bytes,
     /// When set, the appended record joins the named effect's pending tail:
     /// durable on the replica quorum but fenced behind the committed
     /// boundary until the effect's terminal journal marker releases it.
@@ -104,7 +105,7 @@ pub struct StoredRangeFrame {
     pub position: RangePosition,
     pub identity: AppendIdentity,
     pub cursor: String,
-    pub frame: Vec<u8>,
+    pub frame: Bytes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -237,6 +238,8 @@ pub enum ActiveRangeStoreError {
     RetentionExpired { position: u64, retained_from: u64 },
     #[error("history was cryptographically erased — the Feed's data key is destroyed")]
     FeedErased,
+    #[error("a deferred segment fsync failed: {0}")]
+    DeferredSyncFailed(String),
     #[error("Active Range tail is held by pending effect {0:?}")]
     PendingEffectOccupied(PendingEffect),
     #[error("storage worker failed: {0}")]
@@ -419,6 +422,20 @@ struct FileActiveRangeStoreInner {
     /// Collapses speculative prefetch storms: a read burst across cold
     /// remote spans spawns at most one in-flight read-ahead per range.
     prefetch_running: std::sync::atomic::AtomicBool,
+    /// Lets the deferred fsync worker re-enter the range lock without an
+    /// owning cycle: set right after the Arc is built.
+    self_weak: std::sync::OnceLock<std::sync::Weak<FileActiveRangeStoreInner>>,
+    /// Test-only deferred-sync failure injection, scoped to this store so
+    /// parallel tests are never poisoned.
+    #[cfg(test)]
+    test_deferred_sync_fail: std::sync::atomic::AtomicBool,
+    /// Test hooks for the lock-free committed read path, scoped to this
+    /// store: a one-shot pause between file I/O and re-lock, and a count
+    /// of unlocked span reads.
+    #[cfg(test)]
+    test_lock_free_pause: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    test_lock_free_reads: std::sync::atomic::AtomicUsize,
 }
 
 struct LoadedRange {
@@ -450,6 +467,17 @@ struct LoadedRange {
     /// `sync_interval` the deferred path only pays a real sync once the
     /// interval has elapsed; strict mode always syncs.
     last_durable_sync: std::time::Instant,
+    /// A background thread is fsyncing the active segment: the append
+    /// path must not launch a second one.
+    sync_in_flight: bool,
+    /// A deferred fsync failed: every mutating operation fails closed
+    /// with this error until the store is reopened.
+    sync_error: Option<String>,
+    /// Tracked byte length of the active segment file — updated wherever
+    /// the file is written, rotated, or truncated; replaces a per-frame
+    /// `metadata()` syscall and gives staged batch writes their entry
+    /// offsets before the bytes land.
+    active_length: u64,
 }
 
 /// A remote segment fetched into the tier cache: the cache file path, its
@@ -502,6 +530,11 @@ pub(crate) struct PersistedRangeState {
     /// range. Strict checkpoints keep the hard integrity error.
     #[serde(default)]
     relaxed_commit: bool,
+    /// Monotonic checkpoint counter: lazy A/B slots and the strict file
+    /// carry it so reopen picks the freshest valid snapshot without
+    /// relying on rename ordering. Legacy files deserialize as 0.
+    #[serde(default)]
+    checkpoint_seq: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -575,12 +608,8 @@ impl FileActiveRangeStore {
         }
         let directory = range_directory(root.as_ref(), &descriptor);
         fs::create_dir_all(&directory)?;
-        let state_path = directory.join("range-state.json");
-        let mut persisted = if state_path.exists() {
-            serde_json::from_slice::<PersistedRangeState>(&fs::read(&state_path)?)?
-        } else {
-            PersistedRangeState::new(&descriptor)
-        };
+        let mut persisted = read_latest_persisted_state(&directory)?
+            .unwrap_or_else(|| PersistedRangeState::new(&descriptor));
         validate_persisted_identity(&persisted, &descriptor)?;
         if persisted.ownership_epoch < descriptor.ownership_epoch {
             persisted.ownership_epoch = descriptor.ownership_epoch;
@@ -663,31 +692,45 @@ impl FileActiveRangeStore {
             // the effect journal's replay decides the outcome instead.
             persisted.pending_effect = None;
         }
-        persist_state(&directory, &persisted)?;
+        persist_state(&directory, &mut persisted)?;
         let active_file = open_segment(&directory, persisted.active_segment)?;
-        Ok(Self {
-            inner: Arc::new(FileActiveRangeStoreInner {
-                directory,
-                tier: options.tier.clone(),
-                options,
-                persistence_failure: std::sync::atomic::AtomicBool::new(false),
-                prefetch_running: std::sync::atomic::AtomicBool::new(false),
-                loaded: Mutex::new(LoadedRange {
-                    persisted,
-                    active_file,
-                    entries,
-                    cursor_positions,
-                    digest_positions,
-                    deduplication: recovered_deduplication,
-                    remote,
-                    materialized: BTreeMap::new(),
-                    materialized_bytes: 0,
-                    use_seq: 0,
-                    ingest_monotonic,
-                    last_durable_sync: std::time::Instant::now(),
-                }),
+        let active_length = active_file.metadata()?.len();
+        let inner = Arc::new(FileActiveRangeStoreInner {
+            directory,
+            tier: options.tier.clone(),
+            options,
+            persistence_failure: std::sync::atomic::AtomicBool::new(false),
+            prefetch_running: std::sync::atomic::AtomicBool::new(false),
+            loaded: Mutex::new(LoadedRange {
+                persisted,
+                active_file,
+                entries,
+                cursor_positions,
+                digest_positions,
+                deduplication: recovered_deduplication,
+                remote,
+                materialized: BTreeMap::new(),
+                materialized_bytes: 0,
+                use_seq: 0,
+                ingest_monotonic,
+                last_durable_sync: std::time::Instant::now(),
+                sync_in_flight: false,
+                sync_error: None,
+                active_length,
             }),
-        })
+            self_weak: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            test_deferred_sync_fail: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            test_lock_free_pause: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            test_lock_free_reads: std::sync::atomic::AtomicUsize::new(0),
+        });
+        inner
+            .self_weak
+            .set(Arc::downgrade(&inner))
+            .expect("self weak set once");
+        Ok(Self { inner })
     }
 
     async fn blocking<T, F>(&self, operation: F) -> Result<T, ActiveRangeStoreError>
@@ -1133,7 +1176,7 @@ impl ActiveRangeStore for FileActiveRangeStore {
                 .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
             let mut next = loaded.persisted.clone();
             next.ownership_epoch = new_epoch;
-            persist_state(&inner.directory, &next)?;
+            persist_state(&inner.directory, &mut next)?;
             loaded.persisted = next;
             Ok(())
         })
@@ -1157,6 +1200,7 @@ impl PersistedRangeState {
             deduplication: Vec::new(),
             pending_effect: None,
             relaxed_commit: false,
+            checkpoint_seq: 0,
         }
     }
 }
@@ -1269,6 +1313,10 @@ fn snapshot(loaded: &LoadedRange) -> Result<ActiveRangeSnapshot, ActiveRangeStor
 /// history or an idempotent retry degrades into a false PositionConflict.
 /// Fetching happens here — before the write lock — so the byte-level
 /// dedup comparisons still run against real frame content.
+#[cfg(test)]
+static PREMATERIALIZE_SCANS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn prematerialize_for_appends(
     inner: &FileActiveRangeStoreInner,
     requests: &[ActiveRangeAppend],
@@ -1279,49 +1327,55 @@ fn prematerialize_for_appends(
                 .loaded
                 .lock()
                 .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
-            let mut needed: Vec<SegmentManifest> = Vec::new();
-            let mut consider = |position: RangePosition| {
-                let position = position.value();
-                if let Some(manifest) = loaded.remote.values().find(|manifest| {
-                    !loaded.materialized.contains_key(&manifest.segment)
-                        && manifest.first_position <= position
-                        && position <= manifest.last_position
-                }) {
-                    if needed
-                        .iter()
-                        .all(|span: &SegmentManifest| span.segment != manifest.segment)
+            if loaded.remote.is_empty() {
+                Vec::new()
+            } else {
+                #[cfg(test)]
+                PREMATERIALIZE_SCANS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut needed: Vec<SegmentManifest> = Vec::new();
+                let mut consider = |position: RangePosition| {
+                    let position = position.value();
+                    if let Some(manifest) = loaded.remote.values().find(|manifest| {
+                        !loaded.materialized.contains_key(&manifest.segment)
+                            && manifest.first_position <= position
+                            && position <= manifest.last_position
+                    }) {
+                        if needed
+                            .iter()
+                            .all(|span: &SegmentManifest| span.segment != manifest.segment)
+                        {
+                            needed.push(manifest.clone());
+                        }
+                    }
+                };
+                for request in requests {
+                    if let Some(supplied) = request
+                        .expected_position
+                        .filter(|supplied| supplied.value() <= loaded.persisted.appended)
                     {
-                        needed.push(manifest.clone());
+                        consider(supplied);
+                    }
+                    let frame_digest = blake3::hash(&request.frame);
+                    if let Some(position) = loaded
+                        .digest_positions
+                        .get(frame_digest.as_bytes())
+                        .copied()
+                    {
+                        consider(position);
+                    }
+                    if let Some(position) = loaded.cursor_positions.get(&request.cursor).copied() {
+                        consider(position);
+                    }
+                    let writer_key = WriterKey {
+                        writer_session_id: request.identity.writer_session_id,
+                        writer_epoch: request.identity.writer_epoch,
+                    };
+                    if let Some(deduplication) = loaded.deduplication.get(&writer_key) {
+                        consider(deduplication.position);
                     }
                 }
-            };
-            for request in requests {
-                if let Some(supplied) = request
-                    .expected_position
-                    .filter(|supplied| supplied.value() <= loaded.persisted.appended)
-                {
-                    consider(supplied);
-                }
-                let frame_digest = blake3::hash(&request.frame);
-                if let Some(position) = loaded
-                    .digest_positions
-                    .get(frame_digest.as_bytes())
-                    .copied()
-                {
-                    consider(position);
-                }
-                if let Some(position) = loaded.cursor_positions.get(&request.cursor).copied() {
-                    consider(position);
-                }
-                let writer_key = WriterKey {
-                    writer_session_id: request.identity.writer_session_id,
-                    writer_epoch: request.identity.writer_epoch,
-                };
-                if let Some(deduplication) = loaded.deduplication.get(&writer_key) {
-                    consider(deduplication.position);
-                }
+                needed
             }
-            needed
         };
         if needed.is_empty() {
             return Ok(());
@@ -1340,7 +1394,7 @@ fn append(
     if request.cursor.len() > MAX_CURSOR_BYTES {
         return Err(ActiveRangeStoreError::CursorTooLarge);
     }
-    let record = decode_record(&request.frame)?;
+    let record = peek_record_header(&request.frame)?;
     if record.producer_id != request.identity.writer_session_id
         || record.producer_sequence != request.identity.sequence
     {
@@ -1351,7 +1405,16 @@ fn append(
         .loaded
         .lock()
         .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
-    append_locked(inner, &mut loaded, request, import, true, &record)
+    append_locked(
+        inner,
+        &mut loaded,
+        request,
+        None,
+        import,
+        true,
+        &record,
+        None,
+    )
 }
 
 /// Ordered batch body shared by `append_batch` (live Writer fences) and
@@ -1379,32 +1442,123 @@ fn append_batch(
     commit: Option<BatchCommit>,
     allow_deferred: bool,
 ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError> {
+    let _timer = std::time::Instant::now();
+    // Header peek + blake3 digest are pure functions of the frame
+    // bytes — run them for the whole batch before the `loaded` lock,
+    // spread over threads when the batch is large (this already runs
+    // on a blocking-pool thread).
+    let mut frame_meta: Vec<(crate::codec::RecordHeader, [u8; 32])> =
+        Vec::with_capacity(requests.len());
+    if requests.len() >= 256 {
+        let workers = std::thread::available_parallelism()
+            .map(|count| count.get().min(8))
+            .unwrap_or(1);
+        let chunk = requests.len().div_ceil(workers);
+        let scoped = std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for slice in requests.chunks(chunk) {
+                handles.push(scope.spawn(move || {
+                    slice
+                        .iter()
+                        .map(|request| {
+                            peek_record_header(&request.frame)
+                                .map(|header| (header, *blake3::hash(&request.frame).as_bytes()))
+                        })
+                        .collect::<Result<Vec<_>, _>>()
+                }));
+            }
+            let mut outcomes = Vec::with_capacity(handles.len());
+            for handle in handles {
+                outcomes.push(handle.join());
+            }
+            outcomes
+        })
+        .into_iter()
+        .map(|joined| {
+            joined
+                .map_err(|_| {
+                    ActiveRangeStoreError::Worker("frame header worker panicked".to_owned())
+                })
+                .and_then(|result| result.map_err(ActiveRangeStoreError::from))
+        })
+        .collect::<Result<Vec<Vec<(crate::codec::RecordHeader, [u8; 32])>>, _>>()?;
+        frame_meta.extend(scoped.into_iter().flatten());
+    } else {
+        for request in &requests {
+            frame_meta.push((
+                peek_record_header(&request.frame)?,
+                *blake3::hash(&request.frame).as_bytes(),
+            ));
+        }
+    }
+    let _precompute_ms = _timer.elapsed().as_secs_f64() * 1000.0;
+    let _prematerialize_mark = std::time::Instant::now();
     prematerialize_for_appends(inner, &requests)?;
+    let _prematerialize_ms = _prematerialize_mark.elapsed().as_secs_f64() * 1000.0;
+    let _lock_wait_mark = std::time::Instant::now();
     let mut loaded = inner
         .loaded
         .lock()
         .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+    let _lock_wait_ms = _lock_wait_mark.elapsed().as_secs_f64() * 1000.0;
     let mut results = Vec::with_capacity(requests.len());
     let mut has_pending = false;
-    for request in requests {
+    let mut _peek_ms = 0.0f64;
+    let mut _loop_ms = 0.0f64;
+    // Staged batch write: frames accumulate here and land in ONE
+    // write_all before sync/persist — or before any error returns, so a
+    // refused tail still leaves the staged prefix durable on disk.
+    let mut staging: Vec<u8> = Vec::new();
+    let mut _write_ms = 0.0f64;
+    for (index, request) in requests.into_iter().enumerate() {
         if request.cursor.len() > MAX_CURSOR_BYTES {
             return Err(ActiveRangeStoreError::CursorTooLarge);
         }
-        let record = decode_record(&request.frame)?;
+        let (record, frame_digest) = &frame_meta[index];
+        let frame_digest = *frame_digest;
         if record.producer_id != request.identity.writer_session_id
             || record.producer_sequence != request.identity.sequence
         {
             return Err(ActiveRangeStoreError::WriterIdentityMismatch);
         }
         has_pending |= request.pending_effect.is_some();
-        match append_locked(inner, &mut loaded, request, import, false, &record) {
-            Ok(result) => results.push(result),
+        let _mark = std::time::Instant::now();
+        match append_locked(
+            inner,
+            &mut loaded,
+            request,
+            Some(&mut staging),
+            import,
+            false,
+            record,
+            Some(frame_digest),
+        ) {
+            Ok(result) => {
+                _loop_ms += _mark.elapsed().as_secs_f64() * 1000.0;
+                results.push(result);
+            }
             Err(error) => {
+                let _mark = std::time::Instant::now();
+                loaded.active_file.write_all(&staging)?;
+                _write_ms += _mark.elapsed().as_secs_f64() * 1000.0;
+                loaded.active_length += staging.len() as u64;
+                staging.clear();
                 loaded.active_file.sync_data()?;
-                persist_state(&inner.directory, &loaded.persisted)?;
+                loaded.persisted.deduplication = persisted_deduplication(&loaded.deduplication);
+                persist_state(&inner.directory, &mut loaded.persisted)?;
                 return Err(error);
             }
         }
+    }
+    // Land the staged frames before anything below can early-return —
+    // commit validation errors must leave the prefix durable, exactly
+    // as per-frame writes did before.
+    if !staging.is_empty() {
+        let _mark = std::time::Instant::now();
+        loaded.active_file.write_all(&staging)?;
+        _write_ms += _mark.elapsed().as_secs_f64() * 1000.0;
+        loaded.active_length += staging.len() as u64;
+        staging.clear();
     }
     // Fused commit: the batch's commit marker rides the same durability
     // unit as its frames — a follower applies it only after every frame
@@ -1421,47 +1575,85 @@ fn append_batch(
         )?;
         let position = commit.position;
         if position.value() < loaded.persisted.committed {
-            return Err(ActiveRangeStoreError::CommitMovedBackwards {
-                current: loaded.persisted.committed,
-                supplied: position.value(),
-            });
+            // Windowed replica sends can deliver a duplicate batch after
+            // its fused commit already moved past it: when every frame
+            // deduplicated and the batch tail still matches the marker's
+            // digest, the commit is already satisfied — replay Ok
+            // instead of rewinding the watermark. A fresh append or a
+            // digest mismatch keeps the fail-closed error.
+            let satisfied = !results.is_empty()
+                && results.iter().all(|result| result.deduplicated)
+                && results.last().map(|result| result.frame_digest) == Some(commit.frame_digest);
+            if !satisfied {
+                return Err(ActiveRangeStoreError::CommitMovedBackwards {
+                    current: loaded.persisted.committed,
+                    supplied: position.value(),
+                });
+            }
+        } else {
+            if position.value() > loaded.persisted.flushed {
+                return Err(ActiveRangeStoreError::CommitBeyondFlushed {
+                    supplied: position.value(),
+                    flushed: loaded.persisted.flushed,
+                });
+            }
+            // The fused marker must pin this batch's own tail — committing a
+            // position whose frame digest differs would ratify bytes the
+            // caller never proved, exactly the check the commit endpoint runs.
+            let tail = results.last();
+            if tail.map(|result| result.position.value()) != Some(position.value())
+                || tail.map(|result| result.frame_digest) != Some(commit.frame_digest)
+            {
+                loaded.active_file.write_all(&staging)?;
+                loaded.active_length += staging.len() as u64;
+                staging.clear();
+                loaded.active_file.sync_data()?;
+                loaded.persisted.deduplication = persisted_deduplication(&loaded.deduplication);
+                persist_state(&inner.directory, &mut loaded.persisted)?;
+                return Err(ActiveRangeStoreError::InvalidState(
+                    "fused commit does not match the batch tail".to_owned(),
+                ));
+            }
+            let mut next = loaded.persisted.clone();
+            next.committed = position.value();
+            if next
+                .pending_effect
+                .as_ref()
+                .is_some_and(|pending| pending.last_position <= position.value())
+            {
+                next.pending_effect = None;
+            }
+            loaded.persisted = next;
         }
-        if position.value() > loaded.persisted.flushed {
-            return Err(ActiveRangeStoreError::CommitBeyondFlushed {
-                supplied: position.value(),
-                flushed: loaded.persisted.flushed,
-            });
-        }
-        // The fused marker must pin this batch's own tail — committing a
-        // position whose frame digest differs would ratify bytes the
-        // caller never proved, exactly the check the commit endpoint runs.
-        let tail = results.last();
-        if tail.map(|result| result.position.value()) != Some(position.value())
-            || tail.map(|result| result.frame_digest) != Some(commit.frame_digest)
-        {
-            loaded.active_file.sync_data()?;
-            persist_state(&inner.directory, &loaded.persisted)?;
-            return Err(ActiveRangeStoreError::InvalidState(
-                "fused commit does not match the batch tail".to_owned(),
-            ));
-        }
-        let mut next = loaded.persisted.clone();
-        next.committed = position.value();
-        if next
-            .pending_effect
-            .as_ref()
-            .is_some_and(|pending| pending.last_position <= position.value())
-        {
-            next.pending_effect = None;
-        }
-        loaded.persisted = next;
     }
+    let _sync_mark = std::time::Instant::now();
     sync_due(inner, &mut loaded, strict)?;
+    let _sync_ms = _sync_mark.elapsed().as_secs_f64() * 1000.0;
+    let _persist_mark = std::time::Instant::now();
+    loaded.persisted.deduplication = persisted_deduplication(&loaded.deduplication);
     if strict {
-        persist_state(&inner.directory, &loaded.persisted)?;
-    } else {
-        persist_state_lazy(&inner.directory, &loaded.persisted)?;
+        persist_state(&inner.directory, &mut loaded.persisted)?;
+    } else if commit.is_some() {
+        // Non-strict batches without a fused commit only touched
+        // appended/flushed/dedup — all recomputed by the reopen rescan,
+        // so the lazy checkpoint is redundant write amplification
+        // (the commit that follows writes it again anyway).
+        persist_state_lazy(&inner.directory, &mut loaded.persisted)?;
     }
+    let _persist_ms = _persist_mark.elapsed().as_secs_f64() * 1000.0;
+    tracing::debug!(
+        frames = results.len(),
+        precompute_ms = _precompute_ms,
+        prematerialize_ms = _prematerialize_ms,
+        lock_wait_ms = _lock_wait_ms,
+        peek_ms = _peek_ms,
+        append_loop_ms = _loop_ms,
+        write_ms = _write_ms,
+        sync_ms = _sync_ms,
+        persist_ms = _persist_ms,
+        total_ms = _timer.elapsed().as_secs_f64() * 1000.0,
+        "store append batch timing"
+    );
     // Report the fused commit through the same per-frame flag the
     // single-append path reports, so the owner can count commit evidence.
     if let Some(commit) = commit {
@@ -1479,15 +1671,27 @@ fn append_batch(
 /// sync/state flush to the batch end because staged candidate frames are
 /// re-derivable from the source and a partial batch stays resumable through
 /// the same dedup checks.
+fn sync_error_check(loaded: &LoadedRange) -> Result<(), ActiveRangeStoreError> {
+    match &loaded.sync_error {
+        Some(message) => Err(ActiveRangeStoreError::DeferredSyncFailed(message.clone())),
+        None => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn append_locked(
     inner: &FileActiveRangeStoreInner,
     loaded: &mut LoadedRange,
     request: ActiveRangeAppend,
+    mut staging: Option<&mut Vec<u8>>,
     import: bool,
     flush: bool,
-    record: &StoredRecord,
+    record: &RecordHeader,
+    precomputed_digest: Option<[u8; 32]>,
 ) -> Result<ActiveRangeAppendResult, ActiveRangeStoreError> {
-    let frame_digest = *blake3::hash(&request.frame).as_bytes();
+    sync_error_check(loaded)?;
+    let frame_digest =
+        precomputed_digest.unwrap_or_else(|| *blake3::hash(&request.frame).as_bytes());
     let writer_key = WriterKey {
         writer_session_id: request.identity.writer_session_id,
         writer_epoch: request.identity.writer_epoch,
@@ -1609,7 +1813,7 @@ fn append_locked(
             .ok_or(ActiveRangeStoreError::PositionConflict(existing_position))?;
         let existing_frame = read_indexed_frame(&inner.directory, loaded, &existing)?;
         let existing_record = decode_record(&existing_frame.frame)?;
-        if same_request_record(&existing_record, record) {
+        if same_request_record(&existing_record, &decode_record(&request.frame)?) {
             // The API layer allocated this retry a fresh sequence before the
             // Cursor dedup caught it; that number is consumed even though no
             // record lands. Record it against the original position so the
@@ -1637,7 +1841,7 @@ fn append_locked(
                 let mut next = loaded.persisted.clone();
                 next.deduplication = persisted_deduplication(&loaded.deduplication);
                 if flush {
-                    persist_state(&inner.directory, &next)?;
+                    persist_state(&inner.directory, &mut next)?;
                 }
                 loaded.persisted = next;
             }
@@ -1665,7 +1869,7 @@ fn append_locked(
                     )?;
                     let existing_frame = read_indexed_frame(&inner.directory, loaded, &existing)?;
                     let existing_record = decode_record(&existing_frame.frame)?;
-                    if !same_request_record(&existing_record, record) {
+                    if !same_request_record(&existing_record, &decode_record(&request.frame)?) {
                         return Err(ActiveRangeStoreError::WriterSequenceConflict {
                             latest: previous.sequence,
                         });
@@ -1712,22 +1916,52 @@ fn append_locked(
         position,
         identity: request.identity,
         cursor: request.cursor,
-        frame: request.frame,
+        frame: request.frame.to_vec(),
         frame_digest,
         message_id: record.message_id,
         ingest_time_ns: record.ingest_time_ns,
     };
     let encoded = encode_entry(&decoded)?;
+    let staged = staging.as_deref().map_or(0, |bytes| bytes.len() as u64);
     if let Some(limit) = inner.options.max_range_bytes {
+        // range_segment_bytes sums every segment (sealed included);
+        // max_range_bytes bounds the whole Range, not the active file.
         let required = range_segment_bytes(&inner.directory, loaded.persisted.active_segment)?
+            .saturating_add(staged)
             .saturating_add(encoded.len() as u64);
         if required > limit {
             return Err(ActiveRangeStoreError::DiskCapacityExceeded { required, limit });
         }
     }
-    rotate_if_needed(inner, loaded, encoded.len() as u64)?;
-    let entry_start = loaded.active_file.seek(SeekFrom::End(0))?;
-    loaded.active_file.write_all(&encoded)?;
+    // A staged batch buffers bytes before one write; the rotation check
+    // must see them on disk first, or the new segment's offsets drift.
+    if staged > 0 {
+        let would_rotate = loaded.active_length + staged + encoded.len() as u64
+            > inner.options.max_segment_bytes
+            && loaded.persisted.appended == loaded.persisted.committed;
+        if would_rotate {
+            let staging = staging.as_deref_mut().expect("staged above");
+            loaded.active_file.write_all(staging)?;
+            loaded.active_length += staging.len() as u64;
+            staging.clear();
+            rotate_if_needed(inner, loaded, encoded.len() as u64)?;
+        }
+    } else {
+        rotate_if_needed(inner, loaded, encoded.len() as u64)?;
+    }
+    let entry_start = match staging {
+        Some(staging) => {
+            let start = loaded.active_length + staging.len() as u64;
+            staging.extend_from_slice(&encoded);
+            start
+        }
+        None => {
+            let start = loaded.active_length;
+            loaded.active_file.write_all(&encoded)?;
+            loaded.active_length += encoded.len() as u64;
+            start
+        }
+    };
     if flush {
         sync_due(inner, loaded, request.pending_effect.is_some())?;
     }
@@ -1772,31 +2006,43 @@ fn append_locked(
             loaded.deduplication.insert(writer_key, deduplication);
         }
     }
-    let mut next = loaded.persisted.clone();
-    next.appended = position.value();
-    next.flushed = position.value();
-    next.deduplication = persisted_deduplication(&loaded.deduplication);
-    if let Some(requested) = request.pending_effect {
-        next.pending_effect = Some(PendingEffect {
-            effect_id: requested.effect_id,
-            subscription_id: requested.subscription_id,
-            last_position: position.value(),
-            last_frame_digest: frame_digest,
-        });
-    }
     if flush {
+        let mut next = loaded.persisted.clone();
+        next.appended = position.value();
+        next.flushed = position.value();
+        next.deduplication = persisted_deduplication(&loaded.deduplication);
+        if let Some(requested) = request.pending_effect {
+            next.pending_effect = Some(PendingEffect {
+                effect_id: requested.effect_id,
+                subscription_id: requested.subscription_id,
+                last_position: position.value(),
+                last_frame_digest: frame_digest,
+            });
+        }
         // A pending-effect marker must be crash-durable with its frames; a
         // plain append's dedup/appended/flushed bookkeeping is recomputed
         // by recovery rescan, so it takes the checkpoint-only write.
         let persistence = if next.pending_effect.is_some() {
-            persist_state(&inner.directory, &next)
+            persist_state(&inner.directory, &mut next)
         } else {
-            persist_state_lazy(&inner.directory, &next)
+            persist_state_lazy(&inner.directory, &mut next)
         };
         loaded.persisted = next;
         persistence?;
     } else {
-        loaded.persisted = next;
+        // Batch frames update watermarks in place: the dedup checkpoint
+        // Vec is refreshed where a checkpoint is actually written, not
+        // rebuilt per frame.
+        loaded.persisted.appended = position.value();
+        loaded.persisted.flushed = position.value();
+        if let Some(requested) = request.pending_effect {
+            loaded.persisted.pending_effect = Some(PendingEffect {
+                effect_id: requested.effect_id,
+                subscription_id: requested.subscription_id,
+                last_position: position.value(),
+                last_frame_digest: frame_digest,
+            });
+        }
     }
     Ok(ActiveRangeAppendResult {
         position,
@@ -1818,6 +2064,7 @@ fn commit(
         .loaded
         .lock()
         .map_err(|_| ActiveRangeStoreError::Worker("range lock poisoned".to_owned()))?;
+    sync_error_check(&loaded)?;
     validate_generation_and_epoch(&loaded.persisted, generation, ownership_epoch)?;
     if position.value() < loaded.persisted.committed {
         return Err(ActiveRangeStoreError::CommitMovedBackwards {
@@ -1844,9 +2091,9 @@ fn commit(
     // checkpoint; a plain commit's watermark is quorum-replicated
     // evidence, so the deferred mode takes the checkpoint-only write.
     if inner.options.sync_interval.is_some() && next.pending_effect.is_none() {
-        persist_state_lazy(&inner.directory, &next)?;
+        persist_state_lazy(&inner.directory, &mut next)?;
     } else {
-        persist_state(&inner.directory, &next)?;
+        persist_state(&inner.directory, &mut next)?;
     }
     loaded.persisted = next;
     Ok(())
@@ -2196,6 +2443,7 @@ fn read_window_inner(
     committed_only: bool,
     max_bytes: Option<usize>,
 ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
+    let _timer = std::time::Instant::now();
     let mut next = after.map_or(0, RangePosition::value).saturating_add(1);
     // History below the retention floor is gone: a cursor resuming below
     // it fails closed rather than silently skipping lost positions, while
@@ -2264,7 +2512,7 @@ fn read_window_inner(
                         }
                         let frame = read_indexed_frame(&inner.directory, &loaded, entry)?;
                         if let Some(cap) = max_bytes {
-                            let size = crate::codec::logical_frame_size(&frame.frame)?;
+                            let size = crate::codec::logical_frame_size_unchecked(&frame.frame)?;
                             let candidate = bytes
                                 .checked_add(size)
                                 .ok_or(ActiveRangeStoreError::ReadBudgetExceeded)?;
@@ -2334,16 +2582,71 @@ fn read_window_inner(
                             end
                         };
                         let run = &loaded.entries[index..span_end];
-                        let mut span_frames = read_indexed_frame_run(
-                            &inner.directory,
-                            &mut segment_cache,
-                            &loaded,
-                            run,
-                        )?
-                        .into_iter();
+                        let encrypted = loaded
+                            .materialized
+                            .get(&segment)
+                            .is_some_and(|materialized| materialized.plaintext.is_some());
+                        // The unlocked path is only safe for committed
+                        // frames: those are immutable, while an uncommitted
+                        // tail can be truncated and rewritten under the lock,
+                        // so reads above the watermark stay locked.
+                        let span_frames: Vec<StoredRangeFrame> = if encrypted || !committed_only {
+                            // Encrypted spans serve from the in-memory
+                            // plaintext view — keep that path under the lock.
+                            read_indexed_frame_run(
+                                &inner.directory,
+                                &mut segment_cache,
+                                &loaded,
+                                run,
+                            )?
+                        } else {
+                            // Local unencrypted committed frames are
+                            // immutable: clone the index run, drop the range
+                            // lock across the file I/O, then re-check the
+                            // retention floor so a concurrent delete still
+                            // fails closed.
+                            let path = loaded
+                                .materialized
+                                .get(&segment)
+                                .map(|materialized| materialized.path.clone())
+                                .unwrap_or_else(|| segment_path(&inner.directory, segment));
+                            let run = run.to_vec();
+                            #[cfg(test)]
+                            inner
+                                .test_lock_free_reads
+                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            drop(loaded);
+                            let span_frames = read_file_frame_run(
+                                &inner.directory,
+                                &mut segment_cache,
+                                &path,
+                                segment,
+                                &run,
+                            )?;
+                            #[cfg(test)]
+                            if inner
+                                .test_lock_free_pause
+                                .swap(false, std::sync::atomic::Ordering::SeqCst)
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(400));
+                            }
+                            loaded = inner.loaded.lock().map_err(|_| {
+                                ActiveRangeStoreError::Worker("range lock poisoned".to_owned())
+                            })?;
+                            let floor = loaded.persisted.retained_from_position.unwrap_or(1).max(1);
+                            if next < floor {
+                                return Err(ActiveRangeStoreError::RetentionExpired {
+                                    position: next,
+                                    retained_from: floor,
+                                });
+                            }
+                            span_frames
+                        };
+                        let mut span_frames = span_frames.into_iter();
                         for frame in &mut span_frames {
                             if let Some(cap) = max_bytes {
-                                let size = crate::codec::logical_frame_size(&frame.frame)?;
+                                let size =
+                                    crate::codec::logical_frame_size_unchecked(&frame.frame)?;
                                 let candidate = bytes
                                     .checked_add(size)
                                     .ok_or(ActiveRangeStoreError::ReadBudgetExceeded)?;
@@ -2381,7 +2684,7 @@ fn read_uncommitted(
     after: Option<RangePosition>,
     limit: usize,
 ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
-    read_window(inner, after, limit.clamp(1, 10_000) as u64, false, None)
+    read_window(inner, after, limit.clamp(1, 65_536) as u64, false, None)
 }
 
 fn read_committed(
@@ -2389,7 +2692,7 @@ fn read_committed(
     after: Option<RangePosition>,
     limit: usize,
 ) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
-    read_window(inner, after, limit.clamp(1, 10_000) as u64, true, None)
+    read_window(inner, after, limit.clamp(1, 65_536) as u64, true, None)
 }
 
 fn read_committed_bounded(
@@ -2401,7 +2704,7 @@ fn read_committed_bounded(
     read_window(
         inner,
         after,
-        limit.clamp(1, 10_000) as u64,
+        limit.clamp(1, 65_536) as u64,
         true,
         Some(max_bytes),
     )
@@ -2458,6 +2761,7 @@ fn truncate_uncommitted_locked(
     truncate.set_len(active_length)?;
     truncate.sync_all()?;
     let previous = loaded.persisted.appended;
+    loaded.active_length = active_length;
     loaded
         .entries
         .retain(|entry| entry.position.value() <= committed);
@@ -2482,7 +2786,7 @@ fn truncate_uncommitted_locked(
     next.flushed = committed;
     next.deduplication = persisted_deduplication(&loaded.deduplication);
     next.pending_effect = None;
-    persist_state(&inner.directory, &next)?;
+    persist_state(&inner.directory, &mut next)?;
     loaded.persisted = next;
     Ok(previous.saturating_sub(committed))
 }
@@ -2509,7 +2813,7 @@ fn rotate_if_needed(
     next_file.sync_all()?;
     let mut next = loaded.persisted.clone();
     next.active_segment = next_segment;
-    persist_state(&inner.directory, &next)?;
+    persist_state(&inner.directory, &mut next)?;
     // The sealed segment's committed index is now immutable; persist it as
     // a checkpoint so reopen recovers it without rescanning frame bodies.
     let sealed_entries: Vec<EntryIndex> = loaded
@@ -2543,6 +2847,7 @@ fn rotate_if_needed(
     )?;
     loaded.persisted = next;
     loaded.active_file = next_file;
+    loaded.active_length = loaded.active_file.metadata()?.len();
     Ok(())
 }
 
@@ -3539,7 +3844,7 @@ fn decode_entry(body: &[u8]) -> Result<DecodedEntry, ActiveRangeStoreError> {
             "record frame digest is invalid".to_owned(),
         ));
     }
-    let record = decode_record(&frame)?;
+    let record = peek_record_header(&frame)?;
     if record.producer_id != writer_session_id || record.producer_sequence != sequence {
         return Err(ActiveRangeStoreError::WriterIdentityMismatch);
     }
@@ -3615,7 +3920,7 @@ fn read_indexed_frame(
             position: entry.position,
             identity: entry.identity.clone(),
             cursor: entry.cursor.clone(),
-            frame,
+            frame: frame.into(),
         });
     }
     let path = loaded
@@ -3650,7 +3955,7 @@ fn read_indexed_frame(
         position: entry.position,
         identity: entry.identity.clone(),
         cursor: entry.cursor.clone(),
-        frame,
+        frame: frame.into(),
     })
 }
 
@@ -3684,16 +3989,31 @@ fn read_indexed_frame_run(
             .map(|entry| read_indexed_frame(directory, loaded, entry))
             .collect();
     }
+    let path = loaded
+        .materialized
+        .get(&segment)
+        .map(|materialized| materialized.path.clone())
+        .unwrap_or_else(|| segment_path(directory, segment));
+    read_file_frame_run(directory, cache, &path, segment, entries)
+}
+
+/// Span read for a local, unencrypted segment: one seek+read for the whole
+/// contiguous entry run, then per-entry `Bytes` slices with their blake3
+/// digests re-checked. Takes the resolved segment path so the caller may
+/// drop the range lock across the file I/O.
+fn read_file_frame_run(
+    directory: &Path,
+    cache: &mut SegmentReadCache,
+    path: &Path,
+    segment: u64,
+    entries: &[EntryIndex],
+) -> Result<Vec<StoredRangeFrame>, ActiveRangeStoreError> {
     if cache.segment != Some(segment) {
-        let path = loaded
-            .materialized
-            .get(&segment)
-            .map(|materialized| materialized.path.clone())
-            .unwrap_or_else(|| segment_path(directory, segment));
-        cache.file = Some(File::open(&path)?);
+        cache.file = Some(File::open(path)?);
         cache.segment = Some(segment);
     }
     let file = cache.file.as_mut().expect("segment file opened above");
+    let _timer = std::time::Instant::now();
     let span_start = entries[0].frame_offset;
     let span_end = entries.iter().try_fold(0_u64, |end, entry| {
         entry
@@ -3708,24 +4028,76 @@ fn read_indexed_frame_run(
     let mut span = vec![0_u8; span_length];
     file.seek(SeekFrom::Start(span_start))?;
     file.read_exact(&mut span)?;
+    let _io_ms = _timer.elapsed().as_secs_f64() * 1000.0;
+    let span = Bytes::from(span);
+    // Large runs hash every frame serially on this blocking thread;
+    // spreading contiguous entry chunks over the CPU keeps the ~70 MB
+    // digest pass off the page's critical path.
+    let verified = if entries.len() >= 1_024 {
+        let workers = std::thread::available_parallelism()
+            .map(|count| count.get().min(8))
+            .unwrap_or(1);
+        let chunk = entries.len().div_ceil(workers);
+        let results: Vec<Result<bool, ActiveRangeStoreError>> = std::thread::scope(|scope| {
+            let span = &span;
+            entries
+                .chunks(chunk)
+                .map(|chunk| {
+                    scope.spawn(move || {
+                        for entry in chunk {
+                            let start = (entry.frame_offset - span_start) as usize;
+                            let end = start + entry.frame_length as usize;
+                            if *blake3::hash(&span[start..end]).as_bytes() != entry.frame_digest {
+                                return Err(corrupt(
+                                    &segment_path(directory, entry.segment),
+                                    "record frame changed after recovery",
+                                ));
+                            }
+                        }
+                        Ok(true)
+                    })
+                })
+                .map(|handle| handle.join().expect("digest worker"))
+                .collect()
+        });
+        results
+            .into_iter()
+            .try_for_each(|result| result.map(|_| ()))
+    } else {
+        entries.iter().try_for_each(|entry| {
+            let start = (entry.frame_offset - span_start) as usize;
+            let end = start + entry.frame_length as usize;
+            if *blake3::hash(&span[start..end]).as_bytes() != entry.frame_digest {
+                return Err(corrupt(
+                    &segment_path(directory, entry.segment),
+                    "record frame changed after recovery",
+                ));
+            }
+            Ok(())
+        })
+    };
+    let _verify_ms = _timer.elapsed().as_secs_f64() * 1000.0 - _io_ms;
+    verified?;
     let mut frames = Vec::with_capacity(entries.len());
     for entry in entries {
         let start = (entry.frame_offset - span_start) as usize;
         let end = start + entry.frame_length as usize;
-        let frame = span[start..end].to_vec();
-        if *blake3::hash(&frame).as_bytes() != entry.frame_digest {
-            return Err(corrupt(
-                &segment_path(directory, entry.segment),
-                "record frame changed after recovery",
-            ));
-        }
         frames.push(StoredRangeFrame {
             position: entry.position,
             identity: entry.identity.clone(),
             cursor: entry.cursor.clone(),
-            frame,
+            frame: span.slice(start..end),
         });
     }
+    let _build_ms = _timer.elapsed().as_secs_f64() * 1000.0 - _verify_ms - _io_ms;
+    tracing::debug!(
+        frames = frames.len(),
+        bytes = span_length,
+        io_ms = _io_ms,
+        verify_ms = _verify_ms,
+        build_ms = _build_ms,
+        "store read timing"
+    );
     Ok(frames)
 }
 
@@ -4103,6 +4475,7 @@ fn expire_loaded(
         for manifest in loaded.remote.values() {
             surviving.extend(manifest.first_position..=manifest.last_position);
         }
+        loaded.persisted.deduplication = persisted_deduplication(&loaded.deduplication);
         loaded.deduplication = merge_deduplication(
             deduplication_from_entries(&loaded.entries),
             loaded.persisted.deduplication.clone(),
@@ -4116,7 +4489,7 @@ fn expire_loaded(
         let mut next = loaded.persisted.clone();
         next.retained_from_position = Some(floor);
         next.deduplication = persisted_deduplication(&loaded.deduplication);
-        persist_state(&inner.directory, &next)?;
+        persist_state(&inner.directory, &mut next)?;
         loaded.persisted = next;
         report.retained_from = floor;
         report.deleted_segments = delete_set.len() as u64;
@@ -4150,25 +4523,114 @@ fn sync_due(
             loaded.last_durable_sync = std::time::Instant::now();
         }
         Some(interval) => {
-            if force || loaded.last_durable_sync.elapsed() >= interval {
+            if force {
                 loaded.active_file.sync_data()?;
                 // Pin directory metadata (lazy state renames, rotated
                 // segment entries) on the same tick so a crash cannot
                 // resurrect an older checkpoint naming newer files.
                 sync_directory(&inner.directory)?;
                 loaded.last_durable_sync = std::time::Instant::now();
+            } else if loaded.last_durable_sync.elapsed() >= interval && !loaded.sync_in_flight {
+                // Deferred mode moves the ~ms-scale fsync off the locked
+                // append path: clone the fd, hand it to a background
+                // thread, and stamp the watermark when it finishes. The
+                // watermark only advances on completion, so a second due
+                // tick simply skips while one is in flight.
+                match inner.self_weak.get().and_then(std::sync::Weak::upgrade) {
+                    Some(strong) => {
+                        let file = loaded.active_file.try_clone()?;
+                        let directory = inner.directory.clone();
+                        loaded.sync_in_flight = true;
+                        std::thread::spawn(move || {
+                            let outcome = file.sync_data().and_then(|_| sync_directory(&directory));
+                            #[cfg(test)]
+                            let outcome = outcome.and_then(|_| {
+                                if strong
+                                    .test_deferred_sync_fail
+                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                {
+                                    Err(std::io::Error::other("injected deferred sync failure"))
+                                } else {
+                                    Ok(())
+                                }
+                            });
+                            if let Ok(mut loaded) = strong.loaded.lock() {
+                                loaded.sync_in_flight = false;
+                                match outcome {
+                                    Ok(()) => {
+                                        loaded.last_durable_sync = std::time::Instant::now();
+                                    }
+                                    Err(error) => {
+                                        tracing::error!(
+                                            directory = %strong.directory.display(),
+                                            "deferred Active Range fsync failed: {error}"
+                                        );
+                                        loaded.sync_error = Some(error.to_string());
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    None => {
+                        loaded.active_file.sync_data()?;
+                        sync_directory(&inner.directory)?;
+                        loaded.last_durable_sync = std::time::Instant::now();
+                    }
+                }
             }
         }
     }
     Ok(())
 }
 
+/// Resolve the freshest valid persisted state on disk: strict
+/// `range-state.json` plus both lazy A/B slots, highest
+/// `checkpoint_seq` wins, strict wins ties. Readers outside a live
+/// store (retention sweep, tier scan, repair) MUST use this — a bare
+/// range-state.json read sees stale state whenever lazy slots are
+/// newer.
+pub(crate) fn read_latest_persisted_state(
+    directory: &Path,
+) -> Result<Option<PersistedRangeState>, ActiveRangeStoreError> {
+    let state_path = directory.join("range-state.json");
+    // Candidates: strict file + both lazy A/B slots; the highest valid
+    // checkpoint_seq wins. A torn lazy slot (bad trailing checksum or
+    // unparseable body) is ignored rather than fatal.
+    let mut candidates: Vec<PersistedRangeState> = Vec::new();
+    // Slots first: on a checkpoint_seq tie the strict file wins (it is
+    // the stronger durability class), so it is read LAST.
+    for slot in ["range-state.lazy-a", "range-state.lazy-b"] {
+        let path = directory.join(slot);
+        let Ok(bytes) = fs::read(&path) else { continue };
+        let (body, checksum) = bytes.split_at(bytes.len().saturating_sub(4));
+        if checksum.len() != 4
+            || crc32fast::hash(body) != u32::from_be_bytes(checksum.try_into().unwrap_or_default())
+        {
+            continue;
+        }
+        if let Ok(state) = serde_json::from_slice::<PersistedRangeState>(body) {
+            candidates.push(state);
+        }
+    }
+    if state_path.exists() {
+        candidates.push(serde_json::from_slice::<PersistedRangeState>(&fs::read(
+            &state_path,
+        )?)?);
+    }
+    Ok(candidates
+        .into_iter()
+        .max_by_key(|state| state.checkpoint_seq))
+}
+
 fn persist_state(
     directory: &Path,
-    state: &PersistedRangeState,
+    state: &mut PersistedRangeState,
 ) -> Result<(), ActiveRangeStoreError> {
     let target = directory.join("range-state.json");
     let temporary = directory.join("range-state.json.tmp");
+    // Bump the caller's in-memory seq as well so the next checkpoint
+    // (either path) alternates/increments monotonically.
+    state.checkpoint_seq = state.checkpoint_seq.saturating_add(1);
     let mut state = state.clone();
     state.relaxed_commit = false;
     let encoded = serde_json::to_vec(&state)?;
@@ -4193,20 +4655,32 @@ fn persist_state(
 /// `persist_state` instead: losing them would change observed semantics.
 fn persist_state_lazy(
     directory: &Path,
-    state: &PersistedRangeState,
+    state: &mut PersistedRangeState,
 ) -> Result<(), ActiveRangeStoreError> {
-    let target = directory.join("range-state.json");
-    let temporary = directory.join("range-state.json.tmp");
+    // A/B slot files written in place: no tmp+rename (a journaled op
+    // that stalls behind background fsyncs) and no fsync — the crash
+    // contract is unchanged because rescan rebuilds this state anyway.
+    // Bump the caller's in-memory seq as well so the next checkpoint
+    // (either path) alternates/increments monotonically.
+    state.checkpoint_seq = state.checkpoint_seq.saturating_add(1);
     let mut state = state.clone();
     state.relaxed_commit = true;
+    let slot = if state.checkpoint_seq.is_multiple_of(2) {
+        "range-state.lazy-a"
+    } else {
+        "range-state.lazy-b"
+    };
     let encoded = serde_json::to_vec(&state)?;
+    let checksum = crc32fast::hash(&encoded);
     let mut file = OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
-        .open(&temporary)?;
+        .open(directory.join(slot))?;
     file.write_all(&encoded)?;
-    fs::rename(&temporary, &target)?;
+    file.write_all(&checksum.to_be_bytes())?;
+    // The in-memory state must track the written seq so the next lazy
+    // checkpoint alternates slots — callers pass &loaded.persisted.
     Ok(())
 }
 
@@ -4325,7 +4799,7 @@ pub(crate) fn seed_committed_history_shaped(
     persisted.appended = count;
     persisted.flushed = count;
     persisted.committed = count;
-    persist_state(&directory, &persisted).unwrap();
+    persist_state(&directory, &mut persisted).unwrap();
 }
 
 #[cfg(test)]
@@ -4377,7 +4851,7 @@ mod tests {
         relaxed.appended = 10;
         relaxed.flushed = 10;
         relaxed.committed = 10;
-        persist_state_lazy(&directory, &relaxed).unwrap();
+        persist_state_lazy(&directory, &mut relaxed).unwrap();
         let reopened = FileActiveRangeStore::open(root.path(), descriptor.clone()).unwrap();
         let progress = reopened.snapshot().await.unwrap().progress;
         assert_eq!(progress.commit_position(), CommitPosition::new(5));
@@ -4388,7 +4862,7 @@ mod tests {
         strict.appended = 10;
         strict.flushed = 10;
         strict.committed = 10;
-        persist_state(&directory, &strict).unwrap();
+        persist_state(&directory, &mut strict).unwrap();
         assert!(FileActiveRangeStore::open(root.path(), descriptor).is_err());
     }
 
@@ -4524,7 +4998,7 @@ mod tests {
                         sequence,
                     },
                     cursor: format!("cursor-{sequence}"),
-                    frame: crate::codec::encode_record(&record).unwrap(),
+                    frame: crate::codec::encode_record(&record).unwrap().into(),
                     pending_effect: None,
                 })
                 .await
@@ -4572,7 +5046,7 @@ mod tests {
                     sequence: 6,
                 },
                 cursor: "cursor-6".to_owned(),
-                frame: crate::codec::encode_record(&record).unwrap(),
+                frame: crate::codec::encode_record(&record).unwrap().into(),
                 pending_effect: None,
             })
             .await
@@ -4653,6 +5127,359 @@ mod tests {
         assert!(!store.persistence_failure());
     }
 
+    /// A staged batch must land byte-identical segment bytes and
+    /// identical index positions/digests as the same frames appended
+    /// one by one, and reopen must rebuild the same state.
+    #[tokio::test]
+    async fn staged_batch_matches_single_appends_byte_for_byte() {
+        let descriptor = test_descriptor();
+        let make = |dir: &Path| FileActiveRangeStore::open(dir, descriptor.clone()).unwrap();
+        let request = |sequence: u64| ActiveRangeAppend {
+            generation: descriptor.generation,
+            ownership_epoch: descriptor.ownership_epoch,
+            expected_position: Some(RangePosition::new(sequence)),
+            identity: AppendIdentity {
+                writer_session_id: Uuid::from_u128(9),
+                writer_epoch: 1,
+                sequence,
+            },
+            cursor: format!("cursor-{sequence}"),
+            frame: crate::codec::encode_record(&StoredRecord {
+                message_id: Uuid::from_u128(5000 + sequence as u128),
+                producer_id: Uuid::from_u128(9),
+                producer_sequence: sequence,
+                event_time_ns: sequence as i64,
+                ingest_time_ns: sequence as i64,
+                key: b"k".to_vec(),
+                payload: vec![b'p'; 96],
+                metadata: std::collections::BTreeMap::new(),
+            })
+            .unwrap()
+            .into(),
+            pending_effect: None,
+        };
+        const COUNT: u64 = 300;
+        // One-by-one reference.
+        let a = tempfile::TempDir::new().unwrap();
+        let store_a = make(a.path());
+        for sequence in 1..=COUNT {
+            store_a.append(request(sequence)).await.unwrap();
+        }
+        // One staged batch.
+        let b = tempfile::TempDir::new().unwrap();
+        let store_b = make(b.path());
+        store_b
+            .append_batch((1..=COUNT).map(request).collect())
+            .await
+            .unwrap();
+        let dir_a = range_directory(a.path(), &descriptor);
+        let dir_b = range_directory(b.path(), &descriptor);
+        assert_eq!(
+            fs::read(segment_path(&dir_a, 0)).unwrap(),
+            fs::read(segment_path(&dir_b, 0)).unwrap(),
+            "staged batch writes must be byte-identical to single appends"
+        );
+        let frames_a = store_a
+            .read_uncommitted(None, COUNT as usize)
+            .await
+            .unwrap();
+        let frames_b = store_b
+            .read_uncommitted(None, COUNT as usize)
+            .await
+            .unwrap();
+        assert_eq!(frames_a.len(), COUNT as usize);
+        for (one, batched) in frames_a.iter().zip(frames_b.iter()) {
+            assert_eq!(one.position, batched.position);
+            assert_eq!(one.frame, batched.frame);
+            assert_eq!(one.cursor, batched.cursor);
+        }
+        // Reopen: the staged tail replays to the same watermarks.
+        drop(store_b);
+        let reopened = FileActiveRangeStore::open(b.path(), descriptor).unwrap();
+        let frames = reopened
+            .read_uncommitted(None, COUNT as usize)
+            .await
+            .unwrap();
+        assert_eq!(frames.len(), COUNT as usize);
+        assert_eq!(frames.last().unwrap().position, RangePosition::new(COUNT));
+    }
+
+    /// Without remote manifests the prematerialize pass must skip the
+    /// per-request remote scan entirely.
+    #[tokio::test]
+    async fn prematerialize_skips_scan_with_no_remote() {
+        let descriptor = test_descriptor();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = FileActiveRangeStore::open(dir.path(), descriptor.clone()).unwrap();
+        let before = PREMATERIALIZE_SCANS.load(std::sync::atomic::Ordering::SeqCst);
+        append_committed_records(&store, &descriptor, 1, 4, 32).await;
+        assert_eq!(
+            PREMATERIALIZE_SCANS.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "no-remote batch must skip the remote scan"
+        );
+    }
+
+    /// Lazy A/B slots: reopen picks the freshest valid checkpoint; a
+    /// torn newest slot falls back; a strict write always outranks.
+    #[test]
+    fn lazy_slot_checkpoints_resolve_newest_valid() {
+        let descriptor = test_descriptor();
+        let dir = tempfile::TempDir::new().unwrap();
+        let range_dir = range_directory(dir.path(), &descriptor);
+        fs::create_dir_all(&range_dir).unwrap();
+        let mut base = PersistedRangeState::new(&descriptor);
+
+        // (a) two lazy writes land in alternating slots; reopen picks
+        // the newest seq.
+        base.appended = 7;
+        persist_state_lazy(&range_dir, &mut base).unwrap();
+        base.appended = 9;
+        persist_state_lazy(&range_dir, &mut base).unwrap();
+        let store = FileActiveRangeStore::open(dir.path(), descriptor.clone()).unwrap();
+        drop(store);
+
+        // (b) corrupt the newest slot → falls back to the older slot.
+        let corrupt = range_dir.join("range-state.lazy-b");
+        let mut bytes = fs::read(&corrupt).unwrap();
+        bytes[8] ^= 0xff;
+        fs::write(&corrupt, bytes).unwrap();
+        let store = FileActiveRangeStore::open(dir.path(), descriptor.clone()).unwrap();
+        drop(store);
+
+        // (c) a strict write after lazy writes wins on reopen.
+        persist_state(&range_dir, &mut base).unwrap();
+        let store = FileActiveRangeStore::open(dir.path(), descriptor).unwrap();
+        drop(store);
+    }
+
+    /// A directory holding only a legacy range-state.json (no seq
+    /// field, no slots) opens unchanged.
+    #[test]
+    fn legacy_state_file_without_seq_opens_unchanged() {
+        let descriptor = test_descriptor();
+        let dir = tempfile::TempDir::new().unwrap();
+        let range_dir = range_directory(dir.path(), &descriptor);
+        fs::create_dir_all(&range_dir).unwrap();
+        let mut state = PersistedRangeState::new(&descriptor);
+        state.appended = 3;
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "version": state.version,
+            "feed_id": state.feed_id,
+            "range_id": state.range_id,
+            "generation": state.generation,
+            "ownership_epoch": state.ownership_epoch,
+            "appended": state.appended,
+            "flushed": state.flushed,
+            "committed": state.committed,
+            "active_segment": state.active_segment,
+            "deduplication": [],
+        }))
+        .unwrap();
+        fs::write(range_dir.join("range-state.json"), raw).unwrap();
+        let store = FileActiveRangeStore::open(dir.path(), descriptor).unwrap();
+        drop(store);
+    }
+
+    /// L1: external readers (retention sweep) must resolve lazy slots —
+    /// an expire write must outrank the store's last lazy checkpoint or
+    /// the retention floor is lost on reopen.
+    #[tokio::test]
+    async fn retention_floor_survives_lazy_slots() {
+        let descriptor = test_descriptor();
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = FileActiveRangeStore::open(dir.path(), descriptor.clone()).unwrap();
+        append_committed_records(&store, &descriptor, 1, 4, 32).await;
+        drop(store);
+        let range_dir = range_directory(dir.path(), &descriptor);
+        // At least one lazy checkpoint exists from the append path.
+        assert!(
+            range_dir.join("range-state.lazy-a").exists()
+                || range_dir.join("range-state.lazy-b").exists()
+        );
+        let mut resolved = read_latest_persisted_state(&range_dir)
+            .unwrap()
+            .expect("checkpoint");
+        // The floor write stamps seq = resolved seq + 1 → outranks
+        // every lazy slot the store wrote.
+        let policy = HistoryPolicy {
+            expire_after_ns: Some(1),
+            ..HistoryPolicy::default()
+        };
+        expire_range_directory(&range_dir, &mut resolved, &policy, None, i64::MAX, None).unwrap();
+        let reopened = read_latest_persisted_state(&range_dir)
+            .unwrap()
+            .expect("checkpoint");
+        assert_eq!(
+            reopened.retained_from_position, resolved.retained_from_position,
+            "expire floor must outrank prior lazy checkpoints"
+        );
+        let store = FileActiveRangeStore::open(dir.path(), descriptor).unwrap();
+        drop(store);
+    }
+
+    /// A committed read whose file I/O ran without the lock re-checks
+    /// the retention floor on re-lock: if retention deleted the span
+    /// mid-read, the read fails closed instead of returning dead bytes.
+    #[tokio::test]
+    async fn lock_free_read_fails_closed_when_retention_advances_mid_read() {
+        let root = tempfile::TempDir::new().unwrap();
+        let descriptor = test_descriptor();
+        let store = rotated_store(root.path(), &descriptor).await;
+        let directory = range_directory(root.path(), &descriptor);
+        let persisted: PersistedRangeState =
+            serde_json::from_slice(&fs::read(directory.join("range-state.json")).unwrap()).unwrap();
+        let manifest0 = read_segment_manifest(&directory, 0, &persisted).unwrap();
+        store
+            .inner
+            .test_lock_free_pause
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let store2 = store.clone();
+        let read =
+            tokio::spawn(
+                async move { store2.read_committed(Some(RangePosition::new(1)), 64).await },
+            );
+        // The read's file I/O is asleep outside the lock; retention can
+        // now delete segment 0 and move the floor past it.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let policy = HistoryPolicy {
+            expire_after_ns: Some(1),
+            ..HistoryPolicy::default()
+        };
+        let report = store
+            .apply_retention(&policy, None, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(report.retained_from, manifest0.last_position + 1);
+        match read.await.unwrap() {
+            Err(ActiveRangeStoreError::RetentionExpired { .. }) => {}
+            other => panic!("expected RetentionExpired, got {other:?}"),
+        }
+    }
+
+    /// Uncommitted reads must never take the unlocked span path — only
+    /// committed reads release the range lock across file I/O.
+    #[tokio::test]
+    async fn uncommitted_reads_never_take_the_lock_free_path() {
+        let root = tempfile::TempDir::new().unwrap();
+        let store = FileActiveRangeStore::open(root.path(), test_descriptor()).unwrap();
+        let before = store
+            .inner
+            .test_lock_free_reads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        append_committed_records(&store, &test_descriptor(), 1, 4, 96).await;
+        let committed = store.read_committed(None, 4).await.unwrap();
+        assert_eq!(committed.len(), 4);
+        let mid = store
+            .inner
+            .test_lock_free_reads
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(mid > before, "committed reads take the lock-free path");
+        let uncommitted = store.read_uncommitted(None, 4).await.unwrap();
+        assert_eq!(uncommitted.len(), 4);
+        assert_eq!(
+            store
+                .inner
+                .test_lock_free_reads
+                .load(std::sync::atomic::Ordering::SeqCst),
+            mid,
+            "uncommitted reads must stay under the range lock"
+        );
+    }
+
+    /// A failed deferred fsync must fail the next mutation closed —
+    /// the error is recorded, never swallowed.
+    #[tokio::test]
+    async fn deferred_sync_failure_fails_subsequent_appends() {
+        let root = tempfile::TempDir::new().unwrap();
+        let store = FileActiveRangeStore::open_with_options(
+            root.path(),
+            test_descriptor(),
+            FileActiveRangeStoreOptions {
+                sync_interval: Some(std::time::Duration::from_millis(1)),
+                ..FileActiveRangeStoreOptions::default()
+            },
+        )
+        .unwrap();
+        let request = |sequence: u64| ActiveRangeAppend {
+            generation: test_descriptor().generation,
+            ownership_epoch: test_descriptor().ownership_epoch,
+            expected_position: Some(RangePosition::new(sequence)),
+            identity: AppendIdentity {
+                writer_session_id: Uuid::from_u128(3),
+                writer_epoch: 1,
+                sequence,
+            },
+            cursor: format!("cursor-{sequence}"),
+            frame: crate::codec::encode_record(&StoredRecord {
+                message_id: Uuid::from_u128(700 + sequence as u128),
+                producer_id: Uuid::from_u128(3),
+                producer_sequence: sequence,
+                event_time_ns: 1,
+                ingest_time_ns: 1,
+                key: b"k".to_vec(),
+                payload: b"p".to_vec(),
+                metadata: std::collections::BTreeMap::new(),
+            })
+            .unwrap()
+            .into(),
+            pending_effect: None,
+        };
+        // An uncommitted append takes the deferred (non-strict) path; its
+        // interval-elapsed fsync runs in the background and fails there.
+        store
+            .inner
+            .test_deferred_sync_fail
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        // Every successful append spawns another deferred sync that the
+        // injected flag fails; keep appending until one lands and latches
+        // the error — no sleeps, no thread-timing assumptions.
+        let mut error = None;
+        for sequence in 1..2_000_u64 {
+            match store.append_batch(vec![request(sequence)]).await {
+                Ok(_) => {
+                    // Yield so the background fsync thread gets CPU time
+                    // on a saturated test host.
+                    tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                    continue;
+                }
+                Err(error_) => {
+                    error = Some(error_);
+                    break;
+                }
+            }
+        }
+        store
+            .inner
+            .test_deferred_sync_fail
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let error = error.expect("a deferred sync eventually latched the failure");
+        assert!(
+            matches!(error, ActiveRangeStoreError::DeferredSyncFailed(_)),
+            "expected DeferredSyncFailed, got {error:?}"
+        );
+    }
+
+    /// Committed reads past the old 2,048 page clamp now serve the full
+    /// 65,536-frame window in one page, and the `Bytes` span slicing
+    /// returns frames identical to per-entry reads.
+    #[tokio::test]
+    async fn committed_read_serves_more_than_2048_frames_in_one_page() {
+        let root = tempfile::TempDir::new().unwrap();
+        let store = FileActiveRangeStore::open(root.path(), test_descriptor()).unwrap();
+        const COUNT: u64 = 3_000;
+        append_committed_records(&store, &test_descriptor(), 1, COUNT, 96).await;
+        let frames = store.read_committed(None, COUNT as usize).await.unwrap();
+        assert_eq!(frames.len(), COUNT as usize);
+        for (index, frame) in frames.iter().enumerate() {
+            let position = index as u64 + 1;
+            assert_eq!(frame.position.value(), position);
+            assert_eq!(frame.cursor, format!("cursor-{position}"));
+            let header = peek_record_header(&frame.frame).unwrap();
+            assert_eq!(header.producer_sequence, position);
+        }
+    }
+
     /// Appends and commits `count` records through the production store
     /// path so segment rotation, sealing, and manifest writes all run real
     /// write-path code.
@@ -4685,7 +5512,7 @@ mod tests {
                         sequence,
                     },
                     cursor: format!("cursor-{sequence}"),
-                    frame: crate::codec::encode_record(&record).unwrap(),
+                    frame: crate::codec::encode_record(&record).unwrap().into(),
                     pending_effect: None,
                 })
                 .await
@@ -5460,7 +6287,7 @@ mod tests {
                         sequence,
                     },
                     cursor: format!("cursor-{sequence}"),
-                    frame: crate::codec::encode_record(&record).unwrap(),
+                    frame: crate::codec::encode_record(&record).unwrap().into(),
                     pending_effect: None,
                 })
                 .await
@@ -5672,7 +6499,7 @@ mod tests {
                     sequence: 1,
                 },
                 cursor: "cursor-1".to_owned(),
-                frame: crate::codec::encode_record(&record).unwrap(),
+                frame: crate::codec::encode_record(&record).unwrap().into(),
                 pending_effect: None,
             })
             .await

@@ -7,7 +7,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tempfile::TempDir;
 use uuid::Uuid;
 use whitewater::{
@@ -318,7 +317,7 @@ impl Fixture {
                     sequence,
                 },
                 cursor: format!("cursor-{sequence}"),
-                frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+                frame: encode_record(&record).unwrap().into(),
                 pending_effect: None,
             };
             for replica in assignment.replicas.iter() {

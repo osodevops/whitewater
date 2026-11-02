@@ -5,9 +5,9 @@ use std::{
     sync::Arc,
 };
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{watch, Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::{
@@ -23,7 +23,22 @@ use super::{
 };
 
 pub const MAX_REPLICA_FRAME_BASE64_BYTES: usize = MAX_FRAME_BYTES.div_ceil(3) * 4;
+
+/// How long an out-of-order replica batch waits for its predecessors to
+/// land before the normal PositionGap refusal takes over. Windowed
+/// owner sends start strictly in mint order but arrive concurrently —
+/// this bounded admission delay absorbs the reordering instead of
+/// paying a full gap-repair round per overlapped send. Unit tests use a
+/// short bound; production keeps half a second.
+#[cfg(test)]
+const REPLICA_ORDER_WAIT: std::time::Duration = std::time::Duration::from_millis(50);
+#[cfg(not(test))]
+const REPLICA_ORDER_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 pub const MAX_COMMITTED_READ_BYTES: usize = 96 * 1024 * 1024;
+
+/// One read page carries at most a full logical read window; the
+/// 96 MiB byte budget below remains the real bound on big frames.
+const MAX_LOGICAL_READ_FRAMES: usize = 65_536;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -36,7 +51,8 @@ pub struct ReplicaAppendRequest {
     pub expected_position: RangePosition,
     pub identity: AppendIdentity,
     pub cursor: String,
-    pub frame_base64: String,
+    #[serde(rename = "frame_base64", with = "crate::codec::serde_base64")]
+    pub frame: Bytes,
     /// When set, the frame joins the named effect's pending tail: durable on
     /// the replica quorum but fenced behind the committed boundary until the
     /// effect's terminal journal marker releases it.
@@ -148,7 +164,11 @@ impl std::error::Error for ReplicaAppendError {}
 /// a WriterSession batch costs one quorum round-trip per replica instead
 /// of one per record. Position, digest, epoch, and dedup checks apply
 /// per frame exactly as the single-append contract.
-pub const MAX_REPLICA_BATCH_FRAMES: usize = 512;
+pub // Followers accept merged group-commit rounds: the owner may fold
+// queued submissions into one quorum round (see majority.rs
+// MAX_GROUP_ROUND_FRAMES). Older Nodes still cap at 512 and would
+// refuse a merged round — mixed-version clusters simply merge less.
+const MAX_REPLICA_BATCH_FRAMES: usize = 4_096;
 /// Total base64 budget for one batch body — keeps the wire bound in the
 /// same order as the single-frame limit.
 pub const MAX_REPLICA_BATCH_BASE64_BYTES: usize = 16 * 1024 * 1024;
@@ -165,7 +185,8 @@ pub struct ReplicaBatchFrame {
     pub expected_position: Option<RangePosition>,
     pub identity: AppendIdentity,
     pub cursor: String,
-    pub frame_base64: String,
+    #[serde(rename = "frame_base64", with = "crate::codec::serde_base64")]
+    pub frame: Bytes,
     #[serde(default)]
     pub pending_effect: Option<super::store::PendingEffectRef>,
 }
@@ -587,6 +608,10 @@ pub struct ReplicaAppendService {
     // Serialized per range: appends and generation freezes for one range
     // must not interleave, but unrelated ranges pipeline on this Node.
     append_gates: Arc<Mutex<std::collections::BTreeMap<RangeId, Arc<Mutex<()>>>>>,
+    // Per-range appended watermark for ordered replica-batch admission:
+    // a batch expecting a future position waits on the watch channel
+    // instead of instantly refusing a position gap.
+    order_watermarks: Arc<Mutex<std::collections::BTreeMap<RangeId, watch::Sender<u64>>>>,
     index_apply: Arc<std::sync::RwLock<Option<Arc<crate::index_build::IndexCommitApply>>>>,
     store_options: FileActiveRangeStoreOptions,
 }
@@ -625,6 +650,7 @@ impl ReplicaAppendService {
             quorum_blocked_ranges: Arc::new(RwLock::new(HashSet::new())),
             diverged_ranges: Arc::new(RwLock::new(HashSet::new())),
             append_gates: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            order_watermarks: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             index_apply: Arc::new(std::sync::RwLock::new(None)),
             store_options,
         }
@@ -672,12 +698,13 @@ impl ReplicaAppendService {
     ) -> RetentionSweepReport {
         let mut report = RetentionSweepReport::default();
         for directory in super::tier::generation_directories(self.root.as_path()) {
-            let state_path = directory.join("range-state.json");
-            let mut persisted = match std::fs::read(&state_path).ok().and_then(|bytes| {
-                serde_json::from_slice::<super::store::PersistedRangeState>(&bytes).ok()
-            }) {
-                Some(state) => state,
-                None => continue,
+            // Resolve lazily-slotted checkpoints too: a bare
+            // range-state.json read is stale when the store's last
+            // checkpoint went to a lazy slot, and expire writes must
+            // outrank it to keep the retention floor.
+            let mut persisted = match super::store::read_latest_persisted_state(&directory) {
+                Ok(Some(state)) => state,
+                _ => continue,
             };
             report.ranges_scanned += 1;
             // A legal hold freezes every destruction path: neither
@@ -765,6 +792,62 @@ impl ReplicaAppendService {
             .entry(range_id)
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// The appended watermark watch channel for `range_id`, created
+    /// lazily from the store's current appended position so a Node that
+    /// restarted mid-history still admits correctly.
+    async fn order_watermark(&self, range_id: RangeId) -> watch::Receiver<u64> {
+        if let Some(sender) = self.order_watermarks.lock().await.get(&range_id) {
+            return sender.subscribe();
+        }
+        let initial = match self.control.active_range_assignment_by_id(range_id).await {
+            Some(assignment) => match self.store_for(&assignment).await {
+                Ok(store) => store
+                    .snapshot()
+                    .await
+                    .map(|snapshot| snapshot.progress.appended().value())
+                    .unwrap_or(0),
+                Err(_) => 0,
+            },
+            None => 0,
+        };
+        self.order_watermarks
+            .lock()
+            .await
+            .entry(range_id)
+            .or_insert_with(|| watch::channel(initial).0)
+            .subscribe()
+    }
+
+    /// Advance the appended watermark after a successful append/import,
+    /// waking any out-of-order batch waiting on its predecessors.
+    async fn note_appended(&self, range_id: RangeId, position: RangePosition) {
+        if let Some(sender) = self.order_watermarks.lock().await.get(&range_id) {
+            sender.send_modify(|watermark| {
+                *watermark = (*watermark).max(position.value());
+            });
+        }
+    }
+
+    /// Ordered admission for replica fan-out: a batch whose first frame
+    /// expects a position ahead of the appended watermark waits for its
+    /// predecessors up to `REPLICA_ORDER_WAIT`, then proceeds into the
+    /// normal path whose PositionGap refusal is unchanged.
+    async fn wait_for_appended(&self, range_id: RangeId, expected: RangePosition) {
+        let needed = expected.value().saturating_sub(1);
+        if needed == 0 {
+            return;
+        }
+        let mut receiver = self.order_watermark(range_id).await;
+        if *receiver.borrow() >= needed {
+            return;
+        }
+        let _ = tokio::time::timeout(
+            REPLICA_ORDER_WAIT,
+            receiver.wait_for(|watermark| *watermark >= needed),
+        )
+        .await;
     }
 
     pub async fn freeze_generation(&self, range_id: RangeId, generation: RangeGeneration) {
@@ -860,7 +943,7 @@ impl ReplicaAppendService {
         position: RangePosition,
         identity: AppendIdentity,
         cursor: String,
-        frame: Vec<u8>,
+        frame: Bytes,
     ) -> Result<super::ActiveRangeAppendResult, ReplicaAppendError> {
         if !assignment.replicas.contains(&self.local_node) {
             return Err(ReplicaAppendError::rejected(
@@ -892,7 +975,7 @@ impl ReplicaAppendService {
     pub async fn stage_split_frames(
         &self,
         assignment: &ActiveRangeAssignment,
-        frames: Vec<(RangePosition, AppendIdentity, String, Vec<u8>)>,
+        frames: Vec<(RangePosition, AppendIdentity, String, Bytes)>,
     ) -> Result<Vec<super::ActiveRangeAppendResult>, ReplicaAppendError> {
         if !assignment.replicas.contains(&self.local_node) {
             return Err(ReplicaAppendError::rejected(
@@ -1395,7 +1478,11 @@ impl ReplicaAppendService {
         }
         let boundary = expected_commit.unwrap_or(committed);
         let frames = store
-            .read_committed_bounded(after, page_limit.clamp(1, 2048), MAX_COMMITTED_READ_BYTES)
+            .read_committed_bounded(
+                after,
+                page_limit.clamp(1, MAX_LOGICAL_READ_FRAMES),
+                MAX_COMMITTED_READ_BYTES,
+            )
             .await
             .map_err(map_store_error)?
             .into_iter()
@@ -1604,7 +1691,11 @@ impl ReplicaAppendService {
             frames
         } else {
             store
-                .read_committed_bounded(start, page_limit.clamp(1, 2048), MAX_COMMITTED_READ_BYTES)
+                .read_committed_bounded(
+                    start,
+                    page_limit.clamp(1, MAX_LOGICAL_READ_FRAMES),
+                    MAX_COMMITTED_READ_BYTES,
+                )
                 .await
                 .map_err(map_store_error)?
                 .into_iter()
@@ -1717,7 +1808,7 @@ impl ReplicaAppendService {
                 "Active Range generation is frozen for split cutover; retry safely",
             ));
         }
-        if request.frame_base64.len() > MAX_REPLICA_FRAME_BASE64_BYTES {
+        if request.frame.len() > MAX_FRAME_BYTES {
             return Err(ReplicaAppendError::rejected(
                 ReplicaAppendErrorCode::FrameTooLarge,
                 format!(
@@ -1726,12 +1817,7 @@ impl ReplicaAppendService {
                 ),
             ));
         }
-        let frame = STANDARD.decode(&request.frame_base64).map_err(|error| {
-            ReplicaAppendError::rejected(
-                ReplicaAppendErrorCode::InvalidFrameEncoding,
-                format!("replica frame is not valid base64: {error}"),
-            )
-        })?;
+        let frame = request.frame.clone();
         if frame.len() > MAX_FRAME_BYTES {
             return Err(ReplicaAppendError::rejected(
                 ReplicaAppendErrorCode::FrameTooLarge,
@@ -1784,6 +1870,7 @@ impl ReplicaAppendService {
             store.append(append).await
         }
         .map_err(map_store_error)?;
+        self.note_appended(request.range_id, result.position).await;
         Ok(ReplicaAppendAccepted {
             position: result.position,
             message_id: result.message_id,
@@ -1833,7 +1920,7 @@ impl ReplicaAppendService {
                 format!("replica batch must carry 1..={MAX_REPLICA_BATCH_FRAMES} frames"),
             ));
         }
-        let wire_bytes: usize = request.frames.iter().map(|f| f.frame_base64.len()).sum();
+        let wire_bytes: usize = request.frames.iter().map(|f| f.frame.len()).sum();
         if wire_bytes > MAX_REPLICA_BATCH_BASE64_BYTES {
             return Err(ReplicaAppendError::rejected(
                 ReplicaAppendErrorCode::FrameTooLarge,
@@ -1845,20 +1932,13 @@ impl ReplicaAppendService {
         }
         let mut appends = Vec::with_capacity(request.frames.len());
         for (index, frame_request) in request.frames.iter().enumerate() {
-            if frame_request.frame_base64.len() > MAX_REPLICA_FRAME_BASE64_BYTES {
+            if frame_request.frame.len() > MAX_FRAME_BYTES {
                 return Err(ReplicaAppendError::rejected(
                     ReplicaAppendErrorCode::FrameTooLarge,
                     format!("batch frame {index} exceeds the single-frame byte limit"),
                 ));
             }
-            let frame = STANDARD
-                .decode(&frame_request.frame_base64)
-                .map_err(|error| {
-                    ReplicaAppendError::rejected(
-                        ReplicaAppendErrorCode::InvalidFrameEncoding,
-                        format!("batch frame {index} is not valid base64: {error}"),
-                    )
-                })?;
+            let frame = frame_request.frame.clone();
             if frame.len() > MAX_FRAME_BYTES {
                 return Err(ReplicaAppendError::rejected(
                     ReplicaAppendErrorCode::FrameTooLarge,
@@ -1932,7 +2012,7 @@ impl ReplicaAppendService {
                 expected_position: meta.expected_position,
                 identity: meta.identity.clone(),
                 cursor: meta.cursor.clone(),
-                frame,
+                frame: frame.into(),
                 pending_effect: meta.pending_effect,
             });
         }
@@ -1962,6 +2042,17 @@ impl ReplicaAppendService {
         import: bool,
     ) -> Result<Vec<ReplicaAppendAccepted>, ReplicaAppendError> {
         let diag_t = std::time::Instant::now();
+        // Ordered admission: windowed owner sends arrive concurrently,
+        // so a replica batch may reach this Node before the batch
+        // carrying its predecessor positions. Wait briefly for the
+        // appended watermark rather than refusing a PositionGap the
+        // owner would have to repair. The owner-live path (import ==
+        // false) never waits — single appends keep strict fencing.
+        if import {
+            if let Some(expected) = appends.first().and_then(|append| append.expected_position) {
+                self.wait_for_appended(range_id, expected).await;
+            }
+        }
         let _gate = self.append_gate(range_id).await.lock_owned().await;
         let gate_ms = diag_t.elapsed();
         if self.generation_is_frozen(range_id, generation).await {
@@ -2007,6 +2098,9 @@ impl ReplicaAppendService {
             (false, None) => store.append_batch(appends).await,
         }
         .map_err(map_store_error)?;
+        if let Some(appended) = results.iter().map(|result| result.position).max() {
+            self.note_appended(range_id, appended).await;
+        }
         let store_ms = store_t.elapsed();
         tracing::debug!(
             frames = appends_len,
@@ -2495,7 +2589,7 @@ mod tests {
                 sequence: 1,
             },
             cursor: "cursor-tail".to_owned(),
-            frame_base64: base64::engine::general_purpose::STANDARD.encode(&frame),
+            frame: frame.into(),
             pending_effect: None,
         };
         replica.append(request.clone()).await.unwrap();
@@ -2698,7 +2792,7 @@ mod tests {
                         sequence,
                     },
                     cursor: "cursor-4".to_owned(),
-                    frame_base64: STANDARD.encode(crate::codec::encode_record(&record).unwrap()),
+                    frame: crate::codec::encode_record(&record).unwrap().into(),
                     pending_effect: None,
                 })
                 .await
@@ -2733,7 +2827,7 @@ mod tests {
                 sequence: 5,
             },
             cursor: "cursor-5".to_owned(),
-            frame_base64: STANDARD.encode(crate::codec::encode_record(&repair_record).unwrap()),
+            frame: crate::codec::encode_record(&repair_record).unwrap().into(),
             pending_effect: None,
         };
         let live_error = replica
@@ -2772,7 +2866,7 @@ mod tests {
         let mut replay = repair_request_for(&assignment, 5);
         replay.identity.sequence = 5;
         replay.cursor = "cursor-5".to_owned();
-        replay.frame_base64 = STANDARD.encode(crate::codec::encode_record(&repair_record).unwrap());
+        replay.frame = crate::codec::encode_record(&repair_record).unwrap().into();
         let replayed = replica.import_committed(replay).await.unwrap();
         assert!(replayed.deduplicated);
         assert_eq!(replayed.position, RangePosition::new(5));
@@ -2782,8 +2876,7 @@ mod tests {
         let mut tampered_request = repair_request_for(&assignment, 5);
         tampered_request.identity.sequence = 5;
         tampered_request.cursor = "cursor-5b".to_owned();
-        tampered_request.frame_base64 =
-            STANDARD.encode(crate::codec::encode_record(&tampered).unwrap());
+        tampered_request.frame = crate::codec::encode_record(&tampered).unwrap().into();
         let tampered_error = replica
             .import_committed(tampered_request)
             .await
@@ -2811,8 +2904,157 @@ mod tests {
                 sequence: position,
             },
             cursor: String::new(),
-            frame_base64: String::new(),
+            frame: Bytes::new(),
             pending_effect: None,
         }
+    }
+
+    async fn ordered_batch_fixture() -> (
+        tempfile::TempDir,
+        Arc<ControlController>,
+        ActiveRangeAssignment,
+        ReplicaAppendService,
+    ) {
+        let root = tempfile::TempDir::new().unwrap();
+        let nodes = ["storage-1", "storage-2", "storage-3"]
+            .map(|node| StorageNodeId::try_new(node).unwrap());
+        let legacy: Arc<dyn LogStore> =
+            Arc::new(FileLogStore::open(root.path().join("legacy")).unwrap());
+        let control = Arc::new(
+            ControlController::open_with_storage_nodes(
+                root.path().join("catalog.json"),
+                legacy,
+                nodes.to_vec(),
+            )
+            .unwrap(),
+        );
+        control
+            .execute_commands(vec![
+                Command::CreateSpace {
+                    name: "orders".to_owned(),
+                },
+                Command::CreateFeed {
+                    name: "orders.events".to_owned(),
+                    encrypted: false,
+                },
+            ])
+            .await
+            .unwrap();
+        let feed_id = control
+            .active_feed_by_name("orders.events")
+            .await
+            .unwrap()
+            .feed_id;
+        let assignment = control.active_range_assignment(feed_id).await.unwrap();
+        let replica_id = assignment
+            .replicas
+            .iter()
+            .find(|node| **node != assignment.owner)
+            .unwrap()
+            .clone();
+        let service =
+            ReplicaAppendService::new(root.path().join("replica"), replica_id, control.clone());
+        (root, control, assignment, service)
+    }
+
+    fn ordered_batch_request(
+        assignment: &ActiveRangeAssignment,
+        positions: &[u64],
+    ) -> ReplicaBatchAppendRequest {
+        let writer = Uuid::from_u128(9);
+        ReplicaBatchAppendRequest {
+            feed_id: assignment.feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+            append_owner: assignment.owner.clone(),
+            frames: positions
+                .iter()
+                .map(|position| {
+                    let record = StoredRecord {
+                        message_id: Uuid::from_u128(1_000 + *position as u128),
+                        producer_id: writer,
+                        producer_sequence: *position,
+                        event_time_ns: *position as i64,
+                        ingest_time_ns: *position as i64 + 1,
+                        key: format!("key-{position}").into_bytes(),
+                        payload: format!("payload-{position}").into_bytes(),
+                        metadata: std::collections::BTreeMap::new(),
+                    };
+                    ReplicaBatchFrame {
+                        expected_position: Some(RangePosition::new(*position)),
+                        identity: AppendIdentity {
+                            writer_session_id: writer,
+                            writer_epoch: 1,
+                            sequence: *position,
+                        },
+                        cursor: format!("cursor-{position}"),
+                        frame: crate::codec::encode_record(&record).unwrap().into(),
+                        pending_effect: None,
+                    }
+                })
+                .collect(),
+            commit_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn replica_batch_waits_for_predecessor_positions_instead_of_gapping() {
+        let (_root, _control, assignment, service) = ordered_batch_fixture().await;
+
+        // Windowed sends arrive concurrently: the 3-4 batch reaches the
+        // replica before 1-2 and must wait on the appended watermark
+        // rather than immediately refusing a PositionGap.
+        let late = service.clone();
+        let late_request = ordered_batch_request(&assignment, &[3, 4]);
+        let late_send =
+            tokio::spawn(async move { late.import_committed_batch(late_request).await });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let first = service
+            .import_committed_batch(ordered_batch_request(&assignment, &[1, 2]))
+            .await
+            .unwrap();
+        assert_eq!(
+            first.iter().map(|a| a.position.value()).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        let second = late_send.await.unwrap().unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|a| a.position.value())
+                .collect::<Vec<_>>(),
+            vec![3, 4],
+            "the late batch lands immediately behind its predecessors"
+        );
+
+        let frames = service
+            .read_assignment_uncommitted(&assignment, None, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            frames
+                .iter()
+                .map(|f| f.position.value())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "on-disk order is by position, not arrival order"
+        );
+    }
+
+    #[tokio::test]
+    async fn replica_batch_refuses_a_gap_that_never_fills_after_the_bound() {
+        let (_root, _control, assignment, service) = ordered_batch_fixture().await;
+        let started = std::time::Instant::now();
+        let error = service
+            .import_committed_batch(ordered_batch_request(&assignment, &[3, 4]))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ReplicaAppendErrorCode::PositionGap);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the bound keeps a genuinely missing predecessor from stalling"
+        );
     }
 }

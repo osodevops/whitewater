@@ -301,6 +301,10 @@ parity with Kafka's sendfile consumer. Per-request server assembly is
 
 ### SDK-vs-SDK comparison (Java `kafka-clients` vs Rust SDK)
 
+Remaining JSON/base64 work on the bytes route (SDK -> ingress -> owner
+-> replicas, and the read path) is reviewed in
+[bytes-route-performance-review.md](bytes-route-performance-review.md).
+
 Same isolation as the matched-config runs: Kafka alone, `down -v`,
 then Whitewater alone. Both clients ran in **dedicated containers on
 the bench compose network** — neither rides localhost, so the veth hop
@@ -510,6 +514,179 @@ Honest reads at 8 KB:
 
 (The earlier same-shape 3-feed binary run measured 6,797 rec/s on a
 better host day — Docker Desktop variance; compare within a run set.)
+
+### Kafka-parity rounds — SDK vs SDK as a pass/fail gate (2026-11-01)
+
+The gate: the Whitewater Rust SDK must match or beat the Kafka Java SDK
+on write rec/s, write p50 and read rec/s on an equivalent setup.
+Kafka runs `org.apache.kafka:kafka-clients` 3.8.0 (`benchmarks/kafka-sdk`)
+with `acks=all`, `enable.idempotence=true`, RF3 and `min.insync.replicas=2`
+on 3 brokers, and reads with direct `assign()` (no group join). Whitewater
+runs `whitewater-rust` `examples/bench_feed` on 3 Nodes with RF3 quorum
+commit and `WHITEWATER_RANGE_SYNC_INTERVAL_MS=100`, using binary writes
+(`BENCH_WRITE_FORMAT=binary`, FSA1) and binary reads.
+
+Both clients ran in containers on their own bench network, and only one
+system ran at a time (`down -v` between them). Each Kafka run used a
+fresh topic: a reused topic inflates reads, because records left from
+earlier runs get counted. All runs were on the same day on Docker
+Desktop.
+
+Measured at 60,000 × 1 KiB records with 8 writers (Whitewater batch 512).
+Values are run ranges. For 1-feed reads, the range spans page limits
+65,536 / 8,192 / 4,096 records, with and without prefetch.
+"After" covers the final two server builds, which differ only in
+fsync-error latching and SDK prefetch. One earlier-build outlier, an
+87,034 rec/s 1-feed read at a 65,536 page with no prefetch, is excluded.
+
+| Shape | Metric | Kafka Java SDK | Whitewater before this round (JSON writes) | Whitewater after | Gate |
+|---|---|---|---|---|---|
+| 1 partition / 1 feed | write rec/s | 31,816 / 35,385 / 37,286 | 15,692–17,063 | 36,724 / 37,059 / 37,252 / 37,671 | pass |
+| | write p50 | 377–576 ms | 226–231 ms | 78–85 ms | pass |
+| | read rec/s | 195,532 / 222,096 / 249,783 | 100,913–116,439 | 142,734–180,955 | **fail** |
+| 3 partitions / 3 feeds | write rec/s | 36,307 / 41,537 / 41,791 | 21,185–23,255 | 43,634 / 44,018 / 46,954 | pass |
+| | write p50 | 174–358 ms | 150–167 ms | 46–51 ms | pass |
+| | read rec/s | 87,715 / 88,141 / 88,251 | 248,676–262,601 | 285,175–386,506 | pass |
+
+The larger shape (300,000 × 1 KiB, 16 writers, 1 partition / 1 feed)
+does not pass yet:
+
+| Metric | Kafka Java SDK | Whitewater after |
+|---|---|---|
+| write rec/s | 72,701 / 76,751 | 34,885 |
+| write p50 | 1,447 / 1,480 ms | 200 ms |
+| read rec/s | 312,838 / 368,876 | 204,527–243,989 (8,192/16,384 pages, ± prefetch) |
+
+Kafka's producers keep more batches in flight per broker as writer
+count grows. They gain throughput at roughly 7x the latency. A single
+Whitewater range currently tops out around 35–37k rec/s. That limit is
+the owner's local append section, about 15–20 ms per 512-record round.
+
+What changed, and the phase timing that motivated each change
+(`RUST_LOG=whitewater=debug`, `"append batch phase timing"`):
+
+1. **Windowed replica sends.** Before, each (range, follower) lane carried
+   one send at a time. Under load, rounds spent `send_wait_ms` p50
+   438 ms queued behind the previous send, while the send itself took
+   24 ms. Now up to 4 sends per lane are in flight (`majority.rs`
+   `MAX_INFLIGHT_SENDS_PER_FOLLOWER`). Tickets still start sends in mint
+   order. Followers admit batches in position order: they wait on an
+   appended-watermark `watch` for up to 500 ms before the existing
+   `PositionGap`/repair path. A late duplicate batch whose fused commit
+   is already below the committed watermark is accepted only when every
+   frame dedups and the digest matches. After this change `send_wait_ms`
+   is 0.
+2. **Balanced Append Owners.** Owner selection had been pure rendezvous
+   hash, and one run left a Node owning no ranges (rounds per Node were
+   75 / 45 / 0). The owner is now the replica with the fewest owned
+   ranges, with ties broken by hash rank. Rounds per Node: 277 / 269 / 254.
+3. **Bytes in process.** Key, payload, Metadata and stored frames are now
+   carried as `bytes::Bytes` from ingress to the replicas. serde adapters
+   keep the internal JSON wire format byte-identical. There is no
+   base64 re-encode after FSA1 ingress and no encode→decode pair on the
+   owner. The owner encoder no longer clones records, the store reads
+   the record header without a full decode, and the forward hop to the
+   owner is binary (`/internal/active-range/owner/append-batch-bin`, with
+   a JSON fallback on 404/405).
+4. **Deferred fsync off the append lock.** In deferred mode, the
+   periodic `sync_data` + directory sync used to run inline under the
+   range lock, causing ~30 ms p90 spikes. It now runs on a cloned fd in
+   a background thread. A failed sync latches `DeferredSyncFailed`, and
+   every later mutation fails closed until the store reopens.
+   Strict/forced syncs are unchanged.
+5. **Read path.**
+   - The budget checks use a header-only size, computed once per frame,
+     instead of three CRC passes per frame.
+   - Spans are read once and sliced as zero-copy `Bytes`, and blake3 is
+     verified in parallel for runs of 1,024 frames or more.
+   - Committed local runs are read outside the range lock; uncommitted
+     reads stay locked.
+   - Pages go up to 65,536 frames, still bounded by the 96 MiB budget.
+   - The response streams lazily in ~512 KiB coalesced chunks. An
+     earlier 2-chunks-per-record version made transfer 5x slower.
+   - SDK side: the page is decoded while it streams. The pipelined fetch
+     starts page k+1 as soon as page k's header (with `next_cursor`) has
+     been parsed.
+   - Result for one 60k-frame page in-network (curl): TTFB dropped from
+     ~270 ms to ~160 ms.
+6. **Body limit.** `/v1/writers/append-batch` now takes up to 8 MiB.
+   Before, 4 KiB × 512 batches hit axum's 2 MiB default and got HTTP 413
+   (26 rec/s, 28,672 errors). They now run at 9,070 rec/s with 0 errors.
+   The SDK splits a batch in half on 413 and no longer retries
+   authoritative refusals.
+
+Open items:
+
+* Single-feed read assembly costs ~2.7 µs/record server-side.
+* The owner's local append section limits a single range.
+* SDK per-Writer pipelining will keep per-Key order: in-flight batches
+  never share a Key.
+* One isolated ~29 s stall (1 of ~11 write runs). It is consistent with
+  the batch fast path falling back to per-record appends. Warnings now
+  log that fallback, and the stall has not recurred.
+
+#### Round 2 — group commit, staged store writes, per-Key pipelining (same session, both systems re-measured)
+
+Setup is the same as above. Every Kafka run used a fresh topic, and the
+systems ran one at a time. Whitewater ran with info-level logging and
+`BENCH_PAGE_LIMIT=16384`. The 300k shape used `BENCH_BATCHED=1`, the
+Kafka-producer-equivalent mode: linger 5 ms, 512-record batches, 5
+in flight per Writer, and no two in-flight batches from one Writer ever
+share a Key.
+
+| Shape | Metric | Kafka Java SDK | Whitewater Rust SDK | Gate |
+|---|---|---|---|---|
+| 60k × 1 KiB, 8 writers, 1 partition / 1 feed | write rec/s | 29,134 / 37,343 | 46,125 / 64,945 | pass |
+| | write p50 | 595 / 410 ms | 54 / 37 ms | pass |
+| | read rec/s | 218,182 / 232,959 | 191,305 / 130,817 | **fail** |
+| 60k × 1 KiB, 8 writers, 3 partitions / 3 feeds | write rec/s | 32,160 / 45,247 | 48,622 / 48,198 | pass |
+| | write p50 | 370 / 144 ms | 30 / 30 ms | pass |
+| | read rec/s | 85,649 / 88,576 | 240,823 / 331,099 | pass |
+| 300k × 1 KiB, 16 writers, 1 partition / 1 feed | write rec/s | 93,970 / 103,477 | 49,510 / 50,515 | **fail** |
+| | write p50 | 1,134 / 893 ms | 83 / 90 ms | pass |
+| | read rec/s | 282,654 / 214,549 | 190,672 / 158,603 | **fail** |
+| 300k × 1 KiB, 16 writers, 3 partitions / 3 feeds | write rec/s | 101,417 / 113,512 | 61,866 / 63,236 | **fail** |
+| | write p50 | 740 / 626 ms | 69 / 74 ms | pass |
+| | read rec/s | 304,324 / 290,849 | 241,741 / 306,724 | mixed |
+
+Changes in this round:
+
+* **Owner group commit.** Client batches waiting on one range merge
+  into a single quorum round. Rounds observed at 1–3k frames, capped at
+  4,096 frames / 16 MiB. A merged round that fails non-retryably re-runs
+  each submission alone, so one bad batch cannot fail its neighbours.
+  Pending-effect submissions are never merged. The in-flight window
+  permit is taken per round, after enqueue.
+  `MAX_REPLICA_BATCH_FRAMES` is now 4096: a follower still on an older
+  version refuses merged rounds.
+* **Staged store writes.** One `write_all` per batch, with the active
+  segment length tracked in memory instead of a seek per frame. The
+  persisted state is updated in place. Header peek and blake3 digests are
+  computed in parallel before the range lock. When no segments are
+  tiered, the remote-manifest scan is skipped.
+* **Encoding outside the append lock.** Frames are encoded before the
+  lock; under it, only the minted sequence is patched in and the CRC
+  recomputed.
+* **Checkpoints without rename.** Lazy (deferred-mode) checkpoints go to
+  alternating `range-state.lazy-a`/`-b` slots, each with a sequence
+  number and checksum, written with no rename and no fsync. Strict
+  checkpoints keep tmp + fsync + rename. Open, retention sweep and tier
+  scan all resolve the newest valid checkpoint.
+* **SDK.** `Writer::batched` pipelines up to `max_in_flight` batches,
+  with in-flight batches never sharing a Key. A finished batch wakes the
+  pump immediately; before, it could idle for up to 500 ms.
+
+Verdict: Whitewater passes every latency gate, by 4–13x. It passes write
+throughput at the 8-writer shape and read throughput across 3 feeds.
+
+It does not yet match Kafka on write throughput with 16 producers, or on
+single-feed reads. Kafka's leader scales to ~100k rec/s on one partition
+by coalescing many in-flight producer batches, at 0.9–1.1 s p50. One
+Whitewater range currently saturates around 50k rec/s. Once the owner
+lock is no longer the bottleneck, the limit is the follower apply path:
+it is serialized per range and costs ~10–14 ms per 1k-frame round. Node
+CPU stays below ~1.4 of 16 cores, so the remaining gap is serialization,
+not compute.
 
 ### Write-path history
 

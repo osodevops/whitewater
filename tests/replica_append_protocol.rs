@@ -1,6 +1,5 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tempfile::TempDir;
 use uuid::Uuid;
 use whitewater::{
@@ -99,7 +98,7 @@ impl Fixture {
                 sequence,
             },
             cursor: format!("cursor-{sequence}"),
-            frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            frame: encode_record(&record).unwrap().into(),
             pending_effect: None,
         }
     }
@@ -110,7 +109,7 @@ async fn replica_persists_the_exact_frame_and_identical_retry_is_idempotent() {
     let fixture = Fixture::new().await;
     let service = fixture.service("storage-2");
     let request = fixture.request(1, 1, b"one");
-    let expected_digest = blake3::hash(&STANDARD.decode(&request.frame_base64).unwrap());
+    let expected_digest = blake3::hash(&request.frame);
 
     let accepted = service.append(request.clone()).await.unwrap();
     assert_eq!(accepted.position, RangePosition::new(1));
@@ -128,8 +127,7 @@ async fn replica_persists_the_exact_frame_and_identical_retry_is_idempotent() {
 async fn all_assigned_replicas_persist_identical_checksummed_bytes() {
     let fixture = Fixture::new().await;
     let request = fixture.request(1, 1, b"identical");
-    let expected_digest =
-        *blake3::hash(&STANDARD.decode(&request.frame_base64).unwrap()).as_bytes();
+    let expected_digest = *blake3::hash(&request.frame).as_bytes();
 
     for replica in fixture.replicas.clone() {
         let accepted = fixture
@@ -263,10 +261,10 @@ async fn replica_rejects_invalid_frame_checksum_before_storage_mutation() {
     let fixture = Fixture::new().await;
     let service = fixture.service("storage-2");
     let mut request = fixture.request(1, 1, b"one");
-    let mut frame = STANDARD.decode(&request.frame_base64).unwrap();
+    let mut frame = request.frame.to_vec();
     let last = frame.len() - 1;
     frame[last] ^= 0xff;
-    request.frame_base64 = STANDARD.encode(frame);
+    request.frame = frame.into();
 
     let error = service.append(request).await.unwrap_err();
     assert_eq!(error.code, ReplicaAppendErrorCode::InvalidFrame);
@@ -335,15 +333,14 @@ async fn replica_rejects_unknown_feed_and_oversized_or_invalid_base64() {
     );
 
     let mut invalid = fixture.request(1, 1, b"one");
-    invalid.frame_base64 = "not-base64".to_owned();
+    invalid.frame = bytes::Bytes::from_static(b"not-a-frame");
     assert_eq!(
         service.append(invalid).await.unwrap_err().code,
-        ReplicaAppendErrorCode::InvalidFrameEncoding
+        ReplicaAppendErrorCode::InvalidFrame
     );
 
     let mut oversized = fixture.request(1, 1, b"one");
-    oversized.frame_base64 =
-        "A".repeat(whitewater::active_range::MAX_REPLICA_FRAME_BASE64_BYTES + 1);
+    oversized.frame = vec![b'A'; whitewater::codec::MAX_FRAME_BYTES + 1].into();
     assert_eq!(
         service.append(oversized).await.unwrap_err().code,
         ReplicaAppendErrorCode::FrameTooLarge

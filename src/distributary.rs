@@ -18,6 +18,7 @@
 //! copied Feed rather than receiving rows; manual StateStore journal
 //! shipping is tracked separately.
 
+use base64::Engine as _;
 use uuid::Uuid;
 
 use crate::admin::{AdminClient, AdminClientError};
@@ -287,9 +288,26 @@ pub async fn drive_distributary_once(
             writer: writer.clone(),
             session_epoch: writer_epoch,
             event_time_ns: Some(record.event_time_ns.clone()),
-            key_base64: record.key_base64.clone(),
-            payload_base64: record.payload_base64.clone(),
-            metadata_base64: record.metadata_base64.clone(),
+            key: base64::engine::general_purpose::STANDARD
+                .decode(&record.key_base64)
+                .map_err(|error| format!("remote record has invalid key_base64: {error}"))?
+                .into(),
+            payload: base64::engine::general_purpose::STANDARD
+                .decode(&record.payload_base64)
+                .map_err(|error| format!("remote record has invalid payload_base64: {error}"))?
+                .into(),
+            metadata: record
+                .metadata_base64
+                .iter()
+                .map(|(name, value)| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(value)
+                        .map(|bytes| (name.clone(), bytes.into()))
+                        .map_err(|error| {
+                            format!("remote record has invalid metadata_base64: {error}")
+                        })
+                })
+                .collect::<Result<_, String>>()?,
             use_compression: false,
         };
         match local.append_writer(&request).await {

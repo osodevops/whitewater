@@ -92,6 +92,106 @@ pub fn encode_record_with_compression(
     Ok(frame)
 }
 
+/// Overwrite the fixed-offset producer_sequence of a valid FSR1/FSR2
+/// frame and recompute the trailing CRC — the minted-sequence fast path:
+/// encoders run sequence-0 outside the append lock and only this cheap
+/// patch runs under it. FSR3 (LZ4) is patched by
+/// decompress → patch → recompress so callers never re-encode; LZ4 is
+/// deterministic, so bytes match an encode(seq) byte-for-byte.
+/// In-place variant for frames the caller just encoded itself: skips
+/// the inbound envelope CRC re-check but still validates magic/length
+/// and recomputes the trailer. FSR3 is patched via
+/// decompress → patch → recompress (LZ4 is deterministic →
+/// byte-identical to encode(seq)).
+pub fn patch_producer_sequence_unchecked(
+    frame: &mut Vec<u8>,
+    sequence: u64,
+) -> Result<(), CodecError> {
+    if frame.len() < 8 {
+        return Err(CodecError::Truncated);
+    }
+    let body_len =
+        u32::from_be_bytes(frame[..4].try_into().map_err(|_| CodecError::Truncated)?) as usize;
+    if body_len > MAX_FRAME_BYTES || frame.len() != body_len + 8 {
+        return Err(if body_len > MAX_FRAME_BYTES {
+            CodecError::FrameTooLarge
+        } else {
+            CodecError::Truncated
+        });
+    }
+    let magic = &frame[4..8];
+    if magic == MAGIC_LZ4 {
+        let decompressed_len =
+            u32::from_be_bytes(frame[8..12].try_into().map_err(|_| CodecError::Truncated)?)
+                as usize;
+        let mut decompressed =
+            lz4_flex::block::decompress(&frame[12..4 + body_len], decompressed_len)
+                .map_err(|_| CodecError::InvalidCompression)?;
+        if decompressed.len() < 44 {
+            return Err(CodecError::Truncated);
+        }
+        decompressed[36..44].copy_from_slice(&sequence.to_be_bytes());
+        let compressed = lz4_flex::block::compress(&decompressed);
+        let mut body = Vec::with_capacity(compressed.len() + 8);
+        body.extend_from_slice(MAGIC_LZ4);
+        body.extend_from_slice(&(decompressed.len() as u32).to_be_bytes());
+        body.extend_from_slice(&compressed);
+        frame.clear();
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&body);
+        frame.extend_from_slice(&crc32fast::hash(&body).to_be_bytes());
+        return Ok(());
+    }
+    if magic != MAGIC_V1 && magic != MAGIC_V2 {
+        return Err(CodecError::InvalidMagic);
+    }
+    if body_len < 44 {
+        return Err(CodecError::Truncated);
+    }
+    frame[4 + 36..4 + 44].copy_from_slice(&sequence.to_be_bytes());
+    let crc = crc32fast::hash(&frame[4..4 + body_len]);
+    let trailer = frame.len() - 4;
+    frame[trailer..].copy_from_slice(&crc.to_be_bytes());
+    Ok(())
+}
+
+pub fn patch_producer_sequence(frame: &[u8], sequence: u64) -> Result<Vec<u8>, CodecError> {
+    let body = checked_body(frame)?;
+    let magic = &body[..4];
+    if magic == MAGIC_LZ4 {
+        let original =
+            u32::from_be_bytes(body[4..8].try_into().map_err(|_| CodecError::Truncated)?) as usize;
+        let mut decompressed = lz4_flex::block::decompress(&body[8..], original)
+            .map_err(|_| CodecError::InvalidCompression)?;
+        if decompressed.len() < 44 {
+            return Err(CodecError::Truncated);
+        }
+        decompressed[36..44].copy_from_slice(&sequence.to_be_bytes());
+        let compressed = lz4_flex::block::compress(&decompressed);
+        let mut body = Vec::with_capacity(compressed.len() + 8);
+        body.extend_from_slice(MAGIC_LZ4);
+        body.extend_from_slice(&(decompressed.len() as u32).to_be_bytes());
+        body.extend_from_slice(&compressed);
+        let mut frame = Vec::with_capacity(body.len() + 8);
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&body);
+        frame.extend_from_slice(&crc32fast::hash(&body).to_be_bytes());
+        return Ok(frame);
+    }
+    if magic != MAGIC_V1 && magic != MAGIC_V2 {
+        return Err(CodecError::InvalidMagic);
+    }
+    if body.len() < 44 {
+        return Err(CodecError::Truncated);
+    }
+    let mut frame = frame.to_vec();
+    frame[4 + 36..4 + 44].copy_from_slice(&sequence.to_be_bytes());
+    let crc = crc32fast::hash(&frame[4..4 + body.len()]);
+    let trailer = frame.len() - 4;
+    frame[trailer..].copy_from_slice(&crc.to_be_bytes());
+    Ok(frame)
+}
+
 fn checked_body(frame: &[u8]) -> Result<&[u8], CodecError> {
     if frame.len() < 8 {
         return Err(CodecError::Truncated);
@@ -196,6 +296,141 @@ fn decode_body(body: &[u8]) -> Result<StoredRecord, CodecError> {
         payload,
         metadata,
     })
+}
+
+/// The fixed-offset record identity fields, readable without touching
+/// key/payload/metadata bytes: the store's dedup and ordering fences
+/// only ever need this header, so appends no longer pay a full decode.
+pub struct RecordHeader {
+    pub message_id: Uuid,
+    pub producer_id: Uuid,
+    pub producer_sequence: u64,
+    pub event_time_ns: i64,
+    pub ingest_time_ns: i64,
+}
+
+/// Read just the record header out of a stored frame: the envelope
+/// length + CRC32 are still validated once (fail-closed like
+/// `decode_record`), then only the fixed header fields are parsed for
+/// FSR1/FSR2 bodies. FSR3 (LZ4) envelopes decompress fully — the header
+/// is inside the compressed payload.
+pub fn peek_record_header(frame: &[u8]) -> Result<RecordHeader, CodecError> {
+    let body = checked_body(frame)?;
+    if body.starts_with(MAGIC_LZ4) {
+        return decode_record(frame).map(|record| RecordHeader {
+            message_id: record.message_id,
+            producer_id: record.producer_id,
+            producer_sequence: record.producer_sequence,
+            event_time_ns: record.event_time_ns,
+            ingest_time_ns: record.ingest_time_ns,
+        });
+    }
+    let mut reader = Reader::new(body);
+    let magic = reader.take(4)?;
+    if magic != MAGIC_V1 && magic != MAGIC_V2 {
+        return Err(CodecError::InvalidMagic);
+    }
+    let message_id = Uuid::from_slice(reader.take(16)?).map_err(|_| CodecError::InvalidUuid)?;
+    let producer_id = Uuid::from_slice(reader.take(16)?).map_err(|_| CodecError::InvalidUuid)?;
+    let producer_sequence = reader.u64()?;
+    let (event_time_ns, ingest_time_ns) = if magic == MAGIC_V1 {
+        let timestamp_ms = reader.u64()?;
+        let timestamp_ns =
+            i64::try_from(timestamp_ms.saturating_mul(1_000_000)).unwrap_or(i64::MAX);
+        (timestamp_ns, timestamp_ns)
+    } else {
+        (reader.i64()?, reader.i64()?)
+    };
+    Ok(RecordHeader {
+        message_id,
+        producer_id,
+        producer_sequence,
+        event_time_ns,
+        ingest_time_ns,
+    })
+}
+
+/// The logical (uncompressed + envelope) byte size of a stored frame
+/// whose integrity is already established — the blake3-verified read
+/// path skips the second CRC pass `logical_frame_size` performs. Same
+/// bounds and errors otherwise.
+pub fn logical_frame_size_unchecked(frame: &[u8]) -> Result<usize, CodecError> {
+    if frame.len() < 8 {
+        return Err(CodecError::Truncated);
+    }
+    let body_len =
+        u32::from_be_bytes(frame[..4].try_into().map_err(|_| CodecError::Truncated)?) as usize;
+    if body_len > MAX_FRAME_BYTES || frame.len() != body_len + 8 {
+        return Err(if body_len > MAX_FRAME_BYTES {
+            CodecError::FrameTooLarge
+        } else {
+            CodecError::Truncated
+        });
+    }
+    let body = &frame[4..4 + body_len];
+    let size = if body.starts_with(MAGIC_LZ4) {
+        let mut envelope = Reader::new(body);
+        envelope.take(4)?;
+        envelope.u32()? as usize
+    } else {
+        body.len()
+    };
+    if size > MAX_FRAME_BYTES {
+        return Err(CodecError::FrameTooLarge);
+    }
+    size.checked_add(8).ok_or(CodecError::FrameTooLarge)
+}
+
+/// serde adapters keeping byte buffers on the wire as their base64
+/// strings while the in-process representation carries raw bytes.
+pub mod serde_base64 {
+    use std::collections::BTreeMap;
+
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use bytes::Bytes;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Bytes, serializer: S) -> Result<S::Ok, S::Error> {
+        STANDARD.encode(value).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Bytes, D::Error> {
+        let encoded = String::deserialize(deserializer)?;
+        STANDARD
+            .decode(&encoded)
+            .map(Bytes::from)
+            .map_err(serde::de::Error::custom)
+    }
+
+    pub mod map {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            value: &BTreeMap<String, Bytes>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            value
+                .iter()
+                .map(|(name, value)| (name.clone(), STANDARD.encode(value)))
+                .collect::<BTreeMap<String, String>>()
+                .serialize(serializer)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<BTreeMap<String, Bytes>, D::Error> {
+            BTreeMap::<String, String>::deserialize(deserializer)?
+                .into_iter()
+                .map(|(name, encoded)| {
+                    STANDARD
+                        .decode(&encoded)
+                        .map(Bytes::from)
+                        .map(|value| (name, value))
+                        .map_err(serde::de::Error::custom)
+                })
+                .collect()
+        }
+    }
 }
 
 fn put_u32(target: &mut Vec<u8>, value: usize) -> Result<(), CodecError> {
@@ -595,6 +830,113 @@ mod tests {
         assert!(matches!(
             decode_append_frame_page(&wrong),
             Err(CodecError::InvalidMagic)
+        ));
+    }
+    fn header_fixture(use_compression: bool) -> (Vec<u8>, StoredRecord) {
+        let record = StoredRecord {
+            message_id: Uuid::from_u128(7),
+            producer_id: Uuid::from_u128(9),
+            producer_sequence: 42,
+            event_time_ns: -5,
+            ingest_time_ns: 1_700_000_000_000_000_001,
+            key: b"k".to_vec(),
+            payload: vec![0xAB; 4096],
+            metadata: BTreeMap::from([("origin".to_owned(), b"lab".to_vec())]),
+        };
+        (
+            encode_record_with_compression(&record, use_compression).expect("encode"),
+            record,
+        )
+    }
+
+    #[test]
+    fn patch_producer_sequence_unchecked_matches_encode() {
+        for sequence in [0_u64, 7, u64::MAX] {
+            let record = StoredRecord {
+                message_id: Uuid::from_u128(11),
+                producer_id: Uuid::from_u128(22),
+                producer_sequence: sequence,
+                event_time_ns: 1,
+                ingest_time_ns: 2,
+                key: b"key".to_vec(),
+                payload: b"payload".to_vec(),
+                metadata: BTreeMap::new(),
+            };
+            let zero = encode_record(&StoredRecord {
+                producer_sequence: 0,
+                ..record.clone()
+            })
+            .unwrap();
+            let mut patched = zero.clone();
+            patch_producer_sequence_unchecked(&mut patched, sequence).unwrap();
+            assert_eq!(
+                patched,
+                encode_record(&record).unwrap(),
+                "unchecked patch must match encode(seq) byte-for-byte"
+            );
+        }
+        let mut bad = encode_record(&StoredRecord {
+            message_id: Uuid::from_u128(11),
+            producer_id: Uuid::from_u128(22),
+            producer_sequence: 0,
+            event_time_ns: 1,
+            ingest_time_ns: 2,
+            key: vec![],
+            payload: vec![],
+            metadata: BTreeMap::new(),
+        })
+        .unwrap();
+        bad[4] = b'X';
+        assert!(patch_producer_sequence_unchecked(&mut bad, 5).is_err());
+        assert!(patch_producer_sequence_unchecked(&mut vec![1, 2, 3], 5).is_err());
+    }
+
+    #[test]
+    fn peek_record_header_matches_full_decode() {
+        for compressed in [false, true] {
+            let (frame, record) = header_fixture(compressed);
+            let header = peek_record_header(&frame).expect("peek");
+            assert_eq!(header.message_id, record.message_id);
+            assert_eq!(header.producer_id, record.producer_id);
+            assert_eq!(header.producer_sequence, record.producer_sequence);
+            assert_eq!(header.event_time_ns, record.event_time_ns);
+            assert_eq!(header.ingest_time_ns, record.ingest_time_ns);
+        }
+        // FSR1 timestamps land in both fields like the full decode.
+        let mut body = MAGIC_V1.to_vec();
+        body.extend_from_slice(&[7u8; 16]);
+        body.extend_from_slice(&[9u8; 16]);
+        body.extend_from_slice(&3u64.to_be_bytes());
+        body.extend_from_slice(&1_700_000_000u64.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&0u32.to_be_bytes());
+        body.extend_from_slice(&0u16.to_be_bytes());
+        let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+        frame.extend_from_slice(&body);
+        frame.extend_from_slice(&crc32fast::hash(&body).to_be_bytes());
+        let header = peek_record_header(&frame).expect("peek v1");
+        let record = decode_record(&frame).expect("decode v1");
+        assert_eq!(header.event_time_ns, record.event_time_ns);
+        assert_eq!(header.ingest_time_ns, record.ingest_time_ns);
+    }
+
+    #[test]
+    fn peek_record_header_fails_closed_on_corruption() {
+        let (frame, _) = header_fixture(false);
+        let mut torn = frame.clone();
+        let last = torn.len() - 1;
+        torn[last] ^= 0xFF;
+        assert!(matches!(
+            peek_record_header(&torn),
+            Err(CodecError::InvalidChecksum)
+        ));
+        assert!(matches!(
+            peek_record_header(&frame[..frame.len() - 4]),
+            Err(CodecError::Truncated)
+        ));
+        assert!(matches!(
+            peek_record_header(&frame[..4]),
+            Err(CodecError::Truncated)
         ));
     }
 }

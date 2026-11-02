@@ -671,7 +671,7 @@ pub async fn repair_replica(
                     expected_position: item.position,
                     identity: item.identity,
                     cursor: item.cursor,
-                    frame_base64: STANDARD.encode(&item.frame),
+                    frame: item.frame.clone(),
                     pending_effect: None,
                 })
                 .await
@@ -881,7 +881,10 @@ impl LocalRepairSupervisor {
                         expected_position: item.position,
                         identity: item.identity,
                         cursor: item.cursor,
-                        frame_base64: item.frame_base64,
+                        frame: STANDARD
+                            .decode(&item.frame_base64)
+                            .unwrap_or_default()
+                            .into(),
                         pending_effect: None,
                     })
                     .await

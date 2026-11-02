@@ -1,7 +1,6 @@
 use std::{collections::BTreeMap, fs, sync::Arc};
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tempfile::TempDir;
 use uuid::Uuid;
 use whitewater::{
@@ -207,7 +206,7 @@ async fn missing_committed_frames_are_verified_transferred_and_dedup_rebuilt() {
                 sequence,
             },
             cursor: format!("cursor-{sequence}"),
-            frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            frame: encode_record(&record).unwrap().into(),
             pending_effect: None,
         };
         let accepted = source.append(request.clone()).await.unwrap();
@@ -317,7 +316,7 @@ async fn corrupt_replica_directory_is_quarantined_before_rebuild() {
             sequence: 1,
         },
         cursor: "cursor-1".to_owned(),
-        frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+        frame: encode_record(&record).unwrap().into(),
         pending_effect: None,
     };
     for service in [&source, &target] {
@@ -426,7 +425,7 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
                 sequence,
             },
             cursor: format!("cursor-{sequence}"),
-            frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            frame: encode_record(&record).unwrap().into(),
             pending_effect: None,
         };
         for node in original.replicas.iter() {
@@ -505,7 +504,7 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
             sequence: 4,
         },
         cursor: "cursor-4".to_owned(),
-        frame_base64: STANDARD.encode(encode_record(&delta).unwrap()),
+        frame: encode_record(&delta).unwrap().into(),
         pending_effect: None,
     };
     for node in original.replicas.iter() {
@@ -635,7 +634,7 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
             sequence: 5,
         },
         cursor: "cursor-5".to_owned(),
-        frame_base64: STANDARD.encode(encode_record(&next_record).unwrap()),
+        frame: encode_record(&next_record).unwrap().into(),
         pending_effect: None,
     };
     assert!(services[&removed]
@@ -668,7 +667,7 @@ async fn follower_move_copies_committed_frames_before_swapping_rf3() {
         request.expected_position = RangePosition::new(sequence);
         request.identity.sequence = sequence;
         request.cursor = format!("cursor-{sequence}");
-        request.frame_base64 = STANDARD.encode(encode_record(&record).unwrap());
+        request.frame = encode_record(&record).unwrap().into();
         for node in current.replicas.iter() {
             let accepted = services[node].append(request.clone()).await.unwrap();
             services[node]
@@ -774,7 +773,7 @@ async fn follower_move_copy_resumes_staged_prefix_after_target_restart() {
                 sequence,
             },
             cursor: format!("cursor-{sequence}"),
-            frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            frame: encode_record(&record).unwrap().into(),
             pending_effect: None,
         };
         for replica in original.replicas.iter() {
@@ -927,7 +926,7 @@ async fn follower_move_stages_the_prefix_before_freezing_the_tail() {
                 sequence,
             },
             cursor: format!("cursor-{sequence}"),
-            frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            frame: encode_record(&record).unwrap().into(),
             pending_effect: None,
         };
         for replica in original.replicas.iter() {

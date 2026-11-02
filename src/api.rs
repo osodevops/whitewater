@@ -372,6 +372,14 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             state.clone(),
             authorize_replica_append,
         ));
+    let owner_append_batch_bin_route = post(owner_append_batch_bin)
+        .layer(DefaultBodyLimit::max(
+            MAX_REPLICA_BATCH_BASE64_BYTES + 1024 * 1024,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
     let owner_release_pending_route = post(owner_release_pending).layer(
         middleware::from_fn_with_state(state.clone(), authorize_replica_append),
     );
@@ -526,6 +534,10 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
         .route(
             "/internal/active-range/owner/append-batch",
             owner_append_batch_route,
+        )
+        .route(
+            "/internal/active-range/owner/append-batch-bin",
+            owner_append_batch_bin_route,
         )
         .route(
             "/internal/active-range/owner/release-pending",
@@ -687,6 +699,11 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
         )
 }
 
+/// Client append-batch bodies may run to several MiB (a full
+/// `MAX_FRAME_BYTES` run re-encodes past the 2 MiB axum default), while
+/// staying inside the internal owner-forward and replica batch budgets.
+const MAX_WRITER_BATCH_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 pub fn router(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/health", get(health))
@@ -708,7 +725,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/state-stores/replay", post(state_store_replay))
         .route("/v1/indexes/query", post(index_query))
         .route("/v1/writers/append", post(writer_session_append))
-        .route("/v1/writers/append-batch", post(writer_batch_append))
+        .route(
+            "/v1/writers/append-batch",
+            post(writer_batch_append).layer(DefaultBodyLimit::max(MAX_WRITER_BATCH_BODY_BYTES)),
+        )
         .route("/v1/readers/open", post(reader_open))
         .route("/v1/readers/fetch", post(reader_fetch))
         .route("/v1/readers/ack", post(reader_ack))
@@ -1811,7 +1831,7 @@ async fn replica_append(
         code: None,
     })?;
     let range_id = request.range_id;
-    let wire_bytes = request.frame_base64.len();
+    let wire_bytes = request.frame.len();
     // Replica fan-out replays the owner's authoritative log, not live Writer
     // traffic: dedup-consumed retries can carry a replica's Writer watermark
     // ahead of its landed positions, so applying live-ordering fences here
@@ -1847,7 +1867,7 @@ async fn replica_append_batch(
         code: None,
     })?;
     let range_id = request.range_id;
-    let wire_bytes: usize = request.frames.iter().map(|f| f.frame_base64.len()).sum();
+    let wire_bytes: usize = request.frames.iter().map(|f| f.frame.len()).sum();
     Ok(Json(match service.import_committed_batch(request).await {
         Ok(results) => {
             state.demand.record_range_replication(range_id, wire_bytes);
@@ -9752,9 +9772,24 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
             writer_epoch: output.writer_epoch,
             sequence: output.sequence,
             event_time_ns: Some(output.event_time_ns.to_string()),
-            key_base64: output.key_base64.clone(),
-            payload_base64: output.payload_base64.clone(),
-            metadata_base64: output.metadata_base64.clone(),
+            key: STANDARD
+                .decode(&output.key_base64)
+                .unwrap_or_default()
+                .into(),
+            payload: STANDARD
+                .decode(&output.payload_base64)
+                .unwrap_or_default()
+                .into(),
+            metadata: output
+                .metadata_base64
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.clone(),
+                        STANDARD.decode(value).unwrap_or_default().into(),
+                    )
+                })
+                .collect(),
             use_compression: false,
             pending_effect: Some(crate::active_range::PendingEffectRef {
                 effect_id,
@@ -10324,7 +10359,7 @@ async fn repair_export(
                         position: item.position,
                         identity: item.identity,
                         cursor: item.cursor,
-                        frame_base64: STANDARD.encode(item.frame),
+                        frame_base64: STANDARD.encode(&item.frame),
                     })
                     .collect(),
                 error: None,
@@ -11232,8 +11267,6 @@ fn wants_frame_binary(headers: &HeaderMap) -> bool {
         .is_some_and(|accept| accept.contains(FRAMES_MEDIA_TYPE))
 }
 
-const FRAME_FETCH_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-
 #[cfg(test)]
 fn encode_frame_fetch(next_cursor: Option<String>, frames: Vec<StoredRangeFrame>) -> Vec<u8> {
     let mut body = Vec::new();
@@ -11247,34 +11280,96 @@ fn encode_frame_fetch(next_cursor: Option<String>, frames: Vec<StoredRangeFrame>
 /// ~`FRAME_FETCH_CHUNK_BYTES` chunks. Splitting construction from
 /// transport lets the HTTP layer stream chunks as they are produced
 /// instead of buffering the whole page before the first byte leaves.
+/// Body chunks target ~512 KiB: small frames and their per-record
+/// prefixes coalesce into one `BytesMut` per chunk, while a frame
+/// larger than the threshold yields as its own prefix + frame `Bytes`
+/// so the big payload still never memcpys. Generated lazily so the
+/// first byte leaves before the last frame is framed up.
+const FRAME_FETCH_CHUNK_BYTES: usize = 512 * 1024;
+
+/// Stream the binary fetch page as `Bytes` chunks with a wire format
+/// byte-identical to the coalesced version.
 fn encode_frame_fetch_stream(
     next_cursor: Option<String>,
     frames: Vec<StoredRangeFrame>,
-) -> impl Iterator<Item = Vec<u8>> {
+) -> impl Iterator<Item = Bytes> {
     let cursor_bytes = next_cursor.unwrap_or_default().into_bytes();
     let mut header = Vec::with_capacity(8 + cursor_bytes.len());
     header.extend_from_slice(&(frames.len() as u32).to_le_bytes());
     header.extend_from_slice(&(cursor_bytes.len() as u32).to_le_bytes());
     header.extend_from_slice(&cursor_bytes);
-    let mut chunks = Vec::new();
-    let mut current = Vec::with_capacity(FRAME_FETCH_CHUNK_BYTES);
-    for frame in frames {
-        let entry_bytes = 8 + frame.cursor.len() + frame.frame.len();
-        if current.len() + entry_bytes > FRAME_FETCH_CHUNK_BYTES && !current.is_empty() {
-            chunks.push(std::mem::replace(
-                &mut current,
-                Vec::with_capacity(FRAME_FETCH_CHUNK_BYTES),
-            ));
+    std::iter::once(Bytes::from(header)).chain(FrameFetchChunks::new(frames))
+}
+
+struct FrameFetchChunks {
+    frames: std::vec::IntoIter<StoredRangeFrame>,
+    coalesce: bytes::BytesMut,
+    /// A large frame pending its zero-copy turn after its prefix.
+    large_frame: Option<Bytes>,
+}
+
+impl FrameFetchChunks {
+    fn new(frames: Vec<StoredRangeFrame>) -> Self {
+        Self {
+            frames: frames.into_iter(),
+            coalesce: bytes::BytesMut::with_capacity(FRAME_FETCH_CHUNK_BYTES),
+            large_frame: None,
         }
-        current.extend_from_slice(&(frame.cursor.len() as u32).to_le_bytes());
-        current.extend_from_slice(frame.cursor.as_bytes());
-        current.extend_from_slice(&(frame.frame.len() as u32).to_le_bytes());
-        current.extend_from_slice(&frame.frame);
     }
-    if !current.is_empty() {
-        chunks.push(current);
+}
+
+impl Iterator for FrameFetchChunks {
+    type Item = Bytes;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(frame) = self.large_frame.take() {
+                return Some(frame);
+            }
+            let Some(frame) = self.frames.next() else {
+                return (!self.coalesce.is_empty())
+                    .then(|| std::mem::take(&mut self.coalesce).freeze());
+            };
+            let entry_bytes = 8 + frame.cursor.len() + frame.frame.len();
+            if frame.frame.len() > FRAME_FETCH_CHUNK_BYTES {
+                // Oversized frames go out zero-copy: flush the pending
+                // coalesced bytes first, then emit prefix + frame.
+                let mut prefix = Vec::with_capacity(8 + frame.cursor.len());
+                prefix.extend_from_slice(&(frame.cursor.len() as u32).to_le_bytes());
+                prefix.extend_from_slice(frame.cursor.as_bytes());
+                prefix.extend_from_slice(&(frame.frame.len() as u32).to_le_bytes());
+                self.large_frame = Some(frame.frame);
+                if !self.coalesce.is_empty() {
+                    let flushed = std::mem::take(&mut self.coalesce).freeze();
+                    self.coalesce.extend_from_slice(&prefix);
+                    return Some(flushed);
+                }
+                return Some(Bytes::from(prefix));
+            }
+            if self.coalesce.len() + entry_bytes > FRAME_FETCH_CHUNK_BYTES
+                && !self.coalesce.is_empty()
+            {
+                // Hold the frame for the next call: stash it back into a
+                // one-slot pending via large_frame only when oversized —
+                // here we push the coalesced chunk and re-queue via a
+                // small copy into the fresh buffer on the next call.
+                let flushed = std::mem::take(&mut self.coalesce).freeze();
+                self.coalesce
+                    .extend_from_slice(&(frame.cursor.len() as u32).to_le_bytes());
+                self.coalesce.extend_from_slice(frame.cursor.as_bytes());
+                self.coalesce
+                    .extend_from_slice(&(frame.frame.len() as u32).to_le_bytes());
+                self.coalesce.extend_from_slice(&frame.frame);
+                return Some(flushed);
+            }
+            self.coalesce
+                .extend_from_slice(&(frame.cursor.len() as u32).to_le_bytes());
+            self.coalesce.extend_from_slice(frame.cursor.as_bytes());
+            self.coalesce
+                .extend_from_slice(&(frame.frame.len() as u32).to_le_bytes());
+            self.coalesce.extend_from_slice(&frame.frame);
+        }
     }
-    std::iter::once(header).chain(chunks)
 }
 
 async fn temporary_reader_fetch(
@@ -11350,7 +11445,7 @@ async fn temporary_reader_fetch(
             if wants_frame_binary(&headers) {
                 let stream = futures_util::stream::iter(
                     encode_frame_fetch_stream(next_cursor, frames)
-                        .map(Ok::<Vec<u8>, std::convert::Infallible>),
+                        .map(Ok::<Bytes, std::convert::Infallible>),
                 );
                 return Response::builder()
                     .header(header::CONTENT_TYPE, FRAMES_MEDIA_TYPE)
@@ -11393,10 +11488,16 @@ pub struct WriterSessionAppendRequest {
     pub writer: String,
     pub session_epoch: u64,
     pub event_time_ns: Option<String>,
-    pub key_base64: String,
-    pub payload_base64: String,
-    #[serde(default)]
-    pub metadata_base64: BTreeMap<String, String>,
+    #[serde(rename = "key_base64", with = "crate::codec::serde_base64")]
+    pub key: Bytes,
+    #[serde(rename = "payload_base64", with = "crate::codec::serde_base64")]
+    pub payload: Bytes,
+    #[serde(
+        default,
+        rename = "metadata_base64",
+        with = "crate::codec::serde_base64::map"
+    )]
+    pub metadata: BTreeMap<String, Bytes>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub use_compression: bool,
 }
@@ -13308,7 +13409,7 @@ async fn move_export(
             position: frame.position,
             identity: frame.identity,
             cursor: frame.cursor,
-            frame_base64: STANDARD.encode(frame.frame),
+            frame_base64: STANDARD.encode(&frame.frame),
         })
         .collect();
     Ok(Json(MoveExportResponse {
@@ -13446,7 +13547,7 @@ async fn move_stage_local(
                     frame.position,
                     frame.identity.clone(),
                     frame.cursor.clone(),
-                    bytes.clone(),
+                    bytes.clone().into(),
                 )
                 .await
                 .map_err(|error| ApiError::unavailable(error.to_string()))?;
@@ -13975,7 +14076,7 @@ async fn owner_move_export(
             position: frame.position,
             identity: frame.identity,
             cursor: frame.cursor,
-            frame_base64: STANDARD.encode(frame.frame),
+            frame_base64: STANDARD.encode(&frame.frame),
         })
         .collect();
     Ok(Json(MoveExportResponse {
@@ -14836,10 +14937,16 @@ struct ClientAppendRequest {
     writer_epoch: u64,
     sequence: u64,
     event_time_ns: Option<String>,
-    key_base64: String,
-    payload_base64: String,
-    #[serde(default)]
-    metadata_base64: BTreeMap<String, String>,
+    #[serde(rename = "key_base64", with = "crate::codec::serde_base64")]
+    key: Bytes,
+    #[serde(rename = "payload_base64", with = "crate::codec::serde_base64")]
+    payload: Bytes,
+    #[serde(
+        default,
+        rename = "metadata_base64",
+        with = "crate::codec::serde_base64::map"
+    )]
+    metadata: BTreeMap<String, Bytes>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     use_compression: bool,
     /// Effect-journal appends only: the frame joins the effect's pending
@@ -14899,6 +15006,135 @@ struct InternalOwnerAppendResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct InternalOwnerBatchAppendRequest {
     requests: Vec<ClientAppendRequest>,
+}
+
+/// Binary owner-forward batch body:
+/// `u32le header_len | JSON header | concatenated blobs`. The header
+/// mirrors `InternalOwnerBatchAppendRequest` with every byte field
+/// replaced by its blob length; the blobs follow in header order —
+/// key, payload, then metadata values per request.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InternalOwnerBatchAppendBinHeader {
+    requests: Vec<InternalOwnerBatchAppendBinItem>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct InternalOwnerBatchAppendBinItem {
+    request_id: Uuid,
+    feed: String,
+    writer_session_id: Uuid,
+    writer_epoch: u64,
+    sequence: u64,
+    event_time_ns: Option<String>,
+    key_len: u32,
+    payload_len: u32,
+    #[serde(default)]
+    metadata_lens: BTreeMap<String, u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    use_compression: bool,
+    #[serde(default)]
+    pending_effect: Option<crate::active_range::PendingEffectRef>,
+    #[serde(default)]
+    mint_sequence: bool,
+}
+
+fn encode_owner_batch_bin_body(requests: &[ClientAppendRequest]) -> Result<Vec<u8>, ApiError> {
+    let mut items = Vec::with_capacity(requests.len());
+    let mut blobs = Vec::new();
+    for request in requests {
+        let metadata_lens = request
+            .metadata
+            .iter()
+            .map(|(name, value)| {
+                u32::try_from(value.len())
+                    .map(|len| (name.clone(), len))
+                    .map_err(|_| ApiError::bad_request("metadata value exceeds u32 length"))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        items.push(InternalOwnerBatchAppendBinItem {
+            request_id: request.request_id,
+            feed: request.feed.clone(),
+            writer_session_id: request.writer_session_id,
+            writer_epoch: request.writer_epoch,
+            sequence: request.sequence,
+            event_time_ns: request.event_time_ns.clone(),
+            key_len: u32::try_from(request.key.len())
+                .map_err(|_| ApiError::bad_request("key exceeds u32 length"))?,
+            payload_len: u32::try_from(request.payload.len())
+                .map_err(|_| ApiError::bad_request("payload exceeds u32 length"))?,
+            metadata_lens,
+            use_compression: request.use_compression,
+            pending_effect: request.pending_effect,
+            mint_sequence: request.mint_sequence,
+        });
+        blobs.extend_from_slice(&request.key);
+        blobs.extend_from_slice(&request.payload);
+        for value in request.metadata.values() {
+            blobs.extend_from_slice(value);
+        }
+    }
+    let header = serde_json::to_vec(&InternalOwnerBatchAppendBinHeader { requests: items })
+        .map_err(|error| ApiError::bad_request(format!("owner batch header encode: {error}")))?;
+    let mut body = Vec::with_capacity(header.len() + blobs.len() + 4);
+    body.extend_from_slice(&(header.len() as u32).to_le_bytes());
+    body.extend_from_slice(&header);
+    body.extend_from_slice(&blobs);
+    Ok(body)
+}
+
+fn decode_owner_batch_bin_body(body: &Bytes) -> Result<Vec<ClientAppendRequest>, ApiError> {
+    if body.len() < 4 {
+        return Err(ApiError::bad_request("owner batch body is truncated"));
+    }
+    let header_len = u32::from_le_bytes(
+        body[..4]
+            .try_into()
+            .map_err(|_| ApiError::bad_request("owner batch body is truncated"))?,
+    ) as usize;
+    if 4 + header_len > body.len() {
+        return Err(ApiError::bad_request("owner batch header is truncated"));
+    }
+    let header: InternalOwnerBatchAppendBinHeader =
+        serde_json::from_slice(&body[4..4 + header_len]).map_err(|error| {
+            ApiError::bad_request(format!("invalid owner batch header: {error}"))
+        })?;
+    let mut cursor = 4 + header_len;
+    let mut requests = Vec::with_capacity(header.requests.len());
+    for item in header.requests {
+        let take = |cursor: &mut usize, len: u32| -> Result<Bytes, ApiError> {
+            let end = cursor
+                .checked_add(len as usize)
+                .filter(|end| *end <= body.len())
+                .ok_or_else(|| ApiError::bad_request("owner batch blob is truncated"))?;
+            let slice = body.slice(*cursor..end);
+            *cursor = end;
+            Ok(slice)
+        };
+        let key = take(&mut cursor, item.key_len)?;
+        let payload = take(&mut cursor, item.payload_len)?;
+        let mut metadata = BTreeMap::new();
+        for (name, len) in item.metadata_lens {
+            metadata.insert(name, take(&mut cursor, len)?);
+        }
+        requests.push(ClientAppendRequest {
+            request_id: item.request_id,
+            feed: item.feed,
+            writer_session_id: item.writer_session_id,
+            writer_epoch: item.writer_epoch,
+            sequence: item.sequence,
+            event_time_ns: item.event_time_ns,
+            key,
+            payload,
+            metadata,
+            use_compression: item.use_compression,
+            pending_effect: item.pending_effect,
+            mint_sequence: item.mint_sequence,
+        });
+    }
+    if cursor != body.len() {
+        return Err(ApiError::bad_request("owner batch body has trailing bytes"));
+    }
+    Ok(requests)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -15458,7 +15694,7 @@ async fn writer_batch_prepare(
         }
     };
     authorize_namespace(state, headers, &feed.name, PermissionAction::Write)?;
-    let routing_key = decode_base64("key_base64", &request.key_base64)?;
+    let routing_key = request.key.clone();
     if routing_key.is_empty() {
         return Err(ApiError::bad_request(
             "key_base64 must contain a non-empty key",
@@ -15509,9 +15745,9 @@ async fn writer_batch_prepare(
             writer_epoch: request.session_epoch,
             sequence: 0,
             event_time_ns: request.event_time_ns.clone(),
-            key_base64: request.key_base64.clone(),
-            payload_base64: request.payload_base64.clone(),
-            metadata_base64: request.metadata_base64.clone(),
+            key: request.key.clone(),
+            payload: request.payload.clone(),
+            metadata: request.metadata.clone(),
             use_compression: request.use_compression,
             pending_effect: None,
             mint_sequence: true,
@@ -15525,9 +15761,20 @@ async fn writer_batch_append(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<WriterBatchAppendResponse>, ApiError> {
+    let _timer = std::time::Instant::now();
     // Content-Type selects the wire contract: the JSON request stays
     // the default, while `application/vnd.whitewater.frames` carries
     // FSA1 append frames — same records, no base64 or JSON-serde pass.
+    let binary = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        == Some("application/vnd.whitewater.frames");
+    let body_bytes = body.len();
+    tracing::debug!(
+        content_type = if binary { "fsa1" } else { "json" },
+        body_bytes,
+        "append-batch received"
+    );
     let request = match headers
         .get(axum::http::header::CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -15544,12 +15791,12 @@ async fn writer_batch_append(
                         writer: record.writer,
                         session_epoch: record.session_epoch,
                         event_time_ns: record.event_time_ns.map(|value| value.to_string()),
-                        key_base64: STANDARD.encode(&record.key),
-                        payload_base64: STANDARD.encode(&record.payload),
-                        metadata_base64: record
+                        key: record.key.into(),
+                        payload: record.payload.into(),
+                        metadata: record
                             .metadata
-                            .iter()
-                            .map(|(name, value)| (name.clone(), STANDARD.encode(value)))
+                            .into_iter()
+                            .map(|(name, value)| (name, value.into()))
                             .collect(),
                         use_compression: record.use_compression,
                     })
@@ -15560,7 +15807,15 @@ async fn writer_batch_append(
             ApiError::bad_request(format!("invalid append batch body: {error}"))
         })?,
     };
-    writer_batch_append_inner(state, headers, request).await
+    let first_request_id = request.records.first().map(|r| r.request_id);
+    let outcome = writer_batch_append_inner(state, headers, request).await;
+    tracing::debug!(
+        elapsed_ms = _timer.elapsed().as_secs_f64() * 1000.0,
+        ok = outcome.is_ok(),
+        ?first_request_id,
+        "append-batch done"
+    );
+    outcome
 }
 
 async fn writer_batch_append_inner(
@@ -15568,6 +15823,7 @@ async fn writer_batch_append_inner(
     headers: HeaderMap,
     request: WriterBatchAppendRequest,
 ) -> Result<Json<WriterBatchAppendResponse>, ApiError> {
+    let _timer = std::time::Instant::now();
     authenticate_credential(&state, &headers)?;
     if request.records.is_empty() || request.records.len() > 1_000 {
         return Err(ApiError::bad_request(
@@ -15576,15 +15832,9 @@ async fn writer_batch_append_inner(
     }
     let encoded_bytes = request.records.iter().fold(0_usize, |total, record| {
         total
-            .saturating_add(record.key_base64.len())
-            .saturating_add(record.payload_base64.len())
-            .saturating_add(
-                record
-                    .metadata_base64
-                    .values()
-                    .map(String::len)
-                    .sum::<usize>(),
-            )
+            .saturating_add(record.key.len())
+            .saturating_add(record.payload.len())
+            .saturating_add(record.metadata.values().map(Bytes::len).sum::<usize>())
     });
     if encoded_bytes > crate::codec::MAX_FRAME_BYTES {
         return Err(ApiError::bad_request(
@@ -15639,14 +15889,23 @@ async fn writer_batch_append_inner(
                             landed.push((*index, result));
                         }
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        tracing::warn!(
+                            range_id = %range_id,
+                            chunk = end - offset,
+                            status = %error.status,
+                            code = ?error.code,
+                            "owner batch refused; replaying {} records through the session path: {}",
+                            end - offset,
+                            error.message,
+                        );
                         for index in &indices[offset..end] {
                             landed.push((
                                 *index,
-                                writer_session_append(
-                                    State(state.clone()),
+                                writer_session_append_inner(
+                                    state.clone(),
                                     headers.clone(),
-                                    Json(originals[*index].clone()),
+                                    originals[*index].clone(),
                                 )
                                 .await?
                                 .0,
@@ -15768,7 +16027,19 @@ async fn subscription_when_applied(
 async fn writer_session_append(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<WriterSessionAppendRequest>,
+    body: Bytes,
+) -> Result<Json<WriterAppendResponse>, ApiError> {
+    // Parsing here rather than in the Json extractor keeps malformed
+    // base64/JSON a 400 contract instead of axum's 422 rejection.
+    let request = serde_json::from_slice::<WriterSessionAppendRequest>(&body)
+        .map_err(|error| ApiError::bad_request(format!("invalid append body: {error}")))?;
+    writer_session_append_inner(state, headers, request).await
+}
+
+async fn writer_session_append_inner(
+    state: AppState,
+    headers: HeaderMap,
+    request: WriterSessionAppendRequest,
 ) -> Result<Json<WriterAppendResponse>, ApiError> {
     authenticate_credential(&state, &headers)?;
     let writer = writer_when_applied(&state.control, &request.writer, state.control_plane.is_some())
@@ -15789,7 +16060,7 @@ async fn writer_session_append(
         .await
         .ok_or_else(|| ApiError::bad_request("Writer Feed does not exist"))?;
     authorize_namespace(&state, &headers, &feed.name, PermissionAction::Write)?;
-    let routing_key = decode_base64("key_base64", &request.key_base64)?;
+    let routing_key = request.key.clone();
     if routing_key.is_empty() {
         return Err(ApiError::bad_request(
             "key_base64 must contain a non-empty key",
@@ -15826,10 +16097,10 @@ async fn writer_session_append(
         };
         let Some(next) = next else { break };
         boundary = Some(next);
-        healed = client_append(
-            State(state.clone()),
+        healed = client_append_inner(
+            state.clone(),
             headers.clone(),
-            Json(ClientAppendRequest {
+            ClientAppendRequest {
                 mint_sequence: false,
                 request_id: request.request_id,
                 feed: feed.name.clone(),
@@ -15837,12 +16108,12 @@ async fn writer_session_append(
                 writer_epoch: request.session_epoch,
                 sequence: next,
                 event_time_ns: request.event_time_ns.clone(),
-                key_base64: request.key_base64.clone(),
-                payload_base64: request.payload_base64.clone(),
-                metadata_base64: request.metadata_base64.clone(),
+                key: request.key.clone(),
+                payload: request.payload.clone(),
+                metadata: request.metadata.clone(),
                 use_compression: request.use_compression,
                 pending_effect: None,
-            }),
+            },
         )
         .await
         .map(|Json(response)| response);
@@ -15908,23 +16179,23 @@ async fn session_append_owner_minted(
             definition.session_epoch, request.session_epoch
         )));
     }
-    client_append(
-        State(state.clone()),
+    client_append_inner(
+        state.clone(),
         headers.clone(),
-        Json(ClientAppendRequest {
+        ClientAppendRequest {
             request_id: request.request_id,
             feed: feed_name.to_owned(),
             writer_session_id: writer.writer_id,
             writer_epoch: request.session_epoch,
             sequence: 0,
             event_time_ns: request.event_time_ns.clone(),
-            key_base64: request.key_base64.clone(),
-            payload_base64: request.payload_base64.clone(),
-            metadata_base64: request.metadata_base64.clone(),
+            key: request.key.clone(),
+            payload: request.payload.clone(),
+            metadata: request.metadata.clone(),
             use_compression: request.use_compression,
             pending_effect: None,
             mint_sequence: true,
-        }),
+        },
     )
     .await
     .map(|Json(response)| response)
@@ -15933,7 +16204,19 @@ async fn session_append_owner_minted(
 async fn client_append(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(request): Json<ClientAppendRequest>,
+    body: Bytes,
+) -> Result<Json<WriterAppendResponse>, ApiError> {
+    // Same 400 contract as the Writer routes: the Json extractor would
+    // reject malformed base64 bytes with a bare 422.
+    let request = serde_json::from_slice::<ClientAppendRequest>(&body)
+        .map_err(|error| ApiError::bad_request(format!("invalid append body: {error}")))?;
+    client_append_inner(state, headers, request).await
+}
+
+async fn client_append_inner(
+    state: AppState,
+    headers: HeaderMap,
+    request: ClientAppendRequest,
 ) -> Result<Json<WriterAppendResponse>, ApiError> {
     authorize_namespace(&state, &headers, &request.feed, PermissionAction::Write)?;
     if request.pending_effect.is_some() {
@@ -15960,7 +16243,7 @@ async fn route_append_to_owner(
     feed_id: Uuid,
     request: ClientAppendRequest,
 ) -> Result<WriterAppendResponse, ApiError> {
-    let routing_key = decode_base64("key_base64", &request.key_base64)?;
+    let routing_key = request.key.clone();
     if routing_key.is_empty() {
         return Err(ApiError::bad_request(
             "key_base64 must contain a non-empty key",
@@ -16042,7 +16325,7 @@ async fn route_effect_append_to_owner(
     feed_id: Uuid,
     request: ClientAppendRequest,
 ) -> Result<EffectAppendOutcome, ApiError> {
-    let routing_key = decode_base64("key_base64", &request.key_base64)?;
+    let routing_key = request.key.clone();
     if routing_key.is_empty() {
         return Err(ApiError::bad_request(
             "key_base64 must contain a non-empty key",
@@ -16450,7 +16733,7 @@ async fn owner_append_local(
                 ApiError::bad_request(format!("Feed does not exist: {}", request.feed))
             }
         })?;
-    let routing_key = decode_base64("key_base64", &request.key_base64)?;
+    let routing_key = request.key.clone();
     if routing_key.is_empty() {
         return Err(ApiError::bad_request("key_base64 must contain a non-empty key").into());
     }
@@ -16468,13 +16751,13 @@ async fn owner_append_local(
     }
     let key = routing_key;
     let pressure_key = key.clone();
-    let payload = decode_base64("payload_base64", &request.payload_base64)?;
+    let payload = request.payload.to_vec();
     let pressure_bytes = key.len().saturating_add(payload.len());
     let metadata = request
-        .metadata_base64
+        .metadata
         .into_iter()
-        .map(|(name, value)| decode_base64("metadata_base64", &value).map(|value| (name, value)))
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+        .map(|(name, value)| (name, value.to_vec()))
+        .collect::<BTreeMap<_, _>>();
     let ingest_time_ns = unix_ns();
     let event_time_ns = request
         .event_time_ns
@@ -16491,16 +16774,15 @@ async fn owner_append_local(
         producer_sequence: request.sequence,
         event_time_ns,
         ingest_time_ns,
-        key,
+        key: key.to_vec(),
         payload,
         metadata,
     };
     let use_compression = request.use_compression;
     let encode_with_sequence = move |sequence: u64| {
-        let mut record = record.clone();
+        let mut record = record;
         record.producer_sequence = sequence;
-        crate::codec::encode_record_with_compression(&record, use_compression)
-            .map(|frame| STANDARD.encode(frame))
+        crate::codec::encode_record_with_compression(&record, use_compression).map(Bytes::from)
     };
     let coordinator = state
         .majority_append
@@ -16519,7 +16801,7 @@ async fn owner_append_local(
             sequence: request.sequence,
         },
         cursor,
-        frame_base64: String::new(),
+        frame: Bytes::new(),
         pending_effect: request.pending_effect,
     };
     // Session appends mint the Writer sequence on the owner inside the
@@ -16531,7 +16813,7 @@ async fn owner_append_local(
             .await
     } else {
         let mut replica_request = replica_request;
-        replica_request.frame_base64 = encode_with_sequence(request.sequence)
+        replica_request.frame = encode_with_sequence(request.sequence)
             .map_err(|error| ApiError::bad_request(error.to_string()))?;
         coordinator.append(replica_request).await
     }
@@ -16567,22 +16849,55 @@ async fn owner_append_batch(
     State(state): State<AppState>,
     Json(request): Json<InternalOwnerBatchAppendRequest>,
 ) -> Json<InternalOwnerBatchAppendResponse> {
-    Json(
-        match owner_append_batch_local(&state, request.requests).await {
-            Ok(results) => InternalOwnerBatchAppendResponse {
-                results: Some(results),
-                error: None,
-                retryable: false,
-                code: None,
-            },
-            Err(error) => InternalOwnerBatchAppendResponse {
-                results: None,
-                retryable: error.api.status == StatusCode::SERVICE_UNAVAILABLE,
-                error: Some(error.api.message),
-                code: error.api.code.map(str::to_owned),
-            },
+    Json(owner_append_batch_logged(&state, request.requests, false).await)
+}
+
+async fn owner_append_batch_logged(
+    state: &AppState,
+    requests: Vec<ClientAppendRequest>,
+    binary: bool,
+) -> InternalOwnerBatchAppendResponse {
+    let timer = std::time::Instant::now();
+    let records = requests.len();
+    let outcome = owner_append_batch_local(state, requests).await;
+    tracing::debug!(
+        records,
+        binary,
+        elapsed_ms = timer.elapsed().as_secs_f64() * 1000.0,
+        ok = outcome.is_ok(),
+        "owner append-batch done"
+    );
+    match outcome {
+        Ok(results) => InternalOwnerBatchAppendResponse {
+            results: Some(results),
+            error: None,
+            retryable: false,
+            code: None,
         },
-    )
+        Err(error) => InternalOwnerBatchAppendResponse {
+            results: None,
+            retryable: error.api.status == StatusCode::SERVICE_UNAVAILABLE,
+            error: Some(error.api.message),
+            code: error.api.code.map(str::to_owned),
+        },
+    }
+}
+
+/// Binary twin of `owner_append_batch`: same response contract, but the
+/// request body carries raw record bytes instead of JSON base64.
+async fn owner_append_batch_bin(
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Json<InternalOwnerBatchAppendResponse> {
+    Json(match decode_owner_batch_bin_body(&body) {
+        Ok(requests) => owner_append_batch_logged(&state, requests, true).await,
+        Err(error) => InternalOwnerBatchAppendResponse {
+            results: None,
+            retryable: false,
+            error: Some(error.message),
+            code: error.code.map(str::to_owned),
+        },
+    })
 }
 
 /// Owner-side batch append: every record resolves to one Active Range,
@@ -16650,7 +16965,7 @@ async fn owner_append_batch_local(
                 feed
             }
         };
-        let routing_key = decode_base64("key_base64", &request.key_base64)?;
+        let routing_key = request.key.clone();
         if routing_key.is_empty() {
             return Err(ApiError::bad_request("key_base64 must contain a non-empty key").into());
         }
@@ -16701,15 +17016,13 @@ async fn owner_append_batch_local(
             .into());
         }
         let key = routing_key;
-        let payload = decode_base64("payload_base64", &request.payload_base64)?;
+        let payload = request.payload.to_vec();
         pressure.push((key.clone(), key.len().saturating_add(payload.len())));
         let metadata = request
-            .metadata_base64
+            .metadata
             .into_iter()
-            .map(|(name, value)| {
-                decode_base64("metadata_base64", &value).map(|value| (name, value))
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+            .map(|(name, value)| (name, value.to_vec()))
+            .collect::<BTreeMap<_, _>>();
         let ingest_time_ns = unix_ns();
         let event_time_ns = request
             .event_time_ns
@@ -16728,16 +17041,15 @@ async fn owner_append_batch_local(
             producer_sequence: request.sequence,
             event_time_ns,
             ingest_time_ns,
-            key,
+            key: key.to_vec(),
             payload,
             metadata,
         };
         let use_compression = request.use_compression;
         encoders.push(move |sequence: u64| {
-            let mut record = record.clone();
+            let mut record = record;
             record.producer_sequence = sequence;
-            crate::codec::encode_record_with_compression(&record, use_compression)
-                .map(|frame| STANDARD.encode(frame))
+            crate::codec::encode_record_with_compression(&record, use_compression).map(Bytes::from)
         });
         replica_requests.push(ReplicaAppendRequest {
             feed_id: feed_r.feed_id,
@@ -16752,7 +17064,7 @@ async fn owner_append_batch_local(
                 sequence: request.sequence,
             },
             cursor,
-            frame_base64: String::new(),
+            frame: Bytes::new(),
             pending_effect: None,
         });
     }
@@ -16824,18 +17136,64 @@ async fn route_append_batch_to_owner(
         .internal_key
         .as_ref()
         .ok_or_else(|| ApiError::unavailable("internal forwarding credential is unavailable"))?;
+    let owner_base = format!(
+        "{}/internal/active-range/owner",
+        endpoint.trim_end_matches('/')
+    );
+    let request_count = requests.len();
+    let _forward_timer = std::time::Instant::now();
+    tracing::debug!(
+        %range_id,
+        owner = %assignment.owner,
+        records = request_count,
+        "owner batch forward start"
+    );
+    let bin_body = encode_owner_batch_bin_body(&requests)?;
     let response = state
         .internal_http
-        .post(format!(
-            "{}/internal/active-range/owner/append-batch",
-            endpoint.trim_end_matches('/')
-        ))
+        .post(format!("{owner_base}/append-batch-bin"))
         .header("x-whitewater-control-key", key)
-        .json(&InternalOwnerBatchAppendRequest { requests })
+        .header(axum::http::header::CONTENT_TYPE, "application/octet-stream")
+        .body(bin_body)
         .send()
         .await
-        .map_err(|error| ApiError::unavailable(error.to_string()))?;
+        .map_err(|error| {
+            tracing::warn!(
+                %range_id,
+                records = request_count,
+                "binary owner batch transport failed: {error}"
+            );
+            ApiError::unavailable(error.to_string())
+        })?;
+    // A Node from before the binary hop answers 404/405: retry once over
+    // the existing JSON route. Real append refusals never reach this.
+    let response = if response.status() == StatusCode::NOT_FOUND
+        || response.status() == StatusCode::METHOD_NOT_ALLOWED
+    {
+        tracing::warn!(
+            %range_id,
+            records = request_count,
+            status = %response.status(),
+            "Append Owner lacks the binary batch route; retrying once over JSON"
+        );
+        state
+            .internal_http
+            .post(format!("{owner_base}/append-batch"))
+            .header("x-whitewater-control-key", key)
+            .json(&InternalOwnerBatchAppendRequest { requests })
+            .send()
+            .await
+            .map_err(|error| ApiError::unavailable(error.to_string()))?
+    } else {
+        response
+    };
     if !response.status().is_success() {
+        tracing::warn!(
+            %range_id,
+            records = request_count,
+            status = %response.status(),
+            "Append Owner batch hop returned non-success"
+        );
         return Err(ApiError::unavailable(format!(
             "Append Owner returned HTTP {}",
             response.status()
@@ -16845,6 +17203,12 @@ async fn route_append_batch_to_owner(
         .json()
         .await
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
+    tracing::debug!(
+        %range_id,
+        elapsed_ms = _forward_timer.elapsed().as_secs_f64() * 1000.0,
+        ok = response.error.is_none(),
+        "owner batch forward done"
+    );
     response.results.ok_or_else(|| ApiError {
         status: if response.retryable {
             StatusCode::SERVICE_UNAVAILABLE
@@ -17038,7 +17402,7 @@ fn majority_api_error(error: MajorityAppendError) -> ApiError {
 }
 
 fn logical_frame_bytes(frame: &[u8]) -> Result<usize, ApiError> {
-    crate::codec::logical_frame_size(frame)
+    crate::codec::logical_frame_size_unchecked(frame)
         .map_err(|error| ApiError::unavailable(error.to_string()))
 }
 
@@ -17473,7 +17837,7 @@ async fn read_owned_range_page(
                 position: frame.position,
                 identity: frame.identity,
                 cursor: frame.cursor,
-                frame_base64: STANDARD.encode(frame.frame),
+                frame_base64: STANDARD.encode(&frame.frame),
             })
             .collect(),
     }))
@@ -17842,7 +18206,7 @@ async fn fetch_range_page(
             position: frame.position,
             identity: frame.identity,
             cursor: frame.cursor,
-            frame: decoded,
+            frame: decoded.into(),
         });
     }
     Ok(FetchedRangePage {
@@ -17919,7 +18283,11 @@ async fn read_single_range(
                 ingest_threshold: None,
                 cursors: None,
                 single_range: true,
-                page_limit: Some(limit.saturating_sub(frames.len()).clamp(1, 2048)),
+                page_limit: Some(
+                    limit
+                        .saturating_sub(frames.len())
+                        .clamp(1, MAX_LOGICAL_READ_FRAMES),
+                ),
             },
         )
         .await?;
@@ -17950,11 +18318,9 @@ async fn read_single_range(
                 ));
             }
             let decoded = &frame.frame;
-            bytes = bytes
-                .saturating_add(logical_frame_bytes(decoded)?.saturating_add(frame.cursor.len()));
-            if logical_frame_bytes(decoded)? > MAX_LOGICAL_READ_BYTES
-                || bytes > MAX_LOGICAL_READ_BYTES
-            {
+            let frame_bytes = logical_frame_bytes(decoded)?;
+            bytes = bytes.saturating_add(frame_bytes.saturating_add(frame.cursor.len()));
+            if frame_bytes > MAX_LOGICAL_READ_BYTES || bytes > MAX_LOGICAL_READ_BYTES {
                 return Err(ApiError::unavailable(
                     "Feed page exceeds the bounded read byte budget",
                 ));
@@ -18131,7 +18497,7 @@ impl RangeFrameStream<'_> {
                     tail_count: None,
                     ingest_threshold: None,
                     cursors: None,
-                    page_limit: Some(2048),
+                    page_limit: Some(MAX_LOGICAL_READ_FRAMES),
                 },
             )
             .await?;
@@ -18292,9 +18658,11 @@ async fn read_complete_feed(
     tail: bool,
     require_complete: bool,
 ) -> Result<Vec<StoredRangeFrame>, ApiError> {
+    let _timer = std::time::Instant::now();
     let assignments = read_placement(state, feed_id, feed_name).await?;
+    let _placement_ms = _timer.elapsed().as_secs_f64() * 1000.0;
     if assignments.len() == 1 && !(tail && after.is_some()) {
-        return read_single_range(
+        let frames = read_single_range(
             state,
             feed_id,
             feed_name,
@@ -18306,11 +18674,19 @@ async fn read_complete_feed(
                 require_complete,
             },
         )
-        .await;
+        .await?;
+        tracing::debug!(
+            records = frames.len(),
+            placement_ms = _placement_ms,
+            total_ms = _timer.elapsed().as_secs_f64() * 1000.0,
+            "temporary fetch timing"
+        );
+        return Ok(frames);
     }
     if !tail && !require_complete {
         return read_paginated_feed(state, feed_id, feed_name, after, limit).await;
     }
+    let _multi = std::time::Instant::now();
     let mut merged = Vec::new();
     let mut bytes = 0_usize;
     for assignment in &assignments {
@@ -18326,7 +18702,7 @@ async fn read_complete_feed(
                 ingest_threshold: None,
                 cursors: None,
                 single_range: false,
-                page_limit: Some(2048),
+                page_limit: Some(MAX_LOGICAL_READ_FRAMES),
             };
             let page = fetch_range_page(state, request).await?;
             if boundary.is_some_and(|expected| expected != page.committed)
@@ -18352,10 +18728,9 @@ async fn read_complete_feed(
                     ));
                 }
                 let decoded = &frame.frame;
-                bytes = bytes.saturating_add(
-                    logical_frame_bytes(decoded)?.saturating_add(frame.cursor.len()),
-                );
-                if logical_frame_bytes(decoded)? > MAX_LOGICAL_READ_BYTES
+                let frame_bytes = logical_frame_bytes(decoded)?;
+                bytes = bytes.saturating_add(frame_bytes.saturating_add(frame.cursor.len()));
+                if frame_bytes > MAX_LOGICAL_READ_BYTES
                     || bytes > MAX_LOGICAL_READ_BYTES
                     || merged.len() >= MAX_LOGICAL_READ_FRAMES
                 {
@@ -18372,7 +18747,7 @@ async fn read_complete_feed(
             "Feed placement changed during read; retry with the same Cursor",
         ));
     }
-    if tail {
+    let result = if tail {
         let ordered = merge_feed_frames(merged, after, MAX_LOGICAL_READ_FRAMES)?;
         Ok(ordered
             .into_iter()
@@ -18384,7 +18759,17 @@ async fn read_complete_feed(
             .collect())
     } else {
         merge_feed_frames(merged, after, limit)
+    };
+    if let Ok(frames) = &result {
+        tracing::debug!(
+            records = frames.len(),
+            placement_ms = _placement_ms,
+            range_read_ms = _multi.elapsed().as_secs_f64() * 1000.0,
+            total_ms = _timer.elapsed().as_secs_f64() * 1000.0,
+            "temporary fetch timing"
+        );
     }
+    result
 }
 
 #[derive(Deserialize)]
@@ -19229,7 +19614,7 @@ mod tests {
                     sequence: position,
                 },
                 cursor: format!("cursor-{position}"),
-                frame: Vec::new(),
+                frame: Bytes::new(),
             },
         ))
     }
@@ -19886,7 +20271,8 @@ mod tests {
                 payload: Vec::new(),
                 metadata: BTreeMap::new(),
             })
-            .unwrap(),
+            .unwrap()
+            .into(),
         };
         let frames = vec![frame(3, 3), frame(1, 1), frame(2, 2)];
         let resumed = merge_feed_frames(frames.clone(), Some("cursor-1"), 2).unwrap();
@@ -20895,7 +21281,7 @@ mod tests {
                     sequence: 5,
                 },
                 cursor: "cursor-5".to_owned(),
-                frame_base64: STANDARD.encode(&frame),
+                frame: frame.into(),
                 pending_effect: None,
             })
             .await
@@ -28804,6 +29190,296 @@ mod tests {
         plane.raft().shutdown().await.unwrap();
     }
 
+    #[test]
+    fn append_wire_json_round_trips_raw_byte_fields() {
+        // The in-process Bytes refactor must keep the exact internal
+        // JSON contract: same field names, same base64 values.
+        let replica: ReplicaAppendRequest = serde_json::from_value(json!({
+            "feed_id": Uuid::from_u128(1),
+            "range_id": Uuid::from_u128(7),
+            "generation": 2u64,
+            "ownership_epoch": 3u64,
+            "append_owner": "storage-1",
+            "expected_position": 0u64,
+            "identity": {
+                "writer_session_id": Uuid::from_u128(4),
+                "writer_epoch": 5u64,
+                "sequence": 6u64,
+            },
+            "cursor": "cursor-1",
+            "frame_base64": "AQIDBA==",
+            "pending_effect": null,
+        }))
+        .unwrap();
+        assert_eq!(replica.frame.as_ref(), &[1, 2, 3, 4]);
+        let value = serde_json::to_value(&replica).unwrap();
+        assert_eq!(value["frame_base64"], "AQIDBA==");
+
+        let batch: crate::active_range::replication::ReplicaBatchFrame =
+            serde_json::from_value(json!({
+                "expected_position": 1u64,
+                "identity": {
+                    "writer_session_id": Uuid::from_u128(4),
+                    "writer_epoch": 5u64,
+                    "sequence": 6u64,
+                },
+                "cursor": "cursor-1",
+                "frame_base64": "AAEC",
+            }))
+            .unwrap();
+        assert_eq!(batch.frame.as_ref(), &[0, 1, 2]);
+        assert_eq!(
+            serde_json::to_value(&batch).unwrap()["frame_base64"],
+            "AAEC"
+        );
+
+        let client: ClientAppendRequest = serde_json::from_value(json!({
+            "request_id": Uuid::from_u128(8),
+            "feed": "orders.events",
+            "writer_session_id": Uuid::from_u128(4),
+            "writer_epoch": 5u64,
+            "sequence": 6u64,
+            "event_time_ns": "1234",
+            "key_base64": "a2V5",
+            "payload_base64": "cGF5",
+            "metadata_base64": { "origin": "bGFi" },
+            "use_compression": true,
+            "mint_sequence": true,
+        }))
+        .unwrap();
+        assert_eq!(client.key.as_ref(), b"key");
+        assert_eq!(client.payload.as_ref(), b"pay");
+        assert_eq!(client.metadata["origin"].as_ref(), b"lab");
+        let value = serde_json::to_value(&client).unwrap();
+        assert_eq!(value["key_base64"], "a2V5");
+        assert_eq!(value["payload_base64"], "cGF5");
+        assert_eq!(value["metadata_base64"]["origin"], "bGFi");
+
+        let session: WriterSessionAppendRequest = serde_json::from_value(json!({
+            "request_id": Uuid::from_u128(8),
+            "writer": "ingest",
+            "session_epoch": 2u64,
+            "event_time_ns": null,
+            "key_base64": "a2V5",
+            "payload_base64": "cGF5",
+            "metadata_base64": { "origin": "bGFi" },
+        }))
+        .unwrap();
+        assert_eq!(session.key.as_ref(), b"key");
+        let value = serde_json::to_value(&session).unwrap();
+        assert_eq!(value["payload_base64"], "cGF5");
+        assert_eq!(value["metadata_base64"]["origin"], "bGFi");
+    }
+
+    #[test]
+    fn owner_batch_bin_body_round_trips_requests() {
+        let requests = vec![
+            ClientAppendRequest {
+                request_id: Uuid::from_u128(1),
+                feed: "orders.events".to_owned(),
+                writer_session_id: Uuid::from_u128(2),
+                writer_epoch: 3,
+                sequence: 0,
+                event_time_ns: Some("99".to_owned()),
+                key: Bytes::from_static(b"k1"),
+                payload: Bytes::from_static(b"p1"),
+                metadata: BTreeMap::from([("origin".to_owned(), Bytes::from_static(b"lab"))]),
+                use_compression: true,
+                pending_effect: None,
+                mint_sequence: true,
+            },
+            ClientAppendRequest {
+                request_id: Uuid::from_u128(11),
+                feed: "orders.events".to_owned(),
+                writer_session_id: Uuid::from_u128(2),
+                writer_epoch: 3,
+                sequence: 0,
+                event_time_ns: None,
+                key: Bytes::from_static(b"k2"),
+                payload: Bytes::new(),
+                metadata: BTreeMap::new(),
+                use_compression: false,
+                pending_effect: None,
+                mint_sequence: true,
+            },
+        ];
+        let body = Bytes::from(encode_owner_batch_bin_body(&requests).unwrap());
+        let decoded = decode_owner_batch_bin_body(&body).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].request_id, requests[0].request_id);
+        assert_eq!(decoded[0].key, requests[0].key);
+        assert_eq!(decoded[0].payload, requests[0].payload);
+        assert_eq!(decoded[0].metadata, requests[0].metadata);
+        assert_eq!(decoded[0].use_compression, requests[0].use_compression);
+        assert_eq!(decoded[1].key, requests[1].key);
+        assert!(decoded[1].metadata.is_empty());
+        // Truncation and trailing junk fail closed.
+        assert!(decode_owner_batch_bin_body(&body.slice(..body.len() - 1)).is_err());
+        let mut padded = body.to_vec();
+        padded.push(0);
+        assert!(decode_owner_batch_bin_body(&Bytes::from(padded)).is_err());
+    }
+
+    /// The binary owner hop must retry once over JSON when an older
+    /// Owner lacks `/internal/active-range/owner/append-batch-bin`.
+    #[tokio::test]
+    async fn owner_batch_binary_route_falls_back_to_json_on_404() {
+        let directory = TempDir::new().unwrap();
+        let (mut state, _plane, control, _progress) = internal_replica_test_state(&directory).await;
+        let execution = control
+            .execute("CREATE FEED orders.ownerhop;")
+            .await
+            .unwrap();
+        let feed_id: Uuid =
+            serde_json::from_value(execution.results[0].data["feed_id"].clone()).unwrap();
+        let assignment = control.active_range_assignment(feed_id).await.unwrap();
+
+        // Stub owner: 404 on the binary route, a valid reply on JSON.
+        let json_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits = json_hits.clone();
+        let app = axum::Router::new()
+            .route(
+                "/internal/active-range/owner/append-batch-bin",
+                axum::routing::post(|| async { StatusCode::NOT_FOUND }),
+            )
+            .route(
+                "/internal/active-range/owner/append-batch",
+                axum::routing::post(move |body: axum::body::Bytes| async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    let results: Vec<serde_json::Value> = request["requests"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|_| {
+                            json!({
+                                "message_id": Uuid::nil(),
+                                "cursor": "stub-cursor",
+                                "deduplicated": false,
+                                "durability": "quorum",
+                                "feedback": {
+                                    "recommended_batch_count": 0,
+                                    "recommended_batch_bytes": 0,
+                                    "pressure": 0.0,
+                                    "retry_after_ms": 0,
+                                    "max_frame_bytes": 0,
+                                },
+                            })
+                        })
+                        .collect();
+                    axum::Json(json!({"results": results, "error": null, "retryable": false}))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        state.storage_node_id = Some(
+            assignment
+                .replicas
+                .iter()
+                .find(|node| **node != assignment.owner)
+                .unwrap()
+                .clone(),
+        );
+        state.internal_key = Some("test-internal-key".to_owned());
+        state.control_endpoints = Arc::new(
+            std::collections::BTreeMap::from([(
+                assignment.owner.clone(),
+                format!("http://127.0.0.1:{port}"),
+            )])
+            .into(),
+        );
+
+        let requests = vec![ClientAppendRequest {
+            request_id: Uuid::from_u128(9),
+            feed: "orders.ownerhop".to_owned(),
+            writer_session_id: Uuid::from_u128(77),
+            writer_epoch: 1,
+            sequence: 1,
+            event_time_ns: Some("1700000000000000000".to_owned()),
+            key: b"key".to_vec().into(),
+            payload: b"payload".to_vec().into(),
+            metadata: std::collections::BTreeMap::new(),
+            use_compression: false,
+            pending_effect: None,
+            mint_sequence: false,
+        }];
+        let results = route_append_batch_to_owner(&state, assignment.range_id, requests)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].cursor, "stub-cursor");
+        assert_eq!(
+            json_hits.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the JSON owner route must be hit exactly once after the 404"
+        );
+    }
+
+    #[test]
+    fn fsa1_and_json_ingress_produce_identical_requests() {
+        // The binary append path must mint the same WriterSessionAppendRequest
+        // as the JSON path — same bytes in, same stored frame out.
+        let record = crate::codec::AppendFrameRecord {
+            writer: "ingest".to_owned(),
+            request_id: Uuid::from_u128(42),
+            session_epoch: 7,
+            event_time_ns: Some(1234),
+            use_compression: true,
+            key: b"key".to_vec(),
+            payload: b"payload".to_vec(),
+            metadata: BTreeMap::from([("origin".to_owned(), b"lab".to_vec())]),
+        };
+        let from_fsa1 = WriterSessionAppendRequest {
+            request_id: record.request_id,
+            writer: record.writer.clone(),
+            session_epoch: record.session_epoch,
+            event_time_ns: record.event_time_ns.map(|value| value.to_string()),
+            key: record.key.clone().into(),
+            payload: record.payload.clone().into(),
+            metadata: record
+                .metadata
+                .clone()
+                .into_iter()
+                .map(|(name, value)| (name, value.into()))
+                .collect(),
+            use_compression: record.use_compression,
+        };
+        let from_json: WriterSessionAppendRequest = serde_json::from_value(json!({
+            "request_id": Uuid::from_u128(42),
+            "writer": "ingest",
+            "session_epoch": 7u64,
+            "event_time_ns": "1234",
+            "key_base64": STANDARD.encode(b"key"),
+            "payload_base64": STANDARD.encode(b"payload"),
+            "metadata_base64": { "origin": STANDARD.encode(b"lab") },
+            "use_compression": true,
+        }))
+        .unwrap();
+        assert_eq!(from_fsa1, from_json);
+    }
+
+    #[tokio::test]
+    async fn invalid_base64_append_bodies_fail_with_400() {
+        let directory = TempDir::new().unwrap();
+        let app = admin_test_router(&directory);
+        for uri in ["/v1/writers/append", "/v1/writers/append-batch"] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(if uri.ends_with("batch") {
+                    br#"{"records": [{"key_base64": "!!!"}]}"#.to_vec()
+                } else {
+                    br#"{"key_base64": "!!!"}"#.to_vec()
+                }))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+    }
+
     #[tokio::test]
     async fn split_freeze_reports_the_frozen_ranges_boundary() {
         let directory = TempDir::new().unwrap();
@@ -29355,6 +30031,45 @@ mod tests {
                 4,
             );
         }
+        plane.raft().shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_batch_endpoint_accepts_multi_mib_bodies_up_to_the_limit() {
+        let directory = TempDir::new().unwrap();
+        let (state, plane, _control, _replica) = internal_replica_test_state(&directory).await;
+        let app = router(state);
+        let post = |payload_bytes: usize| {
+            let record = serde_json::json!({
+                "request_id": Uuid::from_u128(1),
+                "writer": "orders.missing",
+                "session_epoch": 1,
+                "key_base64": "aw==",
+                "payload_base64": base64::engine::general_purpose::STANDARD
+                    .encode(vec![b'x'; payload_bytes]),
+            });
+            Request::builder()
+                .method("POST")
+                .uri("/v1/writers/append-batch")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer this-is-a-long-development-api-key")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({ "records": [record] })).unwrap(),
+                ))
+                .unwrap()
+        };
+        // ~2.8 MiB of base64 payload blew past the old 2 MiB axum
+        // default; the explicit budget must admit it to the handler,
+        // which then refuses on the unknown Writer (never 413).
+        let response = app.clone().oneshot(post(2 * 1024 * 1024)).await.unwrap();
+        assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        // Past the explicit budget the route still fails closed.
+        let response = app
+            .clone()
+            .oneshot(post(MAX_WRITER_BATCH_BODY_BYTES))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
         plane.raft().shutdown().await.unwrap();
     }
 
@@ -30122,7 +30837,8 @@ mod tests {
                 payload: payload.to_vec(),
                 metadata: BTreeMap::new(),
             })
-            .expect("record encodes"),
+            .expect("record encodes")
+            .into(),
         }
     }
 
@@ -30168,7 +30884,7 @@ mod tests {
             .map(|position| test_frame(position, &big))
             .collect();
         let expected = encode_frame_fetch(None, frames.clone());
-        let chunks: Vec<Vec<u8>> = encode_frame_fetch_stream(None, frames).collect();
+        let chunks: Vec<Bytes> = encode_frame_fetch_stream(None, frames).collect();
         // 6000 * ~1KB records = ~6.6MB, must split past the 4MiB chunk size
         assert!(chunks.len() > 2, "expected header plus several chunks");
         assert!(chunks

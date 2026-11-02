@@ -1,6 +1,5 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tempfile::TempDir;
 use uuid::Uuid;
 use whitewater::{
@@ -123,7 +122,7 @@ fn replica_request(
             sequence: position,
         },
         cursor: format!("cursor-{position}"),
-        frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+        frame: encode_record(&record).unwrap().into(),
         pending_effect: None,
     }
 }

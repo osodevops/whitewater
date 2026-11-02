@@ -1,7 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_trait::async_trait;
-use base64::{engine::general_purpose::STANDARD, Engine as _};
 use tempfile::TempDir;
 use uuid::Uuid;
 use whitewater::{
@@ -203,7 +202,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
                     sequence,
                 },
                 cursor: format!("cursor-{sequence}"),
-                frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+                frame: encode_record(&record).unwrap().into(),
                 pending_effect: None,
             })
             .await
@@ -342,7 +341,7 @@ async fn committed_right_hand_records_stage_identically_on_all_replicas() {
                 sequence: 5,
             },
             cursor: "cursor-5".to_owned(),
-            frame_base64: STANDARD.encode(encode_record(&fifth).unwrap()),
+            frame: encode_record(&fifth).unwrap().into(),
             pending_effect: None,
         })
         .await
@@ -652,7 +651,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
             payload: payload.as_bytes().to_vec(),
             metadata: BTreeMap::new(),
         };
-        STANDARD.encode(encode_record(&record).unwrap())
+        encode_record(&record).unwrap().into()
     };
     for (index, key) in [
         left_key.clone(),
@@ -678,7 +677,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
                     sequence,
                 },
                 cursor: format!("cursor-{sequence}"),
-                frame_base64: build_frame(
+                frame: build_frame(
                     sequence,
                     &key,
                     &format!("value-{sequence}"),
@@ -755,7 +754,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
                     sequence,
                 },
                 cursor: format!("branched-cursor-{index}"),
-                frame_base64: frame.clone(),
+                frame: frame.clone(),
                 pending_effect: None,
             })
             .await
@@ -852,7 +851,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
                     sequence: if index == 0 { 4 } else { 5 },
                 },
                 cursor: format!("branched-cursor-{index}"),
-                frame_base64: frame.clone(),
+                frame: frame.clone(),
                 pending_effect: None,
             })
             .await
@@ -878,7 +877,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
                 sequence: 5,
             },
             cursor: "conflicting-cursor".to_owned(),
-            frame_base64: build_frame(5, &left_key, "tampered", 9_999),
+            frame: build_frame(5, &left_key, "tampered", 9_999),
             pending_effect: None,
         })
         .await
@@ -901,7 +900,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
                 sequence: 4,
             },
             cursor: "stale-cursor".to_owned(),
-            frame_base64: build_frame(4, &left_key, "tampered", 9_998),
+            frame: build_frame(4, &left_key, "tampered", 9_998),
             pending_effect: None,
         })
         .await
@@ -923,7 +922,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
                 sequence: 6,
             },
             cursor: "cursor-6".to_owned(),
-            frame_base64: build_frame(6, &left_key, "value-6", 1_006),
+            frame: build_frame(6, &left_key, "value-6", 1_006),
             pending_effect: None,
         })
         .await
@@ -961,7 +960,7 @@ async fn merge_of_branched_writer_history_deduplicates_retries_by_frame_digest()
                 sequence: 5,
             },
             cursor: "branched-cursor-1".to_owned(),
-            frame_base64: frame.clone(),
+            frame: frame.clone(),
             pending_effect: None,
         })
         .await
@@ -1035,7 +1034,7 @@ async fn failed_split_activation_unfreezes_and_retains_the_plan() {
                 sequence: 1,
             },
             cursor: "cursor-1".to_owned(),
-            frame_base64: STANDARD.encode(encode_record(&record).unwrap()),
+            frame: encode_record(&record).unwrap().into(),
             pending_effect: None,
         })
         .await

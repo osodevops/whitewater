@@ -55,7 +55,7 @@ async fn append_committed(
                     sequence,
                 },
                 cursor: format!("cursor-{sequence}"),
-                frame: encode_record(&record).unwrap(),
+                frame: encode_record(&record).unwrap().into(),
                 pending_effect: None,
             })
             .await
