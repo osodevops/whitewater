@@ -18713,11 +18713,70 @@ async fn read_complete_feed(
         return read_paginated_feed(state, feed_id, feed_name, after, limit).await;
     }
     let _multi = std::time::Instant::now();
+    // Each range's page loop runs concurrently — ranges are
+    // independent, and a single-range read is already the dominant
+    // sequential case above. The combined byte/frame bounds are
+    // re-checked on the merged result below.
+    let mut range_reads = Vec::with_capacity(assignments.len());
+    for assignment in &assignments {
+        range_reads.push(read_range_history(state, assignment.clone()));
+    }
     let mut merged = Vec::new();
     let mut bytes = 0_usize;
-    for assignment in &assignments {
-        let mut after_position = None;
-        let mut boundary = None;
+    for frames in futures_util::future::try_join_all(range_reads).await? {
+        for frame in frames {
+            let frame_bytes = logical_frame_bytes(&frame.frame)?;
+            bytes = bytes.saturating_add(frame_bytes.saturating_add(frame.cursor.len()));
+            if bytes > MAX_LOGICAL_READ_BYTES || merged.len() >= MAX_LOGICAL_READ_FRAMES {
+                return Err(ApiError::unavailable("Feed history exceeds the bounded read budget; scalable continuation is not available"));
+            }
+            merged.push(frame);
+        }
+    }
+    if read_placement(state, feed_id, feed_name).await? != assignments {
+        return Err(ApiError::unavailable(
+            "Feed placement changed during read; retry with the same Cursor",
+        ));
+    }
+    let result = if tail {
+        let ordered = merge_feed_frames(merged, after, MAX_LOGICAL_READ_FRAMES)?;
+        Ok(ordered
+            .into_iter()
+            .rev()
+            .take(limit)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect())
+    } else {
+        merge_feed_frames(merged, after, limit)
+    };
+    if let Ok(frames) = &result {
+        tracing::debug!(
+            records = frames.len(),
+            placement_ms = _placement_ms,
+            range_read_ms = _multi.elapsed().as_secs_f64() * 1000.0,
+            total_ms = _timer.elapsed().as_secs_f64() * 1000.0,
+            "temporary fetch timing"
+        );
+    }
+    result
+}
+
+/// One range's full committed-history page loop for `read_complete_feed`:
+/// pages until `committed`, checking boundary stability, contiguity, and
+/// the per-range byte/frame budget exactly as the sequential loop did.
+async fn read_range_history(
+    state: &AppState,
+    assignment: ActiveRangeAssignment,
+) -> Result<Vec<StoredRangeFrame>, ApiError> {
+    #[cfg(test)]
+    test_range_read_enter();
+    let mut frames_out = Vec::new();
+    let mut bytes = 0_usize;
+    let mut after_position = None;
+    let mut boundary = None;
+    let outcome = async {
         loop {
             let request = ReadRangePageRequest {
                 assignment: assignment.clone(),
@@ -18758,44 +18817,44 @@ async fn read_complete_feed(
                 bytes = bytes.saturating_add(frame_bytes.saturating_add(frame.cursor.len()));
                 if frame_bytes > MAX_LOGICAL_READ_BYTES
                     || bytes > MAX_LOGICAL_READ_BYTES
-                    || merged.len() >= MAX_LOGICAL_READ_FRAMES
+                    || frames_out.len() >= MAX_LOGICAL_READ_FRAMES
                 {
                     return Err(ApiError::unavailable("Feed history exceeds the bounded read budget; scalable continuation is not available"));
                 }
                 after_position = Some(frame.position);
-                merged.push(frame);
+                frames_out.push(frame);
                 expected = expected.saturating_add(1);
             }
         }
+        Ok(frames_out)
     }
-    if read_placement(state, feed_id, feed_name).await? != assignments {
-        return Err(ApiError::unavailable(
-            "Feed placement changed during read; retry with the same Cursor",
-        ));
-    }
-    let result = if tail {
-        let ordered = merge_feed_frames(merged, after, MAX_LOGICAL_READ_FRAMES)?;
-        Ok(ordered
-            .into_iter()
-            .rev()
-            .take(limit)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect())
-    } else {
-        merge_feed_frames(merged, after, limit)
-    };
-    if let Ok(frames) = &result {
-        tracing::debug!(
-            records = frames.len(),
-            placement_ms = _placement_ms,
-            range_read_ms = _multi.elapsed().as_secs_f64() * 1000.0,
-            total_ms = _timer.elapsed().as_secs_f64() * 1000.0,
-            "temporary fetch timing"
-        );
-    }
-    result
+    .await;
+    #[cfg(test)]
+    test_range_read_exit();
+    outcome
+}
+
+#[cfg(test)]
+static TEST_RANGE_READ_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TEST_RANGE_READ_HIGH_WATER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn test_range_read_enter() {
+    let current = TEST_RANGE_READ_IN_FLIGHT.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    TEST_RANGE_READ_HIGH_WATER.fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn test_range_read_exit() {
+    TEST_RANGE_READ_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn test_range_read_high_water() -> usize {
+    TEST_RANGE_READ_HIGH_WATER.swap(0, std::sync::atomic::Ordering::SeqCst)
 }
 
 #[derive(Deserialize)]
@@ -30921,6 +30980,18 @@ mod tests {
         ] {
             assert!(!super::owner_batch_error_heals(code), "{code:?}");
         }
+    }
+
+    #[test]
+    fn range_read_concurrency_counter_tracks_overlap() {
+        // The accessor doubles as the overlap witness read_complete_feed's
+        // parallel try_join_all relies on.
+        assert_eq!(test_range_read_high_water(), 0);
+        test_range_read_enter();
+        test_range_read_enter();
+        test_range_read_exit();
+        assert_eq!(test_range_read_high_water(), 2);
+        test_range_read_exit();
     }
 
     #[test]

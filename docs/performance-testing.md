@@ -720,6 +720,41 @@ For the fsync-every-100 ms comparison, Kafka needs both
 `KAFKA_LOG_FLUSH_SCHEDULER_INTERVAL_MS=100`. The scheduler also
 defaults to Long.MAX, so setting only the first knob does nothing.
 
+#### Round 4 — read verification once per process, parallel range reads, gated directory sync
+
+* **Verify-once reads.** A 16,384-frame page cost ~37 ms on the
+  server, of which 17–19 ms was re-hashing every frame with blake3 on
+  every read. Each store now tracks the positions it has verified:
+  - frames this process appended, whose digest came from the exact
+    bytes it wrote;
+  - frames already blake3-verified on an earlier read.
+
+  Only frames outside that set are re-hashed. The first read after
+  open, recovery or remote materialization still verifies everything.
+  Truncation, retention and eviction invalidate the set. Every frame
+  still carries its CRC32 envelope, which the SDK checks end to end.
+  Single-feed reads went from 208k–228k to 261k–301k rec/s; one outlier
+  run read 172k.
+* **Parallel range reads.** `read_complete_feed` (tail and complete
+  reads) now fetches every range's pages concurrently. The combined
+  frame/byte bounds are still enforced on the merged result. The
+  paginated history path used by this bench was already range-parallel,
+  so the bench numbers above are unaffected.
+* **Directory sync only when needed.** The deferred periodic sync now
+  syncs the range directory only after a new file was created. There
+  was no measurable change on this host: with 100 ms fsync, 1 range ran
+  50.9k–58.1k rec/s and 3 ranges 55.4k–71.6k rec/s, against
+  56.4k–59.5k before. It is kept because it removes a journal commit
+  per tick.
+
+Same shape as above (300k × 1 KiB, 16 writers, no fsync, 1 GiB
+segments):
+
+| Shape | Kafka read rec/s | Whitewater read rec/s, before → after |
+|---|---|---|
+| 1 partition / 1 range | 322,310 / 394,947 | 210k–228k → 260,764 / 286,590 / 292,467 (one 171,977 outlier) |
+| 3 partitions / 3 ranges | 307,164 / 329,031 | 212k–216k → 270,101 / 289,825 / 299,394 / 301,299 |
+
 ### Write-path history
 
 The original per-record pipeline saturated at ~5-10 records/s (each
