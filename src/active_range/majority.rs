@@ -263,24 +263,6 @@ fn group_compatible(
 // run on the range's executor thread via spawn_local, so non-Send
 // sections never cross a boundary. Only the CLOSURE (Send captures)
 // crosses the channel.
-type RoundJob = Box<
-    dyn FnOnce() -> std::pin::Pin<
-            Box<
-                dyn std::future::Future<
-                    Output = Result<Vec<MajorityAppendResult>, MajorityAppendError>,
-                >,
-            >,
-        > + Send,
->;
-
-type RoundReply =
-    tokio::sync::oneshot::Sender<Result<Vec<MajorityAppendResult>, MajorityAppendError>>;
-
-/// Fixed shared pool of round-executor lanes — never grows, never
-/// leaks a thread per range.
-type RoundExecutorLanes =
-    Arc<Mutex<Option<Vec<tokio::sync::mpsc::UnboundedSender<(RoundJob, RoundReply)>>>>>;
-
 #[derive(Clone)]
 pub struct MajorityAppendCoordinator {
     local: Arc<ReplicaAppendService>,
@@ -327,8 +309,6 @@ pub struct MajorityAppendCoordinator {
     /// the driving HTTP request can never abort a quorum round. The
     /// round future is CONSTRUCTED on the executor thread so non-Send
     /// sections never cross a thread boundary.
-    round_executors: RoundExecutorLanes,
-
     proofs: Option<Arc<CommitProofReporter>>,
 }
 
@@ -350,7 +330,7 @@ impl MajorityAppendCoordinator {
             repair_locks: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             group_queues: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             group_queue_windows: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
-            round_executors: Arc::new(Mutex::new(None)),
+
             proofs: None,
         }
     }
@@ -375,47 +355,6 @@ impl MajorityAppendCoordinator {
             .entry(range_id)
             .or_insert_with(|| Arc::new(OrderedTurn::new()))
             .clone()
-    }
-
-    /// Shared executor lanes: `min(available_parallelism, 8)` threads,
-    /// each with its own current-thread runtime + LocalSet; a range
-    /// hashes to one lane so rounds run detached without a thread per
-    /// range.
-    async fn round_executor(
-        &self,
-        range_id: super::RangeId,
-    ) -> tokio::sync::mpsc::UnboundedSender<(RoundJob, RoundReply)> {
-        let mut lanes = self.round_executors.lock().await;
-        let lanes = lanes.get_or_insert_with(|| {
-            (0..std::thread::available_parallelism()
-                .map(|count| count.get().min(8))
-                .unwrap_or(1))
-                .map(|lane| {
-                    let (tx, mut rx) =
-                        tokio::sync::mpsc::unbounded_channel::<(RoundJob, RoundReply)>();
-                    std::thread::Builder::new()
-                        .name(format!("ww-group-round-{lane}"))
-                        .spawn(move || {
-                            let runtime = tokio::runtime::Builder::new_current_thread()
-                                .enable_all()
-                                .build()
-                                .expect("group round runtime");
-                            let local = tokio::task::LocalSet::new();
-                            local.block_on(&runtime, async move {
-                                while let Some((job, reply)) = rx.recv().await {
-                                    tokio::task::spawn_local(async move {
-                                        let outcome = job().await;
-                                        let _ = reply.send(outcome);
-                                    });
-                                }
-                            });
-                        })
-                        .expect("group round thread");
-                    tx
-                })
-                .collect()
-        });
-        lanes[(range_id.as_uuid().as_u128() as usize) % lanes.len()].clone()
     }
 
     async fn group_queue_window(&self, range_id: super::RangeId) -> Arc<Semaphore> {
@@ -1128,6 +1067,7 @@ impl MajorityAppendCoordinator {
                     reply: reply_tx,
                 });
         }
+        tracing::debug!(%range_id, my_id, "batch-trace queued");
         // Either this submission becomes a driver (permit acquired →
         // drain + round) or an earlier driver already took it (reply).
         let window = self.in_flight_window(range_id).await;
@@ -1142,6 +1082,7 @@ impl MajorityAppendCoordinator {
                 )
             })?,
             reply = &mut reply_rx => {
+                tracing::debug!(%range_id, my_id, "batch-trace passenger reply");
                 return match reply {
                     Ok(outcome) => outcome,
                     Err(_) => Err(self.error(
@@ -1154,6 +1095,7 @@ impl MajorityAppendCoordinator {
                 };
             }
         };
+        tracing::debug!(%range_id, my_id, "batch-trace permit+lock");
         let _append_guard = self.append_lock(range_id).await.lock_owned().await;
         // Drain compatible submissions FIFO — always including this one.
         let (mut subs, mine) = {
@@ -1223,25 +1165,28 @@ impl MajorityAppendCoordinator {
         // reply to every merged submission — the caller only awaits its
         // own slice. Guards/permits move into the spawned task with the
         // exact lifetimes they had here.
+        // The round runs inline in the driver's task — cancellation
+        // safety lives at the HTTP boundary (handlers spawn detached).
         let this = self.clone();
-        let executor = this.round_executor(range_id).await;
-        let job: RoundJob = Box::new(move || {
-            Box::pin(async move {
-                let merged_submissions = subs.len() > 1;
-                // Reassemble the round in queue order; per-request `None` keeps
-                // explicit-sequence submissions unpatched.
-                let mut merged_requests = Vec::new();
-                let mut merged_frames: Vec<Option<Vec<u8>>> = Vec::new();
-                // Capture per-submission frame counts before the vecs drain —
-                // the split below slices results by them.
-                let counts: Vec<usize> = subs.iter().map(|sub| sub.frames.len()).collect();
-                for sub in &mut subs {
-                    merged_requests.append(&mut sub.requests);
-                    merged_frames.append(&mut sub.frames);
-                }
-                let mut requests = merged_requests;
-                let _locked_at = _phase_timer.elapsed();
-                let round_result: Result<Vec<MajorityAppendResult>, MajorityAppendError> = async {
+        // Boxed: the round body is recursive through batch fallbacks —
+        // pinning breaks the type-size cycle without reintroducing a
+        // separate executor.
+        let outcome = Box::pin(async move {
+            let merged_submissions = subs.len() > 1;
+            // Reassemble the round in queue order; per-request `None` keeps
+            // explicit-sequence submissions unpatched.
+            let mut merged_requests = Vec::new();
+            let mut merged_frames: Vec<Option<Vec<u8>>> = Vec::new();
+            // Capture per-submission frame counts before the vecs drain —
+            // the split below slices results by them.
+            let counts: Vec<usize> = subs.iter().map(|sub| sub.frames.len()).collect();
+            for sub in &mut subs {
+                merged_requests.append(&mut sub.requests);
+                merged_frames.append(&mut sub.frames);
+            }
+            let mut requests = merged_requests;
+            let _locked_at = _phase_timer.elapsed();
+            let round_result: Result<Vec<MajorityAppendResult>, MajorityAppendError> = async {
         let _locked_at = _phase_timer.elapsed();
         let assignment = this
             .control
@@ -1829,90 +1774,70 @@ impl MajorityAppendCoordinator {
             .collect())
         }
         .await;
-                // Split the merged round back per submission in queue order.
-                let groups = subs.len();
-                let mine_index = mine;
-                match round_result {
-                    Ok(results) => {
-                        let mut offset = 0_usize;
+            // Split the merged round back per submission in queue order.
+            let groups = subs.len();
+            let mine_index = mine;
+            match round_result {
+                Ok(results) => {
+                    let mut offset = 0_usize;
+                    let mut mine = None;
+                    for (index, sub) in subs.into_iter().enumerate() {
+                        let end = offset + counts[index];
+                        let slice = results[offset..end].to_vec();
+                        offset = end;
+                        if index == mine_index {
+                            mine = Some(slice);
+                        } else {
+                            let _ = sub.reply.send(Ok(slice));
+                        }
+                    }
+                    tracing::debug!(groups, "append batch group round");
+                    Ok(mine.expect("own slice"))
+                }
+                Err(error) => {
+                    // Poison isolation: a merged round's per-frame refusal
+                    // may not apply to every submission — re-run each solo
+                    // so one bad batch cannot take innocent ones down.
+                    // Non-retryable refusals may be per-frame: solo re-runs
+                    // isolate the bad submission from the innocent ones.
+                    let poisonous = !error.retryable;
+                    if merged_submissions && poisonous {
                         let mut mine = None;
                         for (index, sub) in subs.into_iter().enumerate() {
-                            let end = offset + counts[index];
-                            let slice = results[offset..end].to_vec();
-                            offset = end;
+                            // Solo re-run lands the pre-encoded frames as
+                            // explicit requests — sequences were already
+                            // minted into request.identity by the failed
+                            // round, and dedup replays any landed prefix.
+                            let mut sub = sub;
+                            for (request, frame) in
+                                sub.requests.iter_mut().zip(sub.frames.iter_mut())
+                            {
+                                if let Some(frame) = frame.take() {
+                                    request.frame = frame.into();
+                                }
+                            }
+                            let outcome = this.append_batch(sub.requests).await;
                             if index == mine_index {
-                                mine = Some(slice);
+                                mine = Some(outcome);
                             } else {
-                                let _ = sub.reply.send(Ok(slice));
+                                let _ = sub.reply.send(outcome);
                             }
                         }
-                        tracing::debug!(groups, "append batch group round");
-                        Ok(mine.expect("own slice"))
-                    }
-                    Err(error) => {
-                        // Poison isolation: a merged round's per-frame refusal
-                        // may not apply to every submission — re-run each solo
-                        // so one bad batch cannot take innocent ones down.
-                        // Non-retryable refusals may be per-frame: solo re-runs
-                        // isolate the bad submission from the innocent ones.
-                        let poisonous = !error.retryable;
-                        if merged_submissions && poisonous {
-                            let mut mine = None;
-                            for (index, sub) in subs.into_iter().enumerate() {
-                                // Solo re-run lands the pre-encoded frames as
-                                // explicit requests — sequences were already
-                                // minted into request.identity by the failed
-                                // round, and dedup replays any landed prefix.
-                                let mut sub = sub;
-                                for (request, frame) in
-                                    sub.requests.iter_mut().zip(sub.frames.iter_mut())
-                                {
-                                    if let Some(frame) = frame.take() {
-                                        request.frame = frame.into();
-                                    }
-                                }
-                                let outcome = this.append_batch(sub.requests).await;
-                                if index == mine_index {
-                                    mine = Some(outcome);
-                                } else {
-                                    let _ = sub.reply.send(outcome);
-                                }
+                        mine.expect("own outcome")
+                    } else {
+                        for (index, sub) in subs.into_iter().enumerate() {
+                            let cloned = error.clone();
+                            if index == mine_index {
+                                continue;
                             }
-                            mine.expect("own outcome")
-                        } else {
-                            for (index, sub) in subs.into_iter().enumerate() {
-                                let cloned = error.clone();
-                                if index == mine_index {
-                                    continue;
-                                }
-                                let _ = sub.reply.send(Err(cloned));
-                            }
-                            Err(error)
+                            let _ = sub.reply.send(Err(cloned));
                         }
+                        Err(error)
                     }
                 }
-            })
+            }
         });
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-        if executor.send((job, done_tx)).is_err() {
-            return Err(self.error(
-                MajorityAppendErrorCode::LocalStorageFailure,
-                "group-commit executor is closed",
-                true,
-                vec![],
-                vec![],
-            ));
-        }
-        match done_rx.await {
-            Ok(outcome) => outcome,
-            Err(_) => Err(self.error(
-                MajorityAppendErrorCode::LocalStorageFailure,
-                "group-commit round task failed",
-                true,
-                vec![],
-                vec![],
-            )),
-        }
+        outcome.await
     }
 
     /// Re-drive the positions a lagging replica never stored so the caller

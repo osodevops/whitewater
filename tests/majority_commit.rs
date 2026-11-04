@@ -2631,12 +2631,17 @@ async fn cancelled_driver_still_completes_the_group_round() {
         fixture.control.clone(),
         Arc::new(transport.clone()),
     );
-    // Driver: cancelled once the send delay has it inside the round.
+    // Driver: an HTTP-boundary detachment around the coordinator call,
+    // exactly like api.rs::detached_owner_work — aborting the outer
+    // future (a cancelled request) must not reach the detached round.
     let driver_request = windowed_request(&fixture, 1);
-    let driver = {
+    let detached = {
         let coordinator = coordinator.clone();
         tokio::spawn(async move { coordinator.append_batch(vec![driver_request]).await })
     };
+    let outer = tokio::spawn(async move {
+        let _ = detached.await;
+    });
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     // Passengers queue behind the append lock and merge into the round.
     let passenger_requests: Vec<_> = (2..=4_u64)
@@ -2649,7 +2654,7 @@ async fn cancelled_driver_still_completes_the_group_round() {
             coordinator.append_batch(vec![request]).await
         }));
     }
-    driver.abort();
+    outer.abort();
     let mut positions = Vec::new();
     for handle in passengers {
         let results = handle.await.unwrap().unwrap();
@@ -2660,6 +2665,53 @@ async fn cancelled_driver_still_completes_the_group_round() {
     for pair in positions.windows(2) {
         assert_eq!(pair[1], pair[0] + 1, "merged positions stay contiguous");
     }
+}
+
+#[tokio::test]
+async fn concurrent_submissions_all_reply_under_load() {
+    // Regression for the lost-wakeup hang: many concurrent same-range
+    // submissions must each resolve even while drivers rotate through
+    // the in-flight window — no submission may park forever.
+    let fixture = Fixture::new().await;
+    let transport = WindowedTransport::new(&fixture, std::time::Duration::from_millis(2));
+    let coordinator = MajorityAppendCoordinator::new(
+        fixture.services[&fixture.owner].clone(),
+        fixture.control.clone(),
+        Arc::new(transport),
+    );
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut id = 1_u64;
+    for _task in 0..32 {
+        let coordinator = coordinator.clone();
+        let fixture_ids: Vec<u64> = (0..50).map(|_| id).collect();
+        id += 50;
+        // Avoid unused warnings while keeping per-task request ids unique.
+        drop(fixture_ids);
+        for _seq in 0..50_u64 {
+            let coordinator = coordinator.clone();
+            let request = windowed_request(&fixture, id);
+            id += 1;
+            tasks.spawn(async move { coordinator.append_batch(vec![request]).await });
+        }
+    }
+    let deadline = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let mut resolved = 0_usize;
+        while let Some(result) = tasks.join_next().await {
+            let inner = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                result.unwrap()
+            })
+            .await
+            .expect("submission task exceeded 10s");
+            let _ = inner; // retryable refusals are fine; a reply is required.
+            resolved += 1;
+        }
+        resolved
+    })
+    .await;
+    assert!(
+        deadline.is_ok(),
+        "submissions stalled under concurrent load"
+    );
 }
 
 #[tokio::test]

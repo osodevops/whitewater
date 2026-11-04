@@ -2558,6 +2558,12 @@ pub struct ControlController {
     /// every applied command so leader and replicas converge.
     issued_api_keys: Arc<std::sync::RwLock<IssuedApiKeySet>>,
     synced_replica: bool,
+    /// Lazily-spawned catalog persister lane: serializes the newest
+    /// snapshot off the state lock so fsync never pins catalog readers.
+    persist_queue: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<CatalogPersistJob>>>>,
+    /// Diagnostics: the tag of whoever currently holds `state`, with
+    /// the acquisition instant — read by the lock-wait WARN.
+    lock_holder: Arc<std::sync::Mutex<Option<(&'static str, std::time::Instant)>>>,
 }
 
 impl ControlController {
@@ -2587,6 +2593,8 @@ impl ControlController {
             capacity_policy: CapacityPolicy::default(),
             issued_api_keys: Arc::new(std::sync::RwLock::new(issued_api_keys)),
             synced_replica: false,
+            persist_queue: Arc::new(Mutex::new(None)),
+            lock_holder: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -2619,7 +2627,7 @@ impl ControlController {
         issued_at_ns: i64,
         command: Command,
     ) -> Result<ReplicatedCommand, ControlError> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("prepare_replicated").await;
         if let Command::PrepareFollowerMove {
             replacement_replica,
             ..
@@ -2719,7 +2727,7 @@ impl ControlController {
         &self,
         node: &StorageNodeId,
     ) -> Result<StorageDrainPlan, ControlError> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("storage_drain_plan").await;
         let known =
             state.storage_nodes.contains_key(node) || self.eligible_storage_nodes.contains(node);
         if !known {
@@ -2732,7 +2740,7 @@ impl ControlController {
     /// knows about, evaluated at read time — the same view `SHOW
     /// STORAGE NODES` serves, for diagnostics and Advisor tooling.
     pub async fn storage_pool_report(&self) -> Vec<NodeStorageEligibility> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("storage_pool_report").await;
         storage_eligibility_report(
             &state,
             &self.eligible_storage_nodes,
@@ -2742,7 +2750,10 @@ impl ControlController {
     }
 
     pub async fn draining_storage_nodes(&self) -> BTreeSet<StorageNodeId> {
-        self.state.lock().await.draining_storage_nodes.clone()
+        self.state_lock("draining_storage_nodes")
+            .await
+            .draining_storage_nodes
+            .clone()
     }
 
     /// Every currently storage-eligible Node (configured voters plus
@@ -2752,7 +2763,7 @@ impl ControlController {
     /// re-validates eligibility against `issued_at_ns`.
     pub async fn storage_pool_nodes(&self) -> BTreeSet<StorageNodeId> {
         let now_ns = unix_ns();
-        let state = self.state.lock().await;
+        let state = self.state_lock("storage_pool_nodes").await;
         self.storage_pool(&state, now_ns)
     }
 
@@ -2794,7 +2805,7 @@ impl ControlController {
     /// transfers) that have been prepared but not yet activated. Drain
     /// scheduling treats this count as the movement disruption budget.
     pub async fn pending_move_plan_count(&self) -> usize {
-        let state = self.state.lock().await;
+        let state = self.state_lock("pending_move_plan_count").await;
         state.range_move_plans.len() + state.owner_move_plans.len()
     }
 
@@ -3013,7 +3024,7 @@ impl ControlController {
             ));
         }
         let statement = command_label(&command);
-        let mut state = self.state.lock().await;
+        let mut state = self.state_lock("execute_query").await;
         let (message, data) = self
             .apply(
                 &mut state,
@@ -3031,7 +3042,7 @@ impl ControlController {
     }
 
     pub async fn apply_replicated(&self, request: ReplicatedCommand) -> ReplicatedCommandResult {
-        let mut state = self.state.lock().await;
+        let mut state = self.state_lock("apply_replicated").await;
         if let Some(previous) = state.applied_requests.get(&request.request_id) {
             return previous.clone();
         }
@@ -3111,20 +3122,37 @@ impl ControlController {
         if cache_response {
             state.applied_requests.insert(request_id, response.clone());
         }
-        if let Err(error) = persist_state(&self.path, &state) {
+        // The fsync chain below is synchronous and can stall seconds
+        // on a slow disk — run it on a blocking thread so the whole
+        // runtime keeps ticking; the catalog lock stays held because a
+        // failed persist must roll the applied mutation back under it.
+        // Persist the snapshot OFF the catalog lock: the dedicated
+        // lane fsyncs only the newest queued revision, coalescing
+        // intermediate applies. last_applied_log still advances only
+        // after this confirmation, so a crash replays committed Raft
+        // entries — the same persisted-before-reply contract.
+        let revision = state.revision;
+        let snapshot = state.clone();
+        drop(state);
+        let persist_result = self.persist_snapshot(snapshot).await;
+        if let Err(error) = persist_result {
+            let mut state = self.state_lock("apply_replicated").await;
             *state = previous_state;
             // The view must follow the restored state, never the
             // rolled-back attempt — a failed persist must not leave a
             // phantom issued key authorized.
             self.refresh_issued_api_keys(&state);
             return ReplicatedCommandResult {
-                revision: state.revision,
+                revision,
                 result: None,
                 error: Some(error.to_string()),
             };
         }
         // Authorization view follows committed catalog state.
-        self.refresh_issued_api_keys(&state);
+        {
+            let state = self.state_lock("apply_replicated").await;
+            self.refresh_issued_api_keys(&state);
+        }
         response
     }
 
@@ -3139,7 +3167,9 @@ impl ControlController {
     }
 
     pub async fn snapshot_bytes(&self) -> Result<Vec<u8>, ControlError> {
-        Ok(serde_json::to_vec(&*self.state.lock().await)?)
+        Ok(serde_json::to_vec(
+            &*self.state_lock("snapshot_bytes").await,
+        )?)
     }
 
     pub async fn install_snapshot_bytes(&self, bytes: &[u8]) -> Result<(), ControlError> {
@@ -3148,7 +3178,7 @@ impl ControlController {
         state.migrate_range_metadata();
         persist_state(&self.path, &state)?;
         let issued_api_keys = issued_api_key_view(&state);
-        *self.state.lock().await = state;
+        *self.state_lock("install_snapshot_bytes").await = state;
         if let Ok(mut guard) = self.issued_api_keys.write() {
             *guard = issued_api_keys;
         }
@@ -3156,7 +3186,7 @@ impl ControlController {
     }
 
     pub async fn revision(&self) -> u64 {
-        self.state.lock().await.revision
+        self.state_lock("revision").await.revision
     }
 
     /// Read access to the issued API-key authorization view. The guard
@@ -3251,7 +3281,9 @@ impl ControlController {
         &self,
         subscription_id: Uuid,
     ) -> Option<SubscriptionProgressAssignment> {
-        let state = self.state.lock().await;
+        let state = self
+            .state_lock("active_subscription_progress_assignment_by_id")
+            .await;
         state
             .subscriptions
             .get(&subscription_id)
@@ -3274,7 +3306,9 @@ impl ControlController {
     pub async fn active_subscription_progress_assignments(
         &self,
     ) -> Vec<SubscriptionProgressAssignment> {
-        let state = self.state.lock().await;
+        let state = self
+            .state_lock("active_subscription_progress_assignments")
+            .await;
         state
             .subscription_progress_assignments
             .iter()
@@ -3346,7 +3380,7 @@ impl ControlController {
         &self,
         store_id: Uuid,
     ) -> Option<crate::state_store::StateStoreAssignment> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("active_state_store_assignment_by_id").await;
         // StateStoreDefinitions carry build `stage` rather than ResourceStatus;
         // a present definition with an assignment is active.
         state.state_stores.get(&store_id)?;
@@ -3360,7 +3394,7 @@ impl ControlController {
     pub async fn active_state_store_assignments(
         &self,
     ) -> Vec<crate::state_store::StateStoreAssignment> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("active_state_store_assignments").await;
         state
             .state_store_assignments
             .iter()
@@ -3403,7 +3437,7 @@ impl ControlController {
     pub async fn effective_history_policies(
         &self,
     ) -> std::collections::HashMap<Uuid, HistoryPolicy> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("effective_history_policies").await;
         state
             .feeds
             .values()
@@ -3417,7 +3451,7 @@ impl ControlController {
     /// the Feed is gone — an unresolvable target must not silently
     /// inherit some other Feed's bounds.
     pub async fn effective_history_policy_for_feed(&self, feed_id: Uuid) -> Option<HistoryPolicy> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("effective_history_policy_for_feed").await;
         state
             .feeds
             .get(&feed_id)
@@ -3430,13 +3464,13 @@ impl ControlController {
     /// retained bytes. Tombstoned definitions keep their holds so a drop
     /// race cannot unfreeze evidence.
     pub async fn legal_hold_feed_ids(&self) -> std::collections::HashSet<Uuid> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("legal_hold_feed_ids").await;
         state.legal_holds.keys().copied().collect()
     }
 
     /// The declared legal hold on `feed_id`, for DESCRIBE output.
     pub async fn legal_hold_for_feed(&self, feed_id: Uuid) -> Option<LegalHold> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("legal_hold_for_feed").await;
         state.legal_holds.get(&feed_id).cloned()
     }
 
@@ -3445,7 +3479,7 @@ impl ControlController {
     /// artifacts. Held feeds cannot appear here (the hold fences ERASE),
     /// but the sweep checks holds first anyway — defense in depth.
     pub async fn erased_feed_ids(&self) -> std::collections::HashSet<Uuid> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("erased_feed_ids").await;
         state
             .feeds
             .values()
@@ -3458,7 +3492,7 @@ impl ControlController {
     /// sweep's manifest-heal and seal decisions. Feeds without a row
     /// (unencrypted) do not appear.
     pub async fn feed_key_states(&self) -> std::collections::HashMap<Uuid, FeedKeyState> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("feed_key_states").await;
         state
             .feed_keys
             .values()
@@ -3488,7 +3522,7 @@ impl ControlController {
     /// One Feed's key state for store-open resolution. `None` means the
     /// Feed is unencrypted (no key row was ever minted).
     pub async fn feed_key_state(&self, feed_id: Uuid) -> Option<FeedKeyState> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("feed_key_state").await;
         state.feed_keys.get(&feed_id).map(|key| match key.status {
             FeedKeyStatus::Active => {
                 let mut dek = [0_u8; 32];
@@ -3504,7 +3538,7 @@ impl ControlController {
     }
 
     pub(crate) async fn active_reader_frontier(&self, reader_id: Uuid) -> Option<ReaderFrontier> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("active_reader_frontier").await;
         state
             .readers
             .get(&reader_id)
@@ -3516,7 +3550,7 @@ impl ControlController {
         &self,
         feed_id: Uuid,
     ) -> Vec<ReaderCutoverSnapshot> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("active_reader_cutover_snapshots").await;
         state
             .readers
             .values()
@@ -3529,8 +3563,7 @@ impl ControlController {
     }
 
     pub async fn active_writer_by_name(&self, name: &str) -> Option<WriterDefinition> {
-        self.state
-            .lock()
+        self.state_lock("active_writer_by_name")
             .await
             .writers
             .values()
@@ -3546,7 +3579,7 @@ impl ControlController {
         session_epoch: u64,
         sequence: u64,
     ) -> Result<WriterDefinition, ControlError> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("validate_writer_append").await;
         let writer = state
             .writers
             .get(&writer_id)
@@ -3585,7 +3618,11 @@ impl ControlController {
     /// Feeds still deliver retained history, and the current name is the
     /// honest source label for those deliveries.
     pub(crate) async fn feed_definition_by_id(&self, feed_id: Uuid) -> Option<FeedDefinition> {
-        self.state.lock().await.feeds.get(&feed_id).cloned()
+        self.state_lock("active_feed_by_id")
+            .await
+            .feeds
+            .get(&feed_id)
+            .cloned()
     }
 
     pub async fn active_feed_by_name(&self, name: &str) -> Option<FeedDefinition> {
@@ -3624,7 +3661,12 @@ impl ControlController {
     /// Every persisted Index definition — the rebuild driver scans these
     /// for `Building` stages each tick.
     pub async fn index_definitions(&self) -> Vec<StoredIndexDefinition> {
-        self.state.lock().await.indexes.values().cloned().collect()
+        self.state_lock("index_definitions")
+            .await
+            .indexes
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub async fn declared_index_by_name(&self, name: &str) -> Option<StoredIndexDefinition> {
@@ -3696,7 +3738,7 @@ impl ControlController {
     /// implicit scheduling rule — until an explicit move writes a real
     /// entry.
     pub async fn pipe_compute_lease(&self, pipe_id: Uuid) -> Option<PipeComputeLease> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("pipe_compute_lease").await;
         effective_pipe_compute_lease(&state, pipe_id)
     }
 
@@ -3766,7 +3808,7 @@ impl ControlController {
     pub async fn support_bundle_catalog(&self, now_ns: i64) -> serde_json::Value {
         const MAX_ROWS: usize = 256;
         const MAX_AUDIT: usize = 128;
-        let state = self.state.lock().await;
+        let state = self.state_lock("support_bundle_catalog").await;
         let feed_name = |feed_id: &Uuid| state.feeds.get(feed_id).map(|feed| feed.name.clone());
         let nodes = state
             .storage_nodes
@@ -4021,7 +4063,11 @@ impl ControlController {
     }
 
     pub async fn active_range_assignment(&self, feed_id: Uuid) -> Option<ActiveRangeAssignment> {
-        self.state.lock().await.active_ranges.get(&feed_id).cloned()
+        self.state_lock("active_ranges")
+            .await
+            .active_ranges
+            .get(&feed_id)
+            .cloned()
     }
 
     pub async fn active_range_assignment_by_id(
@@ -4057,7 +4103,7 @@ impl ControlController {
 
     /// Committed-frontier proofs for every Range this Feed's map routes.
     pub async fn feed_commit_proofs(&self, feed_id: Uuid) -> BTreeMap<RangeId, RangeCommitProof> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("feed_commit_proofs").await;
         let Some(map) = state.range_maps.get(&feed_id) else {
             return BTreeMap::new();
         };
@@ -4143,11 +4189,15 @@ impl ControlController {
     }
 
     pub async fn active_range_map(&self, feed_id: Uuid) -> Option<RangeMap> {
-        self.state.lock().await.range_maps.get(&feed_id).cloned()
+        self.state_lock("active_range_map")
+            .await
+            .range_maps
+            .get(&feed_id)
+            .cloned()
     }
 
     pub async fn active_feed_range_maps(&self) -> Vec<(String, RangeMap)> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("active_feed_range_maps").await;
         state
             .feeds
             .values()
@@ -4163,7 +4213,7 @@ impl ControlController {
     }
 
     pub async fn active_feed_name_for_range(&self, range_id: RangeId) -> Option<String> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("active_feed_name_for_range").await;
         let feed_id = state.range_assignments.get(&range_id)?.feed_id;
         state
             .feeds
@@ -4176,7 +4226,7 @@ impl ControlController {
         &self,
         feed_id: Uuid,
     ) -> Vec<ActiveRangeAssignment> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("active_range_assignments_for_feed").await;
         state
             .range_maps
             .get(&feed_id)
@@ -4194,14 +4244,14 @@ impl ControlController {
         feed_id: Uuid,
         key: &[u8],
     ) -> Option<(RangeRoute, ActiveRangeAssignment)> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("active_range_for_key").await;
         let route = state.range_maps.get(&feed_id)?.route_key(key).clone();
         let assignment = state.range_assignments.get(&route.range_id)?.clone();
         Some((route, assignment))
     }
 
     pub async fn active_feed_assignments(&self) -> Vec<(String, ActiveRangeAssignment)> {
-        let state = self.state.lock().await;
+        let state = self.state_lock("active_feed_assignments").await;
         state
             .feeds
             .values()
@@ -11139,6 +11189,130 @@ fn storage_drain_plan(
         moves,
         unplannable,
         ready_to_retire: storage_node_in_use(state, node).is_none(),
+    }
+}
+
+/// One queued catalog snapshot: the lane writes only the newest
+/// revision in the pipe, so bursts of raft applies coalesce into a
+/// single fsync instead of one per command.
+/// Guard that clears the recorded lock holder on drop.
+struct StateGuard<'a> {
+    guard: tokio::sync::MutexGuard<'a, CatalogState>,
+    holder: Arc<std::sync::Mutex<Option<(&'static str, std::time::Instant)>>>,
+}
+impl std::ops::Deref for StateGuard<'_> {
+    type Target = CatalogState;
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+impl std::ops::DerefMut for StateGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+impl Drop for StateGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut holder) = self.holder.lock() {
+            *holder = None;
+        }
+    }
+}
+
+struct CatalogPersistJob {
+    state: CatalogState,
+    reply: tokio::sync::oneshot::Sender<Result<(), ControlError>>,
+}
+
+impl ControlController {
+    /// Catalog lock with holder tracking: on a >1 s wait, WARN with
+    /// the tag of whoever is currently holding the state lock and how
+    /// long it's been held — the stall diagnostic that distinguishes a
+    /// single long holder from lock-pool starvation.
+    async fn state_lock(&self, tag: &'static str) -> StateGuard<'_> {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), self.state.lock()).await {
+                Ok(guard) => {
+                    if let Ok(mut holder) = self.lock_holder.lock() {
+                        *holder = Some((tag, std::time::Instant::now()));
+                    }
+                    return StateGuard {
+                        guard,
+                        holder: self.lock_holder.clone(),
+                    };
+                }
+                Err(_) => {
+                    let (holder_tag, held_ms) = self
+                        .lock_holder
+                        .lock()
+                        .ok()
+                        .and_then(|holder| {
+                            holder
+                                .as_ref()
+                                .map(|(tag, since)| (*tag, since.elapsed().as_millis()))
+                        })
+                        .unwrap_or(("none", 0));
+                    tracing::warn!(holder = holder_tag, held_ms, "catalog lock wait >1s");
+                }
+            }
+        }
+    }
+
+    /// Single persister lane per controller: serializes fsync so two
+    /// applies never interleave a torn catalog, and intermediate
+    /// snapshots collapse to the newest before each write.
+    async fn persist_lane(&self) -> tokio::sync::mpsc::UnboundedSender<CatalogPersistJob> {
+        let mut lane = self.persist_queue.lock().await;
+        if let Some(sender) = lane.as_ref() {
+            return sender.clone();
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<CatalogPersistJob>();
+        let path = self.path.clone();
+        tokio::spawn(async move {
+            while let Some(mut job) = rx.recv().await {
+                // Coalesce to the newest queued snapshot — an older
+                // pending write can never satisfy its waiter better
+                // than the newest durable revision.
+                while let Ok(next) = rx.try_recv() {
+                    job = next;
+                }
+                let reply = job.reply;
+                let path = path.clone();
+                let started = std::time::Instant::now();
+                let result = tokio::task::spawn_blocking(move || persist_state(&path, &job.state))
+                    .await
+                    .map_err(|error| {
+                        ControlError::InvalidOperation(format!(
+                            "catalog persist task failed: {error}"
+                        ))
+                    })
+                    .and_then(|result| result);
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                if elapsed_ms > 500.0 {
+                    tracing::warn!(elapsed_ms, "slow catalog persist_state");
+                }
+                let _ = reply.send(result);
+            }
+        });
+        *lane = Some(tx.clone());
+        tx
+    }
+
+    /// Queue the applied snapshot for durable persist and await the
+    /// lane's confirmation — the reply resolves once THIS version (or
+    /// a newer coalesced one) is fsync'd, keeping the same
+    /// persisted-before-reply contract as the inline fsync path.
+    async fn persist_snapshot(&self, state: CatalogState) -> Result<(), ControlError> {
+        let (reply, wait) = tokio::sync::oneshot::channel();
+        self.persist_lane()
+            .await
+            .send(CatalogPersistJob { state, reply })
+            .map_err(|_| {
+                ControlError::InvalidOperation("catalog persist lane is closed".to_owned())
+            })?;
+        wait.await.map_err(|_| {
+            ControlError::InvalidOperation("catalog persist lane dropped the reply".to_owned())
+        })?
     }
 }
 

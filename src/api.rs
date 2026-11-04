@@ -414,6 +414,12 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
         state.clone(),
         authorize_replica_append,
     ));
+    let read_continuation_route = post(accept_read_continuation)
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            authorize_replica_append,
+        ));
     let range_pressure_route = get(range_pressure_totals).layer(middleware::from_fn_with_state(
         state.clone(),
         authorize_replica_append,
@@ -573,6 +579,7 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             merge_stage_route,
         )
         .route("/internal/active-range/pressure", range_pressure_route)
+        .route("/internal/feed/read-continuation", read_continuation_route)
         .route("/internal/active-range/move/export", move_export_route)
         .route("/internal/active-range/move/stage", move_stage_route)
         .route("/internal/active-range/move/freeze", move_freeze_route)
@@ -15653,14 +15660,19 @@ struct AppendLookupCache {
 }
 
 async fn writer_batch_prepare(
+    trace_id: Uuid,
     state: &AppState,
     headers: &HeaderMap,
     request: &WriterSessionAppendRequest,
     cache: &mut AppendLookupCache,
 ) -> Result<(ClientAppendRequest, crate::active_range::RangeId), ApiError> {
+    tracing::debug!("batch-trace prepare record");
+    let _t = std::time::Instant::now();
     let writer = match cache.writers.get(&request.writer) {
         Some(writer) => writer.clone(),
         None => {
+            tracing::debug!("batch-trace prepare writer-lookup");
+            tracing::debug!(%trace_id, "batch-trace prepare step=writer_lookup start");
             let writer = writer_when_applied(
                 &state.control,
                 &request.writer,
@@ -15681,6 +15693,7 @@ async fn writer_batch_prepare(
             writer
         }
     };
+    tracing::debug!(%trace_id, step = "writer_lookup", ms = _t.elapsed().as_millis(), "batch-trace prepare step done");
     let feed = match cache.feeds.get(&writer.feed_id) {
         Some(feed) => feed.clone(),
         None => {
@@ -15725,6 +15738,13 @@ async fn writer_batch_prepare(
             None => break,
         }
     }
+    // Cache the (possibly refreshed) definition so the next record in
+    // the batch reuses the resolved epoch instead of re-polling the
+    // catalog lock + sleeping per record — a fresh session otherwise
+    // costs ~100 ms x every record in a large batch.
+    cache
+        .writers
+        .insert(request.writer.clone(), definition.clone());
     if !definition.session_active {
         return Err(ApiError::bad_request(format!(
             "Writer {} has no active session",
@@ -15808,7 +15828,8 @@ async fn writer_batch_append(
         })?,
     };
     let first_request_id = request.records.first().map(|r| r.request_id);
-    let outcome = writer_batch_append_inner(state, headers, request).await;
+    let trace_id = Uuid::new_v4();
+    let outcome = writer_batch_append_inner(trace_id, state, headers, request).await;
     tracing::debug!(
         elapsed_ms = _timer.elapsed().as_secs_f64() * 1000.0,
         ok = outcome.is_ok(),
@@ -15819,12 +15840,15 @@ async fn writer_batch_append(
 }
 
 async fn writer_batch_append_inner(
+    trace_id: Uuid,
     state: AppState,
     headers: HeaderMap,
     request: WriterBatchAppendRequest,
 ) -> Result<Json<WriterBatchAppendResponse>, ApiError> {
     let _timer = std::time::Instant::now();
+    tracing::debug!(%trace_id, records = request.records.len(), "batch-trace inner start");
     authenticate_credential(&state, &headers)?;
+    tracing::debug!(%trace_id, "batch-trace auth done");
     if request.records.is_empty() || request.records.len() > 1_000 {
         return Err(ApiError::bad_request(
             "Writer batch must contain between 1 and 1000 records",
@@ -15849,8 +15873,9 @@ async fn writer_batch_append_inner(
     let mut prepared = Vec::with_capacity(originals.len());
     let mut cache = AppendLookupCache::default();
     for record in &originals {
-        prepared.push(writer_batch_prepare(&state, &headers, record, &mut cache).await?);
+        prepared.push(writer_batch_prepare(trace_id, &state, &headers, record, &mut cache).await?);
     }
+    tracing::debug!(%trace_id, "batch-trace prepared");
     let mut group_order: Vec<crate::active_range::RangeId> = Vec::new();
     let mut groups: BTreeMap<crate::active_range::RangeId, (Vec<usize>, Vec<ClientAppendRequest>)> =
         BTreeMap::new();
@@ -15883,8 +15908,10 @@ async fn writer_batch_append_inner(
                 // replica batch at MAX_REPLICA_BATCH_FRAMES.
                 let end = (offset + MAX_REPLICA_BATCH_FRAMES).min(requests.len());
                 let chunk: Vec<ClientAppendRequest> = requests[offset..end].to_vec();
+                tracing::debug!(%trace_id, %range_id, chunk = chunk.len(), "batch-trace range chunk start");
                 match route_append_batch_to_owner(&state, range_id, chunk).await {
                     Ok(chunk_results) => {
+                        tracing::debug!(%trace_id, %range_id, "batch-trace range chunk done");
                         for (index, result) in indices[offset..end].iter().zip(chunk_results) {
                             landed.push((*index, result));
                         }
@@ -16815,10 +16842,28 @@ async fn owner_append_local(
     // Session appends mint the Writer sequence on the owner inside the
     // range's append lock so the stored frame's producer_sequence and the
     // dedup stream agree; explicit-sequence callers encode up front.
+    let coordinator = coordinator.clone();
     let result = if request.mint_sequence {
-        coordinator
-            .append_minted(replica_request, encode_with_sequence)
-            .await
+        // Detached: HTTP cancellation must never abort a group round
+        // mid-flight — a failed driver task reads as a retryable store
+        // failure, not a silent drop.
+        match detached_owner_work(async move {
+            coordinator
+                .append_minted(replica_request, encode_with_sequence)
+                .await
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(crate::active_range::MajorityAppendError {
+                code: crate::active_range::MajorityAppendErrorCode::LocalStorageFailure,
+                message: error.message,
+                retryable: true,
+                durable_replicas: vec![],
+                commit_evidence: vec![],
+                pending_effect: None,
+            }),
+        }
     } else {
         let mut replica_request = replica_request;
         replica_request.frame = encode_with_sequence(request.sequence)
@@ -16857,7 +16902,39 @@ async fn owner_append_batch(
     State(state): State<AppState>,
     Json(request): Json<InternalOwnerBatchAppendRequest>,
 ) -> Json<InternalOwnerBatchAppendResponse> {
-    Json(owner_append_batch_logged(&state, request.requests, false).await)
+    // Detached: a cancelled HTTP request must never abort a group
+    // round mid-flight — the driver must reply every merged passenger.
+    Json(
+        match detached_owner_work(async move {
+            owner_append_batch_logged(&state, request.requests, false).await
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => InternalOwnerBatchAppendResponse {
+                results: None,
+                retryable: true,
+                error: Some(error.message),
+                code: None,
+            },
+        },
+    )
+}
+
+/// Run owner-append work in a detached task: group rounds run inline
+/// in the driver's task, so HTTP cancellation at the boundary must not
+/// reach them — JoinErrors map to a retryable 503.
+async fn detached_owner_work<F, T>(work: F) -> Result<T, ApiError>
+where
+    F: std::future::Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    tracing::debug!("batch-trace detached start");
+    let result = tokio::spawn(work)
+        .await
+        .map_err(|error| ApiError::unavailable(format!("owner append task failed: {error}")));
+    tracing::debug!("batch-trace detached done");
+    result
 }
 
 async fn owner_append_batch_logged(
@@ -16898,7 +16975,19 @@ async fn owner_append_batch_bin(
     body: Bytes,
 ) -> Json<InternalOwnerBatchAppendResponse> {
     Json(match decode_owner_batch_bin_body(&body) {
-        Ok(requests) => owner_append_batch_logged(&state, requests, true).await,
+        Ok(requests) => match detached_owner_work(async move {
+            owner_append_batch_logged(&state, requests, true).await
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => InternalOwnerBatchAppendResponse {
+                results: None,
+                retryable: true,
+                error: Some(error.message),
+                code: None,
+            },
+        },
         Err(error) => InternalOwnerBatchAppendResponse {
             results: None,
             retryable: false,
@@ -17126,10 +17215,17 @@ async fn route_append_batch_to_owner(
         ApiError::unavailable("this Node is not configured for Active Range routing")
     })?;
     if &assignment.owner == local {
-        return owner_append_batch_local(state, requests)
-            .await
-            .map_err(|error| error.api);
+        // Detached so a cancelled caller (HTTP or per-range fetch) can
+        // never abort an in-flight group round.
+        tracing::debug!(%range_id, "batch-trace route local-owner");
+        let state = state.clone();
+        return detached_owner_work(
+            async move { owner_append_batch_local(&state, requests).await },
+        )
+        .await
+        .and_then(|inner| inner.map_err(|error| error.api));
     }
+    tracing::debug!(%range_id, "batch-trace route forward");
     let endpoint = state
         .control_endpoints
         .resolve(&assignment.owner)
@@ -18480,6 +18576,130 @@ async fn read_reader_frontier(
     Ok((records, progress))
 }
 
+/// Per-Node resume state for multi-range paginated reads, keyed by the Cursor
+/// of the last frame a page emitted. A hit resumes each range directly after
+/// its last emitted position instead of re-merging every range from the start;
+/// a miss or placement change falls back to the full merge scan.
+struct ReadContinuation {
+    placement: String,
+    resume: Vec<Option<RangePosition>>,
+}
+
+/// Peer-shared form of a [`ReadContinuation`]: SDKs rotate requests across
+/// Nodes, so each page's resume state is offered to the other Nodes before
+/// the page is returned. Entries are hints validated against the current
+/// placement fingerprint; a miss falls back to the full merge scan.
+#[derive(Debug, Serialize, Deserialize)]
+struct ReadContinuationShare {
+    feed_id: Uuid,
+    cursor: String,
+    placement: String,
+    resume: Vec<Option<u64>>,
+}
+
+fn placement_fingerprint(assignments: &[ActiveRangeAssignment]) -> String {
+    blake3::hash(&serde_json::to_vec(assignments).unwrap_or_default())
+        .to_hex()
+        .to_string()
+}
+
+#[cfg(test)]
+static READ_CONTINUATION_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+async fn accept_read_continuation(Json(share): Json<ReadContinuationShare>) -> StatusCode {
+    READ_CONTINUATIONS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            share.feed_id,
+            share.cursor,
+            ReadContinuation {
+                placement: share.placement,
+                resume: share
+                    .resume
+                    .into_iter()
+                    .map(|position| position.map(RangePosition::new))
+                    .collect(),
+            },
+        );
+    StatusCode::NO_CONTENT
+}
+
+/// Offers a continuation to every peer Node, bounded and best-effort: a
+/// failed or slow peer only costs that peer a scan on the next page.
+async fn share_read_continuation(state: &AppState, share: &ReadContinuationShare) {
+    if state.internal_mtls.is_some() {
+        return;
+    }
+    let Some(key) = state.internal_key.clone() else {
+        return;
+    };
+    let peers = state.control_endpoints.all().await;
+    join_all(
+        peers
+            .into_iter()
+            .filter(|(node, _)| Some(node) != state.storage_node_id.as_ref())
+            .map(|(_, endpoint)| {
+                state
+                    .internal_http
+                    .post(format!(
+                        "{}/internal/feed/read-continuation",
+                        endpoint.trim_end_matches('/')
+                    ))
+                    .header("x-whitewater-control-key", key.clone())
+                    .timeout(Duration::from_millis(500))
+                    .json(share)
+                    .send()
+            }),
+    )
+    .await;
+}
+
+const READ_CONTINUATION_CAPACITY: usize = 4096;
+
+#[derive(Default)]
+struct ReadContinuationCache {
+    entries: std::collections::HashMap<(Uuid, String), ReadContinuation>,
+    order: std::collections::VecDeque<(Uuid, String)>,
+}
+
+impl ReadContinuationCache {
+    fn get(&self, feed_id: Uuid, cursor: &str) -> Option<&ReadContinuation> {
+        self.entries.get(&(feed_id, cursor.to_owned()))
+    }
+
+    fn insert(&mut self, feed_id: Uuid, cursor: String, continuation: ReadContinuation) {
+        let key = (feed_id, cursor);
+        if self.entries.insert(key.clone(), continuation).is_none() {
+            self.order.push_back(key);
+        }
+        while self.entries.len() > READ_CONTINUATION_CAPACITY {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+}
+
+static READ_CONTINUATIONS: std::sync::LazyLock<std::sync::Mutex<ReadContinuationCache>> =
+    std::sync::LazyLock::new(Default::default);
+
+#[cfg(test)]
+static READ_CONTINUATIONS_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn read_continuations_enabled() -> bool {
+    #[cfg(test)]
+    {
+        !READ_CONTINUATIONS_DISABLED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
 struct RangeFrameStream<'a> {
     state: &'a AppState,
     assignment: &'a ActiveRangeAssignment,
@@ -18488,6 +18708,7 @@ struct RangeFrameStream<'a> {
     after_cursor: Option<String>,
     pending: std::collections::VecDeque<StoredRangeFrame>,
     exhausted: bool,
+    page_limit: usize,
 }
 
 impl RangeFrameStream<'_> {
@@ -18500,6 +18721,7 @@ impl RangeFrameStream<'_> {
             after_cursor: None,
             pending: std::collections::VecDeque::new(),
             exhausted: false,
+            page_limit: MAX_LOGICAL_READ_FRAMES,
         }
     }
 
@@ -18523,7 +18745,7 @@ impl RangeFrameStream<'_> {
                     tail_count: None,
                     ingest_threshold: None,
                     cursors: None,
-                    page_limit: Some(MAX_LOGICAL_READ_FRAMES),
+                    page_limit: Some(self.page_limit),
                 },
             )
             .await?;
@@ -18595,15 +18817,52 @@ async fn read_paginated_feed(
         .await;
     }
     let limit = limit.min(MAX_LOGICAL_READ_FRAMES);
+    let placement = placement_fingerprint(&assignments);
+    let cached_resume = after
+        .filter(|_| read_continuations_enabled())
+        .and_then(|cursor| {
+            let cache = READ_CONTINUATIONS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            cache
+                .get(feed_id, cursor)
+                .filter(|entry| {
+                    entry.placement == placement && entry.resume.len() == assignments.len()
+                })
+                .map(|entry| entry.resume.clone())
+        });
+    #[cfg(test)]
+    if cached_resume.is_some() {
+        READ_CONTINUATION_HITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    let mut found_after = after.is_none() || cached_resume.is_some();
+    // A resumed page needs roughly its share of `limit` from each range;
+    // fetching a full page per range would read and ship ~N times the
+    // emitted frames. Short ranges simply refill again.
+    let range_page_limit = if found_after {
+        let share = limit.div_ceil(assignments.len().max(1));
+        share
+            .saturating_add(share / 4)
+            .saturating_add(16)
+            .min(MAX_LOGICAL_READ_FRAMES)
+    } else {
+        MAX_LOGICAL_READ_FRAMES
+    };
+    let mut resume = cached_resume.unwrap_or_else(|| vec![None; assignments.len()]);
     let mut streams: Vec<RangeFrameStream> = assignments
         .iter()
-        .map(|assignment| RangeFrameStream::new(state, assignment))
+        .zip(&resume)
+        .map(|(assignment, position)| {
+            let mut stream = RangeFrameStream::new(state, assignment);
+            stream.after = *position;
+            stream.page_limit = range_page_limit;
+            stream
+        })
         .collect();
     let mut heads: Vec<Option<((i64, Uuid), StoredRangeFrame)>> =
         (0..streams.len()).map(|_| None).collect();
     let mut emitted: Vec<StoredRangeFrame> = Vec::new();
     let mut bytes = 0_usize;
-    let mut found_after = after.is_none();
     loop {
         // Refill every drained head concurrently — each stream owns an
         // independent remote page fetch, so serial awaits paid one owner
@@ -18660,6 +18919,7 @@ async fn read_paginated_feed(
             break;
         }
         bytes = bytes.saturating_add(frame_bytes);
+        resume[index] = Some(frame.position);
         emitted.push(frame);
     }
     if !found_after {
@@ -18671,6 +18931,26 @@ async fn read_paginated_feed(
         return Err(ApiError::unavailable(
             "Feed placement changed during read; retry with the same Cursor",
         ));
+    }
+    if let Some(last) = emitted.last().filter(|_| read_continuations_enabled()) {
+        let share = ReadContinuationShare {
+            feed_id,
+            cursor: last.cursor.clone(),
+            placement: placement.clone(),
+            resume: resume
+                .iter()
+                .map(|position| position.map(RangePosition::value))
+                .collect(),
+        };
+        READ_CONTINUATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                feed_id,
+                last.cursor.clone(),
+                ReadContinuation { placement, resume },
+            );
+        share_read_continuation(state, &share).await;
     }
     Ok(emitted)
 }
@@ -26387,6 +26667,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_read_continuation_is_accepted_into_the_cache() {
+        let feed = Uuid::new_v4();
+        let status = accept_read_continuation(Json(ReadContinuationShare {
+            feed_id: feed,
+            cursor: "cursor-shared".to_owned(),
+            placement: "fingerprint".to_owned(),
+            resume: vec![Some(7), None, Some(3)],
+        }))
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let cache = READ_CONTINUATIONS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = cache.get(feed, "cursor-shared").unwrap();
+        assert_eq!(entry.placement, "fingerprint");
+        assert_eq!(
+            entry.resume,
+            vec![
+                Some(RangePosition::new(7)),
+                None,
+                Some(RangePosition::new(3))
+            ]
+        );
+    }
+
+    #[test]
+    fn read_continuation_cache_is_bounded_and_keyed_by_feed() {
+        let mut cache = ReadContinuationCache::default();
+        let feed = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        for index in 0..READ_CONTINUATION_CAPACITY + 10 {
+            cache.insert(
+                feed,
+                format!("cursor-{index}"),
+                ReadContinuation {
+                    placement: String::new(),
+                    resume: vec![None],
+                },
+            );
+        }
+        assert_eq!(cache.entries.len(), READ_CONTINUATION_CAPACITY);
+        assert_eq!(cache.order.len(), READ_CONTINUATION_CAPACITY);
+        assert!(cache.get(feed, "cursor-0").is_none());
+        assert!(cache
+            .get(feed, &format!("cursor-{}", READ_CONTINUATION_CAPACITY + 9))
+            .is_some());
+        assert!(cache
+            .get(other, &format!("cursor-{}", READ_CONTINUATION_CAPACITY + 9))
+            .is_none());
+    }
+
+    #[tokio::test]
     async fn multi_range_feed_reads_merge_pages_across_owner_nodes() {
         let directory = TempDir::new().unwrap();
         let log_store: Arc<dyn LogStore> =
@@ -26591,6 +26923,34 @@ mod tests {
         assert!(body.as_array().unwrap().is_empty());
         let (status, _) = read_feed("orders.events", Some("cursor-404"), 5).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        // Resumed multi-range pages (continuation cache) must return exactly
+        // the sequence the full merge scan returns.
+        let mut sequences = Vec::new();
+        let hits_before = READ_CONTINUATION_HITS.load(std::sync::atomic::Ordering::SeqCst);
+        for disabled in [true, false] {
+            READ_CONTINUATIONS_DISABLED.store(disabled, std::sync::atomic::Ordering::SeqCst);
+            let mut all = Vec::new();
+            let mut after: Option<String> = None;
+            loop {
+                let (status, body) = read_feed("orders.deep", after.as_deref(), 997).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                let page = cursors_of(&body);
+                let Some(last) = page.last().cloned() else {
+                    break;
+                };
+                all.extend(page);
+                after = Some(last);
+            }
+            sequences.push(all);
+        }
+        READ_CONTINUATIONS_DISABLED.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            READ_CONTINUATION_HITS.load(std::sync::atomic::Ordering::SeqCst) >= hits_before + 9,
+            "deep paged reads must resume from cached continuations"
+        );
+        assert_eq!(sequences[0].len(), 10_005);
+        assert_eq!(sequences[0], sequences[1]);
 
         // Bounded exact-Key search: the seeded keys alternate between the
         // two deterministic routing keys, so an exact match set is

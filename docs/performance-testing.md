@@ -518,6 +518,55 @@ Honest reads at 8 KB:
 (The earlier same-shape 3-feed binary run measured 6,797 rec/s on a
 better host day — Docker Desktop variance; compare within a run set.)
 
+### Current same-session result — pipelined Rust SDK vs Kafka Java SDK (2026-11-03)
+
+This is the authoritative comparison. Earlier Whitewater tables that used the
+stale pre-Nov-3 `bench_feed` binary (one batch in flight per writer, and
+"3 ranges" that never actually split) are superseded.
+
+Setup: 300,000 × 1 KiB records, 16 writers, 3 Nodes / 3 brokers, RF3.
+Kafka: `kafka-clients` 3.8.0, `acks=all`, idempotence on, `min.insync.replicas=2`,
+default flush (no fsync); fresh topic per run. Whitewater: `whitewater-rust`
+`bench_feed` freshly built and date-checked, pipelined binary writes
+(`BENCH_BATCHED=1`, batch 512, 5 in flight), binary reads (page 16,384),
+`WHITEWATER_RANGE_SYNC_INTERVAL_MS=never` (Kafka's default durability), fresh
+Riverbed (`down -v`) per server build. One system ran at a time.
+
+Factor = Whitewater ÷ Kafka for throughput and Kafka ÷ Whitewater for latency,
+so **above 1x always means Whitewater is better**. Midpoints of the run ranges.
+
+| Shape | Metric | Kafka | Whitewater | Result | Factor |
+|---|---|---|---|---|---|
+| 1 partition / 1 range | write rec/s | 75.4k / 87.3k | 77.7k / 80.5k | TIE | 0.97x |
+| | write p50 | 1,279–1,495 ms | 602–650 ms | **WIN** | 2.22x |
+| | read rec/s | 341k / 369k | 405k / 424k | **WIN** | 1.17x |
+| 3 partitions / 3 ranges | write rec/s | 108.5k / 110.2k | 91.0k / 96.9k | LOSE | 0.86x |
+| | write p50 | 632–667 ms | 506–528 ms | **WIN** | 1.26x |
+| | read rec/s | 315k / 330k | 397k / 412k | **WIN** | 1.26x |
+| **Grand average** | | | | **WIN** | **1.29x** |
+
+All Whitewater runs: 0 errors, 0 slow appends (no 30 s stalls).
+
+What changed to get here:
+
+- **Stall fix.** `writer_batch_prepare` refreshed a Writer definition with a
+  stale session epoch but never stored it back in the batch cache, so every
+  record of a 512-record batch re-waited ~100 ms (≈ the SDK's 30 s timeout).
+  The refreshed definition is now reused for the rest of the batch.
+- **Multi-range read continuation (62k → ~400k rec/s on 3 ranges).** A page
+  read with `after` used to re-merge every range from the start and skip to the
+  Cursor, so each page cost grew with read depth. Each Node now keeps a bounded
+  (4,096-entry) continuation cache keyed by (FeedId, last emitted Cursor) holding
+  each range's last emitted position plus a placement fingerprint, and offers it
+  to its peers (`/internal/feed/read-continuation`) because SDKs rotate Nodes per
+  request. A hit resumes each range directly and fetches only about its share of
+  the page; a miss or placement change falls back to the full merge scan, so
+  correctness never depends on the cache. SDKs are unchanged.
+
+Remaining loss: 3-range write throughput (0.86x). It does not respond to in-flight
+depth (2/5/8/12 all ≈ 90–94k) and in-memory storage reaches only 93–105k, so the
+limit is neither the disk nor the client's in-flight window.
+
 ### Kafka-parity rounds — SDK vs SDK as a pass/fail gate (2026-11-01)
 
 The gate: the Whitewater Rust SDK must match or beat the Kafka Java SDK
@@ -693,6 +742,17 @@ not compute.
 
 #### Round 3 — 1 GiB default segments (Kafka's `log.segment.bytes`)
 
+> **Correction (Nov 3):** every Whitewater run recorded from Nov 1 onward used a stale `bench_feed`
+> binary built on Nov 1, before `BENCH_RANGES` and `BENCH_BATCHED` existed. In those runs:
+> - the Rust SDK sent one append-batch at a time per writer, not through the pipelined pump;
+> - rows labelled "3 ranges" were never pre-split, so they actually measured a single range and
+>   are invalid as 3-range results.
+>
+> The server-side changes and the Kafka figures are unaffected. A freshly built binary with the
+> pipelined pump measured 60k rec/s at 749 ms p50 on 1 range, and stalled on 3 ranges
+> (9.7k rec/s, p99 30 s). Re-measured results replace these sections.
+
+
 At 256 MiB, a 300k-record run rotates the active segment partway
 through. Sealing the old segment (a ~256 MB `sync_all`, a ~38 MB index
 checkpoint, and a full-segment manifest hash) flooded Docker Desktop's
@@ -721,6 +781,17 @@ For the fsync-every-100 ms comparison, Kafka needs both
 defaults to Long.MAX, so setting only the first knob does nothing.
 
 #### Round 4 — read verification once per process, parallel range reads, gated directory sync
+
+> **Correction (Nov 3):** every Whitewater run recorded from Nov 1 onward used a stale `bench_feed`
+> binary built on Nov 1, before `BENCH_RANGES` and `BENCH_BATCHED` existed. In those runs:
+> - the Rust SDK sent one append-batch at a time per writer, not through the pipelined pump;
+> - rows labelled "3 ranges" were never pre-split, so they actually measured a single range and
+>   are invalid as 3-range results.
+>
+> The server-side changes and the Kafka figures are unaffected. A freshly built binary with the
+> pipelined pump measured 60k rec/s at 749 ms p50 on 1 range, and stalled on 3 ranges
+> (9.7k rec/s, p99 30 s). Re-measured results replace these sections.
+
 
 * **Verify-once reads.** A 16,384-frame page cost ~37 ms on the
   server, of which 17–19 ms was re-hashing every frame with blake3 on
