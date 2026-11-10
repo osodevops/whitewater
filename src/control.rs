@@ -405,7 +405,7 @@ pub enum PipeOperation {
         #[serde(default)]
         on_miss: EnrichMiss,
         /// Resolved at define time when `on_miss` is `Quarantine`; the
-        /// declared name resolves to a same-Domain Feed that is neither
+        /// declared name resolves to a Feed (any Domain) that is neither
         /// the input nor the output.
         #[serde(default)]
         quarantine_feed_id: Option<Uuid>,
@@ -4408,11 +4408,9 @@ impl ControlController {
                             }
                         }
                         let definition = active_feed(state, &feed)?;
-                        if definition.space_id != space_id {
-                            return Err(ControlError::InvalidOperation(
-                                "StateStore source Feed must belong to its Domain".to_owned(),
-                            ));
-                        }
+                        // Feed-sourced stores may materialize another
+                        // Domain's committed history — the store belongs
+                        // to its own name's Domain either way.
                         StateStoreSource::Feed {
                             feed_id: definition.feed_id,
                         }
@@ -4614,11 +4612,8 @@ impl ControlController {
                             )
                         })?;
                         let output = active_feed(state, &output_feed)?;
-                        if output.space_id != space_id {
-                            return Err(ControlError::InvalidOperation(
-                                "Pipe output Feed must belong to its Domain".to_owned(),
-                            ));
-                        }
+                        // Output endpoints may live in another Domain —
+                        // the Pipe is owned by its name's Domain.
                         if subscription.source.feed_id() == Some(output.feed_id) {
                             return Err(ControlError::InvalidOperation(
                                 "Pipe output Feed cannot be its own input Feed".to_owned(),
@@ -4748,12 +4743,6 @@ impl ControlController {
                                     "StateStore {output_store}"
                                 ))
                             })?;
-                        if store.space_id != space_id {
-                            return Err(ControlError::InvalidOperation(
-                                "Pipe output StateStore must belong to its Domain"
-                                    .to_owned(),
-                            ));
-                        }
                         // Pane rows post their group key and pane index under
                         // two reserved named keys so the view is enumerable
                         // without knowing composite row keys.
@@ -4787,12 +4776,6 @@ impl ControlController {
                                     ));
                                 }
                                 let feed = active_feed(state, name)?;
-                                if feed.space_id != space_id {
-                                    return Err(ControlError::InvalidOperation(
-                                        "Pipe emission Feed must belong to its Domain"
-                                            .to_owned(),
-                                    ));
-                                }
                                 if subscription.source.feed_id() == Some(feed.feed_id) {
                                     return Err(ControlError::InvalidOperation(
                                         "Pipe emission Feed cannot be its own input Feed"
@@ -4846,11 +4829,6 @@ impl ControlController {
                             )
                         })?;
                         let output = active_feed(state, &output_feed)?;
-                        if output.space_id != space_id {
-                            return Err(ControlError::InvalidOperation(
-                                "Pipe output Feed must belong to its Domain".to_owned(),
-                            ));
-                        }
                         if subscription.source.feed_id() == Some(output.feed_id) {
                             return Err(ControlError::InvalidOperation(
                                 "Pipe output Feed cannot be its own input Feed".to_owned(),
@@ -4866,24 +4844,13 @@ impl ControlController {
                             .ok_or_else(|| {
                                 ControlError::NotFound(format!("StateStore {output_store}"))
                             })?;
-                        if store.space_id != space_id {
-                            return Err(ControlError::InvalidOperation(
-                                "Pipe lookup StateStore must belong to its Domain".to_owned(),
-                            ));
-                        }
                         validate_window_field(key)?;
                         // A declared quarantine routes misses to a resolved
-                        // same-Domain Feed — never the input (re-processing
+                        // Feed — never the input (re-processing
                         // loop) or the output (contamination).
                         *quarantine_feed_id = match (on_miss, &quarantine_feed) {
                             (EnrichMiss::Quarantine, Some(name)) => {
                                 let quarantine = active_feed(state, name)?;
-                                if quarantine.space_id != space_id {
-                                    return Err(ControlError::InvalidOperation(
-                                        "Pipe quarantine Feed must belong to its Domain"
-                                            .to_owned(),
-                                    ));
-                                }
                                 if subscription.source.feed_id()
                                     == Some(quarantine.feed_id)
                                     || quarantine.feed_id == output.feed_id
@@ -5154,13 +5121,10 @@ impl ControlController {
                 }
                 let source = match (feed, domain) {
                     (Some(feed), None) => {
+                        // A Subscription owns progress in its own Domain;
+                        // the source Feed may live in another — cross-Domain
+                        // consumption reads immutable history.
                         let source = active_feed(state, &feed)?;
-                        if source.space_id != space_id {
-                            return Err(ControlError::InvalidOperation(
-                                "Subscription and source Feed must belong to the same Domain"
-                                    .to_owned(),
-                            ));
-                        }
                         SubscriptionSource::Feed {
                             feed_id: source.feed_id,
                         }
@@ -12726,16 +12690,18 @@ mod tests {
             }])
             .await
             .is_ok());
+        // A cross-Domain source Feed is legal — the store belongs to
+        // `accounts` while materializing `other.users` history.
         assert!(leader
             .execute_commands(vec![Command::DefineStateStore {
-                name: "accounts.invalid".to_owned(),
+                name: "accounts.mirrored".to_owned(),
                 source: StateStoreSourceRequest::Feed {
                     feed: "other.users".to_owned()
                 },
                 named_keys: vec![],
             }])
             .await
-            .is_err());
+            .is_ok());
         assert!(leader
             .execute_commands(vec![Command::DefineStateStore {
                 name: "accounts.unknown".to_owned(),
@@ -12751,7 +12717,7 @@ mod tests {
             .install_snapshot_bytes(&leader.snapshot_bytes().await.unwrap())
             .await
             .unwrap();
-        assert_eq!(follower.state.lock().await.state_stores.len(), 2);
+        assert_eq!(follower.state.lock().await.state_stores.len(), 3);
         assert_eq!(
             follower
                 .declared_state_store_by_name("accounts.profiles")
@@ -13483,11 +13449,12 @@ mod tests {
             }])
             .await
             .is_err());
-        // Cross-Domain inputs and outputs, missing resources, and a
-        // self-feeding loop are all refused.
+        // A cross-Domain input Subscription, missing resources, and a
+        // self-feeding loop are all refused. Output endpoints may live in
+        // another Domain — only the input Subscription is pinned to the
+        // Pipe's Domain.
         for (subscription, output_feed) in [
             ("other.flow", "accounts.enriched"),
-            ("accounts.flow", "other.enriched"),
             ("accounts.missing", "accounts.enriched"),
             ("accounts.flow", "accounts.missing"),
             ("accounts.flow", "accounts.events"),
@@ -13508,6 +13475,22 @@ mod tests {
                 "{subscription} -> {output_feed} must fail"
             );
         }
+        // A cross-Domain output Feed is legal: the Pipe stays owned by
+        // its name's Domain while it writes into `other.enriched`.
+        let crossed = leader
+            .execute_commands(vec![Command::DefinePipe {
+                name: "accounts.towards".to_owned(),
+                subscription: "accounts.flow".to_owned(),
+                output_feed: Some("other.enriched".to_owned()),
+                output_store: None,
+                quarantine_feed: None,
+                emit_feed: None,
+                operation: Box::new(PipeOperation::Forward),
+            }])
+            .await
+            .unwrap();
+        assert!(crossed.results[0].data["output_feed_id"].is_string());
+        leader.execute("DROP PIPE accounts.towards;").await.unwrap();
         // PAUSE halts driving without losing the declaration; RESUME
         // returns it. Both are idempotent and refuse unknown Pipes.
         assert!(leader
@@ -13968,10 +13951,24 @@ mod tests {
             }])
             .await
             .is_err());
-        assert!(controller
+        // A cross-Domain source Feed is legal: the Subscription owns its
+        // progress in `accounts` while consuming `other.events`.
+        controller
             .execute_commands(vec![Command::CreateSubscription {
                 name: "accounts.crossspace".to_owned(),
                 feed: Some("other.events".to_owned()),
+                domain: None,
+                start: ReaderStart::Beginning,
+                delivery_delay_ns: None,
+                exhausted_policy: None,
+            }])
+            .await
+            .unwrap();
+        // A missing source still refuses.
+        assert!(controller
+            .execute_commands(vec![Command::CreateSubscription {
+                name: "accounts.missing".to_owned(),
+                feed: Some("other.missing".to_owned()),
                 domain: None,
                 start: ReaderStart::Beginning,
                 delivery_delay_ns: None,
@@ -13990,7 +13987,7 @@ mod tests {
         let feeds = controller.execute("SHOW FEEDS;").await.unwrap();
         assert_eq!(feeds.results[0].data.as_array().unwrap().len(), 2);
         let subscriptions = controller.execute("SHOW SUBSCRIPTIONS;").await.unwrap();
-        assert_eq!(subscriptions.results[0].data.as_array().unwrap().len(), 1);
+        assert_eq!(subscriptions.results[0].data.as_array().unwrap().len(), 2);
         assert!(controller.state.lock().await.reader_frontiers.is_empty());
         let legacy_dir = TempDir::new().unwrap();
         let mut legacy: Value =
@@ -14824,36 +14821,53 @@ mod tests {
             .await
             .unwrap();
 
-        let define = |output_store: Option<String>, window_ns: u64| Command::DefinePipe {
-            name: "accounts.rollup".to_owned(),
-            subscription: "accounts.flow".to_owned(),
-            output_feed: None,
-            output_store,
-            quarantine_feed: None,
-            emit_feed: None,
-            operation: Box::new(PipeOperation::Window {
-                window_ns,
-                key: IndexFieldSpec::Key,
-                aggregation: WindowAggregation::Count,
-                time: WindowTime::Event,
-                max_late_ns: None,
-                watermark_ns: None,
-                grace_ns: None,
-                expire_ns: None,
-                key_limit: None,
-                byte_limit: None,
-            }),
+        let define_named =
+            |name: &str, output_store: Option<String>, window_ns: u64| Command::DefinePipe {
+                name: name.to_owned(),
+                subscription: "accounts.flow".to_owned(),
+                output_feed: None,
+                output_store,
+                quarantine_feed: None,
+                emit_feed: None,
+                operation: Box::new(PipeOperation::Window {
+                    window_ns,
+                    key: IndexFieldSpec::Key,
+                    aggregation: WindowAggregation::Count,
+                    time: WindowTime::Event,
+                    max_late_ns: None,
+                    watermark_ns: None,
+                    grace_ns: None,
+                    expire_ns: None,
+                    key_limit: None,
+                    byte_limit: None,
+                }),
+            };
+        let define = |output_store: Option<String>, window_ns: u64| {
+            define_named("accounts.rollup", output_store, window_ns)
         };
-        // Missing store, foreign-Domain store, zero window, and a missing
-        // output target are all refused.
+        // Missing store, zero window, and a missing output target are all
+        // refused; a foreign-Domain pane store is legal.
         for command in [
             define(Some("accounts.missing".to_owned()), 60),
-            define(Some("other.panes".to_owned()), 60),
             define(None, 60),
             define(Some("accounts.panes".to_owned()), 0),
         ] {
             assert!(leader.execute_commands(vec![command]).await.is_err());
         }
+        // `other.panes` lives in a different Domain and already declares
+        // the pane postings — a legal cross-Domain output.
+        leader
+            .execute_commands(vec![define_named(
+                "accounts.cross.rollup",
+                Some("other.panes".to_owned()),
+                60_000_000_000,
+            )])
+            .await
+            .unwrap();
+        leader
+            .execute("DROP PIPE accounts.cross.rollup;")
+            .await
+            .unwrap();
         // A store without the enumerable pane postings is refused.
         leader
             .execute("DEFINE STATESTORE accounts.plain KEYS dept;")
@@ -15222,7 +15236,8 @@ mod tests {
         }
 
         // Enrich Pipes need both targets: an output Feed and a lookup
-        // StateStore in the same Domain, plus a valid key projection.
+        // StateStore (either may live in another Domain), plus a valid
+        // key projection.
         let enrich = |output_feed, output_store| Command::DefinePipe {
             name: "accounts.enrich".to_owned(),
             subscription: "accounts.flow".to_owned(),
@@ -15251,10 +15266,6 @@ mod tests {
                 Some("accounts.enriched".to_owned()),
                 Some("accounts.missing".to_owned()),
             ),
-            enrich(
-                Some("accounts.enriched".to_owned()),
-                Some("other.panes".to_owned()),
-            ),
             // A self-feeding output loop is refused for Enrich too.
             enrich(
                 Some("accounts.events".to_owned()),
@@ -15268,7 +15279,7 @@ mod tests {
         let result = leader
             .execute_commands(vec![enrich(
                 Some("accounts.enriched".to_owned()),
-                Some("accounts.panes".to_owned()),
+                Some("other.panes".to_owned()),
             )])
             .await
             .unwrap();
