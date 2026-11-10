@@ -35,3 +35,4 @@
 - Autoscaling must use sustained thresholds, hysteresis, cooldowns, and one-node steps.
 - Never scale in a node unless ownership/data draining has completed and the node reports safe-to-remove. Do not use the legacy metadata-only owner transfer as an operator shortcut; owner moves require a verified frozen committed boundary and a compare-and-set Control Plane cutover.
 - Infrastructure scaling runs outside data nodes; do not mount Docker or orchestrator credentials into a data node.
+- Kafka-parity benchmarking: the current status, open work and exact run/profiling recipe live in `docs/kafka-parity-handoff.md`. Always rebuild `whitewater-rust/target-linux/release/examples/bench_feed` and check its timestamp before trusting a Whitewater number, run one system at a time, and never benchmark with debug logging on.

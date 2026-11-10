@@ -6720,10 +6720,27 @@ impl ControlController {
                 // Nodes that already hold the source Range; the consensus
                 // draw only chooses which of them owns it.
                 let replicas = source_assignment.replicas.clone();
+                // Prefer the eligible replica owning the fewest of this
+                // Feed's ranges (ties keep the consensus draw order), so
+                // repeated splits spread owner work across Nodes the way
+                // Kafka spreads partition leaders.
+                let feed_owner_load = |node: &StorageNodeId| {
+                    current_map
+                        .routes()
+                        .iter()
+                        .filter(|route| {
+                            state
+                                .range_assignments
+                                .get(&route.range_id)
+                                .is_some_and(|assignment| &assignment.owner == node)
+                        })
+                        .count()
+                };
                 let owner = placement
                     .replicas
                     .iter()
-                    .find(|node| **node != source_assignment.owner && replicas.contains(node))
+                    .filter(|node| **node != source_assignment.owner && replicas.contains(node))
+                    .min_by_key(|node| feed_owner_load(node))
                     .or_else(|| {
                         replicas
                             .iter()

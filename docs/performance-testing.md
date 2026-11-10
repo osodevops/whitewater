@@ -567,6 +567,11 @@ Remaining loss: 3-range write throughput (0.86x). It does not respond to in-flig
 depth (2/5/8/12 all ≈ 90–94k) and in-memory storage reaches only 93–105k, so the
 limit is neither the disk nor the client's in-flight window.
 
+### Kafka-parity handoff
+
+Current status, open work and the exact run/profiling recipe: see
+[`kafka-parity-handoff.md`](kafka-parity-handoff.md).
+
 ### Kafka-parity rounds — SDK vs SDK as a pass/fail gate (2026-11-01)
 
 The gate: the Whitewater Rust SDK must match or beat the Kafka Java SDK
