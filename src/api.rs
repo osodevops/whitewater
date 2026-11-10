@@ -4450,6 +4450,33 @@ struct ExhaustedDeliveryEvidence {
     positions: BTreeMap<RangeId, Vec<String>>,
 }
 
+/// The member-fetch metadata prelude for
+/// `application/vnd.whitewater.member-frames`: every response field
+/// except `records`/`cursor`, which ride the frame page that follows.
+#[derive(Serialize)]
+struct SubscriptionMemberFetchMeta {
+    request_id: Uuid,
+    positions: BTreeMap<RangeId, String>,
+    ownership_epoch: u64,
+    delivery_attempt: u64,
+    next_delivery_ns: Option<String>,
+    exhausted: Option<ExhaustedDeliveryEvidence>,
+    key_window: Option<u16>,
+    delivery_evidence: Option<String>,
+}
+
+/// The member-fetch binary media type: `u32 meta_len` + meta JSON +
+/// standard frame page. A distinct type (rather than header flags)
+/// because the metadata carries per-range maps too large for headers.
+const MEMBER_FRAMES_MEDIA_TYPE: &str = "application/vnd.whitewater.member-frames";
+
+fn wants_member_frames(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::ACCEPT)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|accept| accept.contains(MEMBER_FRAMES_MEDIA_TYPE))
+}
+
 /// Delivers the bounded page of records after the shared Subscription frontier
 /// to a member holding a live work lease. The returned per-range positions and
 /// Cursor are what the member supplies to `ack`; concurrent members may fetch
@@ -4459,7 +4486,7 @@ async fn subscription_member_fetch(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<SubscriptionMemberFetchRequest>,
-) -> Result<Json<SubscriptionMemberFetchResponse>, ApiError> {
+) -> Result<Response, ApiError> {
     let limit = request
         .limit
         .unwrap_or(64)
@@ -4608,25 +4635,30 @@ async fn subscription_member_fetch(
                 // other windows through the deferred set.
                 let mut exhausted_positions: BTreeMap<RangeId, Vec<String>> = BTreeMap::new();
                 let mut deferred_positions: BTreeMap<RangeId, Vec<String>> = BTreeMap::new();
-                for (range_id, cursor, record) in &parked {
-                    let covered = window_coverage.as_ref().is_none_or(|mine| {
-                        mine.contains(&crate::reader::subscription_work_window(&record.key))
-                    });
+                for (range_id, frame) in &parked {
+                    let covered = match window_coverage.as_ref() {
+                        Some(mine) => {
+                            let record = decode_record(&frame.frame)
+                                .map_err(|error| ApiError::unavailable(error.to_string()))?;
+                            mine.contains(&crate::reader::subscription_work_window(&record.key))
+                        }
+                        None => true,
+                    };
                     if covered {
                         exhausted_positions
                             .entry(*range_id)
                             .or_default()
-                            .push(cursor.clone());
+                            .push(frame.cursor.clone());
                     } else {
                         deferred_positions
                             .entry(*range_id)
                             .or_default()
-                            .push(cursor.clone());
+                            .push(frame.cursor.clone());
                     }
                 }
                 let exhausted_cursor = parked
                     .last()
-                    .map(|(_, cursor, _)| cursor.clone())
+                    .map(|(_, frame)| frame.cursor.clone())
                     .unwrap_or_else(|| claim_view.cursor.clone());
                 // The marker lease op rides the same mutation: one commit
                 // both exhausts the positions and flags the claim, so a
@@ -4674,14 +4706,16 @@ async fn subscription_member_fetch(
     // The frontier Cursor is the end of the fetched span whether or not
     // the records at it were withheld — the deferred set owes them, not
     // the frontier position.
-    let page_end_cursor = delivered.last().map(|(_, cursor, _)| cursor.clone());
+    let page_end_cursor = delivered.last().map(|(_, frame)| frame.cursor.clone());
     // The withheld span positions ride server-issued delivery evidence so
     // the ack defers them to their windows instead of consuming them.
     let mut delivery_evidence: Option<String> = None;
     let delivered = if let Some(mine) = window_coverage.clone() {
         // Positions already deferred to this lease's coverage are the
         // oldest owed work — they deliver first, preserving per-Key order.
-        let mut picked: Vec<(RangeId, String, StoredRecord)> = Vec::new();
+        // The window check is the only consumer of record Keys here, so
+        // deferred/coverage decodes run only on the windowed path.
+        let mut picked: Vec<(RangeId, StoredRangeFrame)> = Vec::new();
         if !page_view.deferred.is_empty() {
             let assignments = state
                 .control
@@ -4714,11 +4748,10 @@ async fn subscription_member_fetch(
                     )
                     .await?;
                     for frame in page.frames {
-                        let bytes = &frame.frame;
-                        let record = decode_record(bytes)
+                        let record = decode_record(&frame.frame)
                             .map_err(|error| ApiError::unavailable(error.to_string()))?;
                         if mine.contains(&crate::reader::subscription_work_window(&record.key)) {
-                            picked.push((*range_id, frame.cursor.clone(), record));
+                            picked.push((*range_id, frame));
                         }
                         if picked.len() >= limit {
                             break 'outer;
@@ -4729,23 +4762,25 @@ async fn subscription_member_fetch(
         }
         let mut delivered_set: BTreeMap<RangeId, Vec<String>> = BTreeMap::new();
         let mut withheld_set: BTreeMap<RangeId, Vec<String>> = BTreeMap::new();
-        let mut head: Vec<(RangeId, String, StoredRecord)> = Vec::new();
-        for (range_id, cursor, record) in delivered {
+        let mut head: Vec<(RangeId, StoredRangeFrame)> = Vec::new();
+        for (range_id, frame) in delivered {
+            let record = decode_record(&frame.frame)
+                .map_err(|error| ApiError::unavailable(error.to_string()))?;
             if mine.contains(&crate::reader::subscription_work_window(&record.key)) {
                 delivered_set
                     .entry(range_id)
                     .or_default()
-                    .push(cursor.clone());
-                head.push((range_id, cursor, record));
+                    .push(frame.cursor.clone());
+                head.push((range_id, frame));
             } else {
-                withheld_set.entry(range_id).or_default().push(cursor);
+                withheld_set.entry(range_id).or_default().push(frame.cursor);
             }
         }
-        for (range_id, cursor, _) in &picked {
+        for (range_id, frame) in &picked {
             delivered_set
                 .entry(*range_id)
                 .or_default()
-                .push(cursor.clone());
+                .push(frame.cursor.clone());
         }
         delivery_evidence = Some(
             STANDARD.encode(
@@ -4778,19 +4813,66 @@ async fn subscription_member_fetch(
     // the legacy absent Cursor.
     let cursor =
         page_end_cursor.or_else(|| window_coverage.is_some().then(|| page_view.cursor.clone()));
+    if wants_member_frames(&headers) {
+        // Member-fetch wire format (`application/vnd.whitewater.member-frames`):
+        // `u32 meta_len` + meta JSON — every response field except
+        // `records`/`cursor`, which ride the standard frame page that
+        // follows verbatim — so bulk member drains never pay the
+        // server-side decode + base64 + JSON pass.
+        let meta = serde_json::to_vec(&SubscriptionMemberFetchMeta {
+            request_id: request.request_id,
+            positions,
+            ownership_epoch: progress_assignment.ownership_epoch,
+            delivery_attempt: request.lease_epoch,
+            next_delivery_ns,
+            exhausted,
+            key_window: lease_window,
+            delivery_evidence,
+        })
+        .map_err(|_| ApiError::unavailable("member fetch metadata failed to encode"))?;
+        let frames: Vec<StoredRangeFrame> = delivered.into_iter().map(|(_, frame)| frame).collect();
+        let mut prefix = Vec::with_capacity(4 + meta.len());
+        prefix.extend_from_slice(&(meta.len() as u32).to_le_bytes());
+        prefix.extend_from_slice(&meta);
+        let stream = futures_util::stream::iter(
+            std::iter::once(Bytes::from(prefix))
+                .chain(encode_frame_fetch_stream(cursor, frames))
+                .map(Ok::<Bytes, std::convert::Infallible>),
+        );
+        state.demand.record_subscription_op(
+            definition.subscription_id,
+            crate::demand::SubscriptionTrafficSample {
+                op: crate::demand::SubscriptionTrafficOp::Fetch,
+                records: delivered_records,
+                ranges: 0,
+                quarantine_add: 0,
+                quarantine_remove: 0,
+                members: members.member_epochs.len() as u64,
+                sampled_at_ns: unix_ns(),
+            },
+        );
+        return Response::builder()
+            .header(header::CONTENT_TYPE, MEMBER_FRAMES_MEDIA_TYPE)
+            .body(Body::from_stream(stream))
+            .map_err(|error| ApiError::unavailable(error.to_string()));
+    }
     let source = record_source_by_id(&state, page_view.feed_id).await;
     let records = delivered
         .into_iter()
-        .map(|(_, frame_cursor, record)| {
-            record_response(
-                crate::domain::CursorRecord {
-                    cursor: frame_cursor,
-                    record,
-                },
-                source.clone(),
-            )
+        .map(|(_, frame)| {
+            decode_record(&frame.frame)
+                .map_err(|error| ApiError::unavailable(error.to_string()))
+                .map(|record| {
+                    record_response(
+                        crate::domain::CursorRecord {
+                            cursor: frame.cursor,
+                            record,
+                        },
+                        source.clone(),
+                    )
+                })
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
     state.demand.record_subscription_op(
         definition.subscription_id,
         crate::demand::SubscriptionTrafficSample {
@@ -4814,7 +4896,8 @@ async fn subscription_member_fetch(
         exhausted,
         key_window: lease_window,
         delivery_evidence,
-    }))
+    })
+    .into_response())
 }
 
 /// Resolve the last committed frame Cursor in every Active Range plus the
@@ -4848,10 +4931,8 @@ async fn resolve_tail_positions(
             frame.map(|frame| frame.cursor.clone()).unwrap_or_default(),
         );
         if let Some(frame) = frame {
-            let decoded = &frame.frame;
-            let record =
-                decode_record(decoded).map_err(|error| ApiError::unavailable(error.to_string()))?;
-            let key = (record.ingest_time_ns, record.message_id);
+            // Ordering fields ride the entry index — no decode here.
+            let key = (frame.ingest_time_ns, frame.message_id);
             if tail.as_ref().is_none_or(|(current, _)| key > *current) {
                 tail = Some((key, frame.cursor.clone()));
             }
@@ -5159,14 +5240,7 @@ async fn resolve_cursor_positions(
         )
         .await;
         for (index, next) in refills.into_iter().zip(refilled) {
-            heads[index] = match next? {
-                Some(frame) => {
-                    let record = decode_record(&frame.frame)
-                        .map_err(|error| ApiError::unavailable(error.to_string()))?;
-                    Some(((record.ingest_time_ns, record.message_id), frame))
-                }
-                None => None,
-            };
+            heads[index] = next?.map(|frame| ((frame.ingest_time_ns, frame.message_id), frame));
         }
         let Some(index) = heads
             .iter()
@@ -5554,7 +5628,7 @@ async fn fetch_frontier_page(
     eligible_ingest_ns: Option<i64>,
 ) -> Result<
     (
-        Vec<(RangeId, String, StoredRecord)>,
+        Vec<(RangeId, StoredRangeFrame)>,
         BTreeMap<RangeId, String>,
         Option<i64>,
     ),
@@ -5592,9 +5666,11 @@ async fn fetch_frontier_page(
         });
     }
 
+    // Ordering fields ride the entry index on every StoredRangeFrame —
+    // this merge never re-decodes a stored frame.
     let mut heads: Vec<Option<((i64, Uuid), StoredRangeFrame)>> =
         (0..streams.len()).map(|_| None).collect();
-    let mut records: Vec<(RangeId, String, StoredRecord)> = Vec::new();
+    let mut records: Vec<(RangeId, StoredRangeFrame)> = Vec::new();
     let mut positions = frontier.positions.clone();
     let mut bytes = 0_usize;
     loop {
@@ -5613,14 +5689,7 @@ async fn fetch_frontier_page(
         )
         .await;
         for (index, next) in refills.into_iter().zip(refilled) {
-            heads[index] = match next? {
-                Some(frame) => {
-                    let record = decode_record(&frame.frame)
-                        .map_err(|error| ApiError::unavailable(error.to_string()))?;
-                    Some(((record.ingest_time_ns, record.message_id), frame))
-                }
-                None => None,
-            };
+            heads[index] = next?.map(|frame| ((frame.ingest_time_ns, frame.message_id), frame));
         }
         let Some(index) = earliest_eligible_head(&heads, eligible_ingest_ns) else {
             break;
@@ -5641,10 +5710,8 @@ async fn fetch_frontier_page(
             break;
         }
         bytes = bytes.saturating_add(frame_bytes);
-        let record = decode_record(&frame.frame)
-            .map_err(|error| ApiError::unavailable(error.to_string()))?;
         positions.insert(streams[index].0, frame.cursor.clone());
-        records.push((streams[index].0, frame.cursor, record));
+        records.push((streams[index].0, frame));
     }
     // The earliest parked head tells the caller when the next record becomes
     // eligible; with no cutoff nothing can be parked.
@@ -6030,10 +6097,14 @@ async fn pipe_drive_fetch_page(
             .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
     let cursor = delivered
         .last()
-        .map(|(_, cursor, _)| cursor.clone())
+        .map(|(_, frame)| frame.cursor.clone())
         .unwrap_or_else(|| frontier.cursor.clone());
     let mut records = Vec::with_capacity(delivered.len());
-    for (_, _, record) in delivered {
+    for (_, frame) in delivered {
+        // The Pipe apply consumes the decoded record — decode runs
+        // here, off the merge path.
+        let record = decode_record(&frame.frame)
+            .map_err(|_| crate::effect::EffectJournalError::Unavailable)?;
         if let Ok(mut tally) = tally.lock() {
             tally.fetch_bytes = tally.fetch_bytes.saturating_add(
                 (record.key.len()
@@ -6423,6 +6494,29 @@ async fn publish_distributary_status(
         .is_ok()
 }
 
+/// Committed Distributary leases read through the Control Plane leader —
+/// `Show{Distributaries}` is read-only, so the reply is linearizable on
+/// the committed catalog, unlike the local applied copy which can lag a
+/// just-committed MOVE. `None` when no committed view is reachable
+/// (local prototype Node, mid-election): the caller then keeps trusting
+/// the locally applied catalog.
+async fn committed_distributary_leases(
+    state: &AppState,
+) -> Option<std::collections::HashMap<Uuid, crate::control::DistributaryLease>> {
+    let plane = state.control_plane.as_ref()?;
+    let execution = plane
+        .execute_commands(vec![crate::control::Command::Show {
+            kind: crate::control::ShowKind::Distributaries,
+            limit: None,
+        }])
+        .await
+        .ok()?;
+    let data = execution.results.into_iter().next()?.data;
+    Some(crate::distributary::parse_committed_distributary_leases(
+        &data,
+    ))
+}
+
 /// A driver could not even be constructed (missing Link, target Feed,
 /// or credentials) — still an operator-visible stall, so publish it
 /// under the committed lease. `copied_records` reads 0 because nothing
@@ -6460,6 +6554,7 @@ pub async fn drive_local_distributaries(
     drivers: &mut std::collections::HashMap<Uuid, crate::distributary::DistributaryDriver>,
     local: &crate::admin::AdminClient,
     limit: usize,
+    committed_check_due: bool,
 ) -> Vec<crate::distributary::DistributaryDriveOutcome> {
     use crate::distributary::{DistributaryDriveOutcome, DistributaryDriveState};
     let Some(local_node) = state.storage_node_id.clone() else {
@@ -6467,13 +6562,35 @@ pub async fn drive_local_distributaries(
         return Vec::new();
     };
     let distributaries = state.control.active_distributaries().await;
-    let leases: std::collections::HashMap<Uuid, crate::control::DistributaryLease> = state
+    let mut leases: std::collections::HashMap<Uuid, crate::control::DistributaryLease> = state
         .control
         .distributary_leases()
         .await
         .into_iter()
         .map(|lease| (lease.distributary_id, lease))
         .collect();
+    // The owner gate below reads the applied catalog, which can lag a
+    // just-committed MOVE — a lease owner that only just rejoined is the
+    // live case. Confirming suspected non-ownership against the leader's
+    // committed view keeps the committed owner driving instead of the
+    // status row going silently stale. `committed_check_due` throttles
+    // the linearizable read to the caller's cadence.
+    if committed_check_due
+        && distributaries.iter().any(|definition| {
+            leases
+                .get(&definition.distributary_id)
+                .is_none_or(|lease| lease.owner != local_node)
+        })
+    {
+        if let Some(committed) = committed_distributary_leases(state).await {
+            crate::distributary::overlay_committed_leases(
+                &mut leases,
+                &committed,
+                &distributaries,
+                &local_node,
+            );
+        }
+    }
     // Evict drivers for dropped Distributaries or leases that moved
     // away; remote session fencing covers an in-flight cycle finishing
     // after the move.
@@ -10367,6 +10484,8 @@ async fn repair_export(
                         identity: item.identity,
                         cursor: item.cursor,
                         frame_base64: STANDARD.encode(&item.frame),
+                        message_id: item.message_id,
+                        ingest_time_ns: item.ingest_time_ns,
                     })
                     .collect(),
                 error: None,
@@ -10445,6 +10564,8 @@ pub struct ReaderFetchRequest {
     pub reader: String,
     pub session_epoch: u64,
     pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ack_cursor: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -10469,14 +10590,22 @@ async fn execute_reader_command(
     command: crate::control::Command,
     request_id: Uuid,
 ) -> Result<crate::control::ControlExecution, ApiError> {
+    execute_reader_commands(state, vec![command], request_id).await
+}
+
+async fn execute_reader_commands(
+    state: &AppState,
+    commands: Vec<crate::control::Command>,
+    request_id: Uuid,
+) -> Result<crate::control::ControlExecution, ApiError> {
     match &state.control_plane {
         Some(control_plane) => control_plane
-            .execute_commands_with_request_id(vec![command], request_id)
+            .execute_commands_with_request_id(commands, request_id)
             .await
             .map_err(ApiError::from),
         None => state
             .control
-            .execute_commands_with_request_id(vec![command], request_id)
+            .execute_commands_with_request_id(commands, request_id)
             .await
             .map_err(ApiError::from),
     }
@@ -10544,7 +10673,7 @@ fn verify_reader_frontier_result(
 ) -> Result<(), ApiError> {
     let data = execution
         .results
-        .first()
+        .last()
         .map(|result| &result.data)
         .ok_or_else(|| ApiError::unavailable("Reader frontier commit returned no result"))?;
     let applied =
@@ -10571,7 +10700,8 @@ async fn replay_reader_fetch(
     reader: &crate::control::ReaderDefinition,
     feed_name: &str,
     request: &ReaderFetchRequest,
-) -> Result<Json<ReaderFetchResponse>, ApiError> {
+    binary: bool,
+) -> Result<Response, ApiError> {
     let reopen = || {
         ApiError::unavailable(
             "Reader fetch request already delivered; reopen the session to replay unacknowledged progress",
@@ -10602,6 +10732,27 @@ async fn replay_reader_fetch(
         .active_reader_by_name(&reader.name)
         .await
         .unwrap_or_else(|| reader.clone());
+    state.demand.record_read(frames.len());
+    record_reader_traffic(
+        state,
+        reader.reader_id,
+        crate::demand::ReaderTrafficOp::Fetch,
+        frames.len(),
+    );
+    let delivered_cursor = Some(reader_frontier_cursor(
+        reader.reader_id,
+        request.session_epoch,
+        request.request_id,
+    ));
+    if binary {
+        return reader_fetch_frames_response(
+            frames,
+            delivered_cursor,
+            fresh.acknowledged_cursor,
+            frontier.last_fetch_limit,
+            frontier.last_fetch_retry_after_ms,
+        );
+    }
     let source = record_source_by_id(state, reader.feed_id).await;
     let records = frames
         .into_iter()
@@ -10618,28 +10769,18 @@ async fn replay_reader_fetch(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
-    state.demand.record_read(records.len());
-    record_reader_traffic(
-        state,
-        reader.reader_id,
-        crate::demand::ReaderTrafficOp::Fetch,
-        records.len(),
-    );
     // A replay serves the identical page, so it reports the advice that
     // page was paced under: both values come from the persisted frontier
     // rather than a Node-local plan that may describe a sibling fetch on
     // this ingress.
     Ok(Json(ReaderFetchResponse {
         records,
-        delivered_cursor: Some(reader_frontier_cursor(
-            reader.reader_id,
-            request.session_epoch,
-            request.request_id,
-        )),
+        delivered_cursor,
         acknowledged_cursor: fresh.acknowledged_cursor,
         recommended_capacity: frontier.last_fetch_limit,
         retry_after_ms: frontier.last_fetch_retry_after_ms,
-    }))
+    })
+    .into_response())
 }
 
 /// Replay the exact page a duplicate `request_id` already committed through
@@ -10654,7 +10795,8 @@ async fn replay_reader_delivery(
     reader: &crate::control::ReaderDefinition,
     feed_name: &str,
     request: &ReaderFetchRequest,
-) -> Result<Json<ReaderFetchResponse>, ApiError> {
+    binary: bool,
+) -> Result<Response, ApiError> {
     let reopen = || {
         ApiError::unavailable(
             "Reader fetch request already delivered; reopen the session to replay unacknowledged progress",
@@ -10691,6 +10833,29 @@ async fn replay_reader_delivery(
         });
         frames.truncate(replay.limit);
     }
+    // The re-derived page must commit to the Cursor the original delivery
+    // recorded; history is immutable, so disagreement means the bracket no
+    // longer describes the page and only a reopen is honest.
+    if frames.is_empty() || frames.last().map(|item| item.cursor.clone()) != reader.delivered_cursor
+    {
+        return Err(reopen());
+    }
+    state.demand.record_read(frames.len());
+    record_reader_traffic(
+        state,
+        reader.reader_id,
+        crate::demand::ReaderTrafficOp::Fetch,
+        frames.len(),
+    );
+    if binary {
+        return reader_fetch_frames_response(
+            frames,
+            reader.delivered_cursor.clone(),
+            reader.acknowledged_cursor.clone(),
+            replay.limit,
+            replay.retry_after_ms,
+        );
+    }
     let source = record_source_by_id(state, reader.feed_id).await;
     let records = frames
         .into_iter()
@@ -10707,35 +10872,22 @@ async fn replay_reader_delivery(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| ApiError::unavailable(error.to_string()))?;
-    // The re-derived page must commit to the Cursor the original delivery
-    // recorded; history is immutable, so disagreement means the bracket no
-    // longer describes the page and only a reopen is honest.
-    if records.is_empty()
-        || records.last().map(|record| record.cursor.clone()) != reader.delivered_cursor
-    {
-        return Err(reopen());
-    }
-    state.demand.record_read(records.len());
-    record_reader_traffic(
-        state,
-        reader.reader_id,
-        crate::demand::ReaderTrafficOp::Fetch,
-        records.len(),
-    );
     Ok(Json(ReaderFetchResponse {
         records,
         delivered_cursor: reader.delivered_cursor.clone(),
         acknowledged_cursor: reader.acknowledged_cursor.clone(),
         recommended_capacity: replay.limit,
         retry_after_ms: replay.retry_after_ms,
-    }))
+    })
+    .into_response())
 }
 
 async fn reader_fetch(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<ReaderFetchRequest>,
-) -> Result<Json<ReaderFetchResponse>, ApiError> {
+) -> Result<Response, ApiError> {
+    let wants_binary = wants_frame_binary(&headers);
     authenticate_credential(&state, &headers)?;
     let reader = reader_when_applied(
         &state.control,
@@ -10775,7 +10927,7 @@ async fn reader_fetch(
         .and_then(|value| value.last_fetch_request_id)
         == Some(request.request_id)
     {
-        return replay_reader_fetch(&state, &reader, &feed.name, &request).await;
+        return replay_reader_fetch(&state, &reader, &feed.name, &request, wants_binary).await;
     }
     // The non-frontier delivery path tracks its own replay bracket on the
     // Reader itself; without this check a retried fetch would re-derive a
@@ -10787,7 +10939,36 @@ async fn reader_fetch(
             .map(|replay| replay.request_id)
             == Some(request.request_id)
     {
-        return replay_reader_delivery(&state, &reader, &feed.name, &request).await;
+        return replay_reader_delivery(&state, &reader, &feed.name, &request, wants_binary).await;
+    }
+    let mut piggybacked_ack: Option<crate::control::Command> = None;
+    if let Some(ack_cursor) = &request.ack_cursor {
+        if reader.acknowledged_cursor.as_deref() != Some(ack_cursor.as_str()) {
+            if reader.delivered_cursor.as_deref() != Some(ack_cursor.as_str()) {
+                return Err(ApiError::bad_request(
+                    "Reader acknowledgement must match the latest delivered Cursor",
+                ));
+            }
+            piggybacked_ack = Some(crate::control::Command::AcknowledgeReader {
+                reader: request.reader.clone(),
+                session_epoch: request.session_epoch,
+                cursor: ack_cursor.clone(),
+            });
+            reader.acknowledged_cursor = Some(ack_cursor.clone());
+        }
+        state.reader_pacing.observe_ack(reader.reader_id);
+        record_reader_traffic(
+            &state,
+            reader.reader_id,
+            crate::demand::ReaderTrafficOp::Ack,
+            0,
+        );
+    } else if reader.acknowledged_cursor.is_some()
+        && reader.acknowledged_cursor == reader.delivered_cursor
+    {
+        state
+            .reader_pacing
+            .reconcile_settled_delivery(reader.reader_id);
     }
     let client_limit = request
         .limit
@@ -10812,13 +10993,23 @@ async fn reader_fetch(
             crate::demand::ReaderTrafficOp::Fetch,
             0,
         );
+        if wants_binary {
+            return reader_fetch_frames_response(
+                Vec::new(),
+                reader.delivered_cursor.clone(),
+                reader.acknowledged_cursor.clone(),
+                0,
+                pacing.retry_after.as_millis().min(u64::MAX as u128) as u64,
+            );
+        }
         return Ok(Json(ReaderFetchResponse {
             records: Vec::new(),
             delivered_cursor: reader.delivered_cursor.clone(),
             acknowledged_cursor: reader.acknowledged_cursor.clone(),
             recommended_capacity: 0,
             retry_after_ms: pacing.retry_after.as_millis().min(u64::MAX as u128) as u64,
-        }));
+        })
+        .into_response());
     }
     let limit = pacing.max_records;
     // A sibling fetch committed through another ingress can land on the
@@ -10828,14 +11019,14 @@ async fn reader_fetch(
     // reporting a session error for applied-catalog lag; a genuinely
     // concurrent commit still fences after the bound.
     let mut stale_delivery_attempts = 0;
-    let (records, delivered_cursor, page_bytes) = loop {
+    let (frames, delivered_cursor, page_bytes) = loop {
         let frontier = state.control.active_reader_frontier(reader.reader_id).await;
         if frontier
             .as_ref()
             .and_then(|value| value.last_fetch_request_id)
             == Some(request.request_id)
         {
-            return replay_reader_fetch(&state, &reader, &feed.name, &request).await;
+            return replay_reader_fetch(&state, &reader, &feed.name, &request, wants_binary).await;
         }
         if stale_delivery_attempts > 0 {
             if let Some(fresh) = state.control.active_reader_by_name(&request.reader).await {
@@ -10886,29 +11077,13 @@ async fn reader_fetch(
             });
             frames.truncate(limit);
         }
-        let source = record_source_by_id(&state, reader.feed_id).await;
         let page_bytes = frames
             .iter()
             .map(|item| item.frame.len().saturating_add(item.cursor.len()))
             .sum::<usize>();
-        let records = frames
-            .into_iter()
-            .map(|item| {
-                decode_record(&item.frame).map(|record| {
-                    record_response(
-                        CursorRecord {
-                            cursor: item.cursor,
-                            record,
-                        },
-                        source.clone(),
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| ApiError::unavailable(error.to_string()))?;
-        let delivered_cursor = records
+        let delivered_cursor = frames
             .last()
-            .map(|record| {
+            .map(|item| {
                 if next_frontier.is_some() {
                     reader_frontier_cursor(
                         reader.reader_id,
@@ -10916,11 +11091,11 @@ async fn reader_fetch(
                         request.request_id,
                     )
                 } else {
-                    record.cursor.clone()
+                    item.cursor.clone()
                 }
             })
             .or(reader.delivered_cursor.clone());
-        if !records.is_empty() {
+        if !frames.is_empty() {
             let cursor = delivered_cursor
                 .clone()
                 .ok_or_else(|| ApiError::unavailable("Reader progress token is unavailable"))?;
@@ -10952,7 +11127,13 @@ async fn reader_fetch(
                     ),
                 }
             };
-            let execution = match execute_reader_command(&state, command, request.request_id).await
+            let mut batch_cmds = Vec::with_capacity(2);
+            if let Some(ack_cmd) = piggybacked_ack.clone() {
+                batch_cmds.push(ack_cmd);
+            }
+            batch_cmds.push(command);
+            let execution = match execute_reader_commands(&state, batch_cmds, request.request_id)
+                .await
             {
                 Ok(execution) => execution,
                 Err(error) => {
@@ -10961,7 +11142,8 @@ async fn reader_fetch(
                         // frontier commit after the winner landed; re-derive the
                         // stored page instead of refusing when it proves identical.
                         if let Ok(response) =
-                            replay_reader_fetch(&state, &reader, &feed.name, &request).await
+                            replay_reader_fetch(&state, &reader, &feed.name, &request, wants_binary)
+                                .await
                         {
                             return Ok(response);
                         }
@@ -10999,7 +11181,7 @@ async fn reader_fetch(
                 // this attempt derived, serve the committed page instead of
                 // reporting a Cursor the ack contract would refuse.
                 let applied = serde_json::from_value::<crate::control::ReaderDefinition>(
-                    execution.results[0].data.clone(),
+                    execution.results.last().expect("result").data.clone(),
                 )
                 .map_err(|error| ApiError::unavailable(error.to_string()))?;
                 if applied.delivered_cursor.as_deref() != Some(persisted_token.as_str()) {
@@ -11009,8 +11191,14 @@ async fn reader_fetch(
                         .map(|replay| replay.request_id)
                         == Some(request.request_id)
                     {
-                        return replay_reader_delivery(&state, &applied, &feed.name, &request)
-                            .await;
+                        return replay_reader_delivery(
+                            &state,
+                            &applied,
+                            &feed.name,
+                            &request,
+                            wants_binary,
+                        )
+                        .await;
                     }
                     return Err(ApiError::unavailable(
                         "Reader progress was not committed; reopen the session to retry safely",
@@ -11018,25 +11206,56 @@ async fn reader_fetch(
                 }
             }
         }
-        break (records, delivered_cursor, page_bytes);
+        if frames.is_empty() {
+            if let Some(ack_cmd) = piggybacked_ack.take() {
+                execute_reader_command(&state, ack_cmd, request.request_id).await?;
+            }
+        }
+        break (frames, delivered_cursor, page_bytes);
     };
-    state.demand.record_read(records.len());
+    state.demand.record_read(frames.len());
     record_reader_traffic(
         &state,
         reader.reader_id,
         crate::demand::ReaderTrafficOp::Fetch,
-        records.len(),
+        frames.len(),
     );
     state
         .reader_pacing
-        .record_page(reader.reader_id, records.len(), page_bytes, limit);
+        .record_page(reader.reader_id, frames.len(), page_bytes, limit);
+    if wants_binary {
+        return reader_fetch_frames_response(
+            frames,
+            delivered_cursor,
+            reader.acknowledged_cursor,
+            pacing.max_records,
+            pacing.retry_after.as_millis().min(u64::MAX as u128) as u64,
+        );
+    }
+    let source = record_source_by_id(&state, reader.feed_id).await;
+    let records = frames
+        .into_iter()
+        .map(|item| {
+            decode_record(&item.frame).map(|record| {
+                record_response(
+                    CursorRecord {
+                        cursor: item.cursor,
+                        record,
+                    },
+                    source.clone(),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ApiError::unavailable(error.to_string()))?;
     Ok(Json(ReaderFetchResponse {
         records,
         delivered_cursor,
         acknowledged_cursor: reader.acknowledged_cursor,
         recommended_capacity: pacing.max_records,
         retry_after_ms: pacing.retry_after.as_millis().min(u64::MAX as u128) as u64,
-    }))
+    })
+    .into_response())
 }
 
 /// `POST /v1/readers/frontier` — the named Reader's durable progress
@@ -11377,6 +11596,41 @@ impl Iterator for FrameFetchChunks {
             self.coalesce.extend_from_slice(&frame.frame);
         }
     }
+}
+
+/// Named-Reader fetch metadata headers for the binary wire: the page's
+/// `next_cursor` slot carries `delivered_cursor` (the opaque ack token),
+/// while session advice that JSON returns as fields moves to headers so
+/// `frame::parse_frame_page` reads the body unchanged.
+const READER_ACK_CURSOR_HEADER: &str = "x-whitewater-acknowledged-cursor";
+const READER_CAPACITY_HEADER: &str = "x-whitewater-recommended-capacity";
+const READER_RETRY_AFTER_HEADER: &str = "x-whitewater-retry-after-ms";
+
+/// `application/vnd.whitewater.frames` response for `/v1/readers/fetch`:
+/// `delivered_cursor` in the `next_cursor` slot plus the session pacing
+/// fields as headers; identical page semantics to the JSON
+/// `ReaderFetchResponse`, without the per-record decode + base64 pass.
+fn reader_fetch_frames_response(
+    frames: Vec<StoredRangeFrame>,
+    delivered_cursor: Option<String>,
+    acknowledged_cursor: Option<String>,
+    recommended_capacity: usize,
+    retry_after_ms: u64,
+) -> Result<Response, ApiError> {
+    let stream = futures_util::stream::iter(
+        encode_frame_fetch_stream(delivered_cursor, frames)
+            .map(Ok::<Bytes, std::convert::Infallible>),
+    );
+    let mut builder = Response::builder()
+        .header(header::CONTENT_TYPE, FRAMES_MEDIA_TYPE)
+        .header(READER_CAPACITY_HEADER, recommended_capacity as u64)
+        .header(READER_RETRY_AFTER_HEADER, retry_after_ms);
+    if let Some(acknowledged) = acknowledged_cursor {
+        builder = builder.header(READER_ACK_CURSOR_HEADER, acknowledged);
+    }
+    builder
+        .body(Body::from_stream(stream))
+        .map_err(|error| ApiError::unavailable(error.to_string()))
 }
 
 async fn temporary_reader_fetch(
@@ -13417,6 +13671,8 @@ async fn move_export(
             identity: frame.identity,
             cursor: frame.cursor,
             frame_base64: STANDARD.encode(&frame.frame),
+            message_id: frame.message_id,
+            ingest_time_ns: frame.ingest_time_ns,
         })
         .collect();
     Ok(Json(MoveExportResponse {
@@ -14084,6 +14340,8 @@ async fn owner_move_export(
             identity: frame.identity,
             cursor: frame.cursor,
             frame_base64: STANDARD.encode(&frame.frame),
+            message_id: frame.message_id,
+            ingest_time_ns: frame.ingest_time_ns,
         })
         .collect();
     Ok(Json(MoveExportResponse {
@@ -17960,6 +18218,8 @@ async fn read_owned_range_page(
                 identity: frame.identity,
                 cursor: frame.cursor,
                 frame_base64: STANDARD.encode(&frame.frame),
+                message_id: frame.message_id,
+                ingest_time_ns: frame.ingest_time_ns,
             })
             .collect(),
     }))
@@ -17970,6 +18230,25 @@ async fn read_placement(
     feed_id: Uuid,
     feed_name: &str,
 ) -> Result<Vec<ActiveRangeAssignment>, ApiError> {
+    if let Some(map) = state.control.active_range_map(feed_id).await {
+        let routes: Vec<RangeId> = map.routes().iter().map(|route| route.range_id).collect();
+        let assignments = state
+            .control
+            .active_range_assignments_for_feed(feed_id)
+            .await;
+        if !routes.is_empty()
+            && routes.len() <= MAX_LOGICAL_READ_RANGES
+            && routes.len() == assignments.len()
+            && routes
+                .iter()
+                .zip(&assignments)
+                .all(|(range_id, assignment)| {
+                    *range_id == assignment.range_id && assignment.feed_id == feed_id
+                })
+        {
+            return Ok(assignments);
+        }
+    }
     let (routes, assignments): (Vec<RangeId>, Vec<ActiveRangeAssignment>) =
         if let Some(control_plane) = &state.control_plane {
             let execution = control_plane
@@ -18329,6 +18608,8 @@ async fn fetch_range_page(
             identity: frame.identity,
             cursor: frame.cursor,
             frame: decoded.into(),
+            message_id: frame.message_id,
+            ingest_time_ns: frame.ingest_time_ns,
         });
     }
     Ok(FetchedRangePage {
@@ -18344,14 +18625,12 @@ fn merge_feed_frames(
     after: Option<&str>,
     limit: usize,
 ) -> Result<Vec<StoredRangeFrame>, ApiError> {
+    // Ordering rides the entry index — the merge never re-decodes a
+    // stored frame to discover (ingest_time_ns, message_id).
     let mut ordered = frames
         .iter()
-        .map(|item| {
-            decode_record(&item.frame)
-                .map(|record| (record.ingest_time_ns, record.message_id))
-                .map_err(|error| ApiError::unavailable(error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|item| (item.ingest_time_ns, item.message_id))
+        .collect::<Vec<_>>();
     let mut indexed = frames.drain(..).zip(ordered.drain(..)).collect::<Vec<_>>();
     indexed.sort_by_key(|(_, order)| *order);
     let start = match after {
@@ -18536,14 +18815,7 @@ async fn read_reader_frontier(
         )
         .await;
         for (index, next) in refills.into_iter().zip(refilled) {
-            heads[index] = match next? {
-                Some(frame) => {
-                    let record = decode_record(&frame.frame)
-                        .map_err(|error| ApiError::unavailable(error.to_string()))?;
-                    Some(((record.ingest_time_ns, record.message_id), frame))
-                }
-                None => None,
-            };
+            heads[index] = next?.map(|frame| ((frame.ingest_time_ns, frame.message_id), frame));
         }
         let Some(index) = heads
             .iter()
@@ -18879,14 +19151,7 @@ async fn read_paginated_feed(
         )
         .await;
         for (index, next) in refills.into_iter().zip(refilled) {
-            heads[index] = match next? {
-                Some(frame) => {
-                    let record = decode_record(&frame.frame)
-                        .map_err(|error| ApiError::unavailable(error.to_string()))?;
-                    Some(((record.ingest_time_ns, record.message_id), frame))
-                }
-                None => None,
-            };
+            heads[index] = next?.map(|frame| ((frame.ingest_time_ns, frame.message_id), frame));
         }
         let Some(index) = heads
             .iter()
@@ -19395,7 +19660,7 @@ async fn read_feed_records(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<FeedReadQuery>,
-) -> Result<Json<Vec<RecordResponse>>, ApiError> {
+) -> Result<Response, ApiError> {
     authorize_namespace(&state, &headers, &query.feed, PermissionAction::Read)?;
     let feed = feed_when_applied(&state.control, &query.feed, state.control_plane.is_some())
         .await
@@ -19410,7 +19675,21 @@ async fn read_feed_records(
         false,
     )
     .await?;
-    frames
+    if wants_frame_binary(&headers) {
+        let next_cursor = frames
+            .last()
+            .map(|item| item.cursor.clone())
+            .or(query.after.clone());
+        let stream = futures_util::stream::iter(
+            encode_frame_fetch_stream(next_cursor, frames)
+                .map(Ok::<Bytes, std::convert::Infallible>),
+        );
+        return Response::builder()
+            .header(header::CONTENT_TYPE, FRAMES_MEDIA_TYPE)
+            .body(Body::from_stream(stream))
+            .map_err(|error| ApiError::unavailable(error.to_string()));
+    }
+    let records = frames
         .into_iter()
         .map(|item| {
             decode_record(&item.frame)
@@ -19425,8 +19704,8 @@ async fn read_feed_records(
                 })
                 .map_err(|error| ApiError::unavailable(error.to_string()))
         })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Json)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Json(records).into_response())
 }
 
 #[derive(Deserialize)]
@@ -19980,6 +20259,8 @@ mod tests {
                 },
                 cursor: format!("cursor-{position}"),
                 frame: Bytes::new(),
+                message_id: Uuid::from_u128(u128::from(position) + 1),
+                ingest_time_ns,
             },
         ))
     }
@@ -20638,6 +20919,8 @@ mod tests {
             })
             .unwrap()
             .into(),
+            message_id: Uuid::from_u128(index as u128),
+            ingest_time_ns: ingest,
         };
         let frames = vec![frame(3, 3), frame(1, 1), frame(2, 2)];
         let resumed = merge_feed_frames(frames.clone(), Some("cursor-1"), 2).unwrap();
@@ -27547,6 +27830,30 @@ mod tests {
                 (status, body)
             }
         };
+        // The member-frames wire: `Accept` negotiates the binary page and
+        // the reply is `u32 meta_len` + meta JSON + standard frame page.
+        let post_member_frames = |path: &str, body: Value| {
+            let client = client.clone();
+            let url = format!("{base}/{path}");
+            async move {
+                let response = client
+                    .post(url)
+                    .header("authorization", "Bearer this-is-a-long-development-api-key")
+                    .header("accept", "application/vnd.whitewater.member-frames")
+                    .json(&body)
+                    .send()
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let content_type = response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let body = response.bytes().await.unwrap().to_vec();
+                (status, content_type, body)
+            }
+        };
         let member = Uuid::from_u128(0x1111);
         let work = Uuid::from_u128(0x2222);
 
@@ -27795,6 +28102,49 @@ mod tests {
             body["positions"][progress_range.to_string()],
             json!("cursor-10")
         );
+        // The member-frames wire serves the identical page: `u32
+        // meta_len` + meta JSON (every field except records/cursor) +
+        // the standard frame page whose `next_cursor` carries `cursor`.
+        let (status, content_type, raw) = post_member_frames(
+            "fetch",
+            json!({"subscription": "orders.billing", "request_id": Uuid::from_u128(0x1201),
+                "member_id": member, "member_epoch": 2, "work_id": work,
+                "lease_epoch": claimed_epoch,
+                "limit": 3}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            content_type.as_deref(),
+            Some("application/vnd.whitewater.member-frames")
+        );
+        let meta_len = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+        let meta: Value = serde_json::from_slice(&raw[4..4 + meta_len]).unwrap();
+        assert_eq!(meta["delivery_attempt"], json!(claimed_epoch));
+        assert_eq!(
+            meta["positions"][progress_range.to_string()],
+            json!("cursor-10")
+        );
+        let page = &raw[4 + meta_len..];
+        let count = u32::from_le_bytes(page[..4].try_into().unwrap()) as usize;
+        assert_eq!(count, 3);
+        let next_len = u32::from_le_bytes(page[4..8].try_into().unwrap()) as usize;
+        let next_cursor = std::str::from_utf8(&page[8..8 + next_len]).unwrap();
+        assert_eq!(next_cursor, "cursor-10");
+        let mut offset = 8 + next_len;
+        let mut page_cursors = Vec::new();
+        for _ in 0..count {
+            let cursor_len =
+                u32::from_le_bytes(page[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4;
+            let cursor = std::str::from_utf8(&page[offset..offset + cursor_len]).unwrap();
+            offset += cursor_len;
+            let frame_len =
+                u32::from_le_bytes(page[offset..offset + 4].try_into().unwrap()) as usize;
+            offset += 4 + frame_len;
+            page_cursors.push(cursor.to_owned());
+        }
+        assert_eq!(page_cursors, vec!["cursor-8", "cursor-9", "cursor-10"]);
         // The member acknowledges the delivered page atomically, marking
         // one delivered record as delivered-but-not-processed — durable
         // poison/quarantine evidence the operator can inspect and a later
@@ -31284,6 +31634,8 @@ mod tests {
             })
             .expect("record encodes")
             .into(),
+            message_id: Uuid::nil(),
+            ingest_time_ns: 1,
         }
     }
 
@@ -31370,5 +31722,284 @@ mod tests {
             .all(|chunk| chunk.len() <= FRAME_FETCH_CHUNK_BYTES + 2048));
         let joined: Vec<u8> = chunks.into_iter().flatten().collect();
         assert_eq!(joined, expected);
+    }
+
+    #[tokio::test]
+    async fn reader_fetch_accepts_piggybacked_ack_cursor_in_one_round_trip() {
+        let directory = TempDir::new().unwrap();
+        let (mut local_state, _plane, control, _replica) =
+            internal_replica_test_state(&directory).await;
+        let assignment = control
+            .active_range_assignment(
+                control
+                    .active_feed_by_name("orders.events")
+                    .await
+                    .unwrap()
+                    .feed_id,
+            )
+            .await
+            .unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id: assignment.feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        seed_committed_history(&directory.path().join("active-ranges"), &descriptor, 4);
+        control
+            .execute("CREATE READER orders.reader FROM orders.events START AT BEGINNING;")
+            .await
+            .unwrap();
+        let opened = control
+            .execute_commands(vec![Command::OpenReaderSession {
+                reader: "orders.reader".to_owned(),
+                capacity: 2,
+            }])
+            .await
+            .unwrap();
+        let epoch = opened.results[0].data["session_epoch"].as_u64().unwrap();
+        // Switch to local-prototype mode so reader_fetch executes against
+        // the in-process catalog without a 3-node Raft network.
+        local_state.control_plane = None;
+        let app = router(local_state);
+        let key = Some("this-is-a-long-development-api-key");
+
+        let page1 = app
+            .clone()
+            .oneshot(admin_request(
+                "/v1/readers/fetch",
+                json!({
+                    "request_id": Uuid::new_v4(),
+                    "reader": "orders.reader",
+                    "session_epoch": epoch,
+                    "limit": 2,
+                }),
+                key,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(page1.status(), StatusCode::OK);
+        let body1: Value = serde_json::from_slice(
+            &axum::body::to_bytes(page1.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body1["records"].as_array().unwrap().len(), 2);
+        let delivered1 = body1["delivered_cursor"].as_str().unwrap().to_owned();
+        assert!(body1["acknowledged_cursor"].is_null());
+
+        // Second fetch piggybacks ack_cursor = delivered1, acknowledging
+        // page 1 and fetching page 2 in one HTTP call.
+        let page2 = app
+            .clone()
+            .oneshot(admin_request(
+                "/v1/readers/fetch",
+                json!({
+                    "request_id": Uuid::new_v4(),
+                    "reader": "orders.reader",
+                    "session_epoch": epoch,
+                    "limit": 2,
+                    "ack_cursor": delivered1,
+                }),
+                key,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(page2.status(), StatusCode::OK);
+        let body2: Value = serde_json::from_slice(
+            &axum::body::to_bytes(page2.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body2["records"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body2["acknowledged_cursor"].as_str(),
+            Some(delivered1.as_str())
+        );
+        let reader_after = control
+            .active_reader_by_name("orders.reader")
+            .await
+            .unwrap();
+        assert_eq!(
+            reader_after.acknowledged_cursor.as_deref(),
+            Some(delivered1.as_str())
+        );
+        let _ = app;
+    }
+
+    #[tokio::test]
+    async fn reader_fetch_serves_binary_frames_with_pacing_headers() {
+        let directory = TempDir::new().unwrap();
+        let (mut local_state, _plane, control, _replica) =
+            internal_replica_test_state(&directory).await;
+        let assignment = control
+            .active_range_assignment(
+                control
+                    .active_feed_by_name("orders.events")
+                    .await
+                    .unwrap()
+                    .feed_id,
+            )
+            .await
+            .unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id: assignment.feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        seed_committed_history(&directory.path().join("active-ranges"), &descriptor, 4);
+        control
+            .execute("CREATE READER orders.reader FROM orders.events START AT BEGINNING;")
+            .await
+            .unwrap();
+        let opened = control
+            .execute_commands(vec![Command::OpenReaderSession {
+                reader: "orders.reader".to_owned(),
+                capacity: 2,
+            }])
+            .await
+            .unwrap();
+        let epoch = opened.results[0].data["session_epoch"].as_u64().unwrap();
+        local_state.control_plane = None;
+        let app = router(local_state);
+        let frames_request = |body: Value| {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/readers/fetch")
+                .header("content-type", "application/json")
+                .header("accept", "application/vnd.whitewater.frames")
+                .header("authorization", "Bearer this-is-a-long-development-api-key")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap()
+        };
+        let page = app
+            .clone()
+            .oneshot(frames_request(json!({
+                "request_id": Uuid::new_v4(),
+                "reader": "orders.reader",
+                "session_epoch": epoch,
+                "limit": 2,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        assert_eq!(
+            page.headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/vnd.whitewater.frames")
+        );
+        assert!(page
+            .headers()
+            .get("x-whitewater-recommended-capacity")
+            .is_some());
+        assert!(page.headers().get("x-whitewater-retry-after-ms").is_some());
+        let raw = axum::body::to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let count = u32::from_le_bytes(raw[..4].try_into().unwrap()) as usize;
+        assert_eq!(count, 2);
+        let next_len = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
+        let delivered = std::str::from_utf8(&raw[8..8 + next_len])
+            .unwrap()
+            .to_owned();
+        assert!(!delivered.is_empty());
+        // A second binary fetch piggybacks the ack the same way the
+        // JSON contract does — acknowledged_cursor rides the header.
+        let page2 = app
+            .clone()
+            .oneshot(frames_request(json!({
+                "request_id": Uuid::new_v4(),
+                "reader": "orders.reader",
+                "session_epoch": epoch,
+                "limit": 2,
+                "ack_cursor": delivered,
+            })))
+            .await
+            .unwrap();
+        assert_eq!(page2.status(), StatusCode::OK);
+        assert_eq!(
+            page2
+                .headers()
+                .get("x-whitewater-acknowledged-cursor")
+                .and_then(|value| value.to_str().ok()),
+            Some(delivered.as_str())
+        );
+        let _ = app;
+    }
+
+    #[tokio::test]
+    async fn feed_records_serves_binary_frames_on_accept() {
+        let directory = TempDir::new().unwrap();
+        let (mut local_state, _plane, control, _replica) =
+            internal_replica_test_state(&directory).await;
+        let assignment = control
+            .active_range_assignment(
+                control
+                    .active_feed_by_name("orders.events")
+                    .await
+                    .unwrap()
+                    .feed_id,
+            )
+            .await
+            .unwrap();
+        let descriptor = ActiveRangeDescriptor {
+            feed_id: assignment.feed_id,
+            range_id: assignment.range_id,
+            generation: assignment.generation,
+            ownership_epoch: assignment.ownership_epoch,
+        };
+        seed_committed_history(&directory.path().join("active-ranges"), &descriptor, 4);
+        local_state.control_plane = None;
+        let app = router(local_state);
+        let page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/feeds/records?feed=orders.events&limit=2")
+                    .header("accept", "application/vnd.whitewater.frames")
+                    .header("authorization", "Bearer this-is-a-long-development-api-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        assert_eq!(
+            page.headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok()),
+            Some("application/vnd.whitewater.frames")
+        );
+        let raw = axum::body::to_bytes(page.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(raw[..4].try_into().unwrap()), 2);
+        // The same GET without the Accept stays JSON for compatibility.
+        let page = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/feeds/records?feed=orders.events&limit=2")
+                    .header("authorization", "Bearer this-is-a-long-development-api-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(page.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body.as_array().unwrap().len(), 2);
+        let _ = app;
     }
 }

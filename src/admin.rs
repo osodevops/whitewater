@@ -996,6 +996,7 @@ impl ReaderSessionClient {
                     reader: self.reader.clone(),
                     session_epoch: self.session_epoch,
                     limit,
+                    ack_cursor: None,
                 },
             )
             .await
@@ -1028,6 +1029,7 @@ impl ReaderSessionClient {
                     reader: self.reader.clone(),
                     session_epoch: self.session_epoch,
                     limit: None,
+                    ack_cursor: None,
                 },
             )
             .await

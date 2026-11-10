@@ -45,6 +45,12 @@ pub struct RepairFrame {
     pub identity: super::AppendIdentity,
     pub cursor: String,
     pub frame_base64: String,
+    /// Indexed MessageId/ingest time — the reader merge orders frames
+    /// from these fields without re-decoding the stored frame.
+    #[serde(default)]
+    pub message_id: Uuid,
+    #[serde(default)]
+    pub ingest_time_ns: i64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

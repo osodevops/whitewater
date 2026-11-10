@@ -15,3 +15,4 @@ Thumbs.db
 .tmp_*.py
 __pycache__/
 /acceptance-logs/
+/target-linux

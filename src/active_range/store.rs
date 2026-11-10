@@ -106,6 +106,11 @@ pub struct StoredRangeFrame {
     pub identity: AppendIdentity,
     pub cursor: String,
     pub frame: Bytes,
+    /// The record's MessageId as indexed at append time — ordering fields
+    /// ride the index so merges never re-decode the stored frame.
+    pub message_id: Uuid,
+    /// The record's ingest timestamp as indexed at append time.
+    pub ingest_time_ns: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -305,6 +310,17 @@ pub trait ActiveRangeStore: Send + Sync {
         requests: Vec<ActiveRangeAppend>,
         commit: BatchCommit,
     ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError>;
+    /// Replica-side batch + fused commit with precomputed frame headers and
+    /// BLAKE3 digests (computed outside the follower's `append_gate`).
+    async fn import_commit_batch_precomputed(
+        &self,
+        requests: Vec<ActiveRangeAppend>,
+        precomputed: Vec<(crate::codec::RecordHeader, [u8; 32])>,
+        commit: BatchCommit,
+    ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError> {
+        let _ = precomputed;
+        self.import_commit_batch(requests, commit).await
+    }
     /// Staged-import one ordered batch of frames under a single range lock,
     /// flushing file data and the persisted snapshot once at the end.
     /// Staged candidates are re-derivable from the split/merge source and
@@ -974,6 +990,18 @@ impl ActiveRangeStore for FileActiveRangeStore {
             .await
     }
 
+    async fn import_commit_batch_precomputed(
+        &self,
+        requests: Vec<ActiveRangeAppend>,
+        precomputed: Vec<(crate::codec::RecordHeader, [u8; 32])>,
+        commit: BatchCommit,
+    ) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError> {
+        self.blocking_mutation(move |inner| {
+            append_batch_with_meta(inner, requests, Some(precomputed), true, Some(commit), true)
+        })
+        .await
+    }
+
     async fn commit(
         &self,
         generation: RangeGeneration,
@@ -1478,20 +1506,12 @@ pub struct BatchCommit {
     pub frame_digest: [u8; 32],
 }
 
-fn append_batch(
-    inner: &FileActiveRangeStoreInner,
-    requests: Vec<ActiveRangeAppend>,
-    import: bool,
-    commit: Option<BatchCommit>,
-    allow_deferred: bool,
-) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError> {
-    let _timer = std::time::Instant::now();
-    // Header peek + blake3 digest are pure functions of the frame
-    // bytes — run them for the whole batch before the `loaded` lock,
-    // spread over threads when the batch is large (this already runs
-    // on a blocking-pool thread).
-    let mut frame_meta: Vec<(crate::codec::RecordHeader, [u8; 32])> =
-        Vec::with_capacity(requests.len());
+/// Precompute `(RecordHeader, frame_digest)` for a batch of frames in
+/// parallel outside any range gate or store lock.
+pub fn precompute_frame_meta(
+    requests: &[ActiveRangeAppend],
+) -> Result<Vec<(crate::codec::RecordHeader, [u8; 32])>, ActiveRangeStoreError> {
+    let mut frame_meta = Vec::with_capacity(requests.len());
     if requests.len() >= 256 {
         let workers = std::thread::available_parallelism()
             .map(|count| count.get().min(8))
@@ -1527,13 +1547,39 @@ fn append_batch(
         .collect::<Result<Vec<Vec<(crate::codec::RecordHeader, [u8; 32])>>, _>>()?;
         frame_meta.extend(scoped.into_iter().flatten());
     } else {
-        for request in &requests {
+        for request in requests {
             frame_meta.push((
                 peek_record_header(&request.frame)?,
                 *blake3::hash(&request.frame).as_bytes(),
             ));
         }
     }
+    Ok(frame_meta)
+}
+
+fn append_batch(
+    inner: &FileActiveRangeStoreInner,
+    requests: Vec<ActiveRangeAppend>,
+    import: bool,
+    commit: Option<BatchCommit>,
+    allow_deferred: bool,
+) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError> {
+    append_batch_with_meta(inner, requests, None, import, commit, allow_deferred)
+}
+
+fn append_batch_with_meta(
+    inner: &FileActiveRangeStoreInner,
+    requests: Vec<ActiveRangeAppend>,
+    precomputed: Option<Vec<(crate::codec::RecordHeader, [u8; 32])>>,
+    import: bool,
+    commit: Option<BatchCommit>,
+    allow_deferred: bool,
+) -> Result<Vec<ActiveRangeAppendResult>, ActiveRangeStoreError> {
+    let _timer = std::time::Instant::now();
+    let frame_meta = match precomputed {
+        Some(meta) if meta.len() == requests.len() => meta,
+        _ => precompute_frame_meta(&requests)?,
+    };
     let _precompute_ms = _timer.elapsed().as_secs_f64() * 1000.0;
     let _prematerialize_mark = std::time::Instant::now();
     prematerialize_for_appends(inner, &requests)?;
@@ -1978,10 +2024,16 @@ fn append_locked(
     }
     // A staged batch buffers bytes before one write; the rotation check
     // must see them on disk first, or the new segment's offsets drift.
+    let encrypted = matches!(
+        inner.options.feed_key,
+        Some(crate::control::FeedKeyState::Active(_))
+    );
+    let can_rotate = loaded.persisted.pending_effect.is_none()
+        && (!encrypted || loaded.persisted.appended == loaded.persisted.committed);
     if staged > 0 {
         let would_rotate = loaded.active_length + staged + encoded.len() as u64
             > inner.options.max_segment_bytes
-            && loaded.persisted.appended == loaded.persisted.committed;
+            && can_rotate;
         if would_rotate {
             let staging = staging.as_deref_mut().expect("staged above");
             loaded.active_file.write_all(staging)?;
@@ -2784,14 +2836,43 @@ fn truncate_uncommitted_locked(
 ) -> Result<u64, ActiveRangeStoreError> {
     validate_generation_and_epoch(&loaded.persisted, generation, ownership_epoch)?;
     let committed = loaded.persisted.committed;
-    if loaded.entries.iter().any(|entry| {
-        entry.position.value() > committed && entry.segment != loaded.persisted.active_segment
-    }) || loaded
+    let encrypted = matches!(
+        inner.options.feed_key,
+        Some(crate::control::FeedKeyState::Active(_))
+    );
+    if loaded
         .remote
         .values()
         .any(|manifest| manifest.last_position > committed)
+        || (encrypted
+            && loaded.entries.iter().any(|entry| {
+                entry.position.value() > committed
+                    && entry.segment != loaded.persisted.active_segment
+            }))
     {
         return Err(ActiveRangeStoreError::UncommittedSealedSegment);
+    }
+    let target_segment = loaded
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| entry.position.value() <= committed)
+        .map(|entry| entry.segment)
+        .or_else(|| loaded.remote.keys().next_back().map(|seg| seg + 1))
+        .unwrap_or(0);
+    if target_segment < loaded.persisted.active_segment {
+        for seg in (target_segment + 1)..=loaded.persisted.active_segment {
+            let _ = fs::remove_file(segment_path(&inner.directory, seg));
+            let _ = fs::remove_file(checkpoint_path(&inner.directory, seg));
+            let _ = fs::remove_file(manifest_path(&inner.directory, seg));
+            loaded.sealing.remove(&seg);
+            unverify_segment(&inner.verified, seg);
+        }
+        let _ = fs::remove_file(checkpoint_path(&inner.directory, target_segment));
+        let _ = fs::remove_file(manifest_path(&inner.directory, target_segment));
+        loaded.sealing.remove(&target_segment);
+        loaded.persisted.active_segment = target_segment;
+        loaded.active_file = open_segment(&inner.directory, target_segment)?;
     }
     let active_length = loaded
         .entries
@@ -2852,9 +2933,14 @@ fn rotate_if_needed(
     next_entry_bytes: u64,
 ) -> Result<(), ActiveRangeStoreError> {
     let current_length = loaded.active_file.metadata()?.len();
+    let encrypted = matches!(
+        inner.options.feed_key,
+        Some(crate::control::FeedKeyState::Active(_))
+    );
     if current_length == 0
         || current_length.saturating_add(next_entry_bytes) <= inner.options.max_segment_bytes
-        || loaded.persisted.appended != loaded.persisted.committed
+        || loaded.persisted.pending_effect.is_some()
+        || (encrypted && loaded.persisted.appended != loaded.persisted.committed)
     {
         return Ok(());
     }
@@ -4074,6 +4160,8 @@ fn read_indexed_frame(
             identity: entry.identity.clone(),
             cursor: entry.cursor.clone(),
             frame: frame.into(),
+            message_id: entry.message_id,
+            ingest_time_ns: entry.ingest_time_ns,
         });
     }
     let path = loaded
@@ -4109,6 +4197,8 @@ fn read_indexed_frame(
         identity: entry.identity.clone(),
         cursor: entry.cursor.clone(),
         frame: frame.into(),
+        message_id: entry.message_id,
+        ingest_time_ns: entry.ingest_time_ns,
     })
 }
 
@@ -4301,6 +4391,8 @@ fn read_file_frame_run(
             identity: entry.identity.clone(),
             cursor: entry.cursor.clone(),
             frame: span.slice(start..end),
+            message_id: entry.message_id,
+            ingest_time_ns: entry.ingest_time_ns,
         });
     }
     let _build_ms = _timer.elapsed().as_secs_f64() * 1000.0 - _verify_ms - _io_ms;
@@ -7310,5 +7402,95 @@ mod tests {
                 | ActiveRangeStoreError::RemoteFetch(_)
                 | ActiveRangeStoreError::Io(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn unencrypted_segments_rotate_identically_when_uncommitted_vs_fused_committed() {
+        let descriptor = test_descriptor();
+        let opts = FileActiveRangeStoreOptions {
+            max_segment_bytes: 512,
+            ..FileActiveRangeStoreOptions::default()
+        };
+        let owner_dir = tempfile::TempDir::new().unwrap();
+        let follower_dir = tempfile::TempDir::new().unwrap();
+        let owner = FileActiveRangeStore::open_with_options(
+            owner_dir.path(),
+            descriptor.clone(),
+            opts.clone(),
+        )
+        .unwrap();
+        let follower =
+            FileActiveRangeStore::open_with_options(follower_dir.path(), descriptor.clone(), opts)
+                .unwrap();
+
+        let make_batch = |start: u64, count: u64| -> Vec<ActiveRangeAppend> {
+            (start..start + count)
+                .map(|seq| ActiveRangeAppend {
+                    generation: descriptor.generation,
+                    ownership_epoch: descriptor.ownership_epoch,
+                    expected_position: Some(RangePosition::new(seq)),
+                    identity: AppendIdentity {
+                        writer_session_id: Uuid::from_u128(11),
+                        writer_epoch: 1,
+                        sequence: seq,
+                    },
+                    cursor: format!("cursor-{seq}"),
+                    frame: crate::codec::encode_record(&StoredRecord {
+                        message_id: Uuid::from_u128(9000 + seq as u128),
+                        producer_id: Uuid::from_u128(11),
+                        producer_sequence: seq,
+                        event_time_ns: seq as i64,
+                        ingest_time_ns: seq as i64,
+                        key: b"k".to_vec(),
+                        payload: vec![b'x'; 200],
+                        metadata: std::collections::BTreeMap::new(),
+                    })
+                    .unwrap()
+                    .into(),
+                    pending_effect: None,
+                })
+                .collect()
+        };
+
+        // Owner appends two batches while batch 1 is still uncommitted
+        // (simulating pipelined in-flight quorum rounds).
+        let b1 = make_batch(1, 3);
+        let b2 = make_batch(4, 3);
+        let r1 = owner.append_batch(b1.clone()).await.unwrap();
+        let r2 = owner.append_batch(b2.clone()).await.unwrap();
+
+        // Follower imports each batch with a fused commit marker.
+        follower
+            .import_commit_batch(
+                b1,
+                BatchCommit {
+                    generation: descriptor.generation,
+                    ownership_epoch: descriptor.ownership_epoch,
+                    position: CommitPosition::new(3),
+                    frame_digest: r1.last().unwrap().frame_digest,
+                },
+            )
+            .await
+            .unwrap();
+        follower
+            .import_commit_batch(
+                b2,
+                BatchCommit {
+                    generation: descriptor.generation,
+                    ownership_epoch: descriptor.ownership_epoch,
+                    position: CommitPosition::new(6),
+                    frame_digest: r2.last().unwrap().frame_digest,
+                },
+            )
+            .await
+            .unwrap();
+
+        let owner_snap = owner.snapshot().await.unwrap();
+        let follower_snap = follower.snapshot().await.unwrap();
+        assert!(owner_snap.segment_count > 1);
+        assert_eq!(
+            owner_snap.segment_count, follower_snap.segment_count,
+            "pipelined owner and fused-commit follower must rotate at identical boundaries"
+        );
     }
 }

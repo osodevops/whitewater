@@ -220,9 +220,7 @@ impl RaftStorage<ControlTypeConfig> for PersistentRaftStore {
     ) -> Result<(), StorageError<ControlNodeId>> {
         let mut data = self.data.write().await;
         data.committed = committed;
-        Ok(self
-            .persist(&data)
-            .map_err(|error| StorageIOError::write_logs(&error))?)
+        Ok(())
     }
 
     async fn read_committed(
@@ -309,11 +307,16 @@ impl RaftStorage<ControlTypeConfig> for PersistentRaftStore {
                     }
                 }
             };
-            let mut data = self.data.write().await;
-            data.state_machine.last_applied_log = Some(entry.log_id);
+            {
+                let mut data = self.data.write().await;
+                data.state_machine.last_applied_log = Some(entry.log_id);
+            }
+            results.push(result);
+        }
+        if !entries.is_empty() {
+            let data = self.data.read().await;
             self.persist(&data)
                 .map_err(|error| StorageIOError::write_state_machine(&error))?;
-            results.push(result);
         }
         Ok(results)
     }

@@ -163,6 +163,9 @@ type SendLanes =
     Arc<Mutex<std::collections::BTreeMap<(super::RangeId, StorageNodeId), Arc<Semaphore>>>>;
 type RepairLocks =
     Arc<Mutex<std::collections::BTreeMap<(super::RangeId, StorageNodeId), Arc<Mutex<()>>>>>;
+type FollowerWatermark = (super::RangeGeneration, super::OwnershipEpoch, u64, u64);
+type FollowerWatermarks =
+    Arc<Mutex<std::collections::BTreeMap<(super::RangeId, StorageNodeId), FollowerWatermark>>>;
 
 struct OrderedTurn {
     next_issue: AtomicU64,
@@ -304,6 +307,9 @@ pub struct MajorityAppendCoordinator {
     >,
     /// Per-range bound on queued-but-undrained submissions.
     group_queue_windows: Arc<Mutex<std::collections::BTreeMap<super::RangeId, Arc<Semaphore>>>>,
+    /// Per-(range, follower) highest confirmed (generation, epoch, appended, committed)
+    /// positions observed from replica batch/commit acks.
+    follower_watermarks: FollowerWatermarks,
     /// Per-range round executor: a dedicated OS thread with its own
     /// current-thread runtime runs group rounds detached — cancelling
     /// the driving HTTP request can never abort a quorum round. The
@@ -330,9 +336,45 @@ impl MajorityAppendCoordinator {
             repair_locks: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             group_queues: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             group_queue_windows: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            follower_watermarks: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
 
             proofs: None,
         }
+    }
+
+    async fn note_follower_progress(
+        &self,
+        range_id: super::RangeId,
+        follower: &StorageNodeId,
+        generation: super::RangeGeneration,
+        epoch: super::OwnershipEpoch,
+        appended: u64,
+        committed: u64,
+    ) {
+        let mut guard = self.follower_watermarks.lock().await;
+        let entry = guard
+            .entry((range_id, follower.clone()))
+            .or_insert((generation, epoch, 0, 0));
+        if (generation.value(), epoch.value()) > (entry.0.value(), entry.1.value()) {
+            *entry = (generation, epoch, appended, committed);
+        } else if entry.0 == generation && entry.1 == epoch {
+            entry.2 = entry.2.max(appended);
+            entry.3 = entry.3.max(committed);
+        }
+    }
+
+    async fn follower_progress(
+        &self,
+        range_id: super::RangeId,
+        follower: &StorageNodeId,
+        generation: super::RangeGeneration,
+        epoch: super::OwnershipEpoch,
+    ) -> Option<(u64, u64)> {
+        let guard = self.follower_watermarks.lock().await;
+        guard
+            .get(&(range_id, follower.clone()))
+            .filter(|(g, e, _, _)| *g == generation && *e == epoch)
+            .map(|(_, _, appended, committed)| (*appended, *committed))
     }
 
     async fn send_turn(
@@ -575,6 +617,20 @@ impl MajorityAppendCoordinator {
     where
         F: FnOnce(u64) -> Result<bytes::Bytes, crate::codec::CodecError> + Send,
     {
+        let _drain = self
+            .in_flight_window(request.range_id)
+            .await
+            .acquire_many_owned(MAX_INFLIGHT_ROUNDS as u32)
+            .await
+            .map_err(|_| {
+                self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    "Active Range append window is closed",
+                    true,
+                    vec![],
+                    vec![],
+                )
+            })?;
         let _append_guard = self.append_lock(request.range_id).await.lock_owned().await;
         request.expected_position = self
             .next_position(request.feed_id, request.range_id)
@@ -1397,16 +1453,38 @@ impl MajorityAppendCoordinator {
         // unit — the same CommitPosition the two-round protocol writes,
         // one network round earlier. Pending-effect runs stay fenced
         // behind their effect journal and keep the deferred path.
+        // Sort and deduplicate follower frames by expected_position so a
+        // merged round combining a deduplicated retry batch with a fresh
+        // batch stays in strictly increasing position order and pins its
+        // fused commit marker to the true highest-position tail frame.
+        let mut paired: Vec<(
+            crate::active_range::replication::ReplicaBatchFrame,
+            RangePosition,
+            [u8; 32],
+        )> = follower_frames
+            .into_iter()
+            .zip(local_results.iter())
+            .map(|(frame, local)| (frame, local.position, local.frame_digest))
+            .collect();
+        paired.sort_by_key(|(_, pos, _)| *pos);
+        paired.dedup_by_key(|(_, pos, _)| *pos);
+        let expected_frames: Vec<(RangePosition, [u8; 32])> =
+            paired.iter().map(|(_, pos, digest)| (*pos, *digest)).collect();
+        let follower_frames: Vec<crate::active_range::replication::ReplicaBatchFrame> =
+            paired.into_iter().map(|(frame, _, _)| frame).collect();
+        let (last_position, last_frame_digest) = expected_frames
+            .last()
+            .copied()
+            .expect("non-empty batch");
         let has_pending = follower_frames
             .iter()
             .any(|frame| frame.pending_effect.is_some());
         let commit_hint = if has_pending {
             None
         } else {
-            let tail = &local_results[local_results.len() - 1];
             Some(crate::active_range::replication::ReplicaBatchCommit {
-                position: CommitPosition::new(tail.position.value()),
-                frame_digest: tail.frame_digest,
+                position: CommitPosition::new(last_position.value()),
+                frame_digest: last_frame_digest,
             })
         };
         // Pipeline point: mint order is fixed — sequences, owner
@@ -1420,7 +1498,6 @@ impl MajorityAppendCoordinator {
         let send_permit_a = send_turn_a.hold();
         let send_permit_b = send_turn_b.hold();
         let commit_permit = this.commit_turn(range_id).await.hold();
-        let last_position = local_results[local_results.len() - 1].position;
         let _store_ms = _phase_timer.elapsed() - _store_mark;
         let _local_ms = _phase_timer.elapsed() - _locked_at;
         drop(_append_guard);
@@ -1560,7 +1637,7 @@ impl MajorityAppendCoordinator {
                     continue;
                 }
             };
-            if accepted.len() != local_results.len() {
+            if accepted.len() != expected_frames.len() {
                 return Err(this.error(
                     MajorityAppendErrorCode::FrameConflict,
                     format!("replica {node} acknowledged a truncated batch"),
@@ -1573,14 +1650,16 @@ impl MajorityAppendCoordinator {
             // the single-append fork proof; a bare position/digest
             // mismatch stays a fatal contradiction.
             let mut mismatch = false;
-            for (accepted_frame, local_frame) in accepted.iter().zip(local_results.iter()) {
-                if accepted_frame.position != local_frame.position && accepted_frame.committed {
+            for (accepted_frame, (expected_pos, expected_digest)) in
+                accepted.iter().zip(expected_frames.iter())
+            {
+                if accepted_frame.position != *expected_pos && accepted_frame.committed {
                     divergent.push(node.clone());
                     mismatch = true;
                     break;
                 }
-                if accepted_frame.position != local_frame.position
-                    || accepted_frame.frame_digest != local_frame.frame_digest
+                if accepted_frame.position != *expected_pos
+                    || accepted_frame.frame_digest != *expected_digest
                 {
                     return Err(this.error(
                         MajorityAppendErrorCode::FrameConflict,
@@ -1595,14 +1674,36 @@ impl MajorityAppendCoordinator {
                 continue;
             }
             durable.push(node.clone());
-            if accepted.last().is_some_and(|frame| frame.committed) {
-                // The fused marker landed with the frames — this replica
-                // already holds CommitPosition evidence and needs no
-                // commit round.
+            let committed_tail = if accepted.last().is_some_and(|frame| frame.committed) {
                 fused_commit.push(node.clone());
-            }
+                last_position.value()
+            } else {
+                0
+            };
+            this.note_follower_progress(
+                range_id,
+                &node,
+                requests[0].generation,
+                requests[0].ownership_epoch,
+                last_position.value(),
+                committed_tail,
+            )
+            .await;
             durable_followers.push(node);
         }
+        // Acquire commit_permit before evaluating final quorum fate and
+        // updating quorum_blocked state:
+        // 1. `note_owner_quorum_blocked` / `restored` execute in strict
+        //    mint order so an earlier failed round can never overwrite a
+        //    later round's quorum restoration.
+        // 2. If this round's direct send to a follower failed, a concurrent
+        //    later round may have already repaired and confirmed positions
+        //    `>= last_position` on that follower via `fill_replica_gap` —
+        //    crediting that watermark prevents reporting `NoDurableMajority`
+        //    for frames a subsequent round is about to ratify.
+        let _commit_wait_at = _phase_timer.elapsed();
+        commit_permit.wait().await;
+        let _commit_waited = _phase_timer.elapsed() - _commit_wait_at;
         if !divergent.is_empty() {
             this.local
                 .note_owner_diverged(range_id, requests[0].ownership_epoch)
@@ -1622,6 +1723,30 @@ impl MajorityAppendCoordinator {
                 vec![],
             ));
         }
+        if durable.len() < ACTIVE_RANGE_COMMIT_QUORUM && !has_pending {
+            for follower in &followers {
+                if durable.contains(follower) {
+                    continue;
+                }
+                if let Some((appended, committed)) = this
+                    .follower_progress(
+                        range_id,
+                        follower,
+                        requests[0].generation,
+                        requests[0].ownership_epoch,
+                    )
+                    .await
+                {
+                    if appended >= last_position.value() {
+                        durable.push(follower.clone());
+                        durable_followers.push(follower.clone());
+                        if committed >= last_position.value() {
+                            fused_commit.push(follower.clone());
+                        }
+                    }
+                }
+            }
+        }
         if durable.len() < ACTIVE_RANGE_COMMIT_QUORUM {
             this.local.note_owner_quorum_blocked(range_id).await;
             return Err(this.error(
@@ -1634,9 +1759,6 @@ impl MajorityAppendCoordinator {
         }
         this.local.note_owner_quorum_restored(range_id).await;
         if has_pending {
-            // Deferred commit: pending-effect frames stay fenced behind
-            // their effect marker exactly like the single-append path —
-            // the effect journal's terminal marker releases the tail.
             durable.sort();
             return Ok(local_results
                 .into_iter()
@@ -1651,13 +1773,6 @@ impl MajorityAppendCoordinator {
                 })
                 .collect());
         }
-        // Commit phase runs in mint order: the quorum is established, so
-        // the watermark may advance — but only after every earlier round's
-        // commit turn, keeping the local watermark and per-follower commit
-        // order contiguous.
-        let _commit_wait_at = _phase_timer.elapsed();
-        commit_permit.wait().await;
-        let _commit_waited = _phase_timer.elapsed() - _commit_wait_at;
         let commit_request = ReplicaCommitRequest {
             feed_id: requests[0].feed_id,
             range_id,
@@ -1665,7 +1780,7 @@ impl MajorityAppendCoordinator {
             ownership_epoch: requests[0].ownership_epoch,
             append_owner: requests[0].append_owner.clone(),
             commit_position: CommitPosition::new(last_position.value()),
-            frame_digest: local_results[local_results.len() - 1].frame_digest,
+            frame_digest: last_frame_digest,
         };
         // Replicas that fused the commit already hold evidence; only a
         // durable follower that landed frames without the marker gets a
@@ -1757,7 +1872,7 @@ impl MajorityAppendCoordinator {
             requests[0].feed_id,
             range_id,
             CommitPosition::new(last_position.value()),
-            local_results[local_results.len() - 1].frame_digest,
+            last_frame_digest,
             evidence.clone(),
         );
         Ok(local_results
@@ -1802,6 +1917,7 @@ impl MajorityAppendCoordinator {
                     // isolate the bad submission from the innocent ones.
                     let poisonous = !error.retryable;
                     if merged_submissions && poisonous {
+                        drop(_in_flight_permit);
                         let mut mine = None;
                         for (index, sub) in subs.into_iter().enumerate() {
                             // Solo re-run lands the pre-encoded frames as
@@ -1995,6 +2111,20 @@ impl MajorityAppendCoordinator {
         &self,
         request: PendingReleaseRequest,
     ) -> Result<PendingReleaseOutcome, MajorityAppendError> {
+        let _drain = self
+            .in_flight_window(request.range_id)
+            .await
+            .acquire_many_owned(MAX_INFLIGHT_ROUNDS as u32)
+            .await
+            .map_err(|_| {
+                self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    "Active Range append window is closed",
+                    true,
+                    vec![],
+                    vec![],
+                )
+            })?;
         let _append_guard = self.append_lock(request.range_id).await.lock_owned().await;
         let assignment = self
             .control
@@ -2128,6 +2258,20 @@ impl MajorityAppendCoordinator {
         &self,
         request: PendingReleaseRequest,
     ) -> Result<super::store::PendingDiscardOutcome, MajorityAppendError> {
+        let _drain = self
+            .in_flight_window(request.range_id)
+            .await
+            .acquire_many_owned(MAX_INFLIGHT_ROUNDS as u32)
+            .await
+            .map_err(|_| {
+                self.error(
+                    MajorityAppendErrorCode::LocalStorageFailure,
+                    "Active Range append window is closed",
+                    true,
+                    vec![],
+                    vec![],
+                )
+            })?;
         let _append_guard = self.append_lock(request.range_id).await.lock_owned().await;
         let assignment = self
             .control

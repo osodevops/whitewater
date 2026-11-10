@@ -509,6 +509,19 @@ impl ReaderPacingTable {
         }
     }
 
+    /// Reconcile unacknowledged byte budget when the replicated Reader
+    /// definition proves an earlier delivery was acknowledged on another
+    /// Node, without recording a multi-cycle ack latency sample.
+    pub fn reconcile_settled_delivery(&self, reader_id: Uuid) {
+        let Ok(mut map) = self.inner.lock() else {
+            return;
+        };
+        if let Some(entry) = map.get_mut(&reader_id) {
+            entry.unacknowledged_bytes = 0;
+            entry.last_fetch_at = None;
+        }
+    }
+
     /// Session close drops the entry; bounded capacity plus removal on
     /// close keeps the table proportional to live Readers.
     pub fn remove(&self, reader_id: Uuid) {

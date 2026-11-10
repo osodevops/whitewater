@@ -17583,4 +17583,69 @@ mod tests {
         let rows: Vec<Value> = serde_json::from_value(shown.results[0].data.clone()).unwrap();
         assert!(rows.is_empty());
     }
+
+    #[tokio::test]
+    async fn two_successive_splits_spread_range_owners_across_all_three_nodes() {
+        let directory = tempfile::TempDir::new().unwrap();
+        let store: Arc<dyn crate::storage::LogStore> =
+            Arc::new(crate::storage::FileLogStore::open(directory.path().join("data")).unwrap());
+        let nodes: Vec<StorageNodeId> = ["node-1", "node-2", "node-3"]
+            .into_iter()
+            .map(|n| StorageNodeId::try_new(n).unwrap())
+            .collect();
+        let control = ControlController::open_with_storage_nodes(
+            directory.path().join("catalog.json"),
+            store,
+            nodes,
+        )
+        .unwrap();
+        control
+            .execute("CREATE DOMAIN orders; CREATE FEED orders.events;")
+            .await
+            .unwrap();
+        let feed = control.active_feed_by_name("orders.events").await.unwrap();
+        for split_byte in [0x55_u8, 0xAA_u8] {
+            let prepared = control
+                .execute_commands(vec![Command::PrepareActiveRangeSplit {
+                    feed: "orders.events".to_owned(),
+                    split_at: crate::active_range::KeyToken::from_bytes([split_byte; 16]),
+                }])
+                .await
+                .unwrap();
+            let plan: RangeSplitPlan =
+                serde_json::from_value(prepared.results[0].data.clone()).unwrap();
+            control
+                .execute_commands(vec![
+                    Command::RecordActiveRangeSplitCatchUp {
+                        feed: "orders.events".to_owned(),
+                        plan_id: plan.plan_id,
+                        source_commit: crate::active_range::CommitPosition::new(0),
+                        source_scanned_through: crate::active_range::CommitPosition::new(0),
+                        right_commit: crate::active_range::CommitPosition::new(0),
+                        checksum_verified: true,
+                    },
+                    Command::ActivateActiveRangeSplit {
+                        feed: "orders.events".to_owned(),
+                        plan_id: plan.plan_id,
+                        left_writer_sequences: Vec::new(),
+                        right_writer_sequences: Vec::new(),
+                        reader_translations: Vec::new(),
+                        subscription_translations: Vec::new(),
+                    },
+                ])
+                .await
+                .unwrap();
+        }
+        let assignments = control
+            .active_range_assignments_for_feed(feed.feed_id)
+            .await;
+        assert_eq!(assignments.len(), 3);
+        let owners: std::collections::BTreeSet<StorageNodeId> =
+            assignments.into_iter().map(|a| a.owner).collect();
+        assert_eq!(
+            owners.len(),
+            3,
+            "two splits on a 3-Node Feed must spread ownership 1-per-Node"
+        );
+    }
 }

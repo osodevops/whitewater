@@ -458,6 +458,70 @@ pub fn stalled_lag_floor(current: Option<u64>, pending_unacked: usize) -> Option
     Some(current.unwrap_or(0).max(pending_unacked as u64))
 }
 
+/// Overlay the Control Plane's *committed* lease rows onto the locally
+/// applied lease map for Distributaries the local catalog reports as
+/// not locally owned. The drive gate reads the applied catalog, but a
+/// Node whose catalog lags a just-committed MOVE — a lease owner that
+/// only just rejoined is the live case — would yield the drive while it
+/// is the committed owner, and no Node would publish at all: the status
+/// row then goes silently stale. Rows the committed view still assigns
+/// elsewhere are untouched; the `ReportDistributaryStatus` epoch/owner
+/// fence stays authoritative either way.
+pub fn overlay_committed_leases(
+    leases: &mut std::collections::HashMap<Uuid, crate::control::DistributaryLease>,
+    committed: &std::collections::HashMap<Uuid, crate::control::DistributaryLease>,
+    distributaries: &[crate::control::DistributaryDefinition],
+    local_node: &crate::active_range::StorageNodeId,
+) {
+    for definition in distributaries {
+        let owned = leases
+            .get(&definition.distributary_id)
+            .is_some_and(|lease| lease.owner == *local_node);
+        if owned {
+            continue;
+        }
+        if let Some(lease) = committed.get(&definition.distributary_id) {
+            if lease.owner == *local_node {
+                leases.insert(definition.distributary_id, lease.clone());
+            }
+        }
+    }
+}
+
+/// Committed lease rows read back out of a `SHOW DISTRIBUTARIES`
+/// result — the leader's linearizable view. Rows without a lease or
+/// with malformed identities are skipped rather than guessed at.
+pub fn parse_committed_distributary_leases(
+    data: &serde_json::Value,
+) -> std::collections::HashMap<Uuid, crate::control::DistributaryLease> {
+    let mut leases = std::collections::HashMap::new();
+    let Some(rows) = data.as_array() else {
+        return leases;
+    };
+    for row in rows {
+        let (Some(id), Some(owner), Some(epoch)) = (
+            row.get("distributary_id")
+                .and_then(|value| value.as_str())
+                .and_then(|text| Uuid::parse_str(text).ok()),
+            row.get("lease_owner")
+                .and_then(|value| value.as_str())
+                .and_then(|text| crate::active_range::StorageNodeId::try_new(text).ok()),
+            row.get("lease_epoch").and_then(|value| value.as_u64()),
+        ) else {
+            continue;
+        };
+        leases.insert(
+            id,
+            crate::control::DistributaryLease {
+                distributary_id: id,
+                owner,
+                epoch,
+            },
+        );
+    }
+    leases
+}
+
 /// The Distributary a node currently drives; the supervisor reconciles
 /// this set against committed leases every tick. The status fields are
 /// operator-facing accumulators scoped to the lease epoch — an epoch
@@ -650,6 +714,87 @@ mod tests {
         assert_eq!(stalled_lag_floor(Some(3), 10), Some(10));
         // A later exact probe figure is never dragged backwards.
         assert_eq!(stalled_lag_floor(Some(42), 10), Some(42));
+    }
+
+    #[test]
+    fn committed_lease_overlay_covers_lagged_applied_catalog() {
+        use crate::active_range::StorageNodeId;
+        use crate::control::{DistributaryDefinition, DistributaryLease};
+        let local = StorageNodeId::try_new("control-2").unwrap();
+        let other = StorageNodeId::try_new("control-1").unwrap();
+        let id = Uuid::new_v4();
+        let definitions = vec![DistributaryDefinition {
+            distributary_id: id,
+            name: "dstdom.mirror".to_owned(),
+            space_id: Uuid::new_v4(),
+            link_id: Uuid::new_v4(),
+            source_feed: Some("srcdom.events".to_owned()),
+            target_feed_id: Some(Uuid::new_v4()),
+            source_store: None,
+            target_store_id: None,
+            shipped_seq: 0,
+            status: ResourceStatus::Active,
+            created_at_ns: 0,
+        }];
+        let lease = |owner: &StorageNodeId, epoch| DistributaryLease {
+            distributary_id: id,
+            owner: owner.clone(),
+            epoch,
+        };
+        // Local catalog still assigns the lease away while the committed
+        // lease already moved it here — the overlay surfaces the
+        // committed row so the committed owner keeps driving.
+        let mut leases = std::collections::HashMap::from([(id, lease(&other, 1))]);
+        let committed = std::collections::HashMap::from([(id, lease(&local, 2))]);
+        overlay_committed_leases(&mut leases, &committed, &definitions, &local);
+        assert_eq!(leases[&id].owner, local);
+        assert_eq!(leases[&id].epoch, 2);
+        // A missing local row is filled the same way.
+        let mut leases = std::collections::HashMap::new();
+        overlay_committed_leases(&mut leases, &committed, &definitions, &local);
+        assert_eq!(leases[&id].epoch, 2);
+        // Committed view still assigns the lease elsewhere — no overlay:
+        // driving stays fenced off until the applied MOVE lands.
+        let mut leases = std::collections::HashMap::new();
+        overlay_committed_leases(
+            &mut leases,
+            &std::collections::HashMap::from([(id, lease(&other, 2))]),
+            &definitions,
+            &local,
+        );
+        assert!(!leases.contains_key(&id));
+        // Local ownership already visible — the committed row must not
+        // downgrade a fresher local view.
+        let mut leases = std::collections::HashMap::from([(id, lease(&local, 3))]);
+        overlay_committed_leases(&mut leases, &committed, &definitions, &local);
+        assert_eq!(leases[&id].epoch, 3);
+    }
+
+    #[test]
+    fn committed_lease_rows_parse_from_show_result() {
+        let id = Uuid::new_v4();
+        let missing_lease = Uuid::new_v4();
+        let data = serde_json::json!([
+            {
+                "distributary_id": id.to_string(),
+                "name": "dstdom.mirror",
+                "lease_owner": "control-2",
+                "lease_epoch": 3,
+            },
+            // A Distributary with no committed lease yields no row.
+            {"distributary_id": missing_lease.to_string(), "name": "dstdom.s"},
+        ]);
+        let leases = parse_committed_distributary_leases(&data);
+        assert_eq!(leases.len(), 1);
+        assert_eq!(leases[&id].owner.as_str(), "control-2");
+        assert_eq!(leases[&id].epoch, 3);
+        // Non-array payloads and malformed rows parse to empty rather
+        // than inventing ownership.
+        assert!(parse_committed_distributary_leases(&serde_json::json!({})).is_empty());
+        assert!(parse_committed_distributary_leases(&serde_json::json!([
+            {"distributary_id": "not-a-uuid", "lease_owner": "control-1", "lease_epoch": 1}
+        ]))
+        .is_empty());
     }
 
     #[test]

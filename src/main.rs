@@ -1053,14 +1053,27 @@ async fn main() -> Result<()> {
                     whitewater::distributary::DistributaryDriver,
                 > = std::collections::HashMap::new();
                 let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
+                // The committed-lease fallback reads through the leader's
+                // linearizable path — a real quorum heartbeat — so it is
+                // throttled rather than paid every tick. The cadence only
+                // needs to beat the applied-catalog lag that strands a
+                // just-moved owner (typically a single apply).
+                const COMMITTED_LEASE_CHECK: Duration = Duration::from_secs(2);
+                let mut last_committed_check: Option<std::time::Instant> = None;
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
+                            let committed_check_due = last_committed_check
+                                .is_none_or(|at| at.elapsed() >= COMMITTED_LEASE_CHECK);
+                            if committed_check_due {
+                                last_committed_check = Some(std::time::Instant::now());
+                            }
                             for outcome in whitewater::api::drive_local_distributaries(
                                 &state,
                                 &mut drivers,
                                 &local,
                                 64,
+                                committed_check_due,
                             ).await {
                                 use whitewater::distributary::DistributaryDriveOutcome;
                                 match outcome {

@@ -232,6 +232,7 @@ pub struct ReplicaBatchAppendHeader {
     pub generation: RangeGeneration,
     pub ownership_epoch: OwnershipEpoch,
     pub append_owner: StorageNodeId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub frames: Vec<ReplicaBatchFrameMeta>,
     #[serde(default)]
     pub commit_at: Option<ReplicaBatchCommit>,
@@ -261,25 +262,80 @@ pub fn encode_batch_body(
             "binary batch header/frame count mismatch",
         ));
     }
-    let header_json = serde_json::to_vec(header).map_err(|error| {
+    let slim_header = ReplicaBatchAppendHeader {
+        feed_id: header.feed_id,
+        range_id: header.range_id,
+        generation: header.generation,
+        ownership_epoch: header.ownership_epoch,
+        append_owner: header.append_owner.clone(),
+        frames: Vec::new(),
+        commit_at: header.commit_at,
+    };
+    let header_json = serde_json::to_vec(&slim_header).map_err(|error| {
         ReplicaAppendError::rejected(
             ReplicaAppendErrorCode::InvalidFrameEncoding,
             format!("binary batch header does not encode: {error}"),
         )
     })?;
     let mut body = Vec::with_capacity(
-        4 + header_json.len() + 4 + 4 * frames.len() + frames.iter().map(Vec::len).sum::<usize>(),
+        4 + header_json.len() + 4 + 64 * frames.len() + frames.iter().map(Vec::len).sum::<usize>(),
     );
     body.extend_from_slice(&(header_json.len() as u32).to_le_bytes());
     body.extend_from_slice(&header_json);
     body.extend_from_slice(&(frames.len() as u32).to_le_bytes());
-    for frame in frames {
+    let mut prev_pos: Option<u64> = None;
+    let mut prev_id: Option<&AppendIdentity> = None;
+    for (meta, frame) in header.frames.iter().zip(frames) {
+        let pos_val = meta.expected_position.map(RangePosition::value);
+        let pos_contig =
+            matches!((prev_pos, pos_val), (Some(p), Some(c)) if c == p.wrapping_add(1));
+        let id_contig = prev_id.is_some_and(|prev| {
+            prev.writer_session_id == meta.identity.writer_session_id
+                && prev.writer_epoch == meta.identity.writer_epoch
+                && meta.identity.sequence == prev.sequence.wrapping_add(1)
+        });
+        let mut flags = 0_u8;
+        if pos_val.is_some() {
+            flags |= 0x01;
+        }
+        if pos_contig {
+            flags |= 0x02;
+        }
+        if id_contig {
+            flags |= 0x04;
+        }
+        if meta.pending_effect.is_some() {
+            flags |= 0x08;
+        }
+        body.push(flags);
+        if let Some(pos) = pos_val.filter(|_| !pos_contig) {
+            body.extend_from_slice(&pos.to_le_bytes());
+        }
+        if !id_contig {
+            body.extend_from_slice(meta.identity.writer_session_id.as_bytes());
+            body.extend_from_slice(&meta.identity.writer_epoch.to_le_bytes());
+            body.extend_from_slice(&meta.identity.sequence.to_le_bytes());
+        }
+        let cursor_bytes = meta.cursor.as_bytes();
+        let cursor_len: u16 = cursor_bytes.len().try_into().map_err(|_| {
+            ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::InvalidFrameEncoding,
+                "binary batch cursor exceeds u16 length",
+            )
+        })?;
+        body.extend_from_slice(&cursor_len.to_le_bytes());
+        body.extend_from_slice(cursor_bytes);
+        if let Some(pending) = &meta.pending_effect {
+            body.extend_from_slice(pending.effect_id.as_bytes());
+            body.extend_from_slice(pending.subscription_id.as_bytes());
+        }
         body.extend_from_slice(&(frame.len() as u32).to_le_bytes());
         body.extend_from_slice(frame);
+        prev_pos = pos_val;
+        prev_id = Some(&meta.identity);
     }
     Ok(body)
 }
-
 /// Parse the binary batch body produced by `encode_batch_body`.
 pub fn decode_batch_body(
     body: &[u8],
@@ -287,7 +343,7 @@ pub fn decode_batch_body(
     let take = |offset: &mut usize, len: usize| -> Result<&[u8], ReplicaAppendError> {
         let end = offset
             .checked_add(len)
-            .filter(|end| *end <= body.len())
+            .filter(|e| *e <= body.len())
             .ok_or_else(|| {
                 ReplicaAppendError::rejected(
                     ReplicaAppendErrorCode::InvalidFrameEncoding,
@@ -300,24 +356,95 @@ pub fn decode_batch_body(
     };
     let mut offset = 0_usize;
     let header_len = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap()) as usize;
-    let header: ReplicaBatchAppendHeader = serde_json::from_slice(take(&mut offset, header_len)?)
-        .map_err(|error| {
-        ReplicaAppendError::rejected(
-            ReplicaAppendErrorCode::InvalidFrameEncoding,
-            format!("binary batch header does not parse: {error}"),
-        )
-    })?;
+    let mut header: ReplicaBatchAppendHeader =
+        serde_json::from_slice(take(&mut offset, header_len)?).map_err(|error| {
+            ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::InvalidFrameEncoding,
+                format!("binary batch header does not parse: {error}"),
+            )
+        })?;
     let count = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap()) as usize;
-    if count != header.frames.len() {
-        return Err(ReplicaAppendError::rejected(
-            ReplicaAppendErrorCode::InvalidFrameEncoding,
-            "binary batch header/frame count mismatch",
-        ));
-    }
-    let mut frames = Vec::with_capacity(count);
-    for _ in 0..count {
-        let len = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap()) as usize;
-        frames.push(take(&mut offset, len)?.to_vec());
+    let mut frames = Vec::with_capacity(count.min(MAX_REPLICA_BATCH_FRAMES + 1));
+    if !header.frames.is_empty() {
+        if count != header.frames.len() {
+            return Err(ReplicaAppendError::rejected(
+                ReplicaAppendErrorCode::InvalidFrameEncoding,
+                "binary batch header/frame count mismatch",
+            ));
+        }
+        for _ in 0..count {
+            let len = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap()) as usize;
+            frames.push(take(&mut offset, len)?.to_vec());
+        }
+    } else {
+        header
+            .frames
+            .reserve(count.min(MAX_REPLICA_BATCH_FRAMES + 1));
+        let mut prev_pos: Option<u64> = None;
+        let mut prev_id: Option<AppendIdentity> = None;
+        for _ in 0..count {
+            let flags = take(&mut offset, 1)?[0];
+            let expected_position = if flags & 0x01 != 0 {
+                let pos = if flags & 0x02 != 0 {
+                    prev_pos
+                        .ok_or_else(|| {
+                            ReplicaAppendError::rejected(
+                                ReplicaAppendErrorCode::InvalidFrameEncoding,
+                                "delta position without predecessor",
+                            )
+                        })?
+                        .wrapping_add(1)
+                } else {
+                    u64::from_le_bytes(take(&mut offset, 8)?.try_into().unwrap())
+                };
+                prev_pos = Some(pos);
+                Some(RangePosition::new(pos))
+            } else {
+                prev_pos = None;
+                None
+            };
+            let identity = if flags & 0x04 != 0 {
+                let mut id = prev_id.ok_or_else(|| {
+                    ReplicaAppendError::rejected(
+                        ReplicaAppendErrorCode::InvalidFrameEncoding,
+                        "delta identity without predecessor",
+                    )
+                })?;
+                id.sequence = id.sequence.wrapping_add(1);
+                id
+            } else {
+                AppendIdentity {
+                    writer_session_id: Uuid::from_bytes(take(&mut offset, 16)?.try_into().unwrap()),
+                    writer_epoch: u64::from_le_bytes(take(&mut offset, 8)?.try_into().unwrap()),
+                    sequence: u64::from_le_bytes(take(&mut offset, 8)?.try_into().unwrap()),
+                }
+            };
+            prev_id = Some(identity.clone());
+            let cursor_len = u16::from_le_bytes(take(&mut offset, 2)?.try_into().unwrap()) as usize;
+            let cursor =
+                String::from_utf8(take(&mut offset, cursor_len)?.to_vec()).map_err(|_| {
+                    ReplicaAppendError::rejected(
+                        ReplicaAppendErrorCode::InvalidFrameEncoding,
+                        "binary batch cursor is not UTF-8",
+                    )
+                })?;
+            let pending_effect = if flags & 0x08 != 0 {
+                Some(super::store::PendingEffectRef {
+                    effect_id: Uuid::from_bytes(take(&mut offset, 16)?.try_into().unwrap()),
+                    subscription_id: Uuid::from_bytes(take(&mut offset, 16)?.try_into().unwrap()),
+                })
+            } else {
+                None
+            };
+            let len = u32::from_le_bytes(take(&mut offset, 4)?.try_into().unwrap()) as usize;
+            frames.push(take(&mut offset, len)?.to_vec());
+            header.frames.push(ReplicaBatchFrameMeta {
+                expected_position,
+                identity,
+                cursor,
+                pending_effect,
+            });
+        }
     }
     if offset != body.len() {
         return Err(ReplicaAppendError::rejected(
@@ -327,7 +454,6 @@ pub fn decode_batch_body(
     }
     Ok((header, frames))
 }
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ReplicaBatchAppendResponse {
     pub results: Option<Vec<ReplicaAppendAccepted>>,
@@ -830,6 +956,14 @@ impl ReplicaAppendService {
         }
     }
 
+    async fn reset_order_watermark(&self, range_id: RangeId, position: u64) {
+        if let Some(sender) = self.order_watermarks.lock().await.get(&range_id) {
+            sender.send_modify(|watermark| {
+                *watermark = position;
+            });
+        }
+    }
+
     /// Ordered admission for replica fan-out: a batch whose first frame
     /// expects a position ahead of the appended watermark waits for its
     /// predecessors up to `REPLICA_ORDER_WAIT`, then proceeds into the
@@ -951,7 +1085,8 @@ impl ReplicaAppendService {
                 format!("Node {} is not a staged replica", self.local_node),
             ));
         }
-        self.store_for(assignment)
+        let result = self
+            .store_for(assignment)
             .await?
             .import_split(ActiveRangeAppend {
                 generation: assignment.generation,
@@ -963,7 +1098,10 @@ impl ReplicaAppendService {
                 pending_effect: None,
             })
             .await
-            .map_err(map_store_error)
+            .map_err(map_store_error)?;
+        self.note_appended(assignment.range_id, result.position)
+            .await;
+        Ok(result)
     }
 
     /// Staged-import an ordered batch of frames in one call. Split/merge
@@ -983,7 +1121,8 @@ impl ReplicaAppendService {
                 format!("Node {} is not a staged replica", self.local_node),
             ));
         }
-        self.store_for(assignment)
+        let results = self
+            .store_for(assignment)
             .await?
             .import_split_batch(
                 frames
@@ -1000,7 +1139,11 @@ impl ReplicaAppendService {
                     .collect(),
             )
             .await
-            .map_err(map_store_error)
+            .map_err(map_store_error)?;
+        if let Some(appended) = results.iter().map(|result| result.position).max() {
+            self.note_appended(assignment.range_id, appended).await;
+        }
+        Ok(results)
     }
 
     pub async fn read_staged_committed(
@@ -1040,11 +1183,16 @@ impl ReplicaAppendService {
         &self,
         assignment: &ActiveRangeAssignment,
     ) -> Result<u64, ReplicaAppendError> {
-        self.store_for(assignment)
-            .await?
+        let store = self.store_for(assignment).await?;
+        let dropped = store
             .truncate_uncommitted(assignment.generation, assignment.ownership_epoch)
             .await
-            .map_err(map_store_error)
+            .map_err(map_store_error)?;
+        if let Ok(snapshot) = store.snapshot().await {
+            self.reset_order_watermark(assignment.range_id, snapshot.progress.appended().value())
+                .await;
+        }
+        Ok(dropped)
     }
 
     pub async fn recovery_status_for_assignment(
@@ -1137,6 +1285,13 @@ impl ReplicaAppendService {
                 })
             }
             super::store::PendingDiscardOutcome::Discarded { dropped_frames } => {
+                if let Ok(snapshot) = store.snapshot().await {
+                    self.reset_order_watermark(
+                        assignment.range_id,
+                        snapshot.progress.appended().value(),
+                    )
+                    .await;
+                }
                 Ok(ReplicaDiscardPendingResponse {
                     outcome: Some(ReplicaDiscardOutcome::Discarded { dropped_frames }),
                     occupant: None,
@@ -1245,10 +1400,15 @@ impl ReplicaAppendService {
                 .await
                 .map_err(map_store_error)?;
         }
-        store
+        let dropped = store
             .truncate_uncommitted(assignment.generation, assignment.ownership_epoch)
             .await
-            .map_err(map_store_error)
+            .map_err(map_store_error)?;
+        if let Ok(after) = store.snapshot().await {
+            self.reset_order_watermark(assignment.range_id, after.progress.appended().value())
+                .await;
+        }
+        Ok(dropped)
     }
 
     pub async fn export_assignment_committed(
@@ -1342,6 +1502,7 @@ impl ReplicaAppendService {
             .write()
             .await
             .retain(|(range_id, _), _| range_id != &assignment.range_id);
+        self.reset_order_watermark(assignment.range_id, 0).await;
         let directory = self
             .root
             .join(assignment.feed_id.to_string())
@@ -2048,9 +2209,29 @@ impl ReplicaAppendService {
         // appended watermark rather than refusing a PositionGap the
         // owner would have to repair. The owner-live path (import ==
         // false) never waits — single appends keep strict fencing.
+        // Precompute frame headers and BLAKE3 digests outside the follower's
+        // `wait_for_appended` and `append_gate` so pipelined follower batches
+        // overlap CPU hashing with the preceding batch's disk write.
+        let (appends, precomputed) = if import && commit_at.is_some() {
+            tokio::task::spawn_blocking(move || {
+                let meta =
+                    super::store::precompute_frame_meta(&appends).map_err(map_store_error)?;
+                Ok::<_, ReplicaAppendError>((appends, Some(meta)))
+            })
+            .await
+            .map_err(|error| ReplicaAppendError::storage(error.to_string()))??
+        } else {
+            (appends, None)
+        };
         if import {
-            if let Some(expected) = appends.first().and_then(|append| append.expected_position) {
-                self.wait_for_appended(range_id, expected).await;
+            let mut prev: Option<u64> = None;
+            for append in &appends {
+                if let Some(expected) = append.expected_position {
+                    if prev.is_none_or(|p| expected.value() != p.wrapping_add(1)) {
+                        self.wait_for_appended(range_id, expected).await;
+                    }
+                    prev = Some(expected.value());
+                }
             }
         }
         let _gate = self.append_gate(range_id).await.lock_owned().await;
@@ -2092,7 +2273,14 @@ impl ReplicaAppendService {
             frame_digest: hint.frame_digest,
         });
         let results = match (import, commit) {
-            (true, Some(commit)) => store.import_commit_batch(appends, commit).await,
+            (true, Some(commit)) => match precomputed {
+                Some(meta) => {
+                    store
+                        .import_commit_batch_precomputed(appends, meta, commit)
+                        .await
+                }
+                None => store.import_commit_batch(appends, commit).await,
+            },
             (false, Some(commit)) => store.append_commit_batch(appends, commit).await,
             (true, None) => store.import_split_batch(appends).await,
             (false, None) => store.append_batch(appends).await,
@@ -3056,5 +3244,75 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(2),
             "the bound keeps a genuinely missing predecessor from stalling"
         );
+    }
+
+    #[test]
+    fn compact_batch_body_round_trips_delta_and_non_contiguous_frames() {
+        let session = Uuid::from_u128(42);
+        let header = ReplicaBatchAppendHeader {
+            feed_id: Uuid::from_u128(1),
+            range_id: RangeId::from_uuid(Uuid::from_u128(2)),
+            generation: RangeGeneration::new(1),
+            ownership_epoch: OwnershipEpoch::new(3),
+            append_owner: StorageNodeId::try_new("node-1").unwrap(),
+            frames: vec![
+                ReplicaBatchFrameMeta {
+                    expected_position: Some(RangePosition::new(10)),
+                    identity: AppendIdentity {
+                        writer_session_id: session,
+                        writer_epoch: 2,
+                        sequence: 100,
+                    },
+                    cursor: "c-10".to_owned(),
+                    pending_effect: None,
+                },
+                ReplicaBatchFrameMeta {
+                    expected_position: Some(RangePosition::new(11)),
+                    identity: AppendIdentity {
+                        writer_session_id: session,
+                        writer_epoch: 2,
+                        sequence: 101,
+                    },
+                    cursor: "c-11".to_owned(),
+                    pending_effect: None,
+                },
+                ReplicaBatchFrameMeta {
+                    expected_position: Some(RangePosition::new(25)),
+                    identity: AppendIdentity {
+                        writer_session_id: Uuid::from_u128(99),
+                        writer_epoch: 1,
+                        sequence: 1,
+                    },
+                    cursor: "c-25".to_owned(),
+                    pending_effect: Some(super::super::store::PendingEffectRef {
+                        effect_id: Uuid::from_u128(7),
+                        subscription_id: Uuid::from_u128(8),
+                    }),
+                },
+            ],
+            commit_at: Some(ReplicaBatchCommit {
+                position: CommitPosition::new(25),
+                frame_digest: [0xAB; 32],
+            }),
+        };
+        let payloads = vec![b"f1".to_vec(), b"f2".to_vec(), b"f3".to_vec()];
+        let encoded = encode_batch_body(&header, &payloads).unwrap();
+        let (decoded, decoded_payloads) = decode_batch_body(&encoded).unwrap();
+        assert_eq!(decoded_payloads, payloads);
+        assert_eq!(decoded.frames.len(), 3);
+        assert_eq!(
+            decoded.frames[0].expected_position,
+            Some(RangePosition::new(10))
+        );
+        assert_eq!(
+            decoded.frames[1].expected_position,
+            Some(RangePosition::new(11))
+        );
+        assert_eq!(decoded.frames[1].identity.sequence, 101);
+        assert_eq!(
+            decoded.frames[2].expected_position,
+            Some(RangePosition::new(25))
+        );
+        assert!(decoded.frames[2].pending_effect.is_some());
     }
 }
