@@ -309,16 +309,44 @@ def main():
             check=True,
         )
         range_survivor = live_dst(range_victim)
-        for record_id in range(41, 51):
-            append(SRC[record_id % 3], "srcwriter", epoch, record_id)
+        # One atomic burst larger than a drive tick's 64-record copy
+        # page. Sequential ~2s appends can never outpace a fast
+        # two-replica recovery — the driver copies each inside one tick
+        # and no gap ever reaches the committed status row. Landing the
+        # burst at once makes the lag figure deterministic either way:
+        # a stalled driver holds a page (the floor publishes >=64), or
+        # the post-recovery copy spans several ticks (the Copying
+        # transition publishes the full probed figure).
+        status, result = post(
+            SRC[0],
+            "/v1/writers/append-batch",
+            {
+                "records": [
+                    {
+                        "request_id": str(uuid.uuid4()),
+                        "writer": "srcwriter",
+                        "session_epoch": epoch,
+                        "event_time_ns": str(
+                            1_700_000_000_000_000_000 + record_id
+                        ),
+                        "key_base64": b64(f"key-{record_id % 5}"),
+                        "payload_base64": b64(f"payload-{record_id}"),
+                        "metadata_base64": {"origin": b64("distributary-test")},
+                    }
+                    for record_id in range(41, 201)
+                ]
+            },
+        )
+        if status != 200:
+            raise AssertionError({"append-batch": result})
 
         # Numeric lag evidence: while the destination range is down the
         # driver stalls holding an un-acked page — a strict lower bound
         # the stalled report publishes immediately — while report ticks
-        # keep probing the exact source frontier. Unacknowledged records
-        # 41..50 must surface as a positive lag_records figure before the
-        # copy resumes. The diagnostic dict keeps a timeout honest about
-        # what SHOW was actually reporting.
+        # keep probing the exact source frontier. The burst must surface
+        # as a positive lag_records figure before the copy resumes. The
+        # diagnostic dict keeps a timeout honest about what SHOW was
+        # actually reporting.
         lag_peak = [0]
 
         def feed_lag_visible():
@@ -356,12 +384,12 @@ def main():
                 read_error = None
             except Exception as error:
                 rows, row_count, read_error = [], -1, str(error)
-            if row_count == 50:
+            if row_count == 200:
                 payloads = [
                     base64.b64decode(row["payload_base64"]).decode()
                     for row in rows
                 ]
-                if len(set(payloads)) != 50:
+                if len(set(payloads)) != 200:
                     raise AssertionError(
                         "duplicate records after range owner loss"
                     )
@@ -391,7 +419,10 @@ def main():
             except Exception as error:
                 return f"inspect failed: {error}"
 
-        wait_for(resumed_after_range_owner_loss, "range-owner resume", timeout=240)
+        # Copy pace through the Distributary is ~3s/record on this
+        # fixture — a >64-record burst needs a budget sized to the
+        # honest rate, not the tick page.
+        wait_for(resumed_after_range_owner_loss, "range-owner resume", timeout=720)
         range_owner_after = range_owner_index(range_survivor)
         assert range_owner_after != range_victim
 
@@ -552,8 +583,8 @@ def main():
                     "initial_copy": 20,
                     "continuous_copy": 10,
                     "post_failover_copy": 10,
-                    "post_range_owner_loss_copy": 10,
-                    "destination_records": 50,
+                    "post_range_owner_loss_copy": 160,
+                    "destination_records": 200,
                     "duplicates": 0,
                     "lease_owner_before": owner,
                     "lease_owner_after": recovered_owner,
