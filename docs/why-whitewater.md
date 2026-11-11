@@ -310,7 +310,9 @@ A Node is a replaceable process or container contributing storage, network, CPU,
 
 ### Domain
 
-A Domain is a hierarchical administrative boundary for ownership, policy inheritance, quotas, authorization, schemas, encryption, and billing. Dotted Feed names naturally project into Domain prefixes. Existing `SPACE` commands and the `space_id` wire/catalog field remain compatibility representations of that same identity; they do not define another public resource.
+A Domain is a first-class business boundary for ownership, policy inheritance, quotas, authorization, schemas, encryption, and billing — replacing Kafka's flat-topic naming folklore (`orders-v2-prod`) with structural ownership (`purchasing.orders`).
+
+In all six SDKs, the Domain handle is the only public front door for creating and addressing Feeds, Writers, Readers, Subscriptions, StateStores, Indexes, and Pipes. Domains are boundaries of **authority**, not connectivity silos: a Pipe or Subscription is owned by the Domain in its declared name (which owns its durable progress frontier), while its source Feed, lookup StateStore, quarantine Feed, or output Feed may explicitly cross into other Domains (`purchasing.orders` → `warehouse.fulfill`). Dotted resource names project directly into their owning Domain prefix. Existing `SPACE` commands and the `space_id` wire/catalog field remain compatibility representations of that same identity; they do not define another public resource.
 
 ### Feed
 

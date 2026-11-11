@@ -30,6 +30,8 @@ This does not mean zero configuration: Node identities, endpoints, Control Plane
 
 | With Kafka | With Whitewater |
 |---|---|
+| Topics live in one flat global namespace; ownership is encoded in naming conventions (`orders-v2-prod`) and wiki folklore. | Every resource belongs to a first-class **Domain** (`purchasing.orders`), which is the required front door in every SDK. |
+| Cross-team dependencies are implicit inside consumer-group strings and application configs. | A Pipe or Subscription is owned by its declaring Domain while explicitly declaring cross-Domain source Feeds, lookup StateStores, and outputs. |
 | A topic is divided into a configured number of partitions. | A Feed has no partition-count setting. |
 | Partitioning determines which partition receives a Key. | The business Key defines ordering; physical routing is internal. |
 | A consumer group assigns topic partitions to its consumers. | Applications use Readers and Subscriptions, not partition assignments. |
@@ -42,6 +44,16 @@ This does not mean zero configuration: Node identities, endpoints, Control Plane
 Partition-free does not mean the storage engine has no internal divisions. Whitewater uses internal Active Ranges that can split, merge, and move beneath a stable Feed identity. These are storage mechanisms, not public partitions that customers must size or assign. Authorized diagnostics may show placement to explain an incident; inspecting it does not make it part of the application contract.
 
 Ordering is defined for the same Feed and Key, not as a total order across the entire Feed. Adding Nodes does not parallelize one strictly ordered hot Key. The partition-free interface is the contract; the delivery status of automatic placement, scaling, and processing is identified below.
+
+## Domains: structural ownership instead of topic-naming folklore
+
+In Kafka, every topic lives in a single flat namespace. Which business capability owns `orders-v2-prod-eu` — and which downstream services are allowed to read or materialize it — is typically tribal folklore held together by naming conventions, prefix ACLs, and out-of-date wiki pages.
+
+Whitewater turns that convention into a first-class resource boundary:
+
+- **The only SDK front door.** In all six official SDKs, applications open or create a **Domain** first (`createDomain("purchasing")`) and declare Feeds, Writers, Readers, Subscriptions, StateStores, Indexes, and Pipes through that Domain handle. You cannot accidentally create an unowned, randomly named stream.
+- **Boundaries of authority, not connectivity silos.** A Domain defines *who owns and governs* a resource without trapping data inside a silo. A Pipe declared in `warehouse` (`warehouse.fulfill`) owns its durable progress frontier in `warehouse`, while legally consuming `purchasing.orders`, enriching from `catalog.skus`, and emitting to `shipping.dispatches`. Cross-domain data flows become explicit, inspectable catalog contracts rather than hidden consumer-group strings.
+- **One attach point for governance and cost.** Instead of configuring retention, access control, quotas, and cost attribution per topic across hundreds of streams, a Domain provides the administrative boundary where policy and accounting attach once.
 
 ## What this comparison means
 
@@ -57,6 +69,7 @@ The checkboxes below are for a reader evaluating which simplifications matter to
 
 | Evaluate | The job | Kafka model / typical team responsibility | Whitewater experience | Basis |
 |---|---|---|---|---|
+| [ ] | Organize streams by business ownership | Topics share one flat pool; ownership and cross-team boundaries rely on naming conventions (`team-orders-v2`) and wiki folklore. | Declare a **Domain** first (`purchasing`, `warehouse`). Every SDK routes Feed, Writer, Reader, Subscription, StateStore, Index, and Pipe creation through its owning Domain, while Pipes and Subscriptions can explicitly cross Domains. | Implemented across server Control Plane and all six SDKs |
 | [ ] | Create a partition-free event stream | A topic has partitions, with a count and replication factor explicitly chosen or inherited from defaults. | Create a Feed with no public partitions: no partition count to choose, no partition assignments to maintain, and no replica layout to supply. | Contract |
 | [ ] | Preserve business ordering | Keys map to partitions; partitioning strategy and count changes can affect that mapping. | Supply the business Key. Same-Feed/same-Key accepted order is the contract; physical placement stays internal. | Contract |
 | [ ] | **Durable by default** | Coordinate replication factor, producer acknowledgements, `min.insync.replicas`, and related policies. | **Three replicas by default; a fixed minimum of two durable, matching replicas.** No `min.insync` argument. All three participate when healthy; the owner plus either follower can acknowledge when the other is unavailable. One replica alone never succeeds. | Implemented and tested: [majority commit](../tests/majority_commit.rs) and [replica protocol](../tests/replica_append_protocol.rs) |
