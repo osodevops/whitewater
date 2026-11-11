@@ -67,8 +67,8 @@ _ = store.Page(ctx, limit)
 // Rust — Domain-scoped spec + typed key sets
 let accounts = client.domain("accounts")?;
 let spec = StateStoreSpec::new("employees")?
-    .add_unique_key("passport", None)?
-    .add_non_unique_key("department", None)?;
+    .add_unique_key("passport")?
+    .add_non_unique_key("department")?;
 let store = accounts.define_state_store(spec, None).await?;
 store.put_key_set(mutation_id, key, payload,
                   &PassportKeySet::with("P123", "eng")).await?;
