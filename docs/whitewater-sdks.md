@@ -82,34 +82,41 @@ Whitewater's SDK model includes a primary key plus **up to ten declared named se
 The following fragments illustrate existing Java, Python, and TypeScript facade shapes; they assume an initialized client, the relevant imports, and application payload/export functions. They are not standalone programs or proof of cross-language conformance.
 
 ```java
-var spec = StateStore.named("accounts.employees")
-        .addKey("passport", true)        // unique named key
-        .addKey("department", false);    // non-unique named key
-var store = client.stateStores().define(spec, null);
+var accounts = client.createDomain("accounts");
+var spec = StateStoreSpec.named("employees")
+        .addUniqueKey("passport")          // one row per value
+        .addNonUniqueKey("department");    // value -> every matching row
+var store = accounts.defineStateStore(spec, null);
 
-store.put("emp-1".getBytes(), payload,
-        Map.of("passport", "P123", "department", "eng"), null);
+store.put("emp-1", payload, PassportKeySet.with("P123", "eng")); // typed key set…
+store.put("emp-1", payload, Map.of("passport", "P123"));         // …or a raw map
 
-var row  = store.get("emp-1".getBytes(), false, null);        // by primary key
-var rows = store.getBy("passport", "P123", null, false, null); // by named key
-store.iterate(256, r -> export(r));                            // bounded pages
+var row  = store.get("emp-1");              // by primary key
+var rows = store.getBy("passport", "P123"); // by named key
+store.iterate(r -> export(r));              // bounded pages
 ```
 
 ```python
-store = client.state_stores.define(
-    StateStore.named("accounts.employees")
-    .add_key("passport", unique=True).add_key("department"))
+accounts = client.domain("accounts")
+store = accounts.define_state_store(
+    StateStore.named("employees")
+    .add_unique_key("passport").add_non_unique_key("department"))
 
-store.put(b"emp-1", payload, named={"passport": "P123", "department": "eng"})
-rows = store.get_by("department", "eng").rows          # every match
+store.put("emp-1", payload, PassportKeySet(passport="P123", department="eng"))
+store.put("emp-1", payload, named={"passport": "P123"})   # raw dict form
+rows = store.get_by("department", "eng").rows              # every match
 ```
 
 ```ts
-const spec = StateStore.named("accounts.employees")
-  .addKey("passport", true).addKey("department", false);
-const store = await client.stateStores.define(spec);
+const accounts = await client.createDomain("accounts");
+const spec = StateStore.named("employees")
+  .addUniqueKey("passport").addNonUniqueKey("department");
+const store = await accounts.defineStateStore(spec);
+await store.put("emp-1", payload, PassportKeySet.with("P123", "eng"));
 const rows = await store.getBy("passport", "P123");
 ```
+
+Named-key postings accept whichever call-site form reads cleanest — a typed `StoreKeySet` subclass with fluent/static/lambda constructors, a raw map/dict/record, or a single string for stores with one named key — and all lower to the same wire shape. `unique` means "one row per value" (passport, email); non-unique means "every row carrying the value" (department, status).
 
 The shared contract includes freshness evidence, explicit uniqueness behavior, bounded iteration, and retry-safe mutations. Secondary keys are declared at store creation; adding a key to a local builder does not retrofit an existing server-side store. Extra indexes also have storage, replication, and write costs — built in does not mean free.
 

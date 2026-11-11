@@ -76,6 +76,7 @@ on this surface.
 | Window Pipe (watermark/grace/max_late/expire/limits) | `window-pipe` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Pipe declaration surface (`define_*_pipe`) | SDK unit suites + fixture legs | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | StateStore declaration (`define_state_store`, named-key extractors) | SDK unit suites + `statestore-manual-lifecycle` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Named-key ergonomics (`addUniqueKey`/`addNonUniqueKey`, `StoreKeySet` key sets, single-key fallback) | per-SDK store unit suites | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Supervised consumer + value-level store lookups | per-SDK consumer unit suites | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Demand telemetry + hot-Key reports | per-SDK operations unit suites | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | Node restart / owner loss / two-Node outage / partition | `zz-chaos-restart`, `zz-chaos-owner-loss`, `zz-chaos-two-node-outage`, `zz-chaos-partition` | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
