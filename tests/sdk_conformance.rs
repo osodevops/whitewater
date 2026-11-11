@@ -48,11 +48,31 @@ async fn shared_conformance_corpus() {
         runner = runner.with_chaos_hook(Arc::new(move |action| {
             let shell = if cfg!(windows) { "cmd" } else { "sh" };
             let flag = if cfg!(windows) { "/C" } else { "-c" };
-            let status = std::process::Command::new(shell)
+            // The driver's own internal waits are bounded to a few
+            // minutes; give it headroom but never let a wedged hook
+            // stall the gate — `status()` alone has no timeout.
+            let mut child = std::process::Command::new(shell)
                 .arg(flag)
                 .arg(format!("{command} {action}"))
-                .status()
+                .spawn()
                 .map_err(|error| format!("chaos command failed to start: {error}"))?;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(420);
+            let status = loop {
+                match child
+                    .try_wait()
+                    .map_err(|error| format!("chaos command wait failed: {error}"))?
+                {
+                    Some(status) => break status,
+                    None if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                    None => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return Err(format!("chaos command timed out after 420s: {action}"));
+                    }
+                }
+            };
             status
                 .success()
                 .then_some(())

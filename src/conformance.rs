@@ -11,7 +11,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine;
 use serde_json::{json, Value};
@@ -56,6 +56,7 @@ pub struct ConformanceRunner {
     client: Client,
     chaos_hook: Option<ChaosHook>,
     transient_attempts: u64,
+    transient_window: Duration,
 }
 
 /// Driver-injected fault action: `chaos.<action>` steps call it with
@@ -71,7 +72,18 @@ impl ConformanceRunner {
             client,
             chaos_hook: None,
             transient_attempts: 120,
+            transient_window: Duration::from_secs(120),
         }
+    }
+
+    /// Wall-clock bound on the transient window: the attempt count was
+    /// meant as a ~one-minute budget, but an unavailable endpoint can
+    /// burn a whole transport timeout per attempt — the elapsed cap
+    /// fails a dead Riverbed instead of grinding for hours. Poll-window
+    /// retries are unaffected: they still use `poll.times`.
+    pub fn with_transient_window(mut self, transient_window: Duration) -> Self {
+        self.transient_window = transient_window;
+        self
     }
 
     /// Bound the infrastructure-transient retry budget (transport errors
@@ -223,12 +235,14 @@ impl ConformanceRunner {
             // conditions, and unpollable steps still ride out a bounded
             // commit/election window instead of reporting a flaky step.
             let mut transient_attempts = 0u64;
+            let transient_deadline = Instant::now() + self.transient_window;
             let (_status, body) = loop {
                 let args = context.substitute(&args_template);
                 match dispatch(&client, &op, &args).await {
                     Err(message) => {
                         if message.starts_with("transport:")
                             && transient_attempts < self.transient_attempts
+                            && Instant::now() < transient_deadline
                         {
                             transient_attempts += 1;
                             tokio::time::sleep(Duration::from_millis(500)).await;
@@ -251,7 +265,10 @@ impl ConformanceRunner {
                         };
                     }
                     Ok((status, body)) => {
-                        if status >= 500 && transient_attempts < self.transient_attempts {
+                        if status >= 500
+                            && transient_attempts < self.transient_attempts
+                            && Instant::now() < transient_deadline
+                        {
                             transient_attempts += 1;
                             tokio::time::sleep(Duration::from_millis(500)).await;
                             continue;
