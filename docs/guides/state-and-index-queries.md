@@ -56,11 +56,12 @@ spec, _ := whitewater.NewStateStore("employees")
 spec.AddUniqueKey("passport").AddNonUniqueKey("department")
 store, _ := accounts.DefineStateStore(ctx, spec, nil)
 _, _ = store.PutKeySet(ctx, "emp-1", payload,
-    PassportKeySet{}.WithPassport("P123").WithDepartment("eng"), "")
-row, _ := store.Get(ctx, key, strict)
-page, _ := store.GetBy(ctx, "department", "eng", strict, 0)
-_ = store.Delete(ctx, key, "")
-_ = store.Page(ctx, limit)
+    PassportKeySet{}.WithPassport("P123").WithDepartment("eng"))
+row, _ := store.Get(ctx, key)
+page, _ := store.GetBy(ctx, "department", "eng",
+    whitewater.Strict(5*time.Second), whitewater.Limit(64))
+_ = store.Delete(ctx, key)
+_ = store.Page(ctx, whitewater.Limit(256))
 ```
 
 ```rust
@@ -70,10 +71,11 @@ let spec = StateStoreSpec::new("employees")?
     .add_unique_key("passport")?
     .add_non_unique_key("department")?;
 let store = accounts.define_state_store(spec, None).await?;
-store.put_key_set(mutation_id, key, payload,
+store.put_key_set(&key, &payload,
                   &PassportKeySet::with("P123", "eng")).await?;
-let row = store.lookup(key, strict).await?;
-let hits = store.get_by("department", value, strict, limit).await?;
+let row = store.lookup(&key).await?;
+let hits = store.get_by_opts("department", &value,
+    &ReadOpts::new().strict().limit(64)).await?;
 ```
 
 ```csharp
