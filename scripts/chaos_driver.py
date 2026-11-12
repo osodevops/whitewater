@@ -49,26 +49,45 @@ def control_plane(endpoint):
         return None
 
 
-def wait_riverbed(timeout_s=120):
+def wait_riverbed(timeout_s=240):
     # `/health` reports the HTTP listener only and a stale local catalog can
     # still answer reads, so usability means every Node reports a leader AND
     # each applied index has converged with the replicated log tail — the
     # same convergence the acceptance runner requires between scripts.
+    #
+    # The replicated tail moves on a live Riverbed (Pipes and internal
+    # mutations keep committing), so identical `last_log_index` values
+    # sampled across Nodes races replication and can never settle. The
+    # honest check is lag, not equality: once every Node has *applied* the
+    # tail observed one sample earlier, all replicas provably hold the
+    # same prefix — a still-behind Node fails its applied predicate every
+    # sample and keeps the wait honest.
     deadline = time.monotonic() + timeout_s
+    statuses = []
+    seen_tail = None
     while time.monotonic() < deadline:
         statuses = [control_plane(endpoint) for endpoint in ENDPOINTS]
         if all(status is not None for status in statuses):
-            tails = {status.get("last_log_index") for status in statuses}
             leaders_ok = all(status.get("leader_id") is not None for status in statuses)
-            applied_ok = all(
+            if leaders_ok and seen_tail is not None and all(
                 status.get("last_applied_index") is not None
-                and status["last_applied_index"] >= (status.get("last_log_index") or 0)
+                and status["last_applied_index"] >= seen_tail
                 for status in statuses
-            )
-            if leaders_ok and applied_ok and len(tails) == 1:
+            ):
                 return
+            seen_tail = max(status.get("last_log_index") or 0 for status in statuses)
+        else:
+            seen_tail = None
         time.sleep(0.5)
-    raise AssertionError("Riverbed did not converge after the chaos action")
+    summary = [
+        "unreachable" if status is None else {
+            key: status.get(key)
+            for key in ("leader_id", "last_log_index", "last_applied_index")
+        }
+        for status in statuses
+    ]
+    raise AssertionError(
+        f"Riverbed did not converge after the chaos action; last control-plane view: {summary}")
 
 
 def wait_writable(timeout_s=45):
@@ -101,19 +120,30 @@ def probe_writer():
     # Self-provisioned append-path probe: chaos actions must prove the
     # append plane — owner routing plus follower commit corroboration —
     # recovered, not just the WCL catalog. A dedicated probe Feed keeps
-    # fixture record assertions uncontaminated.
+    # fixture record assertions uncontaminated. The call can race a
+    # restart's published-port gap, so retry through refusals on every
+    # endpoint rather than dying on the first refused socket.
     stamp = int(time.time() * 1000)
     domain, writer = f"chaosap{stamp}", f"chaosapw{stamp}"
-    request = urllib.request.Request(
-        f"{ENDPOINTS[0]}/v1/admin/wcl",
-        data=json.dumps({"script": f"CREATE DOMAIN {domain}; CREATE FEED {domain}.events; CREATE WRITER {writer} TO {domain}.events; OPEN WRITER SESSION {writer};"}).encode(),
-        headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=15) as reply:
-        body = json.load(reply)
-    epoch = body["results"][3]["data"]["session_epoch"]
-    return writer, epoch
+    deadline = time.monotonic() + 90
+    last = "no attempt completed"
+    while time.monotonic() < deadline:
+        for endpoint in ENDPOINTS:
+            try:
+                request = urllib.request.Request(
+                    f"{endpoint}/v1/admin/wcl",
+                    data=json.dumps({"script": f"CREATE DOMAIN {domain}; CREATE FEED {domain}.events; CREATE WRITER {writer} TO {domain}.events; OPEN WRITER SESSION {writer};"}).encode(),
+                    headers={"authorization": f"Bearer {KEY}", "content-type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=15) as reply:
+                    body = json.load(reply)
+                epoch = body["results"][3]["data"]["session_epoch"]
+                return writer, epoch
+            except Exception as error:
+                last = str(error)
+        time.sleep(0.5)
+    raise AssertionError(f"probe writer never answered: {last}")
 
 
 def wait_appends(writer, epoch, timeout_s=90):
@@ -165,8 +195,10 @@ def restart():
 
 def placement(feed):
     # Retry through a still-recovering control plane; the action runs
-    # immediately after the previous step committed WCL.
-    deadline = time.monotonic() + 30
+    # immediately after the previous step committed WCL. The bound is
+    # generous because a prior action's restart window can hold the
+    # published ports shut for tens of seconds on some Docker stacks.
+    deadline = time.monotonic() + 90
     last = None
     while time.monotonic() < deadline:
         for endpoint in ENDPOINTS:
