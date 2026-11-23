@@ -418,8 +418,13 @@ def emissions(records):
         expected_event = (body["pane"] + 1) * PANE_NS - 1
         if record["event_time_ns"] != str(expected_event):
             raise AssertionError({"emission event_time": record})
-        if int(body["pane_end_ns"]) - int(body["pane_start_ns"]) != PANE_NS:
-            raise AssertionError({"emission bounds": record})
+        # Rolling membership: the row aggregates the trailing
+        # (window_end - WINDOW_NS, window_end] interval — the pane
+        # bounds remain the row's own close coordinates.
+        if int(body["window_end_ns"]) - int(body["window_start_ns"]) != WINDOW_NS:
+            raise AssertionError({"emission window bounds": record})
+        if int(body["window_end_ns"]) != int(body["pane_end_ns"]):
+            raise AssertionError({"emission window end": record})
         if int(body["store_seq"]) <= 0:
             raise AssertionError({"emission store_seq": record})
         out[identity] = body
@@ -428,6 +433,48 @@ def emissions(records):
 
 def pane_of(event_ns):
     return max(event_ns, 0) // PANE_NS
+
+
+def member_panes(event_ns):
+    """Pane indices whose rolling (end - WINDOW_NS, end] window covers
+    `event_ns`: pane ends inside [event_ns, event_ns + WINDOW_NS)."""
+    t = max(event_ns, 0)
+    first = max((t + PANE_NS - 1) // PANE_NS, 1) - 1
+    last = (t + WINDOW_NS - 1) // PANE_NS - 1
+    return range(first, last + 1)
+
+
+def rolling_expect(events, pane):
+    """(count, sum) one pane row should emit: every event inside the
+    trailing (end - WINDOW_NS, end] window, grouped per (group, pane).
+    `events` is a list of (group, value, event_ns) tuples; returns a
+    {(group, pane): (count, sum)} dict over non-empty windows."""
+    out = {}
+    for (group, value, t) in events:
+        if t < 0:
+            continue
+        end = (pane + 1) * PANE_NS
+        if end - WINDOW_NS < t <= end:
+            out[(group, pane)] = (
+                out.get((group, pane), (0, 0))[0] + 1,
+                out.get((group, pane), (0, 0))[1] + value,
+            )
+    return out
+
+
+def rolling_expected(events, closed_through_ns):
+    """Full expected emission set for `events`: every (group, member
+    pane) whose pane end provably closed (end + close bound <=
+    closed_through_ns reads as 'pane end <= closed_through_ns' — the
+    caller supplies the horizon it already waited past)."""
+    out = {}
+    for (group, _value, t) in events:
+        if t < 0:
+            continue
+        for pane in member_panes(t):
+            if (pane + 1) * PANE_NS <= closed_through_ns:
+                out.update(rolling_expect(events, pane))
+    return out
 
 
 def assert_subset(out, expected):
@@ -572,14 +619,20 @@ def main():
             ],
         )
 
-        expected = {
-            ("acme", p0): (3, 60),
-            ("globex", p0): (1, 5),
-            ("acme", p0 + 1): (1, 40),
-            ("globex", p0 + 2): (1, 7),
-            ("acme", p0 + 3): (1, 100),
-        }
-        emitted = emissions(wait_records(results_feed, 5))
+        # Rolling membership: every member pane ending at or before the
+        # provably-closed bound emits a trailing-8s aggregate, so each
+        # early pane's result covers several of the batch events.
+        ab_events = [
+            ("acme", 10, p0_start + 100_000_000),
+            ("acme", 20, p0_start + 200_000_000),
+            ("globex", 5, p0_start + 300_000_000),
+            ("acme", 30, p0_start + 400_000_000),
+            ("acme", 40, p0_start + 600_000_000),
+            ("globex", 7, p0_start + 1_100_000_000),
+            ("acme", 100, p0_start + 1_600_000_000),
+        ]
+        expected = rolling_expected(ab_events, p0_start + 2_000_000_000)
+        emitted = emissions(wait_records(results_feed, len(expected)))
         assert_subset(emitted, expected)
 
         # The sentinel pane never emits; neither does the overflow pane.
@@ -613,9 +666,11 @@ def main():
         if len(sentinel_rows(NODES[0], panes_store)) != 1:
             raise AssertionError("request retry re-accumulated into the sentinel")
 
-        # The fresh batch-C pane closes on its own boundary and emits too.
-        expected[("acme", pfresh)] = (1, 1)
-        emitted = emissions(wait_records(results_feed, 6))
+        # The fresh batch-C event rolls into its own member panes; the
+        # earliest member (end pfresh_end) provably closes next.
+        fresh_events = ab_events + [("acme", 1, t_c + 30_000_000_000)]
+        expected = rolling_expected(fresh_events, (pfresh + 1) * PANE_NS)
+        emitted = emissions(wait_records(results_feed, len(expected)))
         assert_subset(emitted, expected)
 
         # Bounded state: emitted panes deleted; only the overflow pane row
@@ -670,8 +725,11 @@ def main():
             [("globex", 3, t2 + 30_000_000_000)],
             retries=45,
         )
-        expected[("globex", pmoved)] = (1, 3)
-        emitted = emissions(wait_records(results_feed, 7, deadline=180))
+        all_events = fresh_events + [
+            ("globex", 3, t2 + 30_000_000_000),
+        ]
+        expected = rolling_expected(all_events, (pmoved + 1) * PANE_NS)
+        emitted = emissions(wait_records(results_feed, len(expected), deadline=180))
         assert_subset(emitted, expected)
 
         # Per-Domain Pipe cost attribution, read while every drive Node is
@@ -773,17 +831,18 @@ def main():
             [("acme", 9, t3 + 30_000_000_000)],
             retries=45,
         )
-        expected[("acme", pdone)] = (1, 9)
-        emitted = emissions(wait_records(results_feed, 8, deadline=180))
+        all_events = all_events + [("acme", 9, t3 + 30_000_000_000)]
+        expected = rolling_expected(all_events, (pdone + 1) * PANE_NS)
+        emitted = emissions(wait_records(results_feed, len(expected), deadline=180))
         assert_subset(emitted, expected)
-        if len(emitted) != 8:
+        if len(emitted) != len(expected):
             raise AssertionError({"unexpected extra emissions": emitted})
 
         # Re-drive idempotency is the supervisor's own behavior: at a 200ms
         # drive interval each settle window is dozens of re-drives over a
         # caught-up frontier, and replay rides the committed Declare rather
         # than re-resolving panes. Any double-apply would surface here.
-        if len(settle(results_feed)) != 8:
+        if len(settle(results_feed)) != len(expected):
             raise AssertionError("re-drive emitted extra outputs")
 
         # No-input expiry: the non-emitting Pipe's pane rows (fed by the
@@ -913,14 +972,17 @@ def main():
         )
         writer_w_epoch = wm_declare[4]["session_epoch"]
 
-        # Pane QA holds event ev_a; a second event 10s later commits
-        # horizon ev_a + 6s. pane_end(QA) = ev_a + 0.4s closes; its grace
-        # edge ev_a + 6.4s still exceeds the horizon, so a record landing
-        # in QA revises. An event in QA-1 ends at ev_a - 0.1s — its grace
-        # edge ev_a + 5.9s is behind the horizon, so it quarantines.
+        # Rolling membership under WATERMARK+GRACE: event ev_a's member
+        # windows end ev_a+0.4s..ev_a+7.9s (panes qa..qa+15); event ev_q's
+        # members end ev_a-0.1s..ev_a+7.4s. The second event ev_b commits
+        # horizon ev_b - 4s; at horizon ev_a + 13.5s every ev_q member is
+        # past grace (last end + 6s = ev_a+13.4s < horizon) so the record
+        # quarantines whole, while ev_a's last member (end ev_a+7.9s,
+        # grace edge ev_a+13.9s) is still revisable — so the replayed
+        # ev_a record revises pane qa+15 alone.
         qa = pane_of(time.time_ns() + 40_000_000_000)
         ev_a = qa * PANE_NS + 100_000_000
-        ev_b = ev_a + 10_000_000_000
+        ev_b = ev_a + 17_500_000_000
         ev_q = ev_a - 500_000_000
         append_json(
             NODES[1],
@@ -928,6 +990,8 @@ def main():
             writer_w_epoch,
             [("wacme", 10, ev_a), ("wacme", 20, ev_b)],
         )
+        # Every ev_a member pane ending at or below the horizon emits
+        # the same trailing-window aggregate (count 1, sum 10).
         first = emissions(wait_records(wm_results, 1, deadline=240))
         assert_subset(first, {("wacme", qa): (1, 10)})
 
@@ -937,16 +1001,30 @@ def main():
             writer_w_epoch,
             [("wacme", 5, ev_a), ("wacme", 7, ev_q)],
         )
-        revised = wait_records(wm_results, 2, deadline=240)
-        bodies = [
-            json.loads(unb64(record["payload_base64"])) for record in revised
-        ]
+        # First publishes cover panes qa..qa+15; the replayed event
+        # revises only pane qa+15 — the sole member still inside grace —
+        # so a revision-2 record eventually appears alongside them.
+        bodies = []
+        deadline = time.time() + 240
+        rev2 = None
+        while time.time() < deadline:
+            bodies = [
+                json.loads(unb64(record["payload_base64"]))
+                for record in wait_records(wm_results, 1, deadline=240)
+            ]
+            rev2 = next(
+                (body for body in bodies if body["revision"] == "2"), None
+            )
+            if rev2 is not None:
+                break
+            time.sleep(0.5)
+        if rev2 is None:
+            raise AssertionError({"wm emissions": bodies})
         revisions = {
             (body["group"], body["pane"], body["revision"]) for body in bodies
         }
-        if revisions != {("wacme", qa, "1"), ("wacme", qa, "2")}:
+        if ("wacme", qa, "1") not in revisions or ("wacme", qa + 15, "2") not in revisions:
             raise AssertionError({"wm emissions": bodies})
-        rev2 = next(body for body in bodies if body["revision"] == "2")
         if (rev2["count"], rev2["sum"]) != (1, "5"):
             raise AssertionError({"revision 2 result": rev2})
 

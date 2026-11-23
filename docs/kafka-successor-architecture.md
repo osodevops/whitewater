@@ -302,7 +302,7 @@ boundary, so replay projections can never consume an uncommitted record.
 Rolling-window accumulation is the first consumer of co-located mutations.
 A `Window` Pipe declares only the business duration, a grouping projection,
 and an aggregation (`count`, `sum`, `average`); Whitewater shards each
-window into sixteen event-time accumulation panes internally - pane layout
+window into sixteen event-time accumulation panes internally, where each record accumulates into every pane whose `(pane_end - window, pane_end]` window covers it - so an emitted pane row is an exact trailing-duration rolling aggregate, not a window/16 tumbling slice - and pane layout
 is an implementation detail, never a user-visible partition. Each drive
 cycle folds its fetched page by (group, `event_time_ns` pane) into a single
 `AccumulateRows` mutation that rides the same `Declare -> Applied ->

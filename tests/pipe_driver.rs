@@ -1297,23 +1297,25 @@ async fn window_pipe_quarantines_late_events_into_a_countable_row() {
     let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
         panic!("expected AccumulateRows")
     };
-    assert_eq!(entries.len(), 2);
-    // On-time record lands on pane 99 (990 / 10ns panes); the late record
-    // lands on the sentinel late pane with a count-only contribution.
-    assert_eq!(entries[0].named[1].values, vec![IndexValue::I64(99)]);
+    // The on-time record lands in every member window ending
+    // 990..1140 -> panes 98..=113; the late record lands on the
+    // sentinel late pane with a count-only contribution.
+    assert_eq!(entries.len(), 17);
+    assert_eq!(entries[0].named[1].values, vec![IndexValue::I64(98)]);
+    assert_eq!(entries[15].named[1].values, vec![IndexValue::I64(113)]);
     // Same group bytes, sentinel pane — the late row sorts after every
     // real pane for the group and can never collide with one.
     assert_eq!(
         entries[0].key[..entries[0].key.len() - 8],
-        entries[1].key[..entries[1].key.len() - 8]
+        entries[16].key[..entries[16].key.len() - 8]
     );
     assert_eq!(
-        entries[1].key[entries[1].key.len() - 8..],
+        entries[16].key[entries[16].key.len() - 8..],
         u64::MAX.to_be_bytes()
     );
-    assert_eq!(entries[1].named[1].values, vec![IndexValue::I64(-1)]);
-    assert_eq!(entries[1].count_delta, 1);
-    assert_eq!(entries[1].sum_delta, 0);
+    assert_eq!(entries[16].named[1].values, vec![IndexValue::I64(-1)]);
+    assert_eq!(entries[16].count_delta, 1);
+    assert_eq!(entries[16].sum_delta, 0);
 }
 
 /// A window Pipe on the durable event-time watermark: `WATERMARK 40ns
@@ -1368,9 +1370,10 @@ async fn watermark_delta_rides_inside_the_window_effect() {
     let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
         panic!("expected AccumulateRows")
     };
-    // Pane row for event 500 (pane 50) plus the watermark row — one
-    // AccumulateRows so horizon and panes commit atomically.
-    assert_eq!(entries.len(), 2);
+    // Member rows for event 500 (ends 500..650 -> panes 49..=64) plus
+    // the watermark row — one AccumulateRows so horizon and panes
+    // commit atomically.
+    assert_eq!(entries.len(), 17);
     let watermark = entries
         .iter()
         .find(|entry| entry.key == whitewater::pipe::window_watermark_row_key())
@@ -1422,10 +1425,11 @@ async fn grace_boundaries_split_late_events_between_revision_and_quarantine() {
     let harness = harness_for(watermark_window_pipe());
     seed_frontier(&harness.progress, "p0").await;
 
-    // 10ns panes. Event 25 lands in pane 2 (end 30). A committed horizon
-    // of 45 means pane 2 closed and `30 + grace(15) = 45` still revises;
-    // a horizon of 46 quarantines. Event 50 (pane 5, end 60 > 45) is
-    // simply on time.
+    // 10ns panes under a 160ns window: event 25's member windows end
+    // 30..180 (panes 2..=17). A committed horizon of 45 closes the
+    // earliest members but `30 + grace(15) = 45` still revises pane 2
+    // while members ending 40..180 stay open. Event 50's members
+    // (ends 50..200) are all on time.
     let mut revising = page(
         vec![
             json_record(1, b"key-a", 25, 1),
@@ -1455,7 +1459,7 @@ async fn grace_boundaries_split_late_events_between_revision_and_quarantine() {
         panic!("expected AccumulateRows")
     };
     // Real pane rows only — no sentinel: pane 2 revised inside grace,
-    // pane 5 on time, plus the watermark row.
+    // every other member contributed on time, plus the watermark row.
     let late_rows = entries
         .iter()
         .filter(|entry| entry.key[entry.key.len() - 8..] == u64::MAX.to_be_bytes())
@@ -1466,10 +1470,11 @@ async fn grace_boundaries_split_late_events_between_revision_and_quarantine() {
         .any(|entry| entry.named.get(1).map(|named| named.values.clone())
             == Some(vec![IndexValue::I64(2)])));
 
-    // One ns later the same event is beyond grace — it accumulates the
-    // countable late sentinel instead of revising pane 2.
+    // A horizon of 46 skips pane 2 alone — members ending 40..180
+    // still admit the record. Whole-record quarantine needs the
+    // horizon past the last member's grace bound: 196 > 180 + 15.
     let mut quarantining = page(vec![json_record(3, b"key-a", 25, 1)], "p2");
-    quarantining.watermark = Some((45, 46));
+    quarantining.watermark = Some((190, 196));
     let applied = harness
         .driver
         .drive_once(
@@ -1496,11 +1501,15 @@ async fn grace_boundaries_split_late_events_between_revision_and_quarantine() {
         .expect("late sentinel row");
     assert_eq!(sentinel.count_delta, 1);
     assert_eq!(sentinel.named[1].values, vec![IndexValue::I64(-1)]);
-    // No pane-2 row was touched.
+    // No member row was touched — every window was past grace.
     assert!(!entries
         .iter()
         .any(|entry| entry.named.get(1).map(|named| named.values.clone())
             == Some(vec![IndexValue::I64(2)])));
+    assert!(!entries
+        .iter()
+        .any(|entry| entry.named.get(1).map(|named| named.values.clone())
+            == Some(vec![IndexValue::I64(17)])));
 }
 
 #[tokio::test]
@@ -1628,8 +1637,9 @@ async fn ingest_time_window_panes_on_the_ingest_clock() {
     let harness = harness_for(ingest_window_pipe());
     seed_frontier(&harness.progress, "p0").await;
 
-    // Same record, two clocks: event_time 0 lands in pane 0 but
-    // ingest_time 15 lands in pane 1 under the 10ns pane size.
+    // Same record, two clocks: event_time 0 would roll into panes
+    // 0..=14, but the ingest clock reads 15 — its member windows end
+    // 20..170 -> panes 1..=16 under the 10ns pane size.
     let mut record = json_record(1, b"k", 0, 1);
     record.ingest_time_ns = 15;
     let applied = harness
@@ -1652,9 +1662,10 @@ async fn ingest_time_window_panes_on_the_ingest_clock() {
     let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
         panic!("expected AccumulateRows")
     };
-    assert_eq!(entries.len(), 1);
+    assert_eq!(entries.len(), 16);
     assert_eq!(entries[0].count_delta, 1);
     assert_eq!(entries[0].named[1].values, vec![IndexValue::I64(1)]);
+    assert_eq!(entries[15].named[1].values, vec![IndexValue::I64(16)]);
 }
 
 #[tokio::test]
@@ -1662,8 +1673,11 @@ async fn window_pipe_folds_a_page_into_one_accumulate_mutation() {
     let harness = harness_for(window_pipe());
     seed_frontier(&harness.progress, "p0").await;
 
-    // window 160ns -> 10ns panes: pane 0 covers event_time 0..10,
-    // pane 1 covers 10..20. Two records share (key-a, pane 0).
+    // window 160ns -> 10ns panes, rolling membership: rec1 (t=0)
+    // covers ends 10..150 -> panes 0..=14; rec2 (t=9) covers ends
+    // 10..160 -> panes 0..=15; rec3 (key-b, t=12) covers ends
+    // 20..170 -> panes 1..=16. Every emitted row aggregates an exact
+    // trailing-160ns window.
     let applied = harness
         .driver
         .drive_once(
@@ -1724,21 +1738,35 @@ async fn window_pipe_folds_a_page_into_one_accumulate_mutation() {
     let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
         panic!("expected AccumulateRows")
     };
-    assert_eq!(entries.len(), 2);
+    // key-a: 16 member rows (panes 0..=15); panes 0..=14 merged both
+    // records, pane 15 saw only rec2. key-b: 16 member rows (1..=16).
+    assert_eq!(entries.len(), 32);
     // Deterministic order: (group bytes, pane) sorted.
-    assert_eq!(entries[0].count_delta, 2);
-    assert_eq!(entries[0].sum_delta, 12);
-    assert_eq!(entries[1].count_delta, 1);
-    assert_eq!(entries[1].sum_delta, -3);
+    for entry in &entries[..15] {
+        assert_eq!(entry.count_delta, 2);
+        assert_eq!(entry.sum_delta, 12);
+    }
+    assert_eq!(entries[15].count_delta, 1);
+    assert_eq!(entries[15].sum_delta, 7);
+    for entry in &entries[16..] {
+        assert_eq!(entry.count_delta, 1);
+        assert_eq!(entry.sum_delta, -3);
+    }
     // Pane postings make the view enumerable by group key and pane index.
     assert_eq!(
         entries[0].named[0].values,
         vec![IndexValue::Bytes(b"key-a".to_vec())]
     );
     assert_eq!(entries[0].named[1].values, vec![IndexValue::I64(0)]);
-    assert_eq!(entries[1].named[1].values, vec![IndexValue::I64(1)]);
+    assert_eq!(entries[15].named[1].values, vec![IndexValue::I64(15)]);
+    assert_eq!(
+        entries[16].named[0].values,
+        vec![IndexValue::Bytes(b"key-b".to_vec())]
+    );
+    assert_eq!(entries[16].named[1].values, vec![IndexValue::I64(1)]);
+    assert_eq!(entries[31].named[1].values, vec![IndexValue::I64(16)]);
     // Distinct (key, pane) composite row keys.
-    assert_ne!(entries[0].key, entries[1].key);
+    assert_ne!(entries[0].key, entries[16].key);
 
     // The mutation reached the apply sink exactly once with the same shape.
     let recorded = harness.sink.mutations.lock().unwrap();
@@ -2174,6 +2202,10 @@ async fn window_pipe_emits_a_closed_pane_and_deletes_its_row_atomically() {
     assert_eq!(payload["pane"], 3);
     assert_eq!(payload["pane_start_ns"], "30");
     assert_eq!(payload["pane_end_ns"], "40");
+    // The aggregated interval is the declared 160ns window ending at
+    // the pane close, not the pane slice — saturating at the epoch.
+    assert_eq!(payload["window_start_ns"], "0");
+    assert_eq!(payload["window_end_ns"], "40");
     assert_eq!(payload["count"], 4);
     assert_eq!(payload["sum"], "30");
     assert_eq!(
@@ -2597,25 +2629,27 @@ async fn window_limit_keys_quarantines_refused_groups_into_a_shared_sentinel() {
     let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
         panic!("expected AccumulateRows")
     };
-    // One real pane row for "a" plus the single shared refusal row —
-    // refused groups never materialize per-group state.
-    assert_eq!(entries.len(), 2);
+    // Sixteen member rows for "a" (ends 10..160 -> panes 0..=15)
+    // plus the single shared refusal row — refused groups never
+    // materialize per-group state.
+    assert_eq!(entries.len(), 17);
     assert_eq!(
         entries[0].named[0].values,
         vec![IndexValue::Bytes(b"a".to_vec())]
     );
-    assert_eq!(entries[0].named[1].values, vec![IndexValue::I64(1)]);
+    assert_eq!(entries[0].named[1].values, vec![IndexValue::I64(0)]);
+    assert_eq!(entries[15].named[1].values, vec![IndexValue::I64(15)]);
     // Shared sentinel: `__keycap__` carries the count of every refused
     // record regardless of which group it arrived under.
     assert_eq!(
-        entries[1].named[0].values,
+        entries[16].named[0].values,
         vec![IndexValue::Text("__keycap__".to_owned())]
     );
-    assert_eq!(entries[1].named[1].values, vec![IndexValue::I64(-1)]);
-    assert_eq!(entries[1].count_delta, 3);
-    assert_eq!(entries[1].sum_delta, 0);
+    assert_eq!(entries[16].named[1].values, vec![IndexValue::I64(-1)]);
+    assert_eq!(entries[16].count_delta, 3);
+    assert_eq!(entries[16].sum_delta, 0);
     assert_eq!(
-        entries[1].key[entries[1].key.len() - 8..],
+        entries[16].key[entries[16].key.len() - 8..],
         u64::MAX.to_be_bytes()
     );
 }
@@ -2659,9 +2693,11 @@ async fn window_limit_bytes_refuses_new_pane_rows_into_bytecap() {
     let PipeOperation::Window { byte_limit, .. } = &mut pipe.operation else {
         panic!("window pipe")
     };
-    // 120 bytes: one existing 38-byte row leaves 82 — two further rows
-    // (38 each) admit, the third would exceed and refuses.
-    *byte_limit = Some(120);
+    // 40-byte rows: existing (a,0) spends 40 of 680 — room for exactly
+    // one record's full 16-member set (16 * 40 = 640). Member writes
+    // are all-or-nothing: a record whose new rows overflow refuses
+    // whole rather than under-aggregating a subset of its windows.
+    *byte_limit = Some(680);
     let harness = harness_for(pipe);
     seed_frontier(&harness.progress, "p0").await;
 
@@ -2669,11 +2705,13 @@ async fn window_limit_bytes_refuses_new_pane_rows_into_bytecap() {
     // The fetch-time scan proved group "a" already owns pane 0.
     let existing: BTreeSet<(Vec<u8>, u64)> = [(tagged(b"a"), 0u64)].into_iter().collect();
     let records = vec![
-        json_record(1, b"b", 5, 7),   // new pane (b,0): admits
-        json_record(2, b"c", 15, 9),  // new pane (c,1): admits, budget spent
-        json_record(3, b"d", 5, 11),  // new pane (d,0): refuses
-        json_record(4, b"b", 25, 13), // new pane (b,2): refuses
-        json_record(5, b"b", 7, 13),  // merges into admitted (b,0)
+        json_record(1, b"b", 5, 7),  // members (b,0..=15): 16 new rows — admits
+        json_record(2, b"c", 15, 9), // members (c,1..=16): 16 new — refuses whole
+        json_record(3, b"d", 5, 11), // members (d,0..=15): 16 new — refuses
+        // (b,2..=15) already owned, but new (b,16)/(b,17) exceed the
+        // spent budget — the record refuses whole, not partially.
+        json_record(4, b"b", 25, 13),
+        json_record(5, b"b", 7, 13), // members (b,0..=15): all owned — free merge
     ];
     let applied = harness
         .driver
@@ -2709,30 +2747,28 @@ async fn window_limit_bytes_refuses_new_pane_rows_into_bytecap() {
     let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
         panic!("expected AccumulateRows")
     };
-    // (b,0) and (c,1) admitted; (d,0) and (b,2) refused into the shared
-    // `__bytecap__` sentinel; (a,0) untouched — rows never revise on merge.
-    assert_eq!(entries.len(), 3);
+    // (b,0..=15) admitted — rec1 and rec5 merged two contributions
+    // each; records 2-4 refused whole into the shared `__bytecap__`
+    // sentinel; (a,0) untouched — rows never revise on merge.
+    assert_eq!(entries.len(), 17);
+    for (idx, entry) in entries[..16].iter().enumerate() {
+        assert_eq!(
+            entry.named[0].values,
+            vec![IndexValue::Bytes(b"b".to_vec())]
+        );
+        assert_eq!(entry.named[1].values, vec![IndexValue::I64(idx as i64)]);
+        assert_eq!(entry.count_delta, 2);
+        assert_eq!(entry.sum_delta, 20);
+    }
     assert_eq!(
-        entries[0].named[0].values,
-        vec![IndexValue::Bytes(b"b".to_vec())]
-    );
-    assert_eq!(entries[0].named[1].values, vec![IndexValue::I64(0)]);
-    assert_eq!(entries[0].count_delta, 2);
-    assert_eq!(entries[0].sum_delta, 20);
-    assert_eq!(
-        entries[1].named[0].values,
-        vec![IndexValue::Bytes(b"c".to_vec())]
-    );
-    assert_eq!(entries[1].named[1].values, vec![IndexValue::I64(1)]);
-    assert_eq!(
-        entries[2].named[0].values,
+        entries[16].named[0].values,
         vec![IndexValue::Text("__bytecap__".to_owned())]
     );
-    assert_eq!(entries[2].named[1].values, vec![IndexValue::I64(-1)]);
-    assert_eq!(entries[2].count_delta, 2);
-    assert_eq!(entries[2].sum_delta, 0);
+    assert_eq!(entries[16].named[1].values, vec![IndexValue::I64(-1)]);
+    assert_eq!(entries[16].count_delta, 3);
+    assert_eq!(entries[16].sum_delta, 0);
     assert_eq!(
-        entries[2].key[entries[2].key.len() - 8..],
+        entries[16].key[entries[16].key.len() - 8..],
         u64::MAX.to_be_bytes()
     );
 }
@@ -2750,8 +2786,11 @@ async fn window_limit_bytes_saturated_scan_refuses_every_new_row() {
     let tagged = |bytes: &[u8]| window_group_key_bytes(&IndexValue::Bytes(bytes.to_vec())).unwrap();
     let existing: BTreeSet<(Vec<u8>, u64)> = [(tagged(b"a"), 0u64)].into_iter().collect();
     let records = vec![
-        json_record(1, b"a", 5, 7), // merges into scanned (a,0): admits
-        json_record(2, b"b", 5, 9), // unproven budget: refuses
+        // (a,0) is proven but its other 15 member rows are not — a
+        // saturated scan cannot prove them, so the record refuses
+        // whole rather than under-aggregating.
+        json_record(1, b"a", 5, 7),
+        json_record(2, b"b", 5, 9), // all 16 member rows unproven: refuses
     ];
     let applied = harness
         .driver
@@ -2787,17 +2826,13 @@ async fn window_limit_bytes_saturated_scan_refuses_every_new_row() {
     let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
         panic!("expected AccumulateRows")
     };
-    assert_eq!(entries.len(), 2);
+    // Both records refused whole — only the shared sentinel moved.
+    assert_eq!(entries.len(), 1);
     assert_eq!(
         entries[0].named[0].values,
-        vec![IndexValue::Bytes(b"a".to_vec())]
-    );
-    assert_eq!(entries[0].count_delta, 1);
-    assert_eq!(
-        entries[1].named[0].values,
         vec![IndexValue::Text("__bytecap__".to_owned())]
     );
-    assert_eq!(entries[1].count_delta, 1);
+    assert_eq!(entries[0].count_delta, 2);
 }
 
 #[test]

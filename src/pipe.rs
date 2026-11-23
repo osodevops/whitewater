@@ -519,21 +519,6 @@ impl PipeDriver {
                     .iter()
                     .map(|(group, _)| window_pane_row_bytes(group))
                     .sum();
-                let mut admit_pane = |target: &(Vec<u8>, u64)| -> bool {
-                    let Some(limit) = byte_limit else {
-                        return true;
-                    };
-                    if admitted_panes.contains(target) {
-                        return true;
-                    }
-                    let row_bytes = window_pane_row_bytes(&target.0);
-                    if page.pane_rows_saturated || used_bytes.saturating_add(row_bytes) > *limit {
-                        return false;
-                    }
-                    used_bytes += row_bytes;
-                    admitted_panes.insert(target.clone());
-                    true
-                };
                 for record in &page.records {
                     let Some(source) = source_record(record) else {
                         continue;
@@ -564,28 +549,22 @@ impl PipeDriver {
                         WindowTime::Event => record.event_time_ns,
                         WindowTime::Ingest => record.ingest_time_ns,
                     };
-                    let pane = u64::try_from(instant.max(0)).unwrap_or(0) / pane_ns;
                     let lateness = record.ingest_time_ns.saturating_sub(record.event_time_ns);
-                    // WATERMARK mode: the pane is closed once its end
-                    // reaches the durable horizon; an event landing there
-                    // revises while `horizon <= pane_end + grace` and
-                    // quarantines past the bound (grace absent = zero —
-                    // only a horizon exactly at the edge still revises).
-                    let beyond_watermark_grace = watermark_ns
-                        .zip(page.watermark)
-                        .map(|(_, (_, horizon))| {
-                            let pane_end = pane.saturating_add(1).saturating_mul(pane_ns);
-                            pane_end <= horizon
-                                && horizon > pane_end.saturating_add(grace_ns.unwrap_or(0))
-                        })
-                        .unwrap_or(false);
-                    if (matches!(time, WindowTime::Event)
+                    // `MAX_LATE` judges the whole record's freshness:
+                    // past the bound it quarantines rather than revising
+                    // closed windows.
+                    if matches!(time, WindowTime::Event)
                         && max_late_ns
                             .map(|bound| lateness > bound as i64)
-                            .unwrap_or(false))
-                        || beyond_watermark_grace
+                            .unwrap_or(false)
                     {
-                        if !admit_pane(&(group.0.clone(), WINDOW_LATE_PANE)) {
+                        if !window_admit_pane_row(
+                            &(group.0.clone(), WINDOW_LATE_PANE),
+                            byte_limit,
+                            page,
+                            &mut admitted_panes,
+                            &mut used_bytes,
+                        ) {
                             bytecap = bytecap.saturating_add(1);
                             continue;
                         }
@@ -609,13 +588,81 @@ impl PipeDriver {
                             }
                         }
                     };
-                    if !admit_pane(&(group.0.clone(), pane)) {
-                        bytecap = bytecap.saturating_add(1);
+                    // Rolling membership: the event lands in every pane
+                    // row whose `(end - window_ns, end]` window covers
+                    // it. Under WATERMARK a member stays revisable while
+                    // `horizon <= end + GRACE` — the event still
+                    // contributes to its later windows when earlier
+                    // members are past grace, and quarantines whole only
+                    // when every member window is gone.
+                    let instant_u = u64::try_from(instant.max(0)).unwrap_or(0);
+                    let (first_member, last_member) =
+                        window_member_panes(instant_u, pane_ns, *window_ns);
+                    let horizon = watermark_ns
+                        .zip(page.watermark)
+                        .map(|(_, (_, horizon))| horizon);
+                    let grace = grace_ns.unwrap_or(0);
+                    // Admissible member windows: under WATERMARK a member
+                    // stays revisable while `horizon <= end + GRACE`; the
+                    // event still contributes to its later windows when
+                    // earlier members are gone, and quarantines whole
+                    // only when every member window is past grace.
+                    let mut members =
+                        Vec::with_capacity(usize::try_from(WINDOW_PANE_COUNT).unwrap_or(16) + 1);
+                    for pane in first_member..=last_member {
+                        if let Some(horizon) = horizon {
+                            let member_end = pane.saturating_add(1).saturating_mul(pane_ns);
+                            if member_end.saturating_add(grace) < horizon {
+                                continue;
+                            }
+                        }
+                        members.push(pane);
+                    }
+                    if members.is_empty() {
+                        if !window_admit_pane_row(
+                            &(group.0.clone(), WINDOW_LATE_PANE),
+                            byte_limit,
+                            page,
+                            &mut admitted_panes,
+                            &mut used_bytes,
+                        ) {
+                            bytecap = bytecap.saturating_add(1);
+                            continue;
+                        }
+                        let entry = late.entry(group.0).or_insert((0, group.1));
+                        entry.0 = entry.0.saturating_add(1);
                         continue;
                     }
-                    let entry = panes.entry((group.0, pane)).or_insert((0, 0, group.1));
-                    entry.0 = entry.0.saturating_add(1);
-                    entry.1 = entry.1.saturating_add(sum_delta);
+                    // `LIMIT BYTES` is all-or-nothing per record: a
+                    // partially written record would silently
+                    // under-aggregate the member windows it missed, so
+                    // the record refuses whole into `__bytecap__` when
+                    // its new member rows would exceed the bound.
+                    let row_bytes = window_pane_row_bytes(&group.0);
+                    let new_rows = members
+                        .iter()
+                        .filter(|pane| !admitted_panes.contains(&(group.0.clone(), **pane)))
+                        .count() as u64;
+                    if let Some(limit) = byte_limit {
+                        if (page.pane_rows_saturated && new_rows > 0)
+                            || used_bytes.saturating_add(new_rows.saturating_mul(row_bytes))
+                                > *limit
+                        {
+                            bytecap = bytecap.saturating_add(1);
+                            continue;
+                        }
+                    }
+                    for pane in members {
+                        if byte_limit.is_some() && admitted_panes.insert((group.0.clone(), pane)) {
+                            used_bytes = used_bytes.saturating_add(row_bytes);
+                        }
+                        let entry =
+                            panes
+                                .entry((group.0.clone(), pane))
+                                .or_insert((0, 0, group.1.clone()));
+                        entry.0 = entry.0.saturating_add(1);
+                        entry.1 = entry.1.saturating_add(sum_delta);
+                    }
                 }
                 // Closed-pane emissions resolved at fetch time emit even
                 // when this page accumulated nothing (all-late or empty
@@ -750,8 +797,9 @@ impl PipeDriver {
                             feed_id,
                             key_base64: base64::engine::general_purpose::STANDARD
                                 .encode(&emission.group_tagged),
-                            payload_base64: base64::engine::general_purpose::STANDARD
-                                .encode(window_emission_payload(emission, pane_ns, aggregation)),
+                            payload_base64: base64::engine::general_purpose::STANDARD.encode(
+                                window_emission_payload(emission, pane_ns, *window_ns, aggregation),
+                            ),
                             metadata_base64: metadata,
                             event_time_ns: emission
                                 .pane
@@ -1118,6 +1166,52 @@ pub fn window_pane_ns(window_ns: u64) -> u64 {
     (window_ns / WINDOW_PANE_COUNT).max(1)
 }
 
+/// `LIMIT BYTES` admission for one pane row: rows already proven by
+/// the scan or this page's own admissions always merge free, while a
+/// new row admits only inside the accounted bound — a saturated scan
+/// refuses every unproven row rather than guessing capacity. Shared by
+/// member windows and the sentinel rows so both account identically.
+fn window_admit_pane_row(
+    target: &(Vec<u8>, u64),
+    byte_limit: &Option<u64>,
+    page: &FetchedPage,
+    admitted_panes: &mut BTreeSet<(Vec<u8>, u64)>,
+    used_bytes: &mut u64,
+) -> bool {
+    let Some(limit) = byte_limit else {
+        return true;
+    };
+    if admitted_panes.contains(target) {
+        return true;
+    }
+    let row_bytes = window_pane_row_bytes(&target.0);
+    if page.pane_rows_saturated || used_bytes.saturating_add(row_bytes) > *limit {
+        return false;
+    }
+    *used_bytes += row_bytes;
+    admitted_panes.insert(target.clone());
+    true
+}
+
+/// Inclusive `(first, last)` pane indices whose rolling
+/// `(end - window_ns, end]` window covers an event at `instant_ns`: the
+/// member pane ends are the multiples of `pane_ns` inside
+/// `[instant_ns, instant_ns + window_ns)`. A boundary-aligned instant
+/// belongs to the pane closing exactly at it (the window's inclusive
+/// right edge) plus the panes closing within its duration, so a member
+/// count near `WINDOW_PANE_COUNT` results — one less at the epoch edge,
+/// where the would-be pane `-1` does not exist. Each emitted pane row
+/// therefore aggregates an exact `window_ns`-long trailing window rather
+/// than only its own `pane_ns` slice.
+pub fn window_member_panes(instant_ns: u64, pane_ns: u64, window_ns: u64) -> (u64, u64) {
+    // Smallest member end = ceil(instant / pane_ns) * pane_ns, floored at
+    // the first real pane end (no pane ends at 0).
+    let first_end = instant_ns.div_ceil(pane_ns).max(1);
+    // Largest member end < instant + window_ns.
+    let last_end = instant_ns.saturating_add(window_ns).saturating_sub(1) / pane_ns;
+    (first_end - 1, last_end.saturating_sub(1))
+}
+
 /// The StateStore row key for one (group, pane): length-prefixed so binary
 /// group bytes stay unambiguous, big-endian pane so row keys order by time.
 pub fn window_pane_row_key(group: &[u8], pane: u64) -> Vec<u8> {
@@ -1260,6 +1354,7 @@ pub fn window_row_disposition(
 fn window_emission_payload(
     emission: &WindowEmission,
     pane_ns: u64,
+    window_ns: u64,
     aggregation: &WindowAggregation,
 ) -> Vec<u8> {
     let group = match &emission.group {
@@ -1279,6 +1374,12 @@ fn window_emission_payload(
         "pane": emission.pane,
         "pane_start_ns": pane_start.to_string(),
         "pane_end_ns": pane_end.to_string(),
+        // The semantic interval this row aggregates: the trailing
+        // `(pane_end - window_ns, pane_end]` rolling window, which spans
+        // many panes — pane_start/pane_end stay the row's identity and
+        // close coordinates.
+        "window_start_ns": pane_end.saturating_sub(window_ns).to_string(),
+        "window_end_ns": pane_end.to_string(),
         "count": emission.count,
         "sum": serde_json::Value::Null,
         "average": serde_json::Value::Null,
@@ -1694,6 +1795,7 @@ mod tests {
         let payload = window_emission_payload(
             &emission,
             10,
+            160,
             &WindowAggregation::Average {
                 value: crate::control::IndexFieldSpec::Key,
             },
@@ -1703,6 +1805,11 @@ mod tests {
         assert_eq!(body["pane"], 7);
         assert_eq!(body["pane_start_ns"], "70");
         assert_eq!(body["pane_end_ns"], "80");
+        // The aggregated interval is the declared window, not the pane:
+        // pane 7 closes at 80, so the rolling 160ns result covers
+        // (-80, 80] — saturating at the epoch edge.
+        assert_eq!(body["window_start_ns"], "0");
+        assert_eq!(body["window_end_ns"], "80");
         assert_eq!(body["count"], 4);
         assert_eq!(body["sum"], "30");
         assert_eq!(body["average"], "7.5");
@@ -1712,9 +1819,34 @@ mod tests {
         assert_eq!(body["store_seq"], "41");
         assert_eq!(body["revision"], "2");
         // Count aggregations carry no sum/average fields.
-        let payload = window_emission_payload(&emission, 10, &WindowAggregation::Count);
+        let payload = window_emission_payload(&emission, 10, 160, &WindowAggregation::Count);
         let body: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(body["sum"], serde_json::Value::Null);
         assert_eq!(body["average"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn window_member_panes_cover_exactly_the_declared_duration() {
+        // 10ns panes under a 160ns window: every member set is the pane
+        // ends inside `[instant, instant + 160)`.
+        let (pane_ns, window_ns) = (10u64, 160u64);
+        // Interior instant: members end at 10..=160 -> panes 0..=15.
+        assert_eq!(window_member_panes(9, pane_ns, window_ns), (0, 15));
+        // Boundary instant belongs to the pane closing exactly at it —
+        // (end - d, end] includes its own right edge — plus the 15
+        // panes closing inside the duration: ends 10..=160.
+        assert_eq!(window_member_panes(10, pane_ns, window_ns), (0, 15));
+        assert_eq!(window_member_panes(20, pane_ns, window_ns), (1, 16));
+        assert_eq!(window_member_panes(990, pane_ns, window_ns), (98, 113));
+        // Epoch edge: pane -1 does not exist, so t=0 gets 15 members.
+        assert_eq!(window_member_panes(0, pane_ns, window_ns), (0, 14));
+        // Every member window is exactly `window_ns` long.
+        let (first, last) = window_member_panes(41, pane_ns, window_ns);
+        for pane in first..=last {
+            let end = (pane + 1) * pane_ns;
+            assert!(end >= 41 && end < 41 + window_ns);
+        }
+        // Degenerate sub-pane window still lands somewhere sensible.
+        assert_eq!(window_member_panes(5, 1, 1), (4, 4));
     }
 }
