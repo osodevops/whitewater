@@ -1441,6 +1441,7 @@ struct CatalogState {
     subscriptions: BTreeMap<Uuid, SubscriptionDefinition>,
     #[serde(default)]
     subscription_progress_assignments: BTreeMap<Uuid, SubscriptionProgressAssignment>,
+    reader_progress_assignments: BTreeMap<Uuid, crate::reader_progress::ReaderProgressAssignment>,
     /// Translated Subscription frontiers committed by Active Range
     /// activations but not yet applied to the separate RF3 progress quorum —
     /// durable replayable evidence so an interrupted reconcile heals on the
@@ -1591,6 +1592,7 @@ impl Default for CatalogState {
             readers: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
             subscription_progress_assignments: BTreeMap::new(),
+            reader_progress_assignments: BTreeMap::new(),
             pending_subscription_cutovers: BTreeMap::new(),
             pipe_compute_leases: BTreeMap::new(),
             riverbed_links: BTreeMap::new(),
@@ -2453,6 +2455,12 @@ pub struct FixedActiveRangePlacement {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FixedReaderProgressPlacement {
+    pub owner: StorageNodeId,
+    pub replicas: [StorageNodeId; ACTIVE_RANGE_REPLICA_COUNT],
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FixedSubscriptionProgressPlacement {
     pub owner: StorageNodeId,
     pub replicas: [StorageNodeId; ACTIVE_RANGE_REPLICA_COUNT],
@@ -2470,6 +2478,7 @@ pub struct FixedStateStorePlacement {
 pub struct FixedPlacements {
     pub active_range: Option<FixedActiveRangePlacement>,
     pub subscription_progress: Option<FixedSubscriptionProgressPlacement>,
+    pub reader_progress: Option<FixedReaderProgressPlacement>,
     pub state_store: Option<FixedStateStorePlacement>,
 }
 
@@ -2487,6 +2496,8 @@ pub struct ReplicatedCommand {
     pub fixed_active_range: Option<FixedActiveRangePlacement>,
     #[serde(default)]
     pub fixed_subscription_progress: Option<FixedSubscriptionProgressPlacement>,
+    #[serde(default)]
+    pub fixed_reader_progress: Option<FixedReaderProgressPlacement>,
     #[serde(default)]
     pub fixed_state_store: Option<FixedStateStorePlacement>,
 }
@@ -2662,6 +2673,15 @@ impl ControlController {
                 )
             })
             .transpose()?;
+        let fixed_reader_progress = matches!(&command, Command::CreateReader { .. })
+            .then(|| {
+                self.select_fixed_reader_progress(
+                    &state,
+                    derived_resource_id(request_id, "reader"),
+                    issued_at_ns,
+                )
+            })
+            .transpose()?;
         let fixed_state_store = matches!(&command, Command::DefineStateStore { .. })
             .then(|| {
                 self.select_fixed_state_store(
@@ -2679,6 +2699,7 @@ impl ControlController {
             actor,
             fixed_active_range,
             fixed_subscription_progress,
+            fixed_reader_progress,
             fixed_state_store,
         })
     }
@@ -2894,6 +2915,40 @@ impl ControlController {
         })
     }
 
+    fn select_fixed_reader_progress(
+        &self,
+        state: &CatalogState,
+        reader_id: Uuid,
+        now_ns: i64,
+    ) -> Result<FixedReaderProgressPlacement, ControlError> {
+        let mut ranked = self
+            .storage_pool(state, now_ns)
+            .into_iter()
+            .map(|node| {
+                let mut hash = blake3::Hasher::new();
+                hash.update(b"whitewater-reader-progress-v1");
+                hash.update(reader_id.as_bytes());
+                hash.update(node.as_str().as_bytes());
+                (*hash.finalize().as_bytes(), node)
+            })
+            .collect::<Vec<_>>();
+        ranked.sort_unstable_by(|left, right| {
+            right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1))
+        });
+        let replicas: [StorageNodeId; ACTIVE_RANGE_REPLICA_COUNT] = ranked.into_iter()
+            .take(ACTIVE_RANGE_REPLICA_COUNT).map(|(_, node)| node).collect::<Vec<_>>()
+            .try_into().map_err(|replicas: Vec<StorageNodeId>| {
+                ControlError::InvalidOperation(format!(
+                    "Reader progress requires at least three eligible storage Nodes; only {} are configured",
+                    replicas.len(),
+                ))
+            })?;
+        Ok(FixedReaderProgressPlacement {
+            owner: replicas[0].clone(),
+            replicas,
+        })
+    }
+
     fn select_fixed_state_store(
         &self,
         state: &CatalogState,
@@ -3055,6 +3110,7 @@ impl ControlController {
             actor,
             fixed_active_range,
             fixed_subscription_progress,
+            fixed_reader_progress,
             fixed_state_store,
         } = request;
         let statement = command_label(&command);
@@ -3072,6 +3128,7 @@ impl ControlController {
                 FixedPlacements {
                     active_range: fixed_active_range,
                     subscription_progress: fixed_subscription_progress,
+                    reader_progress: fixed_reader_progress,
                     state_store: fixed_state_store,
                 },
             )
@@ -3303,6 +3360,24 @@ impl ControlController {
     /// Every active Subscription's current progress placement — the recovery
     /// supervisor's scan input. Declared Subscriptions without a placement
     /// have nothing to recover and are absent.
+    pub async fn active_reader_progress_assignment_by_id(
+        &self,
+        reader_id: Uuid,
+    ) -> Option<crate::reader_progress::ReaderProgressAssignment> {
+        let state = self
+            .state_lock("active_reader_progress_assignment_by_id")
+            .await;
+        state.reader_progress_assignments.get(&reader_id).cloned()
+    }
+
+    /// The Feed a Reader's progress row is scoped to — the shard's scope
+    /// identity, pinned so a replica write cannot smuggle another Feed's
+    /// row under a Reader's placement.
+    pub(crate) async fn active_reader_progress_scope_by_id(&self, reader_id: Uuid) -> Option<Uuid> {
+        let state = self.state_lock("active_reader_progress_scope_by_id").await;
+        state.readers.get(&reader_id).map(|reader| reader.feed_id)
+    }
+
     pub async fn active_subscription_progress_assignments(
         &self,
     ) -> Vec<SubscriptionProgressAssignment> {
@@ -5077,6 +5152,23 @@ impl ControlController {
                     status: ResourceStatus::Active,
                     created_at_ns: issued_at_ns,
                 };
+                let fixed = fixed.reader_progress.ok_or_else(|| {
+                    ControlError::InvalidOperation(
+                        "Reader progress has no consensus-prepared placement".to_owned(),
+                    )
+                })?;
+                let replicas = ReplicaSet::try_new(fixed.replicas)
+                    .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                let placement = crate::reader_progress::ReaderProgressAssignment::try_new(
+                    definition.reader_id,
+                    fixed.owner,
+                    replicas,
+                    1,
+                )
+                .map_err(|error| ControlError::InvalidOperation(error.to_string()))?;
+                state
+                    .reader_progress_assignments
+                    .insert(definition.reader_id, placement);
                 state
                     .readers
                     .insert(definition.reader_id, definition.clone());
@@ -12358,6 +12450,7 @@ mod tests {
             actor: AuditActor::System,
             fixed_active_range: None,
             fixed_subscription_progress: None,
+            fixed_reader_progress: None,
             fixed_state_store: None,
         };
         let left_result = left.apply_replicated(request.clone()).await;
@@ -12389,6 +12482,7 @@ mod tests {
             actor: AuditActor::System,
             fixed_active_range: None,
             fixed_subscription_progress: None,
+            fixed_reader_progress: None,
             fixed_state_store: None,
         };
         left.apply_replicated(space.clone()).await;
@@ -12410,6 +12504,7 @@ mod tests {
                 ],
             }),
             fixed_subscription_progress: None,
+            fixed_reader_progress: None,
             fixed_state_store: None,
         };
         let left_result = left.apply_replicated(create.clone()).await;

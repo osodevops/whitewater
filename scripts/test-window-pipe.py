@@ -673,21 +673,30 @@ def main():
         emitted = emissions(wait_records(results_feed, len(expected)))
         assert_subset(emitted, expected)
 
-        # Bounded state: emitted panes deleted; only the overflow pane row
-        # (and possibly the not-yet-closed fresh pane) remains alongside the
-        # sentinel â€” never a re-materialized closed pane. The read may land
-        # on a replica still applying the emission deletes, so converge.
+        # Bounded state: emitted panes deleted; under rolling membership
+        # the only legitimate open rows are members of the never-closing
+        # `edge` window set (its member ends sit ~45 years out) plus any
+        # not-yet-closed members of the fresh acme event — never a
+        # re-materialized closed pane. The read may land on a replica
+        # still applying the emission deletes, so converge.
+        edge_members = set(member_panes(I64_MAX))
+        acme_members = set(member_panes(t_c + 30_000_000_000))
         remaining_groups = None
         for _ in range(30):
             open_rows = pane_rows(NODES[1], panes_store)
-            remaining_groups = sorted(
-                decode_group(parse_row_key(row["key_base64"])[0])
-                for row in open_rows
-            )
-            if remaining_groups in (["edge"], ["acme", "edge"]):
+            open_set = [
+                (decode_group(parsed[0]), parsed[1])
+                for parsed in (parse_row_key(row["key_base64"]) for row in open_rows)
+            ]
+            remaining_groups = sorted(group for group, _ in open_set)
+            if open_set and all(
+                (group == "edge" and pane in edge_members)
+                or (group == "acme" and pane in acme_members)
+                for group, pane in open_set
+            ) and any(group == "edge" for group, _ in open_set):
                 break
             time.sleep(1)
-        if remaining_groups not in (["edge"], ["acme", "edge"]):
+        else:
             raise AssertionError({"unbounded pane rows": open_rows})
 
         # Owner change: drain the progress owner so the Control Plane moves
@@ -846,8 +855,11 @@ def main():
             raise AssertionError("re-drive emitted extra outputs")
 
         # No-input expiry: the non-emitting Pipe's pane rows (fed by the
-        # same source) delete at pane_end + EXPIRE on idle drives â€” the
-        # sentinel and the overflow pane are kept as designed.
+        # same source) delete at pane_end + EXPIRE on idle drives. Under
+        # rolling membership the only survivors are `edge`'s far-future
+        # member panes (~45 years out — unexpirable by design); every
+        # closed pane row must be gone.
+        edge_members = set(member_panes(I64_MAX))
         expiry_deadline = (pdone + 1) * PANE_NS + 40_000_000_000 + 30_000_000_000
         # A pane row that materialized late — its record consumed only after
         # restart convergence — lands already past its expiry boundary and
@@ -856,10 +868,14 @@ def main():
         last_sig, last_change = None, time.time_ns()
         while True:
             rows = pane_rows(NODES[2], retired_store)
-            if len(rows) == 1:
-                group_tagged, _ = parse_row_key(rows[0]["key_base64"])
-                if decode_group(group_tagged) == "edge":
-                    break
+            survivors = [
+                (decode_group(parsed[0]), parsed[1])
+                for parsed in (parse_row_key(row["key_base64"]) for row in rows)
+            ]
+            if survivors and all(
+                group == "edge" and pane in edge_members for group, pane in survivors
+            ):
+                break
             sig = sorted(row["key_base64"] for row in rows)
             if sig != last_sig:
                 last_sig, last_change = sig, time.time_ns()

@@ -86,6 +86,7 @@ pub struct AppState {
     pub progress_authority: Arc<dyn crate::reader::SubscriptionPlacementAuthority>,
     pub replica_append: Option<Arc<ReplicaAppendService>>,
     pub subscription_progress: Option<Arc<SubscriptionProgressReplicaService>>,
+    pub reader_progress: Option<Arc<crate::reader_progress::ReaderProgressReplicaService>>,
     pub effect_journal: Option<Arc<crate::effect::EffectJournalService>>,
     pub state_store_journal: Option<Arc<crate::state_store::StateStoreMutationService>>,
     pub subscription_mtls_enabled: bool,
@@ -360,6 +361,17 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
     let subscription_adopt_route = subscription_key_layer(
         post(subscription_adopt_local).layer(DefaultBodyLimit::max(512 * 1024)),
     );
+    let reader_prepare_route =
+        subscription_key_layer(post(reader_prepare_local).layer(DefaultBodyLimit::max(512 * 1024)));
+    let reader_commit_route =
+        subscription_key_layer(post(reader_commit_local).layer(DefaultBodyLimit::max(512 * 1024)));
+    let reader_committed_route = subscription_key_layer(
+        post(reader_committed_local).layer(DefaultBodyLimit::max(64 * 1024)),
+    );
+    let reader_inspect_route =
+        subscription_key_layer(post(reader_inspect_local).layer(DefaultBodyLimit::max(64 * 1024)));
+    let reader_adopt_route =
+        subscription_key_layer(post(reader_adopt_local).layer(DefaultBodyLimit::max(512 * 1024)));
     let owner_append_route = post(owner_append).layer(middleware::from_fn_with_state(
         state.clone(),
         authorize_replica_append,
@@ -622,6 +634,14 @@ fn internal_routes(state: &AppState, require_shared_key: bool) -> Router<AppStat
             "/internal/subscription-progress/adopt",
             subscription_adopt_route,
         )
+        .route("/internal/reader-progress/prepare", reader_prepare_route)
+        .route("/internal/reader-progress/commit", reader_commit_route)
+        .route(
+            "/internal/reader-progress/committed",
+            reader_committed_route,
+        )
+        .route("/internal/reader-progress/inspect", reader_inspect_route)
+        .route("/internal/reader-progress/adopt", reader_adopt_route)
         .route(
             "/internal/effect-journal/prepare",
             subscription_key_layer(
@@ -10241,6 +10261,146 @@ impl LiveEffectApply<'_> {
             Err(error) => Err(progress_apply_error(error)),
         }
     }
+}
+
+fn reader_progress_api_error(
+    error: crate::reader_progress::ReaderProgressJournalError,
+) -> ApiError {
+    let code = error.code();
+    let status = match error {
+        crate::reader_progress::ReaderProgressJournalError::Unavailable
+        | crate::reader_progress::ReaderProgressJournalError::AmbiguousCommit
+        | crate::reader_progress::ReaderProgressJournalError::NoQuorum
+        | crate::reader_progress::ReaderProgressJournalError::Engine(_)
+        | crate::reader_progress::ReaderProgressJournalError::Serialization(_) => {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
+        _ => StatusCode::CONFLICT,
+    };
+    ApiError {
+        status,
+        message: error.to_string(),
+        code: Some(code),
+    }
+}
+
+async fn reader_prepare_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::reader_progress::ReaderPrepareRequest>,
+) -> Result<
+    Json<crate::reader_progress::ReaderReplicaReply<crate::reader_progress::ReaderPrepareVote>>,
+    ApiError,
+> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let service = state
+        .reader_progress
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Reader progress replica is not configured"))?;
+    Ok(Json(
+        service
+            .prepare(request)
+            .await
+            .map_err(reader_progress_api_error)?,
+    ))
+}
+
+async fn reader_commit_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::reader_progress::ReaderCommitRequest>,
+) -> Result<
+    Json<
+        crate::reader_progress::ReaderReplicaReply<crate::reader_progress::ReaderProgressMutation>,
+    >,
+    ApiError,
+> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let service = state
+        .reader_progress
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Reader progress replica is not configured"))?;
+    Ok(Json(
+        service
+            .commit(request)
+            .await
+            .map_err(reader_progress_api_error)?,
+    ))
+}
+
+async fn reader_committed_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::reader_progress::ReaderCommittedReadRequest>,
+) -> Result<
+    Json<
+        crate::reader_progress::ReaderReplicaReply<
+            Option<crate::reader_progress::ReaderProgressMutation>,
+        >,
+    >,
+    ApiError,
+> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let service = state
+        .reader_progress
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Reader progress replica is not configured"))?;
+    Ok(Json(
+        service
+            .committed(request)
+            .await
+            .map_err(reader_progress_api_error)?,
+    ))
+}
+
+async fn reader_inspect_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::reader_progress::ReaderCommittedReadRequest>,
+) -> Result<
+    Json<
+        crate::reader_progress::ReaderReplicaReply<
+            crate::reader_progress::ReaderProgressInspection,
+        >,
+    >,
+    ApiError,
+> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let service = state
+        .reader_progress
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Reader progress replica is not configured"))?;
+    Ok(Json(
+        service
+            .inspect(request)
+            .await
+            .map_err(reader_progress_api_error)?,
+    ))
+}
+
+async fn reader_adopt_local(
+    State(state): State<AppState>,
+    peer: Option<axum::Extension<AuthenticatedSubscriptionPeer>>,
+    Json(request): Json<crate::reader_progress::ReaderProgressAdoptRequest>,
+) -> Result<
+    Json<
+        crate::reader_progress::ReaderReplicaReply<
+            Option<crate::reader_progress::ReaderProgressMutation>,
+        >,
+    >,
+    ApiError,
+> {
+    check_subscription_peer(&state, peer.as_ref().map(|peer| &peer.0))?;
+    let service = state
+        .reader_progress
+        .as_ref()
+        .ok_or_else(|| ApiError::unavailable("Reader progress replica is not configured"))?;
+    Ok(Json(
+        service
+            .adopt(request)
+            .await
+            .map_err(reader_progress_api_error)?,
+    ))
 }
 
 async fn subscription_prepare_local(
@@ -21040,6 +21200,7 @@ mod tests {
                 replica_append: None,
                 majority_append: None,
                 subscription_progress: None,
+                reader_progress: None,
                 effect_journal: None,
                 state_store_journal: Some(Arc::new(service)),
                 subscription_mtls_enabled: false,
@@ -21417,6 +21578,7 @@ mod tests {
                 ))),
                 majority_append: None,
                 subscription_progress: None,
+                reader_progress: None,
                 effect_journal: None,
                 state_store_journal: Some(Arc::new(
                     crate::state_store::StateStoreMutationService::new(
@@ -21649,6 +21811,7 @@ mod tests {
                 ))),
                 majority_append: None,
                 subscription_progress: None,
+                reader_progress: None,
                 effect_journal: None,
                 state_store_journal: Some(Arc::new(
                     crate::state_store::StateStoreMutationService::new(
@@ -21843,6 +22006,7 @@ mod tests {
             ))),
             majority_append: None,
             subscription_progress: None,
+            reader_progress: None,
             effect_journal: None,
             state_store_journal: Some(Arc::new(
                 crate::state_store::StateStoreMutationService::new(
@@ -22085,6 +22249,7 @@ mod tests {
                 ))),
                 majority_append: None,
                 subscription_progress: None,
+                reader_progress: None,
                 effect_journal: None,
                 state_store_journal: Some(Arc::new(
                     crate::state_store::StateStoreMutationService::new(
@@ -22412,6 +22577,7 @@ mod tests {
                 replica_append: None,
                 majority_append: None,
                 subscription_progress: None,
+                reader_progress: None,
                 effect_journal: None,
                 state_store_journal: Some(Arc::new(service)),
                 subscription_mtls_enabled: false,
@@ -22707,6 +22873,7 @@ mod tests {
                 replica_append: None,
                 majority_append: None,
                 subscription_progress: None,
+                reader_progress: None,
                 effect_journal: None,
                 state_store_journal: Some(Arc::new(service)),
                 subscription_mtls_enabled: false,
@@ -23031,6 +23198,7 @@ mod tests {
                 replica_append: None,
                 majority_append: None,
                 subscription_progress: None,
+                reader_progress: None,
                 effect_journal: None,
                 state_store_journal: Some(Arc::new(service)),
                 subscription_mtls_enabled: false,
@@ -23386,6 +23554,7 @@ mod tests {
             progress_authority: control.clone(),
             majority_append: None,
             subscription_progress: None,
+            reader_progress: None,
             effect_journal: None,
             state_store_journal: None,
             subscription_mtls_enabled: false,
@@ -23492,6 +23661,7 @@ mod tests {
             replica_append: None,
             majority_append: None,
             subscription_progress: None,
+            reader_progress: None,
             effect_journal: None,
             state_store_journal: None,
             subscription_mtls_enabled: false,
@@ -23589,6 +23759,7 @@ mod tests {
                 replica_append: Some(replica_append),
                 majority_append: None,
                 subscription_progress: Some(subscription_progress),
+                reader_progress: None,
                 effect_journal: Some(Arc::new(crate::effect::EffectJournalService::new(
                     crate::active_range::StorageNodeId::try_new("control-1").unwrap(),
                     control.clone(),
@@ -27137,6 +27308,7 @@ mod tests {
                     ),
                 )),
                 subscription_progress: None,
+                reader_progress: None,
                 effect_journal: None,
                 state_store_journal: None,
                 subscription_mtls_enabled: false,
@@ -27726,6 +27898,7 @@ mod tests {
                         replica,
                     ),
                 )),
+                reader_progress: None,
                 effect_journal: Some(Arc::new(crate::effect::EffectJournalService::new(
                     node.clone(),
                     control.clone(),
@@ -29231,6 +29404,7 @@ mod tests {
                 ))),
                 majority_append: None,
                 subscription_progress: None,
+                reader_progress: None,
                 effect_journal: None,
                 state_store_journal: None,
                 subscription_mtls_enabled: false,

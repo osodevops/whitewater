@@ -22,6 +22,7 @@ pub mod membership;
 pub mod node;
 pub mod pipe;
 pub mod reader;
+pub mod reader_progress;
 pub mod sdk;
 pub mod state_store;
 pub mod storage;

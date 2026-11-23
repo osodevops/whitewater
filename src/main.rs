@@ -345,6 +345,22 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+    let reader_progress = if let Some(local) = &replica_append {
+        let path = config.data_dir.join("reader-progress");
+        let replica = tokio::task::spawn_blocking(move || {
+            whitewater::reader_progress::FjallReaderProgressReplica::open(path)
+        })
+        .await??;
+        Some(Arc::new(
+            whitewater::reader_progress::ReaderProgressReplicaService::new(
+                local.local_node().clone(),
+                control.clone(),
+                Arc::new(replica),
+            ),
+        ))
+    } else {
+        None
+    };
     let effect_journal = if let Some(local) = &replica_append {
         let path = config.data_dir.join("effect-journal");
         let replica = tokio::task::spawn_blocking(move || {
@@ -889,6 +905,7 @@ async fn main() -> Result<()> {
             .map(|service| service.local_node().clone()),
         replica_append,
         subscription_progress,
+        reader_progress,
         effect_journal,
         state_store_journal,
         subscription_mtls_enabled: config.subscription_mtls.is_some(),
