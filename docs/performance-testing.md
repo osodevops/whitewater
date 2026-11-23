@@ -567,6 +567,38 @@ Remaining loss: 3-range write throughput (0.86x). It does not respond to in-flig
 depth (2/5/8/12 all ≈ 90–94k) and in-memory storage reaches only 93–105k, so the
 limit is neither the disk nor the client's in-flight window.
 
+### Same-session result — 2026-11-23 (post owner-spread + verify-once reads)
+
+Re-measured on the same host after the `control.rs` split-owner selection
+(right-hand child goes to the eligible replica owning the fewest of the Feed's
+ranges) and the verify-once/range-parallel read changes landed. Single run per
+cell; same setup contract as 2026-11-03 — 300,000 × 1 KiB, 16 writers, RF3 both
+sides, no fsync (`WHITEWATER_RANGE_SYNC_INTERVAL_MS=never`, Kafka default
+flush), fresh `bench_feed` binary verified newer than `src/`, one system at a
+time. Kafka numbers from `bench-kafka-sdk.py` (`kafka-clients`, acks=all +
+idempotence, min-ISR-2).
+
+| Shape | Metric | Kafka | Whitewater | Result | Factor |
+|---|---|---|---|---|---|
+| 1 partition / 1 range | write rec/s | 55,756 | 63,001 | **WIN** | 1.13x |
+| | write p50 / p95 / p99 | 1,968 / 3,020 / 3,170 ms | 888 / 1,237 / 1,360 ms | **WIN** | ~2.3x |
+| | read rec/s | 276,181 | 402,651 | **WIN** | 1.46x |
+| 3 partitions / 3 ranges | write rec/s | 76,140 | 77,243 | **WIN** | 1.01x |
+| | write p50 / p95 / p99 | 793 / 1,464 / 1,839 ms | 697 / 969 / 1,307 ms | **WIN** | ~1.3x |
+| | read rec/s | 239,816 | 399,153 | **WIN** | 1.66x |
+
+Every cell a Whitewater win — the 3-range write loss (0.86x) from 2026-11-03 is
+closed (3 ranges now out-write 1 range, the owner-spread effect), and reads
+roughly hold the verify-once/range-parallel gains (~400k both shapes). Caveats:
+single runs, not the Nov two-run ranges; write p50 includes client-side
+queueing on both systems; Kafka read used `consumers=3` on 3 partitions while
+Whitewater's single reader fetched ranges in parallel internally.
+
+Soak cross-check (`bench-soak.py`, Python driver — client-bound, not
+server-bound): 8 writers + 4 tail-following readers, 60 s — flat ~14.1k rec/s
+in both directions across every 10 s interval, 0 errors, write p50 138 ms /
+p99 228 ms.
+
 ### Kafka-parity handoff
 
 Current status, open work and the exact run/profiling recipe: see

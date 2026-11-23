@@ -1,5 +1,12 @@
 # Kafka-parity handoff — status and next steps (2026-11-10)
 
+> **2026-11-23 update:** re-measured same-session after the owner-spread commit
+> landed — **the 3-range write loss is closed** (77.2k vs Kafka 76.1k, 1.01x) and
+> every cell is now a Whitewater win (writes 1.13x/1.01x, write p50 ~1.3–2.3x,
+> reads 1.46x/1.66x). Fresh table in `performance-testing.md` "Same-session
+> result — 2026-11-23". The remaining next steps below are optimizations toward
+> the 100k–200k sustained-write target, not parity gaps.
+
 **Where it stands** (pushed: whitewater `78cdaaa`, whitewater-rust `43bb04c`; see
 the 2026-11-03 same-session table in `performance-testing.md`): grand average **WIN 1.29x** vs the Kafka
 Java SDK. Wins: write p50 (both shapes), reads (1 and 3 ranges). Tie: 1-range
