@@ -539,15 +539,16 @@ def main():
             f"CREATE PIPE {capped_pipe} FROM SUBSCRIPTION {subscription_c} "
             f"TO STATESTORE {capped_store} WINDOW 8s EVENT MAX_LATE 20s "
             f"LIMIT KEYS 1 BY JSON 'customer' COUNT; "
-            # Byte-capped pipe: LIMIT BYTES 131 admits three pane rows
-            # (43-45 accounted bytes each under the v2 accumulator) then
-            # refuses every further new (group, pane) row into the shared
+            # Byte-capped pipe: LIMIT BYTES 700 admits the first record's
+            # full 16-member pane set (~43 accounted bytes each under the
+            # v2 accumulator, 16*43=688) then refuses every later record
+            # that needs even one new (group, pane) row into the shared
             # __bytecap__ sentinel.
             f"DEFINE STATESTORE {byte_store} KEYS key, pane; "
             f"CREATE SUBSCRIPTION {subscription_d} FROM {source} START AT BEGINNING; "
             f"CREATE PIPE {byte_pipe} FROM SUBSCRIPTION {subscription_d} "
             f"TO STATESTORE {byte_store} WINDOW 8s EVENT MAX_LATE 20s "
-            f"LIMIT BYTES 131 BY JSON 'customer' COUNT;",
+            f"LIMIT BYTES 700 BY JSON 'customer' COUNT;",
         )
         writer_epoch = results[6]["session_epoch"]
         described = wcl(NODES[1], f"DESCRIBE PIPE {totals_pipe};")[0]
@@ -769,11 +770,11 @@ def main():
             "keycap": keycap_row["telemetry"]
         }
         byte_row = merged[byte_pipe]
-        assert byte_row["telemetry"]["records_refused"] >= 5, {
+        assert byte_row["telemetry"]["records_refused"] >= 8, {
             "bytecap": byte_row["telemetry"]
         }
-        assert byte_row["telemetry"]["pane_rows_last"] >= 3
-        assert byte_row["telemetry"]["pane_bytes_last"] >= 125
+        assert byte_row["telemetry"]["pane_rows_last"] >= 16
+        assert byte_row["telemetry"]["pane_bytes_last"] >= 688
         rollup = domains[domain]
         assert rollup["pipes"] >= 3
         # Four Pipes each fetch the same 11 records through their own
@@ -887,7 +888,9 @@ def main():
             raise AssertionError("sentinel row expired or duplicated")
 
         # LIMIT KEYS: the capped Pipe folds the same 12 source records but
-        # admits only "acme" (the smallest tagged group) to pane state.
+        # admits only "acme" (the smallest tagged group) to pane state --
+        # every acme member row emits and deletes as its window closes, so
+        # open groups may be empty but can never hold a non-acme row.
         # The five non-acme records accumulate the single shared
         # `__keycap__` sentinel row â€” countable refusal evidence, and the
         # bound holds no matter how many distinct Keys arrive.
@@ -901,7 +904,7 @@ def main():
             }
             if (
                 len(capped_sentinels) == 1
-                and capped_groups == {"acme"}
+                and capped_groups <= {"acme"}
                 and decode_accumulator(capped_sentinels[0]["payload_base64"])
                 == (5, 0)
             ):
@@ -920,13 +923,17 @@ def main():
         if keycap_pane != 2**64 - 1 or decode_group(keycap_tagged) != "__keycap__":
             raise AssertionError({"keycap sentinel": capped_sentinels[0]})
 
-        # LIMIT BYTES: the byte-capped Pipe admits the first three pane
-        # rows it encounters â€” (acme,P0), (globex,P0), (acme,P0+1) at
-        # 43+45+43=131 accounted bytes â€” then every later new (group,
-        # pane) row refuses into the one shared `__bytecap__` sentinel:
-        # globex P0+2, acme P0+3, lateco's late row, acme pfresh, edge's
-        # overflow pane, and the post-move/restart records â€” 7 refused
-        # records total. Merges into admitted rows never grow the budget.
+        # LIMIT BYTES: the byte-capped Pipe admits the first record's full
+        # rolling member set -- acme's 16 pane rows at ~43 accounted bytes
+        # each (16*43=688 <= 700) -- then every later record needing even
+        # one new (group, pane) row refuses whole into the shared
+        # `__bytecap__` sentinel: globex's member set, acme+0.6s's
+        # one-new-pane set, globex P0+2, acme P0+3, lateco's late row,
+        # acme pfresh, edge's overflow members, and the post-move/restart
+        # records -- 9 refused records total. Merges into admitted rows
+        # never grow the budget. The admitted member rows emit and delete
+        # as their 8s windows close, so any still-open rows must be a
+        # subset of that first record's acme member set.
         byte_sentinels, byte_panes = [], None
         deadline = time.time() + 300
         while time.time() < deadline:
@@ -934,9 +941,8 @@ def main():
             byte_panes = pane_rows(NODES[0], byte_store)
             if (
                 len(byte_sentinels) == 1
-                and len(byte_panes) == 3
                 and decode_accumulator(byte_sentinels[0]["payload_base64"])
-                == (7, 0)
+                == (9, 0)
             ):
                 break
             time.sleep(1)
@@ -951,12 +957,15 @@ def main():
                     "source tail": read(NODES[2], source)[-3:],
                 }
             )
-        byte_groups = sorted(
-            decode_group(parse_row_key(row["key_base64"])[0])
+        stray_rows = [
+            row
             for row in byte_panes
-        )
-        if byte_groups != ["acme", "acme", "globex"]:
-            raise AssertionError({"admitted rows": byte_groups})
+            if decode_group(parse_row_key(row["key_base64"])[0]) != "acme"
+            or parse_row_key(row["key_base64"])[1]
+            not in set(member_panes(p0_start + 100_000_000))
+        ]
+        if stray_rows:
+            raise AssertionError({"rows outside the admitted member set": stray_rows})
         bytecap_tagged, bytecap_pane = parse_row_key(
             byte_sentinels[0]["key_base64"]
         )
@@ -1045,9 +1054,12 @@ def main():
             raise AssertionError({"revision 2 result": rev2})
 
         # The durable watermark row commits the horizon inside the same
-        # effect as the pane writes; the emitted marker proves two
-        # publishes on (wacme, QA); the beyond-grace event counts in the
-        # shared sentinel rather than revising.
+        # effect as the pane writes; under rolling membership all sixteen
+        # member panes publish once and only the still-in-grace qa+15
+        # re-publishes, so its emitted marker proves two publishes while
+        # every other member marker holds one. The beyond-grace event
+        # counts in the shared sentinel rather than revising.
+        wm_member_panes = set(member_panes(ev_a))
         deadline = time.time() + 240
         wm_row, markers, sentinels = [], [], []
         while time.time() < deadline:
@@ -1057,7 +1069,11 @@ def main():
             )
             markers = marker_rows(NODES[0], wm_store)
             sentinels = sentinel_rows(NODES[0], wm_store)
-            if len(wm_row) == 1 and len(markers) == 1 and len(sentinels) == 1:
+            if (
+                len(wm_row) == 1
+                and len(markers) == len(wm_member_panes)
+                and len(sentinels) == 1
+            ):
                 break
             time.sleep(0.5)
         if len(wm_row) != 1:
@@ -1067,13 +1083,20 @@ def main():
             ev_b - 4_000_000_000,
         ):
             raise AssertionError({"watermark accumulator": wm_row[0]})
-        if len(markers) != 1:
-            raise AssertionError({"emitted markers": markers})
-        marker_group, marker_pane = parse_marker_key(markers[0]["key_base64"])
-        if decode_group(marker_group) != "wacme" or marker_pane != qa:
-            raise AssertionError({"emitted marker": markers[0]})
-        if decode_accumulator(markers[0]["payload_base64"]) != (2, 0):
-            raise AssertionError({"marker accumulator": markers[0]})
+        marker_counts = {}
+        for row in markers:
+            marker_group, marker_pane = parse_marker_key(row["key_base64"])
+            if decode_group(marker_group) != "wacme":
+                raise AssertionError({"emitted marker": row})
+            marker_counts[marker_pane] = decode_accumulator(
+                row["payload_base64"]
+            )
+        if set(marker_counts) != wm_member_panes:
+            raise AssertionError({"emitted markers": marker_counts})
+        if marker_counts[qa + 15] != (2, 0):
+            raise AssertionError({"revision marker": marker_counts})
+        if any(count != (1, 0) for pane, count in marker_counts.items() if pane != qa + 15):
+            raise AssertionError({"member markers": marker_counts})
         if len(sentinels) != 1:
             raise AssertionError({"wm sentinel rows": sentinels})
         sent_group, sent_pane = parse_row_key(sentinels[0]["key_base64"])
