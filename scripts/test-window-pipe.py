@@ -431,7 +431,32 @@ def emissions(records):
     return out
 
 
+def wait_emissions(feed, expected, deadline=90):
+    """wait_records + member-level diagnostics: on timeout, name the
+    (group, pane) members that never emitted."""
+    try:
+        return emissions(wait_records(feed, len(expected), deadline=deadline))
+    except AssertionError as error:
+        seen = set()
+        try:
+            for record in read(NODES[2], feed):
+                body = json.loads(unb64(record["payload_base64"]))
+                seen.add((body["group"], body["pane"]))
+        except Exception:
+            pass
+        missing = sorted(set(expected) - seen, key=lambda item: (item[1], item[0]))
+        raise AssertionError(
+            {
+                "missing emissions": [f"{group}@{pane}" for group, pane in missing],
+                "seen": len(seen),
+                "expected": len(expected),
+                "cause": str(error)[:300],
+            }
+        )
+
+
 def pane_of(event_ns):
+
     return max(event_ns, 0) // PANE_NS
 
 
@@ -739,7 +764,7 @@ def main():
             ("globex", 3, t2 + 30_000_000_000),
         ]
         expected = rolling_expected(all_events, (pmoved + 1) * PANE_NS)
-        emitted = emissions(wait_records(results_feed, len(expected), deadline=180))
+        emitted = wait_emissions(results_feed, expected, deadline=180)
         assert_subset(emitted, expected)
 
         # Per-Domain Pipe cost attribution, read while every drive Node is
@@ -832,6 +857,41 @@ def main():
         subprocess.run([*COMPOSE, "start", new_owner], check=True)
         wait_for_fabric()
 
+        # Journal convergence gate: a restarted replica re-adopts its
+        # progress/effect journal state asynchronously — drives on the
+        # recovered owner can fail quorum while it lags. Gate on the
+        # totals pipe's drive cycles advancing over a window without new
+        # failures before demanding fresh emissions; a permanently wedged
+        # quorum fails here with the telemetry in the diagnostics dump
+        # rather than silently at the feed count.
+        drive_deadline = time.time() + 300
+        last_probe = None
+        while time.time() < drive_deadline:
+            try:
+                first = (
+                    pipe_demand()[0]
+                    .get(totals_pipe, {})
+                    .get("telemetry", {})
+                )
+                time.sleep(10)
+                second = (
+                    pipe_demand()[0]
+                    .get(totals_pipe, {})
+                    .get("telemetry", {})
+                )
+            except Exception as probe_error:
+                last_probe = repr(probe_error)
+                time.sleep(5)
+                continue
+            last_probe = {"first": first, "second": second}
+            if (
+                second.get("drives", 0) > first.get("drives", 0)
+                and second.get("failed", 0) == first.get("failed", 0)
+            ):
+                break
+        else:
+            raise AssertionError({"drives did not recover post-restart": last_probe})
+
         t3 = time.time_ns()
         pdone = pane_of(t3 + 30_000_000_000)
         append_json(
@@ -843,7 +903,7 @@ def main():
         )
         all_events = all_events + [("acme", 9, t3 + 30_000_000_000)]
         expected = rolling_expected(all_events, (pdone + 1) * PANE_NS)
-        emitted = emissions(wait_records(results_feed, len(expected), deadline=180))
+        emitted = wait_emissions(results_feed, expected, deadline=180)
         assert_subset(emitted, expected)
         if len(emitted) != len(expected):
             raise AssertionError({"unexpected extra emissions": emitted})
@@ -1156,6 +1216,15 @@ def main():
                 return repr(inner)
 
         diag = {
+            "totals_telemetry": probe(
+                lambda: pipe_demand()[0].get(totals_pipe, {})
+            ),
+            "sub_progress": probe(
+                lambda: [admin_progress(node, subscription) for node in NODES]
+            ),
+            "sub_d_progress": probe(
+                lambda: [admin_progress(node, subscription_d) for node in NODES]
+            ),
             "source_records": probe(lambda: len(read(NODES[0], source))),
             "result_records": probe(lambda: read(NODES[1], results_feed)),
             "panes_store_real": probe(lambda: pane_rows(NODES[0], panes_store)),
