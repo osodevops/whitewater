@@ -1227,7 +1227,30 @@ def main():
             ),
             "source_records": probe(lambda: len(read(NODES[0], source))),
             "result_records": probe(lambda: read(NODES[1], results_feed)),
+            "result_records_by_node": probe(
+                lambda: {
+                    f"node-{i + 1}": len(read(node, results_feed))
+                    for i, node in enumerate(NODES)
+                }
+            ),
+            "results_placement": probe(
+                lambda: {
+                    f"node-{i + 1}": wcl(
+                        node, f"INSPECT PLACEMENT FOR FEED {results_feed};"
+                    )
+                    for i, node in enumerate(NODES)
+                }
+            ),
             "panes_store_real": probe(lambda: pane_rows(NODES[0], panes_store)),
+            "panes_store_markers": probe(
+                lambda: [
+                    f"{tagged!r}@{pane}"
+                    for tagged, pane in (
+                        parse_marker_key(row["key_base64"])
+                        for row in marker_rows(NODES[0], panes_store)
+                    )
+                ]
+            ),
             "panes_store_sentinel": probe(
                 lambda: sentinel_rows(NODES[0], panes_store)
             ),
