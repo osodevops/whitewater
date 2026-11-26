@@ -165,3 +165,52 @@ replica store is 5–15 ms per ~2–4k frames (≈7–8 µs/frame serialized per
 - Does the 9-pipeline aggregate keep scaling past 166k (12+ pipelines) or is there a
   per-node serialization ceiling? Unanswered — cheap follow-up experiment.
 - Docker Desktop WSL2 bridge bandwidth ceiling unmeasured — irrelevant until CPU/convoy fixed.
+
+## 2026-11-26 (cont.) — validated target reproduction + pipelining design notes
+
+### Clean validation: ~148k writes/sec verified end-to-end
+
+3 parallel client containers, each: 150k records × 1 KiB, 8 writers, batch 512,
+3 single-range feeds in its own domain (`vald1..3`), `BENCH_MODE=all` (write then
+read-back verification). All three fully overlapped:
+
+| client | write rec/s | read-back | errors |
+|---|---|---|---|
+| val1 | 66,658 | 150,000/150,000 verified | 0 |
+| val2 | 41,453 | 150,000/150,000 verified | 0 |
+| val3 | 39,791 | 150,000/150,000 verified | 0 |
+| **aggregate** | **≈148k writes/s sustained** | all records verified | 0 |
+
+(Reads validated at 310k–1.04M rec/s per client.) Aggregate is lower than the
+166k write-only run because read-back phases overlap the write windows — the
+target range is confirmed either way.
+
+### Pipelined-rounds design notes (started)
+
+The serialization is NOT a plain mutex-held round. Existing machinery in
+`active_range/majority.rs`:
+- `_append_guard` (per-range append lock) is **dropped before the fan-out** —
+  local mint/store is the only lock-held section.
+- `commit_turns: RangeTurns` — an `OrderedTurn` per range; sends wait on
+  `turn_permit.wait()` and completion is turn-ordered.
+- Per-follower `send_lane` semaphores + `MAX_INFLIGHT_SENDS_PER_FOLLOWER`
+  (deep-acquired only for pending-effect frames).
+- `group_queue_window` / `in_flight_window` per-range semaphores bounding
+  submission depth.
+
+So rounds already overlap *structurally*; the throughput cap means the overlap
+doesn't yield parallelism in practice. Design questions for next session:
+1. What does `OrderedTurn` actually serialize — is the next round's fan-out
+   gated on the previous round's completion (turn-ordered sends), making the
+   pipeline effectively stop-and-wait per range? (`turn_permit.wait()` BEFORE
+   `lane.acquire` in send_to suggests sends are turn-gated.)
+2. `in_flight_window`/`group_queue_window` depths — what are the constants, and
+   do they permit >1 round per range in flight?
+3. If sends are turn-gated, the fix is forming round N+1's frames and fanning
+   out while round N awaits quorum, keeping only COMMIT turn-ordered. The
+   position assignment happens at mint time under the append lock — positions
+   are already contiguous-by-construction, so out-of-order fan-out completion
+   is safe as long as commit evidence publishes in position order.
+4. Per-writer ordering constraint (writer sequences must stay contiguous per
+   key) interacts with cross-writer rounds — verify the dedup/sequence fences
+   tolerate reordering across rounds.
