@@ -114,6 +114,25 @@ watermark leg: all sixteen member panes published revision 1, qa+15
 published revision 2 carrying exactly the delta (1,"5"), marker
 counts (2,0)/(1,0), sentinel (1,0), watermark row (0, ev_b-4s).
 
+Push `3c27fb7` (the five-fix commit): the `pipe` CI lane went green
+(enrich + forward + window 3N all exactly-once), and
+`test-window-pipe-4n.py` — ported to rolling expectations — passed
+locally (101 emissions through lease move, drain, storage-Node
+restart). Two unrelated lanes flaked on first attempt and both
+passed on rerun, leaving the run fully green: `verify-reads-b`
+failed `test-m4-throughput-transparency.py` on the >=10% post-split
+growth assertion (single=250/s split=215/s — perf noise on the
+shared CI VM), and `isolated-zone` failed `test-mtls-plane.py` on
+`replica control-2 acknowledged different bytes or position` — AR
+quorum corroboration veto on the append right after `RETIRE STORAGE
+NODE control-4`. The divergence signature is real (a replica matched
+the frame to a different position) but intermittent: the test passed
+locally on the same commit, on the prior CI run, and on the rerun.
+Same replica-divergence family as the open journal reconciliation
+gap — worth a dedicated investigation; the staged follower copy
+resuming at a proven committed boundary while the source keeps
+accepting writes is the plausible mechanism.
+
 
 ## F0 â€” Product and architecture
 
