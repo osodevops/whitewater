@@ -877,3 +877,65 @@ per-batch fsync chain that the 3-Node fixture serialized on
 (seconds under load) — pre-provisioning (`BENCH_RANGES`) measures
 steady-state fan-out, while tuning auto-split under live load is
 separate work.
+
+## Write-path ceiling evidence (2026-11-26)
+
+Fresh `bench_feed` binary (Nov 26). Write-only runs (`BENCH_MODE=write`),
+1 KiB records, batch 512, binary (`FSA1`) appends, `sync=never`,
+3-Node bench Riverbed, 16 cores visible inside the Docker VM.
+Full analysis in `docs/kafka-parity-handoff.md`.
+
+### Throughput by topology
+
+| topology | rec/s | notes |
+|---|---|---|
+| 1 feed × 1 range, 16 writers | 56,261 | no fragmentation, full 512-record rounds |
+| 1 feed × 3 ranges, 16 writers | 74,071 | batches fragment ~170 records/round |
+| 1 feed × 9 ranges, 16 writers | 49,612 | fragmentation destroys round amortization |
+| 3 feeds × 1 range, 15 writers | 65,429 | 3 independent pipelines ≈ 21.8k each |
+| 4 KiB records, batch 128, 1 feed × 3 ranges | 27,002 (105 MiB/s) | byte throughput UP 46% vs 1 KiB — mixed cost model |
+| 32 writers, 1 feed × 3 ranges | 59,716 | more writers = slower: server convoy, not client cap |
+| `BENCH_IN_FLIGHT=20` (default 5) | 63,938 | deeper client pump pipeline does not help |
+| **3 parallel client containers, 3 single-range feeds each (9 independent pipelines)** | **75.5k + 46.8k + 45.7k ≈ 166k aggregate** | errors=0 on all three |
+
+### Conclusions
+
+1. **The server already sustains ~166k writes/sec aggregate** when driven
+   by enough independent pipelines — inside the 100–200k target. The
+   long-standing ~74k ceiling is a bench-topology artifact (one client
+   process, few writers, fragmented ranges), not a server limit.
+2. Per-pipeline throughput ≈ 18–25k rec/s; total scales ~linearly with
+   independent pipeline count at least to 9.
+3. **CPU is not the cap** (nodes peak 1.5–2.4 cores of 16) and network is
+   not obviously the cap (~250–280 MB/s/node rx at peak). The system is
+   latency/convoy-bound: one quorum round in flight per range at ~7 ms.
+4. Wire amplification end-to-end ≈ 8.6× payload counting rx+tx
+   (structural ≈ 4.2×: client→ingress ~1.1 KB, ingress→owner relay
+   ~0.73 KB avg, owner→2 replicas ~1.17 KB each per 1 KiB record).
+   Per-replica-frame wire ≈ 1169 B: payload + key + ~80 B stored-codec
+   overhead + ~46 B batch-wire (41 B of that the derivable cursor string).
+5. Cost model from the 1 KiB vs 4 KiB comparison: ≈5.7 µs fixed per
+   record + ≈7.7 ns/byte through the pipeline — both terms matter.
+6. Fragmentation is structural: `writer_batch_append_inner` splits client
+   batches per range by key routing; Kafka producers instead batch
+   per-partition client-side. More ranges per feed → smaller rounds →
+   worse throughput.
+
+### Server round-phase instrumentation (already in tree, DEBUG level)
+
+`writer_batch_append` elapsed · `batch-trace` range chunks ·
+`owner batch forward` relay timing · `append batch phase timing`
+(lock_wait / mint_store / send_wait / send / commit per round) ·
+`replica batch handler timing` and `replica append inner timing`
+(decode / service / gate / store per fan-in). Debug logging costs
+20–30% throughput — read relative structure only. At saturation rounds
+show 640+ ms lock_wait behind the per-range append lock; fan-out
+send_wait dominates; replica store ≈ 7–8 µs/frame serialized per
+range-store.
+
+### Lever ranking implied by this evidence
+
+1. Pipelined quorum rounds per range (binding constraint; consensus-critical)
+2. Range-affine batching — SDK-side per-range batches or ingress re-batch
+3. Owner-direct writes (removes relay hop, ~17% wire + one decode/forward pass)
+4. Cursor elision in replica frames (~2% wire — opportunistic only)
