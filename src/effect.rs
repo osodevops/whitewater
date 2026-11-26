@@ -821,6 +821,8 @@ impl EffectCoordinator {
         let mut observed: Option<EffectMutation> = None;
         let mut votes = 0;
         let mut lagged = false;
+        let mut lagged_nodes: Vec<(crate::active_range::StorageNodeId, EffectJournalError)> =
+            Vec::new();
         let replies = futures_util::future::join_all(self.assignment.replicas.iter().map(|node| {
             self.transport
                 .committed(node, effect_id, self.assignment.ownership_epoch)
@@ -864,11 +866,28 @@ impl EffectCoordinator {
                         }
                     }
                 }
-                Err(error) if lagging_witness(&error) => lagged = true,
+                Err(error) if lagging_witness(&error) => {
+                    lagged = true;
+                    lagged_nodes.push((node.clone(), error));
+                }
                 Err(error) => return Err(error),
             }
         }
         if votes < 2 || (observed.is_none() && (votes < 3 || lagged)) {
+            let lagged_detail: Vec<String> = lagged_nodes
+                .iter()
+                .map(|(node, error)| format!("{node}:{error}"))
+                .collect();
+            tracing::warn!(
+                %effect_id,
+                subscription = %self.assignment.subscription_id,
+                owner = %self.assignment.owner,
+                ownership_epoch = self.assignment.ownership_epoch,
+                votes,
+                observed = observed.is_some(),
+                ?lagged_detail,
+                "effect journal committed read lost quorum"
+            );
             return Err(EffectJournalError::NoQuorum);
         }
         Ok(observed)
@@ -888,6 +907,8 @@ impl EffectCoordinator {
             return Err(EffectJournalError::InvalidAssignment);
         }
         let mut prepared = Vec::with_capacity(3);
+        let mut lagged_nodes: Vec<(crate::active_range::StorageNodeId, EffectJournalError)> =
+            Vec::new();
         let replies = futures_util::future::join_all(
             self.assignment
                 .replicas
@@ -905,7 +926,9 @@ impl EffectCoordinator {
                     return Err(EffectJournalError::InvalidAssignment)
                 }
                 Ok(reply) => prepared.push((node.clone(), reply.result.digest)),
-                Err(error) if lagging_witness(&error) => {}
+                Err(error) if lagging_witness(&error) => {
+                    lagged_nodes.push((node.clone(), error));
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -914,6 +937,22 @@ impl EffectCoordinator {
                 .iter()
                 .any(|(node, _)| node == &self.assignment.owner)
         {
+            let lagged_detail: Vec<String> = lagged_nodes
+                .iter()
+                .map(|(node, error)| format!("{node}:{error}"))
+                .collect();
+            let prepared_nodes: Vec<String> =
+                prepared.iter().map(|(node, _)| format!("{node}")).collect();
+            tracing::warn!(
+                effect_id = %mutation.effect_id,
+                sequence = mutation.sequence,
+                subscription = %self.assignment.subscription_id,
+                owner = %self.assignment.owner,
+                ownership_epoch = self.assignment.ownership_epoch,
+                ?prepared_nodes,
+                ?lagged_detail,
+                "effect journal prepare lost quorum"
+            );
             return Err(EffectJournalError::NoQuorum);
         }
         let digest = prepared
@@ -1141,6 +1180,20 @@ impl EffectCoordinator {
         state_mutations: &[EffectStateMutation],
         apply: &A,
     ) -> Result<EffectMutation, EffectJournalError> {
+        // A `Declare` planned off a frontier that has since moved belongs
+        // to the decision that moved it: fence before any side effect so
+        // a stale-planned effect cannot double-apply its outputs or
+        // mutations ahead of the frontier CAS that would refuse it at the
+        // end. Replays of this effect's own frontier commit pass through
+        // on the request-identity check; `Applied` rows carry no consume.
+        if let Some(consume) = consume {
+            apply
+                .check_consume_frontier(
+                    consume,
+                    effect_apply_request_id(committed.request_id, b"frontier"),
+                )
+                .await?;
+        }
         let mut receipts = Vec::with_capacity(outputs.len());
         for output in outputs {
             let mut sweeps = 0;
@@ -1553,6 +1606,25 @@ pub trait EffectApply: Send + Sync {
         output: &EffectOutput,
         effect_id: Uuid,
     ) -> Result<EffectOutputReceipt, EffectJournalError>;
+
+    /// Fence a `Declare` whose consume evidence no longer matches the
+    /// committed Subscription frontier: the covered input's disposition
+    /// now belongs to the decision that moved the frontier, so the stale
+    /// effect must not apply its declared outputs or co-located store
+    /// mutations ahead of the frontier CAS that would refuse it later.
+    /// `frontier_request_id` is the request identity this effect's own
+    /// frontier commit carries, letting a replay that finds the frontier
+    /// already at its target distinguish its own commit from a foreign
+    /// decision covering the same positions. `Conflict` aborts the
+    /// `Declare` before any side effect; the default passes for sinks
+    /// without progress access.
+    async fn check_consume_frontier(
+        &self,
+        _consume: &EffectConsume,
+        _frontier_request_id: Uuid,
+    ) -> Result<(), EffectJournalError> {
+        Ok(())
+    }
 
     /// Idempotently commit the declared frontier move on the consumed
     /// Subscription's replicated progress journal.
@@ -2559,6 +2631,7 @@ mod tests {
         resolved: std::sync::Mutex<Vec<EffectOccupant>>,
         not_pending: std::sync::Mutex<Option<u64>>,
         fail_mutations: std::sync::Mutex<usize>,
+        fail_consume_check: std::sync::Mutex<bool>,
         events: std::sync::Mutex<Vec<&'static str>>,
     }
 
@@ -2596,6 +2669,17 @@ mod tests {
                 range_id: crate::active_range::RangeId::from_uuid(Uuid::from_u128(7)),
                 position: crate::active_range::RangePosition::new(1),
             })
+        }
+
+        async fn check_consume_frontier(
+            &self,
+            _consume: &EffectConsume,
+            _frontier_request_id: Uuid,
+        ) -> Result<(), EffectJournalError> {
+            if *self.fail_consume_check.lock().unwrap() {
+                return Err(EffectJournalError::Conflict);
+            }
+            Ok(())
         }
 
         async fn commit_frontier(
@@ -2643,6 +2727,15 @@ mod tests {
             self.resolved.lock().unwrap().push(occupant);
             *self.occupied.lock().unwrap() = None;
             Ok(())
+        }
+
+        async fn discard_output(
+            &self,
+            _output: &EffectOutput,
+            _effect_id: Uuid,
+            _subscription_id: Uuid,
+        ) -> Result<EffectDiscardOutcome, EffectJournalError> {
+            Ok(EffectDiscardOutcome::NotPending)
         }
     }
 
@@ -2811,6 +2904,50 @@ mod tests {
             last_mutate.is_some() && first_frontier.is_some() && last_mutate < first_frontier,
             "every mutation must settle before the frontier commits: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn apply_committed_fences_a_declare_whose_consume_frontier_moved() {
+        // A `Declare` committed off a frontier that has since moved must
+        // fence before any side effect: the covered input belongs to the
+        // decision that moved it, so the stale effect aborts without
+        // applying its outputs or co-located mutations — otherwise a
+        // second committed plan covering the same records would
+        // double-apply its deltas before its own frontier CAS refused.
+        let (_directories, _nodes, _transport, coordinator) = apply_fixture();
+        let mut mutation = scoped_declare(Uuid::new_v4());
+        let EffectTransition::Declare {
+            state_mutations, ..
+        } = &mut mutation.transition
+        else {
+            panic!("expected declare")
+        };
+        state_mutations.push(EffectStateMutation {
+            store_id: Uuid::from_u128(5),
+            mutation_id: Uuid::from_u128(6),
+            op: crate::state_store::StateStoreMutationOp::DeleteRow { key: b"k".to_vec() },
+        });
+        coordinator.apply(mutation.clone()).await.unwrap();
+        let sink = RecordingApply::default();
+        *sink.fail_consume_check.lock().unwrap() = true;
+        let terminal = coordinator
+            .apply_committed(mutation.effect_id, &sink)
+            .await
+            .unwrap();
+        assert!(matches!(
+            terminal.transition,
+            EffectTransition::Aborted { .. }
+        ));
+        let events = sink.events.lock().unwrap();
+        assert!(
+            !events.contains(&"append") && !events.contains(&"mutate"),
+            "a fenced consume must not apply outputs or mutations: {events:?}"
+        );
+        drop(events);
+        // The abandoned consume still settles its declared positions over
+        // the frontier as skipped rather than wedging on the stale
+        // expected Cursor.
+        assert!(!sink.frontier_requests.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -1470,11 +1470,12 @@ async fn grace_boundaries_split_late_events_between_revision_and_quarantine() {
         .any(|entry| entry.named.get(1).map(|named| named.values.clone())
             == Some(vec![IndexValue::I64(2)])));
 
-    // A horizon of 46 skips pane 2 alone — members ending 40..180
-    // still admit the record. Whole-record quarantine needs the
-    // horizon past the last member's grace bound: 196 > 180 + 15.
+    // A committed horizon of 46 skips pane 2 alone — members ending
+    // 40..180 still admit the record. Whole-record quarantine needs the
+    // durable horizon at the record's arrival past the last member's
+    // grace bound: 196 > 180 + 15.
     let mut quarantining = page(vec![json_record(3, b"key-a", 25, 1)], "p2");
-    quarantining.watermark = Some((190, 196));
+    quarantining.watermark = Some((196, 196));
     let applied = harness
         .driver
         .drive_once(
@@ -1510,6 +1511,174 @@ async fn grace_boundaries_split_late_events_between_revision_and_quarantine() {
         .iter()
         .any(|entry| entry.named.get(1).map(|named| named.values.clone())
             == Some(vec![IndexValue::I64(17)])));
+}
+
+#[tokio::test]
+async fn window_admission_judges_lateness_against_the_arrival_horizon() {
+    let harness = harness_for(watermark_window_pipe());
+    seed_frontier(&harness.progress, "p0").await;
+
+    // The durable horizon at the record's arrival (40) decides
+    // lateness — the horizon its own page produces (196, from a
+    // same-page event at 236) must not retroactively age it past
+    // grace. Event 25's member ends are 30..180; every end + 15 >= 40
+    // admits, even though all are below the after-horizon.
+    let mut arriving = page(
+        vec![
+            json_record(1, b"key-a", 25, 1),
+            json_record(2, b"key-a", 236, 1),
+        ],
+        "p1",
+    );
+    arriving.watermark = Some((40, 196));
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_f, _l| async { Ok(arriving) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
+        panic!("expected AccumulateRows")
+    };
+    // No sentinel — event 25 contributed to all sixteen members.
+    let late_rows = entries
+        .iter()
+        .filter(|entry| entry.key[entry.key.len() - 8..] == u64::MAX.to_be_bytes())
+        .count();
+    assert_eq!(late_rows, 0);
+    // The earliest member (pane 2, end 30) — past its grace bound under
+    // the after-horizon — still carries event 25's contribution.
+    assert!(entries
+        .iter()
+        .any(|entry| entry.named.get(1).map(|named| named.values.clone())
+            == Some(vec![IndexValue::I64(2)])));
+}
+
+#[tokio::test]
+async fn emitted_pane_revised_same_page_rebuilds_fresh_for_a_delta_publish() {
+    let mut pipe = watermark_window_pipe();
+    pipe.output_feed_id = Some(Uuid::from_u128(OUTPUT_FEED));
+    let harness = harness_for(pipe);
+    seed_frontier(&harness.progress, "p0").await;
+
+    // Pane 3 emitted this scan (its row held (1, 10)); the same page's
+    // event at t=25 revises it — pane 3's grace edge 40 + 15 = 55 stays
+    // at or above the arrival horizon 45. The emitted delete must land
+    // before the revision accumulate so the rebuilt row carries only the
+    // since-publish delta: revision payloads are deltas, not window
+    // totals.
+    let emission = pane_emission(IndexValue::Bytes(b"key-a".to_vec()), 3, 1, 10);
+    let mut page = page_with_emissions(
+        vec![json_record(1, b"key-a", 25, 5)],
+        vec![emission.clone()],
+        "p0",
+    );
+    page.watermark = Some((45, 45));
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_f, _l| async { Ok(page) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    let StateStoreMutationOp::DeleteRow { key } = &state_mutations[0].op else {
+        panic!("expected the emitted pane's DeleteRow first")
+    };
+    assert_eq!(*key, emission.row_key);
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[1].op else {
+        panic!("expected AccumulateRows after the delete")
+    };
+    let revised = entries
+        .iter()
+        .find(|entry| entry.key == emission.row_key)
+        .expect("revised pane row entry");
+    assert_eq!((revised.count_delta, revised.sum_delta), (1, 0));
+    assert!(entries.iter().any(|entry| {
+        entry.key == whitewater::pipe::window_emitted_marker_key(&emission.group_tagged, 3)
+            && entry.count_delta == 1
+    }));
+}
+
+#[tokio::test]
+async fn same_page_emit_and_revise_publishes_then_rebuilds_for_the_delta() {
+    let mut pipe = watermark_window_pipe();
+    pipe.output_feed_id = Some(Uuid::from_u128(OUTPUT_FEED));
+    let harness = harness_for(pipe);
+    seed_frontier(&harness.progress, "p0").await;
+
+    // Pane 3's row is still live when this page's scan resolves it
+    // (revision 1 — its marker does not exist yet) and the page's event
+    // revises it inside grace: the publish must still land, the row
+    // deletes, and the revision accumulate rebuilds it fresh so the next
+    // drive publishes only the since-publish delta as revision 2.
+    let mut emission = pane_emission(IndexValue::Bytes(b"key-a".to_vec()), 3, 1, 10);
+    emission.revision = 1;
+    let mut page = page_with_emissions(
+        vec![json_record(1, b"key-a", 25, 5)],
+        vec![emission.clone()],
+        "p0",
+    );
+    page.watermark = Some((45, 45));
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_f, _l| async { Ok(page) },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+    let EffectTransition::Applied {
+        outputs,
+        state_mutations,
+        ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    assert_eq!(outputs.len(), 1, "the publish still lands");
+    let StateStoreMutationOp::DeleteRow { key } = &state_mutations[0].op else {
+        panic!("expected the emitted pane's DeleteRow first")
+    };
+    assert_eq!(*key, emission.row_key);
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[1].op else {
+        panic!("expected AccumulateRows after the delete")
+    };
+    let revised = entries
+        .iter()
+        .find(|entry| entry.key == emission.row_key)
+        .expect("revised pane row entry");
+    assert_eq!((revised.count_delta, revised.sum_delta), (1, 0));
+    let marker = entries
+        .iter()
+        .find(|entry| {
+            entry.key == whitewater::pipe::window_emitted_marker_key(&emission.group_tagged, 3)
+        })
+        .expect("emitted marker entry");
+    assert_eq!(marker.count_delta, 1);
 }
 
 #[tokio::test]
@@ -1578,9 +1747,12 @@ async fn revised_emission_scopes_writer_identity_and_marker_posting() {
     )
     .unwrap();
     assert_eq!(payload["revision"], "2");
-    // The marker accumulate posts the pane's own index so the bounded
-    // close-scan prefilters it alongside its pane row.
-    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
+    // The marker accumulate posts `WINDOW_EMITTED_PANE_POSTING` —
+    // `i64::MAX`, above every close bound — so accumulating markers can
+    // never fill the bounded emission scan ahead of still-open panes.
+    // Accumulates land after the emission delete so same-page revisions
+    // rebuild the row fresh.
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[1].op else {
         panic!("expected marker AccumulateRows")
     };
     assert_eq!(entries.len(), 1);
@@ -1588,7 +1760,12 @@ async fn revised_emission_scopes_writer_identity_and_marker_posting() {
         entries[0].key,
         whitewater::pipe::window_emitted_marker_key(&revision.group_tagged, 3)
     );
-    assert_eq!(entries[0].named[0].values, vec![IndexValue::I64(3)]);
+    assert_eq!(
+        entries[0].named[0].values,
+        vec![IndexValue::I64(
+            whitewater::pipe::WINDOW_EMITTED_PANE_POSTING
+        )]
+    );
     // A revision on the same pane is a distinct effect from the first
     // publish — raced Declares arbitrate rather than colliding.
     let mut first = pane_emission(IndexValue::Bytes(b"key-a".to_vec()), 3, 4, 30);
@@ -2223,17 +2400,19 @@ async fn window_pipe_emits_a_closed_pane_and_deletes_its_row_atomically() {
     assert_eq!(output.sequence, 1);
     // pane_end - 1 is the output's event-time edge.
     assert_eq!(output.event_time_ns, 39);
-    // The pane row deletes inside the same effect.
-    let StateStoreMutationOp::DeleteRow { key } = &state_mutations[1].op else {
+    // The pane row deletes inside the same effect — before the
+    // accumulate op, so a same-page revision rebuilds the row fresh
+    // and the next publish carries only the since-publish delta.
+    let StateStoreMutationOp::DeleteRow { key } = &state_mutations[0].op else {
         panic!("expected DeleteRow")
     };
     assert_eq!(*key, emission.row_key);
     assert_eq!(
-        state_mutations[1].mutation_id,
-        whitewater::effect::effect_state_mutation_id(applied.effect_id, 1)
+        state_mutations[0].mutation_id,
+        whitewater::effect::effect_state_mutation_id(applied.effect_id, 0)
     );
-    let StateStoreMutationOp::AccumulateRows { .. } = &state_mutations[0].op else {
-        panic!("expected AccumulateRows first")
+    let StateStoreMutationOp::AccumulateRows { .. } = &state_mutations[1].op else {
+        panic!("expected AccumulateRows last")
     };
     // The append sink saw the emitted record.
     assert_eq!(harness.sink.appends.lock().unwrap().len(), 1);
@@ -2483,10 +2662,10 @@ async fn emitted_panes_fill_the_delete_budget_before_expired_ones() {
         panic!("expected Applied")
     };
     assert_eq!(outputs.len(), 15);
-    // 1 accumulate + 15 deletes exhaust the 16-mutation budget; the
+    // 15 deletes + 1 accumulate exhaust the 16-mutation budget; the
     // expired rows wait for a later drive rather than escape the bound.
     assert_eq!(state_mutations.len(), 16);
-    let deleted: Vec<&Vec<u8>> = state_mutations[1..]
+    let deleted: Vec<&Vec<u8>> = state_mutations[..15]
         .iter()
         .filter_map(|mutation| match &mutation.op {
             StateStoreMutationOp::DeleteRow { key } => Some(key),
@@ -2833,6 +3012,79 @@ async fn window_limit_bytes_saturated_scan_refuses_every_new_row() {
         vec![IndexValue::Text("__bytecap__".to_owned())]
     );
     assert_eq!(entries[0].count_delta, 2);
+}
+
+#[tokio::test]
+async fn window_limit_bytes_merge_passes_when_sentinel_pushes_over_budget() {
+    let mut pipe = window_pipe();
+    let PipeOperation::Window { byte_limit, .. } = &mut pipe.operation else {
+        panic!("window pipe")
+    };
+    // Admitted rows: "a"'s full 16-member set (16 * 40 = 640) plus the
+    // `__bytecap__` sentinel a prior refusal wrote — the sentinel's own
+    // accounted bytes push the scanned total above the declared bound.
+    // A record needing no new (group, pane) rows creates nothing and
+    // must merge: refusing it would silently under-aggregate the member
+    // windows and miscount the record as refused.
+    *byte_limit = Some(640);
+    let harness = harness_for(pipe);
+    seed_frontier(&harness.progress, "p0").await;
+
+    let tagged = |bytes: &[u8]| window_group_key_bytes(&IndexValue::Bytes(bytes.to_vec())).unwrap();
+    let bytecap_group =
+        window_group_key_bytes(&IndexValue::Text("__bytecap__".to_owned())).unwrap();
+    let existing: BTreeSet<(Vec<u8>, u64)> = (0u64..=15)
+        .map(|pane| (tagged(b"a"), pane))
+        .chain(std::iter::once((bytecap_group, u64::MAX)))
+        .collect();
+    let records = vec![
+        json_record(1, b"a", 5, 7), // members (a,0..=15): all owned — free merge
+    ];
+    let applied = harness
+        .driver
+        .drive_once(
+            64,
+            |_frontier, _limit| async {
+                Ok(FetchedPage {
+                    records,
+                    cursor: "p1".to_owned(),
+                    positions: BTreeMap::from([(range(), "p1".to_owned())]),
+                    member_feed: None,
+                    emissions: Vec::new(),
+                    expired: Vec::new(),
+                    refused: Vec::new(),
+                    pane_rows: existing,
+                    pane_rows_saturated: false,
+                    watermark: None,
+                })
+            },
+            || async { Ok(bootstrap_with("p0")) },
+            &harness.sink,
+        )
+        .await
+        .unwrap()
+        .expect("applied");
+
+    let EffectTransition::Applied {
+        state_mutations, ..
+    } = &applied.transition
+    else {
+        panic!("expected Applied")
+    };
+    let StateStoreMutationOp::AccumulateRows { entries } = &state_mutations[0].op else {
+        panic!("expected AccumulateRows")
+    };
+    // The record merges into all 16 admitted rows; nothing refuses.
+    assert_eq!(entries.len(), 16);
+    for (idx, entry) in entries.iter().enumerate() {
+        assert_eq!(
+            entry.named[0].values,
+            vec![IndexValue::Bytes(b"a".to_vec())]
+        );
+        assert_eq!(entry.named[1].values, vec![IndexValue::I64(idx as i64)]);
+        assert_eq!(entry.count_delta, 1);
+        assert_eq!(entry.sum_delta, 7);
+    }
 }
 
 #[test]

@@ -9009,6 +9009,57 @@ async fn resolve_window_emissions(
             break;
         }
     }
+    // Emitted markers post `pane` at `i64::MAX` — outside every close
+    // bound — so they never crowd the scan page above. EXPIRE still
+    // owes them retention: one bounded read at that sentinel value
+    // enumerates them, and the row key carries the real pane back.
+    if let Some(expire) = expire_ns {
+        let marker_page = serve_state_store_read(
+            state,
+            &assignment,
+            store_id,
+            Vec::new(),
+            Some(NamedReadSelection::Range(
+                crate::state_store::StateStoreNamedRangeRead {
+                    name: crate::pipe::WINDOW_PANE_NAME.to_owned(),
+                    lower: Some(crate::control::IndexBound {
+                        value: crate::index::IndexValue::I64(
+                            crate::pipe::WINDOW_EMITTED_PANE_POSTING,
+                        ),
+                        inclusive: true,
+                    }),
+                    upper: Some(crate::control::IndexBound {
+                        value: crate::index::IndexValue::I64(
+                            crate::pipe::WINDOW_EMITTED_PANE_POSTING,
+                        ),
+                        inclusive: true,
+                    }),
+                    limit: crate::pipe::WINDOW_MAX_EMISSIONS_PER_DRIVE,
+                },
+            )),
+            false,
+            Some(500),
+        )
+        .await?;
+        for row in marker_page.result.named_rows {
+            if emissions.len() + expired.len() >= crate::pipe::WINDOW_MAX_EMISSIONS_PER_DRIVE {
+                break;
+            }
+            let Some((_group, pane)) = crate::pipe::window_emitted_marker_key_parse(&row.key)
+            else {
+                continue;
+            };
+            if let Some(bound) = pane
+                .checked_add(1)
+                .and_then(|end| end.checked_mul(pane_ns))
+                .and_then(|end| end.checked_add(expire))
+            {
+                if expire_now >= bound {
+                    expired.push(row.key.clone());
+                }
+            }
+        }
+    }
     // Marker row keys carry a `u32::MAX` length prefix, so they always
     // sort after their pane row in the named scan and the bounded page
     // can split a pane from its marker entirely. Resolving a revision
@@ -9041,14 +9092,17 @@ async fn resolve_window_emissions(
             continue;
         };
         // The marker commits in the emitting drive's `AccumulateRows`
-        // strictly before its pane `DeleteRow`, so a concurrent scan can
-        // observe both rows. A marker cursor at or past the pane row's
+        // after its pane `DeleteRow`, so a concurrent scan can observe
+        // both rows. A marker cursor strictly newer than the pane row's
         // means this evidence was already published — the surviving row
         // is the pending-delete view, and re-emitting it would publish a
-        // revisioned duplicate of identical content. A pane cursor newer
-        // than the marker's means the row re-accumulated after the last
-        // emission — the revision path this marker exists to serve.
-        if marker_row.applied_cursor.as_str() >= emission.row_cursor.as_str() {
+        // revisioned duplicate of identical content. An equal cursor
+        // means the same effect deleted, re-accumulated, and re-marked
+        // the pane — the row is a fresh post-delete rebuild carrying the
+        // next delta — and a newer pane cursor means the row
+        // re-accumulated after the last emission. Both are the revision
+        // path this marker exists to serve.
+        if marker_row.applied_cursor.as_str() > emission.row_cursor.as_str() {
             // The row is emitted evidence awaiting its own `DeleteRow` —
             // deleting it here repairs the interrupted pair rather than
             // stranding the row until the emitting drive replays.
@@ -10097,6 +10151,47 @@ impl crate::effect::EffectApply for LiveEffectApply<'_> {
             .apply_committed(occupant.effect_id, &sink)
             .await
             .map(|_| ())
+    }
+
+    async fn check_consume_frontier(
+        &self,
+        consume: &crate::effect::EffectConsume,
+        frontier_request_id: Uuid,
+    ) -> Result<(), crate::effect::EffectJournalError> {
+        let Some(expected) = consume.expected_cursor.as_deref() else {
+            return Ok(());
+        };
+        let committed = self
+            .progress
+            .read_committed()
+            .await
+            .map_err(progress_apply_error)?;
+        let member_feed = committed
+            .as_ref()
+            .filter(|row| !row.member_progress.is_empty())
+            .map(|_| consume.feed_id);
+        match committed
+            .as_ref()
+            .and_then(|row| row.expected_frontier_cursor(member_feed))
+        {
+            // Unmoved: this effect's CAS remains the next decision.
+            Some(current) if current == expected => Ok(()),
+            // Already at this consume's target: legitimate only as this
+            // effect's own replay — a foreign decision reaching the same
+            // frontier covers the same input and must not re-apply the
+            // declared mutations.
+            Some(current) if current == consume.cursor => {
+                if committed
+                    .as_ref()
+                    .is_some_and(|row| row.request_id == frontier_request_id)
+                {
+                    Ok(())
+                } else {
+                    Err(crate::effect::EffectJournalError::Conflict)
+                }
+            }
+            _ => Err(crate::effect::EffectJournalError::Conflict),
+        }
     }
 
     async fn commit_frontier(

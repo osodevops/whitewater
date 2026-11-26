@@ -598,9 +598,14 @@ impl PipeDriver {
                     let instant_u = u64::try_from(instant.max(0)).unwrap_or(0);
                     let (first_member, last_member) =
                         window_member_panes(instant_u, pane_ns, *window_ns);
+                    // A record's lateness is judged against the durable
+                    // horizon as it stood when the record arrived — the
+                    // page's own events must not retroactively age each
+                    // other past grace. `after` only decides which
+                    // already-admitted panes close this drive.
                     let horizon = watermark_ns
                         .zip(page.watermark)
-                        .map(|(_, (_, horizon))| horizon);
+                        .map(|(_, (before, _))| before);
                     let grace = grace_ns.unwrap_or(0);
                     // Admissible member windows: under WATERMARK a member
                     // stays revisable while `horizon <= end + GRACE`; the
@@ -644,9 +649,15 @@ impl PipeDriver {
                         .filter(|pane| !admitted_panes.contains(&(group.0.clone(), **pane)))
                         .count() as u64;
                     if let Some(limit) = byte_limit {
-                        if (page.pane_rows_saturated && new_rows > 0)
-                            || used_bytes.saturating_add(new_rows.saturating_mul(row_bytes))
-                                > *limit
+                        // Merges create no rows: once the `__bytecap__`
+                        // sentinel's own bytes push `used_bytes` over the
+                        // bound, a record that needs nothing new must
+                        // still merge — refusing it would silently
+                        // under-aggregate and misreport it as refused.
+                        if new_rows > 0
+                            && (page.pane_rows_saturated
+                                || used_bytes.saturating_add(new_rows.saturating_mul(row_bytes))
+                                    > *limit)
                         {
                             bytecap = bytecap.saturating_add(1);
                             continue;
@@ -831,7 +842,7 @@ impl PipeDriver {
                             sum_delta: 0,
                             named: vec![NamedKeyValue {
                                 name: WINDOW_PANE_NAME.to_owned(),
-                                values: vec![IndexValue::I64(emission.pane as i64)],
+                                values: vec![IndexValue::I64(WINDOW_EMITTED_PANE_POSTING)],
                                 unique: false,
                             }],
                         });
@@ -854,11 +865,14 @@ impl PipeDriver {
                         });
                     }
                 }
+                // Emission deletes apply before accumulates: a pane
+                // emitted and re-admitted in the same page rebuilds
+                // fresh, so the next publish carries only the
+                // since-publish delta — revision payloads are deltas,
+                // not full-window state. Expired deletes still land
+                // last: retention wins over a same-page revision.
                 if !entries.is_empty() {
-                    mutations.insert(
-                        0,
-                        (store_id, StateStoreMutationOp::AccumulateRows { entries }),
-                    );
+                    mutations.push((store_id, StateStoreMutationOp::AccumulateRows { entries }));
                 }
                 // Expired pane rows fill whatever delete budget the
                 // emissions left — row-key order keeps replay identities
@@ -1056,6 +1070,17 @@ pub const WINDOW_WATERMARK_LEN_PREFIX: u32 = u32::MAX - 1;
 /// below-bound posting would sort ahead of every pane row and starve
 /// the bounded scan once enough panes have published.
 pub const WINDOW_WATERMARK_PANE_POSTING: i64 = -3;
+
+/// The `pane` posting value every emitted-marker row carries: above
+/// every reachable close/expiry bound so markers never enter the
+/// bounded emission scan. A marker lives forever until its `EXPIRE`
+/// bound — posted at its own pane index it would sit inside every
+/// future scan window and, once enough panes have published, fill the
+/// `limit: 64` page ahead of the still-open pane rows and starve
+/// emission permanently (the row key still carries the real pane, so
+/// expiry reads it back). `get_by` on `pane` stays enumerable for
+/// diagnostics because the sentinel is a real posted value.
+pub const WINDOW_EMITTED_PANE_POSTING: i64 = i64::MAX;
 
 /// The watermark row key: reserved prefix + 0xFF tag + zero pane. The
 /// 0xFF tag can never open a real group (no tag `window_group_key_bytes`

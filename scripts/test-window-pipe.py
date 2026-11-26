@@ -206,6 +206,21 @@ def get_by(node, store, named_key, values=None, lower=None):
     return result["rows"]
 
 
+def lookup(node, store, key_bytes):
+    """Primary-key point read with per-replica freshness evidence."""
+    status, result = post(
+        node,
+        "/v1/state-stores/lookup",
+        {"store": store, "key_base64": base64.b64encode(key_bytes).decode()},
+    )
+    return result
+
+
+def pane_row_key(tagged_group, pane):
+    """`window_pane_row_key`: u32 tagged-group len + tagged bytes + u64 pane."""
+    return struct.pack(">I", len(tagged_group)) + tagged_group + struct.pack(">Q", pane)
+
+
 def pane_rows(node, store):
     """Every real (non-sentinel) pane row: the named `pane` posting of any
     pane index >= 0. Emitted-marker rows post their pane index too but are
@@ -902,7 +917,12 @@ def main():
             retries=45,
         )
         all_events = all_events + [("acme", 9, t3 + 30_000_000_000)]
-        expected = rolling_expected(all_events, (pdone + 1) * PANE_NS)
+        # Rolling members run one full window span above the event's own
+        # pane ([pdone .. pdone+15]); the horizon must cover the last
+        # member end or those legitimate tail emissions look like extras.
+        expected = rolling_expected(
+            all_events, (pdone + 1 + WINDOW_NS // PANE_NS) * PANE_NS
+        )
         emitted = wait_emissions(results_feed, expected, deadline=180)
         assert_subset(emitted, expected)
         if len(emitted) != len(expected):
@@ -1011,6 +1031,7 @@ def main():
                 {
                     "byte-capped pane rows": byte_panes,
                     "byte-capped sentinels": byte_sentinels,
+                    "bytecap telemetry": pipe_demand()[0].get(byte_pipe, {}),
                     "sub_d progress": [
                         admin_progress(node, subscription_d) for node in NODES
                     ],
@@ -1104,7 +1125,32 @@ def main():
                 break
             time.sleep(0.5)
         if rev2 is None:
-            raise AssertionError({"wm emissions": bodies})
+            wm_diag = {
+                "wm_emissions": bodies,
+                "wm_store_rows": get_by(
+                    NODES[0], wm_store, "pane",
+                    lower={"value": {"kind": "i64", "value": 0}, "inclusive": True},
+                ),
+                "wm_markers": marker_rows(NODES[0], wm_store),
+                "wm_sentinels": sentinel_rows(NODES[0], wm_store),
+                "wm_watermark_row": get_by(
+                    NODES[0], wm_store, "pane",
+                    values=[{"kind": "i64", "value": -3}],
+                ),
+            }
+            try:
+                merged, _doms = pipe_demand()
+                wm_diag["wm_telemetry"] = merged.get(wm_pipe)
+            except Exception as demand_error:
+                wm_diag["wm_telemetry_error"] = repr(demand_error)
+            # The revised pane's primary row on every replica — the named
+            # posting cannot see a row whose accumulate never landed on
+            # the scanned replica, so read the key point-exact.
+            revised_key = pane_row_key(b"wacme", qa + 15)
+            wm_diag["wm_revised_row_by_node"] = [
+                lookup(node, wm_store, revised_key) for node in NODES
+            ]
+            raise AssertionError(wm_diag)
         revisions = {
             (body["group"], body["pane"], body["revision"]) for body in bodies
         }
@@ -1261,6 +1307,13 @@ def main():
             "capped_store_real": probe(lambda: pane_rows(NODES[0], capped_store)),
             "capped_store_sentinel": probe(
                 lambda: sentinel_rows(NODES[0], capped_store)
+            ),
+            "byte_store_real": probe(lambda: pane_rows(NODES[0], byte_store)),
+            "byte_store_sentinel": probe(
+                lambda: sentinel_rows(NODES[0], byte_store)
+            ),
+            "bytecap_telemetry": probe(
+                lambda: pipe_demand()[0].get(byte_pipe, {})
             ),
         }
         print(f"DIAGNOSTICS {json.dumps(diag, indent=2, default=str)}")

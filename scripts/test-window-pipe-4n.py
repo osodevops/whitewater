@@ -96,7 +96,7 @@ def wcl_retry(node, script, attempts=30, delay=1):
 
 
 def read(node, feed):
-    query = urllib.parse.urlencode({"feed": feed, "limit": 100})
+    query = urllib.parse.urlencode({"feed": feed, "limit": 300})
     request = urllib.request.Request(
         f"{node}/v1/feeds/records?{query}",
         headers={"authorization": f"Bearer {KEY}"},
@@ -243,22 +243,111 @@ def emissions(records):
         identity = (body["group"], body["pane"])
         if identity in out:
             raise AssertionError(f"duplicate window emission: {body}")
+        # The emitted record carries the last nanosecond of its pane.
         expected_event = (body["pane"] + 1) * PANE_NS - 1
         if record["event_time_ns"] != str(expected_event):
             raise AssertionError({"emission event_time": record})
-        if int(body["pane_end_ns"]) - int(body["pane_start_ns"]) != PANE_NS:
-            raise AssertionError({"emission bounds": record})
+        # Rolling membership: the row aggregates the trailing
+        # (window_end - WINDOW_NS, window_end] interval — the pane
+        # bounds remain the row's own close coordinates.
+        if int(body["window_end_ns"]) - int(body["window_start_ns"]) != WINDOW_NS:
+            raise AssertionError({"emission window bounds": record})
+        if int(body["window_end_ns"]) != int(body["pane_end_ns"]):
+            raise AssertionError({"emission window end": record})
         if int(body["store_seq"]) <= 0:
             raise AssertionError({"emission store_seq": record})
         out[identity] = body
     return out
 
 
+def pipe_demand():
+    """Merged `/v1/admin/demand/pipes` telemetry across all Nodes."""
+    merged = {}
+    for node in NODES:
+        try:
+            candidate = get_json(node, "/v1/admin/demand/pipes")
+        except Exception:
+            continue
+        for row in candidate.get("pipes", []):
+            merged[row["pipe"]] = row.get("telemetry")
+    return merged
+
+
+def wait_emissions(feed, expected, deadline=90):
+    """wait_records + member-level diagnostics: on timeout, name the
+    (group, pane) members that never emitted."""
+    try:
+        return emissions(wait_records(feed, len(expected), deadline=deadline))
+    except AssertionError as error:
+        seen = set()
+        try:
+            for record in read(VOTERS[2], feed):
+                body = json.loads(unb64(record["payload_base64"]))
+                seen.add((body["group"], body["pane"]))
+        except Exception:
+            pass
+        missing = sorted(set(expected) - seen, key=lambda item: (item[1], item[0]))
+        diag = {
+            "missing emissions": [f"{group}@{pane}" for group, pane in missing],
+            "seen": len(seen),
+            "expected": len(expected),
+            "cause": str(error)[:300],
+        }
+        try:
+            diag["pipe_telemetry"] = pipe_demand()
+        except Exception as demand_error:
+            diag["telemetry_error"] = repr(demand_error)
+        raise AssertionError(diag)
+
+
 def pane_of(event_ns):
     return max(event_ns, 0) // PANE_NS
 
 
+def member_panes(event_ns):
+    """Pane indices whose rolling (end - WINDOW_NS, end] window covers
+    `event_ns`: pane ends inside [event_ns, event_ns + WINDOW_NS)."""
+    t = max(event_ns, 0)
+    first = max((t + PANE_NS - 1) // PANE_NS, 1) - 1
+    last = (t + WINDOW_NS - 1) // PANE_NS - 1
+    return range(first, last + 1)
+
+
+def rolling_expect(events, pane):
+    """(count, sum) one pane row should emit: every event inside the
+    trailing (end - WINDOW_NS, end] window, grouped per (group, pane).
+    `events` is a list of (group, value, event_ns) tuples; returns a
+    {(group, pane): (count, sum)} dict over non-empty windows."""
+    out = {}
+    for (group, value, t) in events:
+        if t < 0:
+            continue
+        end = (pane + 1) * PANE_NS
+        if end - WINDOW_NS < t <= end:
+            out[(group, pane)] = (
+                out.get((group, pane), (0, 0))[0] + 1,
+                out.get((group, pane), (0, 0))[1] + value,
+            )
+    return out
+
+
+def rolling_expected(events, closed_through_ns):
+    """Full expected emission set for `events`: every (group, member
+    pane) whose pane end provably closed (end <= closed_through_ns —
+    the caller supplies the horizon it already waited past)."""
+    out = {}
+    for (group, _value, t) in events:
+        if t < 0:
+            continue
+        for pane in member_panes(t):
+            if (pane + 1) * PANE_NS <= closed_through_ns:
+                out.update(rolling_expect(events, pane))
+    return out
+
+
 def assert_subset(out, expected):
+    """Every expected (group, pane) -> (count, sum) appears in `out`; extra
+    emissions are tolerated here because later panes keep closing."""
     for (group, pane), (count, sum_value) in expected.items():
         body = out.get((group, pane))
         if body is None:
@@ -469,14 +558,20 @@ def main():
         if wait_ns > 0:
             time.sleep(wait_ns / 1e9)
         source_records = 7
-        expected = {
-            ("acme", p0): (3, 60),
-            ("globex", p0): (1, 5),
-            ("acme", p0 + 1): (1, 40),
-            ("globex", p0 + 2): (1, 7),
-            ("acme", p0 + 3): (1, 100),
-        }
-        emitted = emissions(wait_records(results_feed, 5))
+        # Rolling membership: every member pane ending at or before the
+        # provably-closed bound emits a trailing-8s aggregate, so each
+        # early pane's result covers several of the batch events.
+        ab_events = [
+            ("acme", 10, p0_start + 100_000_000),
+            ("acme", 20, p0_start + 200_000_000),
+            ("globex", 5, p0_start + 300_000_000),
+            ("acme", 30, p0_start + 400_000_000),
+            ("acme", 40, p0_start + 600_000_000),
+            ("globex", 7, p0_start + 1_100_000_000),
+            ("acme", 100, p0_start + 1_600_000_000),
+        ]
+        expected = rolling_expected(ab_events, p0_start + 2_000_000_000)
+        emitted = wait_emissions(results_feed, expected, deadline=180)
         assert_subset(emitted, expected)
 
         # Compute-lease evidence: the Pipe's drive authority is a catalog
@@ -526,8 +621,13 @@ def main():
             retries=30,
         )
         source_records += 1
-        expected[("acme", pm)] = (1, 9)
-        emitted = emissions(wait_records(results_feed, 6, deadline=90))
+        all_events = ab_events + [("acme", 9, tm + 30_000_000_000)]
+        # Horizon covers the new event's full member span (its own pane
+        # plus the panes closing within its trailing window).
+        expected = rolling_expected(
+            all_events, (pm + 1 + WINDOW_NS // PANE_NS) * PANE_NS
+        )
+        emitted = wait_emissions(results_feed, expected, deadline=180)
         assert_subset(emitted, expected)
 
         # Park the lease on the voter about to drain (it may already be
@@ -597,7 +697,6 @@ def main():
         # Fresh input after the topology change aggregates and emits on the
         # four-Node placement; a deliberately late record still quarantines.
         t2 = time.time_ns()
-        p2 = pane_of(t2 + 30_000_000_000)
         append_json(
             VOTERS[1],
             writer,
@@ -610,16 +709,22 @@ def main():
             retries=45,
         )
         source_records += 3
-        expected[("globex", p2)] = (1, 3)
-        # t2 + 600ms can cross two pane boundaries when t2 sits in the
-        # last 100ms of its pane â€” compute the pane, don't assume p2 + 1.
-        expected[("acme", pane_of(t2 + 30_600_000_000))] = (1, 2)
+        all_events += [
+            ("globex", 3, t2 + 30_000_000_000),
+            ("acme", 2, t2 + 30_600_000_000),
+        ]
+        # The lateco record quarantines into the sentinel row — no pane
+        # emissions. Horizon covers the newest events' member span.
+        last_pane = pane_of(t2 + 30_600_000_000)
+        expected = rolling_expected(
+            all_events, (last_pane + 1 + WINDOW_NS // PANE_NS) * PANE_NS
+        )
         deadline = time.time() + 150
         emitted = None
         last_error = None
         while time.time() < deadline:
             try:
-                emitted = emissions(wait_records(results_feed, 7, deadline=90))
+                emitted = wait_emissions(results_feed, expected, deadline=90)
                 assert_subset(emitted, expected)
                 break
             except AssertionError as error:
@@ -651,13 +756,16 @@ def main():
             retries=45,
         )
         source_records += 1
-        expected[("acme", p3)] = (1, 4)
+        all_events += [("acme", 4, t3 + 30_000_000_000)]
+        expected = rolling_expected(
+            all_events, (p3 + 1 + WINDOW_NS // PANE_NS) * PANE_NS
+        )
         deadline = time.time() + 150
         emitted = None
         last_error = None
         while time.time() < deadline:
             try:
-                emitted = emissions(wait_records(results_feed, 8, deadline=90))
+                emitted = wait_emissions(results_feed, expected, deadline=90)
                 assert_subset(emitted, expected)
                 break
             except AssertionError as error:

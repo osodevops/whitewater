@@ -2516,6 +2516,7 @@ impl StateStoreMutationService {
             }
         }
         let mut source: Option<(StorageNodeId, u64)> = None;
+        let mut source_errors: Vec<String> = Vec::new();
         for candidate in sources {
             match transport
                 .inspect(
@@ -2544,11 +2545,21 @@ impl StateStoreMutationService {
                         source = Some((candidate.clone(), committed));
                     }
                 }
-                Err(error) if lagging_witness(&error) => {}
+                Err(error) if lagging_witness(&error) => {
+                    source_errors.push(format!("{candidate}:{error}"));
+                }
                 Err(error) => return Err(error),
             }
         }
         let Some((source, source_committed)) = source else {
+            tracing::warn!(
+                %store_id,
+                local_node = %self.local_node,
+                owner = %assignment.owner,
+                ownership_epoch = assignment.ownership_epoch,
+                ?source_errors,
+                "state store catch-up found no answering source"
+            );
             return Err(StateStoreMutationError::NoQuorum);
         };
 
@@ -4771,6 +4782,76 @@ mod tests {
         assert_eq!(
             crate::index::decode_accumulator(&row_a.payload),
             Some((3, 17))
+        );
+    }
+
+    #[test]
+    fn accumulate_rows_apply_resurrects_a_deleted_row_with_postings() {
+        let dir = TempDir::new().unwrap();
+        let index: Arc<dyn IndexStore> = Arc::new(FjallIndexStore::open(dir.path()).unwrap());
+        let apply = IndexStoreStateApply::new(index.clone());
+        let store_id = Uuid::new_v4();
+        let reference = |key: &[u8]| PrimaryRef {
+            feed_id: store_id,
+            application_key: key.to_vec(),
+        };
+
+        let mut first = mutation(store_id, 1, "pane-a");
+        first.op = StateStoreMutationOp::AccumulateRows {
+            entries: vec![AccumulateRowEntry {
+                key: b"pane-a".to_vec(),
+                count_delta: 1,
+                sum_delta: 10,
+                named: vec![NamedKeyValue {
+                    name: "pane".to_owned(),
+                    values: vec![crate::index::IndexValue::I64(15)],
+                    unique: false,
+                }],
+            }],
+        };
+        apply.apply(&first).unwrap();
+
+        let mut delete = mutation(store_id, 2, "pane-a");
+        delete.op = StateStoreMutationOp::DeleteRow {
+            key: b"pane-a".to_vec(),
+        };
+        apply.apply(&delete).unwrap();
+        assert!(index.get(&reference(b"pane-a")).unwrap().is_none());
+
+        // The revision path this whole design rests on: after the emit
+        // drive's delete, the next accumulate rebuilds the row fresh —
+        // only the delta lands, and its named postings return so the
+        // emission scan can see it again.
+        let mut third = mutation(store_id, 3, "pane-a");
+        third.op = StateStoreMutationOp::AccumulateRows {
+            entries: vec![AccumulateRowEntry {
+                key: b"pane-a".to_vec(),
+                count_delta: 1,
+                sum_delta: 5,
+                named: vec![NamedKeyValue {
+                    name: "pane".to_owned(),
+                    values: vec![crate::index::IndexValue::I64(15)],
+                    unique: false,
+                }],
+            }],
+        };
+        apply.apply(&third).unwrap();
+        let row = index
+            .get(&reference(b"pane-a"))
+            .unwrap()
+            .expect("resurrected row");
+        assert_eq!(crate::index::decode_accumulator(&row.payload), Some((1, 5)));
+        assert_eq!(
+            index
+                .lookup_exact(
+                    named_key_index_id(store_id, "pane"),
+                    &[crate::index::IndexValue::I64(15)],
+                    8,
+                )
+                .unwrap()
+                .len(),
+            1,
+            "resurrected row's posting must be enumerable again"
         );
     }
 
