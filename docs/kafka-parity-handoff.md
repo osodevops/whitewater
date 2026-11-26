@@ -86,3 +86,82 @@ and parse the JSON log lines `append batch phase timing` (owner round phases),
 `append-batch done` (ingress end-to-end). Debug logging itself costs ~20–30%
 throughput, so never record benchmark numbers with it on. `BENCH_BATCH` above
 512 is refused (`record field is too large`).
+
+## 2026-11-26 — write-path ceiling investigation: the server already sustains ~166k
+
+Fresh `bench_feed` binary verified (Nov 26, target-linux release). All runs write-only
+(`BENCH_MODE=write`), 1 KiB records, batch 512, binary appends, sync=never, 16 cores
+visible inside the Docker VM.
+
+### Measurements (single client process unless noted)
+
+| topology | rec/s | notes |
+|---|---|---|
+| 1 feed × 1 range, 16 writers | 56,261 | no fragmentation, full 512-rounds |
+| 1 feed × 3 ranges, 16 writers | 74,071 | batches fragment ~170/round |
+| 1 feed × 9 ranges, 16 writers | 49,612 | fragmentation destroys amortization (~57/round) |
+| 3 feeds × 1 range, 15 writers | 65,429 | 3 independent pipelines ≈ 21.8k each |
+| 4 KiB records, 1 feed × 3 ranges, batch 128 | 27,002 (105 MiB/s!) | byte throughput UP 46% vs 1 KiB — neither pure wire- nor round-bound |
+| 32 writers (1 feed × 3 ranges) | 59,716 | MORE writers = slower: server convoy, not client cap |
+| BENCH_IN_FLIGHT=20 (vs default 5) | 63,938 | deeper pump pipeline does NOT help |
+| **3 parallel client containers, 3 feeds × 1 range each (9 independent pipelines)** | **75.5k + 46.8k + 45.7k ≈ 166k aggregate** | errors=0 everywhere |
+
+### What this means
+
+1. **The server already sustains ~166k rec/s aggregate** when driven by enough independent
+   pipelines — inside the 100–200k target. The long-standing ~74k "ceiling" is an artifact
+   of driving the system from one client process with few writers over fragmented ranges.
+2. **Per-pipeline throughput ≈ 18–25k rec/s** (single-range, fragment-free). Total system
+   throughput scales ~linearly with independent pipeline count (at least to 9).
+3. **CPU is NOT the cap**: nodes peak at ~1.5–2.4 cores each of 16 available. Network is
+   not obviously the cap either (~250–280 MB/s/node rx at peak). The system is
+   **latency/convoy-bound**: serialized quorum rounds per range + queueing coupling.
+4. **Fragmentation is the enemy**: batches split per-range by key routing
+   (`writer_batch_append_inner` groups by range). More ranges per feed = smaller rounds =
+   worse throughput. Kafka parity was won with the client effectively doing the same;
+   Kafka producers batch per-partition client-side, WW batches pre-routing.
+5. Wire amplification measured end-to-end: **8.6× payload** counting rx+tx on all nodes
+   (intra-cluster hops double-counted; structural estimate ≈4.2×: client→ingress ~1.1 KB,
+   ingress→owner relay ~0.73 KB avg, owner→2 replicas ~1.17 KB each per 1 KiB record).
+   Important for byte-cost reduction but NOT the current binding constraint.
+6. Bytes/record wire decomposition per replica frame ≈ 1169 B: 1024 payload + key +
+   ~80 stored-codec overhead (magic, 2 uuids, 3 u64s, lens, crc) + ~46 batch-wire
+   (41 of which is the per-frame cursor string — derivable from (stream, position)
+   since `encode_cursor` is a pure function; elidable but only ~2% of total wire — LOW priority).
+7. 4 KiB record test: rec/s fell 63% but MiB/s rose 46% — both per-record fixed cost
+   AND per-byte cost matter. Model fit: fixed ≈5.7 µs/record + ≈7.7 ns/byte through the pipeline.
+
+### Server round-phase instrumentation (already in tree, DEBUG level)
+
+`writer_batch_append` elapsed, `batch-trace` per-range chunks, `owner batch forward`,
+`append batch phase timing` (lock_wait/mint_store/send_wait/send/commit per round),
+`replica batch handler timing` / `replica append inner timing` (decode/service/gate/store).
+Debug logging costs 20–30% throughput — read relative structure only. At saturation the
+convoy inflates everything: rounds show 640+ ms lock_wait, fan-out send_wait dominates,
+replica store is 5–15 ms per ~2–4k frames (≈7–8 µs/frame serialized per range-store).
+
+### Next levers, re-ranked by evidence
+
+1. **Pipelined quorum rounds per range** (the original handoff lever, still the big one):
+   one round in flight per range today; round latency ~7 ms even unfragmented.
+   Per-pipeline 20k × more pipelines hits a convoy wall — pipelining raises every pipeline's cap.
+   Consensus-critical: positions must stay ordered/contiguous per range; speculative position
+   assignment with in-order commit is the design problem.
+2. **Range-affine writes / client-side per-range batching**: kill fragmentation. Either the SDK
+   learns the key→range table and forms per-range batches (Kafka-producer-style), or the ingress
+   re-batches per range over a linger window. Big win for multi-range feeds specifically.
+3. **Owner-direct writes** (SDK resolves owner, skips relay hop): ~17% wire + one full
+   decode/forward CPU pass removed per record. Matters more once rounds pipeline.
+4. Cursor elision: real but ~2% — do it opportunistically with other wire work.
+5. Benchmark methodology for validating the target: N parallel client containers × independent
+   single-range feeds. The 166k data point should be reproduced cleanly (synchronized start,
+   longer window, read-back verification) before/after each lever lands.
+
+### Open questions
+
+- Why exactly does per-writer throughput cap at ~5–10k regardless of in-flight depth?
+  In-order per-writer sequence completion interacting with the range round serialization
+  is the suspect — verify when implementing pipelining.
+- Does the 9-pipeline aggregate keep scaling past 166k (12+ pipelines) or is there a
+  per-node serialization ceiling? Unanswered — cheap follow-up experiment.
+- Docker Desktop WSL2 bridge bandwidth ceiling unmeasured — irrelevant until CPU/convoy fixed.
