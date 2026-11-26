@@ -198,8 +198,22 @@ The serialization is NOT a plain mutex-held round. Existing machinery in
 - `group_queue_window` / `in_flight_window` per-range semaphores bounding
   submission depth.
 
+CORRECTION after reading OrderedTurn (majority.rs:150-228): pipelining is
+already implemented and deliberate. Sends per follower run in mint order but
+pipeline MAX_INFLIGHT_SENDS_PER_FOLLOWER=4 deep; rounds merge up to
+MAX_GROUP_ROUND_FRAMES=4096 frames / 16MB; commit is turn-ordered; a dropped
+TurnPermit advances the queue so failed rounds cannot wedge successors. The
+system is NOT stop-and-wait per range by design.
+
 So rounds already overlap *structurally*; the throughput cap means the overlap
-doesn't yield parallelism in practice. Design questions for next session:
+doesn't yield parallelism in practice. The open problem is therefore diagnostic,
+not design: at saturation, where does the pipeline actually stall? Candidates:
+(a) replica-side store serialization per range-store (~7-8us/frame measured)
+sets a hard per-pipeline ceiling of ~125-140k/frame-rate shared across the
+owner + 2 replicas' stores — close to the ~20k/pipeline observed when convoyed;
+(b) turn-order head-of-line blocking: one slow follower send serializes all
+behind it per follower lane even when other followers are idle;
+(c) group-queue/in-flight window depths too shallow to fill the pipe. Design questions for next session:
 1. What does `OrderedTurn` actually serialize — is the next round's fan-out
    gated on the previous round's completion (turn-ordered sends), making the
    pipeline effectively stop-and-wait per range? (`turn_permit.wait()` BEFORE
